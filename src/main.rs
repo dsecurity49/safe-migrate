@@ -214,26 +214,27 @@ fn extract_context_from_ast(node: &squawk_syntax::SyntaxNode) -> StmtContext {
     };
 
     if let Some(rel) = rel_node
-        && let Some(path) = rel.path() {
-            // The segment of the top-level path is exactly the table name.
-            // If the user wrote "public.users", the qualifier is "public" and the segment is "users".
-            if let Some(segment) = path.segment() {
-                let mut extracted = None;
+        && let Some(path) = rel.path()
+    {
+        // The segment of the top-level path is exactly the table name.
+        // If the user wrote "public.users", the qualifier is "public" and the segment is "users".
+        if let Some(segment) = path.segment() {
+            let mut extracted = None;
 
-                if let Some(name) = segment.name() {
-                    extracted = Some(name.syntax().text().to_string());
-                } else if let Some(name_ref) = segment.name_ref() {
-                    extracted = Some(name_ref.syntax().text().to_string());
-                }
+            if let Some(name) = segment.name() {
+                extracted = Some(name.syntax().text().to_string());
+            } else if let Some(name_ref) = segment.name_ref() {
+                extracted = Some(name_ref.syntax().text().to_string());
+            }
 
-                if let Some(name) = extracted {
-                    ctx.table_name = Some(
-                        name.trim_matches(|c| c == '"' || c == '\'' || c == ' ')
-                            .to_string(),
-                    );
-                }
+            if let Some(name) = extracted {
+                ctx.table_name = Some(
+                    name.trim_matches(|c| c == '"' || c == '\'' || c == ' ')
+                        .to_string(),
+                );
             }
         }
+    }
 
     ctx
 }
