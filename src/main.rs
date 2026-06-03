@@ -1,9 +1,9 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use postgres::{Client, NoTls};
 use serde::{Deserialize, Serialize};
 use squawk_linter::{Linter, Rule};
-use squawk_syntax::{ast, ast::AstNode, SourceFile};
+use squawk_syntax::{SourceFile, ast, ast::AstNode};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -23,7 +23,7 @@ enum Commands {
     Lint {
         #[arg(short, long)]
         file: String,
-        
+
         /// Optional config override
         #[arg(short, long, default_value = "safe-migrate.toml")]
         config: String,
@@ -72,22 +72,43 @@ struct Config {
 impl Config {
     fn default_config() -> Self {
         let mut rules = HashMap::new();
-        
+
         let tier1_rules = [
-            "adding-field-with-default", "changing-column-type", "adding-not-nullable-field",
-            "adding-serial-primary-key-field", "adding-required-field", "renaming-column",
-            "renaming-table", "disallowed-unique-constraint", "ban-drop-table", "ban-drop-column",
+            "adding-field-with-default",
+            "changing-column-type",
+            "adding-not-nullable-field",
+            "adding-serial-primary-key-field",
+            "adding-required-field",
+            "renaming-column",
+            "renaming-table",
+            "disallowed-unique-constraint",
+            "ban-drop-table",
+            "ban-drop-column",
         ];
         for r in tier1_rules {
-            rules.insert(r.to_string(), RuleConfig { tier: LockTier::Tier1, threshold: None });
+            rules.insert(
+                r.to_string(),
+                RuleConfig {
+                    tier: LockTier::Tier1,
+                    threshold: None,
+                },
+            );
         }
 
         let tier2_rules = [
-            "require-concurrent-index-creation", "require-concurrent-index-deletion",
-            "adding-foreign-key-constraint", "constraint-missing-not-valid",
+            "require-concurrent-index-creation",
+            "require-concurrent-index-deletion",
+            "adding-foreign-key-constraint",
+            "constraint-missing-not-valid",
         ];
         for r in tier2_rules {
-            rules.insert(r.to_string(), RuleConfig { tier: LockTier::Tier2, threshold: None });
+            rules.insert(
+                r.to_string(),
+                RuleConfig {
+                    tier: LockTier::Tier2,
+                    threshold: None,
+                },
+            );
         }
 
         Config {
@@ -99,11 +120,11 @@ impl Config {
     fn load(path: &str) -> Result<Self> {
         let mut config = Self::default_config();
         let path_obj = Path::new(path);
-        
+
         if path_obj.exists() {
             let contents = fs::read_to_string(path_obj)
                 .with_context(|| format!("Failed to read config file at {}", path))?;
-            
+
             let partial: PartialConfig = toml::from_str(&contents)
                 .context("Malformed safe-migrate.toml. Ensure it is valid TOML.")?;
 
@@ -113,11 +134,18 @@ impl Config {
             if let Some(user_rules) = partial.rules {
                 for (k, v) in user_rules {
                     let existing = config.rules.get_mut(&k).ok_or_else(|| {
-                        anyhow!("Unknown rule '{}' found in config. Please check for typos.", k)
+                        anyhow!(
+                            "Unknown rule '{}' found in config. Please check for typos.",
+                            k
+                        )
                     })?;
-                    
-                    if let Some(t) = v.tier { existing.tier = t; }
-                    if let Some(th) = v.threshold { existing.threshold = Some(th); }
+
+                    if let Some(t) = v.tier {
+                        existing.tier = t;
+                    }
+                    if let Some(th) = v.threshold {
+                        existing.threshold = Some(th);
+                    }
                 }
             }
         }
@@ -147,11 +175,19 @@ fn get_rule_name(rule: &Rule) -> &'static str {
 
 fn get_recipe(rule: &Rule) -> &'static str {
     match rule {
-        Rule::RequireConcurrentIndexCreation => "Use CREATE INDEX CONCURRENTLY. Note: cannot run inside a transaction block.",
+        Rule::RequireConcurrentIndexCreation => {
+            "Use CREATE INDEX CONCURRENTLY. Note: cannot run inside a transaction block."
+        }
         Rule::RequireConcurrentIndexDeletion => "Use DROP INDEX CONCURRENTLY.",
-        Rule::AddingFieldWithDefault => "Expand-Contract Pattern:\n  1. Add nullable column.\n  2. Backfill rows in batches.\n  3. Add NOT NULL constraint separately.",
-        Rule::ChangingColumnType => "Add new column, backfill data, swap references, drop old column.",
-        Rule::AddingForeignKeyConstraint => "Use ADD CONSTRAINT ... NOT VALID, then VALIDATE CONSTRAINT separately.",
+        Rule::AddingFieldWithDefault => {
+            "Expand-Contract Pattern:\n  1. Add nullable column.\n  2. Backfill rows in batches.\n  3. Add NOT NULL constraint separately."
+        }
+        Rule::ChangingColumnType => {
+            "Add new column, backfill data, swap references, drop old column."
+        }
+        Rule::AddingForeignKeyConstraint => {
+            "Use ADD CONSTRAINT ... NOT VALID, then VALIDATE CONSTRAINT separately."
+        }
         _ => "Review PostgreSQL locking documentation.",
     }
 }
@@ -163,7 +199,10 @@ struct StmtContext {
 
 /// Strictly typed AST extraction using Squawk's native Path and PathSegment nodes
 fn extract_context_from_ast(node: &squawk_syntax::SyntaxNode) -> StmtContext {
-    let mut ctx = StmtContext { table_name: None, is_concurrent: false };
+    let mut ctx = StmtContext {
+        table_name: None,
+        is_concurrent: false,
+    };
 
     let rel_node = if let Some(alter_stmt) = ast::AlterTable::cast(node.clone()) {
         alter_stmt.relation_name()
@@ -180,7 +219,7 @@ fn extract_context_from_ast(node: &squawk_syntax::SyntaxNode) -> StmtContext {
             // If the user wrote "public.users", the qualifier is "public" and the segment is "users".
             if let Some(segment) = path.segment() {
                 let mut extracted = None;
-                
+
                 if let Some(name) = segment.name() {
                     extracted = Some(name.syntax().text().to_string());
                 } else if let Some(name_ref) = segment.name_ref() {
@@ -188,7 +227,10 @@ fn extract_context_from_ast(node: &squawk_syntax::SyntaxNode) -> StmtContext {
                 }
 
                 if let Some(name) = extracted {
-                    ctx.table_name = Some(name.trim_matches(|c| c == '"' || c == '\'' || c == ' ').to_string());
+                    ctx.table_name = Some(
+                        name.trim_matches(|c| c == '"' || c == '\'' || c == ' ')
+                            .to_string(),
+                    );
                 }
             }
         }
@@ -210,24 +252,27 @@ fn main() -> Result<()> {
 
     match &cli.command {
         Commands::Sync => {
-            let db_url = std::env::var("DATABASE_URL")
-                .context("DATABASE_URL must be set to run sync.")?;
-            
+            let db_url =
+                std::env::var("DATABASE_URL").context("DATABASE_URL must be set to run sync.")?;
+
             let mut client = Client::connect(&db_url, NoTls)?;
             let mut tables = HashMap::new();
-            
+
             let query = "SELECT n.nspname || '.' || c.relname, c.reltuples::bigint 
                          FROM pg_class c 
                          JOIN pg_namespace n ON n.oid = c.relnamespace 
                          WHERE c.relkind = 'r' 
                          AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast');";
-            
+
             for row in client.query(query, &[])? {
                 let full_name: String = row.get(0);
                 let name = full_name.split('.').last().unwrap();
                 let count: i64 = row.get(1);
-                
-                tables.insert(name.to_string(), (count.max(0) as u64).max(*tables.get(name).unwrap_or(&0)));
+
+                tables.insert(
+                    name.to_string(),
+                    (count.max(0) as u64).max(*tables.get(name).unwrap_or(&0)),
+                );
             }
 
             let state = StateFile {
@@ -235,20 +280,25 @@ fn main() -> Result<()> {
                 tables,
             };
 
-            fs::write(".safe-migrate-stats.json", serde_json::to_string_pretty(&state)?)?;
+            fs::write(
+                ".safe-migrate-stats.json",
+                serde_json::to_string_pretty(&state)?,
+            )?;
             println!("[OK] Database statistics synced.");
         }
 
         Commands::Lint { file, config } => {
             let stats_path = Path::new(".safe-migrate-stats.json");
             if !stats_path.exists() {
-                return Err(anyhow!("Could not find .safe-migrate-stats.json. Please run 'safe-migrate sync' before linting."));
+                return Err(anyhow!(
+                    "Could not find .safe-migrate-stats.json. Please run 'safe-migrate sync' before linting."
+                ));
             }
 
             let cfg = Config::load(config)?;
             let full_sql = fs::read_to_string(file)
                 .with_context(|| format!("Failed to read migration file: {}", file))?;
-            
+
             let state: StateFile = serde_json::from_str(&fs::read_to_string(stats_path)?)
                 .context("Failed to parse state file JSON.")?;
 
@@ -264,17 +314,17 @@ fn main() -> Result<()> {
             let mut linter = Linter::with_default_rules();
 
             let parsed_file = SourceFile::parse(&full_sql);
-            
+
             for stmt in parsed_file.tree().stmts() {
                 let stmt_node = stmt.syntax();
                 let stmt_text = stmt_node.text().to_string();
-                
+
                 if stmt_text.trim().is_empty() {
                     continue;
                 }
 
                 let ctx = extract_context_from_ast(stmt_node);
-                
+
                 if ctx.table_name.is_none() {
                     unclassified_count += 1;
                 }
@@ -287,10 +337,12 @@ fn main() -> Result<()> {
 
                 for violation in violations {
                     let rule_name = get_rule_name(&violation.code);
-                    
+
                     let rule_cfg = cfg.rules.get(rule_name);
                     let tier = rule_cfg.map(|r| r.tier.clone()).unwrap_or(LockTier::Tier3);
-                    let threshold = rule_cfg.and_then(|r| r.threshold).unwrap_or(cfg.default_threshold);
+                    let threshold = rule_cfg
+                        .and_then(|r| r.threshold)
+                        .unwrap_or(cfg.default_threshold);
 
                     if *row_count > threshold && tier != LockTier::Tier3 {
                         reports.push(ViolationReport {
@@ -304,8 +356,14 @@ fn main() -> Result<()> {
                 }
             }
 
-            let fatal_reports: Vec<&ViolationReport> = reports.iter().filter(|r| r.severity == LockTier::Tier1).collect();
-            let warning_reports: Vec<&ViolationReport> = reports.iter().filter(|r| r.severity == LockTier::Tier2).collect();
+            let fatal_reports: Vec<&ViolationReport> = reports
+                .iter()
+                .filter(|r| r.severity == LockTier::Tier1)
+                .collect();
+            let warning_reports: Vec<&ViolationReport> = reports
+                .iter()
+                .filter(|r| r.severity == LockTier::Tier2)
+                .collect();
 
             if !warning_reports.is_empty() {
                 println!("[WARN] Tier 2 Locks Detected (SHARE ROW EXCLUSIVE)");
@@ -317,15 +375,22 @@ fn main() -> Result<()> {
             }
 
             if !fatal_reports.is_empty() {
-                let mut msg = String::from("[HALT] Tier 1 Locks Detected (ACCESS EXCLUSIVE)\nImpact: Table rewrite required. All reads and writes will be blocked.\n\n");
-    
+                let mut msg = String::from(
+                    "[HALT] Tier 1 Locks Detected (ACCESS EXCLUSIVE)\nImpact: Table rewrite required. All reads and writes will be blocked.\n\n",
+                );
+
                 for report in &fatal_reports {
-                    msg.push_str(&format!("  Table: {} (~{} rows)\n  Rule:  {}\n  Fix:   {}\n\n",
-                        report.table, report.rows, report.rule_name, report.recipe));
+                    msg.push_str(&format!(
+                        "  Table: {} (~{} rows)\n  Rule:  {}\n  Fix:   {}\n\n",
+                        report.table, report.rows, report.rule_name, report.recipe
+                    ));
                 }
 
                 if unclassified_count > 0 {
-                    msg.push_str(&format!("[INFO] {} unclassified statement(s) bypassed lock checks.\n", unclassified_count));
+                    msg.push_str(&format!(
+                        "[INFO] {} unclassified statement(s) bypassed lock checks.\n",
+                        unclassified_count
+                    ));
                 }
 
                 return Err(anyhow!(msg));
@@ -334,9 +399,12 @@ fn main() -> Result<()> {
             if reports.is_empty() {
                 println!("[OK] Migration safe to deploy.");
             }
-            
+
             if unclassified_count > 0 {
-                println!("[INFO] {} unclassified statement(s) bypassed lock checks.", unclassified_count);
+                println!(
+                    "[INFO] {} unclassified statement(s) bypassed lock checks.",
+                    unclassified_count
+                );
             }
         }
     }
@@ -352,7 +420,8 @@ mod tests {
 
     fn parse_first_stmt(sql: &str) -> squawk_syntax::SyntaxNode {
         let parsed = SourceFile::parse(sql);
-        parsed.tree()
+        parsed
+            .tree()
             .stmts()
             .next()
             .expect("Failed to parse statement from SQL string")
@@ -366,16 +435,23 @@ mod tests {
         let ctx = extract_context_from_ast(&node);
         assert_eq!(ctx.table_name.unwrap(), "users");
 
-        let node = parse_first_stmt("CREATE INDEX CONCURRENTLY idx_email ON public.\"tenants\" (email);");
+        let node =
+            parse_first_stmt("CREATE INDEX CONCURRENTLY idx_email ON public.\"tenants\" (email);");
         let ctx = extract_context_from_ast(&node);
         assert_eq!(ctx.table_name.unwrap(), "tenants");
         assert!(ctx.is_concurrent);
     }
-    
+
     #[test]
     fn test_rule_mapping() {
-        assert_eq!(get_rule_name(&Rule::AddingFieldWithDefault), "adding-field-with-default");
-        assert_eq!(get_rule_name(&Rule::RequireConcurrentIndexCreation), "require-concurrent-index-creation");
+        assert_eq!(
+            get_rule_name(&Rule::AddingFieldWithDefault),
+            "adding-field-with-default"
+        );
+        assert_eq!(
+            get_rule_name(&Rule::RequireConcurrentIndexCreation),
+            "require-concurrent-index-creation"
+        );
         assert_eq!(get_rule_name(&Rule::BanDropColumn), "ban-drop-column");
     }
 
@@ -390,15 +466,15 @@ mod tests {
         threshold = 1000
         "#;
         file.write_all(toml.as_bytes()).unwrap();
-        
+
         let cfg = Config::load(file.path().to_str().unwrap()).unwrap();
-        
+
         assert_eq!(cfg.default_threshold, 500);
-        
+
         let rule_cfg = cfg.rules.get("adding-field-with-default").unwrap();
         assert_eq!(rule_cfg.tier, LockTier::Tier2);
         assert_eq!(rule_cfg.threshold, Some(1000));
-        
+
         let untouched_rule = cfg.rules.get("ban-drop-column").unwrap();
         assert_eq!(untouched_rule.tier, LockTier::Tier1);
         assert_eq!(untouched_rule.threshold, None);
@@ -414,7 +490,7 @@ mod tests {
         tier = "Tier3"
         "#;
         file.write_all(toml.as_bytes()).unwrap();
-        
+
         let result = Config::load(file.path().to_str().unwrap());
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Unknown rule"));
