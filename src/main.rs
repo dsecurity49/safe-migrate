@@ -213,8 +213,8 @@ fn extract_context_from_ast(node: &squawk_syntax::SyntaxNode) -> StmtContext {
         None
     };
 
-    if let Some(rel) = rel_node {
-        if let Some(path) = rel.path() {
+    if let Some(rel) = rel_node
+        && let Some(path) = rel.path() {
             // The segment of the top-level path is exactly the table name.
             // If the user wrote "public.users", the qualifier is "public" and the segment is "users".
             if let Some(segment) = path.segment() {
@@ -234,7 +234,6 @@ fn extract_context_from_ast(node: &squawk_syntax::SyntaxNode) -> StmtContext {
                 }
             }
         }
-    }
 
     ctx
 }
@@ -266,7 +265,7 @@ fn main() -> Result<()> {
 
             for row in client.query(query, &[])? {
                 let full_name: String = row.get(0);
-                let name = full_name.split('.').last().unwrap();
+                let name = full_name.split('.').next_back().unwrap();
                 let count: i64 = row.get(1);
 
                 tables.insert(
