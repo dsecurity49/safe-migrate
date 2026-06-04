@@ -117,3 +117,7 @@ tier = "Tier2"
 
 ## Architecture
 `safe-migrate` parses your SQL using a native PostgreSQL Abstract Syntax Tree (AST). It handles quotes, complex schemas, and multi-statement transactions natively without relying on brittle regular expressions or string splitting.
+
+## License
+
+This project is dual-licensed under either the [MIT license](LICENSE-MIT) or the [Apache License, Version 2.0](LICENSE-APACHE), at your option.
