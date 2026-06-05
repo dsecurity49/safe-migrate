@@ -154,7 +154,7 @@ fn main() -> Result<()> {
         Commands::Sync { out } => {
             let db_url =
                 std::env::var("DATABASE_URL").context("DATABASE_URL must be set to run sync.")?;
-            println!("Syncing database stats from {}...", db_url);
+            println!("Syncing database stats...");
             safe_migrate::sync::sync_cache(&db_url, std::path::Path::new(&out))?;
             println!("[ OK ] Cache successfully written to {}", out);
         }
