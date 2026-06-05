@@ -90,7 +90,21 @@ threshold = 50000
 tier = "Tier1"
 ````
 
-Available rules: `adding-field-with-default`, `changing-column-type`, `adding-not-nullable-field`, `adding-serial-primary-key-field`, `adding-required-field`, `renaming-column`, `renaming-table`, `disallowed-unique-constraint`, `ban-drop-table`, `ban-drop-column`, `require-concurrent-index-creation`, `require-concurrent-index-deletion`, `adding-foreign-key-constraint`, `constraint-missing-not-valid`
+Available rules: 
+- `adding-field-with-default`
+- `changing-column-type`
+- `adding-not-nullable-field`
+- `adding-serial-primary-key-field`
+- `adding-required-field`
+- `renaming-column`
+- `renaming-table`
+- `disallowed-unique-constraint`
+- `ban-drop-table`
+- `ban-drop-column`
+- `require-concurrent-index-creation`
+- `require-concurrent-index-deletion`
+- `adding-foreign-key-constraint`
+- `constraint-missing-not-valid`
 
 ---
 
@@ -98,8 +112,8 @@ Available rules: `adding-field-with-default`, `changing-column-type`, `adding-no
 
 ### `safe-migrate lint`
 
-| Flag | Default | Description |
-|------|---------|-------------|
+|  Flag  | Default | Description |
+|--------|---------|-------------|
 | `-f, --file` | required | Path to the SQL migration file |
 | `--cache` | `.safe-migrate-stats.json` | Path to the stats cache file |
 | `--config` | `safe-migrate.toml` | Path to TOML config overrides |
