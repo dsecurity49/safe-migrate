@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use safe_migrate::ast::parse_and_classify;
 use safe_migrate::cache::load_cache;
@@ -94,7 +94,9 @@ fn main() -> Result<()> {
                     .unwrap_or_default()
                     .as_secs();
                 if now.saturating_sub(cache_data.last_updated) > 604_800 {
-                    println!("[WARN] Database stats cache (.safe-migrate-stats.json) is over 7 days old!");
+                    println!(
+                        "[WARN] Database stats cache (.safe-migrate-stats.json) is over 7 days old!"
+                    );
                     println!(
                         "       Run `safe-migrate sync` to ensure accurate lock evaluations.\n"
                     );

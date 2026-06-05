@@ -1,4 +1,4 @@
-use crate::config::{get_recipe, Config};
+use crate::config::{Config, get_recipe};
 use crate::model::{AlterAction, CacheData, LintRecord, LockTier, MigrationOp, SpannedOp};
 
 pub fn evaluate(

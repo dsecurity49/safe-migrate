@@ -104,10 +104,9 @@ pub fn parse_and_classify(source_file: ast::SourceFile) -> Result<Vec<SpannedOp>
                         SafeMigrateError::Parse("CreateIndex missing target table".into())
                     })?;
 
-                let index_name = create_index.name().and_then(|n| {
-                    n.ident_token()
-                        .map(|t| normalize_ident(t.text()))
-                });
+                let index_name = create_index
+                    .name()
+                    .and_then(|n| n.ident_token().map(|t| normalize_ident(t.text())));
 
                 local_ops.push(MigrationOp::CreateIndex {
                     index_name,

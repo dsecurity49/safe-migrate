@@ -1,5 +1,5 @@
 use crate::model::LockTier;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -200,7 +200,9 @@ pub fn get_recipe(rule: &str) -> &'static str {
             2. Always precede this command with 'SET lock_timeout = '2s';' so busy databases fail gracefully instead of taking down production.\n\
             3. Let the pipeline retry later."
         }
-        "benign-statement" => "Standard transactional, session, or DML block. No blocking schema lock required.",
+        "benign-statement" => {
+            "Standard transactional, session, or DML block. No blocking schema lock required."
+        }
         "create-table" => "Creating a new table does not block existing application queries.",
         _ => {
             "This statement triggers an unclassified heavy lock.\n\

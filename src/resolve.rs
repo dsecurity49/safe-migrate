@@ -17,9 +17,10 @@ fn extract_segment_text(seg: &ast::PathSegment) -> String {
             return ident.text().to_string();
         }
     } else if let Some(name_ref) = seg.name_ref()
-        && let Some(ident) = name_ref.ident_token() {
-            return ident.text().to_string();
-        }
+        && let Some(ident) = name_ref.ident_token()
+    {
+        return ident.text().to_string();
+    }
     seg.syntax().text().to_string()
 }
 
