@@ -23,7 +23,6 @@ case "${ARCH}" in
 esac
 
 TARGET="${ARCH_TARGET}-${OS_TARGET}"
-
 echo "Target detected: ${TARGET}"
 echo "Fetching latest release version..."
 
@@ -50,15 +49,28 @@ fi
 echo "Extracting archive..."
 tar -xzf "$TAR_FILE" -C "$TMP_DIR"
 
-INSTALL_DIR="/usr/local/bin"
-echo "Moving binary to ${INSTALL_DIR} (This might require sudo password)..."
-sudo mv "${TMP_DIR}/${BIN_NAME}" "${INSTALL_DIR}/${BIN_NAME}"
-sudo chmod +x "${INSTALL_DIR}/${BIN_NAME}"
+# Determine install location based on permissions
+if [ -w "/usr/local/bin" ] || sudo -n true 2>/dev/null; then
+    INSTALL_DIR="/usr/local/bin"
+    echo "Moving binary to ${INSTALL_DIR}..."
+    sudo mv "${TMP_DIR}/${BIN_NAME}" "${INSTALL_DIR}/${BIN_NAME}"
+    sudo chmod +x "${INSTALL_DIR}/${BIN_NAME}"
+else
+    INSTALL_DIR="${HOME}/.local/bin"
+    echo "No sudo privileges detected. Installing to ${INSTALL_DIR}..."
+    mkdir -p "${INSTALL_DIR}"
+    mv "${TMP_DIR}/${BIN_NAME}" "${INSTALL_DIR}/${BIN_NAME}"
+    chmod +x "${INSTALL_DIR}/${BIN_NAME}"
+    
+    if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
+        echo "Note: ${INSTALL_DIR} is not in your PATH. You may need to add it."
+    fi
+fi
 
 # Cleanup
 rm -rf "$TMP_DIR"
 
 echo "----------------------------------------"
-echo "✅ ${BIN_NAME} ${VERSION} installed successfully!"
+echo "${BIN_NAME} ${VERSION} installed successfully!"
 echo "Run 'safe-migrate --help' to get started."
 echo "----------------------------------------"
