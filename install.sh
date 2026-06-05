@@ -9,7 +9,7 @@ echo "Detecting operating system and architecture..."
 # Detect OS
 OS="$(uname -s)"
 case "${OS}" in
-    Linux*)     OS_TARGET="unknown-linux-gnu";;
+    Linux*)     OS_TARGET="unknown-linux-musl";;
     Darwin*)    OS_TARGET="apple-darwin";;
     *)          echo "Unsupported OS: ${OS}. Please compile from source."; exit 1;;
 esac

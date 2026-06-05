@@ -12,6 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Parser)]
 #[command(name = "safe-migrate")]
+#[command(version)]
 #[command(about = "Lint PostgreSQL migrations to prevent blocking locks", long_about = None)]
 struct Cli {
     #[command(subcommand)]
