@@ -717,6 +717,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rowan"
+version = "0.16.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "417a3a9f582e349834051b8a10c8d71ca88da4211e4093528e36b9845f6b5f21"
+dependencies = [
+ "countme",
+ "hashbrown 0.14.5",
+ "rustc-hash",
+ "text-size",
+]
+
+[[package]]
 name = "rustc-hash"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -748,6 +760,7 @@ dependencies = [
  "anyhow",
  "clap",
  "postgres",
+ "rowan 0.16.1",
  "serde",
  "serde_json",
  "squawk-syntax",
@@ -892,7 +905,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "66be04f4e58d8d95d4bc228bbbcf22a4f49498d6ceaf35d14df0ac771c541db5"
 dependencies = [
  "either",
- "rowan",
+ "rowan 0.15.18",
  "smol_str",
  "squawk-parser",
 ]
