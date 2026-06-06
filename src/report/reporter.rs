@@ -3,7 +3,7 @@ use crate::report::violations::{Severity, Violation};
 
 #[derive(Debug, Default)]
 pub struct Reporter {
-    violations: Vec<Violation>,
+    pub violations: Vec<Violation>,
 }
 
 impl Reporter {

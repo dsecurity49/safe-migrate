@@ -7,9 +7,9 @@ pub struct QualifiedName {
 }
 
 impl QualifiedName {
-    pub fn new(schema: Option<impl Into<String>>, name: impl Into<String>) -> Self {
+    pub fn new(schema: Option<String>, name: impl Into<String>) -> Self {
         Self {
-            schema: schema.map(|s| s.into()),
+            schema,
             name: name.into(),
         }
     }

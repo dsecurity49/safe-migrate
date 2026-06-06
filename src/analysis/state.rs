@@ -4,7 +4,7 @@ use crate::model::relation::{ObjectId, RelationOverlay};
 use crate::analysis::graph::DependencyGraph;
 use crate::analysis::transaction::TransactionFrame;
 use crate::analysis::mutations::Mutation;
-
+use crate::model::relation::RelationState;
 /// Indicates the engine's certainty about the current state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Confidence {
@@ -48,12 +48,27 @@ impl AnalysisState {
     }
     pub fn apply(&mut self, mutation: &Mutation) {
         match mutation {
+            Mutation::CreateTable { id } => {
+                self.local.relations.insert(
+                    id.clone(),
+                    RelationOverlay::Present(RelationState {
+                        id: id.clone(),
+                        columns: vec![],
+                    }),
+                );
+            }
             Mutation::DropTable { id } => {
-                // THE TOMBSTONE RULE: Never delete, only shadow.
                 self.local.relations.insert(id.clone(), RelationOverlay::Dropped);
             }
-            // Future mutations (CreateTable, AlterTable) will be handled here
             _ => {}
         }
     }
+    pub fn get_relation(&self, id: &ObjectId) -> Option<&RelationState> {
+        match self.local.relations.get(id) {
+            Some(RelationOverlay::Present(state)) => Some(state),
+            Some(RelationOverlay::Dropped) => None,
+            None => self.cache.get_relation(id),
+        }
+    }
 }
+

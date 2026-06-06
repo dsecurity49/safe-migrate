@@ -20,7 +20,7 @@ mod tests {
 
         // --- STEP 1: Execute `CREATE TABLE users` (Unqualified) ---
         let fact_create = StatementFact::CreateTable {
-            name: QualifiedName::new(None, "users"),
+            name: QualifiedName::new(None, "users".to_string()),
         };
         
         let mutations = Resolver::resolve(&fact_create, &state);
@@ -36,7 +36,7 @@ mod tests {
 
         // --- STEP 2: Execute `DROP TABLE public.users` (Qualified) ---
         let fact_drop = StatementFact::DropTable {
-            name: QualifiedName::new(Some("public"), "users"),
+            name: QualifiedName::new(Some("public".to_string()), "users".to_string()),
             if_exists: false,
         };
 

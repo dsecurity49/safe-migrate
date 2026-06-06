@@ -8,5 +8,3 @@ pub mod report;
 pub mod rules;
 pub mod engine;
 
-#[cfg(test)]
-mod tests;
