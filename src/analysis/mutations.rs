@@ -49,12 +49,34 @@ pub enum Mutation {
 pub struct CreateTable {
     pub id: ObjectId,
     pub if_not_exists: bool,
+    /// Resolved column definitions from the table body.
+    /// Empty for CREATE TABLE AS (no body).
+    pub columns: Vec<ColumnMutation>,
+    /// Resolved foreign key edges from the table body.
+    /// Includes both column-level and table-level FKs.
+    pub foreign_keys: Vec<FkMutation>,
+}
+
+/// A single column definition carried inside a CreateTable mutation.
+/// Mirrors ColumnFact but with ObjectId resolution already applied
+/// (though columns themselves don't need resolution — names are local).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ColumnMutation {
+    pub name: String,
+    pub ty: Option<String>,
+    pub not_null: bool,
+    pub is_primary_key: bool,
+}
+
+/// A foreign key edge carried inside a CreateTable mutation.
+/// `to_table` is the resolved canonical identity of the referenced table.
+/// Source columns are empty — squawk does not expose them from FK nodes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FkMutation {
+    pub to_table: ObjectId,
 }
 
 /// A resolved CREATE VIEW mutation.
-/// The resolver will attempt to populate `depends_on` by inspecting
-/// the view query for table references. Initially this may be empty
-/// until query analysis is implemented.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CreateView {
     pub id: ObjectId,
@@ -69,6 +91,8 @@ pub struct CreateIndex {
     pub id: ObjectId,
     pub table: ObjectId,
     pub if_not_exists: bool,
+    /// True if CONCURRENTLY was present in the statement.
+    pub concurrently: bool,
 }
 
 // ── Schema mutation structs ───────────────────

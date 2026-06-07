@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::analysis::graph::{DependencyGraph, IndexEdge, RenameEdge, ViewEdge};
+use crate::analysis::graph::{DependencyGraph, FkEdge, IndexEdge, RenameEdge, ViewEdge};
 use crate::analysis::mutations::{AlterTableActionMutation, Mutation};
 use crate::analysis::transaction::{StateChange, TransactionFrame};
 use crate::db::cache::DbCache;
@@ -84,12 +84,36 @@ impl AnalysisState {
             // ── Schema definition ─────────────
 
             Mutation::CreateTable(create) => {
-                // Record undo snapshot before mutating if inside a transaction.
                 self.snapshot_relation(&create.id);
+
+                // Build the initial RelationState with columns pre-populated
+                // from the table body extraction. This means has_column() and
+                // column type checks work immediately after CREATE TABLE,
+                // not only after subsequent ADD COLUMN statements.
+                let mut rel_state = RelationState::new(create.id.clone());
+                for col in &create.columns {
+                    rel_state.apply_column_action(&ColumnAction::Add {
+                        name: col.name.clone(),
+                        data_type: col.ty.clone(),
+                    });
+                }
+
                 self.local.relations.insert(
                     create.id.clone(),
-                    RelationOverlay::Present(RelationState::new(create.id)),
+                    RelationOverlay::Present(rel_state),
                 );
+
+                // Insert an FkEdge for each FK constraint declared in the
+                // table body. from_columns is empty — squawk doesn't expose
+                // the source column list from FK nodes.
+                for fk in &create.foreign_keys {
+                    self.local.graph.foreign_keys.push(FkEdge {
+                        from_table: create.id.clone(),
+                        from_columns: Vec::new(),
+                        to_table: fk.to_table.clone(),
+                        to_columns: Vec::new(),
+                    });
+                }
             }
 
             Mutation::CreateView(create_view) => {

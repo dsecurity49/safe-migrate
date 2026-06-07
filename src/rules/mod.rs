@@ -38,6 +38,9 @@ pub fn rules() -> Vec<Box<dyn Rule>> {
         // Destructive operations.
         Box::new(destructive::DestructiveDropRule),
 
+        // Index safety — CONCURRENTLY flag, locking behaviour.
+        Box::new(indexes::ConcurrentIndexRule),
+
         // Dependency safety — views, FK, indexes referencing dropped tables.
         Box::new(views::OrphanedDependencyRule),
 

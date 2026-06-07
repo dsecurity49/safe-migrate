@@ -1,9 +1,9 @@
-use crate::analysis::facts::{AlterTableActionFact, StatementFact};
+use crate::analysis::facts::{AlterTableActionFact, ColumnFact, FkFact, StatementFact};
 use crate::ast::identifiers::QualifiedName;
 use squawk_syntax::ast::{
-    AstNode, AlterTable, AlterTableAction, ConfigValue, CreateIndex, CreateTable,
-    CreateTableAs, CreateView, DropIndex, DropTable, Path, PathSegment,
-    Savepoint, Set, Stmt,
+    AstNode, AlterTable, AlterTableAction, Column, ColumnConstraint, ConfigValue, CreateIndex,
+    CreateTable, CreateTableAs, CreateView, DropIndex, DropTable, Path, PathSegment,
+    Savepoint, Set, Stmt, TableArg, TableConstraint,
 };
 
 pub struct AstVisitor;
@@ -35,26 +35,146 @@ impl AstVisitor {
 
     fn extract_create_table(node: &CreateTable) -> Option<StatementFact> {
         let path = node.path()?;
+        let name = Self::path_to_qualified_name(&path)?;
+        let if_not_exists = node.if_not_exists().is_some();
+
+        // Extract columns and FK facts from the table body.
+        // table_arg_list() returns None for tables with no body (rare but
+        // possible with LIKE clauses only). Both vecs default to empty.
+        let (columns, foreign_keys) = node
+            .table_arg_list()
+            .map(|tal| Self::extract_table_body(tal.args()))
+            .unwrap_or_default();
+
         Some(StatementFact::CreateTable {
-            name: Self::path_to_qualified_name(&path)?,
-            if_not_exists: node.if_not_exists().is_some(),
+            name,
+            if_not_exists,
+            columns,
+            foreign_keys,
         })
     }
 
-    /// CREATE TABLE AS — treated as a plain CreateTable fact.
-    /// The query body is not analysed yet; we register the table identity only.
+    /// CREATE TABLE AS — no table body, so columns and foreign_keys are empty.
     fn extract_create_table_as(node: &CreateTableAs) -> Option<StatementFact> {
         let path = node.path()?;
         Some(StatementFact::CreateTable {
             name: Self::path_to_qualified_name(&path)?,
             if_not_exists: node.if_not_exists().is_some(),
+            columns: Vec::new(),
+            foreign_keys: Vec::new(),
         })
+    }
+
+    // ── Table body extraction ─────────────────────────────────────────
+
+    /// Iterates TableArg children and extracts columns and FK facts.
+    /// Returns (Vec<ColumnFact>, Vec<FkFact>).
+    fn extract_table_body(
+        args: impl Iterator<Item = TableArg>,
+    ) -> (Vec<ColumnFact>, Vec<FkFact>) {
+        let mut columns = Vec::new();
+        let mut foreign_keys = Vec::new();
+
+        for arg in args {
+            match arg {
+                // Column node — extract name, type, and per-column constraints.
+                TableArg::Column(col) => {
+                    if let Some(fact) = Self::extract_column_fact(&col) {
+                        // Also collect column-level FK (ReferencesConstraint)
+                        // from the column's constraint list.
+                        for fk in Self::extract_column_fk_facts(&col) {
+                            foreign_keys.push(fk);
+                        }
+                        columns.push(fact);
+                    }
+                }
+
+                // Table-level constraint — look for ForeignKeyConstraint.
+                TableArg::TableConstraint(tc) => {
+                    if let Some(fk) = Self::extract_table_fk_fact(&tc) {
+                        foreign_keys.push(fk);
+                    }
+                }
+
+                // LIKE clause — not relevant for schema simulation.
+                TableArg::LikeClause(_) => {}
+            }
+        }
+
+        (columns, foreign_keys)
+    }
+
+    /// Extract a ColumnFact from a Column node.
+    /// name() → Name → ident_token()
+    /// ty()   → Type → syntax().text()  [requires AstNode in scope]
+    fn extract_column_fact(col: &Column) -> Option<ColumnFact> {
+        // Column name — always from name(), not name_ref() (definition site).
+        let name = col
+            .name()
+            .and_then(|n| n.ident_token())
+            .map(|t| t.text().to_string())?;
+
+        // Data type — AstNode::syntax() gives us the raw text.
+        let ty = col
+            .ty()
+            .map(|t| t.syntax().text().to_string());
+
+        // Scan per-column constraints for NOT NULL and PRIMARY KEY.
+        let mut not_null = false;
+        let mut is_primary_key = false;
+
+        for constraint in col.constraints() {
+            match constraint {
+                ColumnConstraint::NotNullConstraint(_) => not_null = true,
+                ColumnConstraint::PrimaryKeyConstraint(_) => {
+                    is_primary_key = true;
+                    // PRIMARY KEY implies NOT NULL in PostgreSQL.
+                    not_null = true;
+                }
+                // DefaultConstraint, UniqueConstraint, CheckConstraint,
+                // ReferencesConstraint — handled separately or deferred.
+                _ => {}
+            }
+        }
+
+        Some(ColumnFact { name, ty, not_null, is_primary_key })
+    }
+
+    /// Extract FK facts from a column's ReferencesConstraint.
+    /// A column can have at most one REFERENCES clause in valid SQL,
+    /// but we return a Vec for uniformity with the table-level path.
+    fn extract_column_fk_facts(col: &Column) -> Vec<FkFact> {
+        let mut facts = Vec::new();
+
+        for constraint in col.constraints() {
+            if let ColumnConstraint::ReferencesConstraint(rc) = constraint {
+                // ReferencesConstraint::table() → Option<Path>
+                if let Some(path) = rc.table() {
+                    if let Some(references) = Self::path_to_qualified_name(&path) {
+                        facts.push(FkFact { references });
+                    }
+                }
+            }
+        }
+
+        facts
+    }
+
+    /// Extract an FK fact from a table-level TableConstraint.
+    /// Only ForeignKeyConstraint carries a target table path.
+    fn extract_table_fk_fact(tc: &TableConstraint) -> Option<FkFact> {
+        if let TableConstraint::ForeignKeyConstraint(fkc) = tc {
+            // ForeignKeyConstraint::path() → Option<Path> (the target table)
+            let path = fkc.path()?;
+            let references = Self::path_to_qualified_name(&path)?;
+            Some(FkFact { references })
+        } else {
+            None
+        }
     }
 
     // ── CREATE VIEW ───────────────────────────────────────────────────
 
-    /// FIX C9: was emitting StatementFact::CreateTable — now correctly
-    /// emits StatementFact::CreateView so the resolver inserts a ViewEdge.
     fn extract_create_view(node: &CreateView) -> Option<StatementFact> {
         let path = node.path()?;
         Some(StatementFact::CreateView {
@@ -65,39 +185,33 @@ impl AstVisitor {
 
     // ── CREATE INDEX ──────────────────────────────────────────────────
 
-    /// FIX C4: index name comes from name() not path().
-    /// name() returns Option<Name>; extract via ident_token().
     fn extract_create_index(node: &CreateIndex) -> Option<StatementFact> {
-        // Index name: Name node → ident_token → text
         let index_name_str = node
             .name()?
             .ident_token()?
             .text()
             .to_string();
 
-        // Parent table: relation_name() → RelationName → path() → Path
         let relation_path = node.relation_name()?.path()?;
 
         Some(StatementFact::CreateIndex {
             name: QualifiedName::new(None, index_name_str),
             relation: Self::path_to_qualified_name(&relation_path)?,
             if_not_exists: node.if_not_exists().is_some(),
+            // concurrently_token() is Some if CONCURRENTLY was present.
+            concurrently: node.concurrently_token().is_some(),
         })
     }
 
     // ── ALTER TABLE ───────────────────────────────────────────────────
 
-    /// FIX C2+C5: use relation_name() singular; dispatch actions via
-    /// typed AlterTableAction enum variants, not text search.
     fn extract_alter_table(node: &AlterTable) -> Option<StatementFact> {
-        // FIX C3: relation_name() singular → RelationName → path()
         let path = node.relation_name()?.path()?;
 
         let mut actions = Vec::new();
 
         for action in node.actions() {
             match action {
-                // FIX C5: typed cast — AddColumn::name() + ty() + if_not_exists()
                 AlterTableAction::AddColumn(add) => {
                     let col_name = add
                         .name()
@@ -117,7 +231,6 @@ impl AstVisitor {
                     }
                 }
 
-                // FIX C5: typed cast — DropColumn::name_ref() not name()
                 AlterTableAction::DropColumn(drop) => {
                     let col_name = drop
                         .name_ref()
@@ -132,8 +245,6 @@ impl AstVisitor {
                     }
                 }
 
-                // All other AlterTableAction variants (RLS, triggers, rename,
-                // tablespace, etc.) are not yet simulated. Ignored for now.
                 _ => {}
             }
         }
@@ -146,7 +257,6 @@ impl AstVisitor {
 
     // ── DROP TABLE ────────────────────────────────────────────────────
 
-    /// FIX C2: DropTable::path() is direct — no relation_names() step.
     fn extract_drop_table(node: &DropTable) -> Option<StatementFact> {
         let path = node.path()?;
         Some(StatementFact::DropTable {
@@ -157,8 +267,6 @@ impl AstVisitor {
 
     // ── DROP INDEX ────────────────────────────────────────────────────
 
-    /// FIX C7: DropIndex::paths() is plural — one statement can drop
-    /// multiple indexes. We emit a single DropIndex fact with a Vec.
     fn extract_drop_index(node: &DropIndex) -> Option<StatementFact> {
         let names: Vec<QualifiedName> = node
             .paths()
@@ -177,15 +285,11 @@ impl AstVisitor {
 
     // ── SET ───────────────────────────────────────────────────────────
 
-    /// FIX C6: use path() to check the setting name, config_values()
-    /// to extract the schema list — not raw syntax text scanning.
     fn extract_set(node: &Set) -> Option<StatementFact> {
-        // Check the setting name via path() → segment → name_ref → ident
         let setting_name = node
             .path()
             .and_then(|p| p.segment())
             .and_then(|s| {
-                // PathSegment can expose either name() or name_ref()
                 s.name_ref()
                     .and_then(|n| n.ident_token())
                     .or_else(|| s.name().and_then(|n| n.ident_token()))
@@ -196,9 +300,6 @@ impl AstVisitor {
             return None;
         }
 
-        // Extract schemas from config_values() iterator.
-        // Each ConfigValue is either a Literal (quoted string) or a NameRef
-        // (unquoted identifier). Strip outer quotes from literals.
         let schemas: Vec<String> = node
             .config_values()
             .filter_map(|cv| match cv {
@@ -206,7 +307,6 @@ impl AstVisitor {
                     nr.ident_token().map(|t| t.text().to_string())
                 }
                 ConfigValue::Literal(lit) => {
-                    // Raw text includes surrounding quotes: 'public' → public
                     let raw = lit.syntax().text().to_string();
                     Some(raw.trim_matches('\'').trim_matches('"').to_string())
                 }
@@ -224,7 +324,6 @@ impl AstVisitor {
     // ── SAVEPOINT ─────────────────────────────────────────────────────
 
     fn extract_savepoint(node: &Savepoint) -> Option<StatementFact> {
-        // squawk exposes the savepoint name via name(), not name_ref().
         let name = node
             .name()
             .and_then(|n| n.ident_token())
@@ -233,20 +332,8 @@ impl AstVisitor {
         Some(StatementFact::Savepoint { name })
     }
 
-    // ── Path traversal helper ─────────────────────────────────────────
+    // ── Path traversal helpers ────────────────────────────────────────
 
-    /// FIX C1: Path is a linked list, not a flat names() iterator.
-    ///
-    /// Structure for `public.users`:
-    ///   Path {
-    ///     qualifier: Some(Path { segment: PathSegment("public") }),
-    ///     segment: PathSegment("users"),
-    ///   }
-    ///
-    /// PathSegment exposes both name() (for definitions) and name_ref()
-    /// (for references). We try name_ref() first since most references
-    /// in ALTER/DROP are references, then fall back to name() for
-    /// CREATE definitions where the segment is a new name.
     fn path_to_qualified_name(path: &Path) -> Option<QualifiedName> {
         let name = Self::segment_text(path.segment()?)?;
 
@@ -258,8 +345,6 @@ impl AstVisitor {
         Some(QualifiedName::new(schema, name))
     }
 
-    /// Extract the text from a PathSegment, trying name_ref() first
-    /// (references), then name() (definitions).
     fn segment_text(segment: PathSegment) -> Option<String> {
         segment
             .name_ref()

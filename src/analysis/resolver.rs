@@ -1,8 +1,8 @@
 use crate::analysis::facts::{AlterTableActionFact, StatementFact};
 use crate::analysis::mutations::{
-    AlterTable, AlterTableActionMutation, CreateIndex, CreateTable, CreateView, DropIndex,
-    DropTable, Mutation, OpaqueMutation, ReleaseSavepointMutation, SavepointMutation,
-    SearchPathChange,
+    AlterTable, AlterTableActionMutation, ColumnMutation, CreateIndex, CreateTable, CreateView,
+    DropIndex, DropTable, FkMutation, Mutation, OpaqueMutation, ReleaseSavepointMutation,
+    SavepointMutation, SearchPathChange,
 };
 use crate::analysis::state::AnalysisState;
 use crate::ast::identifiers::{ObjectId, QualifiedName};
@@ -41,10 +41,6 @@ impl Resolver {
     // statement can produce multiple mutations
     // (e.g. ALTER TABLE with many actions, or
     // DROP INDEX with many index names).
-    //
-    // NOTE: state is &mut only to allow future
-    // within-statement resolution (e.g. resolving
-    // a rename mid-statement). Currently read-only.
     // ─────────────────────────────────────────────
 
     pub fn resolve(fact: &StatementFact, state: &AnalysisState) -> Vec<Mutation> {
@@ -53,10 +49,31 @@ impl Resolver {
         match fact {
             // ── Schema definition ─────────────────
 
-            StatementFact::CreateTable { name, if_not_exists } => {
+            StatementFact::CreateTable { name, if_not_exists, columns, foreign_keys } => {
+                // Thread columns through as-is — names are local, no resolution needed.
+                let col_mutations: Vec<ColumnMutation> = columns
+                    .iter()
+                    .map(|c| ColumnMutation {
+                        name: c.name.clone(),
+                        ty: c.ty.clone(),
+                        not_null: c.not_null,
+                        is_primary_key: c.is_primary_key,
+                    })
+                    .collect();
+
+                // Resolve FK target table names using current search_path.
+                let fk_mutations: Vec<FkMutation> = foreign_keys
+                    .iter()
+                    .map(|fk| FkMutation {
+                        to_table: Self::resolve_name(&fk.references, state),
+                    })
+                    .collect();
+
                 mutations.push(Mutation::CreateTable(CreateTable {
                     id: Self::resolve_name(name, state),
                     if_not_exists: *if_not_exists,
+                    columns: col_mutations,
+                    foreign_keys: fk_mutations,
                 }));
             }
 
@@ -64,18 +81,17 @@ impl Resolver {
                 mutations.push(Mutation::CreateView(CreateView {
                     id: Self::resolve_name(name, state),
                     or_replace: *or_replace,
-                    // Query-level dependency analysis is not yet implemented.
-                    // The view edge will have an empty depends_on list until
-                    // the expression visitor is wired up.
+                    // Query-level dependency analysis not yet implemented.
                     depends_on: Vec::new(),
                 }));
             }
 
-            StatementFact::CreateIndex { name, relation, if_not_exists } => {
+            StatementFact::CreateIndex { name, relation, if_not_exists, concurrently } => {
                 mutations.push(Mutation::CreateIndex(CreateIndex {
                     id: Self::resolve_name(name, state),
                     table: Self::resolve_name(relation, state),
                     if_not_exists: *if_not_exists,
+                    concurrently: *concurrently,
                 }));
             }
 
@@ -115,10 +131,7 @@ impl Resolver {
                 }));
             }
 
-            // DropIndex fact carries a Vec<QualifiedName> because one
-            // DROP INDEX statement can name multiple indexes.
-            // Each name becomes its own DropIndex mutation so the rule
-            // engine and apply phase handle one index at a time.
+            // One DropIndex mutation per named index — squawk's paths() is plural.
             StatementFact::DropIndex { names, if_exists } => {
                 for name in names {
                     mutations.push(Mutation::DropIndex(DropIndex {
@@ -137,10 +150,6 @@ impl Resolver {
             }
 
             // ── Transaction control ───────────────
-            // Savepoint and ReleaseSavepoint are NOT opaque — they are
-            // well-defined transaction control statements with names.
-            // They get their own mutations so state.apply() can correctly
-            // manage the TransactionFrame stack.
 
             StatementFact::BeginTransaction => {
                 mutations.push(Mutation::BeginTransaction);

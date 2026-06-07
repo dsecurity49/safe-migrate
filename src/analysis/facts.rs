@@ -17,14 +17,18 @@ pub enum StatementFact {
     CreateTable {
         name: QualifiedName,
         if_not_exists: bool,
+        /// Columns extracted from TableArgList.
+        /// Empty vec means no column info could be extracted (e.g. CTAS).
+        columns: Vec<ColumnFact>,
+        /// Foreign key constraints extracted from TableArgList.
+        /// Includes both column-level (ReferencesConstraint) and
+        /// table-level (ForeignKeyConstraint) FKs.
+        foreign_keys: Vec<FkFact>,
     },
 
     /// A CREATE VIEW statement.
-    /// Kept separate from CreateTable so the resolver can insert a
-    /// ViewEdge into the dependency graph rather than a plain relation.
     CreateView {
         name: QualifiedName,
-        /// OR REPLACE — treated as idempotency signal, same as if_not_exists
         or_replace: bool,
     },
 
@@ -34,6 +38,8 @@ pub enum StatementFact {
         /// The parent table (from relation_name().path()).
         relation: QualifiedName,
         if_not_exists: bool,
+        /// True if CONCURRENTLY was present — from concurrently_token().is_some()
+        concurrently: bool,
     },
 
     // ── Schema mutation ───────────────────────
@@ -86,6 +92,41 @@ pub enum StatementFact {
 
     /// EXECUTE stmt — dynamic SQL, taints confidence.
     Execute,
+}
+
+// ─────────────────────────────────────────────
+// ColumnFact — a single column definition
+// extracted from a Column node inside a
+// TableArgList. Pure syntax — no resolution.
+// ─────────────────────────────────────────────
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ColumnFact {
+    /// From Column::name() → Name::ident_token()
+    pub name: String,
+    /// From Column::ty() → Type::syntax().text()
+    /// None if the AST node had no type child.
+    pub ty: Option<String>,
+    /// True if a NotNullConstraint was found in Column::constraints()
+    pub not_null: bool,
+    /// True if a PrimaryKeyConstraint was found in Column::constraints()
+    pub is_primary_key: bool,
+}
+
+// ─────────────────────────────────────────────
+// FkFact — a foreign key reference extracted
+// from either:
+//   - a column-level ReferencesConstraint
+//     (inside Column::constraints())
+//   - a table-level ForeignKeyConstraint
+//     (inside TableArg::TableConstraint)
+// ─────────────────────────────────────────────
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FkFact {
+    /// The referenced (target) table path.
+    /// From ReferencesConstraint::table() or ForeignKeyConstraint::path()
+    pub references: QualifiedName,
 }
 
 // ─────────────────────────────────────────────
