@@ -1,30 +1,49 @@
-// src/rules/views.rs
 use crate::analysis::mutations::Mutation;
 use crate::analysis::state::AnalysisState;
-use crate::report::Reporter;
+use crate::report::reporter::Reporter;
+use crate::report::violations::{Severity, Violation};
 use crate::rules::Rule;
 
+/// Fires when a DROP TABLE would orphan a view, break a foreign key,
+/// or invalidate an index that depends on the dropped table.
 pub struct OrphanedDependencyRule;
 
 impl Rule for OrphanedDependencyRule {
-    fn evaluate(&self, mutation: &Mutation, state: &AnalysisState, reporter: &mut Reporter) {
-        if let Mutation::DropTable { id, .. } = mutation {
-            
-            // 1. Check for dependent Views
-            let dependent_views = state.local.graph.is_referenced_by_view(id);
-            for view_id in dependent_views {
-                reporter.report(format!(
-                    "FATAL: Cannot drop table '{}.{}'. The view '{}.{}' depends on it.",
-                    id.schema, id.name, view_id.schema, view_id.name
+    fn evaluate(
+        &self,
+        mutation: &Mutation,
+        state: &AnalysisState,
+        reporter: &mut Reporter,
+    ) {
+        // FIX: tuple variant — Mutation::DropTable(drop), not { id, .. }
+        if let Mutation::DropTable(drop) = mutation {
+            for view_id in state.local.graph.is_referenced_by_view(&drop.id) {
+                reporter.report(Violation::new(
+                    Severity::Error,
+                    format!(
+                        "Cannot drop table '{}': view '{}' depends on it.",
+                        drop.id, view_id
+                    ),
                 ));
             }
 
-            // 2. Check for Foreign Key references
-            let dependent_fks = state.local.graph.is_referenced_by_fk(id);
-            for from_table in dependent_fks {
-                reporter.report(format!(
-                    "FATAL: Cannot drop table '{}.{}'. It is referenced by a foreign key on '{}.{}'.",
-                    id.schema, id.name, from_table.schema, from_table.name
+            for from_table in state.local.graph.is_referenced_by_fk(&drop.id) {
+                reporter.report(Violation::new(
+                    Severity::Error,
+                    format!(
+                        "Cannot drop table '{}': referenced by a foreign key on table '{}'.",
+                        drop.id, from_table
+                    ),
+                ));
+            }
+
+            for index_id in state.local.graph.is_referenced_by_index(&drop.id) {
+                reporter.report(Violation::new(
+                    Severity::Warning,
+                    format!(
+                        "Dropping table '{}' will also invalidate index '{}'.",
+                        drop.id, index_id
+                    ),
                 ));
             }
         }

@@ -1,6 +1,13 @@
-// src/analysis/graph.rs
 use crate::model::relation::ObjectId;
 
+// Edge types — one struct per dependency kind.
+// Each edge is immutable once inserted; the graph
+// grows monotonically during forward simulation.
+// Rollback removes edges via the undo log in
+// TransactionFrame, not by mutating the graph
+// directly.
+
+/// A foreign key relationship between two tables.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FkEdge {
     pub from_table: ObjectId,
@@ -9,16 +16,47 @@ pub struct FkEdge {
     pub to_columns: Vec<String>,
 }
 
+/// A view's dependency on one or more base tables or other views.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ViewEdge {
     pub view_id: ObjectId,
     pub depends_on: Vec<ObjectId>,
 }
 
+/// An index's dependency on its parent table.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IndexEdge {
+    pub index_id: ObjectId,
+    pub relation_id: ObjectId,
+}
+
+/// A rename operation — tracks old → new identity so downstream
+/// references can be resolved after a RENAME TO.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RenameEdge {
+    pub from: ObjectId,
+    pub to: ObjectId,
+}
+
+/// A partition's parent → child relationship.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PartitionEdge {
+    pub parent: ObjectId,
+    pub child: ObjectId,
+}
+
+// DependencyGraph — the full live dependency
+// surface of the schema at the current simulation
+// point. Populated by state.apply() and queried
+// read-only by the rule engine.
+
 #[derive(Debug, Clone, Default)]
 pub struct DependencyGraph {
     pub foreign_keys: Vec<FkEdge>,
     pub views: Vec<ViewEdge>,
+    pub indexes: Vec<IndexEdge>,
+    pub renames: Vec<RenameEdge>,
+    pub partitions: Vec<PartitionEdge>,
 }
 
 impl DependencyGraph {
@@ -26,7 +64,9 @@ impl DependencyGraph {
         Self::default()
     }
 
-    /// Checks if a given object is being referenced by any View.
+    // ── Query helpers (read-only, used by rules) ──────────────────────
+
+    /// Returns the IDs of all views that depend on `id`.
     pub fn is_referenced_by_view(&self, id: &ObjectId) -> Vec<&ObjectId> {
         self.views
             .iter()
@@ -35,12 +75,42 @@ impl DependencyGraph {
             .collect()
     }
 
-    /// Checks if a given table is referenced by another table's Foreign Key.
+    /// Returns the IDs of all tables that reference `id` via a foreign key.
     pub fn is_referenced_by_fk(&self, id: &ObjectId) -> Vec<&ObjectId> {
         self.foreign_keys
             .iter()
             .filter(|fk| &fk.to_table == id)
             .map(|fk| &fk.from_table)
             .collect()
+    }
+
+    /// Returns the IDs of all indexes that depend on `id`.
+    pub fn is_referenced_by_index(&self, id: &ObjectId) -> Vec<&ObjectId> {
+        self.indexes
+            .iter()
+            .filter(|ix| &ix.relation_id == id)
+            .map(|ix| &ix.index_id)
+            .collect()
+    }
+
+    /// Returns the IDs of all child partitions of `id`.
+    pub fn partitions_of(&self, id: &ObjectId) -> Vec<&ObjectId> {
+        self.partitions
+            .iter()
+            .filter(|p| &p.parent == id)
+            .map(|p| &p.child)
+            .collect()
+    }
+
+    /// Resolves the current canonical identity of `id` after any renames.
+    /// Walks the rename chain until no further rename is found.
+    pub fn resolve_rename<'a>(&'a self, id: &'a ObjectId) -> &'a ObjectId {
+        let mut current = id;
+        loop {
+            match self.renames.iter().find(|r| &r.from == current) {
+                Some(edge) => current = &edge.to,
+                None => return current,
+            }
+        }
     }
 }
