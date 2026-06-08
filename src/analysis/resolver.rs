@@ -2,7 +2,7 @@ use crate::analysis::facts::{AlterTableActionFact, StatementFact};
 use crate::analysis::mutations::{
     AlterTable, AlterTableActionMutation, ColumnMutation, CreateIndex, CreateTable, CreateView,
     DropIndex, DropTable, FkMutation, Mutation, OpaqueMutation, ReleaseSavepointMutation,
-    SavepointMutation, SearchPathChange,
+    RollbackToSavepointMutation, SavepointMutation, SearchPathChange,
 };
 use crate::analysis::state::AnalysisState;
 use crate::ast::identifiers::{ObjectId, QualifiedName};
@@ -11,11 +11,8 @@ pub struct Resolver;
 
 impl Resolver {
     // ─────────────────────────────────────────────
-    // Name resolution
-    //
-    // INVARIANT: QualifiedName is NEVER used for
-    // state lookups. This function is the single
-    // point where AST form → canonical form.
+    // Name resolution — single point where
+    // QualifiedName → ObjectId via search_path.
     // ─────────────────────────────────────────────
 
     fn resolve_name(name: &QualifiedName, state: &AnalysisState) -> ObjectId {
@@ -27,21 +24,8 @@ impl Resolver {
                 .cloned()
                 .unwrap_or_else(|| "public".to_string())
         });
-        ObjectId {
-            schema,
-            name: name.name.clone(),
-        }
+        ObjectId { schema, name: name.name.clone() }
     }
-
-    // ─────────────────────────────────────────────
-    // resolve()
-    //
-    // Converts one StatementFact into zero or more
-    // Mutations. Returns a Vec because a single
-    // statement can produce multiple mutations
-    // (e.g. ALTER TABLE with many actions, or
-    // DROP INDEX with many index names).
-    // ─────────────────────────────────────────────
 
     pub fn resolve(fact: &StatementFact, state: &AnalysisState) -> Vec<Mutation> {
         let mut mutations = Vec::new();
@@ -50,7 +34,6 @@ impl Resolver {
             // ── Schema definition ─────────────────
 
             StatementFact::CreateTable { name, if_not_exists, columns, foreign_keys } => {
-                // Thread columns through as-is — names are local, no resolution needed.
                 let col_mutations: Vec<ColumnMutation> = columns
                     .iter()
                     .map(|c| ColumnMutation {
@@ -61,11 +44,12 @@ impl Resolver {
                     })
                     .collect();
 
-                // Resolve FK target table names using current search_path.
                 let fk_mutations: Vec<FkMutation> = foreign_keys
                     .iter()
                     .map(|fk| FkMutation {
                         to_table: Self::resolve_name(&fk.references, state),
+                        from_columns: fk.from_columns.clone(),
+                        to_columns: fk.to_columns.clone(),
                     })
                     .collect();
 
@@ -81,7 +65,6 @@ impl Resolver {
                 mutations.push(Mutation::CreateView(CreateView {
                     id: Self::resolve_name(name, state),
                     or_replace: *or_replace,
-                    // Query-level dependency analysis not yet implemented.
                     depends_on: Vec::new(),
                 }));
             }
@@ -99,6 +82,7 @@ impl Resolver {
 
             StatementFact::AlterTable { name, actions } => {
                 let id = Self::resolve_name(name, state);
+
                 for action_fact in actions {
                     let action = match action_fact {
                         AlterTableActionFact::AddColumn { name: col_name, ty, if_not_exists } => {
@@ -108,13 +92,68 @@ impl Resolver {
                                 if_not_exists: *if_not_exists,
                             }
                         }
+
                         AlterTableActionFact::DropColumn { name: col_name, if_exists } => {
                             AlterTableActionMutation::DropColumn {
                                 name: col_name.clone(),
                                 if_exists: *if_exists,
                             }
                         }
+
+                        AlterTableActionFact::RenameColumn { from, to } => {
+                            AlterTableActionMutation::RenameColumn {
+                                from: from.clone(),
+                                to: to.clone(),
+                            }
+                        }
+
+                        // RenameTo produces a Mutation::Rename, not an AlterTable.
+                        // We push it directly and skip the AlterTable wrapper below.
+                        AlterTableActionFact::RenameTo { new_name } => {
+                            // Build the new ObjectId: same schema, new name.
+                            let new_id = ObjectId {
+                                schema: id.schema.clone(),
+                                name: new_name.clone(),
+                            };
+                            mutations.push(Mutation::Rename(
+                                crate::analysis::mutations::Rename {
+                                    old_id: id.clone(),
+                                    new_id,
+                                }
+                            ));
+                            continue; // Skip the AlterTable push below.
+                        }
+
+                        AlterTableActionFact::AddForeignKey {
+                            references,
+                            from_columns,
+                            to_columns,
+                            not_valid,
+                        } => {
+                            AlterTableActionMutation::AddForeignKey {
+                                to_table: Self::resolve_name(references, state),
+                                from_columns: from_columns.clone(),
+                                to_columns: to_columns.clone(),
+                                not_valid: *not_valid,
+                            }
+                        }
+
+                        AlterTableActionFact::SetNotNull { column } => {
+                            AlterTableActionMutation::SetNotNull { column: column.clone() }
+                        }
+
+                        AlterTableActionFact::DropNotNull { column } => {
+                            AlterTableActionMutation::DropNotNull { column: column.clone() }
+                        }
+
+                        AlterTableActionFact::SetType { column, ty } => {
+                            AlterTableActionMutation::SetType {
+                                column: column.clone(),
+                                ty: ty.clone(),
+                            }
+                        }
                     };
+
                     mutations.push(Mutation::AlterTable(AlterTable {
                         id: id.clone(),
                         action,
@@ -131,7 +170,6 @@ impl Resolver {
                 }));
             }
 
-            // One DropIndex mutation per named index — squawk's paths() is plural.
             StatementFact::DropIndex { names, if_exists } => {
                 for name in names {
                     mutations.push(Mutation::DropIndex(DropIndex {
@@ -154,21 +192,20 @@ impl Resolver {
             StatementFact::BeginTransaction => {
                 mutations.push(Mutation::BeginTransaction);
             }
-
             StatementFact::CommitTransaction => {
                 mutations.push(Mutation::CommitTransaction);
             }
-
             StatementFact::RollbackTransaction => {
                 mutations.push(Mutation::RollbackTransaction);
             }
-
-            StatementFact::Savepoint { name } => {
-                mutations.push(Mutation::Savepoint(SavepointMutation {
+            StatementFact::RollbackToSavepoint { name } => {
+                mutations.push(Mutation::RollbackToSavepoint(RollbackToSavepointMutation {
                     name: name.clone(),
                 }));
             }
-
+            StatementFact::Savepoint { name } => {
+                mutations.push(Mutation::Savepoint(SavepointMutation { name: name.clone() }));
+            }
             StatementFact::ReleaseSavepoint { name } => {
                 mutations.push(Mutation::ReleaseSavepoint(ReleaseSavepointMutation {
                     name: name.clone(),
@@ -180,7 +217,6 @@ impl Resolver {
             StatementFact::OpaqueBlock => {
                 mutations.push(Mutation::Opaque(OpaqueMutation::DoBlock));
             }
-
             StatementFact::Execute => {
                 mutations.push(Mutation::Opaque(OpaqueMutation::Execute));
             }

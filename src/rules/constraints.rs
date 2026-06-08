@@ -5,15 +5,10 @@ use crate::report::reporter::Reporter;
 use crate::report::violations::{Severity, Violation};
 use crate::rules::Rule;
 
-/// Validates ADD COLUMN safety:
-///
-/// 1. The target table must exist and not be tombstoned.
-/// 2. If the column is added without IF NOT EXISTS and the table
-///    is known to already have that column, emit an error.
-/// 3. If the column has no type recorded, emit a warning — this
-///    may indicate an AST extraction gap.
-/// 4. Remind the author to ensure the column is nullable or has
-///    a default to avoid a full table rewrite on large tables.
+// ─────────────────────────────────────────────
+// SafeAddColumnRule
+// ─────────────────────────────────────────────
+
 pub struct SafeAddColumnRule;
 
 impl Rule for SafeAddColumnRule {
@@ -23,13 +18,9 @@ impl Rule for SafeAddColumnRule {
         state: &AnalysisState,
         reporter: &mut Reporter,
     ) {
-        // FIX B1: AlterTable is a tuple variant — Mutation::AlterTable(AlterTable { .. })
-        // Old code used struct-variant syntax { id, action } which does not compile.
         if let Mutation::AlterTable(alter) = mutation {
             if let AlterTableActionMutation::AddColumn { name, ty, if_not_exists } = &alter.action {
-
                 match state.get_relation(&alter.id) {
-                    // Table does not exist at all in local state or cache.
                     None => {
                         reporter.report(Violation::new(
                             Severity::Error,
@@ -39,8 +30,6 @@ impl Rule for SafeAddColumnRule {
                             ),
                         ));
                     }
-
-                    // Table was previously dropped — tombstone is active.
                     Some(RelationOverlay::Dropped) => {
                         reporter.report(Violation::new(
                             Severity::Error,
@@ -50,11 +39,8 @@ impl Rule for SafeAddColumnRule {
                             ),
                         ));
                     }
-
-                    // Table exists — check column-level safety.
-                    Some(RelationOverlay::Present(rel_state)) => {
-                        // Duplicate column without IF NOT EXISTS guard.
-                        if rel_state.has_column(name) && !if_not_exists {
+                    Some(RelationOverlay::Present(rel)) => {
+                        if rel.has_column(name) && !if_not_exists {
                             reporter.report(Violation::new(
                                 Severity::Error,
                                 format!(
@@ -64,8 +50,6 @@ impl Rule for SafeAddColumnRule {
                                 ),
                             ));
                         }
-
-                        // No type information extracted — likely an AST gap.
                         if ty.is_none() {
                             reporter.report(Violation::new(
                                 Severity::Warning,
@@ -75,11 +59,7 @@ impl Rule for SafeAddColumnRule {
                                 ),
                             ));
                         }
-
-                        // Remind author about nullable / default requirement.
-                        // Only fires when the column is genuinely being added
-                        // (not a duplicate caught above).
-                        if !rel_state.has_column(name) {
+                        if !rel.has_column(name) {
                             reporter.report(Violation::new(
                                 Severity::Warning,
                                 format!(
@@ -96,3 +76,133 @@ impl Rule for SafeAddColumnRule {
     }
 }
 
+// ─────────────────────────────────────────────
+// NotValidConstraintRule
+//
+// Fires when ADD CONSTRAINT ... NOT VALID is
+// used without a subsequent VALIDATE CONSTRAINT.
+//
+// NOT VALID skips the full table scan at
+// constraint creation time, deferring the check
+// to VALIDATE CONSTRAINT. If VALIDATE is never
+// called, the constraint is unenforced for
+// existing rows — new rows are checked, but old
+// rows are not.
+//
+// This rule fires at the ADD CONSTRAINT point.
+// A companion rule (future) should fire if
+// VALIDATE CONSTRAINT is missing entirely.
+// ─────────────────────────────────────────────
+
+pub struct NotValidConstraintRule;
+
+impl Rule for NotValidConstraintRule {
+    fn evaluate(
+        &self,
+        mutation: &Mutation,
+        _state: &AnalysisState,
+        reporter: &mut Reporter,
+    ) {
+        if let Mutation::AlterTable(alter) = mutation {
+            if let AlterTableActionMutation::AddForeignKey { to_table, not_valid, .. } = &alter.action {
+                if *not_valid {
+                    reporter.report(Violation::new(
+                        Severity::Warning,
+                        format!(
+                            "ADD CONSTRAINT ... NOT VALID on '{}' referencing '{}': \
+                             constraint will not be validated for existing rows. \
+                             Follow this with VALIDATE CONSTRAINT to enforce it fully.",
+                            alter.id, to_table
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────
+// SetNotNullRule
+//
+// Fires when ALTER COLUMN ... SET NOT NULL is
+// used on a table that already has rows (i.e.
+// was created earlier in this migration or
+// exists in DbCache).
+//
+// SET NOT NULL requires a full table scan to
+// verify no existing rows have NULL in that
+// column. On large tables this causes a long
+// ACCESS EXCLUSIVE lock.
+//
+// The safe pattern is:
+//   1. ADD CONSTRAINT ... CHECK (col IS NOT NULL) NOT VALID
+//   2. VALIDATE CONSTRAINT ...
+//   3. ALTER COLUMN ... SET NOT NULL  (uses the validated constraint, no scan)
+//   4. DROP CONSTRAINT ...
+//
+// We can only detect the unsafe case — we emit
+// a warning to prompt the author to consider
+// the safe pattern.
+// ─────────────────────────────────────────────
+
+pub struct SetNotNullRule;
+
+impl Rule for SetNotNullRule {
+    fn evaluate(
+        &self,
+        mutation: &Mutation,
+        state: &AnalysisState,
+        reporter: &mut Reporter,
+    ) {
+        if let Mutation::AlterTable(alter) = mutation {
+            if let AlterTableActionMutation::SetNotNull { column } = &alter.action {
+                // Only warn when the table is known to exist — if it was
+                // just created in this migration it likely has no rows yet.
+                // We still warn because the migration may run against a
+                // pre-existing table in production.
+                match state.get_relation(&alter.id) {
+                    Some(RelationOverlay::Present(rel)) => {
+                        // If the column is already NOT NULL we can skip —
+                        // the constraint is already enforced.
+                        if let Some(col) = rel.get_column(column) {
+                            if !col.is_nullable {
+                                // Already NOT NULL — no scan needed, no warning.
+                                return;
+                            }
+                        }
+                        reporter.report(Violation::new(
+                            Severity::Warning,
+                            format!(
+                                "ALTER COLUMN '{}' SET NOT NULL on '{}': requires a full table \
+                                 scan with ACCESS EXCLUSIVE lock. On large tables, consider \
+                                 using ADD CONSTRAINT ... CHECK (col IS NOT NULL) NOT VALID \
+                                 followed by VALIDATE CONSTRAINT instead.",
+                                column, alter.id
+                            ),
+                        ));
+                    }
+                    Some(RelationOverlay::Dropped) => {
+                        reporter.report(Violation::new(
+                            Severity::Error,
+                            format!(
+                                "ALTER COLUMN '{}' SET NOT NULL: table '{}' has been dropped \
+                                 earlier in this migration.",
+                                column, alter.id
+                            ),
+                        ));
+                    }
+                    None => {
+                        reporter.report(Violation::new(
+                            Severity::Error,
+                            format!(
+                                "ALTER COLUMN '{}' SET NOT NULL: table '{}' does not exist \
+                                 in the simulated schema.",
+                                column, alter.id
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+}

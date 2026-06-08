@@ -1,11 +1,13 @@
 use crate::model::column::Column;
 
+// ─────────────────────────────────────────────
 // ObjectId — canonical identity
 //
 // INVARIANT: This is the ONLY key type used in
 // AnalysisState, DbCache, and DependencyGraph.
 // QualifiedName (AST form) is NEVER used for
 // lookups — only for resolution input.
+// ─────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ObjectId {
@@ -52,21 +54,38 @@ impl RelationState {
     /// Called by AnalysisState::apply() after rule evaluation.
     pub fn apply_column_action(&mut self, action: &ColumnAction) {
         match action {
-            ColumnAction::Add { name, data_type } => {
-                // Idempotency: skip if column already exists (e.g. IF NOT EXISTS path).
-                // The rule engine is responsible for emitting a violation before we get here;
-                // the apply phase just keeps state consistent.
+            ColumnAction::Add { name, data_type, not_null } => {
                 if !self.columns.iter().any(|c| c.name == *name) {
                     self.columns.push(Column {
                         name: name.clone(),
                         data_type: data_type.clone(),
                         default: None,
-                        is_nullable: true, // safe default until constraints are extracted
+                        is_nullable: !not_null,
                     });
                 }
             }
             ColumnAction::Drop { name } => {
                 self.columns.retain(|c| c.name != *name);
+            }
+            ColumnAction::Rename { from, to } => {
+                if let Some(col) = self.columns.iter_mut().find(|c| c.name == *from) {
+                    col.name = to.clone();
+                }
+            }
+            ColumnAction::SetNotNull { name } => {
+                if let Some(col) = self.columns.iter_mut().find(|c| c.name == *name) {
+                    col.is_nullable = false;
+                }
+            }
+            ColumnAction::DropNotNull { name } => {
+                if let Some(col) = self.columns.iter_mut().find(|c| c.name == *name) {
+                    col.is_nullable = true;
+                }
+            }
+            ColumnAction::SetType { name, data_type } => {
+                if let Some(col) = self.columns.iter_mut().find(|c| c.name == *name) {
+                    col.data_type = Some(data_type.clone());
+                }
             }
         }
     }
@@ -74,6 +93,11 @@ impl RelationState {
     /// Returns true if a column with this name exists in the current state.
     pub fn has_column(&self, name: &str) -> bool {
         self.columns.iter().any(|c| c.name == name)
+    }
+
+    /// Returns the column with this name if it exists.
+    pub fn get_column(&self, name: &str) -> Option<&Column> {
+        self.columns.iter().find(|c| c.name == name)
     }
 }
 
@@ -92,9 +116,28 @@ pub enum ColumnAction {
     Add {
         name: String,
         data_type: Option<String>,
+        not_null: bool,
     },
     Drop {
         name: String,
+    },
+    /// RENAME COLUMN old TO new
+    Rename {
+        from: String,
+        to: String,
+    },
+    /// ALTER COLUMN name SET NOT NULL
+    SetNotNull {
+        name: String,
+    },
+    /// ALTER COLUMN name DROP NOT NULL
+    DropNotNull {
+        name: String,
+    },
+    /// ALTER COLUMN name SET DATA TYPE ty
+    SetType {
+        name: String,
+        data_type: String,
     },
 }
 

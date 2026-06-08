@@ -46,6 +46,8 @@ pub fn rules() -> Vec<Box<dyn Rule>> {
 
         // Column-level mutation safety.
         Box::new(constraints::SafeAddColumnRule),
+        Box::new(constraints::NotValidConstraintRule),
+        Box::new(constraints::SetNotNullRule),
 
         // Volatile default heuristic.
         Box::new(expressions::VolatileDefaultRule),

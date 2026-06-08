@@ -95,6 +95,7 @@ impl AnalysisState {
                     rel_state.apply_column_action(&ColumnAction::Add {
                         name: col.name.clone(),
                         data_type: col.ty.clone(),
+                        not_null: col.not_null,
                     });
                 }
 
@@ -109,9 +110,9 @@ impl AnalysisState {
                 for fk in &create.foreign_keys {
                     self.local.graph.foreign_keys.push(FkEdge {
                         from_table: create.id.clone(),
-                        from_columns: Vec::new(),
+                        from_columns: fk.from_columns.clone(),
                         to_table: fk.to_table.clone(),
-                        to_columns: Vec::new(),
+                        to_columns: fk.to_columns.clone(),
                     });
                 }
             }
@@ -144,27 +145,105 @@ impl AnalysisState {
 
             Mutation::AlterTable(alter) => {
                 self.snapshot_relation(&alter.id);
-                if let Some(RelationOverlay::Present(rel_state)) =
-                    self.local.relations.get_mut(&alter.id)
-                {
-                    // Convert AlterTableActionMutation → ColumnAction
-                    // to keep the model layer free of analysis imports.
-                    let column_action = match &alter.action {
-                        AlterTableActionMutation::AddColumn { name, ty, .. } => {
-                            ColumnAction::Add {
+
+                match &alter.action {
+                    // ── Column mutations → RelationState ──────────────
+
+                    AlterTableActionMutation::AddColumn { name, ty, .. } => {
+                        if let Some(RelationOverlay::Present(rel)) =
+                            self.local.relations.get_mut(&alter.id)
+                        {
+                            rel.apply_column_action(&ColumnAction::Add {
                                 name: name.clone(),
                                 data_type: ty.clone(),
-                            }
+                                // ADD COLUMN without NOT NULL constraint is nullable.
+                                // The if_not_exists flag is not the same as not_null —
+                                // we default to nullable here; SetNotNull handles the rest.
+                                not_null: false,
+                            });
                         }
-                        AlterTableActionMutation::DropColumn { name, .. } => {
-                            ColumnAction::Drop { name: name.clone() }
+                    }
+
+                    AlterTableActionMutation::DropColumn { name, .. } => {
+                        if let Some(RelationOverlay::Present(rel)) =
+                            self.local.relations.get_mut(&alter.id)
+                        {
+                            rel.apply_column_action(&ColumnAction::Drop { name: name.clone() });
                         }
-                    };
-                    rel_state.apply_column_action(&column_action);
+                    }
+
+                    AlterTableActionMutation::RenameColumn { from, to } => {
+                        if let Some(RelationOverlay::Present(rel)) =
+                            self.local.relations.get_mut(&alter.id)
+                        {
+                            rel.apply_column_action(&ColumnAction::Rename {
+                                from: from.clone(),
+                                to: to.clone(),
+                            });
+                        }
+                    }
+
+                    AlterTableActionMutation::SetNotNull { column } => {
+                        if let Some(RelationOverlay::Present(rel)) =
+                            self.local.relations.get_mut(&alter.id)
+                        {
+                            rel.apply_column_action(&ColumnAction::SetNotNull {
+                                name: column.clone(),
+                            });
+                        }
+                    }
+
+                    AlterTableActionMutation::DropNotNull { column } => {
+                        if let Some(RelationOverlay::Present(rel)) =
+                            self.local.relations.get_mut(&alter.id)
+                        {
+                            rel.apply_column_action(&ColumnAction::DropNotNull {
+                                name: column.clone(),
+                            });
+                        }
+                    }
+
+                    AlterTableActionMutation::SetType { column, ty } => {
+                        if let Some(RelationOverlay::Present(rel)) =
+                            self.local.relations.get_mut(&alter.id)
+                        {
+                            rel.apply_column_action(&ColumnAction::SetType {
+                                name: column.clone(),
+                                data_type: ty.clone(),
+                            });
+                        }
+                    }
+
+                    // ── FK graph mutations ─────────────────────────────
+
+                    AlterTableActionMutation::AddForeignKey {
+                        to_table,
+                        from_columns,
+                        to_columns,
+                        ..
+                    } => {
+                        self.local.graph.foreign_keys.push(FkEdge {
+                            from_table: alter.id.clone(),
+                            from_columns: from_columns.clone(),
+                            to_table: to_table.clone(),
+                            to_columns: to_columns.clone(),
+                        });
+                    }
                 }
             }
 
             Mutation::Rename(rename) => {
+                // Insert a RenameEdge so the graph can resolve the old name
+                // to the new canonical identity in subsequent statements.
+                // Also move the RelationOverlay to the new key so lookups
+                // by new name work immediately.
+                self.snapshot_relation(&rename.old_id);
+                self.snapshot_relation(&rename.new_id);
+
+                if let Some(overlay) = self.local.relations.remove(&rename.old_id) {
+                    self.local.relations.insert(rename.new_id.clone(), overlay);
+                }
+
                 self.local.graph.renames.push(RenameEdge {
                     from: rename.old_id,
                     to: rename.new_id,
@@ -233,6 +312,30 @@ impl AnalysisState {
                     .rposition(|f| f.name == rsp.name)
                 {
                     self.local.transactions.remove(pos);
+                }
+            }
+
+            Mutation::RollbackToSavepoint(rsp) => {
+                // Find the named savepoint frame by scanning from the top.
+                // Replay its undo log — but leave outer transaction frames intact.
+                // PostgreSQL semantics: only changes after the savepoint are undone.
+                if let Some(pos) = self
+                    .local
+                    .transactions
+                    .iter()
+                    .rposition(|f| f.name == rsp.name)
+                {
+                    // Remove the savepoint frame and everything above it,
+                    // replay their undo logs in reverse order.
+                    let frames: Vec<_> = self.local.transactions.drain(pos..).collect();
+                    for frame in frames.into_iter().rev() {
+                        self.replay_undo_log(frame);
+                    }
+                    // Re-push an empty frame with the same savepoint name
+                    // so the savepoint can still be used again.
+                    self.local
+                        .transactions
+                        .push(TransactionFrame::new(rsp.name));
                 }
             }
 
