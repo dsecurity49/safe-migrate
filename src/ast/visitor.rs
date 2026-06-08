@@ -1,3 +1,5 @@
+use crate::analysis::expr_ir::ExprIr;
+use crate::analysis::expr_visitor::ExprVisitor;
 use crate::analysis::facts::{AlterTableActionFact, ColumnFact, FkFact, StatementFact};
 use crate::ast::identifiers::QualifiedName;
 use squawk_syntax::ast::{
@@ -97,6 +99,7 @@ impl AstVisitor {
 
         let mut not_null = false;
         let mut is_primary_key = false;
+        let mut default: Option<ExprIr> = None;
 
         for constraint in col.constraints() {
             match constraint {
@@ -105,11 +108,16 @@ impl AstVisitor {
                     is_primary_key = true;
                     not_null = true;
                 }
+                // Extract default expression via ExprVisitor.
+                // DefaultConstraint::expr() → Option<Expr> → ExprIr
+                ColumnConstraint::DefaultConstraint(dc) => {
+                    default = dc.expr().map(ExprVisitor::convert);
+                }
                 _ => {}
             }
         }
 
-        Some(ColumnFact { name, ty, not_null, is_primary_key })
+        Some(ColumnFact { name, ty, not_null, is_primary_key, default })
     }
 
     fn extract_column_fk_facts(col: &Column) -> Vec<FkFact> {
@@ -206,10 +214,24 @@ impl AstVisitor {
             match action {
                 AlterTableAction::AddColumn(add) => {
                     if let Some(name) = add.name().and_then(|n| n.ident_token()).map(|t| t.text().to_string()) {
+                        // Extract default from column constraints on the ADD COLUMN node.
+                        // AddColumn::constraints() returns AstChildren<Constraint> (table-level
+                        // Constraint enum), not AstChildren<ColumnConstraint>.
+                        let default = add.constraints()
+                            .filter_map(|c| {
+                                if let Constraint::DefaultConstraint(dc) = c {
+                                    dc.expr().map(ExprVisitor::convert)
+                                } else {
+                                    None
+                                }
+                            })
+                            .next();
+
                         actions.push(AlterTableActionFact::AddColumn {
                             name,
                             ty: add.ty().map(|t| t.syntax().text().to_string()),
                             if_not_exists: add.if_not_exists().is_some(),
+                            default,
                         });
                     }
                 }
@@ -262,6 +284,17 @@ impl AstVisitor {
                     }
                 }
 
+                // VALIDATE CONSTRAINT constraint_name
+                // Clears pending NOT VALID entries from state.
+                AlterTableAction::ValidateConstraint(vc) => {
+                    if let Some(constraint_name) = vc.name_ref()
+                        .and_then(|n| n.ident_token())
+                        .map(|t| t.text().to_string())
+                    {
+                        actions.push(AlterTableActionFact::ValidateConstraint { constraint_name });
+                    }
+                }
+
                 _ => {}
             }
         }
@@ -282,11 +315,15 @@ impl AstVisitor {
                 Some(AlterTableActionFact::DropNotNull { column: col_name })
             }
             AlterColumnOption::SetType(st) => {
-                // SetType::ty() → Option<Type> → syntax().text()
                 let ty = st.ty()?.syntax().text().to_string();
                 Some(AlterTableActionFact::SetType { column: col_name, ty })
             }
-            // AddGenerated, SetDefault, DropDefault, SetCompression, etc. — deferred.
+            // SetDefault — wire ExprVisitor to extract the default expression.
+            AlterColumnOption::SetDefault(sd) => {
+                let default = sd.expr().map(ExprVisitor::convert);
+                Some(AlterTableActionFact::SetDefault { column: col_name, default })
+            }
+            // AddGenerated, DropDefault, SetCompression, etc. — deferred.
             _ => None,
         }
     }

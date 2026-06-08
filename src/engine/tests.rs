@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod tests {
+    use crate::analysis::expr_ir::ExprIr;
     use crate::analysis::facts::{AlterTableActionFact, ColumnFact, FkFact, StatementFact};
     use crate::analysis::resolver::Resolver;
     use crate::analysis::state::AnalysisState;
@@ -7,8 +8,11 @@ mod tests {
     use crate::db::cache::DbCache;
     use crate::model::relation::RelationOverlay;
     use crate::report::reporter::Reporter;
-    use crate::rules::constraints::{NotValidConstraintRule, SetNotNullRule};
+    use crate::rules::constraints::{
+        MissingValidateConstraintRule, NotValidConstraintRule, SetNotNullRule,
+    };
     use crate::rules::destructive::DestructiveDropRule;
+    use crate::rules::expressions::{SetTypeRule, VolatileDefaultRule};
     use crate::rules::indexes::ConcurrentIndexRule;
     use crate::rules::Rule;
 
@@ -37,7 +41,6 @@ mod tests {
         }
     }
 
-    /// Build a minimal FkFact with no column lists.
     fn fk_fact(references_name: &str) -> FkFact {
         FkFact {
             references: QualifiedName::new(None, references_name),
@@ -50,6 +53,17 @@ mod tests {
         StatementFact::AlterTable {
             name: QualifiedName::new(None, table),
             actions,
+        }
+    }
+
+    /// Build a ColumnFact with no default.
+    fn col_fact(name: &str, ty: &str, not_null: bool, pk: bool) -> ColumnFact {
+        ColumnFact {
+            name: name.to_string(),
+            ty: Some(ty.to_string()),
+            not_null,
+            is_primary_key: pk,
+            default: None,
         }
     }
 
@@ -127,8 +141,8 @@ mod tests {
             name: QualifiedName::new(None, "products"),
             if_not_exists: false,
             columns: vec![
-                ColumnFact { name: "id".to_string(),   ty: Some("integer".to_string()), not_null: true,  is_primary_key: true  },
-                ColumnFact { name: "name".to_string(), ty: Some("text".to_string()),    not_null: false, is_primary_key: false },
+                col_fact("id",   "integer", true,  true),
+                col_fact("name", "text",    false, false),
             ],
             foreign_keys: Vec::new(),
         });
@@ -218,7 +232,7 @@ mod tests {
         assert!(reporter.violations.is_empty());
     }
 
-    // ── Phase 3 new tests ─────────────────────────────────────────────
+    // ── Phase 3 regression tests ──────────────────────────────────────
 
     #[test]
     fn test_rename_column_updates_state() {
@@ -227,12 +241,7 @@ mod tests {
         apply_fact(&mut state, &StatementFact::CreateTable {
             name: QualifiedName::new(None, "users"),
             if_not_exists: false,
-            columns: vec![ColumnFact {
-                name: "email_addr".to_string(),
-                ty: Some("text".to_string()),
-                not_null: false,
-                is_primary_key: false,
-            }],
+            columns: vec![col_fact("email_addr", "text", false, false)],
             foreign_keys: Vec::new(),
         });
 
@@ -245,25 +254,20 @@ mod tests {
 
         let id = object_id("public", "users");
         if let Some(RelationOverlay::Present(rel)) = state.get_relation(&id) {
-            assert!(!rel.has_column("email_addr"), "old name should be gone");
-            assert!(rel.has_column("email"),       "new name should exist");
+            assert!(!rel.has_column("email_addr"));
+            assert!(rel.has_column("email"));
         } else { panic!("users should be Present"); }
     }
 
     #[test]
     fn test_rename_table_moves_overlay() {
         let mut state = fresh_state();
-
         apply_fact(&mut state, &create_table_fact(None, "old_name"));
         apply_fact(&mut state, &alter_table_fact("old_name", vec![
             AlterTableActionFact::RenameTo { new_name: "new_name".to_string() },
         ]));
-
-        // Old key should be gone, new key should be Present.
         assert!(!state.relation_is_present(&object_id("public", "old_name")));
         assert!(state.relation_is_present(&object_id("public", "new_name")));
-
-        // A RenameEdge should exist in the graph.
         assert!(state.local.graph.renames.iter().any(|r| {
             r.from == object_id("public", "old_name") &&
             r.to   == object_id("public", "new_name")
@@ -278,12 +282,7 @@ mod tests {
         apply_fact(&mut state, &StatementFact::CreateTable {
             name: QualifiedName::new(None, "users"),
             if_not_exists: false,
-            columns: vec![ColumnFact {
-                name: "email".to_string(),
-                ty: Some("text".to_string()),
-                not_null: false, // nullable — SET NOT NULL should warn
-                is_primary_key: false,
-            }],
+            columns: vec![col_fact("email", "text", false, false)],
             foreign_keys: Vec::new(),
         });
 
@@ -295,7 +294,6 @@ mod tests {
         );
         let rule = SetNotNullRule;
         for m in &mutations { rule.evaluate(m, &state, &mut reporter); }
-
         assert_eq!(reporter.violations.len(), 1);
         assert!(reporter.violations[0].message.contains("full table scan"));
     }
@@ -305,16 +303,10 @@ mod tests {
         let mut state = fresh_state();
         let mut reporter = Reporter::new();
 
-        // Column is already NOT NULL — no warning expected.
         apply_fact(&mut state, &StatementFact::CreateTable {
             name: QualifiedName::new(None, "users"),
             if_not_exists: false,
-            columns: vec![ColumnFact {
-                name: "id".to_string(),
-                ty: Some("integer".to_string()),
-                not_null: true, // already NOT NULL
-                is_primary_key: true,
-            }],
+            columns: vec![col_fact("id", "integer", true, true)],
             foreign_keys: Vec::new(),
         });
 
@@ -326,7 +318,7 @@ mod tests {
         );
         let rule = SetNotNullRule;
         for m in &mutations { rule.evaluate(m, &state, &mut reporter); }
-        assert!(reporter.violations.is_empty(), "already-NOT-NULL column should not warn");
+        assert!(reporter.violations.is_empty());
     }
 
     #[test]
@@ -343,14 +335,13 @@ mod tests {
                     references: QualifiedName::new(None, "users"),
                     from_columns: Vec::new(),
                     to_columns: Vec::new(),
-                    not_valid: true, // ← should trigger warning
+                    not_valid: true,
                 },
             ]),
             &state,
         );
         let rule = NotValidConstraintRule;
         for m in &mutations { rule.evaluate(m, &state, &mut reporter); }
-
         assert_eq!(reporter.violations.len(), 1);
         assert!(reporter.violations[0].message.contains("NOT VALID"));
     }
@@ -359,28 +350,19 @@ mod tests {
     fn test_rollback_to_savepoint_partial_restore() {
         let mut state = fresh_state();
 
-        // Create baseline table outside transaction.
         apply_fact(&mut state, &create_table_fact(None, "baseline"));
-
-        // Begin transaction, create sp1 table, set savepoint, create sp2 table.
         apply_fact(&mut state, &StatementFact::BeginTransaction);
         apply_fact(&mut state, &create_table_fact(None, "sp1_table"));
         apply_fact(&mut state, &StatementFact::Savepoint { name: "sp1".to_string() });
         apply_fact(&mut state, &create_table_fact(None, "sp2_table"));
 
-        // Both tables exist before rollback.
         assert!(state.relation_is_present(&object_id("public", "sp1_table")));
         assert!(state.relation_is_present(&object_id("public", "sp2_table")));
 
-        // Rollback to sp1 — sp2_table should vanish, sp1_table should remain.
         apply_fact(&mut state, &StatementFact::RollbackToSavepoint { name: "sp1".to_string() });
 
-        assert!(state.relation_is_present(&object_id("public", "sp1_table")),
-            "sp1_table created before savepoint should survive ROLLBACK TO SAVEPOINT");
-        assert!(!state.relation_is_present(&object_id("public", "sp2_table")),
-            "sp2_table created after savepoint should be rolled back");
-
-        // Baseline is unaffected.
+        assert!(state.relation_is_present(&object_id("public", "sp1_table")));
+        assert!(!state.relation_is_present(&object_id("public", "sp2_table")));
         assert!(state.relation_is_present(&object_id("public", "baseline")));
     }
 
@@ -390,7 +372,6 @@ mod tests {
 
         apply_fact(&mut state, &create_table_fact(None, "users"));
         apply_fact(&mut state, &create_table_fact(None, "posts"));
-
         apply_fact(&mut state, &alter_table_fact("posts", vec![
             AlterTableActionFact::AddForeignKey {
                 references: QualifiedName::new(None, "users"),
@@ -402,14 +383,160 @@ mod tests {
 
         let posts = object_id("public", "posts");
         let users = object_id("public", "users");
-
-        let edge = state.local.graph.foreign_keys.iter().find(|fk| {
-            fk.from_table == posts && fk.to_table == users
-        });
-        assert!(edge.is_some(), "FkEdge posts → users should exist");
+        let edge = state.local.graph.foreign_keys.iter()
+            .find(|fk| fk.from_table == posts && fk.to_table == users);
+        assert!(edge.is_some());
         let edge = edge.unwrap();
         assert_eq!(edge.from_columns, vec!["user_id"]);
         assert_eq!(edge.to_columns,   vec!["id"]);
     }
-}
 
+    // ── Phase 4 new tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_volatile_default_rule_fires_on_now() {
+        let mut state = fresh_state();
+        let mut reporter = Reporter::new();
+
+        apply_fact(&mut state, &create_table_fact(None, "events"));
+
+        // ADD COLUMN with now() default — should fire VolatileDefaultRule.
+        let volatile_default = ExprIr::FunctionCall {
+            name: "now".to_string(),
+            args: vec![],
+        };
+        let mutations = Resolver::resolve(
+            &alter_table_fact("events", vec![
+                AlterTableActionFact::AddColumn {
+                    name: "created_at".to_string(),
+                    ty: Some("timestamptz".to_string()),
+                    if_not_exists: false,
+                    default: Some(volatile_default),
+                },
+            ]),
+            &state,
+        );
+        let rule = VolatileDefaultRule;
+        for m in &mutations { rule.evaluate(m, &state, &mut reporter); }
+        assert_eq!(reporter.violations.len(), 1);
+        assert!(reporter.violations[0].message.contains("volatile default"));
+    }
+
+    #[test]
+    fn test_volatile_default_rule_silent_on_literal() {
+        let mut state = fresh_state();
+        let mut reporter = Reporter::new();
+
+        apply_fact(&mut state, &create_table_fact(None, "events"));
+
+        // ADD COLUMN with literal default — should NOT fire.
+        let stable_default = ExprIr::Literal("0".to_string());
+        let mutations = Resolver::resolve(
+            &alter_table_fact("events", vec![
+                AlterTableActionFact::AddColumn {
+                    name: "count".to_string(),
+                    ty: Some("integer".to_string()),
+                    if_not_exists: false,
+                    default: Some(stable_default),
+                },
+            ]),
+            &state,
+        );
+        let rule = VolatileDefaultRule;
+        for m in &mutations { rule.evaluate(m, &state, &mut reporter); }
+        assert!(reporter.violations.is_empty(), "literal default should not trigger volatile rule");
+    }
+
+    #[test]
+    fn test_set_type_rule_always_warns() {
+        let mut state = fresh_state();
+        let mut reporter = Reporter::new();
+
+        apply_fact(&mut state, &StatementFact::CreateTable {
+            name: QualifiedName::new(None, "users"),
+            if_not_exists: false,
+            columns: vec![col_fact("email", "varchar", false, false)],
+            foreign_keys: Vec::new(),
+        });
+
+        let mutations = Resolver::resolve(
+            &alter_table_fact("users", vec![
+                AlterTableActionFact::SetType {
+                    column: "email".to_string(),
+                    ty: "text".to_string(),
+                },
+            ]),
+            &state,
+        );
+        let rule = SetTypeRule;
+        for m in &mutations { rule.evaluate(m, &state, &mut reporter); }
+        assert_eq!(reporter.violations.len(), 1);
+        assert!(reporter.violations[0].message.contains("ACCESS EXCLUSIVE"));
+        // Should include the old type in the message.
+        assert!(reporter.violations[0].message.contains("varchar"));
+    }
+
+    #[test]
+    fn test_missing_validate_constraint_fires_at_finalize() {
+        let mut state = fresh_state();
+        let mut reporter = Reporter::new();
+
+        apply_fact(&mut state, &create_table_fact(None, "users"));
+        apply_fact(&mut state, &create_table_fact(None, "orders"));
+
+        // Add FK with NOT VALID — never validated.
+        apply_fact(&mut state, &alter_table_fact("orders", vec![
+            AlterTableActionFact::AddForeignKey {
+                references: QualifiedName::new(None, "users"),
+                from_columns: Vec::new(),
+                to_columns: Vec::new(),
+                not_valid: true,
+            },
+        ]));
+
+        // Verify it's in pending_validation before finalize.
+        assert!(!state.local.pending_validation.is_empty());
+
+        // finalize() should fire the rule.
+        let rule = MissingValidateConstraintRule;
+        rule.finalize(&state, &mut reporter);
+
+        assert_eq!(reporter.violations.len(), 1);
+        assert!(reporter.violations[0].message.contains("NOT VALID") ||
+                reporter.violations[0].message.contains("not be checked"));
+    }
+
+    #[test]
+    fn test_validate_constraint_clears_pending() {
+        let mut state = fresh_state();
+        let mut reporter = Reporter::new();
+
+        apply_fact(&mut state, &create_table_fact(None, "users"));
+        apply_fact(&mut state, &create_table_fact(None, "orders"));
+
+        // Add FK with NOT VALID.
+        apply_fact(&mut state, &alter_table_fact("orders", vec![
+            AlterTableActionFact::AddForeignKey {
+                references: QualifiedName::new(None, "users"),
+                from_columns: Vec::new(),
+                to_columns: Vec::new(),
+                not_valid: true,
+            },
+        ]));
+
+        // Validate it — pending_validation should be cleared.
+        // The synthetic key is __fk__public.users
+        apply_fact(&mut state, &alter_table_fact("orders", vec![
+            AlterTableActionFact::ValidateConstraint {
+                constraint_name: "__fk__public.users".to_string(),
+            },
+        ]));
+
+        let rule = MissingValidateConstraintRule;
+        rule.finalize(&state, &mut reporter);
+
+        // No violations — constraint was validated.
+        assert!(reporter.violations.is_empty(),
+            "validated constraint should not fire MissingValidateConstraintRule");
+    }
+}

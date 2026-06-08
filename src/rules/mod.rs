@@ -18,6 +18,14 @@ pub trait Rule {
         state: &AnalysisState,
         reporter: &mut Reporter,
     );
+
+    /// Called once after all mutations in the migration file have been
+    /// applied. Used for rules that check accumulated state rather than
+    /// individual mutations — e.g. detecting NOT VALID constraints that
+    /// were never followed by VALIDATE CONSTRAINT.
+    ///
+    /// Default implementation is a no-op so existing rules need no changes.
+    fn finalize(&self, _state: &AnalysisState, _reporter: &mut Reporter) {}
 }
 
 /// Returns the active rule set for the engine loop.
@@ -48,8 +56,10 @@ pub fn rules() -> Vec<Box<dyn Rule>> {
         Box::new(constraints::SafeAddColumnRule),
         Box::new(constraints::NotValidConstraintRule),
         Box::new(constraints::SetNotNullRule),
+        Box::new(constraints::MissingValidateConstraintRule),
 
         // Volatile default heuristic.
         Box::new(expressions::VolatileDefaultRule),
+        Box::new(expressions::SetTypeRule),
     ]
 }

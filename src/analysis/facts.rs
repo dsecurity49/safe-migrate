@@ -1,3 +1,4 @@
+use crate::analysis::expr_ir::ExprIr;
 use crate::ast::identifiers::QualifiedName;
 
 // ─────────────────────────────────────────────
@@ -65,8 +66,6 @@ pub enum StatementFact {
     RollbackTransaction,
 
     /// ROLLBACK TO SAVEPOINT name — partial rollback.
-    /// Distinct from RollbackTransaction so state.apply() can
-    /// replay only the undo log up to the named savepoint frame.
     RollbackToSavepoint {
         name: String,
     },
@@ -95,27 +94,20 @@ pub struct ColumnFact {
     pub ty: Option<String>,
     pub not_null: bool,
     pub is_primary_key: bool,
+    /// Default expression extracted from DefaultConstraint::expr().
+    /// None if no DEFAULT was specified or extraction failed.
+    /// Used by VolatileDefaultRule to replace the type-heuristic.
+    pub default: Option<ExprIr>,
 }
 
 // ─────────────────────────────────────────────
-// FkFact — now includes both column lists.
-// from_columns: source columns on this table.
-// to_columns:   target columns on referenced table.
-// Both may be empty for column-level ReferencesConstraint
-// (which only specifies the target table).
+// FkFact
 // ─────────────────────────────────────────────
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct FkFact {
-    /// The referenced (target) table path.
     pub references: QualifiedName,
-    /// Source columns on this table.
-    /// Populated from ForeignKeyConstraint::from_columns() (handwritten).
-    /// Empty for column-level ReferencesConstraint.
     pub from_columns: Vec<String>,
-    /// Target columns on the referenced table.
-    /// Populated from ForeignKeyConstraint::to_columns() (handwritten).
-    /// Empty for column-level ReferencesConstraint.
     pub to_columns: Vec<String>,
 }
 
@@ -130,6 +122,10 @@ pub enum AlterTableActionFact {
         name: String,
         ty: Option<String>,
         if_not_exists: bool,
+        /// Default expression from AddColumn::constraints() →
+        /// ColumnConstraint::DefaultConstraint → DefaultConstraint::expr().
+        /// None if no DEFAULT was specified.
+        default: Option<ExprIr>,
     },
 
     /// DROP COLUMN
@@ -139,23 +135,17 @@ pub enum AlterTableActionFact {
     },
 
     /// RENAME COLUMN old TO new
-    /// from: RenameColumn::from() → NameRef
-    /// to:   RenameColumn::to()   → NameRef
     RenameColumn {
         from: String,
         to: String,
     },
 
     /// RENAME TO new_name (table rename)
-    /// new_name: RenameTo::name()
-    /// old name comes from the enclosing AlterTable::relation_name()
     RenameTo {
         new_name: String,
     },
 
-    /// ADD CONSTRAINT — FK only for now.
-    /// not_valid: true if NOT VALID was present (skips table scan,
-    /// requires subsequent VALIDATE CONSTRAINT).
+    /// ADD CONSTRAINT FOREIGN KEY
     AddForeignKey {
         references: QualifiedName,
         from_columns: Vec<String>,
@@ -177,5 +167,20 @@ pub enum AlterTableActionFact {
     SetType {
         column: String,
         ty: String,
+    },
+
+    /// ALTER COLUMN name SET DEFAULT expr
+    /// From AlterColumnOption::SetDefault → SetDefault::expr()
+    SetDefault {
+        column: String,
+        /// The new default expression. None if extraction failed.
+        default: Option<ExprIr>,
+    },
+
+    /// ALTER TABLE name VALIDATE CONSTRAINT constraint_name
+    /// From AlterTableAction::ValidateConstraint → ValidateConstraint::name_ref()
+    /// Used to clear pending_validation entries in state.
+    ValidateConstraint {
+        constraint_name: String,
     },
 }

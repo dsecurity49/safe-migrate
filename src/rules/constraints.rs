@@ -19,7 +19,7 @@ impl Rule for SafeAddColumnRule {
         reporter: &mut Reporter,
     ) {
         if let Mutation::AlterTable(alter) = mutation {
-            if let AlterTableActionMutation::AddColumn { name, ty, if_not_exists } = &alter.action {
+            if let AlterTableActionMutation::AddColumn { name, ty, if_not_exists, .. } = &alter.action {
                 match state.get_relation(&alter.id) {
                     None => {
                         reporter.report(Violation::new(
@@ -202,6 +202,76 @@ impl Rule for SetNotNullRule {
                         ));
                     }
                 }
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────
+// MissingValidateConstraintRule
+//
+// Fires at end-of-migration (via finalize()) if
+// any NOT VALID constraints were added but never
+// followed by VALIDATE CONSTRAINT.
+//
+// Pattern being detected:
+//   ALTER TABLE t ADD CONSTRAINT fk FOREIGN KEY
+//     REFERENCES other NOT VALID;
+//   -- missing: ALTER TABLE t VALIDATE CONSTRAINT fk;
+//
+// The NOT VALID flag is intentional and useful
+// for zero-downtime FK addition, but only if
+// VALIDATE CONSTRAINT is run afterwards.
+// Without it, existing rows silently bypass the
+// constraint — only new/updated rows are checked.
+//
+// This rule does not fire per-mutation; it uses
+// the Rule::finalize() hook to inspect the
+// accumulated pending_validation state after all
+// statements have been processed.
+// ─────────────────────────────────────────────
+
+pub struct MissingValidateConstraintRule;
+
+impl Rule for MissingValidateConstraintRule {
+    // No per-mutation evaluation needed.
+    fn evaluate(
+        &self,
+        _mutation: &Mutation,
+        _state: &AnalysisState,
+        _reporter: &mut Reporter,
+    ) {}
+
+    /// Fires after all mutations are applied.
+    /// Any entry remaining in pending_validation at this point
+    /// means the author added a NOT VALID constraint but never
+    /// validated it within this migration file.
+    fn finalize(&self, state: &AnalysisState, reporter: &mut Reporter) {
+        for (table_id, constraint_name) in &state.local.pending_validation {
+            // Filter out synthetic FK placeholder names — they can't be
+            // referenced by VALIDATE CONSTRAINT so we format the message
+            // differently.
+            if constraint_name.starts_with("__fk__") {
+                let to_table = constraint_name.trim_start_matches("__fk__");
+                reporter.report(Violation::new(
+                    Severity::Warning,
+                    format!(
+                        "Table '{}' has an unnamed NOT VALID foreign key referencing '{}' \
+                         that was never followed by VALIDATE CONSTRAINT in this migration. \
+                         Existing rows will not be checked against this constraint.",
+                        table_id, to_table
+                    ),
+                ));
+            } else {
+                reporter.report(Violation::new(
+                    Severity::Warning,
+                    format!(
+                        "Constraint '{}' on table '{}' was added with NOT VALID but \
+                         VALIDATE CONSTRAINT was never called in this migration. \
+                         Existing rows will not be checked against this constraint.",
+                        constraint_name, table_id
+                    ),
+                ));
             }
         }
     }

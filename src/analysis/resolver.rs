@@ -41,6 +41,7 @@ impl Resolver {
                         ty: c.ty.clone(),
                         not_null: c.not_null,
                         is_primary_key: c.is_primary_key,
+                        default: c.default.clone(),
                     })
                     .collect();
 
@@ -85,11 +86,12 @@ impl Resolver {
 
                 for action_fact in actions {
                     let action = match action_fact {
-                        AlterTableActionFact::AddColumn { name: col_name, ty, if_not_exists } => {
+                        AlterTableActionFact::AddColumn { name: col_name, ty, if_not_exists, default } => {
                             AlterTableActionMutation::AddColumn {
                                 name: col_name.clone(),
                                 ty: ty.clone(),
                                 if_not_exists: *if_not_exists,
+                                default: default.clone(),
                             }
                         }
 
@@ -108,9 +110,7 @@ impl Resolver {
                         }
 
                         // RenameTo produces a Mutation::Rename, not an AlterTable.
-                        // We push it directly and skip the AlterTable wrapper below.
                         AlterTableActionFact::RenameTo { new_name } => {
-                            // Build the new ObjectId: same schema, new name.
                             let new_id = ObjectId {
                                 schema: id.schema.clone(),
                                 name: new_name.clone(),
@@ -121,7 +121,7 @@ impl Resolver {
                                     new_id,
                                 }
                             ));
-                            continue; // Skip the AlterTable push below.
+                            continue;
                         }
 
                         AlterTableActionFact::AddForeignKey {
@@ -150,6 +150,21 @@ impl Resolver {
                             AlterTableActionMutation::SetType {
                                 column: column.clone(),
                                 ty: ty.clone(),
+                            }
+                        }
+
+                        AlterTableActionFact::SetDefault { column, default } => {
+                            AlterTableActionMutation::SetDefault {
+                                column: column.clone(),
+                                default: default.clone(),
+                            }
+                        }
+
+                        // ValidateConstraint — constraint names are not schema-qualified,
+                        // no ObjectId resolution needed.
+                        AlterTableActionFact::ValidateConstraint { constraint_name } => {
+                            AlterTableActionMutation::ValidateConstraint {
+                                constraint_name: constraint_name.clone(),
                             }
                         }
                     };

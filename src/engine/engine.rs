@@ -33,5 +33,11 @@ pub fn run(file: MigrationFile, db_cache: DbCache) -> Reporter {
         }
     }
 
+    // After all statements: finalize rules that check accumulated state.
+    for rule in rules() {
+        rule.finalize(&state, &mut reporter);
+    }
+
     reporter
 }
+

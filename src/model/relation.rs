@@ -54,12 +54,12 @@ impl RelationState {
     /// Called by AnalysisState::apply() after rule evaluation.
     pub fn apply_column_action(&mut self, action: &ColumnAction) {
         match action {
-            ColumnAction::Add { name, data_type, not_null } => {
+            ColumnAction::Add { name, data_type, not_null, default } => {
                 if !self.columns.iter().any(|c| c.name == *name) {
                     self.columns.push(Column {
                         name: name.clone(),
                         data_type: data_type.clone(),
-                        default: None,
+                        default: default.clone(),
                         is_nullable: !not_null,
                     });
                 }
@@ -85,6 +85,11 @@ impl RelationState {
             ColumnAction::SetType { name, data_type } => {
                 if let Some(col) = self.columns.iter_mut().find(|c| c.name == *name) {
                     col.data_type = Some(data_type.clone());
+                }
+            }
+            ColumnAction::SetDefault { name, default } => {
+                if let Some(col) = self.columns.iter_mut().find(|c| c.name == *name) {
+                    col.default = default.clone();
                 }
             }
         }
@@ -117,6 +122,9 @@ pub enum ColumnAction {
         name: String,
         data_type: Option<String>,
         not_null: bool,
+        /// Default expression for this column.
+        /// Stored on Column::default for future VolatileDefaultRule evaluation.
+        default: Option<crate::analysis::expr_ir::ExprIr>,
     },
     Drop {
         name: String,
@@ -138,6 +146,11 @@ pub enum ColumnAction {
     SetType {
         name: String,
         data_type: String,
+    },
+    /// ALTER COLUMN name SET DEFAULT expr
+    SetDefault {
+        name: String,
+        default: Option<crate::analysis::expr_ir::ExprIr>,
     },
 }
 

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::analysis::graph::{DependencyGraph, FkEdge, IndexEdge, RenameEdge, ViewEdge};
 use crate::analysis::mutations::{AlterTableActionMutation, Mutation};
@@ -33,6 +33,10 @@ pub struct LocalState {
     pub search_path: Vec<String>,
     pub confidence: Confidence,
     pub transactions: Vec<TransactionFrame>,
+    /// Tracks (table_id, constraint_name) pairs from ADD CONSTRAINT ... NOT VALID
+    /// that have not yet been cleared by a VALIDATE CONSTRAINT statement.
+    /// At end-of-migration any remaining entries fire MissingValidateConstraintRule.
+    pub pending_validation: HashSet<(ObjectId, String)>,
 }
 
 // ─────────────────────────────────────────────
@@ -54,6 +58,7 @@ impl AnalysisState {
                 search_path: vec!["public".to_string()],
                 confidence: Confidence::Exact,
                 transactions: Vec::new(),
+                pending_validation: HashSet::new(),
             },
         }
     }
@@ -96,6 +101,7 @@ impl AnalysisState {
                         name: col.name.clone(),
                         data_type: col.ty.clone(),
                         not_null: col.not_null,
+                        default: col.default.clone(),
                     });
                 }
 
@@ -149,17 +155,15 @@ impl AnalysisState {
                 match &alter.action {
                     // ── Column mutations → RelationState ──────────────
 
-                    AlterTableActionMutation::AddColumn { name, ty, .. } => {
+                    AlterTableActionMutation::AddColumn { name, ty, default, .. } => {
                         if let Some(RelationOverlay::Present(rel)) =
                             self.local.relations.get_mut(&alter.id)
                         {
                             rel.apply_column_action(&ColumnAction::Add {
                                 name: name.clone(),
                                 data_type: ty.clone(),
-                                // ADD COLUMN without NOT NULL constraint is nullable.
-                                // The if_not_exists flag is not the same as not_null —
-                                // we default to nullable here; SetNotNull handles the rest.
                                 not_null: false,
+                                default: default.clone(),
                             });
                         }
                     }
@@ -214,13 +218,24 @@ impl AnalysisState {
                         }
                     }
 
+                    AlterTableActionMutation::SetDefault { column, default } => {
+                        if let Some(RelationOverlay::Present(rel)) =
+                            self.local.relations.get_mut(&alter.id)
+                        {
+                            rel.apply_column_action(&ColumnAction::SetDefault {
+                                name: column.clone(),
+                                default: default.clone(),
+                            });
+                        }
+                    }
+
                     // ── FK graph mutations ─────────────────────────────
 
                     AlterTableActionMutation::AddForeignKey {
                         to_table,
                         from_columns,
                         to_columns,
-                        ..
+                        not_valid,
                     } => {
                         self.local.graph.foreign_keys.push(FkEdge {
                             from_table: alter.id.clone(),
@@ -228,6 +243,27 @@ impl AnalysisState {
                             to_table: to_table.clone(),
                             to_columns: to_columns.clone(),
                         });
+                        // Track NOT VALID constraints for MissingValidateConstraintRule.
+                        // We use a synthetic constraint name since ADD CONSTRAINT without
+                        // an explicit name uses a PostgreSQL-generated name. For named
+                        // constraints the name comes from the SQL; for unnamed ones we
+                        // use a placeholder that can't match a VALIDATE CONSTRAINT stmt.
+                        if *not_valid {
+                            self.local.pending_validation.insert((
+                                alter.id.clone(),
+                                format!("__fk__{}", to_table),
+                            ));
+                        }
+                    }
+
+                    // ── Constraint validation ──────────────────────────
+
+                    AlterTableActionMutation::ValidateConstraint { constraint_name } => {
+                        // Remove from pending_validation — the constraint is now
+                        // enforced for all rows. We try both the exact name and
+                        // any synthetic FK placeholder for this table.
+                        self.local.pending_validation
+                            .remove(&(alter.id.clone(), constraint_name.clone()));
                     }
                 }
             }

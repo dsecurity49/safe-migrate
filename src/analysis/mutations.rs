@@ -1,3 +1,4 @@
+use crate::analysis::expr_ir::ExprIr;
 use crate::ast::identifiers::ObjectId;
 
 // ─────────────────────────────────────────────
@@ -60,12 +61,13 @@ pub struct ColumnMutation {
     pub ty: Option<String>,
     pub not_null: bool,
     pub is_primary_key: bool,
+    /// Default expression for this column.
+    /// Used by VolatileDefaultRule — replaces the type-string heuristic.
+    /// None if no DEFAULT was specified or ExprVisitor extraction failed.
+    pub default: Option<ExprIr>,
 }
 
 /// A foreign key edge carried inside a CreateTable or AlterTable mutation.
-/// Both column lists are now populated where squawk exposes them
-/// (table-level ForeignKeyConstraint via handwritten from_columns()/to_columns()).
-/// Both are empty for column-level ReferencesConstraint.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FkMutation {
     pub to_table: ObjectId,
@@ -96,8 +98,6 @@ pub struct AlterTable {
     pub action: AlterTableActionMutation,
 }
 
-/// A table-level rename — old identity from AlterTable::relation_name(),
-/// new name from RenameTo::name().
 #[derive(Clone, Debug, PartialEq)]
 pub struct Rename {
     pub old_id: ObjectId,
@@ -137,8 +137,6 @@ pub struct ReleaseSavepointMutation {
     pub name: String,
 }
 
-/// ROLLBACK TO SAVEPOINT name — partial rollback to a named frame.
-/// Distinct from RollbackTransaction (full rollback).
 #[derive(Clone, Debug, PartialEq)]
 pub struct RollbackToSavepointMutation {
     pub name: String,
@@ -154,11 +152,6 @@ pub enum OpaqueMutation {
 }
 
 // ── Column-level action enum ──────────────────
-//
-// Carried inside AlterTable::action.
-// state.apply() converts this into a ColumnAction
-// (model layer) before calling
-// RelationState::apply_column_action().
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum AlterTableActionMutation {
@@ -166,35 +159,44 @@ pub enum AlterTableActionMutation {
         name: String,
         ty: Option<String>,
         if_not_exists: bool,
+        /// Default expression, resolved from the AST via ExprVisitor.
+        /// None if no DEFAULT was specified.
+        default: Option<ExprIr>,
     },
     DropColumn {
         name: String,
         if_exists: bool,
     },
-    /// RENAME COLUMN old TO new — both names from handwritten RenameColumn accessors.
     RenameColumn {
         from: String,
         to: String,
     },
-    /// ADD CONSTRAINT FOREIGN KEY — includes both column lists where available.
-    /// not_valid: skipped table scan, needs VALIDATE CONSTRAINT later.
     AddForeignKey {
         to_table: ObjectId,
         from_columns: Vec<String>,
         to_columns: Vec<String>,
         not_valid: bool,
     },
-    /// ALTER COLUMN name SET NOT NULL
     SetNotNull {
         column: String,
     },
-    /// ALTER COLUMN name DROP NOT NULL
     DropNotNull {
         column: String,
     },
-    /// ALTER COLUMN name SET DATA TYPE ty
     SetType {
         column: String,
         ty: String,
+    },
+    /// ALTER COLUMN name SET DEFAULT expr
+    SetDefault {
+        column: String,
+        default: Option<ExprIr>,
+    },
+    /// ALTER TABLE name VALIDATE CONSTRAINT constraint_name
+    /// Clears the matching entry from state.local.pending_validation.
+    ValidateConstraint {
+        /// The constraint name as it appears in the SQL — unresolved.
+        /// Matched against pending_validation entries by string equality.
+        constraint_name: String,
     },
 }

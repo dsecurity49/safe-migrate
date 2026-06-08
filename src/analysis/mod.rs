@@ -1,7 +1,8 @@
+pub mod expr_ir;
+pub mod expr_visitor;
 pub mod facts;
+pub mod graph;
+pub mod mutations;
 pub mod resolver;
 pub mod state;
-pub mod mutations;
-pub mod expr_ir;
-pub mod graph;
 pub mod transaction;
