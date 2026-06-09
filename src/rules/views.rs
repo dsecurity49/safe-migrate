@@ -28,6 +28,12 @@ impl Rule for OrphanedDependencyRule {
             }
 
             for from_table in state.local.graph.is_referenced_by_fk(&drop.id) {
+                // Only fire if the referencing table is still alive.
+                // A tombstoned table (RelationOverlay::Dropped) can no longer
+                // enforce its FK constraint — skip it.
+                if !state.relation_is_present(from_table) {
+                    continue;
+                }
                 reporter.report(Violation::new(
                     Severity::Error,
                     format!(

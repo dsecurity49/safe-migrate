@@ -539,4 +539,86 @@ mod tests {
         assert!(reporter.violations.is_empty(),
             "validated constraint should not fire MissingValidateConstraintRule");
     }
+    #[test]
+    fn test_graph_leak_on_rollback() {
+        let mut state = fresh_state();
+        let mut reporter = Reporter::new();
+
+        // 1. Create base tables
+        apply_fact(&mut state, &create_table_fact(None, "users"));
+        apply_fact(&mut state, &create_table_fact(None, "orders"));
+
+        // 2. Open a transaction and add an FK from orders -> users
+        apply_fact(&mut state, &StatementFact::BeginTransaction);
+        apply_fact(&mut state, &alter_table_fact("orders", vec![
+            AlterTableActionFact::AddForeignKey {
+                references: QualifiedName::new(None, "users"),
+                from_columns: Vec::new(),
+                to_columns: Vec::new(),
+                not_valid: false,
+            },
+        ]));
+
+        // 3. Roll it back! The FK should no longer exist.
+        apply_fact(&mut state, &StatementFact::RollbackTransaction);
+
+        // 4. Try to drop the users table.
+        // If the graph leaked, OrphanedDependencyRule will falsely throw a Fatal error
+        // claiming "orders" still depends on "users".
+        let drop_users = StatementFact::DropTable {
+            name: QualifiedName::new(None, "users"),
+            if_exists: false,
+        };
+    
+        let mutations = Resolver::resolve(&drop_users, &state);
+        let rule = crate::rules::views::OrphanedDependencyRule;
+        for m in &mutations { rule.evaluate(m, &state, &mut reporter); }
+
+        // THIS WILL FAIL. 
+        assert!(
+            reporter.violations.is_empty(), 
+            "Graph leaked! Violation found: {:?}", reporter.violations.first()
+        );
+    }
+    #[test]
+    fn test_aba_phantom_dependency() {
+        let mut state = fresh_state();
+        let mut reporter = Reporter::new();
+
+        // 1. Create target and child
+        apply_fact(&mut state, &create_table_fact(None, "target"));
+        apply_fact(&mut state, &StatementFact::CreateTable {
+            name: QualifiedName::new(None, "child"),
+            if_not_exists: false,
+            columns: Vec::new(),
+            foreign_keys: vec![fk_fact("target")], // child -> target
+        });
+
+        // 2. Drop the child. The table is tombstoned, but the FK edge in the graph remains.
+        apply_fact(&mut state, &StatementFact::DropTable {
+            name: QualifiedName::new(None, "child"),
+            if_exists: false,
+        });
+
+        // 3. Try to drop the target.
+        // The target is no longer depended on by any *living* table.
+        let drop_target = StatementFact::DropTable {
+            name: QualifiedName::new(None, "target"),
+            if_exists: false,
+        };
+    
+        let mutations = Resolver::resolve(&drop_target, &state);
+        let rule = crate::rules::views::OrphanedDependencyRule;
+        for m in &mutations { rule.evaluate(m, &state, &mut reporter); }
+
+        // THIS WILL FAIL. It will say "Cannot drop target: referenced by child", 
+        // even though 'child' is currently Dropped!
+        assert!(
+            reporter.violations.is_empty(), 
+            "ABA Problem! Target blocked from dropping by a dead table. Violation: {:?}", 
+            reporter.violations.first()
+        );
+    }
+
 }
+

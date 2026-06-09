@@ -237,17 +237,14 @@ impl AnalysisState {
                         to_columns,
                         not_valid,
                     } => {
+                        // Snapshot the FK graph before mutating so rollback can restore it.
+                        self.snapshot_fk_graph();
                         self.local.graph.foreign_keys.push(FkEdge {
                             from_table: alter.id.clone(),
                             from_columns: from_columns.clone(),
                             to_table: to_table.clone(),
                             to_columns: to_columns.clone(),
                         });
-                        // Track NOT VALID constraints for MissingValidateConstraintRule.
-                        // We use a synthetic constraint name since ADD CONSTRAINT without
-                        // an explicit name uses a PostgreSQL-generated name. For named
-                        // constraints the name comes from the SQL; for unnamed ones we
-                        // use a placeholder that can't match a VALIDATE CONSTRAINT stmt.
                         if *not_valid {
                             self.local.pending_validation.insert((
                                 alter.id.clone(),
@@ -404,6 +401,14 @@ impl AnalysisState {
         }
     }
 
+    fn snapshot_fk_graph(&mut self) {
+        if let Some(frame) = self.local.transactions.last_mut() {
+            frame.undo_log.push(StateChange::FkGraphSnapshot {
+                previous: self.local.graph.foreign_keys.clone(),
+            });
+        }
+    }
+
     fn snapshot_search_path(&mut self) {
         if let Some(frame) = self.local.transactions.last_mut() {
             frame.undo_log.push(StateChange::SearchPathSnapshot {
@@ -428,6 +433,9 @@ impl AnalysisState {
                 }
                 StateChange::SearchPathSnapshot { previous } => {
                     self.local.search_path = previous;
+                }
+                StateChange::FkGraphSnapshot { previous } => {
+                    self.local.graph.foreign_keys = previous;
                 }
             }
         }
