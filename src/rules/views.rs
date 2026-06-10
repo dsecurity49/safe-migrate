@@ -15,9 +15,15 @@ impl Rule for OrphanedDependencyRule {
         state: &AnalysisState,
         reporter: &mut Reporter,
     ) {
-        // FIX: tuple variant — Mutation::DropTable(drop), not { id, .. }
         if let Mutation::DropTable(drop) = mutation {
+            // FIX Bug 2: filter tombstoned views.
+            // A view that was explicitly dropped earlier in this migration
+            // has RelationOverlay::Dropped. Its graph edge is stale — it
+            // must not block dropping the base table.
             for view_id in state.local.graph.is_referenced_by_view(&drop.id) {
+                if !state.relation_is_present(view_id) {
+                    continue; // view already dropped — edge is stale
+                }
                 reporter.report(Violation::new(
                     Severity::Error,
                     format!(
@@ -27,12 +33,21 @@ impl Rule for OrphanedDependencyRule {
                 ));
             }
 
-            for from_table in state.local.graph.is_referenced_by_fk(&drop.id) {
-                // Only fire if the referencing table is still alive.
-                // A tombstoned table (RelationOverlay::Dropped) can no longer
-                // enforce its FK constraint — skip it.
+            // Filter edges by generation — prevents ABA phantom FK dependencies.
+            // An edge is stale if from_table's current generation doesn't match
+            // the generation stamped on the edge when it was created.
+            for (from_table, edge_generation) in state.local.graph.is_referenced_by_fk(&drop.id) {
                 if !state.relation_is_present(from_table) {
-                    continue;
+                    continue; // tombstoned — already dropped
+                }
+                // ABA check: if the table was recreated, its generation changed.
+                let current_generation = state.local.relations.get(from_table)
+                    .and_then(|o| if let crate::model::relation::RelationOverlay::Present(r) = o {
+                        Some(r.generation)
+                    } else { None })
+                    .unwrap_or(0);
+                if current_generation != edge_generation {
+                    continue; // edge belongs to a previous incarnation of this table
                 }
                 reporter.report(Violation::new(
                     Severity::Error,

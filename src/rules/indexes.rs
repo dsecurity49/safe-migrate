@@ -4,29 +4,9 @@ use crate::report::reporter::Reporter;
 use crate::report::violations::{Severity, Violation};
 use crate::rules::Rule;
 
-// ConcurrentIndexRule
-//
-// Fires when CREATE INDEX is used without the
-// CONCURRENTLY flag in a migration.
-//
-// Without CONCURRENTLY, PostgreSQL takes an
-// ACCESS EXCLUSIVE lock on the table for the
-// duration of the index build — blocking all
-// reads and writes. On any table with live
-// traffic this will cause downtime.
-//
-// CONCURRENTLY builds the index in the
-// background with weaker locks, allowing normal
-// table access throughout.
-//
-// Exceptions:
-//   - Inside an explicit transaction block
-//     (CREATE INDEX CONCURRENTLY cannot run
-//     inside a transaction in PostgreSQL).
-//     In that case we flip the violation:
-//     warn that CONCURRENTLY was used inside
-//     a transaction and will be silently
-//     downgraded by PostgreSQL to a blocking build.
+// ─────────────────────────────────────────────
+// ConcurrentIndexRule — CREATE INDEX
+// ─────────────────────────────────────────────
 
 pub struct ConcurrentIndexRule;
 
@@ -41,8 +21,6 @@ impl Rule for ConcurrentIndexRule {
             let inside_transaction = !state.local.transactions.is_empty();
 
             if inside_transaction && create.concurrently {
-                // CONCURRENTLY inside a transaction block is silently ignored
-                // by PostgreSQL — the index build becomes blocking anyway.
                 reporter.report(Violation::new(
                     Severity::Warning,
                     format!(
@@ -53,8 +31,6 @@ impl Rule for ConcurrentIndexRule {
                     ),
                 ));
             } else if !inside_transaction && !create.concurrently {
-                // Non-concurrent build outside a transaction — will take
-                // ACCESS EXCLUSIVE lock and block all table access.
                 reporter.report(Violation::new(
                     Severity::Warning,
                     format!(
@@ -66,10 +42,63 @@ impl Rule for ConcurrentIndexRule {
                     ),
                 ));
             }
-            // inside_transaction && !concurrently: blocking build inside a
-            // transaction is intentional (e.g. migration tooling that wraps
-            // everything in a transaction). No violation — the author made
-            // an explicit choice.
+        }
+    }
+}
+
+// ─────────────────────────────────────────────
+// DropConcurrentIndexRule — DROP INDEX
+//
+// DROP INDEX without CONCURRENTLY takes an
+// ACCESS EXCLUSIVE lock on the parent table
+// for the duration of the drop — blocking all
+// reads and writes exactly like CREATE INDEX.
+//
+// DROP INDEX CONCURRENTLY releases the lock
+// progressively, allowing concurrent access.
+//
+// Same transaction caveat as CREATE INDEX:
+// DROP INDEX CONCURRENTLY cannot run inside
+// a transaction block — PostgreSQL will error.
+// ─────────────────────────────────────────────
+
+pub struct DropConcurrentIndexRule;
+
+impl Rule for DropConcurrentIndexRule {
+    fn evaluate(
+        &self,
+        mutation: &Mutation,
+        state: &AnalysisState,
+        reporter: &mut Reporter,
+    ) {
+        if let Mutation::DropIndex(drop) = mutation {
+            let inside_transaction = !state.local.transactions.is_empty();
+
+            if inside_transaction && drop.concurrently {
+                // DROP INDEX CONCURRENTLY inside a transaction is a hard error
+                // in PostgreSQL — it won't downgrade, it will fail.
+                reporter.report(Violation::new(
+                    Severity::Error,
+                    format!(
+                        "DROP INDEX CONCURRENTLY on '{}' is inside a transaction block. \
+                         PostgreSQL does not allow CONCURRENTLY inside a transaction — \
+                         this will produce an error. Move it outside the transaction.",
+                        drop.id
+                    ),
+                ));
+            } else if !inside_transaction && !drop.concurrently {
+                reporter.report(Violation::new(
+                    Severity::Warning,
+                    format!(
+                        "DROP INDEX '{}' without CONCURRENTLY will take an ACCESS EXCLUSIVE \
+                         lock on the parent table, blocking all reads and writes. \
+                         Use DROP INDEX CONCURRENTLY instead.",
+                        drop.id
+                    ),
+                ));
+            }
+            // inside_transaction && !concurrently: intentional blocking drop inside
+            // a transaction. No violation.
             //
             // !inside_transaction && concurrently: correct usage. No violation.
         }

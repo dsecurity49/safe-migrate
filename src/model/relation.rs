@@ -39,15 +39,19 @@ impl std::fmt::Display for ObjectId {
 pub struct RelationState {
     pub id: ObjectId,
     pub columns: Vec<Column>,
+    /// Monotonically increasing generation counter.
+    /// Incremented each time a new incarnation of this ObjectId is created
+    /// (i.e. when CREATE TABLE/VIEW overwrites a tombstone with the same name).
+    /// Graph edges carry the generation of the relation they were created for.
+    /// Rules filter edges whose generation does not match the current relation's
+    /// generation — preventing ABA phantom dependencies.
+    pub generation: u64,
 }
 
 impl RelationState {
-    /// Create a new empty relation with the given identity.
-    pub fn new(id: ObjectId) -> Self {
-        Self {
-            id,
-            columns: Vec::new(),
-        }
+    /// Create a new relation with the given identity and generation.
+    pub fn new(id: ObjectId, generation: u64) -> Self {
+        Self { id, columns: Vec::new(), generation }
     }
 
     /// Apply a column-level mutation to this relation's live state.

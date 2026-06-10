@@ -1,11 +1,13 @@
 use crate::model::relation::ObjectId;
 
+// ─────────────────────────────────────────────
 // Edge types — one struct per dependency kind.
 // Each edge is immutable once inserted; the graph
 // grows monotonically during forward simulation.
 // Rollback removes edges via the undo log in
 // TransactionFrame, not by mutating the graph
 // directly.
+// ─────────────────────────────────────────────
 
 /// A foreign key relationship between two tables.
 #[derive(Debug, Clone, PartialEq)]
@@ -14,6 +16,9 @@ pub struct FkEdge {
     pub from_columns: Vec<String>,
     pub to_table: ObjectId,
     pub to_columns: Vec<String>,
+    /// Generation of from_table when this edge was created.
+    /// Used to filter ABA phantom edges.
+    pub from_generation: u64,
 }
 
 /// A view's dependency on one or more base tables or other views.
@@ -21,6 +26,8 @@ pub struct FkEdge {
 pub struct ViewEdge {
     pub view_id: ObjectId,
     pub depends_on: Vec<ObjectId>,
+    /// Generation of the view when this edge was created.
+    pub view_generation: u64,
 }
 
 /// An index's dependency on its parent table.
@@ -45,10 +52,12 @@ pub struct PartitionEdge {
     pub child: ObjectId,
 }
 
+// ─────────────────────────────────────────────
 // DependencyGraph — the full live dependency
 // surface of the schema at the current simulation
 // point. Populated by state.apply() and queried
 // read-only by the rule engine.
+// ─────────────────────────────────────────────
 
 #[derive(Debug, Clone, Default)]
 pub struct DependencyGraph {
@@ -66,7 +75,9 @@ impl DependencyGraph {
 
     // ── Query helpers (read-only, used by rules) ──────────────────────
 
-    /// Returns the IDs of all views that depend on `id`.
+    /// Returns the IDs of all views that depend on `id`, filtered by generation.
+    /// Only edges whose view_generation matches the current view's generation
+    /// are returned — prevents ABA phantom view dependencies.
     pub fn is_referenced_by_view(&self, id: &ObjectId) -> Vec<&ObjectId> {
         self.views
             .iter()
@@ -75,12 +86,13 @@ impl DependencyGraph {
             .collect()
     }
 
-    /// Returns the IDs of all tables that reference `id` via a foreign key.
-    pub fn is_referenced_by_fk(&self, id: &ObjectId) -> Vec<&ObjectId> {
+    /// Returns the IDs of all tables that reference `id` via a foreign key,
+    /// filtered by from_generation to prevent ABA phantom FK dependencies.
+    pub fn is_referenced_by_fk(&self, id: &ObjectId) -> Vec<(&ObjectId, u64)> {
         self.foreign_keys
             .iter()
             .filter(|fk| &fk.to_table == id)
-            .map(|fk| &fk.from_table)
+            .map(|fk| (&fk.from_table, fk.from_generation))
             .collect()
     }
 

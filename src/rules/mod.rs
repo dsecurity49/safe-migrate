@@ -5,6 +5,7 @@ use crate::report::reporter::Reporter;
 pub mod constraints;
 pub mod destructive;
 pub mod expressions;
+pub mod idempotency;
 pub mod indexes;
 pub mod opaque;
 pub mod partitions;
@@ -19,47 +20,48 @@ pub trait Rule {
         reporter: &mut Reporter,
     );
 
-    /// Called once after all mutations in the migration file have been
-    /// applied. Used for rules that check accumulated state rather than
-    /// individual mutations — e.g. detecting NOT VALID constraints that
-    /// were never followed by VALIDATE CONSTRAINT.
-    ///
-    /// Default implementation is a no-op so existing rules need no changes.
+    /// Called once after all mutations have been applied.
+    /// Used for rules that inspect accumulated state rather than
+    /// individual mutations. Default is a no-op.
     fn finalize(&self, _state: &AnalysisState, _reporter: &mut Reporter) {}
 }
 
-/// Returns the active rule set for the engine loop.
-///
-/// Rules are evaluated in order for each mutation. Order matters
-/// when a later rule depends on a violation already reported by
-/// an earlier one — put more fundamental checks first.
 pub fn rules() -> Vec<Box<dyn Rule>> {
     vec![
-        // Transaction sanity first — if we're outside a valid
-        // transaction context the rest of the analysis is moot.
+        // Transaction sanity first.
         Box::new(transactions::TransactionSanityRule),
 
-        // Opaque execution downgrades confidence — report it early
-        // so downstream rules know the state may be unreliable.
+        // Opaque execution — downgrades confidence early.
         Box::new(opaque::OpaqueExecutionRule),
 
         // Destructive operations.
         Box::new(destructive::DestructiveDropRule),
 
-        // Index safety — CONCURRENTLY flag, locking behaviour.
+        // Index lock safety.
         Box::new(indexes::ConcurrentIndexRule),
+        Box::new(indexes::DropConcurrentIndexRule),
 
-        // Dependency safety — views, FK, indexes referencing dropped tables.
+        // Dependency safety.
         Box::new(views::OrphanedDependencyRule),
 
-        // Column-level mutation safety.
+        // Constraint lock safety.
         Box::new(constraints::SafeAddColumnRule),
         Box::new(constraints::NotValidConstraintRule),
         Box::new(constraints::SetNotNullRule),
+        Box::new(constraints::AddCheckConstraintRule),
+        Box::new(constraints::AddUniqueConstraintRule),
         Box::new(constraints::MissingValidateConstraintRule),
 
-        // Volatile default heuristic.
+        // Expression / type safety.
         Box::new(expressions::VolatileDefaultRule),
         Box::new(expressions::SetTypeRule),
+
+        // Idempotency.
+        Box::new(idempotency::CreateTableIdempotencyRule),
+        Box::new(idempotency::CreateIndexIdempotencyRule),
+        Box::new(idempotency::DropTableIdempotencyRule),
+        Box::new(idempotency::DropIndexIdempotencyRule),
+        // Bug 16 fix: register the new DropColumn idempotency rule.
+        Box::new(idempotency::DropColumnIdempotencyRule),
     ]
 }

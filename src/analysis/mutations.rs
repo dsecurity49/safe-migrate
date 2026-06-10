@@ -1,51 +1,24 @@
 use crate::analysis::expr_ir::ExprIr;
 use crate::ast::identifiers::ObjectId;
 
-// ─────────────────────────────────────────────
-// Mutation — resolved canonical state changes
-//
-// INVARIANT: Every field uses ObjectId, never
-// QualifiedName. By the time a Mutation exists,
-// the Resolver has already applied search_path
-// expansion and produced a fully qualified id.
-//
-// INVARIANT: Rules are evaluated against these
-// mutations BEFORE state.apply() is called.
-// Rules are read-only — they never produce or
-// modify mutations.
-// ─────────────────────────────────────────────
-
 #[derive(Clone, Debug, PartialEq)]
 pub enum Mutation {
-    // ── Schema definition ─────────────────────
     CreateTable(CreateTable),
     CreateView(CreateView),
     CreateIndex(CreateIndex),
-
-    // ── Schema mutation ───────────────────────
     AlterTable(AlterTable),
     Rename(Rename),
-
-    // ── Schema removal ────────────────────────
     DropTable(DropTable),
     DropIndex(DropIndex),
-
-    // ── Session state ─────────────────────────
     SearchPath(SearchPathChange),
-
-    // ── Transaction control ───────────────────
     BeginTransaction,
     CommitTransaction,
     RollbackTransaction,
     RollbackToSavepoint(RollbackToSavepointMutation),
     Savepoint(SavepointMutation),
     ReleaseSavepoint(ReleaseSavepointMutation),
-
-    // ── Opaque / procedural ───────────────────
     Opaque(OpaqueMutation),
 }
-
-// ── Schema definition structs ─────────────────
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CreateTable {
@@ -53,6 +26,9 @@ pub struct CreateTable {
     pub if_not_exists: bool,
     pub columns: Vec<ColumnMutation>,
     pub foreign_keys: Vec<FkMutation>,
+    /// Bug 9: carry table-level constraints through to apply() so PK columns
+    /// are marked not_null even when the column definition omits the keyword.
+    pub table_constraints: Vec<crate::analysis::facts::TableConstraintFact>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -61,13 +37,9 @@ pub struct ColumnMutation {
     pub ty: Option<String>,
     pub not_null: bool,
     pub is_primary_key: bool,
-    /// Default expression for this column.
-    /// Used by VolatileDefaultRule — replaces the type-string heuristic.
-    /// None if no DEFAULT was specified or ExprVisitor extraction failed.
     pub default: Option<ExprIr>,
 }
 
-/// A foreign key edge carried inside a CreateTable or AlterTable mutation.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FkMutation {
     pub to_table: ObjectId,
@@ -90,8 +62,6 @@ pub struct CreateIndex {
     pub concurrently: bool,
 }
 
-// ── Schema mutation structs ───────────────────
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct AlterTable {
     pub id: ObjectId,
@@ -104,8 +74,6 @@ pub struct Rename {
     pub new_id: ObjectId,
 }
 
-// ── Schema removal structs ────────────────────
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct DropTable {
     pub id: ObjectId,
@@ -116,87 +84,65 @@ pub struct DropTable {
 pub struct DropIndex {
     pub id: ObjectId,
     pub if_exists: bool,
+    /// True if CONCURRENTLY was present.
+    pub concurrently: bool,
 }
-
-// ── Session state structs ─────────────────────
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SearchPathChange {
     pub schemas: Vec<String>,
 }
 
-// ── Transaction control structs ───────────────
+#[derive(Clone, Debug, PartialEq)]
+pub struct SavepointMutation { pub name: String }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct SavepointMutation {
-    pub name: String,
-}
+pub struct ReleaseSavepointMutation { pub name: String }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct ReleaseSavepointMutation {
-    pub name: String,
-}
+pub struct RollbackToSavepointMutation { pub name: String }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct RollbackToSavepointMutation {
-    pub name: String,
-}
-
-// ── Opaque execution enum ─────────────────────
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum OpaqueMutation {
-    DoBlock,
-    Execute,
-    DynamicSql,
-}
-
-// ── Column-level action enum ──────────────────
+pub enum OpaqueMutation { DoBlock, Execute, DynamicSql }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum AlterTableActionMutation {
+    /// Bug 11: added not_null field — previously hardcoded false in apply(),
+    /// so NOT NULL constraints on ADD COLUMN were silently discarded.
     AddColumn {
         name: String,
         ty: Option<String>,
         if_not_exists: bool,
-        /// Default expression, resolved from the AST via ExprVisitor.
-        /// None if no DEFAULT was specified.
+        not_null: bool,
         default: Option<ExprIr>,
     },
     DropColumn {
         name: String,
         if_exists: bool,
     },
-    RenameColumn {
-        from: String,
-        to: String,
-    },
+    RenameColumn { from: String, to: String },
+    /// Bug 10: added constraint_name field — previously a synthetic __fk__...
+    /// placeholder was always used, making VALIDATE CONSTRAINT by real name
+    /// impossible to match.
     AddForeignKey {
+        /// The authored constraint name, or None if the SQL omitted CONSTRAINT <name>.
+        constraint_name: Option<String>,
         to_table: ObjectId,
         from_columns: Vec<String>,
         to_columns: Vec<String>,
         not_valid: bool,
     },
-    SetNotNull {
-        column: String,
+    /// ADD CONSTRAINT ... CHECK (expr)
+    AddCheckConstraint {
+        not_valid: bool,
     },
-    DropNotNull {
-        column: String,
-    },
-    SetType {
-        column: String,
-        ty: String,
-    },
-    /// ALTER COLUMN name SET DEFAULT expr
-    SetDefault {
-        column: String,
-        default: Option<ExprIr>,
-    },
-    /// ALTER TABLE name VALIDATE CONSTRAINT constraint_name
-    /// Clears the matching entry from state.local.pending_validation.
-    ValidateConstraint {
-        /// The constraint name as it appears in the SQL — unresolved.
-        /// Matched against pending_validation entries by string equality.
-        constraint_name: String,
-    },
+    /// ADD CONSTRAINT ... UNIQUE
+    AddUniqueConstraint,
+    /// ADD CONSTRAINT ... PRIMARY KEY
+    AddPrimaryKeyConstraint,
+    SetNotNull { column: String },
+    DropNotNull { column: String },
+    SetType { column: String, ty: String },
+    SetDefault { column: String, default: Option<ExprIr> },
+    ValidateConstraint { constraint_name: String },
 }

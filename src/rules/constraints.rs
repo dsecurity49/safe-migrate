@@ -7,6 +7,24 @@ use crate::rules::Rule;
 
 // ─────────────────────────────────────────────
 // SafeAddColumnRule
+//
+// Bug 15 fix: the previous implementation fired a blanket
+//   "ensure the column is nullable or has a non-volatile default"
+// warning for every ADD COLUMN on a known table. This made the
+// rule fire on every valid migration, creating noise that would
+// cause authors to ignore all warnings.
+//
+// Responsibility split after fix:
+//   - SafeAddColumnRule: structural errors only
+//       * table unknown / tombstoned
+//       * column already exists without IF NOT EXISTS
+//       * column type unextractable from AST
+//   - VolatileDefaultRule: volatile default detection
+//   - (future) NotNullWithoutDefaultRule: NOT NULL add without default
+//
+// The removed catch-all warning was: "ensure the column is nullable
+// or has a non-volatile default to avoid a full table rewrite."
+// This is now covered more precisely by VolatileDefaultRule.
 // ─────────────────────────────────────────────
 
 pub struct SafeAddColumnRule;
@@ -40,6 +58,7 @@ impl Rule for SafeAddColumnRule {
                         ));
                     }
                     Some(RelationOverlay::Present(rel)) => {
+                        // Error: column already exists and author omitted IF NOT EXISTS.
                         if rel.has_column(name) && !if_not_exists {
                             reporter.report(Violation::new(
                                 Severity::Error,
@@ -50,6 +69,10 @@ impl Rule for SafeAddColumnRule {
                                 ),
                             ));
                         }
+
+                        // Warning: type could not be extracted — likely an AST gap.
+                        // This fires regardless of whether the column is new or existing,
+                        // since a missing type is always a sign something went wrong.
                         if ty.is_none() {
                             reporter.report(Violation::new(
                                 Severity::Warning,
@@ -59,16 +82,12 @@ impl Rule for SafeAddColumnRule {
                                 ),
                             ));
                         }
-                        if !rel.has_column(name) {
-                            reporter.report(Violation::new(
-                                Severity::Warning,
-                                format!(
-                                    "ADD COLUMN '{}' on '{}': ensure the column is nullable \
-                                     or has a non-volatile default to avoid a full table rewrite.",
-                                    name, alter.id
-                                ),
-                            ));
-                        }
+
+                        // Volatile-default safety is intentionally NOT checked here.
+                        // VolatileDefaultRule owns that concern — it evaluates the
+                        // extracted ExprIr and fires only when the default is actually
+                        // volatile. The old catch-all warning fired for every valid
+                        // ADD COLUMN regardless of whether there was any default at all.
                     }
                 }
             }
@@ -78,20 +97,6 @@ impl Rule for SafeAddColumnRule {
 
 // ─────────────────────────────────────────────
 // NotValidConstraintRule
-//
-// Fires when ADD CONSTRAINT ... NOT VALID is
-// used without a subsequent VALIDATE CONSTRAINT.
-//
-// NOT VALID skips the full table scan at
-// constraint creation time, deferring the check
-// to VALIDATE CONSTRAINT. If VALIDATE is never
-// called, the constraint is unenforced for
-// existing rows — new rows are checked, but old
-// rows are not.
-//
-// This rule fires at the ADD CONSTRAINT point.
-// A companion rule (future) should fire if
-// VALIDATE CONSTRAINT is missing entirely.
 // ─────────────────────────────────────────────
 
 pub struct NotValidConstraintRule;
@@ -123,26 +128,6 @@ impl Rule for NotValidConstraintRule {
 
 // ─────────────────────────────────────────────
 // SetNotNullRule
-//
-// Fires when ALTER COLUMN ... SET NOT NULL is
-// used on a table that already has rows (i.e.
-// was created earlier in this migration or
-// exists in DbCache).
-//
-// SET NOT NULL requires a full table scan to
-// verify no existing rows have NULL in that
-// column. On large tables this causes a long
-// ACCESS EXCLUSIVE lock.
-//
-// The safe pattern is:
-//   1. ADD CONSTRAINT ... CHECK (col IS NOT NULL) NOT VALID
-//   2. VALIDATE CONSTRAINT ...
-//   3. ALTER COLUMN ... SET NOT NULL  (uses the validated constraint, no scan)
-//   4. DROP CONSTRAINT ...
-//
-// We can only detect the unsafe case — we emit
-// a warning to prompt the author to consider
-// the safe pattern.
 // ─────────────────────────────────────────────
 
 pub struct SetNotNullRule;
@@ -156,17 +141,10 @@ impl Rule for SetNotNullRule {
     ) {
         if let Mutation::AlterTable(alter) = mutation {
             if let AlterTableActionMutation::SetNotNull { column } = &alter.action {
-                // Only warn when the table is known to exist — if it was
-                // just created in this migration it likely has no rows yet.
-                // We still warn because the migration may run against a
-                // pre-existing table in production.
                 match state.get_relation(&alter.id) {
                     Some(RelationOverlay::Present(rel)) => {
-                        // If the column is already NOT NULL we can skip —
-                        // the constraint is already enforced.
                         if let Some(col) = rel.get_column(column) {
                             if !col.is_nullable {
-                                // Already NOT NULL — no scan needed, no warning.
                                 return;
                             }
                         }
@@ -209,32 +187,11 @@ impl Rule for SetNotNullRule {
 
 // ─────────────────────────────────────────────
 // MissingValidateConstraintRule
-//
-// Fires at end-of-migration (via finalize()) if
-// any NOT VALID constraints were added but never
-// followed by VALIDATE CONSTRAINT.
-//
-// Pattern being detected:
-//   ALTER TABLE t ADD CONSTRAINT fk FOREIGN KEY
-//     REFERENCES other NOT VALID;
-//   -- missing: ALTER TABLE t VALIDATE CONSTRAINT fk;
-//
-// The NOT VALID flag is intentional and useful
-// for zero-downtime FK addition, but only if
-// VALIDATE CONSTRAINT is run afterwards.
-// Without it, existing rows silently bypass the
-// constraint — only new/updated rows are checked.
-//
-// This rule does not fire per-mutation; it uses
-// the Rule::finalize() hook to inspect the
-// accumulated pending_validation state after all
-// statements have been processed.
 // ─────────────────────────────────────────────
 
 pub struct MissingValidateConstraintRule;
 
 impl Rule for MissingValidateConstraintRule {
-    // No per-mutation evaluation needed.
     fn evaluate(
         &self,
         _mutation: &Mutation,
@@ -242,15 +199,8 @@ impl Rule for MissingValidateConstraintRule {
         _reporter: &mut Reporter,
     ) {}
 
-    /// Fires after all mutations are applied.
-    /// Any entry remaining in pending_validation at this point
-    /// means the author added a NOT VALID constraint but never
-    /// validated it within this migration file.
     fn finalize(&self, state: &AnalysisState, reporter: &mut Reporter) {
         for (table_id, constraint_name) in &state.local.pending_validation {
-            // Filter out synthetic FK placeholder names — they can't be
-            // referenced by VALIDATE CONSTRAINT so we format the message
-            // differently.
             if constraint_name.starts_with("__fk__") {
                 let to_table = constraint_name.trim_start_matches("__fk__");
                 reporter.report(Violation::new(
@@ -272,6 +222,83 @@ impl Rule for MissingValidateConstraintRule {
                         constraint_name, table_id
                     ),
                 ));
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────
+// AddCheckConstraintRule
+// ─────────────────────────────────────────────
+
+pub struct AddCheckConstraintRule;
+
+impl Rule for AddCheckConstraintRule {
+    fn evaluate(
+        &self,
+        mutation: &Mutation,
+        _state: &AnalysisState,
+        reporter: &mut Reporter,
+    ) {
+        if let Mutation::AlterTable(alter) = mutation {
+            if let AlterTableActionMutation::AddCheckConstraint { not_valid } = &alter.action {
+                if !not_valid {
+                    reporter.report(Violation::new(
+                        Severity::Warning,
+                        format!(
+                            "ADD CONSTRAINT CHECK on '{}' without NOT VALID will scan the \
+                             entire table holding a ShareLock, blocking writes for the duration. \
+                             Use ADD CONSTRAINT ... CHECK (...) NOT VALID followed by \
+                             VALIDATE CONSTRAINT for a shorter lock window.",
+                            alter.id
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────
+// AddUniqueConstraintRule
+// ─────────────────────────────────────────────
+
+pub struct AddUniqueConstraintRule;
+
+impl Rule for AddUniqueConstraintRule {
+    fn evaluate(
+        &self,
+        mutation: &Mutation,
+        _state: &AnalysisState,
+        reporter: &mut Reporter,
+    ) {
+        if let Mutation::AlterTable(alter) = mutation {
+            match &alter.action {
+                AlterTableActionMutation::AddUniqueConstraint => {
+                    reporter.report(Violation::new(
+                        Severity::Warning,
+                        format!(
+                            "ADD CONSTRAINT UNIQUE on '{}' takes ACCESS EXCLUSIVE lock and \
+                             builds an index, blocking all reads and writes. Safe pattern: \
+                             CREATE UNIQUE INDEX CONCURRENTLY first, then \
+                             ADD CONSTRAINT ... UNIQUE USING INDEX.",
+                            alter.id
+                        ),
+                    ));
+                }
+                AlterTableActionMutation::AddPrimaryKeyConstraint => {
+                    reporter.report(Violation::new(
+                        Severity::Warning,
+                        format!(
+                            "ADD CONSTRAINT PRIMARY KEY on '{}' takes ACCESS EXCLUSIVE lock \
+                             and builds an index, blocking all reads and writes. If a unique \
+                             index already exists on the PK columns, use \
+                             ADD CONSTRAINT ... PRIMARY KEY USING INDEX to avoid the rebuild.",
+                            alter.id
+                        ),
+                    ));
+                }
+                _ => {}
             }
         }
     }

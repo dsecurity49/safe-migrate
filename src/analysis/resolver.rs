@@ -15,16 +15,35 @@ impl Resolver {
     // QualifiedName → ObjectId via search_path.
     // ─────────────────────────────────────────────
 
+    /// Resolve a QualifiedName to a canonical ObjectId.
+    ///
+    /// Bug 3 fix: apply .to_lowercase() to both schema and name components.
+    ///
+    /// PostgreSQL folds unquoted identifiers to lowercase. QualifiedName
+    /// carries raw AST text — which for unquoted identifiers is already
+    /// stripped of quotes but preserves the original case as typed. We
+    /// normalise at this single resolution boundary rather than at each
+    /// extraction site in the visitor.
+    ///
+    /// Quoted identifiers (e.g. "MyTable") preserve case in PostgreSQL; the
+    /// squawk parser already strips the surrounding quotes and preserves the
+    /// inner text. Applying .to_lowercase() here would incorrectly fold quoted
+    /// identifiers — this is a known limitation. Full correctness requires the
+    /// visitor to tag whether each identifier was quoted; that is deferred.
     fn resolve_name(name: &QualifiedName, state: &AnalysisState) -> ObjectId {
-        let schema = name.schema.clone().unwrap_or_else(|| {
-            state
-                .local
-                .search_path
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "public".to_string())
-        });
-        ObjectId { schema, name: name.name.clone() }
+        let schema = name
+            .schema
+            .as_deref()
+            .unwrap_or_else(|| {
+                state.local.search_path.first().map(|s| s.as_str())
+                    .unwrap_or("public")
+            })
+            .to_lowercase();
+
+        ObjectId {
+            schema,
+            name: name.name.to_lowercase(),
+        }
     }
 
     pub fn resolve(fact: &StatementFact, state: &AnalysisState) -> Vec<Mutation> {
@@ -33,7 +52,13 @@ impl Resolver {
         match fact {
             // ── Schema definition ─────────────────
 
-            StatementFact::CreateTable { name, if_not_exists, columns, foreign_keys } => {
+            StatementFact::CreateTable {
+                name,
+                if_not_exists,
+                columns,
+                foreign_keys,
+                table_constraints,      // Bug 9
+            } => {
                 let col_mutations: Vec<ColumnMutation> = columns
                     .iter()
                     .map(|c| ColumnMutation {
@@ -59,6 +84,8 @@ impl Resolver {
                     if_not_exists: *if_not_exists,
                     columns: col_mutations,
                     foreign_keys: fk_mutations,
+                    // Bug 9: forward table constraints so apply() can post-process PK columns.
+                    table_constraints: table_constraints.clone(),
                 }));
             }
 
@@ -86,11 +113,19 @@ impl Resolver {
 
                 for action_fact in actions {
                     let action = match action_fact {
-                        AlterTableActionFact::AddColumn { name: col_name, ty, if_not_exists, default } => {
+                        // Bug 11: thread not_null through.
+                        AlterTableActionFact::AddColumn {
+                            name: col_name,
+                            ty,
+                            if_not_exists,
+                            not_null,
+                            default,
+                        } => {
                             AlterTableActionMutation::AddColumn {
                                 name: col_name.clone(),
                                 ty: ty.clone(),
                                 if_not_exists: *if_not_exists,
+                                not_null: *not_null,
                                 default: default.clone(),
                             }
                         }
@@ -113,7 +148,7 @@ impl Resolver {
                         AlterTableActionFact::RenameTo { new_name } => {
                             let new_id = ObjectId {
                                 schema: id.schema.clone(),
-                                name: new_name.clone(),
+                                name: new_name.to_lowercase(),
                             };
                             mutations.push(Mutation::Rename(
                                 crate::analysis::mutations::Rename {
@@ -124,18 +159,35 @@ impl Resolver {
                             continue;
                         }
 
+                        // Bug 10: thread constraint_name through.
                         AlterTableActionFact::AddForeignKey {
+                            constraint_name,
                             references,
                             from_columns,
                             to_columns,
                             not_valid,
                         } => {
                             AlterTableActionMutation::AddForeignKey {
+                                constraint_name: constraint_name.clone(),
                                 to_table: Self::resolve_name(references, state),
                                 from_columns: from_columns.clone(),
                                 to_columns: to_columns.clone(),
                                 not_valid: *not_valid,
                             }
+                        }
+
+                        AlterTableActionFact::AddCheckConstraint { not_valid } => {
+                            AlterTableActionMutation::AddCheckConstraint {
+                                not_valid: *not_valid,
+                            }
+                        }
+
+                        AlterTableActionFact::AddUniqueConstraint => {
+                            AlterTableActionMutation::AddUniqueConstraint
+                        }
+
+                        AlterTableActionFact::AddPrimaryKeyConstraint => {
+                            AlterTableActionMutation::AddPrimaryKeyConstraint
                         }
 
                         AlterTableActionFact::SetNotNull { column } => {
@@ -160,8 +212,6 @@ impl Resolver {
                             }
                         }
 
-                        // ValidateConstraint — constraint names are not schema-qualified,
-                        // no ObjectId resolution needed.
                         AlterTableActionFact::ValidateConstraint { constraint_name } => {
                             AlterTableActionMutation::ValidateConstraint {
                                 constraint_name: constraint_name.clone(),
@@ -185,11 +235,12 @@ impl Resolver {
                 }));
             }
 
-            StatementFact::DropIndex { names, if_exists } => {
+            StatementFact::DropIndex { names, if_exists, concurrently } => {
                 for name in names {
                     mutations.push(Mutation::DropIndex(DropIndex {
                         id: Self::resolve_name(name, state),
                         if_exists: *if_exists,
+                        concurrently: *concurrently,
                     }));
                 }
             }

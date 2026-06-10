@@ -20,9 +20,30 @@ pub struct MigrationFile {
 
 impl MigrationFile {
     /// Parse raw SQL text into a MigrationFile.
-    pub fn parse(sql: &str) -> Option<Self> {
+    ///
+    /// Bug 1 fix: returns Err if the parser found syntax errors.
+    ///
+    /// The squawk parser is resilient — SourceFile::parse() always returns
+    /// a tree and never panics, even for broken input. Without this check,
+    /// the engine would silently analyse a partial/corrupt tree, producing
+    /// spurious violations or missing real ones entirely.
+    ///
+    /// errors() returns a slice of SyntaxError. We convert each to String
+    /// for a stable, displayable error type that doesn't carry AST lifetimes.
+    pub fn parse(sql: &str) -> Result<Self, Vec<String>> {
         let parsed = SourceFile::parse(sql);
-        Some(Self {
+
+        let errors: Vec<String> = parsed
+            .errors()
+            .iter()
+            .map(|e| e.to_string())
+            .collect();
+
+        if !errors.is_empty() {
+            return Err(errors);
+        }
+
+        Ok(Self {
             source: parsed.tree(),
         })
     }
