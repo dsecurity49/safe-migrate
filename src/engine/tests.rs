@@ -18,7 +18,7 @@ mod tests {
     use crate::rules::destructive::DestructiveDropRule;
     use crate::rules::expressions::{SetTypeRule, VolatileDefaultRule};
     use crate::rules::idempotency::{
-        CreateIndexIdempotencyRule, CreateTableIdempotencyRule,
+        CreateTableIdempotencyRule,
         DropColumnIdempotencyRule, DropIndexIdempotencyRule, DropTableIdempotencyRule,
     };
     use crate::rules::indexes::{ConcurrentIndexRule, DropConcurrentIndexRule};
@@ -737,7 +737,7 @@ mod tests {
 
     #[test]
     fn test_idempotency_create_table_warns() {
-        let mut state = fresh_state();
+        let state = fresh_state();
         let mut reporter = Reporter::new();
 
         let mutations = Resolver::resolve(&create_table_fact(None, "users"), &state);
@@ -749,7 +749,7 @@ mod tests {
 
     #[test]
     fn test_idempotency_create_table_with_guard_silent() {
-        let mut state = fresh_state();
+        let state = fresh_state();
         let mut reporter = Reporter::new();
 
         let mutations = Resolver::resolve(&StatementFact::CreateTable {
@@ -782,7 +782,7 @@ mod tests {
 
     #[test]
     fn test_idempotency_drop_index_warns() {
-        let mut state = fresh_state();
+        let state = fresh_state();
         let mut reporter = Reporter::new();
 
         let mutations = Resolver::resolve(&StatementFact::DropIndex {
@@ -853,7 +853,7 @@ mod tests {
         let baseline_id = object_id("public", "legacy");
         cache.insert(crate::model::relation::RelationState::new(baseline_id, 0));
 
-        let mut state = AnalysisState::new(cache);
+        let state = AnalysisState::new(cache);
         let mut reporter = Reporter::new();
 
         let mutations = Resolver::resolve(
