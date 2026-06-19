@@ -1,14 +1,39 @@
+// FILE: ./src/analysis/mutations.rs
+
 use crate::analysis::expr_ir::ExprIr;
 use crate::ast::identifiers::ObjectId;
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum PersistenceMutation {
+    Permanent,
+    Temporary,
+    Unlogged,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Mutation {
     CreateTable(CreateTable),
     CreateView(CreateView),
+    CreateMaterializedView(CreateMaterializedView),
+    RefreshMaterializedView(RefreshMaterializedViewMutation),
     CreateIndex(CreateIndex),
+    CreatePolicy(CreatePolicyMutation),
+    DropPolicy(DropPolicyMutation),
+    CreateTrigger(CreateTriggerMutation),
+    DropTrigger(DropTriggerMutation),
     AlterTable(AlterTable),
+    CreateType(CreateTypeMutation),
+    AlterType(AlterTypeMutation),
+    CreateDomain(CreateDomainMutation),
+    AlterDomain(AlterDomainMutation),
+    DropDomain(DropDomainMutation),
+    CreateSequence(CreateSequenceMutation),
+    AlterSequence(AlterSequenceMutation),
+    DropSequence(DropSequenceMutation),
     Rename(Rename),
     DropTable(DropTable),
+    DropView(DropViewMutation),
+    DropMaterializedView(DropMaterializedViewMutation),
     DropIndex(DropIndex),
     SearchPath(SearchPathChange),
     BeginTransaction,
@@ -21,13 +46,116 @@ pub enum Mutation {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct CreatePolicyMutation {
+    pub name: String,
+    pub table: ObjectId,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DropPolicyMutation {
+    pub name: String,
+    pub table: ObjectId,
+    pub if_exists: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CreateTriggerMutation {
+    pub name: String,
+    pub table: ObjectId,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DropTriggerMutation {
+    pub name: String,
+    pub table: ObjectId,
+    pub if_exists: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DropViewMutation {
+    pub ids: Vec<ObjectId>,
+    pub if_exists: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DropMaterializedViewMutation {
+    pub ids: Vec<ObjectId>,
+    pub if_exists: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CreateMaterializedView {
+    pub id: ObjectId,
+    pub depends_on: Vec<ObjectId>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RefreshMaterializedViewMutation {
+    pub id: ObjectId,
+    pub concurrently: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CreateSequenceMutation {
+    pub id: ObjectId,
+    pub if_not_exists: bool,
+    pub owned_by: Option<(ObjectId, String)>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AlterSequenceMutation {
+    pub id: ObjectId,
+    pub owned_by: Option<(ObjectId, String)>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DropSequenceMutation {
+    pub ids: Vec<ObjectId>,
+    pub if_exists: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CreateDomainMutation {
+    pub id: ObjectId,
+    pub base_type: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AlterDomainMutation {
+    pub id: ObjectId,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DropDomainMutation {
+    pub ids: Vec<ObjectId>,
+    pub if_exists: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CreateTypeMutation {
+    pub id: ObjectId,
+    pub is_enum: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AlterTypeMutation {
+    pub id: ObjectId,
+    pub action: AlterTypeActionMutation,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum AlterTypeActionMutation {
+    AddValue { new_value: String },
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct CreateTable {
     pub id: ObjectId,
     pub if_not_exists: bool,
+    pub as_select: bool,
+    pub persistence: PersistenceMutation,
     pub columns: Vec<ColumnMutation>,
     pub foreign_keys: Vec<FkMutation>,
-    /// Bug 9: carry table-level constraints through to apply() so PK columns
-    /// are marked not_null even when the column definition omits the keyword.
     pub table_constraints: Vec<crate::analysis::facts::TableConstraintFact>,
 }
 
@@ -42,6 +170,7 @@ pub struct ColumnMutation {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct FkMutation {
+    pub constraint_name: Option<String>,
     pub to_table: ObjectId,
     pub from_columns: Vec<String>,
     pub to_columns: Vec<String>,
@@ -60,6 +189,8 @@ pub struct CreateIndex {
     pub table: ObjectId,
     pub if_not_exists: bool,
     pub concurrently: bool,
+    pub using_method: Option<String>,
+    pub has_predicate: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -78,13 +209,13 @@ pub struct Rename {
 pub struct DropTable {
     pub id: ObjectId,
     pub if_exists: bool,
+    pub cascade: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct DropIndex {
     pub id: ObjectId,
     pub if_exists: bool,
-    /// True if CONCURRENTLY was present.
     pub concurrently: bool,
 }
 
@@ -107,8 +238,6 @@ pub enum OpaqueMutation { DoBlock, Execute, DynamicSql }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum AlterTableActionMutation {
-    /// Bug 11: added not_null field — previously hardcoded false in apply(),
-    /// so NOT NULL constraints on ADD COLUMN were silently discarded.
     AddColumn {
         name: String,
         ty: Option<String>,
@@ -121,28 +250,33 @@ pub enum AlterTableActionMutation {
         if_exists: bool,
     },
     RenameColumn { from: String, to: String },
-    /// Bug 10: added constraint_name field — previously a synthetic __fk__...
-    /// placeholder was always used, making VALIDATE CONSTRAINT by real name
-    /// impossible to match.
     AddForeignKey {
-        /// The authored constraint name, or None if the SQL omitted CONSTRAINT <name>.
         constraint_name: Option<String>,
         to_table: ObjectId,
         from_columns: Vec<String>,
         to_columns: Vec<String>,
         not_valid: bool,
     },
-    /// ADD CONSTRAINT ... CHECK (expr)
+    AlterConstraint {
+        name: String,
+        deferrable: bool,
+    },
+    DropConstraint {
+        name: String,
+    },
     AddCheckConstraint {
         not_valid: bool,
     },
-    /// ADD CONSTRAINT ... UNIQUE
     AddUniqueConstraint,
-    /// ADD CONSTRAINT ... PRIMARY KEY
     AddPrimaryKeyConstraint,
+    AddExcludeConstraint,
     SetNotNull { column: String },
     DropNotNull { column: String },
     SetType { column: String, ty: String },
     SetDefault { column: String, default: Option<ExprIr> },
     ValidateConstraint { constraint_name: String },
+    AttachPartition { child: ObjectId },
+    DetachPartition { child: ObjectId },
+    SetStorage { column: String },
+    SetAccessMethod,
 }

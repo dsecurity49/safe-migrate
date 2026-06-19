@@ -1,106 +1,113 @@
-use crate::analysis::mutations::Mutation;
-use crate::analysis::state::AnalysisState;
-use crate::report::reporter::Reporter;
-use crate::report::violations::{Severity, Violation};
-use crate::rules::Rule;
+// FILE: ./src/rules/indexes.rs
 
-// ─────────────────────────────────────────────
-// ConcurrentIndexRule — CREATE INDEX
-// ─────────────────────────────────────────────
+use std::collections::HashMap;
+use crate::ast::identifiers::ObjectId;
+use crate::rules::Rule;
+use crate::analysis::mutations::Mutation;
+use crate::analysis::state::{LocalState, MutationResult};
+use crate::engine::config::Config;
+use crate::report::violations::{Violation, ViolationTier};
+use crate::model::relation::{RelationState, Persistence};
 
 pub struct ConcurrentIndexRule;
 
 impl Rule for ConcurrentIndexRule {
+    fn id(&self) -> &'static str { "require-concurrent-index" }
+    fn default_tier(&self) -> ViolationTier { ViolationTier::Tier1 }
+    fn recipe(&self) -> &'static str { "Index operations block writes (or both reads and writes) when executed synchronously. Add the CONCURRENTLY keyword." }
+
     fn evaluate(
-        &self,
-        mutation: &Mutation,
-        state: &AnalysisState,
-        reporter: &mut Reporter,
-    ) {
-        if let Mutation::CreateIndex(create) = mutation {
-            let inside_transaction = !state.local.transactions.is_empty();
+        &self, 
+        mutation: &Mutation, 
+        result: &MutationResult,
+        pre_relations: &HashMap<ObjectId, RelationState>,
+        _state: &LocalState, 
+        config: &Config
+    ) -> Vec<Violation> {
+        if *result == MutationResult::Skipped { return vec![]; }
 
-            if inside_transaction && create.concurrently {
-                reporter.report(Violation::new(
-                    Severity::Warning,
-                    format!(
-                        "CREATE INDEX CONCURRENTLY on '{}' is inside a transaction block. \
-                         PostgreSQL will silently downgrade this to a blocking index build. \
-                         Move it outside the transaction.",
-                        create.id
-                    ),
-                ));
-            } else if !inside_transaction && !create.concurrently {
-                reporter.report(Violation::new(
-                    Severity::Warning,
-                    format!(
-                        "CREATE INDEX on '{}' without CONCURRENTLY will take an \
-                         ACCESS EXCLUSIVE lock on table '{}', blocking all reads \
-                         and writes for the duration of the index build. \
-                         Use CREATE INDEX CONCURRENTLY instead.",
-                        create.id, create.table
-                    ),
-                ));
+        let mut violations = Vec::new();
+
+        match mutation {
+            Mutation::CreateIndex(create) => {
+                if !create.concurrently {
+                    if let Some(rel) = pre_relations.get(&create.table) {
+                        if rel.persistence == Persistence::Temporary { return violations; }
+
+                        if rel.is_stale() {
+                            let key = format!("{}_stale_{}", self.id(), create.table);
+                            violations.push(Violation {
+                                rule_id: self.id(),
+                                title: format!("Table {} statistics are stale. Lock evaluations may be inaccurate.", create.table),
+                                tier: ViolationTier::Tier2,
+                                recipe: "Run ANALYZE to ensure accurate row estimates before structural changes.",
+                                dedup_key: Some(key),
+                            });
+                        }
+
+                        let tier = match rel.estimated_rows {
+                            None => ViolationTier::Tier1,
+                            Some(r) if r >= config.tier1_threshold_rows => ViolationTier::Tier1,
+                            Some(r) if r >= config.tier2_threshold_rows => ViolationTier::Tier2,
+                            _ => ViolationTier::Tier3,
+                        };
+
+                        if tier != ViolationTier::Tier3 {
+                            let mut title = format!("Synchronous index creation on {}", create.table);
+                            if rel.is_stale() { title.push_str(" [WARNING: Based on stale statistics]"); }
+
+                            violations.push(Violation {
+                                rule_id: self.id(),
+                                title,
+                                tier,
+                                recipe: self.recipe(),
+                                dedup_key: None,
+                            });
+                        }
+                    }
+                }
             }
-        }
-    }
-}
+            Mutation::DropIndex(drop) => {
+                if !drop.concurrently {
+                    // Engine loop already resolved the N-to-many parent tables and pushed them into pre_relations
+                    for rel in pre_relations.values() {
+                        if rel.persistence == Persistence::Temporary { continue; }
 
-// ─────────────────────────────────────────────
-// DropConcurrentIndexRule — DROP INDEX
-//
-// DROP INDEX without CONCURRENTLY takes an
-// ACCESS EXCLUSIVE lock on the parent table
-// for the duration of the drop — blocking all
-// reads and writes exactly like CREATE INDEX.
-//
-// DROP INDEX CONCURRENTLY releases the lock
-// progressively, allowing concurrent access.
-//
-// Same transaction caveat as CREATE INDEX:
-// DROP INDEX CONCURRENTLY cannot run inside
-// a transaction block — PostgreSQL will error.
-// ─────────────────────────────────────────────
+                        if rel.is_stale() {
+                            let key = format!("{}_stale_{}", self.id(), rel.id);
+                            violations.push(Violation {
+                                rule_id: self.id(),
+                                title: format!("Table {} statistics are stale. Lock evaluations may be inaccurate.", rel.id),
+                                tier: ViolationTier::Tier2,
+                                recipe: "Run ANALYZE to ensure accurate row estimates before structural changes.",
+                                dedup_key: Some(key),
+                            });
+                        }
 
-pub struct DropConcurrentIndexRule;
+                        let tier = match rel.estimated_rows {
+                            None => ViolationTier::Tier1,
+                            Some(r) if r >= config.tier1_threshold_rows => ViolationTier::Tier1,
+                            Some(r) if r >= config.tier2_threshold_rows => ViolationTier::Tier2,
+                            _ => ViolationTier::Tier3,
+                        };
 
-impl Rule for DropConcurrentIndexRule {
-    fn evaluate(
-        &self,
-        mutation: &Mutation,
-        state: &AnalysisState,
-        reporter: &mut Reporter,
-    ) {
-        if let Mutation::DropIndex(drop) = mutation {
-            let inside_transaction = !state.local.transactions.is_empty();
+                        if tier != ViolationTier::Tier3 {
+                            let mut title = format!("Synchronous index drop for {} on {}", drop.id, rel.id);
+                            if rel.is_stale() { title.push_str(" [WARNING: Based on stale statistics]"); }
 
-            if inside_transaction && drop.concurrently {
-                // DROP INDEX CONCURRENTLY inside a transaction is a hard error
-                // in PostgreSQL — it won't downgrade, it will fail.
-                reporter.report(Violation::new(
-                    Severity::Error,
-                    format!(
-                        "DROP INDEX CONCURRENTLY on '{}' is inside a transaction block. \
-                         PostgreSQL does not allow CONCURRENTLY inside a transaction — \
-                         this will produce an error. Move it outside the transaction.",
-                        drop.id
-                    ),
-                ));
-            } else if !inside_transaction && !drop.concurrently {
-                reporter.report(Violation::new(
-                    Severity::Warning,
-                    format!(
-                        "DROP INDEX '{}' without CONCURRENTLY will take an ACCESS EXCLUSIVE \
-                         lock on the parent table, blocking all reads and writes. \
-                         Use DROP INDEX CONCURRENTLY instead.",
-                        drop.id
-                    ),
-                ));
+                            violations.push(Violation {
+                                rule_id: "require-concurrent-drop-index",
+                                title,
+                                tier,
+                                recipe: self.recipe(),
+                                dedup_key: None,
+                            });
+                        }
+                    }
+                }
             }
-            // inside_transaction && !concurrently: intentional blocking drop inside
-            // a transaction. No violation.
-            //
-            // !inside_transaction && concurrently: correct usage. No violation.
+            _ => {}
         }
+        violations
     }
 }

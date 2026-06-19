@@ -1,31 +1,47 @@
-// src/rules/opaque.rs
-use crate::analysis::mutations::{Mutation, OpaqueMutation};
-use crate::analysis::state::AnalysisState;
-use crate::report::reporter::Reporter;
-use crate::report::violations::{Severity, Violation};
+// FILE: ./src/rules/opaque.rs
+
+use std::collections::HashMap;
+use crate::ast::identifiers::ObjectId;
+use crate::model::relation::RelationState;
 use crate::rules::Rule;
+use crate::analysis::mutations::Mutation;
+use crate::analysis::state::{LocalState, MutationResult};
+use crate::engine::config::Config;
+use crate::report::violations::{Violation, ViolationTier};
 
-pub struct OpaqueExecutionRule;
+pub struct OpaqueDynamicSqlRule;
 
-impl Rule for OpaqueExecutionRule {
+impl Rule for OpaqueDynamicSqlRule {
+    fn id(&self) -> &'static str { "opaque-dynamic-sql" }
+    fn default_tier(&self) -> ViolationTier { ViolationTier::Tier2 }
+    fn recipe(&self) -> &'static str { "Procedural or dynamic SQL (DO blocks, EXECUTE) obscures schema mutations. Lock analysis confidence is heavily degraded." }
+
     fn evaluate(
-        &self,
-        mutation: &Mutation,
-        _state: &AnalysisState,
-        reporter: &mut Reporter,
-    ) {
-        if matches!(
-            mutation,
-            Mutation::Opaque(
-                OpaqueMutation::DoBlock
-                    | OpaqueMutation::Execute
-                    | OpaqueMutation::DynamicSql
-            )
-        ) {
-            reporter.report(Violation::new(
-                Severity::Warning,
-                "Opaque execution detected. Confidence should be treated as tainted.",
-            ));
+        &self, 
+        mutation: &Mutation, 
+        _result: &MutationResult,
+        _pre_relations: &HashMap<ObjectId, RelationState>,
+        _state: &LocalState, 
+        _config: &Config
+    ) -> Vec<Violation> {
+        let mut violations = Vec::new();
+
+        if let Mutation::Opaque(op) = mutation {
+            let block_type = match op {
+                crate::analysis::mutations::OpaqueMutation::DoBlock => "DO block",
+                crate::analysis::mutations::OpaqueMutation::Execute => "EXECUTE statement",
+                crate::analysis::mutations::OpaqueMutation::DynamicSql => "Dynamic SQL",
+            };
+
+            violations.push(Violation {
+                rule_id: self.id(),
+                title: format!("Encountered opaque {}", block_type),
+                tier: self.default_tier(),
+                recipe: self.recipe(),
+                dedup_key: None,
+            });
         }
+
+        violations
     }
 }

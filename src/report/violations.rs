@@ -1,23 +1,17 @@
-// src/report/violation.rs
+// FILE: ./src/report/violations.rs
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Severity {
-    Warning,
-    Error,
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ViolationTier {
+    Tier3, // Silent pass / Information
+    Tier2, // Warning, Share Row Exclusive
+    Tier1, // Halts build, Access Exclusive
 }
 
 #[derive(Debug, Clone)]
 pub struct Violation {
-    pub severity: Severity,
-    pub message: String,
-    // Future: pub span: TextRange (to map back to the SQL text)
-}
-
-impl Violation {
-    pub fn new(severity: Severity, message: impl Into<String>) -> Self {
-        Self {
-            severity,
-            message: message.into(),
-        }
-    }
+    pub rule_id: &'static str,
+    pub title: String,
+    pub tier: ViolationTier,
+    pub recipe: &'static str,
+    pub dedup_key: Option<String>,
 }

@@ -1,3 +1,4 @@
-// src/report/mod.rs
-pub mod reporter;
+// FILE: ./src/report/mod.rs
+
 pub mod violations;
+pub mod reporter;

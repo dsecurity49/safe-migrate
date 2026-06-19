@@ -1,61 +1,80 @@
+// FILE: ./src/model/relation.rs
+
 use crate::model::column::Column;
+use crate::ast::identifiers::ObjectId;
+use std::collections::HashSet;
+use serde::{Serialize, Deserialize};
 
-// ─────────────────────────────────────────────
-// ObjectId — canonical identity
-//
-// INVARIANT: This is the ONLY key type used in
-// AnalysisState, DbCache, and DependencyGraph.
-// QualifiedName (AST form) is NEVER used for
-// lookups — only for resolution input.
-// ─────────────────────────────────────────────
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ObjectId {
-    pub schema: String,
-    pub name: String,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RelationKind {
+    Table,
+    View,
+    MaterializedView,
 }
 
-impl ObjectId {
-    pub fn new(schema: impl Into<String>, name: impl Into<String>) -> Self {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Persistence {
+    Permanent,
+    Temporary,
+    Unlogged,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RelationState {
+    pub id: ObjectId,
+    pub columns: Vec<Column>,
+    pub generation: u64,
+    pub estimated_rows: Option<u64>,
+    pub relpages: Option<u64>, // Added to support PostgreSQL page statistics in sync.rs
+    pub kind: RelationKind,
+    pub persistence: Persistence,
+    pub triggers: HashSet<String>,
+    pub policies: HashSet<String>,
+    pub last_analyze: Option<String>,
+    pub last_autoanalyze: Option<String>,
+}
+
+impl Default for RelationState {
+    fn default() -> Self {
         Self {
-            schema: schema.into(),
-            name: name.into(),
+            id: ObjectId::new("public", "dummy"), // Fallback for struct updates
+            columns: Vec::new(),
+            generation: 0,
+            estimated_rows: Some(0),
+            relpages: None,
+            kind: RelationKind::Table,
+            persistence: Persistence::Permanent,
+            triggers: HashSet::new(),
+            policies: HashSet::new(),
+            last_analyze: None,
+            last_autoanalyze: None,
         }
     }
 }
 
-impl std::fmt::Display for ObjectId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}.{}", self.schema, self.name)
-    }
-}
-
-// ─────────────────────────────────────────────
-// RelationState — simulated live schema of one
-// table or view at a point in migration execution
-// ─────────────────────────────────────────────
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct RelationState {
-    pub id: ObjectId,
-    pub columns: Vec<Column>,
-    /// Monotonically increasing generation counter.
-    /// Incremented each time a new incarnation of this ObjectId is created
-    /// (i.e. when CREATE TABLE/VIEW overwrites a tombstone with the same name).
-    /// Graph edges carry the generation of the relation they were created for.
-    /// Rules filter edges whose generation does not match the current relation's
-    /// generation — preventing ABA phantom dependencies.
-    pub generation: u64,
-}
-
 impl RelationState {
-    /// Create a new relation with the given identity and generation.
-    pub fn new(id: ObjectId, generation: u64) -> Self {
-        Self { id, columns: Vec::new(), generation }
+    pub fn new(
+        id: ObjectId,
+        generation: u64,
+        estimated_rows: Option<u64>,
+        kind: RelationKind,
+        persistence: Persistence
+    ) -> Self {
+        Self {
+            id,
+            columns: Vec::new(),
+            generation,
+            estimated_rows,
+            relpages: None,
+            kind,
+            persistence,
+            triggers: HashSet::new(),
+            policies: HashSet::new(),
+            last_analyze: None,
+            last_autoanalyze: None,
+        }
     }
 
-    /// Apply a column-level mutation to this relation's live state.
-    /// Called by AnalysisState::apply() after rule evaluation.
     pub fn apply_column_action(&mut self, action: &ColumnAction) {
         match action {
             ColumnAction::Add { name, data_type, not_null, default } => {
@@ -65,6 +84,7 @@ impl RelationState {
                         data_type: data_type.clone(),
                         default: default.clone(),
                         is_nullable: !not_null,
+                        avg_width: None,
                     });
                 }
             }
@@ -99,73 +119,50 @@ impl RelationState {
         }
     }
 
-    /// Returns true if a column with this name exists in the current state.
     pub fn has_column(&self, name: &str) -> bool {
         self.columns.iter().any(|c| c.name == name)
     }
 
-    /// Returns the column with this name if it exists.
     pub fn get_column(&self, name: &str) -> Option<&Column> {
         self.columns.iter().find(|c| c.name == name)
     }
+
+    pub fn is_stale(&self) -> bool {
+        self.last_analyze.is_none() && self.last_autoanalyze.is_none()
+    }
 }
 
-// ─────────────────────────────────────────────
-// ColumnAction — the resolved column-level
-// mutation passed from state.apply() into
-// RelationState::apply_column_action().
-//
-// This is separate from AlterTableActionMutation
-// to keep the model layer independent of the
-// analysis layer.
-// ─────────────────────────────────────────────
-
+// NOTE: ColumnAction does not need Serialize/Deserialize as it is only used during the in-memory execution loop!
 #[derive(Debug, Clone, PartialEq)]
 pub enum ColumnAction {
     Add {
         name: String,
         data_type: Option<String>,
         not_null: bool,
-        /// Default expression for this column.
-        /// Stored on Column::default for future VolatileDefaultRule evaluation.
         default: Option<crate::analysis::expr_ir::ExprIr>,
     },
     Drop {
         name: String,
     },
-    /// RENAME COLUMN old TO new
     Rename {
         from: String,
         to: String,
     },
-    /// ALTER COLUMN name SET NOT NULL
     SetNotNull {
         name: String,
     },
-    /// ALTER COLUMN name DROP NOT NULL
     DropNotNull {
         name: String,
     },
-    /// ALTER COLUMN name SET DATA TYPE ty
     SetType {
         name: String,
         data_type: String,
     },
-    /// ALTER COLUMN name SET DEFAULT expr
     SetDefault {
         name: String,
         default: Option<crate::analysis::expr_ir::ExprIr>,
     },
 }
-
-// ─────────────────────────────────────────────
-// RelationOverlay — tombstone model
-//
-// INVARIANT: Dropped objects are NEVER removed
-// from state. They are shadowed as Dropped so
-// that subsequent statements referencing the
-// same object can be correctly diagnosed.
-// ─────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum RelationOverlay {

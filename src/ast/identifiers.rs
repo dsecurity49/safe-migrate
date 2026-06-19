@@ -1,38 +1,64 @@
-// AST identity types
-//
-// This module contains ONLY syntactic forms —
-// types that come directly off the AST before
-// any resolution has occurred.
-//
-// INVARIANT: QualifiedName is NEVER used for
-// state lookups. It is always resolved into an
-// ObjectId (defined in crate::model::relation)
-// by the Resolver before touching AnalysisState.
-// ─────────────────────────────────────────────
+// FILE: ./src/ast/identifiers.rs
 
-// Re-export ObjectId here so the rest of the
-// analysis layer can use a single import path:
-//   use crate::ast::identifiers::{ObjectId, QualifiedName};
-// without breaking the canonical ownership in
-// model::relation.
-pub use crate::model::relation::ObjectId;
+use serde::{Serialize, Deserialize};
 
-/// A raw, unresolved identifier extracted directly from the AST.
-///
-/// `schema` is `None` when the SQL did not include a schema qualifier
-/// (e.g. `users` vs `public.users`). The Resolver expands the `None`
-/// case using the current simulated `search_path`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Ident {
+    pub text: String,
+    pub quoted: bool,
+}
+
+impl Ident {
+    pub fn new(text: impl Into<String>, quoted: bool) -> Self {
+        Self {
+            text: text.into(),
+            quoted,
+        }
+    }
+
+    /// Resolves the identifier exactly as PostgreSQL would:
+    /// Quoted identifiers preserve exact casing; unquoted identifiers are case-folded to lowercase.
+    pub fn resolve(&self) -> String {
+        if self.quoted {
+            self.text.clone()
+        } else {
+            self.text.to_lowercase()
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct QualifiedName {
-    pub schema: Option<String>,
-    pub name: String,
+    pub schema: Option<Ident>,
+    pub name: Ident,
 }
 
 impl QualifiedName {
-    pub fn new(schema: Option<String>, name: impl Into<String>) -> Self {
+    pub fn new(schema: Option<Ident>, name: Ident) -> Self {
+        Self { schema, name }
+    }
+}
+
+/// ObjectId represents a fully resolved, state-machine tracked database object.
+/// By the time an ObjectId is constructed, its schema and name must already be properly case-folded.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ObjectId {
+    pub schema: String,
+    pub name: String,
+}
+
+impl ObjectId {
+    pub fn new(schema: impl Into<String>, name: impl Into<String>) -> Self {
         Self {
-            schema,
+            schema: schema.into(),
             name: name.into(),
         }
     }
 }
+
+impl std::fmt::Display for ObjectId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}", self.schema, self.name)
+    }
+}
+

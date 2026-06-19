@@ -1,16 +1,15 @@
-// src/db/cache.rs
-use crate::model::relation::{ObjectId, RelationState};
-use std::collections::HashMap;
+// FILE: src/db/cache.rs
 
-/// A read-only representation of the target database's state *before*
-/// the migration begins.
-///
-/// INVARIANT: This cache is NEVER mutated by the rules or the apply phase.
-/// It is populated once at startup (from a live database or test fixtures)
-/// and then only read.
-#[derive(Debug, Clone)]
+use std::collections::HashMap;
+use crate::ast::identifiers::ObjectId;
+use crate::model::relation::RelationState;
+use serde::{Serialize, Deserialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DbCache {
-    relations: HashMap<ObjectId, RelationState>,
+    // Tell Serde to convert the complex HashMap into a flat JSON array
+    #[serde(with = "vectorize")]
+    pub relations: HashMap<ObjectId, RelationState>,
 }
 
 impl DbCache {
@@ -20,26 +19,40 @@ impl DbCache {
         }
     }
 
-    pub fn get_relation(&self, id: &ObjectId) -> Option<&RelationState> {
-        self.relations.get(id)
+    pub fn insert_baseline(&mut self, id: ObjectId, state: RelationState) {
+        self.relations.insert(id, state);
     }
 
-    /// Insert a baseline relation into the cache.
-    ///
-    /// Used by tests and by the database introspection layer (future) to
-    /// populate the pre-migration schema snapshot.
-    pub fn insert(&mut self, state: RelationState) {
-        self.relations.insert(state.id.clone(), state);
-    }
-
-    /// Iterate all baseline relations.
-    ///
-    /// Bug 2 fix: used by AnalysisState::new() to seed LocalState so rules
-    /// see pre-existing tables without requiring a separate DbCache lookup
-    /// path inside every rule. The previous design left DbCache permanently
-    /// invisible to get_relation() — any object that existed only in the
-    /// cache was never found by rules or state lookups.
     pub fn baseline_relations(&self) -> impl Iterator<Item = (&ObjectId, &RelationState)> {
         self.relations.iter()
     }
 }
+
+// Helper module to let Serde handle Structs as HashMap Keys
+mod vectorize {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::HashMap;
+    use std::hash::Hash;
+
+    pub fn serialize<K, V, S>(map: &HashMap<K, V>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        K: Serialize,
+        V: Serialize,
+        S: Serializer,
+    {
+        let vec: Vec<(&K, &V)> = map.iter().collect();
+        vec.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, K, V, D>(deserializer: D) -> Result<HashMap<K, V>, D::Error>
+    where
+        K: Deserialize<'de> + Eq + Hash,
+        V: Deserialize<'de>,
+        D: Deserializer<'de>,
+    {
+        let vec: Vec<(K, V)> = Vec::deserialize(deserializer)?;
+        Ok(vec.into_iter().collect())
+    }
+}
+
+

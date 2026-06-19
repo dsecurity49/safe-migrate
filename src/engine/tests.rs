@@ -1,1509 +1,542 @@
+// FILE: ./src/engine/tests.rs
+
+#![allow(unused_imports)]
+
 #[cfg(test)]
-mod tests {
-    use crate::analysis::expr_ir::ExprIr;
-    use crate::analysis::facts::{
-        AlterTableActionFact, ColumnFact, FkFact, StatementFact, TableConstraintFact,
-    };
-    use crate::analysis::resolver::Resolver;
-    use crate::analysis::state::AnalysisState;
-    use crate::ast::identifiers::{ObjectId, QualifiedName};
+pub mod helpers {
+    use crate::engine::config::Config;
+    use crate::engine::engine::SafeMigrateEngine;
     use crate::db::cache::DbCache;
-    use crate::model::relation::RelationOverlay;
-    use crate::report::reporter::Reporter;
-    use crate::rules::constraints::{
-        AddCheckConstraintRule, AddUniqueConstraintRule,
-        MissingValidateConstraintRule, NotValidConstraintRule, SetNotNullRule,
-        SafeAddColumnRule,
-    };
-    use crate::rules::destructive::DestructiveDropRule;
-    use crate::rules::expressions::{SetTypeRule, VolatileDefaultRule};
-    use crate::rules::idempotency::{
-        CreateTableIdempotencyRule,
-        DropColumnIdempotencyRule, DropIndexIdempotencyRule, DropTableIdempotencyRule,
-    };
-    use crate::rules::indexes::{ConcurrentIndexRule, DropConcurrentIndexRule};
-    use crate::rules::Rule;
+    use crate::ast::identifiers::ObjectId;
 
-    // ─────────────────────────────────────────────
-    // Helpers
-    // ─────────────────────────────────────────────
-
-    fn fresh_state() -> AnalysisState {
-        AnalysisState::new(DbCache::new())
+    pub fn setup_engine() -> SafeMigrateEngine {
+        let config = Config::default(); // Tier1: 100k, Tier2: 10k, Toast: 2048 bytes
+        SafeMigrateEngine::new(config)
     }
 
-    fn object_id(schema: &str, name: &str) -> ObjectId {
+    pub fn object_id(schema: &str, name: &str) -> ObjectId {
         ObjectId::new(schema, name)
     }
+}
 
-    fn apply_fact(state: &mut AnalysisState, fact: &StatementFact) {
-        for m in Resolver::resolve(fact, state) {
-            state.apply(m);
+// ─────────────────────────────────────────────
+// 1. State Machine Skip Guards (No-Op Tests)
+// ─────────────────────────────────────────────
+#[cfg(test)]
+mod state_machine_guards_tests {
+    use super::helpers::*;
+    use crate::analysis::state::AnalysisState;
+    use crate::model::relation::{RelationState, RelationOverlay, RelationKind, Persistence};
+
+    #[test]
+    fn test_skip_guard_create_table() {
+        let engine = setup_engine();
+        let mut state = AnalysisState::new(crate::db::cache::DbCache::new());
+        engine.analyze("CREATE TABLE t(id INT);", &mut state).unwrap();
+        // Skip guard prevents the second statement from overwriting 'id' with 'new_col'
+        engine.analyze("CREATE TABLE IF NOT EXISTS t(new_col INT);", &mut state).unwrap();
+
+        let rel = state.get_relation(&object_id("public", "t")).unwrap();
+        if let RelationOverlay::Present(r) = rel {
+            assert!(r.has_column("id"));
+            assert!(!r.has_column("new_col"));
         }
     }
 
-    /// Build a CreateTable fact. Updated: now includes `table_constraints` field.
-    fn create_table_fact(schema: Option<&str>, name: &str) -> StatementFact {
-        StatementFact::CreateTable {
-            name: QualifiedName::new(schema.map(|s| s.to_string()), name),
-            if_not_exists: false,
-            columns: Vec::new(),
-            foreign_keys: Vec::new(),
-            table_constraints: Vec::new(),      // Bug 9: new required field
+    #[test]
+    fn test_skip_guard_add_column() {
+        let engine = setup_engine();
+        let mut state = AnalysisState::new(crate::db::cache::DbCache::new());
+        engine.analyze("CREATE TABLE t(id INT);", &mut state).unwrap();
+        engine.analyze("ALTER TABLE t ADD COLUMN IF NOT EXISTS id TEXT;", &mut state).unwrap();
+
+        let rel = state.get_relation(&object_id("public", "t")).unwrap();
+        if let RelationOverlay::Present(r) = rel {
+            let col = r.get_column("id").unwrap();
+            assert_eq!(col.data_type.as_deref(), Some("INT")); // Must not be overwritten to TEXT
         }
     }
 
-    fn fk_fact(references_name: &str) -> FkFact {
-        FkFact {
-            references: QualifiedName::new(None, references_name),
-            from_columns: Vec::new(),
-            to_columns: Vec::new(),
+    #[test]
+    fn test_skip_guard_drop_column() {
+        let engine = setup_engine();
+        let mut state = AnalysisState::new(crate::db::cache::DbCache::new());
+        engine.analyze("CREATE TABLE t(id INT);", &mut state).unwrap();
+        // Should bypass without panicking
+        let result = engine.analyze("ALTER TABLE t DROP COLUMN IF EXISTS missing;", &mut state);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_skip_guard_drop_missing_objects() {
+        let engine = setup_engine();
+        let mut state = AnalysisState::new(crate::db::cache::DbCache::new());
+        
+        assert!(engine.analyze("DROP TABLE IF EXISTS missing;", &mut state).is_ok());
+        assert!(engine.analyze("DROP VIEW IF EXISTS missing;", &mut state).is_ok());
+        assert!(engine.analyze("DROP MATERIALIZED VIEW IF EXISTS missing;", &mut state).is_ok());
+        assert!(engine.analyze("DROP INDEX IF EXISTS missing;", &mut state).is_ok());
+        assert!(engine.analyze("DROP SEQUENCE IF EXISTS missing;", &mut state).is_ok());
+        assert!(engine.analyze("DROP DOMAIN IF EXISTS missing;", &mut state).is_ok());
+    }
+
+    #[test]
+    fn test_skip_guard_create_index() {
+        let engine = setup_engine();
+        let mut state = AnalysisState::new(crate::db::cache::DbCache::new());
+        engine.analyze("CREATE TABLE t(id int);", &mut state).unwrap();
+        engine.analyze("CREATE INDEX idx ON t(id);", &mut state).unwrap();
+        
+        let edge_count = state.local.graph.indexes.len();
+        engine.analyze("CREATE INDEX IF NOT EXISTS idx ON t(id);", &mut state).unwrap();
+        assert_eq!(state.local.graph.indexes.len(), edge_count, "Duplicate index creation should be skipped");
+    }
+
+    #[test]
+    fn test_skip_guard_create_sequence() {
+        let engine = setup_engine();
+        let mut state = AnalysisState::new(crate::db::cache::DbCache::new());
+        engine.analyze("CREATE SEQUENCE s;", &mut state).unwrap();
+        engine.analyze("CREATE SEQUENCE IF NOT EXISTS s OWNED BY foo.bar;", &mut state).unwrap();
+        
+        assert!(state.local.graph.sequences.is_empty(), "Second creation skipped, ownership should not be added");
+    }
+}
+
+// ─────────────────────────────────────────────
+// 2. Rule Evaluation Exhaustion
+// ─────────────────────────────────────────────
+#[cfg(test)]
+mod rule_evaluation_tests {
+    use super::helpers::*;
+    use crate::analysis::state::AnalysisState;
+    use crate::report::violations::ViolationTier;
+    use crate::model::relation::{RelationState, RelationKind, Persistence};
+    use crate::model::column::Column;
+
+    #[test]
+    fn test_rule_idempotency() {
+        let engine = setup_engine();
+        let mut state = AnalysisState::new(crate::db::cache::DbCache::new());
+        let violations = engine.analyze("CREATE TABLE t(id int); DROP TABLE t; CREATE INDEX i ON t(id);", &mut state).unwrap();
+        
+        let idem: Vec<_> = violations.into_iter().filter(|v| v.rule_id == "missing-idempotency").collect();
+        assert_eq!(idem.len(), 3);
+        
+        let safe = engine.analyze("CREATE TABLE IF NOT EXISTS x(id int); DROP TABLE IF EXISTS x; CREATE INDEX IF NOT EXISTS ix ON x(id);", &mut state).unwrap();
+        assert!(!safe.iter().any(|v| v.rule_id == "missing-idempotency"));
+    }
+
+    #[test]
+    fn test_rule_cascading_drop() {
+        let engine = setup_engine();
+        let mut state = AnalysisState::new(crate::db::cache::DbCache::new());
+        
+        engine.analyze("CREATE TABLE data(id INT); CREATE VIEW v AS SELECT * FROM data;", &mut state).unwrap();
+        let v1 = engine.analyze("DROP TABLE data CASCADE;", &mut state).unwrap();
+        assert!(v1.iter().any(|v| v.rule_id == "destructive-cascade" && v.tier == ViolationTier::Tier1));
+
+        engine.analyze("CREATE TABLE safe(id INT);", &mut state).unwrap();
+        let v2 = engine.analyze("DROP TABLE safe CASCADE;", &mut state).unwrap();
+        assert!(!v2.iter().any(|v| v.rule_id == "destructive-cascade"), "Unreferenced table cascade is safe");
+    }
+
+    #[test]
+    fn test_rule_size_aware_toast_escalation() {
+        let engine = setup_engine();
+        let mut cache = crate::db::cache::DbCache::new();
+        
+        // Setup Tier 2 table (50k rows) with a wide TOAST column (3000 avg bytes)
+        let tid = object_id("public", "t_toast");
+        let mut rel = RelationState::new(tid.clone(), 0, Some(50_000), RelationKind::Table, Persistence::Permanent);
+        rel.columns.push(Column { name: "data".into(), data_type: Some("text".into()), is_nullable: true, default: None, avg_width: Some(3000) });
+        cache.insert_baseline(tid, rel);
+        let mut state = AnalysisState::new(cache);
+
+        let violations = engine.analyze("ALTER TABLE t_toast ADD COLUMN c INT DEFAULT random();", &mut state).unwrap();
+        let v = violations.iter().find(|v| v.rule_id == "size-aware-add-column" && v.dedup_key.is_none()).unwrap();
+        
+        // Because of the TOAST column, it should escalate from Tier 2 -> Tier 1
+        assert_eq!(v.tier, ViolationTier::Tier1);
+        assert!(v.title.contains("Escalated due to wide TOAST"));
+    }
+
+    #[test]
+    fn test_rule_blocking_constraint_check_and_fk() {
+        let engine = setup_engine();
+        let mut cache = crate::db::cache::DbCache::new();
+        cache.insert_baseline(object_id("public", "t"), RelationState::new(object_id("public", "t"), 0, Some(500_000), RelationKind::Table, Persistence::Permanent));
+        let mut state = AnalysisState::new(cache);
+
+        let v1 = engine.analyze("ALTER TABLE t ADD CONSTRAINT c CHECK (id > 0);", &mut state).unwrap();
+        assert!(v1.iter().any(|v| v.rule_id == "blocking-constraint" && v.tier == ViolationTier::Tier1 && v.dedup_key.is_none()));
+
+        let v2 = engine.analyze("ALTER TABLE t ADD CONSTRAINT c CHECK (id > 0) NOT VALID;", &mut state).unwrap();
+        assert!(!v2.iter().any(|v| v.rule_id == "blocking-constraint" && v.dedup_key.is_none()));
+    }
+
+    #[test]
+    fn test_rule_blocking_constraint_pk_and_unique() {
+        let engine = setup_engine();
+        let mut cache = crate::db::cache::DbCache::new();
+        cache.insert_baseline(object_id("public", "t"), RelationState::new(object_id("public", "t"), 0, Some(500_000), RelationKind::Table, Persistence::Permanent));
+        let mut state = AnalysisState::new(cache);
+
+        let v1 = engine.analyze("ALTER TABLE t ADD PRIMARY KEY (id);", &mut state).unwrap();
+        assert!(v1.iter().any(|v| v.rule_id == "blocking-index-constraint" && v.tier == ViolationTier::Tier1 && v.dedup_key.is_none()));
+    }
+
+    #[test]
+    fn test_rule_concurrent_index() {
+        let engine = setup_engine();
+        let mut cache = crate::db::cache::DbCache::new();
+        cache.insert_baseline(object_id("public", "t"), RelationState::new(object_id("public", "t"), 0, Some(500_000), RelationKind::Table, Persistence::Permanent));
+        let mut state = AnalysisState::new(cache);
+
+        let v1 = engine.analyze("CREATE INDEX i ON t(id);", &mut state).unwrap();
+        assert!(v1.iter().any(|v| v.rule_id == "require-concurrent-index" && v.tier == ViolationTier::Tier1 && v.dedup_key.is_none()));
+        
+        let v2 = engine.analyze("CREATE INDEX CONCURRENTLY i2 ON t(id);", &mut state).unwrap();
+        assert!(!v2.iter().any(|v| v.rule_id == "require-concurrent-index" && v.dedup_key.is_none()));
+    }
+
+    #[test]
+    fn test_rule_temporary_table_bypass() {
+        let engine = setup_engine();
+        let mut state = AnalysisState::new(crate::db::cache::DbCache::new());
+        let v = engine.analyze("CREATE TEMPORARY TABLE temp(id int); CREATE INDEX i ON temp(id); ALTER TABLE temp ADD UNIQUE(id);", &mut state).unwrap();
+        
+        assert!(!v.iter().any(|v| v.rule_id == "require-concurrent-index"));
+        assert!(!v.iter().any(|v| v.rule_id == "blocking-index-constraint"));
+    }
+
+    #[test]
+    fn test_rule_mat_view_refresh() {
+        let engine = setup_engine();
+        let mut cache = crate::db::cache::DbCache::new();
+        cache.insert_baseline(object_id("public", "mv"), RelationState::new(object_id("public", "mv"), 0, Some(150_000), RelationKind::MaterializedView, Persistence::Permanent));
+        let mut state = AnalysisState::new(cache);
+
+        let v1 = engine.analyze("REFRESH MATERIALIZED VIEW mv;", &mut state).unwrap();
+        assert!(v1.iter().any(|v| v.rule_id == "blocking-mat-view-refresh" && v.tier == ViolationTier::Tier1 && v.dedup_key.is_none()));
+        
+        let v2 = engine.analyze("REFRESH MATERIALIZED VIEW CONCURRENTLY mv;", &mut state).unwrap();
+        assert!(!v2.iter().any(|v| v.rule_id == "blocking-mat-view-refresh" && v.dedup_key.is_none()));
+    }
+
+    #[test]
+    fn test_rule_partition_attach_detach() {
+        let engine = setup_engine();
+        let mut cache = crate::db::cache::DbCache::new();
+        cache.insert_baseline(object_id("public", "p"), RelationState::new(object_id("public", "p"), 0, Some(500_000), RelationKind::Table, Persistence::Permanent));
+        let mut state = AnalysisState::new(cache);
+
+        engine.analyze("CREATE TABLE c(id int);", &mut state).unwrap();
+        let v1 = engine.analyze("ALTER TABLE p ATTACH PARTITION c FOR VALUES IN (1);", &mut state).unwrap();
+        assert!(v1.iter().any(|v| v.rule_id == "blocking-partition-mutation" && v.tier == ViolationTier::Tier1 && v.dedup_key.is_none()));
+
+        let v2 = engine.analyze("ALTER TABLE p DETACH PARTITION c;", &mut state).unwrap();
+        assert!(v2.iter().any(|v| v.rule_id == "blocking-partition-mutation" && v.tier == ViolationTier::Tier1 && v.dedup_key.is_none()));
+    }
+
+    #[test]
+    fn test_rule_concurrent_inside_txn() {
+        let engine = setup_engine();
+        let mut state = AnalysisState::new(crate::db::cache::DbCache::new());
+        
+        let v = engine.analyze("BEGIN; CREATE INDEX CONCURRENTLY i ON t(id); DROP INDEX CONCURRENTLY i; COMMIT;", &mut state).unwrap();
+        let count = v.iter().filter(|v| v.rule_id == "concurrent-in-transaction").count();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn test_rule_opaque_sql() {
+        let engine = setup_engine();
+        let mut state = AnalysisState::new(crate::db::cache::DbCache::new());
+        let v = engine.analyze("EXECUTE plan;", &mut state).unwrap();
+        assert_eq!(v.iter().filter(|v| v.rule_id == "opaque-dynamic-sql").count(), 1);
+        assert_eq!(state.local.confidence, crate::analysis::state::Confidence::Tainted);
+    }
+
+    #[test]
+    fn test_rule_volatile_default_create() {
+        let engine = setup_engine();
+        let mut state = AnalysisState::new(crate::db::cache::DbCache::new());
+        let v = engine.analyze("CREATE TABLE t(id int DEFAULT random());", &mut state).unwrap();
+        assert!(v.iter().any(|v| v.rule_id == "volatile-default" && v.tier == ViolationTier::Tier3));
+    }
+}
+
+// ─────────────────────────────────────────────
+// 3. Graph & State Topology Exhaustion
+// ─────────────────────────────────────────────
+#[cfg(test)]
+mod graph_topology_tests {
+    use super::helpers::*;
+    use crate::analysis::state::AnalysisState;
+    use crate::model::relation::RelationOverlay;
+    use crate::model::types::{TypeOverlay, TypeKind};
+    use crate::model::sequence::SequenceOverlay;
+
+    #[test]
+    fn test_topology_create_table_as() {
+        let engine = setup_engine();
+        let mut state = AnalysisState::new(crate::db::cache::DbCache::new());
+        engine.analyze("CREATE TABLE t AS SELECT 1 AS id;", &mut state).unwrap();
+        let rel = state.get_relation(&object_id("public", "t")).unwrap();
+        if let RelationOverlay::Present(r) = rel {
+            assert_eq!(r.estimated_rows, None); // Should default to None (Unknown)
         }
     }
 
-    fn alter_table_fact(table: &str, actions: Vec<AlterTableActionFact>) -> StatementFact {
-        StatementFact::AlterTable {
-            name: QualifiedName::new(None, table),
-            actions,
+    #[test]
+    fn test_topology_rename_table_and_column() {
+        let engine = setup_engine();
+        let mut state = AnalysisState::new(crate::db::cache::DbCache::new());
+        engine.analyze("CREATE TABLE a(col1 INT); ALTER TABLE a RENAME TO b; ALTER TABLE b RENAME COLUMN col1 TO col2;", &mut state).unwrap();
+        
+        assert!(!state.relation_is_present(&object_id("public", "a")));
+        assert!(state.relation_is_present(&object_id("public", "b")));
+        
+        let rel = state.get_relation(&object_id("public", "b")).unwrap();
+        if let RelationOverlay::Present(r) = rel {
+            assert!(r.has_column("col2"));
+            assert!(!r.has_column("col1"));
+        }
+        assert!(state.local.graph.renames.iter().any(|e| e.from == object_id("public", "a") && e.to == object_id("public", "b")));
+    }
+
+    #[test]
+    fn test_topology_rename_index() {
+        let engine = setup_engine();
+        let mut state = AnalysisState::new(crate::db::cache::DbCache::new());
+        engine.analyze("CREATE TABLE t(id int); CREATE INDEX i ON t(id); ALTER INDEX i RENAME TO i2;", &mut state).unwrap();
+        
+        assert!(state.local.graph.indexes.iter().any(|i| i.index_id == object_id("public", "i2")));
+        assert!(!state.local.graph.indexes.iter().any(|i| i.index_id == object_id("public", "i")));
+    }
+
+    #[test]
+    fn test_topology_foreign_key_graph() {
+        let engine = setup_engine();
+        let mut state = AnalysisState::new(crate::db::cache::DbCache::new());
+        engine.analyze("CREATE TABLE p(id int); CREATE TABLE c(p_id int); ALTER TABLE c ADD CONSTRAINT fk FOREIGN KEY (p_id) REFERENCES p(id);", &mut state).unwrap();
+        
+        assert!(state.local.graph.foreign_keys.iter().any(|fk| fk.from_table == object_id("public", "c") && fk.to_table == object_id("public", "p")));
+        
+        engine.analyze("ALTER TABLE c DROP CONSTRAINT fk;", &mut state).unwrap();
+        assert!(state.local.graph.foreign_keys.is_empty());
+    }
+
+    #[test]
+    fn test_topology_view_graph() {
+        let engine = setup_engine();
+        let mut state = AnalysisState::new(crate::db::cache::DbCache::new());
+        engine.analyze("CREATE TABLE t(id int); CREATE VIEW v AS SELECT * FROM t;", &mut state).unwrap();
+        
+        assert!(state.local.graph.views.iter().any(|v| v.view_id == object_id("public", "v") && v.depends_on.contains(&object_id("public", "t"))));
+        
+        engine.analyze("DROP VIEW v;", &mut state).unwrap();
+        assert!(state.local.graph.views.is_empty());
+    }
+
+    #[test]
+    fn test_topology_sequence_graph() {
+        let engine = setup_engine();
+        let mut state = AnalysisState::new(crate::db::cache::DbCache::new());
+        engine.analyze("CREATE TABLE t(id int); CREATE SEQUENCE s OWNED BY t.id;", &mut state).unwrap();
+        
+        assert!(state.local.graph.sequences.iter().any(|s| s.sequence_id == object_id("public", "s") && s.table_id == object_id("public", "t")));
+        
+        engine.analyze("DROP SEQUENCE s;", &mut state).unwrap();
+        assert!(matches!(state.local.sequences.get(&object_id("public", "s")), Some(SequenceOverlay::Dropped)));
+        assert!(state.local.graph.sequences.is_empty(), "Drop sequence must remove graph edges");
+    }
+
+    #[test]
+    fn test_topology_type_and_domain() {
+        let engine = setup_engine();
+        let mut state = AnalysisState::new(crate::db::cache::DbCache::new());
+        engine.analyze("CREATE TYPE e AS ENUM('a'); ALTER TYPE e ADD VALUE 'b'; CREATE DOMAIN d AS INT; ALTER DOMAIN d SET DEFAULT 1;", &mut state).unwrap();
+        
+        if let Some(TypeOverlay::Present(t)) = state.local.types.get(&object_id("public", "e")) {
+            if let TypeKind::Enum { variants } = &t.kind { assert!(variants.contains(&"b".to_string())); }
+        } else { panic!("Type e missing"); }
+
+        engine.analyze("DROP DOMAIN d;", &mut state).unwrap();
+        assert!(matches!(state.local.types.get(&object_id("public", "d")), Some(TypeOverlay::Dropped)));
+    }
+
+    #[test]
+    fn test_topology_trigger_and_policy() {
+        let engine = setup_engine();
+        let mut state = AnalysisState::new(crate::db::cache::DbCache::new());
+        engine.analyze("CREATE TABLE t(id int); CREATE POLICY p ON t FOR SELECT USING(true); CREATE TRIGGER tr BEFORE INSERT ON t EXECUTE FUNCTION f();", &mut state).unwrap();
+        
+        if let Some(RelationOverlay::Present(r)) = state.get_relation(&object_id("public", "t")) {
+            assert!(r.policies.contains("p"));
+            assert!(r.triggers.contains("tr"));
+        }
+        
+        engine.analyze("DROP POLICY p ON t; DROP TRIGGER tr ON t;", &mut state).unwrap();
+        if let Some(RelationOverlay::Present(r)) = state.get_relation(&object_id("public", "t")) {
+            assert!(!r.policies.contains("p"));
+            assert!(!r.triggers.contains("tr"));
         }
     }
 
-    fn col_fact(name: &str, ty: &str, not_null: bool, pk: bool) -> ColumnFact {
-        ColumnFact {
-            name: name.to_string(),
-            ty: Some(ty.to_string()),
-            not_null,
-            is_primary_key: pk,
-            default: None,
+    #[test]
+    fn test_topology_search_path() {
+        let engine = setup_engine();
+        let mut state = AnalysisState::new(crate::db::cache::DbCache::new());
+        engine.analyze("SET search_path TO myschema, public; CREATE TABLE t(id int);", &mut state).unwrap();
+        assert!(state.relation_is_present(&object_id("myschema", "t")));
+    }
+
+    #[test]
+    fn test_state_alter_column_types() {
+        let engine = setup_engine();
+        let mut state = AnalysisState::new(crate::db::cache::DbCache::new());
+        engine.analyze("CREATE TABLE t(id INT NOT NULL); ALTER TABLE t ALTER COLUMN id SET DATA TYPE text; ALTER TABLE t ALTER COLUMN id DROP NOT NULL; ALTER TABLE t ALTER COLUMN id SET DEFAULT 'x';", &mut state).unwrap();
+        
+        if let Some(RelationOverlay::Present(r)) = state.get_relation(&object_id("public", "t")) {
+            let col = r.get_column("id").unwrap();
+            assert_eq!(col.data_type.as_deref(), Some("text"));
+            assert!(col.is_nullable);
+            assert!(col.default.is_some());
         }
     }
 
-    /// Build an AddForeignKey action fact.
-    /// Updated: now includes `constraint_name` field (Bug 10).
-    fn add_fk_fact(
-        constraint_name: Option<&str>,
-        references: &str,
-        from_cols: Vec<&str>,
-        to_cols: Vec<&str>,
-        not_valid: bool,
-    ) -> AlterTableActionFact {
-        AlterTableActionFact::AddForeignKey {
-            constraint_name: constraint_name.map(|s| s.to_string()),
-            references: QualifiedName::new(None, references),
-            from_columns: from_cols.into_iter().map(|s| s.to_string()).collect(),
-            to_columns: to_cols.into_iter().map(|s| s.to_string()).collect(),
-            not_valid,
-        }
+    #[test]
+    fn test_state_storage_and_access_method() {
+        let engine = setup_engine();
+        let mut state = AnalysisState::new(crate::db::cache::DbCache::new());
+        // Just verify parsing and silent state pass-through
+        assert!(engine.analyze("CREATE TABLE t(id int); ALTER TABLE t ALTER COLUMN id SET STORAGE MAIN; ALTER TABLE t SET ACCESS METHOD heap;", &mut state).is_ok());
     }
+}
 
-    /// Build an AddColumn action fact.
-    /// Updated: now includes `not_null` field (Bug 11).
-    fn add_col_fact(
-        name: &str,
-        ty: &str,
-        if_not_exists: bool,
-        not_null: bool,
-        default: Option<ExprIr>,
-    ) -> AlterTableActionFact {
-        AlterTableActionFact::AddColumn {
-            name: name.to_string(),
-            ty: Some(ty.to_string()),
-            if_not_exists,
-            not_null,
-            default,
-        }
-    }
-
-    // ─────────────────────────────────────────────
-    // Existing tests — updated for new field shapes
-    // ─────────────────────────────────────────────
+// ─────────────────────────────────────────────
+// 4. Transaction Lifecycle Rollback Exhaustion
+// ─────────────────────────────────────────────
+#[cfg(test)]
+mod transaction_lifecycle_tests {
+    use super::helpers::*;
+    use crate::analysis::state::AnalysisState;
 
     #[test]
-    fn test_destructive_drop_rule_tombstones() {
-        let mut state = fresh_state();
-        let mut reporter = Reporter::new();
-        let rules: Vec<Box<dyn Rule>> = vec![Box::new(DestructiveDropRule)];
-
-        let fact = StatementFact::DropTable {
-            name: QualifiedName::new(None, "users"),
-            if_exists: false,
-        };
-        let mutations = Resolver::resolve(&fact, &state);
-        for m in mutations {
-            for rule in &rules { rule.evaluate(&m, &state, &mut reporter); }
-            state.apply(m);
-        }
-
-        let id = object_id("public", "users");
-        assert!(matches!(state.get_relation(&id), Some(RelationOverlay::Dropped)));
-        assert_eq!(reporter.violations.len(), 1);
-        assert!(reporter.violations[0].message.contains("public.users"));
+    fn test_txn_commit() {
+        let engine = setup_engine();
+        let mut state = AnalysisState::new(crate::db::cache::DbCache::new());
+        engine.analyze("BEGIN; CREATE TABLE t(id int); COMMIT;", &mut state).unwrap();
+        assert!(state.local.transactions.is_empty());
+        assert!(state.relation_is_present(&object_id("public", "t")));
     }
 
     #[test]
-    fn test_begin_rollback_restores_state() {
-        let mut state = fresh_state();
-
-        apply_fact(&mut state, &create_table_fact(Some("public"), "orders"));
-        apply_fact(&mut state, &StatementFact::BeginTransaction);
-        apply_fact(&mut state, &StatementFact::DropTable {
-            name: QualifiedName::new(Some("public".to_string()), "orders"),
-            if_exists: false,
-        });
-
-        let id = object_id("public", "orders");
-        assert!(matches!(state.get_relation(&id), Some(RelationOverlay::Dropped)));
-
-        apply_fact(&mut state, &StatementFact::RollbackTransaction);
-        assert!(matches!(state.get_relation(&id), Some(RelationOverlay::Present(_))));
+    fn test_txn_rollback() {
+        let engine = setup_engine();
+        let mut state = AnalysisState::new(crate::db::cache::DbCache::new());
+        engine.analyze("BEGIN; CREATE TABLE t(id int); ROLLBACK;", &mut state).unwrap();
+        assert!(state.local.transactions.is_empty());
+        assert!(!state.relation_is_present(&object_id("public", "t")));
     }
 
     #[test]
-    fn test_create_view_inserts_view_edge() {
-        let mut state = fresh_state();
-        apply_fact(&mut state, &StatementFact::CreateView {
-            name: QualifiedName::new(None, "user_summary"),
-            or_replace: false,
-        });
-        let id = object_id("public", "user_summary");
-        assert!(state.relation_is_present(&id));
-        assert!(state.local.graph.views.iter().any(|v| v.view_id == id));
-    }
-
-    #[test]
-    fn test_search_path_expands_unqualified_name() {
-        let mut state = fresh_state();
-        apply_fact(&mut state, &StatementFact::SetSearchPath {
-            schemas: vec!["myschema".to_string()],
-        });
-        apply_fact(&mut state, &create_table_fact(None, "accounts"));
-        assert!(state.relation_is_present(&object_id("myschema", "accounts")));
-        assert!(!state.relation_is_present(&object_id("public", "accounts")));
-    }
-
-    #[test]
-    fn test_create_table_populates_columns() {
-        let mut state = fresh_state();
-        apply_fact(&mut state, &StatementFact::CreateTable {
-            name: QualifiedName::new(None, "products"),
-            if_not_exists: false,
-            columns: vec![
-                col_fact("id",   "integer", true,  true),
-                col_fact("name", "text",    false, false),
-            ],
-            foreign_keys: Vec::new(),
-            table_constraints: Vec::new(),      // Bug 9: field added
-        });
-
-        let id = object_id("public", "products");
-        if let Some(RelationOverlay::Present(rel)) = state.get_relation(&id) {
-            assert!(rel.has_column("id"));
-            assert!(rel.has_column("name"));
-            assert!(!rel.has_column("price"));
-        } else { panic!("products should be Present"); }
-    }
-
-    #[test]
-    fn test_create_table_inserts_fk_edge() {
-        let mut state = fresh_state();
-        apply_fact(&mut state, &create_table_fact(None, "users"));
-        apply_fact(&mut state, &StatementFact::CreateTable {
-            name: QualifiedName::new(None, "orders"),
-            if_not_exists: false,
-            columns: Vec::new(),
-            foreign_keys: vec![fk_fact("users")],
-            table_constraints: Vec::new(),      // Bug 9: field added
-        });
-
-        let orders = object_id("public", "orders");
-        let users  = object_id("public", "users");
-        assert!(state.local.graph.foreign_keys.iter()
-            .any(|fk| fk.from_table == orders && fk.to_table == users));
-    }
-
-    #[test]
-    fn test_orphaned_fk_rule_fires_on_drop() {
-        let mut state = fresh_state();
-        let mut reporter = Reporter::new();
-
-        apply_fact(&mut state, &create_table_fact(None, "users"));
-        apply_fact(&mut state, &StatementFact::CreateTable {
-            name: QualifiedName::new(None, "orders"),
-            if_not_exists: false,
-            columns: Vec::new(),
-            foreign_keys: vec![fk_fact("users")],
-            table_constraints: Vec::new(),      // Bug 9: field added
-        });
-
-        let drop_fact = StatementFact::DropTable {
-            name: QualifiedName::new(None, "users"),
-            if_exists: false,
-        };
-        let mutations = Resolver::resolve(&drop_fact, &state);
-        let all_rules = crate::rules::rules();
-        for m in &mutations {
-            for rule in &all_rules { rule.evaluate(m, &state, &mut reporter); }
-        }
-        assert!(reporter.violations.iter().any(|v| v.message.contains("foreign key")));
-    }
-
-    #[test]
-    fn test_concurrent_index_rule_fires_without_concurrently() {
-        let mut state = fresh_state();
-        let mut reporter = Reporter::new();
-        apply_fact(&mut state, &create_table_fact(None, "events"));
-
-        let mutations = Resolver::resolve(&StatementFact::CreateIndex {
-            name: QualifiedName::new(None, "idx_events_created_at"),
-            relation: QualifiedName::new(None, "events"),
-            if_not_exists: false,
-            concurrently: false,
-        }, &state);
-        let rule = ConcurrentIndexRule;
-        for m in &mutations { rule.evaluate(m, &state, &mut reporter); }
-        assert_eq!(reporter.violations.len(), 1);
-        assert!(reporter.violations[0].message.contains("ACCESS EXCLUSIVE"));
-    }
-
-    #[test]
-    fn test_concurrent_index_correct_usage_no_violation() {
-        let mut state = fresh_state();
-        let mut reporter = Reporter::new();
-        apply_fact(&mut state, &create_table_fact(None, "events"));
-
-        let mutations = Resolver::resolve(&StatementFact::CreateIndex {
-            name: QualifiedName::new(None, "idx_events_user_id"),
-            relation: QualifiedName::new(None, "events"),
-            if_not_exists: false,
-            concurrently: true,
-        }, &state);
-        let rule = ConcurrentIndexRule;
-        for m in &mutations { rule.evaluate(m, &state, &mut reporter); }
-        assert!(reporter.violations.is_empty());
-    }
-
-    #[test]
-    fn test_rename_column_updates_state() {
-        let mut state = fresh_state();
-
-        apply_fact(&mut state, &StatementFact::CreateTable {
-            name: QualifiedName::new(None, "users"),
-            if_not_exists: false,
-            columns: vec![col_fact("email_addr", "text", false, false)],
-            foreign_keys: Vec::new(),
-            table_constraints: Vec::new(),      // Bug 9: field added
-        });
-
-        apply_fact(&mut state, &alter_table_fact("users", vec![
-            AlterTableActionFact::RenameColumn {
-                from: "email_addr".to_string(),
-                to: "email".to_string(),
-            },
-        ]));
-
-        let id = object_id("public", "users");
-        if let Some(RelationOverlay::Present(rel)) = state.get_relation(&id) {
-            assert!(!rel.has_column("email_addr"));
-            assert!(rel.has_column("email"));
-        } else { panic!("users should be Present"); }
-    }
-
-    #[test]
-    fn test_rename_table_moves_overlay() {
-        let mut state = fresh_state();
-        apply_fact(&mut state, &create_table_fact(None, "old_name"));
-        apply_fact(&mut state, &alter_table_fact("old_name", vec![
-            AlterTableActionFact::RenameTo { new_name: "new_name".to_string() },
-        ]));
-        assert!(!state.relation_is_present(&object_id("public", "old_name")));
-        assert!(state.relation_is_present(&object_id("public", "new_name")));
-        assert!(state.local.graph.renames.iter().any(|r| {
-            r.from == object_id("public", "old_name") &&
-            r.to   == object_id("public", "new_name")
-        }));
-    }
-
-    #[test]
-    fn test_set_not_null_rule_warns() {
-        let mut state = fresh_state();
-        let mut reporter = Reporter::new();
-
-        apply_fact(&mut state, &StatementFact::CreateTable {
-            name: QualifiedName::new(None, "users"),
-            if_not_exists: false,
-            columns: vec![col_fact("email", "text", false, false)],
-            foreign_keys: Vec::new(),
-            table_constraints: Vec::new(),      // Bug 9: field added
-        });
-
-        let mutations = Resolver::resolve(
-            &alter_table_fact("users", vec![
-                AlterTableActionFact::SetNotNull { column: "email".to_string() },
-            ]),
-            &state,
-        );
-        let rule = SetNotNullRule;
-        for m in &mutations { rule.evaluate(m, &state, &mut reporter); }
-        assert_eq!(reporter.violations.len(), 1);
-        assert!(reporter.violations[0].message.contains("full table scan"));
-    }
-
-    #[test]
-    fn test_set_not_null_already_constrained_no_warning() {
-        let mut state = fresh_state();
-        let mut reporter = Reporter::new();
-
-        apply_fact(&mut state, &StatementFact::CreateTable {
-            name: QualifiedName::new(None, "users"),
-            if_not_exists: false,
-            columns: vec![col_fact("id", "integer", true, true)],
-            foreign_keys: Vec::new(),
-            table_constraints: Vec::new(),      // Bug 9: field added
-        });
-
-        let mutations = Resolver::resolve(
-            &alter_table_fact("users", vec![
-                AlterTableActionFact::SetNotNull { column: "id".to_string() },
-            ]),
-            &state,
-        );
-        let rule = SetNotNullRule;
-        for m in &mutations { rule.evaluate(m, &state, &mut reporter); }
-        assert!(reporter.violations.is_empty());
-    }
-
-    #[test]
-    fn test_not_valid_constraint_warns() {
-        let mut state = fresh_state();
-        let mut reporter = Reporter::new();
-
-        apply_fact(&mut state, &create_table_fact(None, "users"));
-        apply_fact(&mut state, &create_table_fact(None, "orders"));
-
-        let mutations = Resolver::resolve(
-            &alter_table_fact("orders", vec![
-                add_fk_fact(None, "users", vec![], vec![], true),
-            ]),
-            &state,
-        );
-        let rule = NotValidConstraintRule;
-        for m in &mutations { rule.evaluate(m, &state, &mut reporter); }
-        assert_eq!(reporter.violations.len(), 1);
-        assert!(reporter.violations[0].message.contains("NOT VALID"));
-    }
-
-    #[test]
-    fn test_rollback_to_savepoint_partial_restore() {
-        let mut state = fresh_state();
-
-        apply_fact(&mut state, &create_table_fact(None, "baseline"));
-        apply_fact(&mut state, &StatementFact::BeginTransaction);
-        apply_fact(&mut state, &create_table_fact(None, "sp1_table"));
-        apply_fact(&mut state, &StatementFact::Savepoint { name: "sp1".to_string() });
-        apply_fact(&mut state, &create_table_fact(None, "sp2_table"));
-
-        assert!(state.relation_is_present(&object_id("public", "sp1_table")));
-        assert!(state.relation_is_present(&object_id("public", "sp2_table")));
-
-        apply_fact(&mut state, &StatementFact::RollbackToSavepoint { name: "sp1".to_string() });
-
-        assert!(state.relation_is_present(&object_id("public", "sp1_table")));
-        assert!(!state.relation_is_present(&object_id("public", "sp2_table")));
-        assert!(state.relation_is_present(&object_id("public", "baseline")));
-    }
-
-    #[test]
-    fn test_add_fk_via_alter_inserts_edge() {
-        let mut state = fresh_state();
-
-        apply_fact(&mut state, &create_table_fact(None, "users"));
-        apply_fact(&mut state, &create_table_fact(None, "posts"));
-        apply_fact(&mut state, &alter_table_fact("posts", vec![
-            add_fk_fact(None, "users", vec!["user_id"], vec!["id"], false),
-        ]));
-
-        let posts = object_id("public", "posts");
-        let users = object_id("public", "users");
-        let edge = state.local.graph.foreign_keys.iter()
-            .find(|fk| fk.from_table == posts && fk.to_table == users);
-        assert!(edge.is_some());
-        let edge = edge.unwrap();
-        assert_eq!(edge.from_columns, vec!["user_id"]);
-        assert_eq!(edge.to_columns,   vec!["id"]);
-    }
-
-    #[test]
-    fn test_volatile_default_rule_fires_on_now() {
-        let mut state = fresh_state();
-        let mut reporter = Reporter::new();
-
-        apply_fact(&mut state, &create_table_fact(None, "events"));
-
-        let volatile_default = ExprIr::FunctionCall {
-            name: "now".to_string(),
-            args: vec![],
-        };
-        let mutations = Resolver::resolve(
-            &alter_table_fact("events", vec![
-                add_col_fact("created_at", "timestamptz", false, false, Some(volatile_default)),
-            ]),
-            &state,
-        );
-        let rule = VolatileDefaultRule;
-        for m in &mutations { rule.evaluate(m, &state, &mut reporter); }
-        assert_eq!(reporter.violations.len(), 1);
-        assert!(reporter.violations[0].message.contains("volatile default"));
-    }
-
-    #[test]
-    fn test_volatile_default_rule_silent_on_literal() {
-        let mut state = fresh_state();
-        let mut reporter = Reporter::new();
-
-        apply_fact(&mut state, &create_table_fact(None, "events"));
-
-        let stable_default = ExprIr::Literal("0".to_string());
-        let mutations = Resolver::resolve(
-            &alter_table_fact("events", vec![
-                add_col_fact("count", "integer", false, false, Some(stable_default)),
-            ]),
-            &state,
-        );
-        let rule = VolatileDefaultRule;
-        for m in &mutations { rule.evaluate(m, &state, &mut reporter); }
-        assert!(reporter.violations.is_empty(),
-            "literal default should not trigger volatile rule");
-    }
-
-    #[test]
-    fn test_set_type_rule_always_warns() {
-        let mut state = fresh_state();
-        let mut reporter = Reporter::new();
-
-        apply_fact(&mut state, &StatementFact::CreateTable {
-            name: QualifiedName::new(None, "users"),
-            if_not_exists: false,
-            columns: vec![col_fact("email", "varchar", false, false)],
-            foreign_keys: Vec::new(),
-            table_constraints: Vec::new(),      // Bug 9: field added
-        });
-
-        let mutations = Resolver::resolve(
-            &alter_table_fact("users", vec![
-                AlterTableActionFact::SetType {
-                    column: "email".to_string(),
-                    ty: "text".to_string(),
-                },
-            ]),
-            &state,
-        );
-        let rule = SetTypeRule;
-        for m in &mutations { rule.evaluate(m, &state, &mut reporter); }
-        assert_eq!(reporter.violations.len(), 1);
-        assert!(reporter.violations[0].message.contains("ACCESS EXCLUSIVE"));
-        assert!(reporter.violations[0].message.contains("varchar"));
-    }
-
-    #[test]
-    fn test_missing_validate_constraint_fires_at_finalize() {
-        let mut state = fresh_state();
-        let mut reporter = Reporter::new();
-
-        apply_fact(&mut state, &create_table_fact(None, "users"));
-        apply_fact(&mut state, &create_table_fact(None, "orders"));
-
-        apply_fact(&mut state, &alter_table_fact("orders", vec![
-            add_fk_fact(None, "users", vec![], vec![], true),
-        ]));
-
-        assert!(!state.local.pending_validation.is_empty());
-
-        let rule = MissingValidateConstraintRule;
-        rule.finalize(&state, &mut reporter);
-
-        assert_eq!(reporter.violations.len(), 1);
-        assert!(reporter.violations[0].message.contains("NOT VALID") ||
-                reporter.violations[0].message.contains("not be checked"));
-    }
-
-    #[test]
-    fn test_validate_constraint_clears_pending() {
-        // Bug 10 regression: now that the real constraint name is used as the
-        // pending_validation key, ValidateConstraint must match by that name.
-        let mut state = fresh_state();
-        let mut reporter = Reporter::new();
-
-        apply_fact(&mut state, &create_table_fact(None, "users"));
-        apply_fact(&mut state, &create_table_fact(None, "orders"));
-
-        // Named FK with NOT VALID.
-        apply_fact(&mut state, &alter_table_fact("orders", vec![
-            add_fk_fact(Some("fk_orders_users"), "users", vec![], vec![], true),
-        ]));
-
-        // Validate using the real name.
-        apply_fact(&mut state, &alter_table_fact("orders", vec![
-            AlterTableActionFact::ValidateConstraint {
-                constraint_name: "fk_orders_users".to_string(),
-            },
-        ]));
-
-        let rule = MissingValidateConstraintRule;
-        rule.finalize(&state, &mut reporter);
-
-        assert!(reporter.violations.is_empty(),
-            "validated named constraint should not fire MissingValidateConstraintRule");
-    }
-
-    #[test]
-    fn test_graph_leak_on_rollback() {
-        let mut state = fresh_state();
-        let mut reporter = Reporter::new();
-
-        apply_fact(&mut state, &create_table_fact(None, "users"));
-        apply_fact(&mut state, &create_table_fact(None, "orders"));
-        apply_fact(&mut state, &StatementFact::BeginTransaction);
-        apply_fact(&mut state, &alter_table_fact("orders", vec![
-            add_fk_fact(None, "users", vec![], vec![], false),
-        ]));
-        apply_fact(&mut state, &StatementFact::RollbackTransaction);
-
-        let mutations = Resolver::resolve(&StatementFact::DropTable {
-            name: QualifiedName::new(None, "users"),
-            if_exists: false,
-        }, &state);
-        let rule = crate::rules::views::OrphanedDependencyRule;
-        for m in &mutations { rule.evaluate(m, &state, &mut reporter); }
-        let fk_violations: Vec<_> = reporter.violations.iter()
-            .filter(|v| v.message.contains("foreign key")).collect();
-        assert!(fk_violations.is_empty(), "Graph leaked: {:?}", fk_violations.first());
-    }
-
-    #[test]
-    fn test_aba_phantom_dependency() {
-        let mut state = fresh_state();
-        let mut reporter = Reporter::new();
-
-        apply_fact(&mut state, &create_table_fact(None, "target"));
-        apply_fact(&mut state, &StatementFact::CreateTable {
-            name: QualifiedName::new(None, "child"),
-            if_not_exists: false,
-            columns: Vec::new(),
-            foreign_keys: vec![fk_fact("target")],
-            table_constraints: Vec::new(),      // Bug 9: field added
-        });
-        apply_fact(&mut state, &StatementFact::DropTable {
-            name: QualifiedName::new(None, "child"),
-            if_exists: false,
-        });
-        apply_fact(&mut state, &create_table_fact(None, "child")); // new incarnation, no FK
-
-        let mutations = Resolver::resolve(&StatementFact::DropTable {
-            name: QualifiedName::new(None, "target"),
-            if_exists: false,
-        }, &state);
-        let rule = crate::rules::views::OrphanedDependencyRule;
-        for m in &mutations { rule.evaluate(m, &state, &mut reporter); }
-        let fk_violations: Vec<_> = reporter.violations.iter()
-            .filter(|v| v.message.contains("foreign key")).collect();
-        assert!(fk_violations.is_empty(), "ABA phantom: {:?}", fk_violations.first());
-    }
-
-    #[test]
-    fn test_view_graph_leak_on_rollback() {
-        let mut state = fresh_state();
-        apply_fact(&mut state, &create_table_fact(None, "users"));
-        apply_fact(&mut state, &StatementFact::BeginTransaction);
-        apply_fact(&mut state, &StatementFact::CreateView {
-            name: QualifiedName::new(None, "user_view"),
-            or_replace: false,
-        });
-        apply_fact(&mut state, &StatementFact::RollbackTransaction);
-
-        let view_id = object_id("public", "user_view");
-        assert!(!state.local.graph.views.iter().any(|v| v.view_id == view_id),
-            "View graph leaked after rollback");
-        assert!(!state.relation_is_present(&view_id));
-    }
-
-    #[test]
-    fn test_dropped_view_does_not_block_base_table_drop() {
-        let mut state = fresh_state();
-        let mut reporter = Reporter::new();
-
-        apply_fact(&mut state, &create_table_fact(None, "users"));
-        apply_fact(&mut state, &StatementFact::CreateView {
-            name: QualifiedName::new(None, "user_view"),
-            or_replace: false,
-        });
-        apply_fact(&mut state, &StatementFact::DropTable {
-            name: QualifiedName::new(None, "user_view"),
-            if_exists: false,
-        });
-
-        let mutations = Resolver::resolve(&StatementFact::DropTable {
-            name: QualifiedName::new(None, "users"),
-            if_exists: false,
-        }, &state);
-        let rule = crate::rules::views::OrphanedDependencyRule;
-        for m in &mutations { rule.evaluate(m, &state, &mut reporter); }
-        let view_violations: Vec<_> = reporter.violations.iter()
-            .filter(|v| v.message.contains("view")).collect();
-        assert!(view_violations.is_empty(),
-            "Dead view blocking drop: {:?}", view_violations.first());
-    }
-
-    #[test]
-    fn test_drop_index_without_concurrently_warns() {
-        let mut state = fresh_state();
-        let mut reporter = Reporter::new();
-        apply_fact(&mut state, &create_table_fact(None, "events"));
-
-        let mutations = Resolver::resolve(&StatementFact::DropIndex {
-            names: vec![QualifiedName::new(None, "idx_events_created_at")],
-            if_exists: false,
-            concurrently: false,
-        }, &state);
-        let rule = DropConcurrentIndexRule;
-        for m in &mutations { rule.evaluate(m, &state, &mut reporter); }
-        assert_eq!(reporter.violations.len(), 1);
-        assert!(reporter.violations[0].message.contains("ACCESS EXCLUSIVE"));
-    }
-
-    #[test]
-    fn test_drop_index_concurrently_in_transaction_errors() {
-        let mut state = fresh_state();
-        let mut reporter = Reporter::new();
-        apply_fact(&mut state, &create_table_fact(None, "events"));
-        apply_fact(&mut state, &StatementFact::BeginTransaction);
-
-        let mutations = Resolver::resolve(&StatementFact::DropIndex {
-            names: vec![QualifiedName::new(None, "idx_events_type")],
-            if_exists: false,
-            concurrently: true,
-        }, &state);
-        let rule = DropConcurrentIndexRule;
-        for m in &mutations { rule.evaluate(m, &state, &mut reporter); }
-        assert_eq!(reporter.violations.len(), 1);
-        assert!(reporter.violations[0].message.contains("transaction block"));
-    }
-
-    #[test]
-    fn test_add_check_constraint_without_not_valid_warns() {
-        let mut state = fresh_state();
-        let mut reporter = Reporter::new();
-        apply_fact(&mut state, &create_table_fact(None, "orders"));
-
-        let mutations = Resolver::resolve(
-            &alter_table_fact("orders", vec![
-                AlterTableActionFact::AddCheckConstraint { not_valid: false },
-            ]), &state);
-        let rule = AddCheckConstraintRule;
-        for m in &mutations { rule.evaluate(m, &state, &mut reporter); }
-        assert_eq!(reporter.violations.len(), 1);
-        assert!(reporter.violations[0].message.contains("NOT VALID"));
-    }
-
-    #[test]
-    fn test_add_check_constraint_with_not_valid_silent() {
-        let mut state = fresh_state();
-        let mut reporter = Reporter::new();
-        apply_fact(&mut state, &create_table_fact(None, "orders"));
-
-        let mutations = Resolver::resolve(
-            &alter_table_fact("orders", vec![
-                AlterTableActionFact::AddCheckConstraint { not_valid: true },
-            ]), &state);
-        let rule = AddCheckConstraintRule;
-        for m in &mutations { rule.evaluate(m, &state, &mut reporter); }
-        assert!(reporter.violations.is_empty());
-    }
-
-    #[test]
-    fn test_add_unique_constraint_warns() {
-        let mut state = fresh_state();
-        let mut reporter = Reporter::new();
-        apply_fact(&mut state, &create_table_fact(None, "users"));
-
-        let mutations = Resolver::resolve(
-            &alter_table_fact("users", vec![
-                AlterTableActionFact::AddUniqueConstraint,
-            ]), &state);
-        let rule = AddUniqueConstraintRule;
-        for m in &mutations { rule.evaluate(m, &state, &mut reporter); }
-        assert_eq!(reporter.violations.len(), 1);
-        assert!(reporter.violations[0].message.contains("ACCESS EXCLUSIVE"));
-    }
-
-    #[test]
-    fn test_idempotency_create_table_warns() {
-        let state = fresh_state();
-        let mut reporter = Reporter::new();
-
-        let mutations = Resolver::resolve(&create_table_fact(None, "users"), &state);
-        let rule = CreateTableIdempotencyRule;
-        for m in &mutations { rule.evaluate(m, &state, &mut reporter); }
-        assert_eq!(reporter.violations.len(), 1);
-        assert!(reporter.violations[0].message.contains("IF NOT EXISTS"));
-    }
-
-    #[test]
-    fn test_idempotency_create_table_with_guard_silent() {
-        let state = fresh_state();
-        let mut reporter = Reporter::new();
-
-        let mutations = Resolver::resolve(&StatementFact::CreateTable {
-            name: QualifiedName::new(None, "users"),
-            if_not_exists: true,
-            columns: Vec::new(),
-            foreign_keys: Vec::new(),
-            table_constraints: Vec::new(),      // Bug 9: field added
-        }, &state);
-        let rule = CreateTableIdempotencyRule;
-        for m in &mutations { rule.evaluate(m, &state, &mut reporter); }
-        assert!(reporter.violations.is_empty());
-    }
-
-    #[test]
-    fn test_idempotency_drop_table_warns() {
-        let mut state = fresh_state();
-        let mut reporter = Reporter::new();
-        apply_fact(&mut state, &create_table_fact(None, "users"));
-
-        let mutations = Resolver::resolve(&StatementFact::DropTable {
-            name: QualifiedName::new(None, "users"),
-            if_exists: false,
-        }, &state);
-        let rule = DropTableIdempotencyRule;
-        for m in &mutations { rule.evaluate(m, &state, &mut reporter); }
-        assert_eq!(reporter.violations.len(), 1);
-        assert!(reporter.violations[0].message.contains("IF EXISTS"));
-    }
-
-    #[test]
-    fn test_idempotency_drop_index_warns() {
-        let state = fresh_state();
-        let mut reporter = Reporter::new();
-
-        let mutations = Resolver::resolve(&StatementFact::DropIndex {
-            names: vec![QualifiedName::new(None, "idx_foo")],
-            if_exists: false,
-            concurrently: true,
-        }, &state);
-        let rule = DropIndexIdempotencyRule;
-        for m in &mutations { rule.evaluate(m, &state, &mut reporter); }
-        assert_eq!(reporter.violations.len(), 1);
-        assert!(reporter.violations[0].message.contains("IF EXISTS"));
-    }
-
-    // ─────────────────────────────────────────────
-    // New tests — one adversarial test per bug
-    // ─────────────────────────────────────────────
-
-    // ── Bug 1 — parse errors are now rejected ────
-
-    #[test]
-    fn test_parse_rejects_syntax_errors() {
-        use crate::engine::MigrationFile;
-        let result = MigrationFile::parse("CREATE TABLE (;");
-        assert!(result.is_err(),
-            "Malformed SQL should return Err, not silently succeed");
-    }
-
-    #[test]
-    fn test_parse_accepts_valid_sql() {
-        use crate::engine::MigrationFile;
-        let result = MigrationFile::parse("CREATE TABLE users (id integer);");
-        assert!(result.is_ok(), "Valid SQL should parse successfully");
-    }
-
-    // ── Bug 2 — DbCache baseline is visible to rules ──
-
-    #[test]
-    fn test_baseline_cache_visible_to_get_relation() {
-        // Tables seeded into DbCache before the migration starts must be
-        // visible through get_relation() — the primary state query path.
-        // Before the fix, get_relation() only read local.relations and any
-        // pre-existing table was permanently invisible to all rules.
-        let mut cache = DbCache::new();
-        let baseline_id = object_id("public", "legacy_table");
-
-        let mut rel = crate::model::relation::RelationState::new(baseline_id.clone(), 0);
-        rel.apply_column_action(&crate::model::relation::ColumnAction::Add {
-            name: "id".to_string(),
-            data_type: Some("integer".to_string()),
-            not_null: true,
-            default: None,
-        });
-        cache.insert(rel);
-
-        let state = AnalysisState::new(cache);
-        assert!(
-            matches!(state.get_relation(&baseline_id), Some(RelationOverlay::Present(_))),
-            "Baseline table must be Present after seeding from DbCache"
-        );
-    }
-
-    #[test]
-    fn test_add_column_on_baseline_table_does_not_false_error() {
-        // A SafeAddColumnRule error fires when the table is unknown.
-        // With the DbCache fix, a table that exists only in the baseline
-        // must NOT produce the "table does not exist" error.
-        let mut cache = DbCache::new();
-        let baseline_id = object_id("public", "legacy");
-        cache.insert(crate::model::relation::RelationState::new(baseline_id, 0));
-
-        let state = AnalysisState::new(cache);
-        let mut reporter = Reporter::new();
-
-        let mutations = Resolver::resolve(
-            &alter_table_fact("legacy", vec![
-                add_col_fact("new_col", "text", false, false, None),
-            ]),
-            &state,
-        );
-        let rule = SafeAddColumnRule;
-        for m in &mutations { rule.evaluate(m, &state, &mut reporter); }
-
-        let unknown_table_errors: Vec<_> = reporter.violations.iter()
-            .filter(|v| v.message.contains("does not exist"))
-            .collect();
-        assert!(unknown_table_errors.is_empty(),
-            "ADD COLUMN on a baseline table must not produce 'does not exist' error: {:?}",
-            unknown_table_errors.first());
-    }
-
-    // ── Bug 3 — identifier lowercasing ───────────
-
-    #[test]
-    fn test_resolver_lowercases_unqualified_name() {
-        // Tables created with mixed-case unquoted names must be stored
-        // with a lowercase ObjectId. resolve_name() was previously
-        // preserving the raw AST text, causing lookup mismatches.
-        let mut state = fresh_state();
-        apply_fact(&mut state, &StatementFact::CreateTable {
-            name: QualifiedName::new(None, "Users"),    // mixed case
-            if_not_exists: false,
-            columns: Vec::new(),
-            foreign_keys: Vec::new(),
-            table_constraints: Vec::new(),
-        });
-        // The canonical id must be lowercase.
-        let lower_id = object_id("public", "users");
-        assert!(state.relation_is_present(&lower_id),
-            "Unquoted mixed-case name must resolve to lowercase ObjectId");
-    }
-
-    #[test]
-    fn test_resolver_lowercases_schema() {
-        let mut state = fresh_state();
-        apply_fact(&mut state, &StatementFact::CreateTable {
-            name: QualifiedName::new(Some("MySchema".to_string()), "MyTable"),
-            if_not_exists: false,
-            columns: Vec::new(),
-            foreign_keys: Vec::new(),
-            table_constraints: Vec::new(),
-        });
-        // Both schema and name must be lowercase.
-        let lower_id = object_id("myschema", "mytable");
-        assert!(state.relation_is_present(&lower_id),
-            "Schema component must also be lowercased during resolution");
-    }
-
-    // ── Bug 4 — global ROLLBACK unwinds full stack ──
-
-    #[test]
-    fn test_global_rollback_unwinds_full_stack() {
-        // Previously ROLLBACK only popped one frame, so a migration that
-        // opened a BEGIN, then a SAVEPOINT, then ROLLBACKed would leave
-        // the savepoint frame on the stack — leaking state.
-        let mut state = fresh_state();
-
-        apply_fact(&mut state, &StatementFact::BeginTransaction);
-        apply_fact(&mut state, &create_table_fact(None, "t1"));
-        apply_fact(&mut state, &StatementFact::Savepoint { name: "sp1".to_string() });
-        apply_fact(&mut state, &create_table_fact(None, "t2"));
-
-        // Both tables visible inside the transaction.
+    fn test_txn_savepoint_rollback_and_release() {
+        let engine = setup_engine();
+        let mut state = AnalysisState::new(crate::db::cache::DbCache::new());
+        
+        engine.analyze("BEGIN; CREATE TABLE t1(id int); SAVEPOINT sp1; CREATE TABLE t2(id int);", &mut state).unwrap();
+        engine.analyze("ROLLBACK TO SAVEPOINT sp1;", &mut state).unwrap();
         assert!(state.relation_is_present(&object_id("public", "t1")));
-        assert!(state.relation_is_present(&object_id("public", "t2")));
-        // Stack has two frames: [__transaction__, sp1]
-        assert_eq!(state.local.transactions.len(), 2);
+        assert!(!state.relation_is_present(&object_id("public", "t2")));
+        
+        engine.analyze("CREATE TABLE t3(id int); RELEASE SAVEPOINT sp1;", &mut state).unwrap();
+        assert_eq!(state.local.transactions.len(), 1); // Only main txn left
+        assert!(state.relation_is_present(&object_id("public", "t3")));
+    }
+}
 
-        apply_fact(&mut state, &StatementFact::RollbackTransaction);
+// ─────────────────────────────────────────────
+// 5. AST Expression Parsing Exhaustion
+// ─────────────────────────────────────────────
+#[cfg(test)]
+mod expression_parsing_tests {
+    use super::helpers::*;
+    use crate::analysis::state::AnalysisState;
 
-        // Stack must be empty — all frames drained.
-        assert!(state.local.transactions.is_empty(),
-            "ROLLBACK must drain all transaction frames, not just the innermost");
-
-        // Both tables must have been rolled back.
-        assert!(!state.relation_is_present(&object_id("public", "t1")),
-            "t1 created inside transaction must be rolled back");
-        assert!(!state.relation_is_present(&object_id("public", "t2")),
-            "t2 created inside savepoint must be rolled back");
+    fn assert_expr(expr: &str) {
+        let engine = setup_engine();
+        let mut state = AnalysisState::new(crate::db::cache::DbCache::new());
+        assert!(engine.analyze(&format!("CREATE TABLE t(val INT DEFAULT {});", expr), &mut state).is_ok());
     }
 
-    #[test]
-    fn test_global_commit_clears_full_stack() {
-        let mut state = fresh_state();
-
-        apply_fact(&mut state, &StatementFact::BeginTransaction);
-        apply_fact(&mut state, &StatementFact::Savepoint { name: "sp1".to_string() });
-        apply_fact(&mut state, &create_table_fact(None, "committed"));
-
-        assert_eq!(state.local.transactions.len(), 2);
-
-        apply_fact(&mut state, &StatementFact::CommitTransaction);
-
-        assert!(state.local.transactions.is_empty(),
-            "COMMIT must clear all transaction frames");
-        // Table survives (was committed).
-        assert!(state.relation_is_present(&object_id("public", "committed")));
+    #[test] fn test_expr_literal() { assert_expr("42"); }
+    #[test] fn test_expr_name_ref() { assert_expr("some_col"); }
+    #[test] fn test_expr_call() { assert_expr("COALESCE(1, 2)"); }
+    #[test] fn test_expr_bin_op() { assert_expr("1 + 2 * 3 = 7"); }
+    #[test] fn test_expr_cast() { assert_expr("1::text"); }
+    #[test] fn test_expr_prefix() { assert_expr("-42"); }
+    #[test] fn test_expr_paren() { assert_expr("(1 + 2)"); }
+    #[test] fn test_expr_case() { assert_expr("CASE WHEN true THEN 1 ELSE 0 END"); }
+    #[test] fn test_expr_array() { assert_expr("ARRAY[1, 2, 3]"); }
+    #[test] fn test_expr_between() { assert_expr("5 BETWEEN 1 AND 10"); }
+    #[test] fn test_expr_index() { assert_expr("arr[1]"); }
+    #[test] fn test_expr_slice() { assert_expr("arr[1:3]"); }
+    #[test] fn test_expr_slice_omitted() { assert_expr("arr[2:]"); } // Tests ExprIr::Omitted
+    #[test] fn test_expr_field() { assert_expr("(my_record).my_field"); }
+    #[test] fn test_parser_syntax_error_rejection() {
+        let engine = setup_engine();
+        let mut state = AnalysisState::new(crate::db::cache::DbCache::new());
+        assert!(engine.analyze("CREATE TABLE (;", &mut state).is_err());
     }
+}
 
-    // ── Bug 5 — rename graph rolled back on ROLLBACK ──
-
-    #[test]
-    fn test_rename_edge_rolled_back_on_rollback() {
-        // Previously Mutation::Rename pushed a RenameEdge inside a transaction
-        // but had no undo entry. ROLLBACK restored the relation overlays but
-        // left the phantom RenameEdge in graph.renames.
-        let mut state = fresh_state();
-
-        apply_fact(&mut state, &create_table_fact(None, "original"));
-        let edge_count_before = state.local.graph.renames.len();
-
-        apply_fact(&mut state, &StatementFact::BeginTransaction);
-        apply_fact(&mut state, &alter_table_fact("original", vec![
-            AlterTableActionFact::RenameTo { new_name: "renamed".to_string() },
-        ]));
-
-        // Rename edge exists inside transaction.
-        assert_eq!(state.local.graph.renames.len(), edge_count_before + 1);
-
-        apply_fact(&mut state, &StatementFact::RollbackTransaction);
-
-        // Edge must be gone after rollback.
-        assert_eq!(state.local.graph.renames.len(), edge_count_before,
-            "RenameEdge must be removed when the transaction is rolled back");
-
-        // Original name must be restored.
-        assert!(state.relation_is_present(&object_id("public", "original")));
-        assert!(!state.relation_is_present(&object_id("public", "renamed")));
-    }
-
-    // ── Bug 6 — DROP INDEX rolled back on ROLLBACK ──
+// ─────────────────────────────────────────────
+// 6. Identifier Casing & Quoting Isolation
+// ─────────────────────────────────────────────
+#[cfg(test)]
+mod identifier_casing_tests {
+    use super::helpers::*;
+    use crate::analysis::state::AnalysisState;
+    use crate::model::relation::RelationOverlay;
 
     #[test]
-    fn test_drop_index_rolled_back_on_rollback() {
-        // Previously DropIndex called retain() with no undo snapshot, so
-        // ROLLBACK left the index permanently removed.
-        let mut state = fresh_state();
-
-        apply_fact(&mut state, &create_table_fact(None, "events"));
-        apply_fact(&mut state, &StatementFact::CreateIndex {
-            name: QualifiedName::new(None, "idx_events_ts"),
-            relation: QualifiedName::new(None, "events"),
-            if_not_exists: false,
-            concurrently: false,
-        });
-
-        let idx_id = object_id("public", "idx_events_ts");
-        let edge_count_before = state.local.graph.indexes.len();
-        assert!(state.local.graph.indexes.iter().any(|i| i.index_id == idx_id),
-            "Index must exist before transaction");
-
-        apply_fact(&mut state, &StatementFact::BeginTransaction);
-        apply_fact(&mut state, &StatementFact::DropIndex {
-            names: vec![QualifiedName::new(None, "idx_events_ts")],
-            if_exists: false,
-            concurrently: false,
-        });
-
-        // Index gone inside transaction.
-        assert!(!state.local.graph.indexes.iter().any(|i| i.index_id == idx_id),
-            "Index must be absent after DROP INDEX inside transaction");
-
-        apply_fact(&mut state, &StatementFact::RollbackTransaction);
-
-        // Index must be restored after rollback.
-        assert_eq!(state.local.graph.indexes.len(), edge_count_before,
-            "Index edge count must be restored after rollback");
-        assert!(state.local.graph.indexes.iter().any(|i| i.index_id == idx_id),
-            "Dropped index must be restored when the transaction is rolled back");
-    }
-
-    // ── Bug 9 — table-level PK implies not_null ──
-
-    #[test]
-    fn test_table_pk_constraint_marks_columns_not_null() {
-        // A table-level PRIMARY KEY (id) constraint must mark the `id` column
-        // as not_null=true even when the column definition itself omits NOT NULL.
-        let mut state = fresh_state();
-        apply_fact(&mut state, &StatementFact::CreateTable {
-            name: QualifiedName::new(None, "orders"),
-            if_not_exists: false,
-            columns: vec![
-                // not_null=false, is_primary_key=false — constraint comes from table level
-                col_fact("id", "integer", false, false),
-                col_fact("amount", "numeric", false, false),
-            ],
-            foreign_keys: Vec::new(),
-            table_constraints: vec![
-                TableConstraintFact::PrimaryKey {
-                    columns: vec!["id".to_string()],
-                },
-            ],
-        });
-
-        let id = object_id("public", "orders");
-        if let Some(RelationOverlay::Present(rel)) = state.get_relation(&id) {
-            let col = rel.get_column("id")
-                .expect("id column must exist");
-            assert!(!col.is_nullable,
-                "Column in table-level PRIMARY KEY must be NOT NULL (is_nullable=false)");
-            // amount is not in the PK — must remain nullable.
-            let amount = rel.get_column("amount")
-                .expect("amount column must exist");
-            assert!(amount.is_nullable,
-                "Non-PK column must remain nullable");
-        } else {
-            panic!("orders table must be Present");
-        }
-    }
-
-    #[test]
-    fn test_table_unique_constraint_stored() {
-        let mut state = fresh_state();
-        apply_fact(&mut state, &StatementFact::CreateTable {
-            name: QualifiedName::new(None, "users"),
-            if_not_exists: false,
-            columns: vec![col_fact("email", "text", false, false)],
-            foreign_keys: Vec::new(),
-            table_constraints: vec![
-                TableConstraintFact::Unique { columns: vec!["email".to_string()] },
-            ],
-        });
-        // Just verify the table was created — UNIQUE doesn't change column state.
+    fn test_ident_unquoted_lowercase() {
+        let engine = setup_engine();
+        let mut state = AnalysisState::new(crate::db::cache::DbCache::new());
+        engine.analyze("CREATE TABLE Users (Id int);", &mut state).unwrap();
         assert!(state.relation_is_present(&object_id("public", "users")));
     }
 
-    // ── Bug 10 — constraint name roundtrip ───────
-
     #[test]
-    fn test_named_fk_validate_constraint_clears_pending() {
-        // Previously pending_validation used a synthetic __fk__... key, so
-        // VALIDATE CONSTRAINT by real name never matched. Now the real name
-        // is used, and this test would have passed with the old synthetic key
-        // only by accident (VALIDATE with the synthetic name).
-        let mut state = fresh_state();
-        let mut reporter = Reporter::new();
+    fn test_ident_quoted_preserve() {
+        let engine = setup_engine();
+        let mut state = AnalysisState::new(crate::db::cache::DbCache::new());
+        engine.analyze("CREATE TABLE \"MyTable\" (\"MyCol\" int);", &mut state).unwrap();
+        let mixed_id = object_id("public", "MyTable");
+        assert!(state.relation_is_present(&mixed_id));
 
-        apply_fact(&mut state, &create_table_fact(None, "users"));
-        apply_fact(&mut state, &create_table_fact(None, "orders"));
+        engine.analyze("ALTER TABLE \"MyTable\" RENAME TO \"NewTable\";", &mut state).unwrap();
+        assert!(!state.relation_is_present(&mixed_id));
+        assert!(state.relation_is_present(&object_id("public", "NewTable")));
 
-        apply_fact(&mut state, &alter_table_fact("orders", vec![
-            add_fk_fact(Some("fk_orders_user_id"), "users", vec!["user_id"], vec!["id"], true),
-        ]));
-
-        // Confirm it's pending.
-        let orders_id = object_id("public", "orders");
-        assert!(state.local.pending_validation.contains(
-            &(orders_id.clone(), "fk_orders_user_id".to_string())
-        ), "Named FK must be in pending_validation under its real name");
-
-        apply_fact(&mut state, &alter_table_fact("orders", vec![
-            AlterTableActionFact::ValidateConstraint {
-                constraint_name: "fk_orders_user_id".to_string(),
-            },
-        ]));
-
-        assert!(state.local.pending_validation.is_empty(),
-            "VALIDATE CONSTRAINT by real name must clear the pending entry");
-
-        let rule = MissingValidateConstraintRule;
-        rule.finalize(&state, &mut reporter);
-        assert!(reporter.violations.is_empty());
-    }
-
-    #[test]
-    fn test_unnamed_fk_uses_synthetic_key() {
-        // An FK without a CONSTRAINT name must use the __fk__... synthetic
-        // key as fallback — it can never be matched by VALIDATE CONSTRAINT.
-        let mut state = fresh_state();
-
-        apply_fact(&mut state, &create_table_fact(None, "users"));
-        apply_fact(&mut state, &create_table_fact(None, "orders"));
-
-        apply_fact(&mut state, &alter_table_fact("orders", vec![
-            add_fk_fact(None, "users", vec![], vec![], true),
-        ]));
-
-        let orders_id = object_id("public", "orders");
-        // Must contain a synthetic key, not a real name.
-        let has_synthetic = state.local.pending_validation.iter().any(|(id, key)| {
-            *id == orders_id && key.starts_with("__fk__")
-        });
-        assert!(has_synthetic,
-            "Unnamed NOT VALID FK must be stored with a synthetic __fk__ key");
-    }
-
-    // ── Bug 11 — ADD COLUMN preserves not_null ───
-
-    #[test]
-    fn test_add_column_not_null_stored_in_state() {
-        // Previously AlterTableActionMutation::AddColumn hardcoded not_null=false,
-        // so NOT NULL constraints on ALTER TABLE ADD COLUMN were always lost.
-        let mut state = fresh_state();
-
-        apply_fact(&mut state, &create_table_fact(None, "items"));
-        apply_fact(&mut state, &alter_table_fact("items", vec![
-            add_col_fact("sku", "text", false, true, None),  // not_null=true
-        ]));
-
-        let id = object_id("public", "items");
-        if let Some(RelationOverlay::Present(rel)) = state.get_relation(&id) {
-            let col = rel.get_column("sku").expect("sku must exist");
-            assert!(!col.is_nullable,
-                "ADD COLUMN ... NOT NULL must store not_null=true in RelationState");
+        engine.analyze("ALTER TABLE \"NewTable\" RENAME COLUMN \"MyCol\" TO \"NewCol\";", &mut state).unwrap();
+        let rel = state.get_relation(&object_id("public", "NewTable")).unwrap();
+        if let RelationOverlay::Present(r) = rel {
+            assert!(r.has_column("NewCol"));
+            assert!(!r.has_column("MyCol"));
         } else {
-            panic!("items must be Present");
+            panic!("NewTable must be Present");
         }
     }
 
     #[test]
-    fn test_add_column_nullable_by_default() {
-        // Contrast: ADD COLUMN without NOT NULL must remain nullable.
-        let mut state = fresh_state();
-
-        apply_fact(&mut state, &create_table_fact(None, "items"));
-        apply_fact(&mut state, &alter_table_fact("items", vec![
-            add_col_fact("description", "text", false, false, None),
-        ]));
-
-        let id = object_id("public", "items");
-        if let Some(RelationOverlay::Present(rel)) = state.get_relation(&id) {
-            let col = rel.get_column("description").expect("description must exist");
-            assert!(col.is_nullable,
-                "ADD COLUMN without NOT NULL must remain nullable");
-        } else {
-            panic!("items must be Present");
-        }
-    }
-
-    // ── Bug 12 — inline FK from_columns populated ──
-
-    #[test]
-    fn test_inline_fk_from_columns_populated() {
-        // Inline column-level REFERENCES constraints always had from_columns=[]
-        // because the owning column name was not passed to extract_column_fk_facts.
-        // This is a visitor-level fix verified at the fact layer.
-        let fact = StatementFact::CreateTable {
-            name: QualifiedName::new(None, "orders"),
-            if_not_exists: false,
-            columns: Vec::new(),
-            foreign_keys: vec![
-                FkFact {
-                    references: QualifiedName::new(None, "users"),
-                    from_columns: vec!["user_id".to_string()],  // must be populated
-                    to_columns: Vec::new(),
-                },
-            ],
-            table_constraints: Vec::new(),
-        };
-
-        if let StatementFact::CreateTable { foreign_keys, .. } = &fact {
-            assert_eq!(foreign_keys[0].from_columns, vec!["user_id"],
-                "Inline column FK must have from_columns populated with the owning column name");
-        }
-    }
-
-    // ── Bug 13 — CASE/ARRAY volatility detection ──
-
-    #[test]
-    fn test_case_expr_with_volatile_branch_is_volatile() {
-        // CASE WHEN ... THEN now() END — the CASE expression is volatile
-        // because a THEN arm contains a volatile function. Previously the
-        // entire CASE was collapsed to ExprIr::Literal("<complex>").
-        let volatile_in_case = ExprIr::FunctionCall {
-            name: "<case>".to_string(),
-            args: vec![
-                ExprIr::Literal("true".to_string()),
-                ExprIr::FunctionCall { name: "now".to_string(), args: vec![] },  // THEN arm
-                ExprIr::Literal("2024-01-01".to_string()),                        // ELSE arm
-            ],
-        };
-        assert!(volatile_in_case.is_volatile(),
-            "CASE expr with volatile THEN branch must be volatile");
-    }
-
-    #[test]
-    fn test_case_expr_with_no_volatile_branch_is_stable() {
-        let stable_case = ExprIr::FunctionCall {
-            name: "<case>".to_string(),
-            args: vec![
-                ExprIr::Literal("true".to_string()),
-                ExprIr::Literal("1".to_string()),
-                ExprIr::Literal("2".to_string()),
-            ],
-        };
-        assert!(!stable_case.is_volatile(),
-            "CASE expr with only literal branches must not be volatile");
-    }
-
-    #[test]
-    fn test_array_expr_with_volatile_element_is_volatile() {
-        // ARRAY[1, now()] — volatile because of now().
-        let volatile_array = ExprIr::FunctionCall {
-            name: "<array>".to_string(),
-            args: vec![
-                ExprIr::Literal("1".to_string()),
-                ExprIr::FunctionCall { name: "now".to_string(), args: vec![] },
-            ],
-        };
-        assert!(volatile_array.is_volatile(),
-            "ARRAY with a volatile element must be volatile");
-    }
-
-    #[test]
-    fn test_array_expr_all_literals_is_stable() {
-        let stable_array = ExprIr::FunctionCall {
-            name: "<array>".to_string(),
-            args: vec![
-                ExprIr::Literal("1".to_string()),
-                ExprIr::Literal("2".to_string()),
-            ],
-        };
-        assert!(!stable_array.is_volatile(),
-            "ARRAY with only literal elements must not be volatile");
-    }
-
-    #[test]
-    fn test_volatile_default_rule_fires_on_case_with_now() {
-        // End-to-end: VolatileDefaultRule must fire when the column default
-        // is a CASE expression that contains a volatile function call.
-        let mut state = fresh_state();
-        let mut reporter = Reporter::new();
-
-        apply_fact(&mut state, &create_table_fact(None, "events"));
-
-        let case_with_now = ExprIr::FunctionCall {
-            name: "<case>".to_string(),
-            args: vec![
-                ExprIr::Literal("true".to_string()),
-                ExprIr::FunctionCall { name: "now".to_string(), args: vec![] },
-                ExprIr::Literal("null".to_string()),
-            ],
-        };
-        let mutations = Resolver::resolve(
-            &alter_table_fact("events", vec![
-                add_col_fact("ts", "timestamptz", false, false, Some(case_with_now)),
-            ]),
-            &state,
-        );
-        let rule = VolatileDefaultRule;
-        for m in &mutations { rule.evaluate(m, &state, &mut reporter); }
-        assert_eq!(reporter.violations.len(), 1,
-            "CASE expr containing now() must trigger VolatileDefaultRule");
-    }
-
-    // ── Bug 15 — SafeAddColumnRule not overbroad ──
-
-    #[test]
-    fn test_safe_add_column_no_false_positive_for_new_nullable_column() {
-        // The old rule fired a blanket "ensure nullable or non-volatile default"
-        // warning for every ADD COLUMN. A new nullable column with no default
-        // is the most common, safest pattern — it must produce zero warnings.
-        let mut state = fresh_state();
-        let mut reporter = Reporter::new();
-
-        apply_fact(&mut state, &create_table_fact(None, "products"));
-
-        let mutations = Resolver::resolve(
-            &alter_table_fact("products", vec![
-                add_col_fact("description", "text", false, false, None),  // no default, nullable
-            ]),
-            &state,
-        );
-        let rule = SafeAddColumnRule;
-        for m in &mutations { rule.evaluate(m, &state, &mut reporter); }
-
-        assert!(reporter.violations.is_empty(),
-            "ADD COLUMN (nullable, no default) on a known table must produce zero SafeAddColumn violations; \
-             got: {:?}", reporter.violations.first());
-    }
-
-    #[test]
-    fn test_safe_add_column_still_errors_on_duplicate() {
-        // Even after removing the false positive, the duplicate-column error
-        // (column already exists, no IF NOT EXISTS) must still fire.
-        let mut state = fresh_state();
-        let mut reporter = Reporter::new();
-
-        apply_fact(&mut state, &StatementFact::CreateTable {
-            name: QualifiedName::new(None, "users"),
-            if_not_exists: false,
-            columns: vec![col_fact("email", "text", false, false)],
-            foreign_keys: Vec::new(),
-            table_constraints: Vec::new(),
-        });
-
-        let mutations = Resolver::resolve(
-            &alter_table_fact("users", vec![
-                // Adding "email" again without IF NOT EXISTS — should error.
-                AlterTableActionFact::AddColumn {
-                    name: "email".to_string(),
-                    ty: Some("text".to_string()),
-                    if_not_exists: false,
-                    not_null: false,
-                    default: None,
-                },
-            ]),
-            &state,
-        );
-        let rule = SafeAddColumnRule;
-        for m in &mutations { rule.evaluate(m, &state, &mut reporter); }
-
-        let dup_errors: Vec<_> = reporter.violations.iter()
-            .filter(|v| v.message.contains("already exists"))
-            .collect();
-        assert_eq!(dup_errors.len(), 1,
-            "Duplicate ADD COLUMN without IF NOT EXISTS must still produce an error");
-    }
-
-    #[test]
-    fn test_safe_add_column_if_not_exists_silences_duplicate_error() {
-        let mut state = fresh_state();
-        let mut reporter = Reporter::new();
-
-        apply_fact(&mut state, &StatementFact::CreateTable {
-            name: QualifiedName::new(None, "users"),
-            if_not_exists: false,
-            columns: vec![col_fact("email", "text", false, false)],
-            foreign_keys: Vec::new(),
-            table_constraints: Vec::new(),
-        });
-
-        let mutations = Resolver::resolve(
-            &alter_table_fact("users", vec![
-                // Same column but with IF NOT EXISTS — must be silent.
-                AlterTableActionFact::AddColumn {
-                    name: "email".to_string(),
-                    ty: Some("text".to_string()),
-                    if_not_exists: true,
-                    not_null: false,
-                    default: None,
-                },
-            ]),
-            &state,
-        );
-        let rule = SafeAddColumnRule;
-        for m in &mutations { rule.evaluate(m, &state, &mut reporter); }
-
-        assert!(reporter.violations.is_empty(),
-            "ADD COLUMN IF NOT EXISTS on existing column must be silent");
-    }
-
-    // ── Bug 16 — DropColumnIdempotencyRule ───────
-
-    #[test]
-    fn test_drop_column_without_if_exists_warns() {
-        let mut state = fresh_state();
-        let mut reporter = Reporter::new();
-
-        apply_fact(&mut state, &StatementFact::CreateTable {
-            name: QualifiedName::new(None, "users"),
-            if_not_exists: false,
-            columns: vec![col_fact("legacy_col", "text", false, false)],
-            foreign_keys: Vec::new(),
-            table_constraints: Vec::new(),
-        });
-
-        let mutations = Resolver::resolve(
-            &alter_table_fact("users", vec![
-                AlterTableActionFact::DropColumn {
-                    name: "legacy_col".to_string(),
-                    if_exists: false,
-                },
-            ]),
-            &state,
-        );
-        let rule = DropColumnIdempotencyRule;
-        for m in &mutations { rule.evaluate(m, &state, &mut reporter); }
-
-        assert_eq!(reporter.violations.len(), 1,
-            "DROP COLUMN without IF EXISTS must produce exactly one warning");
-        assert!(reporter.violations[0].message.contains("IF EXISTS"),
-            "Warning message must mention IF EXISTS");
-        assert!(reporter.violations[0].message.contains("legacy_col"),
-            "Warning message must name the column");
-    }
-
-    #[test]
-    fn test_drop_column_with_if_exists_is_silent() {
-        let mut state = fresh_state();
-        let mut reporter = Reporter::new();
-
-        apply_fact(&mut state, &StatementFact::CreateTable {
-            name: QualifiedName::new(None, "users"),
-            if_not_exists: false,
-            columns: vec![col_fact("legacy_col", "text", false, false)],
-            foreign_keys: Vec::new(),
-            table_constraints: Vec::new(),
-        });
-
-        let mutations = Resolver::resolve(
-            &alter_table_fact("users", vec![
-                AlterTableActionFact::DropColumn {
-                    name: "legacy_col".to_string(),
-                    if_exists: true,
-                },
-            ]),
-            &state,
-        );
-        let rule = DropColumnIdempotencyRule;
-        for m in &mutations { rule.evaluate(m, &state, &mut reporter); }
-
-        assert!(reporter.violations.is_empty(),
-            "DROP COLUMN IF EXISTS must produce no idempotency warning");
-    }
-
-    // ── Volatile function list completeness ──────
-
-    #[test]
-    fn test_gen_random_uuid_is_volatile() {
-        let expr = ExprIr::FunctionCall {
-            name: "gen_random_uuid".to_string(),
-            args: vec![],
-        };
-        assert!(expr.is_volatile(), "gen_random_uuid must be in the volatile list");
-    }
-
-    #[test]
-    fn test_nextval_is_volatile() {
-        let expr = ExprIr::FunctionCall {
-            name: "nextval".to_string(),
-            args: vec![ExprIr::Literal("'seq'".to_string())],
-        };
-        assert!(expr.is_volatile(), "nextval must be in the volatile list");
-    }
-
-    #[test]
-    fn test_txid_current_is_volatile() {
-        let expr = ExprIr::FunctionCall {
-            name: "txid_current".to_string(),
-            args: vec![],
-        };
-        assert!(expr.is_volatile(), "txid_current must be in the volatile list");
-    }
-
-    #[test]
-    fn test_immutable_function_is_not_volatile() {
-        // lower() is IMMUTABLE — must not be flagged.
-        let expr = ExprIr::FunctionCall {
-            name: "lower".to_string(),
-            args: vec![ExprIr::Literal("'ABC'".to_string())],
-        };
-        assert!(!expr.is_volatile(), "lower() is IMMUTABLE and must not be volatile");
+    fn test_ident_schema_resolution() {
+        let engine = setup_engine();
+        let mut state = AnalysisState::new(crate::db::cache::DbCache::new());
+        engine.analyze("CREATE TABLE MySchema.MyTable (id int);", &mut state).unwrap();
+        assert!(state.relation_is_present(&object_id("myschema", "mytable")));
     }
 }

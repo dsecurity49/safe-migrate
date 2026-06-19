@@ -1,57 +1,113 @@
-use crate::analysis::expr_ir::ExprIr;
-use crate::analysis::expr_visitor::ExprVisitor;
+// FILE: src/ast/visitor.rs
 use crate::analysis::facts::{
-    AlterTableActionFact, ColumnFact, FkFact, StatementFact, TableConstraintFact,
+    AlterTableActionFact, ColumnFact, FkFact, StatementFact, TableConstraintFact, PersistenceFact,
+    AlterIndexActionFact, AlterTypeActionFact, CreateTypeFact, AlterTypeFact
 };
-use crate::ast::identifiers::QualifiedName;
+use crate::ast::identifiers::{Ident, QualifiedName};
 use squawk_syntax::ast::{
-    AstNode, AlterColumnOption, AlterTable, AlterTableAction, Column, ColumnConstraint,
-    ConfigValue, Constraint, CreateIndex, CreateTable, CreateTableAs, CreateView, DropIndex,
-    DropTable, Path, PathSegment, ReleaseSavepoint, Rollback, Savepoint, Set, Stmt, TableArg,
-    TableConstraint,
+    self, AstNode, AlterColumnOption, AlterTable, AlterTableAction, Column, ColumnConstraint,
+    Constraint, CreateIndex, CreateTable, CreateTableAs, CreateView, DropIndex,
+    DropTable, Path, PathSegment, Stmt, TableArg, TableConstraint,
+    CreateSequence, AlterSequence, DropSequence, CreateMaterializedView,
+    DropView, DropMaterializedView, AlterIndex, UsingMethod, WhereClause, RenameTo,
+    AttachPartition, DetachPartition, AlterConstraint, Set, Rollback, Savepoint, ReleaseSavepoint,
+    CreateType, AlterType, CreateDomain, AlterDomain, DropDomain, CreatePolicy, DropPolicy,
+    CreateTrigger, DropTrigger, AddValue, Name, NameRef
 };
 
 pub struct AstVisitor;
 
 impl AstVisitor {
-    pub fn extract(stmt: &Stmt) -> Option<StatementFact> {
-        match stmt {
-            Stmt::CreateTable(node)      => Self::extract_create_table(node),
-            Stmt::CreateTableAs(node)    => Self::extract_create_table_as(node),
-            Stmt::CreateView(node)       => Self::extract_create_view(node),
-            Stmt::CreateIndex(node)      => Self::extract_create_index(node),
-            Stmt::AlterTable(node)       => Self::extract_alter_table(node),
-            Stmt::DropTable(node)        => Self::extract_drop_table(node),
-            Stmt::DropIndex(node)        => Self::extract_drop_index(node),
-            Stmt::Set(node)              => Self::extract_set(node),
-            Stmt::Begin(_)               => Some(StatementFact::BeginTransaction),
-            Stmt::Commit(_)              => Some(StatementFact::CommitTransaction),
-            Stmt::Rollback(node)         => Some(Self::extract_rollback(node)),
-            Stmt::Savepoint(node)        => Self::extract_savepoint(node),
-            Stmt::ReleaseSavepoint(node) => Self::extract_release_savepoint(node),
-            Stmt::Do(_)                  => Some(StatementFact::OpaqueBlock),
-            Stmt::Execute(_)             => Some(StatementFact::Execute),
-            _                            => None,
-        }
+    /// Safely resolves and trims an unquoted/quoted Name into a string 
+    /// following Postgres casing rules
+    fn resolve_name(n: Name) -> String {
+        Ident::new(n.text().to_string().trim_matches('"').to_string(), n.is_quoted()).resolve()
     }
 
-    // ── CREATE TABLE ──────────────────────────────────────────────────
+    /// Safely resolves and trims an unquoted/quoted NameRef into a string 
+    /// following Postgres casing rules
+    fn resolve_name_ref(nr: NameRef) -> String {
+        Ident::new(nr.text().to_string().trim_matches('"').to_string(), nr.is_quoted()).resolve()
+    }
+
+    pub fn extract(stmt: &Stmt) -> Option<StatementFact> {
+        let syntax = stmt.syntax();
+        match stmt {
+            Stmt::CreateTable(node)            => return Self::extract_create_table(node),
+            Stmt::CreateTableAs(node)          => return Self::extract_create_table_as(node),
+            Stmt::CreateView(node)             => return Self::extract_create_view(node),
+            Stmt::CreateMaterializedView(node) => return Self::extract_create_materialized_view(node),
+            Stmt::CreateIndex(node)            => return Self::extract_create_index(node),
+            Stmt::AlterTable(node)             => return Self::extract_alter_table(node),
+            Stmt::AlterIndex(node)             => return Self::extract_alter_index(node),
+            Stmt::DropTable(node)              => return Self::extract_drop_table(node),
+            Stmt::DropView(node)               => return Self::extract_drop_view(node),
+            Stmt::DropMaterializedView(node)   => return Self::extract_drop_materialized_view(node),
+            Stmt::DropIndex(node)              => return Self::extract_drop_index(node),
+            Stmt::Set(node)                    => return Self::extract_set(node),
+            Stmt::Begin(_)                     => return Some(StatementFact::BeginTransaction),
+            Stmt::Commit(_)                    => return Some(StatementFact::CommitTransaction),
+            Stmt::Rollback(node)               => return Some(Self::extract_rollback(node)),
+            Stmt::Savepoint(node)              => return Some(Self::extract_savepoint(node)),
+            Stmt::ReleaseSavepoint(node)       => return Some(Self::extract_release_savepoint(node)),
+            _ => {}
+        }
+
+        // Dynamically Cast Syntax Nodes for unsupported edge cases
+        if let Some(node) = CreateSequence::cast(syntax.clone()) { return Self::extract_create_sequence(&node); }
+        if let Some(node) = AlterSequence::cast(syntax.clone()) { return Self::extract_alter_sequence(&node); }
+        if let Some(node) = DropSequence::cast(syntax.clone()) { return Self::extract_drop_sequence(&node); }
+        if let Some(node) = CreateType::cast(syntax.clone()) { return Self::extract_create_type(&node); }
+        if let Some(node) = AlterType::cast(syntax.clone()) { return Self::extract_alter_type(&node); }
+        if let Some(node) = CreateDomain::cast(syntax.clone()) { return Self::extract_create_domain(&node); }
+        if let Some(node) = AlterDomain::cast(syntax.clone()) { return Self::extract_alter_domain(&node); }
+        if let Some(node) = DropDomain::cast(syntax.clone()) { return Self::extract_drop_domain(&node); }
+        if let Some(node) = CreatePolicy::cast(syntax.clone()) { return Self::extract_create_policy(&node); }
+        if let Some(node) = DropPolicy::cast(syntax.clone()) { return Self::extract_drop_policy(&node); }
+        if let Some(node) = CreateTrigger::cast(syntax.clone()) { return Self::extract_create_trigger(&node); }
+        if let Some(node) = DropTrigger::cast(syntax.clone()) { return Self::extract_drop_trigger(&node); }
+
+        // Absolute Fallbacks for dynamic blocks and mat-view refreshes
+        let text = syntax.text().to_string();
+        let upper = text.to_uppercase();
+
+        if upper.starts_with("REFRESH MATERIALIZED VIEW") {
+            let concurrently = upper.contains("CONCURRENTLY");
+            let clean_name = text.split_whitespace().last().unwrap_or("").trim_matches(';');
+            return Some(StatementFact::RefreshMaterializedView {
+                name: QualifiedName::new(None, Ident::new(clean_name.to_string(), false)),
+                concurrently
+            });
+        }
+
+        if upper.starts_with("DO ") { return Some(StatementFact::OpaqueBlock); }
+        if upper.starts_with("EXECUTE ") { return Some(StatementFact::Execute); }
+
+        None
+    }
+
+    // ─────────────────────────────────────────────
+    // Table Extractors
+    // ─────────────────────────────────────────────
 
     fn extract_create_table(node: &CreateTable) -> Option<StatementFact> {
-        let path = node.path()?;
+        let path = node.syntax().descendants().find_map(Path::cast)?;
         let name = Self::path_to_qualified_name(&path)?;
-        let if_not_exists = node.if_not_exists().is_some();
 
-        // Bug 9: extract_table_body now returns three vecs; previously returned two,
-        // silently dropping all table-level PK/UNIQUE/CHECK constraints.
+        let persistence = match node.persistence().map(|p| p.syntax().text().to_string().to_lowercase()).as_deref() {
+            Some("temporary") | Some("temp") => PersistenceFact::Temporary,
+            Some("unlogged") => PersistenceFact::Unlogged,
+            _ => PersistenceFact::Permanent,
+        };
         let (columns, foreign_keys, table_constraints) = node
             .table_arg_list()
             .map(|tal| Self::extract_table_body(tal.args()))
             .unwrap_or_else(|| (Vec::new(), Vec::new(), Vec::new()));
-
         Some(StatementFact::CreateTable {
             name,
-            if_not_exists,
+            if_not_exists: node.if_not_exists().is_some(),
+            as_select: false,
+            persistence,
             columns,
             foreign_keys,
             table_constraints,
@@ -59,513 +115,511 @@ impl AstVisitor {
     }
 
     fn extract_create_table_as(node: &CreateTableAs) -> Option<StatementFact> {
-        let path = node.path()?;
+        let path = node.syntax().descendants().find_map(Path::cast)?;
+        let persistence = match node.persistence().map(|p| p.syntax().text().to_string().to_lowercase()).as_deref() {
+            Some("temporary") | Some("temp") => PersistenceFact::Temporary,
+            Some("unlogged") => PersistenceFact::Unlogged,
+            _ => PersistenceFact::Permanent,
+        };
         Some(StatementFact::CreateTable {
             name: Self::path_to_qualified_name(&path)?,
             if_not_exists: node.if_not_exists().is_some(),
+            as_select: true,
+            persistence,
             columns: Vec::new(),
             foreign_keys: Vec::new(),
-            // CREATE TABLE AS has no column list; columns unknown until SELECT executes.
             table_constraints: Vec::new(),
         })
     }
 
-    // ── Table body extraction ─────────────────────────────────────────
-
-    /// Returns (columns, foreign_keys, table_constraints).
-    ///
-    /// Bug 9: previously returned (columns, foreign_keys) and the
-    /// `TableArg::TableConstraint` arm only forwarded FK constraints.
-    /// PK, UNIQUE, and CHECK constraints hit `_ => None` and were dropped.
-    fn extract_table_body(
-        args: impl Iterator<Item = TableArg>,
-    ) -> (Vec<ColumnFact>, Vec<FkFact>, Vec<TableConstraintFact>) {
-        let mut columns: Vec<ColumnFact> = Vec::new();
-        let mut foreign_keys: Vec<FkFact> = Vec::new();
-        let mut table_constraints: Vec<TableConstraintFact> = Vec::new();
-
-        for arg in args {
-            match arg {
-                TableArg::Column(col) => {
-                    // Bug 12: pass the column's name into extract_column_fk_facts
-                    // so that from_columns is populated for inline FK constraints.
-                    // Previously from_columns was always Vec::new().
-                    for fk in Self::extract_column_fk_facts(&col) {
-                        foreign_keys.push(fk);
-                    }
-                    if let Some(fact) = Self::extract_column_fact(&col) {
-                        columns.push(fact);
-                    }
-                }
-                TableArg::TableConstraint(tc) => {
-                    if let Some(fk) = Self::extract_table_fk_fact(&tc) {
-                        foreign_keys.push(fk);
-                    }
-                    // Bug 9: previously only FKs were extracted; now extract all.
-                    if let Some(tc_fact) = Self::extract_table_constraint_fact(&tc) {
-                        table_constraints.push(tc_fact);
-                    }
-                }
-                TableArg::LikeClause(_) => {}
-            }
-        }
-
-        (columns, foreign_keys, table_constraints)
-    }
-
-    fn extract_column_fact(col: &Column) -> Option<ColumnFact> {
-        // Bug 3: use Name::text() directly instead of .ident_token()?.text().
-        // Name and NameRef both expose .text() without going through the token.
-        let name = col
-            .name()
-            .map(|n| n.text().to_string())?;
-
-        let ty = col.ty().map(|t| t.syntax().text().to_string());
-
-        let mut not_null = false;
-        let mut is_primary_key = false;
-        let mut default: Option<ExprIr> = None;
-
-        for constraint in col.constraints() {
-            match constraint {
-                ColumnConstraint::NotNullConstraint(_) => not_null = true,
-                ColumnConstraint::PrimaryKeyConstraint(_) => {
-                    is_primary_key = true;
-                    not_null = true;
-                }
-                ColumnConstraint::DefaultConstraint(dc) => {
-                    default = dc.expr().map(ExprVisitor::convert);
-                }
-                _ => {}
-            }
-        }
-
-        Some(ColumnFact { name, ty, not_null, is_primary_key, default })
-    }
-
-    /// Extract FK facts from inline column-level REFERENCES constraints.
-    ///
-    /// Bug 12: the owning column IS the referencing column for an inline FK,
-    /// so from_columns must be populated with the column's own name.
-    /// Previously from_columns was always Vec::new().
-    fn extract_column_fk_facts(col: &Column) -> Vec<FkFact> {
-        // Bug 3: use Name::text() directly.
-        let col_name: Option<String> = col.name().map(|n| n.text().to_string());
-
-        let mut facts = Vec::new();
-        for constraint in col.constraints() {
-            if let ColumnConstraint::ReferencesConstraint(rc) = constraint {
-                if let Some(path) = rc.table() {
-                    if let Some(references) = Self::path_to_qualified_name(&path) {
-                        facts.push(FkFact {
-                            references,
-                            // Bug 12 fix: the referencing column is this column.
-                            from_columns: col_name.iter().cloned().collect(),
-                            to_columns: Vec::new(),
-                        });
-                    }
-                }
-            }
-        }
-        facts
-    }
-
-    fn extract_table_fk_fact(tc: &TableConstraint) -> Option<FkFact> {
-        if let TableConstraint::ForeignKeyConstraint(fkc) = tc {
-            let path = fkc.path()?;
-            let references = Self::path_to_qualified_name(&path)?;
-
-            let from_columns = fkc
-                .from_columns()
-                .map(|cl| Self::extract_column_list_names(cl))
-                .unwrap_or_default();
-
-            let to_columns = fkc
-                .to_columns()
-                .map(|cl| Self::extract_column_list_names(cl))
-                .unwrap_or_default();
-
-            Some(FkFact { references, from_columns, to_columns })
-        } else {
-            None
-        }
-    }
-
-    /// Extract non-FK table constraints (PK, UNIQUE, CHECK).
-    ///
-    /// Bug 9: this function did not exist — the TableConstraint arm in
-    /// extract_table_body had no equivalent for non-FK constraints.
-    ///
-    /// VERIFY before compiling: PrimaryKeyConstraint and UniqueConstraint
-    /// column-list accessor names. Pattern should match ForeignKeyConstraint
-    /// which uses from_columns(). Grep squawk.rs for PrimaryKeyConstraint
-    /// and UniqueConstraint in the manual extension block (~38k–39k line range).
-    /// Expected: `pkc.columns() -> Option<ColumnList>` and
-    ///           `uc.columns()  -> Option<ColumnList>`.
-    fn extract_table_constraint_fact(tc: &TableConstraint) -> Option<TableConstraintFact> {
-        match tc {
-            TableConstraint::PrimaryKeyConstraint(pkc) => {
-                let columns = pkc
-                    .column_list()
-                    .map(|cl| Self::extract_column_list_names(cl))
-                    .unwrap_or_default();
-                Some(TableConstraintFact::PrimaryKey { columns })
-            }
-            TableConstraint::UniqueConstraint(uc) => {
-                let columns = uc
-                    .column_list()
-                    .map(|cl| Self::extract_column_list_names(cl))
-                    .unwrap_or_default();
-                Some(TableConstraintFact::Unique { columns })
-            }
-            TableConstraint::CheckConstraint(_) => {
-                Some(TableConstraintFact::Check)
-            }
-            // ForeignKeyConstraint is handled separately in extract_table_fk_fact.
-            _ => None,
-        }
-    }
-
-    /// Extract column names from a ColumnList node.
-    /// Bug 3: use NameRef::text() directly instead of .ident_token()?.text().
-    fn extract_column_list_names(cl: squawk_syntax::ast::ColumnList) -> Vec<String> {
-        cl.columns()
-            .filter_map(|col| {
-                col.name_ref().map(|n| n.text().to_string())
-            })
-            .collect()
-    }
-
-    // ── CREATE VIEW ───────────────────────────────────────────────────
-
-    fn extract_create_view(node: &CreateView) -> Option<StatementFact> {
-        let path = node.path()?;
-        Some(StatementFact::CreateView {
+    fn extract_drop_table(node: &DropTable) -> Option<StatementFact> {
+        let path = node.syntax().descendants().find_map(Path::cast)?;
+        Some(StatementFact::DropTable {
             name: Self::path_to_qualified_name(&path)?,
-            or_replace: node.or_replace().is_some(),
+            if_exists: node.if_exists().is_some(),
+            cascade: node.cascade_token().is_some(),
         })
     }
-
-    // ── CREATE INDEX ──────────────────────────────────────────────────
-
-    fn extract_create_index(node: &CreateIndex) -> Option<StatementFact> {
-        // Bug 3: use Name::text() directly.
-        let index_name_str = node
-            .name()?
-            .text()
-            .to_string();
-
-        let relation_path = node.relation_name()?.path()?;
-
-        Some(StatementFact::CreateIndex {
-            name: QualifiedName::new(None, index_name_str),
-            relation: Self::path_to_qualified_name(&relation_path)?,
-            if_not_exists: node.if_not_exists().is_some(),
-            concurrently: node.concurrently_token().is_some(),
-        })
-    }
-
-    // ── ALTER TABLE ───────────────────────────────────────────────────
 
     fn extract_alter_table(node: &AlterTable) -> Option<StatementFact> {
-        let path = node.relation_name()?.path()?;
+        let path = node.syntax().descendants().find_map(Path::cast)?;
         let table_name = Self::path_to_qualified_name(&path)?;
         let mut actions = Vec::new();
 
         for action in node.actions() {
+            if let Some(ap) = AttachPartition::cast(action.syntax().clone()) {
+                if let Some(child_path) = ap.syntax().descendants().find_map(Path::cast) {
+                    if let Some(child) = Self::path_to_qualified_name(&child_path) {
+                        actions.push(AlterTableActionFact::AttachPartition { child });
+                    }
+                }
+                continue;
+            }
+            if let Some(dp) = DetachPartition::cast(action.syntax().clone()) {
+                if let Some(child_path) = dp.syntax().descendants().find_map(Path::cast) {
+                    if let Some(child) = Self::path_to_qualified_name(&child_path) {
+                        actions.push(AlterTableActionFact::DetachPartition { child });
+                    }
+                }
+                continue;
+            }
+            if let Some(ac) = AlterConstraint::cast(action.syntax().clone()) {
+                if let Some(name_ref) = ac.syntax().descendants().find_map(NameRef::cast) {
+                    let name = Self::resolve_name_ref(name_ref);
+                    let deferrable = ac.syntax().text().to_string().to_lowercase().contains("deferrable");
+                    actions.push(AlterTableActionFact::AlterConstraint { name, deferrable });
+                }
+                continue;
+            }
+
             match action {
                 AlterTableAction::AddColumn(add) => {
-                    // Bug 3: use Name::text() directly.
-                    if let Some(name) = add.name().map(|n| n.text().to_string()) {
-                        // Bug 11: scan constraints for NOT NULL and PRIMARY KEY.
-                        // AddColumn::constraints() returns AstChildren<Constraint>
-                        // (table-level Constraint enum, not ColumnConstraint).
+                    if let Some(name) = add.name().map(Self::resolve_name) {
                         let mut not_null = false;
                         let mut default = None;
-
                         for c in add.constraints() {
                             match c {
-                                Constraint::NotNullConstraint(_) => {
-                                    not_null = true;
-                                }
-                                Constraint::PrimaryKeyConstraint(_) => {
-                                    // Inline PK on ADD COLUMN implies NOT NULL.
-                                    not_null = true;
-                                }
-                                Constraint::DefaultConstraint(dc) => {
-                                    default = dc.expr().map(ExprVisitor::convert);
-                                }
+                                Constraint::NotNullConstraint(_) => not_null = true,
+                                Constraint::PrimaryKeyConstraint(_) => not_null = true,
+                                Constraint::DefaultConstraint(dc) => default = dc.expr().map(crate::analysis::expr_visitor::ExprVisitor::convert),
                                 _ => {}
                             }
                         }
-
-                        actions.push(AlterTableActionFact::AddColumn {
-                            name,
-                            ty: add.ty().map(|t| t.syntax().text().to_string()),
-                            if_not_exists: add.if_not_exists().is_some(),
-                            not_null,
-                            default,
-                        });
+                        actions.push(AlterTableActionFact::AddColumn { name, ty: add.ty().map(|t| t.syntax().text().to_string()), if_not_exists: add.if_not_exists().is_some(), not_null, default });
                     }
                 }
-
                 AlterTableAction::DropColumn(drop) => {
-                    // Bug 3: use NameRef::text() directly.
-                    if let Some(name) = drop.name_ref().map(|n| n.text().to_string()) {
-                        actions.push(AlterTableActionFact::DropColumn {
-                            name,
-                            if_exists: drop.if_exists().is_some(),
-                        });
+                    if let Some(name) = drop.name_ref().map(Self::resolve_name_ref) {
+                        actions.push(AlterTableActionFact::DropColumn { name, if_exists: drop.if_exists().is_some() });
                     }
                 }
-
-                // RENAME COLUMN old TO new
-                // Uses handwritten from() / to() accessors returning Option<NameRef>.
                 AlterTableAction::RenameColumn(rc) => {
-                    // Bug 3: use NameRef::text() directly.
-                    let from = rc.from().map(|n| n.text().to_string());
-                    let to   = rc.to().map(|n| n.text().to_string());
-                    if let (Some(from), Some(to)) = (from, to) {
+                    let from_ident = rc.from().map(|nr| Ident::new(nr.text().to_string().trim_matches('"').to_string(), nr.is_quoted()))
+                        .or_else(|| rc.syntax().descendants().find_map(NameRef::cast).map(|nr| Ident::new(nr.text().to_string().trim_matches('"').to_string(), nr.is_quoted())));
+
+                    let to_ident = rc.to().map(|nr| Ident::new(nr.text().to_string().trim_matches('"').to_string(), nr.is_quoted()))
+                        .or_else(|| rc.syntax().descendants().find_map(Name::cast).map(|n| Ident::new(n.text().to_string().trim_matches('"').to_string(), n.is_quoted())));
+
+                    if let (Some(from), Some(to)) = (from_ident, to_ident) {
                         actions.push(AlterTableActionFact::RenameColumn { from, to });
                     }
                 }
-
-                // RENAME TO new_table_name
                 AlterTableAction::RenameTo(rt) => {
-                    // Bug 3: use Name::text() directly.
-                    if let Some(new_name) = rt.name().map(|n| n.text().to_string()) {
-                        actions.push(AlterTableActionFact::RenameTo { new_name });
+                    if let Some(new_name) = rt.name() {
+                        actions.push(AlterTableActionFact::RenameTo { 
+                            new_name: Ident::new(new_name.text().to_string().trim_matches('"').to_string(), new_name.is_quoted()) 
+                        });
                     }
                 }
-
                 AlterTableAction::AddConstraint(ac) => {
-                    if let Some(fact) = Self::extract_add_constraint_fact(&ac) {
-                        actions.push(fact);
+                    if let Some(fact) = Self::extract_add_constraint_fact(&ac) { actions.push(fact); }
+                }
+                AlterTableAction::DropConstraint(dc) => {
+                    if let Some(name) = dc.name_ref().map(Self::resolve_name_ref) {
+                        actions.push(AlterTableActionFact::DropConstraint { name });
                     }
                 }
-
                 AlterTableAction::AlterColumn(alter_col) => {
-                    // Bug 3: use NameRef::text() directly.
-                    let col_name = match alter_col.name_ref().map(|n| n.text().to_string()) {
-                        Some(name) => name,
-                        None => continue,
-                    };
-                    if let Some(opt) = alter_col.option() {
-                        if let Some(fact) = Self::extract_alter_column_option(col_name, opt) {
-                            actions.push(fact);
+                    if let Some(nr) = alter_col.name_ref() {
+                        let col_name = Self::resolve_name_ref(nr);
+                        if let Some(opt) = alter_col.option() {
+                            if let Some(fact) = Self::extract_alter_column_option(col_name, opt) { actions.push(fact); }
                         }
                     }
                 }
-
-                // VALIDATE CONSTRAINT constraint_name
                 AlterTableAction::ValidateConstraint(vc) => {
-                    // Bug 3: use NameRef::text() directly.
-                    if let Some(constraint_name) = vc.name_ref().map(|n| n.text().to_string()) {
+                    if let Some(constraint_name) = vc.syntax().descendants().find_map(NameRef::cast).map(Self::resolve_name_ref) {
                         actions.push(AlterTableActionFact::ValidateConstraint { constraint_name });
                     }
                 }
-
                 _ => {}
             }
         }
-
         Some(StatementFact::AlterTable { name: table_name, actions })
     }
 
-    fn extract_alter_column_option(
-        col_name: String,
-        opt: AlterColumnOption,
-    ) -> Option<AlterTableActionFact> {
+    fn extract_table_body(args: impl Iterator<Item = TableArg>) -> (Vec<ColumnFact>, Vec<FkFact>, Vec<TableConstraintFact>) {
+        let mut columns = Vec::new();
+        let mut foreign_keys = Vec::new();
+        let mut table_constraints = Vec::new();
+        for arg in args {
+            match arg {
+                TableArg::Column(col) => {
+                    for fk in Self::extract_column_fk_facts(&col) { foreign_keys.push(fk); }
+                    if let Some(fact) = Self::extract_column_fact(&col) { columns.push(fact); }
+                }
+                TableArg::TableConstraint(tc) => {
+                    if let Some(fk) = Self::extract_table_fk_fact(&tc) { foreign_keys.push(fk); }
+                    if let Some(tc_fact) = Self::extract_table_constraint_fact(&tc) { table_constraints.push(tc_fact); }
+                }
+                _ => {}
+            }
+        }
+        (columns, foreign_keys, table_constraints)
+    }
+
+    fn extract_column_fact(col: &Column) -> Option<ColumnFact> {
+        let name = Self::resolve_name(col.name()?);
+        let ty = col.ty().map(|t| t.syntax().text().to_string());
+        let not_null = col.constraints().any(|c| matches!(c, ColumnConstraint::NotNullConstraint(_)));
+        let is_primary_key = col.constraints().any(|c| matches!(c, ColumnConstraint::PrimaryKeyConstraint(_)));
+        let default = col.constraints().find_map(|c| if let ColumnConstraint::DefaultConstraint(dc) = c { Some(crate::analysis::expr_visitor::ExprVisitor::convert(dc.expr()?)) } else { None });
+        Some(ColumnFact { name, ty, not_null, is_primary_key, default })
+    }
+
+    fn extract_alter_column_option(col_name: String, opt: AlterColumnOption) -> Option<AlterTableActionFact> {
+        let opt_text = opt.syntax().text().to_string().to_lowercase();
+        if opt_text.starts_with("set storage") { return Some(AlterTableActionFact::SetStorage { column: col_name }); }
+
         match opt {
-            AlterColumnOption::SetNotNull(_) => {
-                Some(AlterTableActionFact::SetNotNull { column: col_name })
-            }
-            AlterColumnOption::DropNotNull(_) => {
-                Some(AlterTableActionFact::DropNotNull { column: col_name })
-            }
-            AlterColumnOption::SetType(st) => {
-                let ty = st.ty()?.syntax().text().to_string();
-                Some(AlterTableActionFact::SetType { column: col_name, ty })
-            }
-            AlterColumnOption::SetDefault(sd) => {
-                let default = sd.expr().map(ExprVisitor::convert);
-                Some(AlterTableActionFact::SetDefault { column: col_name, default })
-            }
+            AlterColumnOption::SetNotNull(_) => Some(AlterTableActionFact::SetNotNull { column: col_name }),
+            AlterColumnOption::DropNotNull(_) => Some(AlterTableActionFact::DropNotNull { column: col_name }),
+            AlterColumnOption::SetType(st) => Some(AlterTableActionFact::SetType { column: col_name, ty: st.ty()?.syntax().text().to_string() }),
+            AlterColumnOption::SetDefault(sd) => Some(AlterTableActionFact::SetDefault { column: col_name, default: sd.expr().map(crate::analysis::expr_visitor::ExprVisitor::convert) }),
             _ => None,
         }
     }
 
-    /// Extract an AddForeignKey fact from an AddConstraint action.
-    /// Also extracts CHECK, UNIQUE, and PK constraint facts.
-    ///
-    /// Bug 10: extracts the constraint name from the inner constraint node.
-    ///
-    /// AddConstraint has no name accessor of its own — confirmed by grep:
-    /// its impl block only has constraint(), not_valid(), deferrable options,
-    /// enforced(), no_inherit(), and token accessors. The CONSTRAINT <name>
-    /// clause is parsed as a ConstraintName child of each inner constraint node
-    /// (ForeignKeyConstraint, UniqueConstraint, PrimaryKeyConstraint, etc.).
-    ///
-    /// Accessor chain: inner.constraint_name() -> Option<ConstraintName>
-    ///                 .and_then(|cn| cn.name())  -> Option<Name>
-    ///                 .map(|n| n.text())          -> &str
-    fn extract_add_constraint_fact(
-        ac: &squawk_syntax::ast::AddConstraint,
-    ) -> Option<AlterTableActionFact> {
+    fn extract_add_constraint_fact(ac: &squawk_syntax::ast::AddConstraint) -> Option<AlterTableActionFact> {
         let constraint = ac.constraint()?;
         let not_valid = ac.not_valid().is_some();
-
         match constraint {
             Constraint::ForeignKeyConstraint(fkc) => {
-                // Bug 10: constraint name lives on the inner FK node.
-                let constraint_name = fkc
-                    .constraint_name()
-                    .and_then(|cn| cn.name())
-                    .map(|n| n.text().to_string());
-                let path = fkc.path()?;
+                let constraint_name = fkc.constraint_name().and_then(|cn| cn.name()).map(Self::resolve_name);
+                let path = fkc.syntax().descendants().find_map(Path::cast)?;
                 let references = Self::path_to_qualified_name(&path)?;
-                let from_columns = fkc
-                    .from_columns()
-                    .map(|cl| Self::extract_column_list_names(cl))
-                    .unwrap_or_default();
-                let to_columns = fkc
-                    .to_columns()
-                    .map(|cl| Self::extract_column_list_names(cl))
-                    .unwrap_or_default();
                 Some(AlterTableActionFact::AddForeignKey {
                     constraint_name,
                     references,
-                    from_columns,
-                    to_columns,
+                    from_columns: fkc.from_columns().map(Self::extract_column_list_names).unwrap_or_default(),
+                    to_columns: fkc.to_columns().map(Self::extract_column_list_names).unwrap_or_default(),
                     not_valid,
                 })
             }
-            Constraint::CheckConstraint(_) => {
-                Some(AlterTableActionFact::AddCheckConstraint { not_valid })
-            }
-            Constraint::UniqueConstraint(uc) => {
-                // Constraint name extracted from inner node — same pattern as FK.
-                let _constraint_name = uc
-                    .constraint_name()
-                    .and_then(|cn| cn.name())
-                    .map(|n| n.text().to_string());
-                Some(AlterTableActionFact::AddUniqueConstraint)
-            }
-            Constraint::PrimaryKeyConstraint(pkc) => {
-                let _constraint_name = pkc
-                    .constraint_name()
-                    .and_then(|cn| cn.name())
-                    .map(|n| n.text().to_string());
-                Some(AlterTableActionFact::AddPrimaryKeyConstraint)
-            }
+            Constraint::CheckConstraint(_) => Some(AlterTableActionFact::AddCheckConstraint { not_valid }),
+            Constraint::UniqueConstraint(_) => Some(AlterTableActionFact::AddUniqueConstraint),
+            Constraint::PrimaryKeyConstraint(_) => Some(AlterTableActionFact::AddPrimaryKeyConstraint),
             _ => None,
         }
     }
 
-    // ── DROP TABLE ────────────────────────────────────────────────────
+    fn extract_table_constraint_fact(tc: &TableConstraint) -> Option<TableConstraintFact> {
+        match tc {
+            TableConstraint::PrimaryKeyConstraint(pkc) => Some(TableConstraintFact::PrimaryKey { columns: Self::extract_column_list_names(pkc.column_list()?) }),
+            TableConstraint::UniqueConstraint(uc) => Some(TableConstraintFact::Unique { columns: Self::extract_column_list_names(uc.column_list()?) }),
+            TableConstraint::CheckConstraint(_) => Some(TableConstraintFact::Check),
+            _ => None,
+        }
+    }
 
-    fn extract_drop_table(node: &DropTable) -> Option<StatementFact> {
-        let path = node.path()?;
-        Some(StatementFact::DropTable {
-            name: Self::path_to_qualified_name(&path)?,
-            if_exists: node.if_exists().is_some(),
+    fn extract_column_fk_facts(col: &Column) -> Vec<FkFact> {
+        let col_name = col.name().map(Self::resolve_name);
+        col.constraints().filter_map(|c| {
+            if let ColumnConstraint::ReferencesConstraint(rc) = c {
+                let ref_path = rc.syntax().descendants().find_map(Path::cast)?;
+                Some(FkFact {
+                    constraint_name: None,
+                    references: Self::path_to_qualified_name(&ref_path)?,
+                    from_columns: col_name.iter().cloned().collect(),
+                    to_columns: Vec::new()
+                })
+            } else { None }
+        }).collect()
+    }
+
+    fn extract_table_fk_fact(tc: &TableConstraint) -> Option<FkFact> {
+        if let TableConstraint::ForeignKeyConstraint(fkc) = tc {
+            let constraint_name = fkc.constraint_name().and_then(|cn| cn.name()).map(Self::resolve_name);
+            let path = fkc.syntax().descendants().find_map(Path::cast)?;
+            let references = Self::path_to_qualified_name(&path)?;
+            let from_columns = fkc.from_columns().map(Self::extract_column_list_names).unwrap_or_default();
+            let to_columns = fkc.to_columns().map(Self::extract_column_list_names).unwrap_or_default();
+            Some(FkFact { constraint_name, references, from_columns, to_columns })
+        } else { None }
+    }
+
+    fn extract_column_list_names(cl: ast::ColumnList) -> Vec<String> {
+        cl.columns().filter_map(|col| col.name_ref().map(Self::resolve_name_ref)).collect()
+    }
+
+    // ─────────────────────────────────────────────
+    // Index Extractors
+    // ─────────────────────────────────────────────
+
+    fn extract_create_index(node: &CreateIndex) -> Option<StatementFact> {
+        let name = node.syntax().descendants().find_map(Name::cast)?;
+        let index_ident = Ident::new(name.text().to_string().trim_matches('"').to_string(), name.is_quoted());
+        let relation_path = node.syntax().descendants().find_map(Path::cast)?;
+
+        let using_method = node.syntax().descendants()
+            .find_map(UsingMethod::cast)
+            .map(|um| um.syntax().text().to_string().to_lowercase().replace("using", "").trim().to_string());
+        let has_predicate = node.syntax().descendants().any(|d| WhereClause::can_cast(d.kind()));
+
+        Some(StatementFact::CreateIndex {
+            name: QualifiedName::new(None, index_ident),
+            relation: Self::path_to_qualified_name(&relation_path)?,
+            if_not_exists: node.if_not_exists().is_some(),
+            concurrently: node.concurrently_token().is_some(),
+            using_method,
+            has_predicate,
         })
     }
 
-    // ── DROP INDEX ────────────────────────────────────────────────────
+    fn extract_alter_index(node: &AlterIndex) -> Option<StatementFact> {
+        let path = node.syntax().descendants().find_map(Path::cast)?;
+        let name = Self::path_to_qualified_name(&path)?;
+        let mut actions = Vec::new();
+
+        if let Some(rt) = node.syntax().descendants().find_map(RenameTo::cast) {
+            if let Some(new_name) = rt.name() {
+                actions.push(AlterIndexActionFact::RenameTo { 
+                    new_name: Ident::new(new_name.text().to_string().trim_matches('"').to_string(), new_name.is_quoted()) 
+                });
+            }
+        }
+
+        if actions.is_empty() { return None; }
+        Some(StatementFact::AlterIndex { name, actions })
+    }
 
     fn extract_drop_index(node: &DropIndex) -> Option<StatementFact> {
-        let names: Vec<QualifiedName> = node
-            .paths()
-            .filter_map(|p| Self::path_to_qualified_name(&p))
-            .collect();
-
+        let names: Vec<QualifiedName> = node.syntax().children().filter_map(Path::cast).filter_map(|p| Self::path_to_qualified_name(&p)).collect();
         if names.is_empty() { return None; }
+        Some(StatementFact::DropIndex { names, if_exists: node.if_exists().is_some(), concurrently: node.concurrently_token().is_some() })
+    }
 
-        Some(StatementFact::DropIndex {
-            names,
-            if_exists: node.if_exists().is_some(),
-            concurrently: node.concurrently_token().is_some(),
+    // ─────────────────────────────────────────────
+    // View Extractors
+    // ─────────────────────────────────────────────
+
+    fn extract_create_view(node: &CreateView) -> Option<StatementFact> {
+        let path = node.syntax().descendants().find_map(Path::cast)?;
+        Some(StatementFact::CreateView {
+            name: Self::path_to_qualified_name(&path)?,
+            or_replace: node.syntax().text().to_string().to_lowercase().contains("or replace"),
+            depends_on: Self::extract_view_dependencies(node.syntax())
         })
     }
 
-    // ── SET ───────────────────────────────────────────────────────────
+    fn extract_create_materialized_view(node: &CreateMaterializedView) -> Option<StatementFact> {
+        let path = node.syntax().descendants().find_map(Path::cast)?;
+        Some(StatementFact::CreateMaterializedView {
+            name: Self::path_to_qualified_name(&path)?,
+            depends_on: Self::extract_view_dependencies(node.syntax())
+        })
+    }
+
+    fn extract_drop_view(node: &DropView) -> Option<StatementFact> {
+        let names: Vec<QualifiedName> = node.syntax().children().filter_map(Path::cast).filter_map(|p| Self::path_to_qualified_name(&p)).collect();
+        if names.is_empty() { return None; }
+        Some(StatementFact::DropView { names, if_exists: node.if_exists().is_some() })
+    }
+
+    fn extract_drop_materialized_view(node: &DropMaterializedView) -> Option<StatementFact> {
+        let names: Vec<QualifiedName> = node.syntax().children().filter_map(Path::cast).filter_map(|p| Self::path_to_qualified_name(&p)).collect();
+        if names.is_empty() { return None; }
+        Some(StatementFact::DropMaterializedView { names, if_exists: node.if_exists().is_some() })
+    }
+
+    fn extract_view_dependencies(syntax: &squawk_syntax::SyntaxNode) -> Vec<QualifiedName> {
+        let mut depends_on = Vec::new();
+        let text = syntax.text().to_string();
+        let tokens: Vec<&str> = text.split_whitespace().collect();
+
+        let mut i = 0;
+        while i < tokens.len() {
+            let upper = tokens[i].to_uppercase();
+            if upper == "FROM" || upper == "JOIN" {
+                if i + 1 < tokens.len() {
+                    let table_str = tokens[i + 1].trim_matches(';');
+                    let parts: Vec<&str> = table_str.split('.').collect();
+                    let is_quoted = table_str.contains('"');
+                    let clean_part = |s: &str| s.trim_matches('"').to_string();
+                    if parts.len() == 1 {
+                        depends_on.push(QualifiedName::new(None, Ident::new(clean_part(parts[0]), is_quoted)));
+                    } else if parts.len() >= 2 {
+                        depends_on.push(QualifiedName::new(
+                            Some(Ident::new(clean_part(parts[0]), is_quoted)),
+                            Ident::new(clean_part(parts[1]), is_quoted)
+                        ));
+                    }
+                }
+            }
+            i += 1;
+        }
+        depends_on
+    }
+
+    // ─────────────────────────────────────────────
+    // Sequence Extractors
+    // ─────────────────────────────────────────────
+
+    fn extract_create_sequence(node: &CreateSequence) -> Option<StatementFact> {
+        let path = node.syntax().descendants().find_map(Path::cast)?;
+        let name = Self::path_to_qualified_name(&path)?;
+        Some(StatementFact::CreateSequence { name, if_not_exists: node.syntax().text().to_string().to_lowercase().contains("if not exists"), owned_by: Self::extract_owned_by(node.syntax()) })
+    }
+
+    fn extract_alter_sequence(node: &AlterSequence) -> Option<StatementFact> {
+        let path = node.syntax().descendants().find_map(Path::cast)?;
+        let name = Self::path_to_qualified_name(&path)?;
+        Some(StatementFact::AlterSequence { name, owned_by: Self::extract_owned_by(node.syntax()) })
+    }
+
+    fn extract_drop_sequence(node: &DropSequence) -> Option<StatementFact> {
+        let names = node.syntax().children().filter_map(Path::cast).filter_map(|p| Self::path_to_qualified_name(&p)).collect();
+        Some(StatementFact::DropSequence { names, if_exists: node.syntax().text().to_string().to_lowercase().contains("if exists") })
+    }
+
+    fn extract_owned_by(node: &squawk_syntax::SyntaxNode) -> Option<(QualifiedName, String)> {
+        let text = node.text().to_string().to_lowercase();
+        if let Some(idx) = text.find("owned by ") {
+            let target = text[idx + 9..].split_whitespace().next()?.trim_end_matches(';');
+            let parts: Vec<&str> = target.split('.').collect();
+            if parts.len() == 2 {
+                return Some((QualifiedName::new(None, Ident::new(parts[0].to_string(), false)), parts[1].to_string()));
+            }
+        }
+        None
+    }
+
+    // ─────────────────────────────────────────────
+    // Type & Domain Extractors
+    // ─────────────────────────────────────────────
+
+    fn extract_create_domain(node: &CreateDomain) -> Option<StatementFact> {
+        let path = node.syntax().descendants().find_map(Path::cast)?;
+        Some(StatementFact::CreateDomain { name: Self::path_to_qualified_name(&path)?, base_type: "<domain>".to_string() })
+    }
+
+    fn extract_alter_domain(node: &AlterDomain) -> Option<StatementFact> {
+        let path = node.syntax().descendants().find_map(Path::cast)?;
+        Some(StatementFact::AlterDomain { name: Self::path_to_qualified_name(&path)? })
+    }
+
+    fn extract_drop_domain(node: &DropDomain) -> Option<StatementFact> {
+        let names = node.syntax().children().filter_map(Path::cast).filter_map(|p| Self::path_to_qualified_name(&p)).collect();
+        Some(StatementFact::DropDomain { names, if_exists: node.syntax().text().to_string().to_lowercase().contains("if exists") })
+    }
+
+    fn extract_create_type(node: &CreateType) -> Option<StatementFact> {
+        let path = node.syntax().descendants().find_map(Path::cast)?;
+        Some(StatementFact::CreateType(CreateTypeFact {
+            name: Self::path_to_qualified_name(&path)?,
+            is_enum: node.syntax().text().to_string().to_lowercase().contains("enum"),
+        }))
+    }
+
+    fn extract_alter_type(node: &AlterType) -> Option<StatementFact> {
+        let path = node.syntax().descendants().find_map(Path::cast)?;
+        let name = Self::path_to_qualified_name(&path)?;
+        let mut actions = Vec::new();
+        for child in node.syntax().children() {
+            if let Some(av) = child.descendants().find_map(AddValue::cast) {
+                if let Some(lit) = av.literal() {
+                    actions.push(AlterTypeActionFact::AddValue { new_value: lit.syntax().text().to_string().trim_matches('\'').to_string() });
+                }
+            }
+        }
+        Some(StatementFact::AlterType(AlterTypeFact { name, actions }))
+    }
+
+    // ─────────────────────────────────────────────
+    // Policy & Trigger Extractors
+    // ─────────────────────────────────────────────
+
+    fn extract_create_policy(node: &CreatePolicy) -> Option<StatementFact> {
+        let name = Self::resolve_name(node.syntax().descendants().find_map(Name::cast)?);
+        let path = node.syntax().descendants().find_map(Path::cast)?;
+        let table = Self::path_to_qualified_name(&path)?;
+        Some(StatementFact::CreatePolicy { name, table })
+    }
+
+    fn extract_drop_policy(node: &DropPolicy) -> Option<StatementFact> {
+        let paths: Vec<_> = node.syntax().descendants().filter_map(Path::cast).collect();
+        let table = Self::path_to_qualified_name(paths.last()?)?;
+        let text = node.syntax().text().to_string();
+        let name = Self::extract_name_before_on(&text)?;
+        Some(StatementFact::DropPolicy { name, table, if_exists: text.to_lowercase().contains("if exists") })
+    }
+
+    fn extract_create_trigger(node: &CreateTrigger) -> Option<StatementFact> {
+        let name = Self::resolve_name(node.syntax().descendants().find_map(Name::cast)?);
+        let path = node.syntax().descendants().find_map(Path::cast)?;
+        let table = Self::path_to_qualified_name(&path)?;
+        Some(StatementFact::CreateTrigger { name, table })
+    }
+
+    fn extract_drop_trigger(node: &DropTrigger) -> Option<StatementFact> {
+        let paths: Vec<_> = node.syntax().descendants().filter_map(Path::cast).collect();
+        let table = Self::path_to_qualified_name(paths.last()?)?;
+        let text = node.syntax().text().to_string();
+        let name = Self::extract_name_before_on(&text)?;
+        Some(StatementFact::DropTrigger { name, table, if_exists: text.to_lowercase().contains("if exists") })
+    }
+
+    fn extract_name_before_on(text: &str) -> Option<String> {
+        let upper = text.to_uppercase();
+        let on_idx = upper.find(" ON ")?;
+        let before_on = &text[..on_idx];
+        let raw_name = before_on.split_whitespace().last()?;
+        Some(Ident::new(raw_name.trim_matches('"').to_string(), raw_name.starts_with('"')).resolve())
+    }
+
+    // ─────────────────────────────────────────────
+    // Transaction & Environment Extractors
+    // ─────────────────────────────────────────────
 
     fn extract_set(node: &Set) -> Option<StatementFact> {
-        let setting_name = node
-            .path()
-            .and_then(|p| p.segment())
-            .and_then(|s| {
-                // Bug 3: use segment_text which calls .text() directly.
-                Self::segment_text(s)
-            })
-            .map(|t| t.to_lowercase())?;
-
+        let setting_name = node.syntax().descendants().find_map(NameRef::cast)?.text().to_lowercase();
         if setting_name != "search_path" { return None; }
-
-        let schemas: Vec<String> = node
-            .config_values()
-            .filter_map(|cv| match cv {
-                ConfigValue::NameRef(nr) => Some(nr.text().to_string()),
-                ConfigValue::Literal(lit) => {
-                    let raw = lit.syntax().text().to_string();
-                    Some(raw.trim_matches('\'').trim_matches('"').to_string())
-                }
-            })
-            .filter(|s| !s.is_empty())
-            .collect();
-
-        if schemas.is_empty() { return None; }
-
+        let schemas: Vec<String> = node.syntax().descendants().filter_map(NameRef::cast)
+            .filter(|nr| nr.text().to_lowercase() != "search_path")
+            .map(Self::resolve_name_ref).collect();
         Some(StatementFact::SetSearchPath { schemas })
     }
 
-    // ── TRANSACTION ───────────────────────────────────────────────────
-
     fn extract_rollback(node: &Rollback) -> StatementFact {
-        // Bug 3: use NameRef::text() directly.
         match node.name_ref().map(|n| n.text().to_string()) {
             Some(name) => StatementFact::RollbackToSavepoint { name },
             None       => StatementFact::RollbackTransaction,
         }
     }
 
-    fn extract_savepoint(node: &Savepoint) -> Option<StatementFact> {
-        // Bug 3: use Name::text() directly.
-        let name = node.name().map(|n| n.text().to_string())?;
-        Some(StatementFact::Savepoint { name })
+    fn extract_savepoint(node: &Savepoint) -> StatementFact {
+        StatementFact::Savepoint { name: node.name().map(|n| n.text().to_string()).unwrap_or_default() }
     }
 
-    fn extract_release_savepoint(node: &ReleaseSavepoint) -> Option<StatementFact> {
-        // Bug 3: use NameRef::text() directly.
-        let name = node.name_ref().map(|n| n.text().to_string())?;
-        Some(StatementFact::ReleaseSavepoint { name })
+    fn extract_release_savepoint(node: &ReleaseSavepoint) -> StatementFact {
+        StatementFact::ReleaseSavepoint { name: node.name_ref().map(|n| n.text().to_string()).unwrap_or_default() }
     }
 
-    // ── Path traversal helpers ────────────────────────────────────────
+    // ─────────────────────────────────────────────
+    // Identifier Helpers
+    // ─────────────────────────────────────────────
+
+    fn segment_ident(segment: PathSegment) -> Option<Ident> {
+        if let Some(nr) = segment.syntax().descendants().find_map(NameRef::cast) {
+            Some(Ident::new(nr.text().to_string().trim_matches('"').to_string(), nr.is_quoted()))
+        } else if let Some(n) = segment.syntax().descendants().find_map(Name::cast) {
+            Some(Ident::new(n.text().to_string().trim_matches('"').to_string(), n.is_quoted()))
+        } else { None }
+    }
 
     fn path_to_qualified_name(path: &Path) -> Option<QualifiedName> {
-        let name = Self::segment_text(path.segment()?)?;
-        let schema = path
-            .qualifier()
-            .and_then(|q| q.segment())
-            .and_then(|s| Self::segment_text(s));
-        Some(QualifiedName::new(schema, name))
-    }
+        let segments: Vec<PathSegment> = path.syntax().descendants().filter_map(PathSegment::cast).collect();
+        if segments.is_empty() { return None; }
 
-    /// Extract the identifier text from a PathSegment.
-    ///
-    /// Bug 3: PathSegment is generated-only (no manual impl).
-    /// name_ref() → Option<NameRef> and name() → Option<Name> both expose
-    /// .text() directly — no .ident_token() indirection needed.
-    ///
-    /// name_ref() covers reference sites (most path segments in SQL statements).
-    /// name() covers definition sites (CREATE TABLE name, CREATE INDEX name, etc.).
-    /// We try name_ref() first (more common), then name().
-    fn segment_text(segment: PathSegment) -> Option<String> {
-        segment
-            .name_ref()
-            .map(|n| n.text().to_string())
-            .or_else(|| segment.name().map(|n| n.text().to_string()))
+        // In squawk, descendants are returned in pre-order traversal.
+        // A qualified path `schema.table` yields PathSegment("schema") then PathSegment("table").
+        if segments.len() >= 2 {
+            let schema = Self::segment_ident(segments[0].clone());
+            let name = Self::segment_ident(segments[1].clone())?;
+            Some(QualifiedName::new(schema, name))
+        } else {
+            let name = Self::segment_ident(segments[0].clone())?;
+            Some(QualifiedName::new(None, name))
+        }
     }
 }
