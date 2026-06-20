@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use crate::ast::identifiers::ObjectId;
 use crate::rules::Rule;                              
 use crate::analysis::mutations::{Mutation, AlterTableActionMutation};                                     
-use crate::analysis::state::{LocalState, MutationResult};           
+use crate::analysis::state::{AnalysisState, MutationResult};           
 use crate::engine::config::Config;                   
 use crate::report::violations::{Violation, ViolationTier};                                                
 use crate::model::relation::{RelationState, Persistence};
@@ -20,7 +20,7 @@ impl Rule for BlockingConstraintRule {
         mutation: &Mutation, 
         result: &MutationResult,
         pre_relations: &HashMap<ObjectId, RelationState>,
-        _state: &LocalState, 
+        _state: &AnalysisState, 
         config: &Config
     ) -> Vec<Violation> {
         if *result == MutationResult::Skipped { return vec![]; }

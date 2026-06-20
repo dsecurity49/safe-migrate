@@ -1,15 +1,14 @@
 // FILE: ./src/analysis/resolver.rs
-
-use crate::analysis::facts::{AlterTableActionFact, AlterIndexActionFact, StatementFact, PersistenceFact};
+use crate::analysis::facts::{AlterTableActionFact, AlterIndexActionFact, StatementFact, PersistenceFact}; 
 use crate::analysis::mutations::{
     AlterTable, AlterTableActionMutation, ColumnMutation, CreateIndex, CreateTable, CreateView,
     DropIndex, DropTable, FkMutation, Mutation, OpaqueMutation, ReleaseSavepointMutation,
-    RollbackToSavepointMutation, SavepointMutation, SearchPathChange, CreateTypeMutation,
-    AlterTypeMutation, AlterTypeActionMutation, CreateDomainMutation, AlterDomainMutation,
+    RollbackToSavepointMutation, SavepointMutation, SearchPathChange, CreateTypeMutation,                     
+    AlterTypeMutation, AlterTypeActionMutation, CreateDomainMutation, AlterDomainMutation,                    
     DropDomainMutation, CreateSequenceMutation, AlterSequenceMutation, DropSequenceMutation,
-    CreateMaterializedView, RefreshMaterializedViewMutation, DropViewMutation,
-    DropMaterializedViewMutation, Rename, PersistenceMutation,
-    CreatePolicyMutation, DropPolicyMutation, CreateTriggerMutation, DropTriggerMutation
+    CreateMaterializedView, RefreshMaterializedViewMutation, DropViewMutation,                                
+    DropMaterializedViewMutation, Rename, PersistenceMutation,                                                
+    CreatePolicyMutation, DropPolicyMutation, CreateTriggerMutation, DropTriggerMutation                  
 };
 use crate::analysis::state::AnalysisState;
 use crate::ast::identifiers::{ObjectId, QualifiedName};
@@ -264,7 +263,7 @@ impl Resolver {
                         AlterTableActionFact::AddExcludeConstraint => AlterTableActionMutation::AddExcludeConstraint,
                         AlterTableActionFact::SetNotNull { column } => AlterTableActionMutation::SetNotNull { column: column.clone() },
                         AlterTableActionFact::DropNotNull { column } => AlterTableActionMutation::DropNotNull { column: column.clone() },
-                        AlterTableActionFact::SetType { column, ty } => AlterTableActionMutation::SetType { column: column.clone(), ty: ty.clone() },
+                        AlterTableActionFact::SetType { column, ty, has_using } => AlterTableActionMutation::SetType { column: column.clone(), ty: ty.clone(), has_using: *has_using },
                         AlterTableActionFact::SetDefault { column, default } => AlterTableActionMutation::SetDefault { column: column.clone(), default: default.clone() },
                         AlterTableActionFact::ValidateConstraint { constraint_name } => AlterTableActionMutation::ValidateConstraint { constraint_name: constraint_name.clone() },
                         AlterTableActionFact::AttachPartition { child } => AlterTableActionMutation::AttachPartition { child: Self::resolve_name(child, state) },
@@ -308,6 +307,7 @@ impl Resolver {
             StatementFact::ReleaseSavepoint { name } => mutations.push(Mutation::ReleaseSavepoint(ReleaseSavepointMutation { name: name.clone() })),
             StatementFact::OpaqueBlock => mutations.push(Mutation::Opaque(OpaqueMutation::DoBlock)),
             StatementFact::Execute => mutations.push(Mutation::Opaque(OpaqueMutation::Execute)),
+            StatementFact::Vacuum { is_full } => mutations.push(Mutation::Vacuum { is_full: *is_full }),
         }
         mutations
     }

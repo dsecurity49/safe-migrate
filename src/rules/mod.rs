@@ -1,4 +1,4 @@
-// FILE: ./src/rules/mod.rs
+// FILE: src/rules/mod.rs
 
 pub mod constraints;
 pub mod destructive;
@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use crate::ast::identifiers::ObjectId;
 use crate::model::relation::RelationState;
 use crate::analysis::mutations::Mutation;
-use crate::analysis::state::{LocalState, MutationResult};
+use crate::analysis::state::{AnalysisState, MutationResult};
 use crate::engine::config::Config;
 use crate::report::violations::{Violation, ViolationTier};
 
@@ -24,14 +24,13 @@ pub trait Rule {
     fn recipe(&self) -> &'static str;
 
     fn evaluate(
-        &self, 
-        mutation: &Mutation, 
+        &self,
+        mutation: &Mutation,
         result: &MutationResult,
         pre_relations: &HashMap<ObjectId, RelationState>,
-        state: &LocalState, 
+        state: &AnalysisState, // ENFORCED: Upgraded to pass DB baseline context
         config: &Config
     ) -> Vec<Violation>;
 }
-
 
 

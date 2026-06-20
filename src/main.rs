@@ -6,7 +6,6 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-// Simply grab them directly from the root, exactly as you exported them in src/lib.rs!
 use safe_migrate::{SafeMigrateEngine, Config, DbCache, AnalysisState, Reporter};
 use safe_migrate::sync;
 
@@ -31,8 +30,12 @@ enum Commands {
 
         #[arg(long, default_value = ".safe-migrate-stats.json")]
         cache: PathBuf,
+
+        /// Bypass the local cache file and evaluate with default worst-case assumptions
+        #[arg(long)]
+        no_cache: bool,
     },
-    /// Sync database table statistics
+    /// Sync database table statistics for accurate lock evaluation
     Sync {
         #[arg(long, default_value = ".safe-migrate-stats.json")]
         out: PathBuf,
@@ -43,35 +46,41 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Lint { file, config: config_path, cache } => {
+        Commands::Lint { file, config: config_path, cache, no_cache } => {
             let sql = fs::read_to_string(&file)
                 .with_context(|| format!("Failed to read migration file: {}", file.display()))?;
 
             // 1. Load config
-            // Config::load_from_file will handle missing/invalid files by merging with defaults gracefully
             let cfg = Config::load_from_file(&config_path);
 
-            // 2. Safely Load Cache
-            let db_cache = if cache.exists() {
+            // 2. Cache Expiry Warning (Only if we aren't bypassing it)
+            if !no_cache && cache.exists() {
+                if let Ok(metadata) = fs::metadata(&cache) {
+                    if let Ok(modified) = metadata.modified() {
+                        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+                        let file_time = modified.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+                        if now.saturating_sub(604_800) > file_time {
+                            println!("[WARN] Database stats cache (.safe-migrate-stats.json) is over 7 days old!");
+                            println!("       Run `safe-migrate sync` to ensure accurate lock evaluations.\n");
+                        }
+                    }
+                }
+            }
+
+            // 3. Safely Load Cache OR Fallback to Empty State
+            let db_cache = if !no_cache && cache.exists() {
                 let json = fs::read_to_string(&cache).context("Failed to read cache file")?;
                 serde_json::from_str::<DbCache>(&json).map_err(|_| {
                     anyhow!("Cache file '{}' is corrupted (Invalid JSON). Run `safe-migrate sync` to rebuild it.", cache.display())
                 })?
             } else {
-                DbCache::new()
-            };
-
-            // 3. Cache Expiry Warning
-            if let Ok(metadata) = fs::metadata(&cache) {
-                if let Ok(modified) = metadata.modified() {
-                    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-                    let file_time = modified.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-                    if now.saturating_sub(file_time) > 604_800 {
-                        println!("[WARN] Database stats cache (.safe-migrate-stats.json) is over 7 days old!");
-                        println!("       Run `safe-migrate sync` to ensure accurate lock evaluations.\n");
-                    }
+                if no_cache {
+                    println!("[INFO] --no-cache passed. Running with default worst-case assumptions.");
+                } else {
+                    println!("[INFO] No cache found. Running with default worst-case assumptions.");
                 }
-            }
+                DbCache::new() // Pure empty state. No DB connection attempted.
+            };
 
             println!("\nAnalyzing migration: {}\n", file.display());
 
@@ -99,9 +108,12 @@ fn main() -> Result<()> {
             }
         }
         Commands::Sync { out } => {
-            let db_url = std::env::var("DATABASE_URL").context("DATABASE_URL must be set to run sync.")?;
+            // DATABASE_URL is strictly isolated to the Sync command
+            let _db_url = std::env::var("DATABASE_URL")
+                .context("DATABASE_URL environment variable must be set to run sync.")?;
+            
             println!("Syncing database stats...");
-            sync::sync_cache(&db_url, &out)?;
+            sync::sync_cache(&out)?; // sync_cache internally uses the env var
             println!("[ OK ] Cache successfully written to {}", out.display());
         }
     }

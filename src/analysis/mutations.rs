@@ -1,16 +1,15 @@
-// FILE: ./src/analysis/mutations.rs
-
+// FILE: src/analysis/mutations.rs
 use crate::analysis::expr_ir::ExprIr;
-use crate::ast::identifiers::ObjectId;
+use crate::ast::identifiers::ObjectId;               
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]                   
 pub enum PersistenceMutation {
-    Permanent,
-    Temporary,
-    Unlogged,
+    Permanent,                                           
+    Temporary,                                           
+    Unlogged,                                        
 }
-
-#[derive(Clone, Debug, PartialEq)]
+                                                     
+#[derive(Clone, Debug, PartialEq)]                   
 pub enum Mutation {
     CreateTable(CreateTable),
     CreateView(CreateView),
@@ -43,6 +42,7 @@ pub enum Mutation {
     Savepoint(SavepointMutation),
     ReleaseSavepoint(ReleaseSavepointMutation),
     Opaque(OpaqueMutation),
+    Vacuum { is_full: bool },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -272,7 +272,7 @@ pub enum AlterTableActionMutation {
     AddExcludeConstraint,
     SetNotNull { column: String },
     DropNotNull { column: String },
-    SetType { column: String, ty: String },
+    SetType { column: String, ty: String, has_using: bool },
     SetDefault { column: String, default: Option<ExprIr> },
     ValidateConstraint { constraint_name: String },
     AttachPartition { child: ObjectId },

@@ -18,13 +18,13 @@ use squawk_syntax::ast::{
 pub struct AstVisitor;
 
 impl AstVisitor {
-    /// Safely resolves and trims an unquoted/quoted Name into a string 
+    /// Safely resolves and trims an unquoted/quoted Name into a string
     /// following Postgres casing rules
     fn resolve_name(n: Name) -> String {
         Ident::new(n.text().to_string().trim_matches('"').to_string(), n.is_quoted()).resolve()
     }
 
-    /// Safely resolves and trims an unquoted/quoted NameRef into a string 
+    /// Safely resolves and trims an unquoted/quoted NameRef into a string
     /// following Postgres casing rules
     fn resolve_name_ref(nr: NameRef) -> String {
         Ident::new(nr.text().to_string().trim_matches('"').to_string(), nr.is_quoted()).resolve()
@@ -50,6 +50,7 @@ impl AstVisitor {
             Stmt::Rollback(node)               => return Some(Self::extract_rollback(node)),
             Stmt::Savepoint(node)              => return Some(Self::extract_savepoint(node)),
             Stmt::ReleaseSavepoint(node)       => return Some(Self::extract_release_savepoint(node)),
+            Stmt::Vacuum(node)                 => return Some(StatementFact::Vacuum { is_full: node.is_full() }),
             _ => {}
         }
 
@@ -206,8 +207,8 @@ impl AstVisitor {
                 }
                 AlterTableAction::RenameTo(rt) => {
                     if let Some(new_name) = rt.name() {
-                        actions.push(AlterTableActionFact::RenameTo { 
-                            new_name: Ident::new(new_name.text().to_string().trim_matches('"').to_string(), new_name.is_quoted()) 
+                        actions.push(AlterTableActionFact::RenameTo {
+                            new_name: Ident::new(new_name.text().to_string().trim_matches('"').to_string(), new_name.is_quoted())
                         });
                     }
                 }
@@ -274,7 +275,14 @@ impl AstVisitor {
         match opt {
             AlterColumnOption::SetNotNull(_) => Some(AlterTableActionFact::SetNotNull { column: col_name }),
             AlterColumnOption::DropNotNull(_) => Some(AlterTableActionFact::DropNotNull { column: col_name }),
-            AlterColumnOption::SetType(st) => Some(AlterTableActionFact::SetType { column: col_name, ty: st.ty()?.syntax().text().to_string() }),
+            AlterColumnOption::SetType(st) => {
+                let has_using = st.syntax().text().to_string().to_lowercase().contains("using ");
+                Some(AlterTableActionFact::SetType { 
+                    column: col_name, 
+                    ty: st.ty()?.syntax().text().to_string(),
+                    has_using 
+                })
+            },
             AlterColumnOption::SetDefault(sd) => Some(AlterTableActionFact::SetDefault { column: col_name, default: sd.expr().map(crate::analysis::expr_visitor::ExprVisitor::convert) }),
             _ => None,
         }
@@ -373,8 +381,8 @@ impl AstVisitor {
 
         if let Some(rt) = node.syntax().descendants().find_map(RenameTo::cast) {
             if let Some(new_name) = rt.name() {
-                actions.push(AlterIndexActionFact::RenameTo { 
-                    new_name: Ident::new(new_name.text().to_string().trim_matches('"').to_string(), new_name.is_quoted()) 
+                actions.push(AlterIndexActionFact::RenameTo {
+                    new_name: Ident::new(new_name.text().to_string().trim_matches('"').to_string(), new_name.is_quoted())
                 });
             }
         }
@@ -611,8 +619,6 @@ impl AstVisitor {
         let segments: Vec<PathSegment> = path.syntax().descendants().filter_map(PathSegment::cast).collect();
         if segments.is_empty() { return None; }
 
-        // In squawk, descendants are returned in pre-order traversal.
-        // A qualified path `schema.table` yields PathSegment("schema") then PathSegment("table").
         if segments.len() >= 2 {
             let schema = Self::segment_ident(segments[0].clone());
             let name = Self::segment_ident(segments[1].clone())?;

@@ -123,6 +123,7 @@ pub enum StatementFact {
     ReleaseSavepoint { name: String },
     OpaqueBlock,
     Execute,
+    Vacuum { is_full: bool },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -214,7 +215,7 @@ pub enum AlterTableActionFact {
     AddExcludeConstraint,
     SetNotNull { column: String },
     DropNotNull { column: String },
-    SetType { column: String, ty: String },
+    SetType { column: String, ty: String, has_using: bool },
     SetDefault { column: String, default: Option<ExprIr> },
     ValidateConstraint { constraint_name: String },
     AttachPartition { child: QualifiedName },
