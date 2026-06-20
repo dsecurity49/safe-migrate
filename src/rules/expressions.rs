@@ -5,7 +5,7 @@ use crate::ast::identifiers::ObjectId;
 use crate::model::relation::RelationState;
 use crate::rules::Rule;
 use crate::analysis::mutations::Mutation;
-use crate::analysis::state::{AnalysisState, MutationResult};
+use crate::analysis::state::{AnalysisState, MutationResult, CascadeResult};
 use crate::engine::config::Config;
 use crate::report::violations::{Violation, ViolationTier};
 
@@ -22,7 +22,8 @@ impl Rule for VolatileDefaultRule {
         result: &MutationResult,
         _pre_relations: &HashMap<ObjectId, RelationState>,
         _state: &AnalysisState, 
-        _config: &Config
+        _config: &Config,
+        _cascade: Option<&CascadeResult>
     ) -> Vec<Violation> {
         if *result == MutationResult::Skipped { return vec![]; }
         

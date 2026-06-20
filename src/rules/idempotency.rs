@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use crate::ast::identifiers::ObjectId;
 use crate::rules::Rule;
 use crate::analysis::mutations::{Mutation, AlterTableActionMutation};
-use crate::analysis::state::{AnalysisState, MutationResult};
+use crate::analysis::state::{AnalysisState, MutationResult, CascadeResult};
 use crate::engine::config::Config;
 use crate::report::violations::{Violation, ViolationTier};
 use crate::model::relation::RelationState;
@@ -22,7 +22,8 @@ impl Rule for IdempotencyRule {
         _result: &MutationResult,
         _pre_relations: &HashMap<ObjectId, RelationState>,
         _state: &AnalysisState,
-        _config: &Config
+        _config: &Config,
+        _cascade: Option<&CascadeResult>
     ) -> Vec<Violation> {
         // ARCHITECTURAL NOTE:
         // We INTENTIONALLY ignore `MutationResult::Skipped` here.

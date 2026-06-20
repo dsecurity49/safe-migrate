@@ -4,7 +4,7 @@ use crate::ast::identifiers::ObjectId;
 use crate::model::relation::RelationState;
 use crate::rules::Rule;
 use crate::analysis::mutations::Mutation;
-use crate::analysis::state::{AnalysisState, MutationResult};
+use crate::analysis::state::{AnalysisState, MutationResult, CascadeResult};
 use crate::engine::config::Config;
 use crate::report::violations::{Violation, ViolationTier};
 
@@ -21,7 +21,8 @@ impl Rule for ConcurrentInsideTransactionRule {
         _result: &MutationResult,
         _pre_relations: &HashMap<ObjectId, RelationState>,
         state: &AnalysisState,
-        _config: &Config
+        _config: &Config,
+        _cascade: Option<&CascadeResult>
     ) -> Vec<Violation> {
         // We INTENTIONALLY ignore `MutationResult::Skipped` here.
         // PostgreSQL blocks CONCURRENTLY execution inside transaction boundaries
@@ -70,7 +71,8 @@ impl Rule for VacuumFullRule {
         _result: &MutationResult,
         _pre_relations: &HashMap<ObjectId, RelationState>,
         _state: &AnalysisState,
-        _config: &Config
+        _config: &Config,
+        _cascade: Option<&CascadeResult>
     ) -> Vec<Violation> {
         let mut violations = Vec::new();
 

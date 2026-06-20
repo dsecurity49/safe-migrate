@@ -47,14 +47,24 @@ impl AstVisitor {
             Stmt::Set(node)                    => return Self::extract_set(node),
             Stmt::Begin(_)                     => return Some(StatementFact::BeginTransaction),
             Stmt::Commit(_)                    => return Some(StatementFact::CommitTransaction),
-            Stmt::Rollback(node)               => return Some(Self::extract_rollback(node)),
+            Stmt::Rollback(node)               => return Self::extract_rollback(node),
             Stmt::Savepoint(node)              => return Some(Self::extract_savepoint(node)),
             Stmt::ReleaseSavepoint(node)       => return Some(Self::extract_release_savepoint(node)),
             Stmt::Vacuum(node)                 => return Some(StatementFact::Vacuum { is_full: node.is_full() }),
             _ => {}
         }
 
-        // Dynamically Cast Syntax Nodes for unsupported edge cases
+        // Dynamically Cast Syntax Nodes for schema entities
+        if let Some(node) = ast::CreateSchema::cast(syntax.clone()) { return Self::extract_create_schema(&node); }
+        if let Some(node) = ast::AlterSchema::cast(syntax.clone()) { return Self::extract_alter_schema(&node); }
+        if let Some(node) = ast::DropSchema::cast(syntax.clone()) { return Self::extract_drop_schema(&node); }
+
+        // Dynamically Cast Syntax Nodes for extended View/MatView operations
+        if let Some(node) = ast::AlterView::cast(syntax.clone()) { return Self::extract_alter_view(&node); }
+        if let Some(node) = ast::AlterMaterializedView::cast(syntax.clone()) { return Self::extract_alter_materialized_view(&node); }
+        if let Some(node) = ast::Refresh::cast(syntax.clone()) { return Self::extract_refresh(&node); }
+
+        // Dynamically Cast Syntax Nodes for secondary entities
         if let Some(node) = CreateSequence::cast(syntax.clone()) { return Self::extract_create_sequence(&node); }
         if let Some(node) = AlterSequence::cast(syntax.clone()) { return Self::extract_alter_sequence(&node); }
         if let Some(node) = DropSequence::cast(syntax.clone()) { return Self::extract_drop_sequence(&node); }
@@ -68,23 +78,65 @@ impl AstVisitor {
         if let Some(node) = CreateTrigger::cast(syntax.clone()) { return Self::extract_create_trigger(&node); }
         if let Some(node) = DropTrigger::cast(syntax.clone()) { return Self::extract_drop_trigger(&node); }
 
-        // Absolute Fallbacks for dynamic blocks and mat-view refreshes
+        // Dynamically Cast Syntax Nodes for advanced transaction blocks
+        if let Some(_) = ast::PrepareTransaction::cast(syntax.clone()) {
+            let name = syntax.descendants().find_map(ast::Literal::cast).map(|l| l.syntax().text().to_string().trim_matches('\'').to_string())
+                .or_else(|| syntax.descendants().find_map(Name::cast).map(Self::resolve_name))
+                .unwrap_or_default();
+            return Some(StatementFact::PrepareTransaction { name });
+        }
+        if let Some(_) = ast::SetTransaction::cast(syntax.clone()) { return Some(StatementFact::SetTransaction); }
+        if let Some(_) = ast::SetConstraints::cast(syntax.clone()) { return Some(StatementFact::SetConstraints); }
+
+        // Absolute Fallbacks for dynamic blocks
         let text = syntax.text().to_string();
         let upper = text.to_uppercase();
-
-        if upper.starts_with("REFRESH MATERIALIZED VIEW") {
-            let concurrently = upper.contains("CONCURRENTLY");
-            let clean_name = text.split_whitespace().last().unwrap_or("").trim_matches(';');
-            return Some(StatementFact::RefreshMaterializedView {
-                name: QualifiedName::new(None, Ident::new(clean_name.to_string(), false)),
-                concurrently
-            });
-        }
 
         if upper.starts_with("DO ") { return Some(StatementFact::OpaqueBlock); }
         if upper.starts_with("EXECUTE ") { return Some(StatementFact::Execute); }
 
         None
+    }
+
+    // ─────────────────────────────────────────────
+    // Schema Extractors
+    // ─────────────────────────────────────────────
+
+    fn extract_create_schema(node: &ast::CreateSchema) -> Option<StatementFact> {
+        let ident = if let Some(n) = node.syntax().descendants().find_map(Name::cast) {
+            Ident::new(n.text().to_string().trim_matches('"').to_string(), n.is_quoted())
+        } else if let Some(nr) = node.syntax().descendants().find_map(NameRef::cast) {
+            Ident::new(nr.text().to_string().trim_matches('"').to_string(), nr.is_quoted())
+        } else {
+            return None;
+        };
+
+        Some(StatementFact::CreateSchema {
+            name: QualifiedName::new(None, ident),
+            if_not_exists: node.syntax().text().to_string().to_uppercase().contains("IF NOT EXISTS"),
+        })
+    }
+
+    fn extract_alter_schema(node: &ast::AlterSchema) -> Option<StatementFact> {
+        let path = node.syntax().descendants().find_map(Path::cast)?;
+        let new_name = if let Some(rt) = node.syntax().descendants().find_map(RenameTo::cast) {
+            rt.name().map(|n| Ident::new(n.text().to_string().trim_matches('"').to_string(), n.is_quoted()))
+        } else { None };
+        Some(StatementFact::AlterSchema {
+            name: Self::path_to_qualified_name(&path)?,
+            new_name,
+        })
+    }
+
+    fn extract_drop_schema(node: &ast::DropSchema) -> Option<StatementFact> {
+        let names: Vec<QualifiedName> = node.syntax().children().filter_map(Path::cast).filter_map(|p| Self::path_to_qualified_name(&p)).collect();
+        if names.is_empty() { return None; }
+        let text = node.syntax().text().to_string().to_uppercase();
+        Some(StatementFact::DropSchema {
+            names,
+            if_exists: text.contains("IF EXISTS"),
+            cascade: text.contains("CASCADE"),
+        })
     }
 
     // ─────────────────────────────────────────────
@@ -100,10 +152,19 @@ impl AstVisitor {
             Some("unlogged") => PersistenceFact::Unlogged,
             _ => PersistenceFact::Permanent,
         };
+
+        let partition_by = node.syntax().descendants().find_map(ast::PartitionBy::cast)
+            .map(|p| p.syntax().text().to_string());
+        
+        let partition_of = node.syntax().descendants().find_map(ast::PartitionOf::cast)
+            .and_then(|p| p.syntax().descendants().find_map(Path::cast))
+            .and_then(|p| Self::path_to_qualified_name(&p));
+
         let (columns, foreign_keys, table_constraints) = node
             .table_arg_list()
             .map(|tal| Self::extract_table_body(tal.args()))
             .unwrap_or_else(|| (Vec::new(), Vec::new(), Vec::new()));
+
         Some(StatementFact::CreateTable {
             name,
             if_not_exists: node.if_not_exists().is_some(),
@@ -112,6 +173,8 @@ impl AstVisitor {
             columns,
             foreign_keys,
             table_constraints,
+            partition_by,
+            partition_of,
         })
     }
 
@@ -130,6 +193,8 @@ impl AstVisitor {
             columns: Vec::new(),
             foreign_keys: Vec::new(),
             table_constraints: Vec::new(),
+            partition_by: None,
+            partition_of: None,
         })
     }
 
@@ -148,6 +213,9 @@ impl AstVisitor {
         let mut actions = Vec::new();
 
         for action in node.actions() {
+            // ARCHITECTURAL WARNING: `PartitionForValuesFrom` bounds for multi-column partitions 
+            // are structurally ambiguous in the AST. If bound overlap rules are added in the future, 
+            // do not naively split `exprs()`. They must be mapped against the parent table's partition key.
             if let Some(ap) = AttachPartition::cast(action.syntax().clone()) {
                 if let Some(child_path) = ap.syntax().descendants().find_map(Path::cast) {
                     if let Some(child) = Self::path_to_qualified_name(&child_path) {
@@ -169,6 +237,14 @@ impl AstVisitor {
                     let name = Self::resolve_name_ref(name_ref);
                     let deferrable = ac.syntax().text().to_string().to_lowercase().contains("deferrable");
                     actions.push(AlterTableActionFact::AlterConstraint { name, deferrable });
+                }
+                continue;
+            }
+            if let Some(rc) = ast::RenameConstraint::cast(action.syntax().clone()) {
+                let old_name = rc.syntax().descendants().find_map(NameRef::cast).map(Self::resolve_name_ref);
+                let new_name = rc.syntax().descendants().find_map(Name::cast).map(Self::resolve_name);
+                if let (Some(old_name), Some(new_name)) = (old_name, new_name) {
+                    actions.push(AlterTableActionFact::RenameConstraint { old_name, new_name });
                 }
                 continue;
             }
@@ -243,6 +319,10 @@ impl AstVisitor {
         let mut columns = Vec::new();
         let mut foreign_keys = Vec::new();
         let mut table_constraints = Vec::new();
+
+        // ARCHITECTURAL WARNING: Do NOT use `arg.can_cast()` as a pre-filter here. 
+        // squawk's TableArg::can_cast() returns false for table constraints due to a parser 
+        // code-gen bug, but actual enum casting via `match` works perfectly.
         for arg in args {
             match arg {
                 TableArg::Column(col) => {
@@ -277,10 +357,10 @@ impl AstVisitor {
             AlterColumnOption::DropNotNull(_) => Some(AlterTableActionFact::DropNotNull { column: col_name }),
             AlterColumnOption::SetType(st) => {
                 let has_using = st.syntax().text().to_string().to_lowercase().contains("using ");
-                Some(AlterTableActionFact::SetType { 
-                    column: col_name, 
+                Some(AlterTableActionFact::SetType {
+                    column: col_name,
                     ty: st.ty()?.syntax().text().to_string(),
-                    has_using 
+                    has_using
                 })
             },
             AlterColumnOption::SetDefault(sd) => Some(AlterTableActionFact::SetDefault { column: col_name, default: sd.expr().map(crate::analysis::expr_visitor::ExprVisitor::convert) }),
@@ -289,26 +369,37 @@ impl AstVisitor {
     }
 
     fn extract_add_constraint_fact(ac: &squawk_syntax::ast::AddConstraint) -> Option<AlterTableActionFact> {
-        let constraint = ac.constraint()?;
         let not_valid = ac.not_valid().is_some();
-        match constraint {
-            Constraint::ForeignKeyConstraint(fkc) => {
-                let constraint_name = fkc.constraint_name().and_then(|cn| cn.name()).map(Self::resolve_name);
-                let path = fkc.syntax().descendants().find_map(Path::cast)?;
-                let references = Self::path_to_qualified_name(&path)?;
-                Some(AlterTableActionFact::AddForeignKey {
-                    constraint_name,
-                    references,
-                    from_columns: fkc.from_columns().map(Self::extract_column_list_names).unwrap_or_default(),
-                    to_columns: fkc.to_columns().map(Self::extract_column_list_names).unwrap_or_default(),
-                    not_valid,
-                })
-            }
-            Constraint::CheckConstraint(_) => Some(AlterTableActionFact::AddCheckConstraint { not_valid }),
-            Constraint::UniqueConstraint(_) => Some(AlterTableActionFact::AddUniqueConstraint),
-            Constraint::PrimaryKeyConstraint(_) => Some(AlterTableActionFact::AddPrimaryKeyConstraint),
-            _ => None,
+
+        if let Some(fkc) = ac.syntax().descendants().find_map(ast::ForeignKeyConstraint::cast) {
+            let constraint_name = fkc.constraint_name().and_then(|cn| cn.name()).map(Self::resolve_name)
+                .or_else(|| ac.syntax().descendants().find_map(ast::ConstraintName::cast).and_then(|cn| cn.name()).map(Self::resolve_name));
+            let path = fkc.syntax().descendants().find_map(Path::cast)?;
+            let references = Self::path_to_qualified_name(&path)?;
+            return Some(AlterTableActionFact::AddForeignKey {
+                constraint_name,
+                references,
+                from_columns: fkc.from_columns().map(Self::extract_column_list_names).unwrap_or_default(),
+                to_columns: fkc.to_columns().map(Self::extract_column_list_names).unwrap_or_default(),
+                not_valid,
+            });
         }
+
+        if let Some(cc) = ac.syntax().descendants().find_map(ast::CheckConstraint::cast) {
+            let constraint_name = cc.constraint_name().and_then(|cn| cn.name()).map(Self::resolve_name)
+                .or_else(|| ac.syntax().descendants().find_map(ast::ConstraintName::cast).and_then(|cn| cn.name()).map(Self::resolve_name));
+            return Some(AlterTableActionFact::AddCheckConstraint { constraint_name, not_valid });
+        }
+
+        if ac.syntax().descendants().any(|n| ast::UniqueConstraint::can_cast(n.kind())) {
+            return Some(AlterTableActionFact::AddUniqueConstraint);
+        }
+
+        if ac.syntax().descendants().any(|n| ast::PrimaryKeyConstraint::can_cast(n.kind())) {
+            return Some(AlterTableActionFact::AddPrimaryKeyConstraint);
+        }
+
+        None
     }
 
     fn extract_table_constraint_fact(tc: &TableConstraint) -> Option<TableConstraintFact> {
@@ -410,6 +501,17 @@ impl AstVisitor {
         })
     }
 
+    fn extract_alter_view(node: &ast::AlterView) -> Option<StatementFact> {
+        let path = node.syntax().descendants().find_map(Path::cast)?;
+        let new_name = if let Some(rt) = node.syntax().descendants().find_map(RenameTo::cast) {
+            rt.name().map(|n| Ident::new(n.text().to_string().trim_matches('"').to_string(), n.is_quoted()))
+        } else { None };
+        Some(StatementFact::AlterView {
+            name: Self::path_to_qualified_name(&path)?,
+            new_name,
+        })
+    }
+
     fn extract_create_materialized_view(node: &CreateMaterializedView) -> Option<StatementFact> {
         let path = node.syntax().descendants().find_map(Path::cast)?;
         Some(StatementFact::CreateMaterializedView {
@@ -418,7 +520,29 @@ impl AstVisitor {
         })
     }
 
+    fn extract_alter_materialized_view(node: &ast::AlterMaterializedView) -> Option<StatementFact> {
+        let path = node.syntax().descendants().find_map(Path::cast)?;
+        let new_name = if let Some(rt) = node.syntax().descendants().find_map(RenameTo::cast) {
+            rt.name().map(|n| Ident::new(n.text().to_string().trim_matches('"').to_string(), n.is_quoted()))
+        } else { None };
+        Some(StatementFact::AlterMaterializedView {
+            name: Self::path_to_qualified_name(&path)?,
+            new_name,
+        })
+    }
+
+    fn extract_refresh(node: &ast::Refresh) -> Option<StatementFact> {
+        let path = node.syntax().descendants().find_map(Path::cast)?;
+        Some(StatementFact::RefreshMaterializedView {
+            name: Self::path_to_qualified_name(&path)?,
+            concurrently: node.syntax().text().to_string().to_uppercase().contains("CONCURRENTLY"),
+        })
+    }
+
     fn extract_drop_view(node: &DropView) -> Option<StatementFact> {
+        // ARCHITECTURAL WARNING: squawk's DropView::path() accessor has a code-gen bug
+        // and only returns the first view in a `DROP VIEW v1, v2` statement.
+        // We intentionally bypass it and sweep the raw syntax tree to find all paths.
         let names: Vec<QualifiedName> = node.syntax().children().filter_map(Path::cast).filter_map(|p| Self::path_to_qualified_name(&p)).collect();
         if names.is_empty() { return None; }
         Some(StatementFact::DropView { names, if_exists: node.if_exists().is_some() })
@@ -481,12 +605,27 @@ impl AstVisitor {
     }
 
     fn extract_owned_by(node: &squawk_syntax::SyntaxNode) -> Option<(QualifiedName, String)> {
-        let text = node.text().to_string().to_lowercase();
-        if let Some(idx) = text.find("owned by ") {
-            let target = text[idx + 9..].split_whitespace().next()?.trim_end_matches(';');
-            let parts: Vec<&str> = target.split('.').collect();
-            if parts.len() == 2 {
-                return Some((QualifiedName::new(None, Ident::new(parts[0].to_string(), false)), parts[1].to_string()));
+        for opt in node.descendants().filter_map(ast::SequenceOption::cast) {
+            if opt.owned_token().is_some() {
+                // If it's OWNED BY NONE, path() will be None.
+                let path = opt.path()?;
+
+                let segments: Vec<PathSegment> = path.syntax().descendants().filter_map(PathSegment::cast).collect();
+                if segments.len() >= 2 {
+                    let col_ident = Self::segment_ident(segments.last().unwrap().clone())?;
+                    let col_name = col_ident.resolve();
+
+                    let table_len = segments.len() - 1;
+                    let table_name = if table_len == 1 {
+                        QualifiedName::new(None, Self::segment_ident(segments[0].clone())?)
+                    } else {
+                        QualifiedName::new(
+                            Some(Self::segment_ident(segments[table_len - 2].clone())?),
+                            Self::segment_ident(segments[table_len - 1].clone())?
+                        )
+                    };
+                    return Some((table_name, col_name));
+                }
             }
         }
         None
@@ -588,10 +727,17 @@ impl AstVisitor {
         Some(StatementFact::SetSearchPath { schemas })
     }
 
-    fn extract_rollback(node: &Rollback) -> StatementFact {
-        match node.name_ref().map(|n| n.text().to_string()) {
-            Some(name) => StatementFact::RollbackToSavepoint { name },
-            None       => StatementFact::RollbackTransaction,
+    fn extract_rollback(node: &Rollback) -> Option<StatementFact> {
+        // BUG FIX: Two-phase commit rollbacks (ROLLBACK PREPARED 'gid') resolve a detached
+        // transaction from another session, NOT the current local session.
+        // We treat it as an opaque block to avoid popping the local transaction frame.
+        if node.prepared_token().is_some() {
+            return Some(StatementFact::OpaqueBlock);
+        }
+
+        match node.name_ref().map(|n| Self::resolve_name_ref(n)) {
+            Some(name) => Some(StatementFact::RollbackToSavepoint { name }),
+            None       => Some(StatementFact::RollbackTransaction),
         }
     }
 

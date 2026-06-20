@@ -56,7 +56,7 @@ impl SafeMigrateEngine {
                 search = &search[start+end+1..];
             } else { break; }
         }
-        
+
         let mut search = text;
         while let Some(idx) = search.find("safe-migrate: ignore(") {
             let start = idx + "safe-migrate: ignore(".len();
@@ -131,17 +131,23 @@ impl SafeMigrateEngine {
                         _ => HashMap::new(),
                     };
 
-                    // State Mutation
-                    let result = state.apply(&mutation);
+                    // O(1) Pre-State Cascade Closure (Engine Orchestration)
+                    let pre_cascade = match &mutation {
+                        Mutation::DropTable(d) if d.cascade => Some(state.get_cascade_closure(&d.id)),
+                        _ => None,
+                    };
+
+                    // State Mutation (passing the pre-computed closure to avoid duplicate traversal)
+                    let result = state.apply(&mutation, pre_cascade.as_ref());
 
                     // Rule Evaluation
                     for rule in &self.rules {
                         // Core Suppression Filter Guard
                         if file_ignores.contains(rule.id()) || stmt_ignores.contains(rule.id()) {
-                            continue; 
+                            continue;
                         }
 
-                        let violations = rule.evaluate(&mutation, &result, &pre_relations, state, &self.config);
+                        let violations = rule.evaluate(&mutation, &result, &pre_relations, state, &self.config, pre_cascade.as_ref());
 
                         for v in violations {
                             if let Some(key) = &v.dedup_key {

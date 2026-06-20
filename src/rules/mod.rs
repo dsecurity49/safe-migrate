@@ -1,5 +1,4 @@
 // FILE: src/rules/mod.rs
-
 pub mod constraints;
 pub mod destructive;
 pub mod expressions;
@@ -14,7 +13,7 @@ use std::collections::HashMap;
 use crate::ast::identifiers::ObjectId;
 use crate::model::relation::RelationState;
 use crate::analysis::mutations::Mutation;
-use crate::analysis::state::{AnalysisState, MutationResult};
+use crate::analysis::state::{AnalysisState, MutationResult, CascadeResult};
 use crate::engine::config::Config;
 use crate::report::violations::{Violation, ViolationTier};
 
@@ -29,8 +28,8 @@ pub trait Rule {
         result: &MutationResult,
         pre_relations: &HashMap<ObjectId, RelationState>,
         state: &AnalysisState, // ENFORCED: Upgraded to pass DB baseline context
-        config: &Config
+        config: &Config,
+        cascade_closure: Option<&CascadeResult> // NEW: Orchestrator-managed pre-state
     ) -> Vec<Violation>;
 }
-
 

@@ -1,4 +1,4 @@
-// FILE: ./src/engine/config.rs                      
+// FILE: src/engine/config.rs
 use serde::{Serialize, Deserialize};
 use std::fs;
 use std::path::Path;
@@ -10,6 +10,8 @@ pub struct Config {
     pub tier2_threshold_rows: u64,
     pub stale_stats_days: u64,
     pub toast_width_threshold_bytes: i32,
+    pub default_rows: u64,      // Fallback for offline/unanalyzed tables
+    pub assume_pg_version: u32, // Fallback for offline PG version
 }
 
 impl Default for Config {
@@ -18,7 +20,9 @@ impl Default for Config {
             tier1_threshold_rows: 100_000,
             tier2_threshold_rows: 10_000,
             stale_stats_days: 7,
-            toast_width_threshold_bytes: 2048, // 2KB avg_width is a good baseline for a "wide" column
+            toast_width_threshold_bytes: 2048, 
+            default_rows: 10_000,      // Assume Tier 2 size by default offline
+            assume_pg_version: 100000, // Assume PG 10 by default offline
         }
     }
 }

@@ -1,5 +1,4 @@
-// FILE: ./src/analysis/facts.rs
-
+// FILE: src/analysis/facts.rs
 use crate::analysis::expr_ir::ExprIr;
 use crate::ast::identifiers::{Ident, QualifiedName};
 
@@ -12,6 +11,19 @@ pub enum PersistenceFact {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum StatementFact {
+    CreateSchema {
+        name: QualifiedName,
+        if_not_exists: bool,
+    },
+    AlterSchema {
+        name: QualifiedName,
+        new_name: Option<Ident>,
+    },
+    DropSchema {
+        names: Vec<QualifiedName>,
+        if_exists: bool,
+        cascade: bool,
+    },
     CreateTable {
         name: QualifiedName,
         if_not_exists: bool,
@@ -20,15 +32,25 @@ pub enum StatementFact {
         columns: Vec<ColumnFact>,
         foreign_keys: Vec<FkFact>,
         table_constraints: Vec<TableConstraintFact>,
+        partition_by: Option<String>,
+        partition_of: Option<QualifiedName>,
     },
     CreateView {
         name: QualifiedName,
         or_replace: bool,
         depends_on: Vec<QualifiedName>,
     },
+    AlterView {
+        name: QualifiedName,
+        new_name: Option<Ident>,
+    },
     CreateMaterializedView {
         name: QualifiedName,
         depends_on: Vec<QualifiedName>,
+    },
+    AlterMaterializedView {
+        name: QualifiedName,
+        new_name: Option<Ident>,
     },
     RefreshMaterializedView {
         name: QualifiedName,
@@ -121,6 +143,9 @@ pub enum StatementFact {
     RollbackToSavepoint { name: String },
     Savepoint { name: String },
     ReleaseSavepoint { name: String },
+    PrepareTransaction { name: String },
+    SetTransaction,
+    SetConstraints,
     OpaqueBlock,
     Execute,
     Vacuum { is_full: bool },
@@ -204,10 +229,15 @@ pub enum AlterTableActionFact {
         name: String,
         deferrable: bool,
     },
+    RenameConstraint {
+        old_name: String,
+        new_name: String,
+    },
     DropConstraint {
         name: String,
     },
     AddCheckConstraint {
+        constraint_name: Option<String>,
         not_valid: bool,
     },
     AddUniqueConstraint,

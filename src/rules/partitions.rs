@@ -1,10 +1,10 @@
-// FILE: ./src/rules/partitions.rs
+// FILE: src/rules/partitions.rs
 
 use std::collections::HashMap;
 use crate::ast::identifiers::ObjectId;
 use crate::rules::Rule;
 use crate::analysis::mutations::{Mutation, AlterTableActionMutation};
-use crate::analysis::state::{AnalysisState, MutationResult};
+use crate::analysis::state::{AnalysisState, MutationResult, CascadeResult};
 use crate::engine::config::Config;
 use crate::report::violations::{Violation, ViolationTier};
 use crate::model::relation::{RelationState, Persistence};
@@ -17,12 +17,13 @@ impl Rule for PartitionLockRule {
     fn recipe(&self) -> &'static str { "Attaching or detaching partitions takes an ACCESS EXCLUSIVE lock on the parent table. Run ATTACH PARTITION concurrently (or manage locks explicitly during low traffic)." }
 
     fn evaluate(
-        &self, 
-        mutation: &Mutation, 
+        &self,
+        mutation: &Mutation,
         result: &MutationResult,
         pre_relations: &HashMap<ObjectId, RelationState>,
-        _state: &AnalysisState, 
-        config: &Config
+        _state: &AnalysisState,
+        config: &Config,
+        _cascade: Option<&CascadeResult>
     ) -> Vec<Violation> {
         if *result == MutationResult::Skipped { return vec![]; }
 
@@ -32,40 +33,45 @@ impl Rule for PartitionLockRule {
             match &alter.action {
                 AlterTableActionMutation::AttachPartition { .. } |
                 AlterTableActionMutation::DetachPartition { .. } => {
-                    if let Some(rel) = pre_relations.get(&alter.id) {
-                        if rel.persistence == Persistence::Temporary { return violations; }
-
-                        if rel.is_stale() {
-                            let key = format!("{}_stale_{}", self.id(), alter.id);
-                            violations.push(Violation {
-                                rule_id: self.id(),
-                                title: format!("Table {} statistics are stale. Lock evaluations may be inaccurate.", alter.id),
-                                tier: ViolationTier::Tier2,
-                                recipe: "Run ANALYZE to ensure accurate row estimates before structural changes.",
-                                dedup_key: Some(key),
-                            });
+                    let (is_temp, is_stale, rows) = match pre_relations.get(&alter.id) {
+                        Some(rel) => {
+                            (rel.persistence == Persistence::Temporary, rel.is_stale(), rel.estimated_rows.unwrap_or(config.default_rows))
                         }
-
-                        let tier = match rel.estimated_rows {
-                            None => ViolationTier::Tier1,
-                            Some(r) if r >= config.tier1_threshold_rows => ViolationTier::Tier1,
-                            Some(r) if r >= config.tier2_threshold_rows => ViolationTier::Tier2,
-                            _ => ViolationTier::Tier3,
-                        };
-
-                        if tier != ViolationTier::Tier3 {
-                            let op_name = if matches!(alter.action, AlterTableActionMutation::AttachPartition{..}) { "Attaching" } else { "Detaching" };
-                            let mut title = format!("{} a partition on heavily utilized parent table {}", op_name, alter.id);
-                            if rel.is_stale() { title.push_str(" [WARNING: Based on stale statistics]"); }
-
-                            violations.push(Violation {
-                                rule_id: self.id(),
-                                title,
-                                tier,
-                                recipe: self.recipe(),
-                                dedup_key: None,
-                            });
+                        None => {
+                            // OFFLINE MODE: Evaluate against configured default
+                            (false, false, config.default_rows)
                         }
+                    };
+
+                    if is_temp { return violations; }
+
+                    if is_stale {
+                        let key = format!("{}_stale_{}", self.id(), alter.id);
+                        violations.push(Violation {
+                            rule_id: self.id(),
+                            title: format!("Table {} statistics are stale. Lock evaluations may be inaccurate.", alter.id),
+                            tier: ViolationTier::Tier2,
+                            recipe: "Run ANALYZE to ensure accurate row estimates before structural changes.",
+                            dedup_key: Some(key),
+                        });
+                    }
+
+                    let tier = if rows >= config.tier1_threshold_rows { ViolationTier::Tier1 }
+                               else if rows >= config.tier2_threshold_rows { ViolationTier::Tier2 }
+                               else { ViolationTier::Tier3 };
+
+                    if tier != ViolationTier::Tier3 {
+                        let op_name = if matches!(alter.action, AlterTableActionMutation::AttachPartition{..}) { "Attaching" } else { "Detaching" };
+                        let mut title = format!("{} a partition on heavily utilized parent table {}", op_name, alter.id);
+                        if is_stale { title.push_str(" [WARNING: Based on stale statistics]"); }
+
+                        violations.push(Violation {
+                            rule_id: self.id(),
+                            title,
+                            tier,
+                            recipe: self.recipe(),
+                            dedup_key: None,
+                        });
                     }
                 }
                 _ => {}

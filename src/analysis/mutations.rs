@@ -1,16 +1,18 @@
 // FILE: src/analysis/mutations.rs
 use crate::analysis::expr_ir::ExprIr;
-use crate::ast::identifiers::ObjectId;               
+use crate::ast::identifiers::ObjectId;
 
-#[derive(Clone, Debug, PartialEq)]                   
+#[derive(Clone, Debug, PartialEq)]
 pub enum PersistenceMutation {
-    Permanent,                                           
-    Temporary,                                           
-    Unlogged,                                        
+    Permanent,
+    Temporary,
+    Unlogged,
 }
-                                                     
-#[derive(Clone, Debug, PartialEq)]                   
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum Mutation {
+    CreateSchema(CreateSchemaMutation),
+    DropSchema(DropSchemaMutation),
     CreateTable(CreateTable),
     CreateView(CreateView),
     CreateMaterializedView(CreateMaterializedView),
@@ -43,6 +45,19 @@ pub enum Mutation {
     ReleaseSavepoint(ReleaseSavepointMutation),
     Opaque(OpaqueMutation),
     Vacuum { is_full: bool },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CreateSchemaMutation {
+    pub name: String,
+    pub if_not_exists: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DropSchemaMutation {
+    pub names: Vec<String>,
+    pub if_exists: bool,
+    pub cascade: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -157,6 +172,8 @@ pub struct CreateTable {
     pub columns: Vec<ColumnMutation>,
     pub foreign_keys: Vec<FkMutation>,
     pub table_constraints: Vec<crate::analysis::facts::TableConstraintFact>,
+    pub partition_by: Option<String>,
+    pub partition_of: Option<ObjectId>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -234,7 +251,7 @@ pub struct ReleaseSavepointMutation { pub name: String }
 pub struct RollbackToSavepointMutation { pub name: String }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum OpaqueMutation { DoBlock, Execute, DynamicSql }
+pub enum OpaqueMutation { DoBlock, Execute, DynamicSql, PrepareTransaction, SetTransaction, SetConstraints }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum AlterTableActionMutation {
@@ -261,10 +278,15 @@ pub enum AlterTableActionMutation {
         name: String,
         deferrable: bool,
     },
+    RenameConstraint {
+        old_name: String,
+        new_name: String,
+    },
     DropConstraint {
         name: String,
     },
     AddCheckConstraint {
+        constraint_name: Option<String>,
         not_valid: bool,
     },
     AddUniqueConstraint,

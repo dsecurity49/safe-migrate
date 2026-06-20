@@ -22,7 +22,7 @@ pub enum MutationResult {
     Skipped,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct CascadeResult {
     pub dropped_relations: HashSet<ObjectId>,
     pub dropped_indexes: HashSet<ObjectId>,
@@ -55,26 +55,23 @@ impl AnalysisState {
         let mut baseline_foreign_keys = HashSet::new();
         let mut graph = DependencyGraph::new();
 
-        // Load relations and populate the baseline snapshot
         for (id, rel_state) in cache.baseline_relations() {
             relations.insert(id.clone(), RelationOverlay::Present(rel_state.clone()));
             baseline_relations.insert(id.clone());
         }
 
-        // Load foreign keys from DB into the graph as native edges
         for fk in cache.foreign_keys {
             baseline_foreign_keys.insert((fk.from_table.clone(), fk.constraint_name.clone()));
             graph.foreign_keys.push(FkEdge {
                 constraint_name: Some(fk.constraint_name),
                 from_table: fk.from_table,
-                from_columns: Vec::new(), // Not needed for cascade dropping
+                from_columns: Vec::new(),
                 to_table: fk.to_table,
-                to_columns: Vec::new(),   // Not needed for cascade dropping
+                to_columns: Vec::new(),
                 from_generation: 0,
             });
         }
 
-        // Load indexes from DB into the graph
         for idx in cache.indexes {
             baseline_relations.insert(idx.index_id.clone());
             graph.indexes.push(IndexEdge {
@@ -115,8 +112,6 @@ impl AnalysisState {
         )
     }
 
-    /// Recursively computes the closure of objects destroyed by dropping the target.
-    /// Cycle-safe via `visited` HashSet.
     pub fn get_cascade_closure(&self, target_oid: &ObjectId) -> CascadeResult {
         let mut result = CascadeResult::default();
         let mut visited = HashSet::new();
@@ -126,28 +121,23 @@ impl AnalysisState {
 
     fn walk_cascade(&self, current: &ObjectId, visited: &mut HashSet<ObjectId>, result: &mut CascadeResult) {
         if !visited.insert(current.clone()) {
-            return; // Cycle detected, stop traversal
+            return;
         }
 
         result.dropped_relations.insert(current.clone());
 
-        // 1. Traverse Transitive Views (Views depending on `current`)
         for view_edge in &self.local.graph.views {
             if view_edge.depends_on.contains(current) && !visited.contains(&view_edge.view_id) {
                 self.walk_cascade(&view_edge.view_id, visited, result);
             }
         }
 
-        // 2. Traverse Indexes attached to `current`
         for index_edge in &self.local.graph.indexes {
             if index_edge.relation_id == *current {
                 result.dropped_indexes.insert(index_edge.index_id.clone());
-                // Indexes don't cascade further, just mark them dropped
             }
         }
 
-        // 3. Traverse Foreign Keys pointing TO `current`
-        // NOTE: Postgres drops the CONSTRAINT on the referencing table, not the referencing table itself.
         for fk_edge in &self.local.graph.foreign_keys {
             if fk_edge.to_table == *current {
                 if let Some(cname) = &fk_edge.constraint_name {
@@ -157,28 +147,68 @@ impl AnalysisState {
         }
     }
 
-    pub fn apply(&mut self, mutation: &Mutation) -> MutationResult {
+    pub fn apply(&mut self, mutation: &Mutation, precomputed_cascade: Option<&CascadeResult>) -> MutationResult {
         match mutation {
+            Mutation::CreateSchema(_) => {
+                // Tracking only; schemas are implicit within ObjectIds
+                MutationResult::Applied
+            }
+            Mutation::DropSchema(drop) => {
+                if drop.cascade {
+                    let mut relations_to_drop = Vec::new();
+                    for (id, _) in &self.local.relations {
+                        if drop.names.contains(&id.schema) {
+                            relations_to_drop.push(id.clone());
+                        }
+                    }
+                    for id in relations_to_drop {
+                        self.snapshot_relation(&id);
+                        self.local.relations.insert(id, RelationOverlay::Dropped);
+                    }
+
+                    let mut types_to_drop = Vec::new();
+                    for (id, _) in &self.local.types {
+                        if drop.names.contains(&id.schema) { types_to_drop.push(id.clone()); }
+                    }
+                    for id in types_to_drop {
+                        self.snapshot_type(&id);
+                        self.local.types.insert(id, TypeOverlay::Dropped);
+                    }
+
+                    let mut seqs_to_drop = Vec::new();
+                    for (id, _) in &self.local.sequences {
+                        if drop.names.contains(&id.schema) { seqs_to_drop.push(id.clone()); }
+                    }
+                    for id in seqs_to_drop {
+                        self.snapshot_sequence(&id);
+                        self.local.sequences.insert(id, SequenceOverlay::Dropped);
+                    }
+                }
+                MutationResult::Applied
+            }
             Mutation::DropTable(drop) => {
                 if drop.if_exists && !self.relation_is_present(&drop.id) {
                     return MutationResult::Skipped;
                 }
 
-                // If cascade: true, we walk the graph to find all collateral damage
                 if drop.cascade {
-                    let closure = self.get_cascade_closure(&drop.id);
+                    let local_closure; 
+                    let closure = match precomputed_cascade { 
+                        Some(c) => c, 
+                        None => { 
+                            local_closure = self.get_cascade_closure(&drop.id); 
+                            &local_closure 
+                        } 
+                    };
 
-                    // 1. Tombstone all transitively dropped relations (Views, MatViews, etc)
                     for dropped_rel_id in &closure.dropped_relations {
                         self.snapshot_relation(dropped_rel_id);
                         self.local.relations.insert(dropped_rel_id.clone(), RelationOverlay::Dropped);
                     }
 
-                    // 2. Prune collateral indexes
                     self.snapshot_index_graph_full();
                     self.local.graph.indexes.retain(|idx| !closure.dropped_indexes.contains(&idx.index_id));
 
-                    // 3. Prune collateral foreign key constraints pointing to the dropped relations
                     self.snapshot_fk_graph_full();
                     self.local.graph.foreign_keys.retain(|fk| {
                         if let Some(cname) = &fk.constraint_name {
@@ -188,11 +218,9 @@ impl AnalysisState {
                         }
                     });
 
-                    // 4. Prune the views that were tombstoned
                     self.snapshot_view_graph_full();
                     self.local.graph.views.retain(|v| !closure.dropped_relations.contains(&v.view_id));
                 } else {
-                    // Non-cascade just drops the single table
                     self.snapshot_relation(&drop.id);
                     self.local.relations.insert(drop.id.clone(), RelationOverlay::Dropped);
                 }
@@ -245,6 +273,14 @@ impl AnalysisState {
                     create.id.clone(),
                     RelationOverlay::Present(rel_state),
                 );
+
+                if let Some(parent_id) = &create.partition_of {
+                    self.snapshot_partition_graph();
+                    self.local.graph.partitions.push(PartitionEdge {
+                        parent: parent_id.clone(),
+                        child: create.id.clone(),
+                    });
+                }
 
                 if !create.foreign_keys.is_empty() {
                     self.snapshot_fk_graph();
@@ -549,10 +585,6 @@ impl AnalysisState {
                             rel.apply_column_action(&ColumnAction::DropNotNull { name: column.clone() });
                         }
                     }
-                    // FIX: pattern now binds `has_using` to match AlterTableActionMutation::SetType's
-                    // actual field set. Discarded here (`_`) -- ColumnAction::SetType has no use for
-                    // it, and TypeChangeRewriteRule (not this state-mutation path) is the consumer
-                    // that reads it for the safe/unsafe coercion judgment.
                     AlterTableActionMutation::SetType { column, ty, has_using: _ } => {
                         if let Some(RelationOverlay::Present(rel)) = self.local.relations.get_mut(&alter.id) {
                             rel.apply_column_action(&ColumnAction::SetType {
@@ -592,6 +624,14 @@ impl AnalysisState {
                                 .clone()
                                 .unwrap_or_else(|| format!("__fk__{}", to_table));
                             self.local.pending_validation.insert((alter.id.clone(), key));
+                        }
+                    }
+                    AlterTableActionMutation::RenameConstraint { old_name, new_name } => {
+                        self.snapshot_fk_graph_full();
+                        for fk in &mut self.local.graph.foreign_keys {
+                            if fk.from_table == alter.id && fk.constraint_name.as_deref() == Some(old_name.as_str()) {
+                                fk.constraint_name = Some(new_name.clone());
+                            }
                         }
                     }
                     AlterTableActionMutation::DropConstraint { name } => {
@@ -740,13 +780,6 @@ impl AnalysisState {
                 self.local.confidence = Confidence::Tainted;
                 MutationResult::Applied
             }
-            // ADDED: Mutation::Vacuum had no match arm in the version of this file
-            // I have on record, which would fail to compile (non-exhaustive match)
-            // the moment the resolver started actually emitting this variant.
-            // Tracking only -- VacuumFullRule reads `is_full` directly off the
-            // Mutation in its own evaluate(), so there's no LocalState to mutate here.
-            // VERIFY: if your real, current state.rs already has this arm, diff it
-            // against this one rather than pasting over it blindly.
             Mutation::Vacuum { .. } => {
                 MutationResult::Applied
             }

@@ -1,14 +1,15 @@
-// FILE: ./src/analysis/resolver.rs
-use crate::analysis::facts::{AlterTableActionFact, AlterIndexActionFact, StatementFact, PersistenceFact}; 
+// FILE: src/analysis/resolver.rs
+use crate::analysis::facts::{AlterTableActionFact, AlterIndexActionFact, StatementFact, PersistenceFact};
 use crate::analysis::mutations::{
     AlterTable, AlterTableActionMutation, ColumnMutation, CreateIndex, CreateTable, CreateView,
     DropIndex, DropTable, FkMutation, Mutation, OpaqueMutation, ReleaseSavepointMutation,
-    RollbackToSavepointMutation, SavepointMutation, SearchPathChange, CreateTypeMutation,                     
-    AlterTypeMutation, AlterTypeActionMutation, CreateDomainMutation, AlterDomainMutation,                    
+    RollbackToSavepointMutation, SavepointMutation, SearchPathChange, CreateTypeMutation,
+    AlterTypeMutation, AlterTypeActionMutation, CreateDomainMutation, AlterDomainMutation,
     DropDomainMutation, CreateSequenceMutation, AlterSequenceMutation, DropSequenceMutation,
-    CreateMaterializedView, RefreshMaterializedViewMutation, DropViewMutation,                                
-    DropMaterializedViewMutation, Rename, PersistenceMutation,                                                
-    CreatePolicyMutation, DropPolicyMutation, CreateTriggerMutation, DropTriggerMutation                  
+    CreateMaterializedView, RefreshMaterializedViewMutation, DropViewMutation,
+    DropMaterializedViewMutation, Rename, PersistenceMutation,
+    CreatePolicyMutation, DropPolicyMutation, CreateTriggerMutation, DropTriggerMutation,
+    CreateSchemaMutation, DropSchemaMutation
 };
 use crate::analysis::state::AnalysisState;
 use crate::ast::identifiers::{ObjectId, QualifiedName};
@@ -35,6 +36,24 @@ impl Resolver {
     pub fn resolve(fact: &StatementFact, state: &AnalysisState) -> Vec<Mutation> {
         let mut mutations = Vec::new();
         match fact {
+            StatementFact::CreateSchema { name, if_not_exists } => {
+                mutations.push(Mutation::CreateSchema(CreateSchemaMutation {
+                    name: name.name.resolve(),
+                    if_not_exists: *if_not_exists,
+                }));
+            }
+            StatementFact::AlterSchema { .. } => {
+                // Rare: SCHEMA renames require deep cascading ObjectId rewrites.
+                // Emitting as opaque to safely taint confidence for this session.
+                mutations.push(Mutation::Opaque(OpaqueMutation::DynamicSql));
+            }
+            StatementFact::DropSchema { names, if_exists, cascade } => {
+                mutations.push(Mutation::DropSchema(DropSchemaMutation {
+                    names: names.iter().map(|n| n.name.resolve()).collect(),
+                    if_exists: *if_exists,
+                    cascade: *cascade,
+                }));
+            }
             StatementFact::CreateTable {
                 name,
                 if_not_exists,
@@ -43,6 +62,8 @@ impl Resolver {
                 columns,
                 foreign_keys,
                 table_constraints,
+                partition_by,
+                partition_of,
             } => {
                 let resolved_persistence = match persistence {
                     PersistenceFact::Permanent => PersistenceMutation::Permanent,
@@ -77,6 +98,8 @@ impl Resolver {
                     columns: col_mutations,
                     foreign_keys: fk_mutations,
                     table_constraints: table_constraints.clone(),
+                    partition_by: partition_by.clone(),
+                    partition_of: partition_of.as_ref().map(|n| Self::resolve_name(n, state)),
                 }));
             }
             StatementFact::CreateView { name, or_replace, depends_on } => {
@@ -90,6 +113,13 @@ impl Resolver {
                     depends_on: resolved_depends,
                 }));
             }
+            StatementFact::AlterView { name, new_name } => {
+                if let Some(new_name) = new_name {
+                    let id = Self::resolve_name(name, state);
+                    let new_id = ObjectId { schema: id.schema.clone(), name: new_name.resolve() };
+                    mutations.push(Mutation::Rename(Rename { old_id: id, new_id }));
+                }
+            }
             StatementFact::CreateMaterializedView { name, depends_on } => {
                 let resolved_depends = depends_on.iter()
                     .map(|n| Self::resolve_name(n, state))
@@ -99,6 +129,13 @@ impl Resolver {
                     id: Self::resolve_name(name, state),
                     depends_on: resolved_depends,
                 }));
+            }
+            StatementFact::AlterMaterializedView { name, new_name } => {
+                if let Some(new_name) = new_name {
+                    let id = Self::resolve_name(name, state);
+                    let new_id = ObjectId { schema: id.schema.clone(), name: new_name.resolve() };
+                    mutations.push(Mutation::Rename(Rename { old_id: id, new_id }));
+                }
             }
             StatementFact::RefreshMaterializedView { name, concurrently } => {
                 mutations.push(Mutation::RefreshMaterializedView(RefreshMaterializedViewMutation {
@@ -256,8 +293,9 @@ impl Resolver {
                             }
                         }
                         AlterTableActionFact::AlterConstraint { name: c_name, deferrable } => AlterTableActionMutation::AlterConstraint { name: c_name.clone(), deferrable: *deferrable },
+                        AlterTableActionFact::RenameConstraint { old_name, new_name } => AlterTableActionMutation::RenameConstraint { old_name: old_name.clone(), new_name: new_name.clone() },
                         AlterTableActionFact::DropConstraint { name: c_name } => AlterTableActionMutation::DropConstraint { name: c_name.clone() },
-                        AlterTableActionFact::AddCheckConstraint { not_valid } => AlterTableActionMutation::AddCheckConstraint { not_valid: *not_valid },
+                        AlterTableActionFact::AddCheckConstraint { constraint_name, not_valid } => AlterTableActionMutation::AddCheckConstraint { constraint_name: constraint_name.clone(), not_valid: *not_valid },
                         AlterTableActionFact::AddUniqueConstraint => AlterTableActionMutation::AddUniqueConstraint,
                         AlterTableActionFact::AddPrimaryKeyConstraint => AlterTableActionMutation::AddPrimaryKeyConstraint,
                         AlterTableActionFact::AddExcludeConstraint => AlterTableActionMutation::AddExcludeConstraint,
@@ -305,6 +343,9 @@ impl Resolver {
             StatementFact::RollbackToSavepoint { name } => mutations.push(Mutation::RollbackToSavepoint(RollbackToSavepointMutation { name: name.clone() })),
             StatementFact::Savepoint { name } => mutations.push(Mutation::Savepoint(SavepointMutation { name: name.clone() })),
             StatementFact::ReleaseSavepoint { name } => mutations.push(Mutation::ReleaseSavepoint(ReleaseSavepointMutation { name: name.clone() })),
+            StatementFact::PrepareTransaction { .. } => mutations.push(Mutation::Opaque(OpaqueMutation::PrepareTransaction)),
+            StatementFact::SetTransaction => mutations.push(Mutation::Opaque(OpaqueMutation::SetTransaction)),
+            StatementFact::SetConstraints => mutations.push(Mutation::Opaque(OpaqueMutation::SetConstraints)),
             StatementFact::OpaqueBlock => mutations.push(Mutation::Opaque(OpaqueMutation::DoBlock)),
             StatementFact::Execute => mutations.push(Mutation::Opaque(OpaqueMutation::Execute)),
             StatementFact::Vacuum { is_full } => mutations.push(Mutation::Vacuum { is_full: *is_full }),
