@@ -2,6 +2,13 @@
 
 All notable changes to safe-migrate are documented here.
 
+## v0.3.1
+
+Hotfix for a broken `cargo install` on v0.3.0.
+
+- Pinned `squawk-syntax` to `=2.56.0`. v0.3.0 was published with a loose version requirement that allowed `squawk-syntax 2.58.0` to be pulled in on fresh installs, which introduced a new `BinOp::Escape` variant and a changed `Arg`/`Expr` relationship in `CallExpr` argument lists that the v0.3.0 source didn't account for. This broke compilation for anyone running `cargo install safe-migrate` after `2.58.0` was published, even though the code in the v0.3.0 tag itself was correct against `2.56.0`.
+- No functional or rule changes. If you built v0.3.0 from source before `squawk-syntax 2.58.0` was published, your binary is unaffected.
+
 ## v0.3.0
 
 Complete internal rewrite of the analysis engine. safe-migrate no longer just parses migrations — it runs a full state machine simulation of the migration against a model of the schema, including transactions, cascading drops, and partition hierarchies.
