@@ -33,7 +33,7 @@ The `sync` command reads from PostgreSQL's catalog:
 
 ## Installation
 
-### From Binary (Recommended)
+### From Binary
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/dsecurity49/safe-migrate/main/install.sh | bash
