@@ -9,13 +9,13 @@ pub mod partitions;
 pub mod transactions;
 pub mod views;
 
-use std::collections::HashMap;
-use crate::ast::identifiers::ObjectId;
-use crate::model::relation::RelationState;
 use crate::analysis::mutations::Mutation;
-use crate::analysis::state::{AnalysisState, MutationResult, CascadeResult};
+use crate::analysis::state::{AnalysisState, CascadeResult, MutationResult};
+use crate::ast::identifiers::ObjectId;
 use crate::engine::config::Config;
+use crate::model::relation::RelationState;
 use crate::report::violations::{Violation, ViolationTier};
+use std::collections::HashMap;
 
 pub trait Rule {
     fn id(&self) -> &'static str;
@@ -29,7 +29,6 @@ pub trait Rule {
         pre_relations: &HashMap<ObjectId, RelationState>,
         state: &AnalysisState, // ENFORCED: Upgraded to pass DB baseline context
         config: &Config,
-        cascade_closure: Option<&CascadeResult> // NEW: Orchestrator-managed pre-state
+        cascade_closure: Option<&CascadeResult>, // NEW: Orchestrator-managed pre-state
     ) -> Vec<Violation>;
 }
-

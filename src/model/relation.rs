@@ -1,9 +1,8 @@
-// FILE: ./src/model/relation.rs
-
-use crate::model::column::Column;
+// FILE: src/model/relation.rs
 use crate::ast::identifiers::ObjectId;
+use crate::model::column::Column;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use serde::{Serialize, Deserialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RelationKind {
@@ -25,19 +24,20 @@ pub struct RelationState {
     pub columns: Vec<Column>,
     pub generation: u64,
     pub estimated_rows: Option<u64>,
-    pub relpages: Option<u64>, // Added to support PostgreSQL page statistics in sync.rs
+    pub relpages: Option<u64>,
     pub kind: RelationKind,
     pub persistence: Persistence,
     pub triggers: HashSet<String>,
     pub policies: HashSet<String>,
     pub last_analyze: Option<String>,
     pub last_autoanalyze: Option<String>,
+    pub created_at_tx_depth: usize, // Phase 1 FIX: Same-Transaction index tracking
 }
 
 impl Default for RelationState {
     fn default() -> Self {
         Self {
-            id: ObjectId::new("public", "dummy"), // Fallback for struct updates
+            id: ObjectId::new("public", "dummy"),
             columns: Vec::new(),
             generation: 0,
             estimated_rows: Some(0),
@@ -48,6 +48,7 @@ impl Default for RelationState {
             policies: HashSet::new(),
             last_analyze: None,
             last_autoanalyze: None,
+            created_at_tx_depth: 0,
         }
     }
 }
@@ -58,7 +59,8 @@ impl RelationState {
         generation: u64,
         estimated_rows: Option<u64>,
         kind: RelationKind,
-        persistence: Persistence
+        persistence: Persistence,
+        created_at_tx_depth: usize,
     ) -> Self {
         Self {
             id,
@@ -72,12 +74,18 @@ impl RelationState {
             policies: HashSet::new(),
             last_analyze: None,
             last_autoanalyze: None,
+            created_at_tx_depth,
         }
     }
 
     pub fn apply_column_action(&mut self, action: &ColumnAction) {
         match action {
-            ColumnAction::Add { name, data_type, not_null, default } => {
+            ColumnAction::Add {
+                name,
+                data_type,
+                not_null,
+                default,
+            } => {
                 if !self.columns.iter().any(|c| c.name == *name) {
                     self.columns.push(Column {
                         name: name.clone(),
@@ -132,7 +140,6 @@ impl RelationState {
     }
 }
 
-// NOTE: ColumnAction does not need Serialize/Deserialize as it is only used during the in-memory execution loop!
 #[derive(Debug, Clone, PartialEq)]
 pub enum ColumnAction {
     Add {
@@ -164,6 +171,7 @@ pub enum ColumnAction {
     },
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum RelationOverlay {
     Present(RelationState),

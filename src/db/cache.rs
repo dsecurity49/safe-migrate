@@ -1,8 +1,8 @@
 // FILE: src/db/cache.rs
-use std::collections::HashMap;
 use crate::ast::identifiers::ObjectId;
 use crate::model::relation::RelationState;
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForeignKeyCache {
@@ -20,16 +20,22 @@ pub struct IndexCache {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DbCache {
     pub pg_version_num: Option<u32>,
-    
+
     // Tell Serde to convert the complex HashMap into a flat JSON array
     #[serde(with = "vectorize")]
     pub relations: HashMap<ObjectId, RelationState>,
-    
+
     #[serde(default)]
     pub foreign_keys: Vec<ForeignKeyCache>,
-    
+
     #[serde(default)]
     pub indexes: Vec<IndexCache>,
+}
+
+impl Default for DbCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DbCache {
@@ -77,4 +83,3 @@ mod vectorize {
         Ok(vec.into_iter().collect())
     }
 }
-

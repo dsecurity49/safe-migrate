@@ -1,7 +1,7 @@
 // FILE: src/model/column.rs
 
-use serde::{Serialize, Deserialize};
 use crate::analysis::expr_ir::ExprIr;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Column {

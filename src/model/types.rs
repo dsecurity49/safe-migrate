@@ -1,5 +1,4 @@
 // FILE: ./src/model/types.rs
-
 use crate::ast::identifiers::ObjectId;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -13,6 +12,9 @@ pub struct TypeState {
 pub enum TypeKind {
     Enum { variants: Vec<String> },
     Domain { base_type: String },
+    Base,
+    Composite,
+    Range,
 }
 
 #[derive(Debug, Clone, PartialEq)]

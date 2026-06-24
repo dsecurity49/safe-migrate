@@ -1,5 +1,4 @@
-// FILE: ./src/analysis/graph.rs
-
+// FILE: src/analysis/graph.rs
 use crate::ast::identifiers::ObjectId;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -61,39 +60,48 @@ impl DependencyGraph {
     pub fn new() -> Self {
         Self::default()
     }
-    
+
+    // Phase 3 FIX (BUG-004): Traverse rename chains dynamically for accurate topology reads
     pub fn is_referenced_by_view(&self, id: &ObjectId) -> Vec<&ObjectId> {
+        let target = self.resolve_rename(id);
         self.views
             .iter()
-            .filter(|v| v.depends_on.contains(id))
-            .map(|v| &v.view_id)
+            .filter(|v| {
+                v.depends_on
+                    .iter()
+                    .any(|dep| self.resolve_rename(dep) == target || dep == id)
+            })
+            .map(|v| self.resolve_rename(&v.view_id))
             .collect()
     }
-    
+
     pub fn is_referenced_by_fk(&self, id: &ObjectId) -> Vec<(&ObjectId, u64)> {
+        let target = self.resolve_rename(id);
         self.foreign_keys
             .iter()
-            .filter(|fk| &fk.to_table == id)
-            .map(|fk| (&fk.from_table, fk.from_generation))
+            .filter(|fk| self.resolve_rename(&fk.to_table) == target || &fk.to_table == id)
+            .map(|fk| (self.resolve_rename(&fk.from_table), fk.from_generation))
             .collect()
     }
-    
+
     pub fn is_referenced_by_index(&self, id: &ObjectId) -> Vec<&ObjectId> {
+        let target = self.resolve_rename(id);
         self.indexes
             .iter()
-            .filter(|ix| &ix.relation_id == id)
-            .map(|ix| &ix.index_id)
+            .filter(|ix| self.resolve_rename(&ix.relation_id) == target || &ix.relation_id == id)
+            .map(|ix| self.resolve_rename(&ix.index_id))
             .collect()
     }
-    
+
     pub fn partitions_of(&self, id: &ObjectId) -> Vec<&ObjectId> {
+        let target = self.resolve_rename(id);
         self.partitions
             .iter()
-            .filter(|p| &p.parent == id)
-            .map(|p| &p.child)
+            .filter(|p| self.resolve_rename(&p.parent) == target || &p.parent == id)
+            .map(|p| self.resolve_rename(&p.child))
             .collect()
     }
-    
+
     pub fn resolve_rename<'a>(&'a self, id: &'a ObjectId) -> &'a ObjectId {
         let mut current = id;
         loop {
@@ -102,5 +110,32 @@ impl DependencyGraph {
                 None => return current,
             }
         }
+    }
+
+    // Phase 3 FIX (BUG-012): Reject cycle topologies
+    pub fn check_partition_cycle(&self, parent: &ObjectId, child: &ObjectId) -> bool {
+        let resolved_parent = self.resolve_rename(parent);
+        let resolved_child = self.resolve_rename(child);
+        if resolved_parent == resolved_child {
+            return true;
+        }
+
+        let mut current_parent = resolved_parent;
+        loop {
+            let maybe_edge = self
+                .partitions
+                .iter()
+                .find(|p| self.resolve_rename(&p.child) == current_parent);
+            if let Some(edge) = maybe_edge {
+                let p = self.resolve_rename(&edge.parent);
+                if p == resolved_child {
+                    return true;
+                }
+                current_parent = p;
+            } else {
+                break;
+            }
+        }
+        false
     }
 }

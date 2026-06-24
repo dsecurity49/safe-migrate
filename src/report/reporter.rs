@@ -1,7 +1,6 @@
 // FILE: src/report/reporter.rs
-
-use crate::report::violations::{Violation, ViolationTier};
 use crate::analysis::state::Confidence;
+use crate::report::violations::{Violation, ViolationTier};
 
 pub struct Reporter;
 
@@ -20,47 +19,52 @@ impl Reporter {
         println!("{:-<80}", "");
 
         for v in violations {
+            // Indent by exactly 9 spaces to align under the 8-character tags + 1 space
+            let indent = "         ";
             let clean_recipe = v
                 .recipe
                 .lines()
                 .map(|line| line.trim())
                 .collect::<Vec<_>>()
-                .join("\n                          ");
+                .join(&format!("\n{}", indent));
 
             match v.tier {
                 ViolationTier::Tier1 => {
                     tier1 += 1;
                     has_tier1_failures = true;
-                    println!("[FAIL] [TIER 1 - DANGER ] {}", v.title);
+                    println!("[ HALT ] {}", v.title);
                 }
                 ViolationTier::Tier2 => {
                     tier2 += 1;
-                    println!("[WARN] [TIER 2 - WARNING] {}", v.title);
+                    println!("[ WARN ] {}", v.title);
                 }
                 ViolationTier::Tier3 => {
                     tier3 += 1;
-                    println!("[ OK ] [TIER 3 - SAFE   ] {}", v.title);
+                    println!("[ SAFE ] {}", v.title);
                 }
             }
-            
-            println!("                          Rule:   {}", v.rule_id);
-            println!("                          Recipe: {}", clean_recipe);
-            
+
+            println!("{}Rule:   {}", indent, v.rule_id);
+            println!("{}Recipe: {}", indent, clean_recipe);
+
             println!("{:-<80}", "");
         }
 
-        println!(); 
+        println!();
         println!("==================================================");
-        println!("Analysis Complete.");
-        
-        match confidence {
-            Confidence::Exact => println!("Analysis Confidence : Exact"),
-            Confidence::Tainted => println!("Analysis Confidence : Tainted (Dynamic/Opaque SQL detected)"),
-        }
-        
-        println!("Tier 1 (Halt Build) : {}", tier1);
-        println!("Tier 2 (Warning)    : {}", tier2);
-        println!("Tier 3 (Info)       : {}", tier3);
+        println!("Analysis Complete");
+        println!("==================================================");
+
+        let conf_str = match confidence {
+            Confidence::Exact => "Exact",
+            Confidence::Tainted => "Tainted (Dynamic/Opaque SQL)",
+        };
+
+        println!("Confidence: {}", conf_str);
+        println!("--------------------------------------------------");
+        println!("[ HALT ] Tier 1: {}", tier1);
+        println!("[ WARN ] Tier 2: {}", tier2);
+        println!("[ SAFE ] Tier 3: {}", tier3);
         println!("==================================================");
 
         has_tier1_failures

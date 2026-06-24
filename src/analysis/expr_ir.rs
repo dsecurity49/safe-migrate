@@ -1,5 +1,5 @@
 // FILE: src/analysis/expr_ir.rs
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ExprIr {
@@ -62,4 +62,3 @@ impl ExprIr {
         }
     }
 }
-

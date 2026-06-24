@@ -1,19 +1,25 @@
 // FILE: src/rules/opaque.rs
-use std::collections::HashMap;
-use crate::ast::identifiers::ObjectId;
-use crate::model::relation::RelationState;
-use crate::rules::Rule;
 use crate::analysis::mutations::Mutation;
-use crate::analysis::state::{AnalysisState, MutationResult, CascadeResult};
+use crate::analysis::state::{AnalysisState, CascadeResult, MutationResult};
+use crate::ast::identifiers::ObjectId;
 use crate::engine::config::Config;
+use crate::model::relation::RelationState;
 use crate::report::violations::{Violation, ViolationTier};
+use crate::rules::Rule;
+use std::collections::HashMap;
 
 pub struct OpaqueDynamicSqlRule;
 
 impl Rule for OpaqueDynamicSqlRule {
-    fn id(&self) -> &'static str { "opaque-dynamic-sql" }
-    fn default_tier(&self) -> ViolationTier { ViolationTier::Tier2 }
-    fn recipe(&self) -> &'static str { "Procedural or dynamic SQL (DO blocks, EXECUTE) obscures schema mutations. Lock analysis confidence is heavily degraded." }
+    fn id(&self) -> &'static str {
+        "opaque-dynamic-sql"
+    }
+    fn default_tier(&self) -> ViolationTier {
+        ViolationTier::Tier2
+    }
+    fn recipe(&self) -> &'static str {
+        "Procedural or dynamic SQL (DO blocks, EXECUTE) obscures schema mutations. Lock analysis confidence is heavily degraded."
+    }
 
     fn evaluate(
         &self,
@@ -22,7 +28,7 @@ impl Rule for OpaqueDynamicSqlRule {
         _pre_relations: &HashMap<ObjectId, RelationState>,
         _state: &AnalysisState,
         _config: &Config,
-        _cascade: Option<&CascadeResult>
+        _cascade: Option<&CascadeResult>,
     ) -> Vec<Violation> {
         let mut violations = Vec::new();
 
@@ -31,7 +37,9 @@ impl Rule for OpaqueDynamicSqlRule {
                 crate::analysis::mutations::OpaqueMutation::DoBlock => "DO block",
                 crate::analysis::mutations::OpaqueMutation::Execute => "EXECUTE statement",
                 crate::analysis::mutations::OpaqueMutation::DynamicSql => "Dynamic SQL",
-                crate::analysis::mutations::OpaqueMutation::PrepareTransaction => "PREPARE TRANSACTION",
+                crate::analysis::mutations::OpaqueMutation::PrepareTransaction => {
+                    "PREPARE TRANSACTION"
+                }
                 crate::analysis::mutations::OpaqueMutation::SetTransaction => "SET TRANSACTION",
                 crate::analysis::mutations::OpaqueMutation::SetConstraints => "SET CONSTRAINTS",
             };
@@ -48,4 +56,3 @@ impl Rule for OpaqueDynamicSqlRule {
         violations
     }
 }
-

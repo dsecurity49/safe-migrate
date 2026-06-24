@@ -1,6 +1,8 @@
 // FILE: src/analysis/mutations.rs
 use crate::analysis::expr_ir::ExprIr;
+use crate::analysis::facts::{SearchPathTarget, TableConstraintFact};
 use crate::ast::identifiers::ObjectId;
+use crate::model::types::TypeKind;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum PersistenceMutation {
@@ -149,7 +151,7 @@ pub struct DropDomainMutation {
 #[derive(Clone, Debug, PartialEq)]
 pub struct CreateTypeMutation {
     pub id: ObjectId,
-    pub is_enum: bool,
+    pub kind: TypeKind,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -171,7 +173,7 @@ pub struct CreateTable {
     pub persistence: PersistenceMutation,
     pub columns: Vec<ColumnMutation>,
     pub foreign_keys: Vec<FkMutation>,
-    pub table_constraints: Vec<crate::analysis::facts::TableConstraintFact>,
+    pub table_constraints: Vec<TableConstraintFact>,
     pub partition_by: Option<String>,
     pub partition_of: Option<ObjectId>,
 }
@@ -238,20 +240,33 @@ pub struct DropIndex {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SearchPathChange {
-    pub schemas: Vec<String>,
+    pub target: SearchPathTarget,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct SavepointMutation { pub name: String }
+pub struct SavepointMutation {
+    pub name: String,
+}
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct ReleaseSavepointMutation { pub name: String }
+pub struct ReleaseSavepointMutation {
+    pub name: String,
+}
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct RollbackToSavepointMutation { pub name: String }
+pub struct RollbackToSavepointMutation {
+    pub name: String,
+}
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum OpaqueMutation { DoBlock, Execute, DynamicSql, PrepareTransaction, SetTransaction, SetConstraints }
+pub enum OpaqueMutation {
+    DoBlock,
+    Execute,
+    DynamicSql,
+    PrepareTransaction,
+    SetTransaction,
+    SetConstraints,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum AlterTableActionMutation {
@@ -266,7 +281,10 @@ pub enum AlterTableActionMutation {
         name: String,
         if_exists: bool,
     },
-    RenameColumn { from: String, to: String },
+    RenameColumn {
+        from: String,
+        to: String,
+    },
     AddForeignKey {
         constraint_name: Option<String>,
         to_table: ObjectId,
@@ -292,13 +310,32 @@ pub enum AlterTableActionMutation {
     AddUniqueConstraint,
     AddPrimaryKeyConstraint,
     AddExcludeConstraint,
-    SetNotNull { column: String },
-    DropNotNull { column: String },
-    SetType { column: String, ty: String, has_using: bool },
-    SetDefault { column: String, default: Option<ExprIr> },
-    ValidateConstraint { constraint_name: String },
-    AttachPartition { child: ObjectId },
-    DetachPartition { child: ObjectId },
-    SetStorage { column: String },
+    SetNotNull {
+        column: String,
+    },
+    DropNotNull {
+        column: String,
+    },
+    SetType {
+        column: String,
+        ty: String,
+        has_using: bool,
+    },
+    SetDefault {
+        column: String,
+        default: Option<ExprIr>,
+    },
+    ValidateConstraint {
+        constraint_name: String,
+    },
+    AttachPartition {
+        child: ObjectId,
+    },
+    DetachPartition {
+        child: ObjectId,
+    },
+    SetStorage {
+        column: String,
+    },
     SetAccessMethod,
 }

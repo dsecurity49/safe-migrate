@@ -1,20 +1,26 @@
 // FILE: src/rules/idempotency.rs
 
-use std::collections::HashMap;
+use crate::analysis::mutations::{AlterTableActionMutation, Mutation};
+use crate::analysis::state::{AnalysisState, CascadeResult, MutationResult};
 use crate::ast::identifiers::ObjectId;
-use crate::rules::Rule;
-use crate::analysis::mutations::{Mutation, AlterTableActionMutation};
-use crate::analysis::state::{AnalysisState, MutationResult, CascadeResult};
 use crate::engine::config::Config;
-use crate::report::violations::{Violation, ViolationTier};
 use crate::model::relation::RelationState;
+use crate::report::violations::{Violation, ViolationTier};
+use crate::rules::Rule;
+use std::collections::HashMap;
 
 pub struct IdempotencyRule;
 
 impl Rule for IdempotencyRule {
-    fn id(&self) -> &'static str { "missing-idempotency" }
-    fn default_tier(&self) -> ViolationTier { ViolationTier::Tier3 }
-    fn recipe(&self) -> &'static str { "Use IF EXISTS or IF NOT EXISTS to prevent migration failures on partial re-runs." }
+    fn id(&self) -> &'static str {
+        "missing-idempotency"
+    }
+    fn default_tier(&self) -> ViolationTier {
+        ViolationTier::Tier3
+    }
+    fn recipe(&self) -> &'static str {
+        "Use IF EXISTS or IF NOT EXISTS to prevent migration failures on partial re-runs."
+    }
 
     fn evaluate(
         &self,
@@ -23,13 +29,13 @@ impl Rule for IdempotencyRule {
         _pre_relations: &HashMap<ObjectId, RelationState>,
         _state: &AnalysisState,
         _config: &Config,
-        _cascade: Option<&CascadeResult>
+        _cascade: Option<&CascadeResult>,
     ) -> Vec<Violation> {
         // ARCHITECTURAL NOTE:
         // We INTENTIONALLY ignore `MutationResult::Skipped` here.
         // This rule is a syntactic policy enforcer. It flags missing IF EXISTS / IF NOT EXISTS
         // clauses regardless of whether the object actually existed during this specific simulator run.
-        
+
         let mut violations = Vec::new();
 
         let mut add_violation = |title: String| {
@@ -62,10 +68,16 @@ impl Rule for IdempotencyRule {
                 add_violation(format!("DROP INDEX {} without IF EXISTS", d.id));
             }
             Mutation::DropPolicy(d) if !d.if_exists => {
-                add_violation(format!("DROP POLICY {} on {} without IF EXISTS", d.name, d.table));
+                add_violation(format!(
+                    "DROP POLICY {} on {} without IF EXISTS",
+                    d.name, d.table
+                ));
             }
             Mutation::DropTrigger(d) if !d.if_exists => {
-                add_violation(format!("DROP TRIGGER {} on {} without IF EXISTS", d.name, d.table));
+                add_violation(format!(
+                    "DROP TRIGGER {} on {} without IF EXISTS",
+                    d.name, d.table
+                ));
             }
 
             // Drop Guards (Vector targets)
@@ -91,17 +103,27 @@ impl Rule for IdempotencyRule {
             }
 
             // Alter Table Action Guards
-            Mutation::AlterTable(a) => {
-                match &a.action {
-                    AlterTableActionMutation::AddColumn { name, if_not_exists, .. } if !*if_not_exists => {
-                        add_violation(format!("ALTER TABLE {} ADD COLUMN {} without IF NOT EXISTS", a.id, name));
-                    }
-                    AlterTableActionMutation::DropColumn { name, if_exists, .. } if !*if_exists => {
-                        add_violation(format!("ALTER TABLE {} DROP COLUMN {} without IF EXISTS", a.id, name));
-                    }
-                    _ => {}
+            Mutation::AlterTable(a) => match &a.action {
+                AlterTableActionMutation::AddColumn {
+                    name,
+                    if_not_exists,
+                    ..
+                } if !*if_not_exists => {
+                    add_violation(format!(
+                        "ALTER TABLE {} ADD COLUMN {} without IF NOT EXISTS",
+                        a.id, name
+                    ));
                 }
-            }
+                AlterTableActionMutation::DropColumn {
+                    name, if_exists, ..
+                } if !*if_exists => {
+                    add_violation(format!(
+                        "ALTER TABLE {} DROP COLUMN {} without IF EXISTS",
+                        a.id, name
+                    ));
+                }
+                _ => {}
+            },
             _ => {}
         }
 

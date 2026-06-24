@@ -10,6 +10,20 @@ pub enum PersistenceFact {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub enum SearchPathTarget {
+    Default,
+    Schemas(Vec<String>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum TypeCreationKind {
+    Enum,
+    Range,
+    Composite,
+    Base,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum StatementFact {
     CreateSchema {
         name: QualifiedName,
@@ -135,20 +149,30 @@ pub enum StatementFact {
         concurrently: bool,
     },
     SetSearchPath {
-        schemas: Vec<String>,
+        target: SearchPathTarget,
     },
     BeginTransaction,
     CommitTransaction,
     RollbackTransaction,
-    RollbackToSavepoint { name: String },
-    Savepoint { name: String },
-    ReleaseSavepoint { name: String },
-    PrepareTransaction { name: String },
+    RollbackToSavepoint {
+        name: String,
+    },
+    Savepoint {
+        name: String,
+    },
+    ReleaseSavepoint {
+        name: String,
+    },
+    PrepareTransaction {
+        name: String,
+    },
     SetTransaction,
     SetConstraints,
     OpaqueBlock,
     Execute,
-    Vacuum { is_full: bool },
+    Vacuum {
+        is_full: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -159,7 +183,7 @@ pub enum AlterIndexActionFact {
 #[derive(Clone, Debug, PartialEq)]
 pub struct CreateTypeFact {
     pub name: QualifiedName,
-    pub is_enum: bool,
+    pub kind: TypeCreationKind,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -243,13 +267,32 @@ pub enum AlterTableActionFact {
     AddUniqueConstraint,
     AddPrimaryKeyConstraint,
     AddExcludeConstraint,
-    SetNotNull { column: String },
-    DropNotNull { column: String },
-    SetType { column: String, ty: String, has_using: bool },
-    SetDefault { column: String, default: Option<ExprIr> },
-    ValidateConstraint { constraint_name: String },
-    AttachPartition { child: QualifiedName },
-    DetachPartition { child: QualifiedName },
-    SetStorage { column: String },
+    SetNotNull {
+        column: String,
+    },
+    DropNotNull {
+        column: String,
+    },
+    SetType {
+        column: String,
+        ty: String,
+        has_using: bool,
+    },
+    SetDefault {
+        column: String,
+        default: Option<ExprIr>,
+    },
+    ValidateConstraint {
+        constraint_name: String,
+    },
+    AttachPartition {
+        child: QualifiedName,
+    },
+    DetachPartition {
+        child: QualifiedName,
+    },
+    SetStorage {
+        column: String,
+    },
     SetAccessMethod,
 }

@@ -11,8 +11,8 @@ pub mod report;
 pub mod rules;
 pub mod sync;
 
+pub use analysis::state::AnalysisState;
+pub use db::cache::DbCache;
 pub use engine::config::Config;
 pub use engine::engine::SafeMigrateEngine;
-pub use db::cache::DbCache;
-pub use analysis::state::AnalysisState;
 pub use report::reporter::Reporter;

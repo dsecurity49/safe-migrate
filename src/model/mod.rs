@@ -2,5 +2,5 @@
 
 pub mod column;
 pub mod relation;
-pub mod types;
 pub mod sequence;
+pub mod types;

@@ -1,4 +1,5 @@
-// FILE: ./src/engine/mod.rs
+// FILE: src/engine/mod.rs
+#![allow(clippy::module_inception)]
 
 pub mod config;
 pub mod engine;
@@ -18,16 +19,12 @@ pub struct MigrationFile {
 impl MigrationFile {
     pub fn parse(sql: &str) -> Result<Self, Vec<String>> {
         let parsed = SourceFile::parse(sql);
-        let errors: Vec<String> = parsed
-            .errors()
-            .iter()
-            .map(|e| e.to_string())
-            .collect();
-        
+        let errors: Vec<String> = parsed.errors().iter().map(|e| e.to_string()).collect();
+
         if !errors.is_empty() {
             return Err(errors);
         }
-        
+
         Ok(Self {
             source: parsed.tree(),
         })

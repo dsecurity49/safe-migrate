@@ -1,6 +1,6 @@
 // FILE: ./src/ast/identifiers.rs
 
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Ident {
@@ -61,4 +61,3 @@ impl std::fmt::Display for ObjectId {
         write!(f, "{}.{}", self.schema, self.name)
     }
 }
-

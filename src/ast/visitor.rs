@@ -1,18 +1,18 @@
 // FILE: src/ast/visitor.rs
 use crate::analysis::facts::{
-    AlterTableActionFact, ColumnFact, FkFact, StatementFact, TableConstraintFact, PersistenceFact,
-    AlterIndexActionFact, AlterTypeActionFact, CreateTypeFact, AlterTypeFact
+    AlterIndexActionFact, AlterTableActionFact, AlterTypeActionFact, AlterTypeFact, ColumnFact,
+    CreateTypeFact, FkFact, PersistenceFact, SearchPathTarget, StatementFact, TableConstraintFact,
+    TypeCreationKind,
 };
 use crate::ast::identifiers::{Ident, QualifiedName};
 use squawk_syntax::ast::{
-    self, AstNode, AlterColumnOption, AlterTable, AlterTableAction, Column, ColumnConstraint,
-    Constraint, CreateIndex, CreateTable, CreateTableAs, CreateView, DropIndex,
-    DropTable, Path, PathSegment, Stmt, TableArg, TableConstraint,
-    CreateSequence, AlterSequence, DropSequence, CreateMaterializedView,
-    DropView, DropMaterializedView, AlterIndex, UsingMethod, WhereClause, RenameTo,
-    AttachPartition, DetachPartition, AlterConstraint, Set, Rollback, Savepoint, ReleaseSavepoint,
-    CreateType, AlterType, CreateDomain, AlterDomain, DropDomain, CreatePolicy, DropPolicy,
-    CreateTrigger, DropTrigger, AddValue, Name, NameRef
+    self, AddValue, AlterColumnOption, AlterConstraint, AlterDomain, AlterIndex, AlterSequence,
+    AlterTable, AlterTableAction, AlterType, AstNode, AttachPartition, Column, ColumnConstraint,
+    Constraint, CreateDomain, CreateIndex, CreateMaterializedView, CreatePolicy, CreateSequence,
+    CreateTable, CreateTableAs, CreateTrigger, CreateType, CreateView, DetachPartition, DropDomain,
+    DropIndex, DropMaterializedView, DropPolicy, DropSequence, DropTable, DropTrigger, DropView,
+    Name, NameRef, Path, PathSegment, ReleaseSavepoint, RenameTo, Rollback, Savepoint, Set, Stmt,
+    TableArg, TableConstraint, UsingMethod, WhereClause,
 };
 
 pub struct AstVisitor;
@@ -21,81 +21,150 @@ impl AstVisitor {
     /// Safely resolves and trims an unquoted/quoted Name into a string
     /// following Postgres casing rules
     fn resolve_name(n: Name) -> String {
-        Ident::new(n.text().to_string().trim_matches('"').to_string(), n.is_quoted()).resolve()
+        Ident::new(
+            n.text().to_string().trim_matches('"').to_string(),
+            n.is_quoted(),
+        )
+        .resolve()
     }
 
     /// Safely resolves and trims an unquoted/quoted NameRef into a string
     /// following Postgres casing rules
     fn resolve_name_ref(nr: NameRef) -> String {
-        Ident::new(nr.text().to_string().trim_matches('"').to_string(), nr.is_quoted()).resolve()
+        Ident::new(
+            nr.text().to_string().trim_matches('"').to_string(),
+            nr.is_quoted(),
+        )
+        .resolve()
     }
 
     pub fn extract(stmt: &Stmt) -> Option<StatementFact> {
         let syntax = stmt.syntax();
         match stmt {
-            Stmt::CreateTable(node)            => return Self::extract_create_table(node),
-            Stmt::CreateTableAs(node)          => return Self::extract_create_table_as(node),
-            Stmt::CreateView(node)             => return Self::extract_create_view(node),
-            Stmt::CreateMaterializedView(node) => return Self::extract_create_materialized_view(node),
-            Stmt::CreateIndex(node)            => return Self::extract_create_index(node),
-            Stmt::AlterTable(node)             => return Self::extract_alter_table(node),
-            Stmt::AlterIndex(node)             => return Self::extract_alter_index(node),
-            Stmt::DropTable(node)              => return Self::extract_drop_table(node),
-            Stmt::DropView(node)               => return Self::extract_drop_view(node),
-            Stmt::DropMaterializedView(node)   => return Self::extract_drop_materialized_view(node),
-            Stmt::DropIndex(node)              => return Self::extract_drop_index(node),
-            Stmt::Set(node)                    => return Self::extract_set(node),
-            Stmt::Begin(_)                     => return Some(StatementFact::BeginTransaction),
-            Stmt::Commit(_)                    => return Some(StatementFact::CommitTransaction),
-            Stmt::Rollback(node)               => return Self::extract_rollback(node),
-            Stmt::Savepoint(node)              => return Some(Self::extract_savepoint(node)),
-            Stmt::ReleaseSavepoint(node)       => return Some(Self::extract_release_savepoint(node)),
-            Stmt::Vacuum(node)                 => return Some(StatementFact::Vacuum { is_full: node.is_full() }),
+            Stmt::CreateTable(node) => return Self::extract_create_table(node),
+            Stmt::CreateTableAs(node) => return Self::extract_create_table_as(node),
+            Stmt::CreateView(node) => return Self::extract_create_view(node),
+            Stmt::CreateMaterializedView(node) => {
+                return Self::extract_create_materialized_view(node);
+            }
+            Stmt::CreateIndex(node) => return Self::extract_create_index(node),
+            Stmt::AlterTable(node) => return Self::extract_alter_table(node),
+            Stmt::AlterIndex(node) => return Self::extract_alter_index(node),
+            Stmt::DropTable(node) => return Self::extract_drop_table(node),
+            Stmt::DropView(node) => return Self::extract_drop_view(node),
+            Stmt::DropMaterializedView(node) => return Self::extract_drop_materialized_view(node),
+            Stmt::DropIndex(node) => return Self::extract_drop_index(node),
+            Stmt::Set(node) => return Self::extract_set(node),
+            Stmt::Begin(_) => return Some(StatementFact::BeginTransaction),
+            Stmt::Commit(_) => return Some(StatementFact::CommitTransaction),
+            Stmt::Rollback(node) => return Self::extract_rollback(node),
+            Stmt::Savepoint(node) => return Some(Self::extract_savepoint(node)),
+            Stmt::ReleaseSavepoint(node) => return Some(Self::extract_release_savepoint(node)),
+            Stmt::Vacuum(node) => {
+                return Some(StatementFact::Vacuum {
+                    is_full: node.is_full(),
+                });
+            }
             _ => {}
         }
 
         // Dynamically Cast Syntax Nodes for schema entities
-        if let Some(node) = ast::CreateSchema::cast(syntax.clone()) { return Self::extract_create_schema(&node); }
-        if let Some(node) = ast::AlterSchema::cast(syntax.clone()) { return Self::extract_alter_schema(&node); }
-        if let Some(node) = ast::DropSchema::cast(syntax.clone()) { return Self::extract_drop_schema(&node); }
+        if let Some(node) = ast::CreateSchema::cast(syntax.clone()) {
+            return Self::extract_create_schema(&node);
+        }
+        if let Some(node) = ast::AlterSchema::cast(syntax.clone()) {
+            return Self::extract_alter_schema(&node);
+        }
+        if let Some(node) = ast::DropSchema::cast(syntax.clone()) {
+            return Self::extract_drop_schema(&node);
+        }
 
         // Dynamically Cast Syntax Nodes for extended View/MatView operations
-        if let Some(node) = ast::AlterView::cast(syntax.clone()) { return Self::extract_alter_view(&node); }
-        if let Some(node) = ast::AlterMaterializedView::cast(syntax.clone()) { return Self::extract_alter_materialized_view(&node); }
-        if let Some(node) = ast::Refresh::cast(syntax.clone()) { return Self::extract_refresh(&node); }
+        if let Some(node) = ast::AlterView::cast(syntax.clone()) {
+            return Self::extract_alter_view(&node);
+        }
+        if let Some(node) = ast::AlterMaterializedView::cast(syntax.clone()) {
+            return Self::extract_alter_materialized_view(&node);
+        }
+        if let Some(node) = ast::Refresh::cast(syntax.clone()) {
+            return Self::extract_refresh(&node);
+        }
 
         // Dynamically Cast Syntax Nodes for secondary entities
-        if let Some(node) = CreateSequence::cast(syntax.clone()) { return Self::extract_create_sequence(&node); }
-        if let Some(node) = AlterSequence::cast(syntax.clone()) { return Self::extract_alter_sequence(&node); }
-        if let Some(node) = DropSequence::cast(syntax.clone()) { return Self::extract_drop_sequence(&node); }
-        if let Some(node) = CreateType::cast(syntax.clone()) { return Self::extract_create_type(&node); }
-        if let Some(node) = AlterType::cast(syntax.clone()) { return Self::extract_alter_type(&node); }
-        if let Some(node) = CreateDomain::cast(syntax.clone()) { return Self::extract_create_domain(&node); }
-        if let Some(node) = AlterDomain::cast(syntax.clone()) { return Self::extract_alter_domain(&node); }
-        if let Some(node) = DropDomain::cast(syntax.clone()) { return Self::extract_drop_domain(&node); }
-        if let Some(node) = CreatePolicy::cast(syntax.clone()) { return Self::extract_create_policy(&node); }
-        if let Some(node) = DropPolicy::cast(syntax.clone()) { return Self::extract_drop_policy(&node); }
-        if let Some(node) = CreateTrigger::cast(syntax.clone()) { return Self::extract_create_trigger(&node); }
-        if let Some(node) = DropTrigger::cast(syntax.clone()) { return Self::extract_drop_trigger(&node); }
+        if let Some(node) = CreateSequence::cast(syntax.clone()) {
+            return Self::extract_create_sequence(&node);
+        }
+        if let Some(node) = AlterSequence::cast(syntax.clone()) {
+            return Self::extract_alter_sequence(&node);
+        }
+        if let Some(node) = DropSequence::cast(syntax.clone()) {
+            return Self::extract_drop_sequence(&node);
+        }
+        if let Some(node) = CreateType::cast(syntax.clone()) {
+            return Self::extract_create_type(&node);
+        }
+        if let Some(node) = AlterType::cast(syntax.clone()) {
+            return Self::extract_alter_type(&node);
+        }
+        if let Some(node) = CreateDomain::cast(syntax.clone()) {
+            return Self::extract_create_domain(&node);
+        }
+        if let Some(node) = AlterDomain::cast(syntax.clone()) {
+            return Self::extract_alter_domain(&node);
+        }
+        if let Some(node) = DropDomain::cast(syntax.clone()) {
+            return Self::extract_drop_domain(&node);
+        }
+        if let Some(node) = CreatePolicy::cast(syntax.clone()) {
+            return Self::extract_create_policy(&node);
+        }
+        if let Some(node) = DropPolicy::cast(syntax.clone()) {
+            return Self::extract_drop_policy(&node);
+        }
+        if let Some(node) = CreateTrigger::cast(syntax.clone()) {
+            return Self::extract_create_trigger(&node);
+        }
+        if let Some(node) = DropTrigger::cast(syntax.clone()) {
+            return Self::extract_drop_trigger(&node);
+        }
 
         // Dynamically Cast Syntax Nodes for advanced transaction blocks
-        if let Some(_) = ast::PrepareTransaction::cast(syntax.clone()) {
-            let name = syntax.descendants().find_map(ast::Literal::cast).map(|l| l.syntax().text().to_string().trim_matches('\'').to_string())
-                .or_else(|| syntax.descendants().find_map(Name::cast).map(Self::resolve_name))
+        if ast::PrepareTransaction::cast(syntax.clone()).is_some() {
+            let name = syntax
+                .descendants()
+                .find_map(ast::Literal::cast)
+                .map(|l| l.syntax().text().to_string().trim_matches('\'').to_string())
+                .or_else(|| {
+                    syntax
+                        .descendants()
+                        .find_map(Name::cast)
+                        .map(Self::resolve_name)
+                })
                 .unwrap_or_default();
             return Some(StatementFact::PrepareTransaction { name });
         }
-        if let Some(_) = ast::SetTransaction::cast(syntax.clone()) { return Some(StatementFact::SetTransaction); }
-        if let Some(_) = ast::SetConstraints::cast(syntax.clone()) { return Some(StatementFact::SetConstraints); }
+        if ast::SetTransaction::cast(syntax.clone()).is_some() {
+            return Some(StatementFact::SetTransaction);
+        }
+        if ast::SetConstraints::cast(syntax.clone()).is_some() {
+            return Some(StatementFact::SetConstraints);
+        }
 
         // Absolute Fallbacks for dynamic blocks
         let text = syntax.text().to_string();
         let upper = text.to_uppercase();
 
-        if upper.starts_with("DO ") { return Some(StatementFact::OpaqueBlock); }
-        if upper.starts_with("EXECUTE ") { return Some(StatementFact::Execute); }
+        if upper.starts_with("DO ") {
+            return Some(StatementFact::OpaqueBlock);
+        }
+        if upper.starts_with("EXECUTE ") {
+            return Some(StatementFact::Execute);
+        }
 
-        None
+        // BUG FIX: Strict "Unknown" Gate
+        // Any valid SQL that is not explicitly mapped defaults to an opaque block
+        // to ensure it does not bypass the migration simulator silently.
+        Some(StatementFact::OpaqueBlock)
     }
 
     // ─────────────────────────────────────────────
@@ -104,24 +173,42 @@ impl AstVisitor {
 
     fn extract_create_schema(node: &ast::CreateSchema) -> Option<StatementFact> {
         let ident = if let Some(n) = node.syntax().descendants().find_map(Name::cast) {
-            Ident::new(n.text().to_string().trim_matches('"').to_string(), n.is_quoted())
+            Ident::new(
+                n.text().to_string().trim_matches('"').to_string(),
+                n.is_quoted(),
+            )
         } else if let Some(nr) = node.syntax().descendants().find_map(NameRef::cast) {
-            Ident::new(nr.text().to_string().trim_matches('"').to_string(), nr.is_quoted())
+            Ident::new(
+                nr.text().to_string().trim_matches('"').to_string(),
+                nr.is_quoted(),
+            )
         } else {
             return None;
         };
 
         Some(StatementFact::CreateSchema {
             name: QualifiedName::new(None, ident),
-            if_not_exists: node.syntax().text().to_string().to_uppercase().contains("IF NOT EXISTS"),
+            if_not_exists: node
+                .syntax()
+                .text()
+                .to_string()
+                .to_uppercase()
+                .contains("IF NOT EXISTS"),
         })
     }
 
     fn extract_alter_schema(node: &ast::AlterSchema) -> Option<StatementFact> {
         let path = node.syntax().descendants().find_map(Path::cast)?;
         let new_name = if let Some(rt) = node.syntax().descendants().find_map(RenameTo::cast) {
-            rt.name().map(|n| Ident::new(n.text().to_string().trim_matches('"').to_string(), n.is_quoted()))
-        } else { None };
+            rt.name().map(|n| {
+                Ident::new(
+                    n.text().to_string().trim_matches('"').to_string(),
+                    n.is_quoted(),
+                )
+            })
+        } else {
+            None
+        };
         Some(StatementFact::AlterSchema {
             name: Self::path_to_qualified_name(&path)?,
             new_name,
@@ -129,8 +216,44 @@ impl AstVisitor {
     }
 
     fn extract_drop_schema(node: &ast::DropSchema) -> Option<StatementFact> {
-        let names: Vec<QualifiedName> = node.syntax().children().filter_map(Path::cast).filter_map(|p| Self::path_to_qualified_name(&p)).collect();
-        if names.is_empty() { return None; }
+        let mut names = Vec::new();
+        for n in node.syntax().descendants().filter_map(NameRef::cast) {
+            let txt = n.text().to_string();
+            let upper = txt.to_uppercase();
+            if upper != "SCHEMA"
+                && upper != "IF"
+                && upper != "EXISTS"
+                && upper != "CASCADE"
+                && upper != "RESTRICT"
+            {
+                names.push(QualifiedName::new(
+                    None,
+                    Ident::new(txt.trim_matches('"').to_string(), n.is_quoted()),
+                ));
+            }
+        }
+
+        // Fallback for Name just in case the parser binds it as a declaration
+        for n in node.syntax().descendants().filter_map(Name::cast) {
+            let txt = n.text().to_string();
+            let upper = txt.to_uppercase();
+            if upper != "SCHEMA"
+                && upper != "IF"
+                && upper != "EXISTS"
+                && upper != "CASCADE"
+                && upper != "RESTRICT"
+            {
+                names.push(QualifiedName::new(
+                    None,
+                    Ident::new(txt.trim_matches('"').to_string(), n.is_quoted()),
+                ));
+            }
+        }
+
+        if names.is_empty() {
+            return None;
+        }
+
         let text = node.syntax().text().to_string().to_uppercase();
         Some(StatementFact::DropSchema {
             names,
@@ -147,16 +270,26 @@ impl AstVisitor {
         let path = node.syntax().descendants().find_map(Path::cast)?;
         let name = Self::path_to_qualified_name(&path)?;
 
-        let persistence = match node.persistence().map(|p| p.syntax().text().to_string().to_lowercase()).as_deref() {
+        let persistence = match node
+            .persistence()
+            .map(|p| p.syntax().text().to_string().to_lowercase())
+            .as_deref()
+        {
             Some("temporary") | Some("temp") => PersistenceFact::Temporary,
             Some("unlogged") => PersistenceFact::Unlogged,
             _ => PersistenceFact::Permanent,
         };
 
-        let partition_by = node.syntax().descendants().find_map(ast::PartitionBy::cast)
+        let partition_by = node
+            .syntax()
+            .descendants()
+            .find_map(ast::PartitionBy::cast)
             .map(|p| p.syntax().text().to_string());
-        
-        let partition_of = node.syntax().descendants().find_map(ast::PartitionOf::cast)
+
+        let partition_of = node
+            .syntax()
+            .descendants()
+            .find_map(ast::PartitionOf::cast)
             .and_then(|p| p.syntax().descendants().find_map(Path::cast))
             .and_then(|p| Self::path_to_qualified_name(&p));
 
@@ -180,7 +313,11 @@ impl AstVisitor {
 
     fn extract_create_table_as(node: &CreateTableAs) -> Option<StatementFact> {
         let path = node.syntax().descendants().find_map(Path::cast)?;
-        let persistence = match node.persistence().map(|p| p.syntax().text().to_string().to_lowercase()).as_deref() {
+        let persistence = match node
+            .persistence()
+            .map(|p| p.syntax().text().to_string().to_lowercase())
+            .as_deref()
+        {
             Some("temporary") | Some("temp") => PersistenceFact::Temporary,
             Some("unlogged") => PersistenceFact::Unlogged,
             _ => PersistenceFact::Permanent,
@@ -212,37 +349,57 @@ impl AstVisitor {
         let table_name = Self::path_to_qualified_name(&path)?;
         let mut actions = Vec::new();
 
+        // BUG FIX: The parser drops the SetAccessMethod node completely in some scenarios.
+        // We capture it reliably via syntax text check at the table level.
+        let full_text = node.syntax().text().to_string().to_lowercase();
+        if full_text.contains("set access method") {
+            actions.push(AlterTableActionFact::SetAccessMethod);
+        }
+
         for action in node.actions() {
-            // ARCHITECTURAL WARNING: `PartitionForValuesFrom` bounds for multi-column partitions 
-            // are structurally ambiguous in the AST. If bound overlap rules are added in the future, 
+            // ARCHITECTURAL WARNING: `PartitionForValuesFrom` bounds for multi-column partitions
+            // are structurally ambiguous in the AST. If bound overlap rules are added in the future,
             // do not naively split `exprs()`. They must be mapped against the parent table's partition key.
             if let Some(ap) = AttachPartition::cast(action.syntax().clone()) {
-                if let Some(child_path) = ap.syntax().descendants().find_map(Path::cast) {
-                    if let Some(child) = Self::path_to_qualified_name(&child_path) {
-                        actions.push(AlterTableActionFact::AttachPartition { child });
-                    }
+                if let Some(child_path) = ap.syntax().descendants().find_map(Path::cast)
+                    && let Some(child) = Self::path_to_qualified_name(&child_path)
+                {
+                    actions.push(AlterTableActionFact::AttachPartition { child });
                 }
                 continue;
             }
             if let Some(dp) = DetachPartition::cast(action.syntax().clone()) {
-                if let Some(child_path) = dp.syntax().descendants().find_map(Path::cast) {
-                    if let Some(child) = Self::path_to_qualified_name(&child_path) {
-                        actions.push(AlterTableActionFact::DetachPartition { child });
-                    }
+                if let Some(child_path) = dp.syntax().descendants().find_map(Path::cast)
+                    && let Some(child) = Self::path_to_qualified_name(&child_path)
+                {
+                    actions.push(AlterTableActionFact::DetachPartition { child });
                 }
                 continue;
             }
             if let Some(ac) = AlterConstraint::cast(action.syntax().clone()) {
                 if let Some(name_ref) = ac.syntax().descendants().find_map(NameRef::cast) {
                     let name = Self::resolve_name_ref(name_ref);
-                    let deferrable = ac.syntax().text().to_string().to_lowercase().contains("deferrable");
+                    let deferrable = ac
+                        .syntax()
+                        .text()
+                        .to_string()
+                        .to_lowercase()
+                        .contains("deferrable");
                     actions.push(AlterTableActionFact::AlterConstraint { name, deferrable });
                 }
                 continue;
             }
             if let Some(rc) = ast::RenameConstraint::cast(action.syntax().clone()) {
-                let old_name = rc.syntax().descendants().find_map(NameRef::cast).map(Self::resolve_name_ref);
-                let new_name = rc.syntax().descendants().find_map(Name::cast).map(Self::resolve_name);
+                let old_name = rc
+                    .syntax()
+                    .descendants()
+                    .find_map(NameRef::cast)
+                    .map(Self::resolve_name_ref);
+                let new_name = rc
+                    .syntax()
+                    .descendants()
+                    .find_map(Name::cast)
+                    .map(Self::resolve_name);
                 if let (Some(old_name), Some(new_name)) = (old_name, new_name) {
                     actions.push(AlterTableActionFact::RenameConstraint { old_name, new_name });
                 }
@@ -258,24 +415,66 @@ impl AstVisitor {
                             match c {
                                 Constraint::NotNullConstraint(_) => not_null = true,
                                 Constraint::PrimaryKeyConstraint(_) => not_null = true,
-                                Constraint::DefaultConstraint(dc) => default = dc.expr().map(crate::analysis::expr_visitor::ExprVisitor::convert),
+                                Constraint::DefaultConstraint(dc) => {
+                                    default = dc
+                                        .expr()
+                                        .map(crate::analysis::expr_visitor::ExprVisitor::convert)
+                                }
                                 _ => {}
                             }
                         }
-                        actions.push(AlterTableActionFact::AddColumn { name, ty: add.ty().map(|t| t.syntax().text().to_string()), if_not_exists: add.if_not_exists().is_some(), not_null, default });
+                        actions.push(AlterTableActionFact::AddColumn {
+                            name,
+                            ty: add.ty().map(|t| t.syntax().text().to_string()),
+                            if_not_exists: add.if_not_exists().is_some(),
+                            not_null,
+                            default,
+                        });
                     }
                 }
                 AlterTableAction::DropColumn(drop) => {
                     if let Some(name) = drop.name_ref().map(Self::resolve_name_ref) {
-                        actions.push(AlterTableActionFact::DropColumn { name, if_exists: drop.if_exists().is_some() });
+                        actions.push(AlterTableActionFact::DropColumn {
+                            name,
+                            if_exists: drop.if_exists().is_some(),
+                        });
                     }
                 }
                 AlterTableAction::RenameColumn(rc) => {
-                    let from_ident = rc.from().map(|nr| Ident::new(nr.text().to_string().trim_matches('"').to_string(), nr.is_quoted()))
-                        .or_else(|| rc.syntax().descendants().find_map(NameRef::cast).map(|nr| Ident::new(nr.text().to_string().trim_matches('"').to_string(), nr.is_quoted())));
+                    let from_ident = rc
+                        .from()
+                        .map(|nr| {
+                            Ident::new(
+                                nr.text().to_string().trim_matches('"').to_string(),
+                                nr.is_quoted(),
+                            )
+                        })
+                        .or_else(|| {
+                            rc.syntax().descendants().find_map(NameRef::cast).map(|nr| {
+                                Ident::new(
+                                    nr.text().to_string().trim_matches('"').to_string(),
+                                    nr.is_quoted(),
+                                )
+                            })
+                        });
 
-                    let to_ident = rc.to().map(|nr| Ident::new(nr.text().to_string().trim_matches('"').to_string(), nr.is_quoted()))
-                        .or_else(|| rc.syntax().descendants().find_map(Name::cast).map(|n| Ident::new(n.text().to_string().trim_matches('"').to_string(), n.is_quoted())));
+                    let to_ident = rc
+                        .to()
+                        .map(|nr| {
+                            Ident::new(
+                                nr.text().to_string().trim_matches('"').to_string(),
+                                nr.is_quoted(),
+                            )
+                        })
+                        // FIX: Corrected nr to n below
+                        .or_else(|| {
+                            rc.syntax().descendants().find_map(Name::cast).map(|n| {
+                                Ident::new(
+                                    n.text().to_string().trim_matches('"').to_string(),
+                                    n.is_quoted(),
+                                )
+                            })
+                        });
 
                     if let (Some(from), Some(to)) = (from_ident, to_ident) {
                         actions.push(AlterTableActionFact::RenameColumn { from, to });
@@ -284,12 +483,17 @@ impl AstVisitor {
                 AlterTableAction::RenameTo(rt) => {
                     if let Some(new_name) = rt.name() {
                         actions.push(AlterTableActionFact::RenameTo {
-                            new_name: Ident::new(new_name.text().to_string().trim_matches('"').to_string(), new_name.is_quoted())
+                            new_name: Ident::new(
+                                new_name.text().to_string().trim_matches('"').to_string(),
+                                new_name.is_quoted(),
+                            ),
                         });
                     }
                 }
                 AlterTableAction::AddConstraint(ac) => {
-                    if let Some(fact) = Self::extract_add_constraint_fact(&ac) { actions.push(fact); }
+                    if let Some(fact) = Self::extract_add_constraint_fact(&ac) {
+                        actions.push(fact);
+                    }
                 }
                 AlterTableAction::DropConstraint(dc) => {
                     if let Some(name) = dc.name_ref().map(Self::resolve_name_ref) {
@@ -297,41 +501,104 @@ impl AstVisitor {
                     }
                 }
                 AlterTableAction::AlterColumn(alter_col) => {
-                    if let Some(nr) = alter_col.name_ref() {
-                        let col_name = Self::resolve_name_ref(nr);
-                        if let Some(opt) = alter_col.option() {
-                            if let Some(fact) = Self::extract_alter_column_option(col_name, opt) { actions.push(fact); }
+                    // Provide multiple fallbacks for the column identifier parsing
+                    let col_ident = alter_col
+                        .syntax()
+                        .descendants()
+                        .find_map(NameRef::cast)
+                        .map(Self::resolve_name_ref)
+                        .or_else(|| {
+                            alter_col
+                                .syntax()
+                                .descendants()
+                                .find_map(Name::cast)
+                                .map(Self::resolve_name)
+                        });
+
+                    if let Some(col_name) = col_ident {
+                        // BUG FIX: SET STORAGE might lack the option() payload
+                        let txt = alter_col.syntax().text().to_string().to_lowercase();
+                        if txt.contains("set storage") {
+                            actions.push(AlterTableActionFact::SetStorage {
+                                column: col_name.clone(),
+                            });
+                        } else if let Some(opt) = alter_col.option()
+                            && let Some(fact) = Self::extract_alter_column_option(col_name, opt)
+                        {
+                            actions.push(fact);
                         }
                     }
                 }
                 AlterTableAction::ValidateConstraint(vc) => {
-                    if let Some(constraint_name) = vc.syntax().descendants().find_map(NameRef::cast).map(Self::resolve_name_ref) {
+                    if let Some(constraint_name) = vc
+                        .syntax()
+                        .descendants()
+                        .find_map(NameRef::cast)
+                        .map(Self::resolve_name_ref)
+                    {
                         actions.push(AlterTableActionFact::ValidateConstraint { constraint_name });
                     }
                 }
-                _ => {}
+                _ => {
+                    // Ultimate action-level text fallback for SET STORAGE if it failed strong typing entirely
+                    let txt = action.syntax().text().to_string().to_lowercase();
+                    if txt.contains("set storage") {
+                        let parts: Vec<&str> = txt.split_whitespace().collect();
+                        if let Some(idx) = parts.iter().position(|&p| p == "column")
+                            && idx + 1 < parts.len()
+                        {
+                            let c_name = parts[idx + 1].trim_matches('"').to_string();
+                            actions.push(AlterTableActionFact::SetStorage { column: c_name });
+                        }
+                    }
+                }
             }
         }
-        Some(StatementFact::AlterTable { name: table_name, actions })
+
+        // Global fallback for SET STORAGE if node.actions() completely rejected it
+        if actions.is_empty() && full_text.contains("set storage") {
+            let parts: Vec<&str> = full_text.split_whitespace().collect();
+            if let Some(idx) = parts.iter().position(|&p| p == "column")
+                && idx + 1 < parts.len()
+            {
+                let c_name = parts[idx + 1].trim_matches('"').to_string();
+                actions.push(AlterTableActionFact::SetStorage { column: c_name });
+            }
+        }
+
+        Some(StatementFact::AlterTable {
+            name: table_name,
+            actions,
+        })
     }
 
-    fn extract_table_body(args: impl Iterator<Item = TableArg>) -> (Vec<ColumnFact>, Vec<FkFact>, Vec<TableConstraintFact>) {
+    fn extract_table_body(
+        args: impl Iterator<Item = TableArg>,
+    ) -> (Vec<ColumnFact>, Vec<FkFact>, Vec<TableConstraintFact>) {
         let mut columns = Vec::new();
         let mut foreign_keys = Vec::new();
         let mut table_constraints = Vec::new();
 
-        // ARCHITECTURAL WARNING: Do NOT use `arg.can_cast()` as a pre-filter here. 
-        // squawk's TableArg::can_cast() returns false for table constraints due to a parser 
+        // ARCHITECTURAL WARNING: Do NOT use `arg.can_cast()` as a pre-filter here.
+        // squawk's TableArg::can_cast() returns false for table constraints due to a parser
         // code-gen bug, but actual enum casting via `match` works perfectly.
         for arg in args {
             match arg {
                 TableArg::Column(col) => {
-                    for fk in Self::extract_column_fk_facts(&col) { foreign_keys.push(fk); }
-                    if let Some(fact) = Self::extract_column_fact(&col) { columns.push(fact); }
+                    for fk in Self::extract_column_fk_facts(&col) {
+                        foreign_keys.push(fk);
+                    }
+                    if let Some(fact) = Self::extract_column_fact(&col) {
+                        columns.push(fact);
+                    }
                 }
                 TableArg::TableConstraint(tc) => {
-                    if let Some(fk) = Self::extract_table_fk_fact(&tc) { foreign_keys.push(fk); }
-                    if let Some(tc_fact) = Self::extract_table_constraint_fact(&tc) { table_constraints.push(tc_fact); }
+                    if let Some(fk) = Self::extract_table_fk_fact(&tc) {
+                        foreign_keys.push(fk);
+                    }
+                    if let Some(tc_fact) = Self::extract_table_constraint_fact(&tc) {
+                        table_constraints.push(tc_fact);
+                    }
                 }
                 _ => {}
             }
@@ -342,60 +609,142 @@ impl AstVisitor {
     fn extract_column_fact(col: &Column) -> Option<ColumnFact> {
         let name = Self::resolve_name(col.name()?);
         let ty = col.ty().map(|t| t.syntax().text().to_string());
-        let not_null = col.constraints().any(|c| matches!(c, ColumnConstraint::NotNullConstraint(_)));
-        let is_primary_key = col.constraints().any(|c| matches!(c, ColumnConstraint::PrimaryKeyConstraint(_)));
-        let default = col.constraints().find_map(|c| if let ColumnConstraint::DefaultConstraint(dc) = c { Some(crate::analysis::expr_visitor::ExprVisitor::convert(dc.expr()?)) } else { None });
-        Some(ColumnFact { name, ty, not_null, is_primary_key, default })
+        let not_null = col
+            .constraints()
+            .any(|c| matches!(c, ColumnConstraint::NotNullConstraint(_)));
+        let is_primary_key = col
+            .constraints()
+            .any(|c| matches!(c, ColumnConstraint::PrimaryKeyConstraint(_)));
+        let default = col.constraints().find_map(|c| {
+            if let ColumnConstraint::DefaultConstraint(dc) = c {
+                Some(crate::analysis::expr_visitor::ExprVisitor::convert(
+                    dc.expr()?,
+                ))
+            } else {
+                None
+            }
+        });
+        Some(ColumnFact {
+            name,
+            ty,
+            not_null,
+            is_primary_key,
+            default,
+        })
     }
 
-    fn extract_alter_column_option(col_name: String, opt: AlterColumnOption) -> Option<AlterTableActionFact> {
+    fn extract_alter_column_option(
+        col_name: String,
+        opt: AlterColumnOption,
+    ) -> Option<AlterTableActionFact> {
         let opt_text = opt.syntax().text().to_string().to_lowercase();
-        if opt_text.starts_with("set storage") { return Some(AlterTableActionFact::SetStorage { column: col_name }); }
+        if opt_text.contains("set storage") {
+            return Some(AlterTableActionFact::SetStorage { column: col_name });
+        }
 
         match opt {
-            AlterColumnOption::SetNotNull(_) => Some(AlterTableActionFact::SetNotNull { column: col_name }),
-            AlterColumnOption::DropNotNull(_) => Some(AlterTableActionFact::DropNotNull { column: col_name }),
+            AlterColumnOption::SetNotNull(_) => {
+                Some(AlterTableActionFact::SetNotNull { column: col_name })
+            }
+            AlterColumnOption::DropNotNull(_) => {
+                Some(AlterTableActionFact::DropNotNull { column: col_name })
+            }
             AlterColumnOption::SetType(st) => {
-                let has_using = st.syntax().text().to_string().to_lowercase().contains("using ");
+                let has_using = st
+                    .syntax()
+                    .text()
+                    .to_string()
+                    .to_lowercase()
+                    .contains("using ");
                 Some(AlterTableActionFact::SetType {
                     column: col_name,
                     ty: st.ty()?.syntax().text().to_string(),
-                    has_using
+                    has_using,
                 })
-            },
-            AlterColumnOption::SetDefault(sd) => Some(AlterTableActionFact::SetDefault { column: col_name, default: sd.expr().map(crate::analysis::expr_visitor::ExprVisitor::convert) }),
+            }
+            AlterColumnOption::SetDefault(sd) => Some(AlterTableActionFact::SetDefault {
+                column: col_name,
+                default: sd
+                    .expr()
+                    .map(crate::analysis::expr_visitor::ExprVisitor::convert),
+            }),
             _ => None,
         }
     }
 
-    fn extract_add_constraint_fact(ac: &squawk_syntax::ast::AddConstraint) -> Option<AlterTableActionFact> {
+    fn extract_add_constraint_fact(
+        ac: &squawk_syntax::ast::AddConstraint,
+    ) -> Option<AlterTableActionFact> {
         let not_valid = ac.not_valid().is_some();
 
-        if let Some(fkc) = ac.syntax().descendants().find_map(ast::ForeignKeyConstraint::cast) {
-            let constraint_name = fkc.constraint_name().and_then(|cn| cn.name()).map(Self::resolve_name)
-                .or_else(|| ac.syntax().descendants().find_map(ast::ConstraintName::cast).and_then(|cn| cn.name()).map(Self::resolve_name));
+        if let Some(fkc) = ac
+            .syntax()
+            .descendants()
+            .find_map(ast::ForeignKeyConstraint::cast)
+        {
+            let constraint_name = fkc
+                .constraint_name()
+                .and_then(|cn| cn.name())
+                .map(Self::resolve_name)
+                .or_else(|| {
+                    ac.syntax()
+                        .descendants()
+                        .find_map(ast::ConstraintName::cast)
+                        .and_then(|cn| cn.name())
+                        .map(Self::resolve_name)
+                });
             let path = fkc.syntax().descendants().find_map(Path::cast)?;
             let references = Self::path_to_qualified_name(&path)?;
             return Some(AlterTableActionFact::AddForeignKey {
                 constraint_name,
                 references,
-                from_columns: fkc.from_columns().map(Self::extract_column_list_names).unwrap_or_default(),
-                to_columns: fkc.to_columns().map(Self::extract_column_list_names).unwrap_or_default(),
+                from_columns: fkc
+                    .from_columns()
+                    .map(Self::extract_column_list_names)
+                    .unwrap_or_default(),
+                to_columns: fkc
+                    .to_columns()
+                    .map(Self::extract_column_list_names)
+                    .unwrap_or_default(),
                 not_valid,
             });
         }
 
-        if let Some(cc) = ac.syntax().descendants().find_map(ast::CheckConstraint::cast) {
-            let constraint_name = cc.constraint_name().and_then(|cn| cn.name()).map(Self::resolve_name)
-                .or_else(|| ac.syntax().descendants().find_map(ast::ConstraintName::cast).and_then(|cn| cn.name()).map(Self::resolve_name));
-            return Some(AlterTableActionFact::AddCheckConstraint { constraint_name, not_valid });
+        if let Some(cc) = ac
+            .syntax()
+            .descendants()
+            .find_map(ast::CheckConstraint::cast)
+        {
+            let constraint_name = cc
+                .constraint_name()
+                .and_then(|cn| cn.name())
+                .map(Self::resolve_name)
+                .or_else(|| {
+                    ac.syntax()
+                        .descendants()
+                        .find_map(ast::ConstraintName::cast)
+                        .and_then(|cn| cn.name())
+                        .map(Self::resolve_name)
+                });
+            return Some(AlterTableActionFact::AddCheckConstraint {
+                constraint_name,
+                not_valid,
+            });
         }
 
-        if ac.syntax().descendants().any(|n| ast::UniqueConstraint::can_cast(n.kind())) {
+        if ac
+            .syntax()
+            .descendants()
+            .any(|n| ast::UniqueConstraint::can_cast(n.kind()))
+        {
             return Some(AlterTableActionFact::AddUniqueConstraint);
         }
 
-        if ac.syntax().descendants().any(|n| ast::PrimaryKeyConstraint::can_cast(n.kind())) {
+        if ac
+            .syntax()
+            .descendants()
+            .any(|n| ast::PrimaryKeyConstraint::can_cast(n.kind()))
+        {
             return Some(AlterTableActionFact::AddPrimaryKeyConstraint);
         }
 
@@ -404,8 +753,12 @@ impl AstVisitor {
 
     fn extract_table_constraint_fact(tc: &TableConstraint) -> Option<TableConstraintFact> {
         match tc {
-            TableConstraint::PrimaryKeyConstraint(pkc) => Some(TableConstraintFact::PrimaryKey { columns: Self::extract_column_list_names(pkc.column_list()?) }),
-            TableConstraint::UniqueConstraint(uc) => Some(TableConstraintFact::Unique { columns: Self::extract_column_list_names(uc.column_list()?) }),
+            TableConstraint::PrimaryKeyConstraint(pkc) => Some(TableConstraintFact::PrimaryKey {
+                columns: Self::extract_column_list_names(pkc.column_list()?),
+            }),
+            TableConstraint::UniqueConstraint(uc) => Some(TableConstraintFact::Unique {
+                columns: Self::extract_column_list_names(uc.column_list()?),
+            }),
             TableConstraint::CheckConstraint(_) => Some(TableConstraintFact::Check),
             _ => None,
         }
@@ -413,32 +766,54 @@ impl AstVisitor {
 
     fn extract_column_fk_facts(col: &Column) -> Vec<FkFact> {
         let col_name = col.name().map(Self::resolve_name);
-        col.constraints().filter_map(|c| {
-            if let ColumnConstraint::ReferencesConstraint(rc) = c {
-                let ref_path = rc.syntax().descendants().find_map(Path::cast)?;
-                Some(FkFact {
-                    constraint_name: None,
-                    references: Self::path_to_qualified_name(&ref_path)?,
-                    from_columns: col_name.iter().cloned().collect(),
-                    to_columns: Vec::new()
-                })
-            } else { None }
-        }).collect()
+        col.constraints()
+            .filter_map(|c| {
+                if let ColumnConstraint::ReferencesConstraint(rc) = c {
+                    let ref_path = rc.syntax().descendants().find_map(Path::cast)?;
+                    Some(FkFact {
+                        constraint_name: None,
+                        references: Self::path_to_qualified_name(&ref_path)?,
+                        from_columns: col_name.iter().cloned().collect(),
+                        to_columns: Vec::new(),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     fn extract_table_fk_fact(tc: &TableConstraint) -> Option<FkFact> {
         if let TableConstraint::ForeignKeyConstraint(fkc) = tc {
-            let constraint_name = fkc.constraint_name().and_then(|cn| cn.name()).map(Self::resolve_name);
+            let constraint_name = fkc
+                .constraint_name()
+                .and_then(|cn| cn.name())
+                .map(Self::resolve_name);
             let path = fkc.syntax().descendants().find_map(Path::cast)?;
             let references = Self::path_to_qualified_name(&path)?;
-            let from_columns = fkc.from_columns().map(Self::extract_column_list_names).unwrap_or_default();
-            let to_columns = fkc.to_columns().map(Self::extract_column_list_names).unwrap_or_default();
-            Some(FkFact { constraint_name, references, from_columns, to_columns })
-        } else { None }
+            let from_columns = fkc
+                .from_columns()
+                .map(Self::extract_column_list_names)
+                .unwrap_or_default();
+            let to_columns = fkc
+                .to_columns()
+                .map(Self::extract_column_list_names)
+                .unwrap_or_default();
+            Some(FkFact {
+                constraint_name,
+                references,
+                from_columns,
+                to_columns,
+            })
+        } else {
+            None
+        }
     }
 
     fn extract_column_list_names(cl: ast::ColumnList) -> Vec<String> {
-        cl.columns().filter_map(|col| col.name_ref().map(Self::resolve_name_ref)).collect()
+        cl.columns()
+            .filter_map(|col| col.name_ref().map(Self::resolve_name_ref))
+            .collect()
     }
 
     // ─────────────────────────────────────────────
@@ -446,18 +821,43 @@ impl AstVisitor {
     // ─────────────────────────────────────────────
 
     fn extract_create_index(node: &CreateIndex) -> Option<StatementFact> {
-        let name = node.syntax().descendants().find_map(Name::cast)?;
-        let index_ident = Ident::new(name.text().to_string().trim_matches('"').to_string(), name.is_quoted());
         let relation_path = node.syntax().descendants().find_map(Path::cast)?;
+        let relation = Self::path_to_qualified_name(&relation_path)?;
 
-        let using_method = node.syntax().descendants()
+        // BUG FIX: Support unnamed indexes (auto-generated by PostgreSQL)
+        let index_ident = if let Some(name) = node.syntax().descendants().find_map(Name::cast) {
+            Ident::new(
+                name.text().to_string().trim_matches('"').to_string(),
+                name.is_quoted(),
+            )
+        } else {
+            Ident::new(
+                format!("<unnamed_idx_on_{}>", relation.name.resolve()),
+                false,
+            )
+        };
+
+        let using_method = node
+            .syntax()
+            .descendants()
             .find_map(UsingMethod::cast)
-            .map(|um| um.syntax().text().to_string().to_lowercase().replace("using", "").trim().to_string());
-        let has_predicate = node.syntax().descendants().any(|d| WhereClause::can_cast(d.kind()));
+            .map(|um| {
+                um.syntax()
+                    .text()
+                    .to_string()
+                    .to_lowercase()
+                    .replace("using", "")
+                    .trim()
+                    .to_string()
+            });
+        let has_predicate = node
+            .syntax()
+            .descendants()
+            .any(|d| WhereClause::can_cast(d.kind()));
 
         Some(StatementFact::CreateIndex {
             name: QualifiedName::new(None, index_ident),
-            relation: Self::path_to_qualified_name(&relation_path)?,
+            relation,
             if_not_exists: node.if_not_exists().is_some(),
             concurrently: node.concurrently_token().is_some(),
             using_method,
@@ -470,22 +870,38 @@ impl AstVisitor {
         let name = Self::path_to_qualified_name(&path)?;
         let mut actions = Vec::new();
 
-        if let Some(rt) = node.syntax().descendants().find_map(RenameTo::cast) {
-            if let Some(new_name) = rt.name() {
-                actions.push(AlterIndexActionFact::RenameTo {
-                    new_name: Ident::new(new_name.text().to_string().trim_matches('"').to_string(), new_name.is_quoted())
-                });
-            }
+        if let Some(rt) = node.syntax().descendants().find_map(RenameTo::cast)
+            && let Some(new_name) = rt.name()
+        {
+            actions.push(AlterIndexActionFact::RenameTo {
+                new_name: Ident::new(
+                    new_name.text().to_string().trim_matches('"').to_string(),
+                    new_name.is_quoted(),
+                ),
+            });
         }
 
-        if actions.is_empty() { return None; }
+        if actions.is_empty() {
+            return None;
+        }
         Some(StatementFact::AlterIndex { name, actions })
     }
 
     fn extract_drop_index(node: &DropIndex) -> Option<StatementFact> {
-        let names: Vec<QualifiedName> = node.syntax().children().filter_map(Path::cast).filter_map(|p| Self::path_to_qualified_name(&p)).collect();
-        if names.is_empty() { return None; }
-        Some(StatementFact::DropIndex { names, if_exists: node.if_exists().is_some(), concurrently: node.concurrently_token().is_some() })
+        let names: Vec<QualifiedName> = node
+            .syntax()
+            .children()
+            .filter_map(Path::cast)
+            .filter_map(|p| Self::path_to_qualified_name(&p))
+            .collect();
+        if names.is_empty() {
+            return None;
+        }
+        Some(StatementFact::DropIndex {
+            names,
+            if_exists: node.if_exists().is_some(),
+            concurrently: node.concurrently_token().is_some(),
+        })
     }
 
     // ─────────────────────────────────────────────
@@ -496,16 +912,28 @@ impl AstVisitor {
         let path = node.syntax().descendants().find_map(Path::cast)?;
         Some(StatementFact::CreateView {
             name: Self::path_to_qualified_name(&path)?,
-            or_replace: node.syntax().text().to_string().to_lowercase().contains("or replace"),
-            depends_on: Self::extract_view_dependencies(node.syntax())
+            or_replace: node
+                .syntax()
+                .text()
+                .to_string()
+                .to_lowercase()
+                .contains("or replace"),
+            depends_on: Self::extract_view_dependencies(node.syntax()),
         })
     }
 
     fn extract_alter_view(node: &ast::AlterView) -> Option<StatementFact> {
         let path = node.syntax().descendants().find_map(Path::cast)?;
         let new_name = if let Some(rt) = node.syntax().descendants().find_map(RenameTo::cast) {
-            rt.name().map(|n| Ident::new(n.text().to_string().trim_matches('"').to_string(), n.is_quoted()))
-        } else { None };
+            rt.name().map(|n| {
+                Ident::new(
+                    n.text().to_string().trim_matches('"').to_string(),
+                    n.is_quoted(),
+                )
+            })
+        } else {
+            None
+        };
         Some(StatementFact::AlterView {
             name: Self::path_to_qualified_name(&path)?,
             new_name,
@@ -516,15 +944,22 @@ impl AstVisitor {
         let path = node.syntax().descendants().find_map(Path::cast)?;
         Some(StatementFact::CreateMaterializedView {
             name: Self::path_to_qualified_name(&path)?,
-            depends_on: Self::extract_view_dependencies(node.syntax())
+            depends_on: Self::extract_view_dependencies(node.syntax()),
         })
     }
 
     fn extract_alter_materialized_view(node: &ast::AlterMaterializedView) -> Option<StatementFact> {
         let path = node.syntax().descendants().find_map(Path::cast)?;
         let new_name = if let Some(rt) = node.syntax().descendants().find_map(RenameTo::cast) {
-            rt.name().map(|n| Ident::new(n.text().to_string().trim_matches('"').to_string(), n.is_quoted()))
-        } else { None };
+            rt.name().map(|n| {
+                Ident::new(
+                    n.text().to_string().trim_matches('"').to_string(),
+                    n.is_quoted(),
+                )
+            })
+        } else {
+            None
+        };
         Some(StatementFact::AlterMaterializedView {
             name: Self::path_to_qualified_name(&path)?,
             new_name,
@@ -535,7 +970,12 @@ impl AstVisitor {
         let path = node.syntax().descendants().find_map(Path::cast)?;
         Some(StatementFact::RefreshMaterializedView {
             name: Self::path_to_qualified_name(&path)?,
-            concurrently: node.syntax().text().to_string().to_uppercase().contains("CONCURRENTLY"),
+            concurrently: node
+                .syntax()
+                .text()
+                .to_string()
+                .to_uppercase()
+                .contains("CONCURRENTLY"),
         })
     }
 
@@ -543,42 +983,96 @@ impl AstVisitor {
         // ARCHITECTURAL WARNING: squawk's DropView::path() accessor has a code-gen bug
         // and only returns the first view in a `DROP VIEW v1, v2` statement.
         // We intentionally bypass it and sweep the raw syntax tree to find all paths.
-        let names: Vec<QualifiedName> = node.syntax().children().filter_map(Path::cast).filter_map(|p| Self::path_to_qualified_name(&p)).collect();
-        if names.is_empty() { return None; }
-        Some(StatementFact::DropView { names, if_exists: node.if_exists().is_some() })
+        let names: Vec<QualifiedName> = node
+            .syntax()
+            .children()
+            .filter_map(Path::cast)
+            .filter_map(|p| Self::path_to_qualified_name(&p))
+            .collect();
+        if names.is_empty() {
+            return None;
+        }
+        Some(StatementFact::DropView {
+            names,
+            if_exists: node.if_exists().is_some(),
+        })
     }
 
     fn extract_drop_materialized_view(node: &DropMaterializedView) -> Option<StatementFact> {
-        let names: Vec<QualifiedName> = node.syntax().children().filter_map(Path::cast).filter_map(|p| Self::path_to_qualified_name(&p)).collect();
-        if names.is_empty() { return None; }
-        Some(StatementFact::DropMaterializedView { names, if_exists: node.if_exists().is_some() })
+        let names: Vec<QualifiedName> = node
+            .syntax()
+            .children()
+            .filter_map(Path::cast)
+            .filter_map(|p| Self::path_to_qualified_name(&p))
+            .collect();
+        if names.is_empty() {
+            return None;
+        }
+        Some(StatementFact::DropMaterializedView {
+            names,
+            if_exists: node.if_exists().is_some(),
+        })
     }
 
     fn extract_view_dependencies(syntax: &squawk_syntax::SyntaxNode) -> Vec<QualifiedName> {
         let mut depends_on = Vec::new();
-        let text = syntax.text().to_string();
-        let tokens: Vec<&str> = text.split_whitespace().collect();
+        let keywords = [
+            "SELECT",
+            "FROM",
+            "WHERE",
+            "JOIN",
+            "ON",
+            "AND",
+            "OR",
+            "AS",
+            "WITH",
+            "GROUP",
+            "BY",
+            "HAVING",
+            "LIMIT",
+            "OFFSET",
+            "ORDER",
+            "ASC",
+            "DESC",
+            "IN",
+            "NOT",
+            "IS",
+            "NULL",
+            "UNION",
+            "ALL",
+            "EXCEPT",
+            "INTERSECT",
+            "TRUE",
+            "FALSE",
+        ];
 
-        let mut i = 0;
-        while i < tokens.len() {
-            let upper = tokens[i].to_uppercase();
-            if upper == "FROM" || upper == "JOIN" {
-                if i + 1 < tokens.len() {
-                    let table_str = tokens[i + 1].trim_matches(';');
-                    let parts: Vec<&str> = table_str.split('.').collect();
-                    let is_quoted = table_str.contains('"');
-                    let clean_part = |s: &str| s.trim_matches('"').to_string();
-                    if parts.len() == 1 {
-                        depends_on.push(QualifiedName::new(None, Ident::new(clean_part(parts[0]), is_quoted)));
-                    } else if parts.len() >= 2 {
-                        depends_on.push(QualifiedName::new(
-                            Some(Ident::new(clean_part(parts[0]), is_quoted)),
-                            Ident::new(clean_part(parts[1]), is_quoted)
-                        ));
-                    }
-                }
+        // BUG FIX: Isolate external dependencies by excluding locally defined aliases and CTEs.
+        // In the squawk AST, `Name` nodes represent declarations, while `NameRef` represents usages.
+        let mut local_declarations = Vec::new();
+        for name_node in syntax.descendants().filter_map(Name::cast) {
+            local_declarations.push(name_node.text().to_string().trim_matches('"').to_string());
+        }
+
+        for n in syntax.descendants().filter_map(NameRef::cast) {
+            let text = n.text().to_string();
+            let upper = text.to_uppercase();
+            let is_quoted = n.is_quoted();
+            let clean_text = text.trim_matches('"').to_string();
+
+            // Ignore SQL keywords
+            if !is_quoted && keywords.contains(&upper.as_str()) {
+                continue;
             }
-            i += 1;
+
+            // If this NameRef matches a locally declared CTE or alias, skip it!
+            if local_declarations.contains(&clean_text) {
+                continue;
+            }
+
+            let qname = QualifiedName::new(None, Ident::new(clean_text, is_quoted));
+            if !depends_on.contains(&qname) {
+                depends_on.push(qname);
+            }
         }
         depends_on
     }
@@ -590,18 +1084,43 @@ impl AstVisitor {
     fn extract_create_sequence(node: &CreateSequence) -> Option<StatementFact> {
         let path = node.syntax().descendants().find_map(Path::cast)?;
         let name = Self::path_to_qualified_name(&path)?;
-        Some(StatementFact::CreateSequence { name, if_not_exists: node.syntax().text().to_string().to_lowercase().contains("if not exists"), owned_by: Self::extract_owned_by(node.syntax()) })
+        Some(StatementFact::CreateSequence {
+            name,
+            if_not_exists: node
+                .syntax()
+                .text()
+                .to_string()
+                .to_lowercase()
+                .contains("if not exists"),
+            owned_by: Self::extract_owned_by(node.syntax()),
+        })
     }
 
     fn extract_alter_sequence(node: &AlterSequence) -> Option<StatementFact> {
         let path = node.syntax().descendants().find_map(Path::cast)?;
         let name = Self::path_to_qualified_name(&path)?;
-        Some(StatementFact::AlterSequence { name, owned_by: Self::extract_owned_by(node.syntax()) })
+        Some(StatementFact::AlterSequence {
+            name,
+            owned_by: Self::extract_owned_by(node.syntax()),
+        })
     }
 
     fn extract_drop_sequence(node: &DropSequence) -> Option<StatementFact> {
-        let names = node.syntax().children().filter_map(Path::cast).filter_map(|p| Self::path_to_qualified_name(&p)).collect();
-        Some(StatementFact::DropSequence { names, if_exists: node.syntax().text().to_string().to_lowercase().contains("if exists") })
+        let names = node
+            .syntax()
+            .children()
+            .filter_map(Path::cast)
+            .filter_map(|p| Self::path_to_qualified_name(&p))
+            .collect();
+        Some(StatementFact::DropSequence {
+            names,
+            if_exists: node
+                .syntax()
+                .text()
+                .to_string()
+                .to_lowercase()
+                .contains("if exists"),
+        })
     }
 
     fn extract_owned_by(node: &squawk_syntax::SyntaxNode) -> Option<(QualifiedName, String)> {
@@ -610,7 +1129,11 @@ impl AstVisitor {
                 // If it's OWNED BY NONE, path() will be None.
                 let path = opt.path()?;
 
-                let segments: Vec<PathSegment> = path.syntax().descendants().filter_map(PathSegment::cast).collect();
+                let segments: Vec<PathSegment> = path
+                    .syntax()
+                    .descendants()
+                    .filter_map(PathSegment::cast)
+                    .collect();
                 if segments.len() >= 2 {
                     let col_ident = Self::segment_ident(segments.last().unwrap().clone())?;
                     let col_name = col_ident.resolve();
@@ -621,7 +1144,7 @@ impl AstVisitor {
                     } else {
                         QualifiedName::new(
                             Some(Self::segment_ident(segments[table_len - 2].clone())?),
-                            Self::segment_ident(segments[table_len - 1].clone())?
+                            Self::segment_ident(segments[table_len - 1].clone())?,
                         )
                     };
                     return Some((table_name, col_name));
@@ -637,25 +1160,53 @@ impl AstVisitor {
 
     fn extract_create_domain(node: &CreateDomain) -> Option<StatementFact> {
         let path = node.syntax().descendants().find_map(Path::cast)?;
-        Some(StatementFact::CreateDomain { name: Self::path_to_qualified_name(&path)?, base_type: "<domain>".to_string() })
+        Some(StatementFact::CreateDomain {
+            name: Self::path_to_qualified_name(&path)?,
+            base_type: "<domain>".to_string(),
+        })
     }
 
     fn extract_alter_domain(node: &AlterDomain) -> Option<StatementFact> {
         let path = node.syntax().descendants().find_map(Path::cast)?;
-        Some(StatementFact::AlterDomain { name: Self::path_to_qualified_name(&path)? })
+        Some(StatementFact::AlterDomain {
+            name: Self::path_to_qualified_name(&path)?,
+        })
     }
 
     fn extract_drop_domain(node: &DropDomain) -> Option<StatementFact> {
-        let names = node.syntax().children().filter_map(Path::cast).filter_map(|p| Self::path_to_qualified_name(&p)).collect();
-        Some(StatementFact::DropDomain { names, if_exists: node.syntax().text().to_string().to_lowercase().contains("if exists") })
+        let names = node
+            .syntax()
+            .children()
+            .filter_map(Path::cast)
+            .filter_map(|p| Self::path_to_qualified_name(&p))
+            .collect();
+        Some(StatementFact::DropDomain {
+            names,
+            if_exists: node
+                .syntax()
+                .text()
+                .to_string()
+                .to_lowercase()
+                .contains("if exists"),
+        })
     }
 
     fn extract_create_type(node: &CreateType) -> Option<StatementFact> {
         let path = node.syntax().descendants().find_map(Path::cast)?;
-        Some(StatementFact::CreateType(CreateTypeFact {
-            name: Self::path_to_qualified_name(&path)?,
-            is_enum: node.syntax().text().to_string().to_lowercase().contains("enum"),
-        }))
+        let name = Self::path_to_qualified_name(&path)?;
+
+        // BUG FIX: Explicit kind extraction (avoids dropping Base/Composite/Range types)
+        let kind = if node.enum_token().is_some() {
+            TypeCreationKind::Enum
+        } else if node.range_token().is_some() {
+            TypeCreationKind::Range
+        } else if node.attribute_list().is_some() {
+            TypeCreationKind::Composite
+        } else {
+            TypeCreationKind::Base
+        };
+
+        Some(StatementFact::CreateType(CreateTypeFact { name, kind }))
     }
 
     fn extract_alter_type(node: &AlterType) -> Option<StatementFact> {
@@ -663,10 +1214,17 @@ impl AstVisitor {
         let name = Self::path_to_qualified_name(&path)?;
         let mut actions = Vec::new();
         for child in node.syntax().children() {
-            if let Some(av) = child.descendants().find_map(AddValue::cast) {
-                if let Some(lit) = av.literal() {
-                    actions.push(AlterTypeActionFact::AddValue { new_value: lit.syntax().text().to_string().trim_matches('\'').to_string() });
-                }
+            if let Some(av) = child.descendants().find_map(AddValue::cast)
+                && let Some(lit) = av.literal()
+            {
+                actions.push(AlterTypeActionFact::AddValue {
+                    new_value: lit
+                        .syntax()
+                        .text()
+                        .to_string()
+                        .trim_matches('\'')
+                        .to_string(),
+                });
             }
         }
         Some(StatementFact::AlterType(AlterTypeFact { name, actions }))
@@ -688,7 +1246,11 @@ impl AstVisitor {
         let table = Self::path_to_qualified_name(paths.last()?)?;
         let text = node.syntax().text().to_string();
         let name = Self::extract_name_before_on(&text)?;
-        Some(StatementFact::DropPolicy { name, table, if_exists: text.to_lowercase().contains("if exists") })
+        Some(StatementFact::DropPolicy {
+            name,
+            table,
+            if_exists: text.to_lowercase().contains("if exists"),
+        })
     }
 
     fn extract_create_trigger(node: &CreateTrigger) -> Option<StatementFact> {
@@ -703,7 +1265,11 @@ impl AstVisitor {
         let table = Self::path_to_qualified_name(paths.last()?)?;
         let text = node.syntax().text().to_string();
         let name = Self::extract_name_before_on(&text)?;
-        Some(StatementFact::DropTrigger { name, table, if_exists: text.to_lowercase().contains("if exists") })
+        Some(StatementFact::DropTrigger {
+            name,
+            table,
+            if_exists: text.to_lowercase().contains("if exists"),
+        })
     }
 
     fn extract_name_before_on(text: &str) -> Option<String> {
@@ -711,7 +1277,13 @@ impl AstVisitor {
         let on_idx = upper.find(" ON ")?;
         let before_on = &text[..on_idx];
         let raw_name = before_on.split_whitespace().last()?;
-        Some(Ident::new(raw_name.trim_matches('"').to_string(), raw_name.starts_with('"')).resolve())
+        Some(
+            Ident::new(
+                raw_name.trim_matches('"').to_string(),
+                raw_name.starts_with('"'),
+            )
+            .resolve(),
+        )
     }
 
     // ─────────────────────────────────────────────
@@ -719,12 +1291,40 @@ impl AstVisitor {
     // ─────────────────────────────────────────────
 
     fn extract_set(node: &Set) -> Option<StatementFact> {
-        let setting_name = node.syntax().descendants().find_map(NameRef::cast)?.text().to_lowercase();
-        if setting_name != "search_path" { return None; }
-        let schemas: Vec<String> = node.syntax().descendants().filter_map(NameRef::cast)
-            .filter(|nr| nr.text().to_lowercase() != "search_path")
-            .map(Self::resolve_name_ref).collect();
-        Some(StatementFact::SetSearchPath { schemas })
+        let setting_name = node
+            .syntax()
+            .descendants()
+            .find_map(NameRef::cast)?
+            .text()
+            .to_lowercase();
+        if setting_name != "search_path" {
+            return None;
+        }
+
+        let text = node.syntax().text().to_string().to_lowercase();
+
+        // BUG FIX: Handle explicit DEFAULT token rather than searching NameRefs
+        if text.contains("default") {
+            return Some(StatementFact::SetSearchPath {
+                target: SearchPathTarget::Default,
+            });
+        }
+
+        let schemas: Vec<String> = node
+            .syntax()
+            .descendants()
+            .filter_map(NameRef::cast)
+            .map(Self::resolve_name_ref)
+            .filter(|s| {
+                s.to_lowercase() != "search_path"
+                    && s.to_lowercase() != "to"
+                    && s.to_lowercase() != "set"
+            })
+            .collect();
+
+        Some(StatementFact::SetSearchPath {
+            target: SearchPathTarget::Schemas(schemas),
+        })
     }
 
     fn extract_rollback(node: &Rollback) -> Option<StatementFact> {
@@ -735,18 +1335,28 @@ impl AstVisitor {
             return Some(StatementFact::OpaqueBlock);
         }
 
-        match node.name_ref().map(|n| Self::resolve_name_ref(n)) {
+        match node.name_ref().map(Self::resolve_name_ref) {
             Some(name) => Some(StatementFact::RollbackToSavepoint { name }),
-            None       => Some(StatementFact::RollbackTransaction),
+            None => Some(StatementFact::RollbackTransaction),
         }
     }
 
     fn extract_savepoint(node: &Savepoint) -> StatementFact {
-        StatementFact::Savepoint { name: node.name().map(|n| n.text().to_string()).unwrap_or_default() }
+        StatementFact::Savepoint {
+            name: node
+                .name()
+                .map(|n| n.text().to_string())
+                .unwrap_or_default(),
+        }
     }
 
     fn extract_release_savepoint(node: &ReleaseSavepoint) -> StatementFact {
-        StatementFact::ReleaseSavepoint { name: node.name_ref().map(|n| n.text().to_string()).unwrap_or_default() }
+        StatementFact::ReleaseSavepoint {
+            name: node
+                .name_ref()
+                .map(|n| n.text().to_string())
+                .unwrap_or_default(),
+        }
     }
 
     // ─────────────────────────────────────────────
@@ -755,15 +1365,33 @@ impl AstVisitor {
 
     fn segment_ident(segment: PathSegment) -> Option<Ident> {
         if let Some(nr) = segment.syntax().descendants().find_map(NameRef::cast) {
-            Some(Ident::new(nr.text().to_string().trim_matches('"').to_string(), nr.is_quoted()))
-        } else if let Some(n) = segment.syntax().descendants().find_map(Name::cast) {
-            Some(Ident::new(n.text().to_string().trim_matches('"').to_string(), n.is_quoted()))
-        } else { None }
+            Some(Ident::new(
+                nr.text().to_string().trim_matches('"').to_string(),
+                nr.is_quoted(),
+            ))
+        } else {
+            segment
+                .syntax()
+                .descendants()
+                .find_map(Name::cast)
+                .map(|n| {
+                    Ident::new(
+                        n.text().to_string().trim_matches('"').to_string(),
+                        n.is_quoted(),
+                    )
+                })
+        }
     }
 
     fn path_to_qualified_name(path: &Path) -> Option<QualifiedName> {
-        let segments: Vec<PathSegment> = path.syntax().descendants().filter_map(PathSegment::cast).collect();
-        if segments.is_empty() { return None; }
+        let segments: Vec<PathSegment> = path
+            .syntax()
+            .descendants()
+            .filter_map(PathSegment::cast)
+            .collect();
+        if segments.is_empty() {
+            return None;
+        }
 
         if segments.len() >= 2 {
             let schema = Self::segment_ident(segments[0].clone());

@@ -76,7 +76,8 @@ pub fn sync_cache(out_path: &Path) -> Result<()> {
             Some(raw_rows as u64)
         };
 
-        let mut state = RelationState::new(object_id.clone(), 0, estimated_rows, kind, persistence);
+        let mut state =
+            RelationState::new(object_id.clone(), 0, estimated_rows, kind, persistence, 0);
         state.relpages = Some(relpages as u64);
         state.last_analyze = last_analyze;
         state.last_autoanalyze = last_autoanalyze;
@@ -165,14 +166,14 @@ pub fn sync_cache(out_path: &Path) -> Result<()> {
         JOIN pg_namespace n2 ON n2.oid = t2.relnamespace
         WHERE c.contype = 'f';
     ";
-    
+
     for row in client.query(fk_query, &[])? {
         let constraint_name: String = row.get("constraint_name");
         let from_schema: String = row.get("from_schema");
         let from_table: String = row.get("from_table");
         let to_schema: String = row.get("to_schema");
         let to_table: String = row.get("to_table");
-        
+
         cache.foreign_keys.push(ForeignKeyCache {
             constraint_name,
             from_table: ObjectId::new(&from_schema, &from_table),
@@ -192,13 +193,13 @@ pub fn sync_cache(out_path: &Path) -> Result<()> {
         JOIN pg_namespace n_t ON n_t.oid = t.relnamespace
         WHERE x.indisvalid = true;
     ";
-    
+
     for row in client.query(idx_query, &[])? {
         let index_schema: String = row.get("index_schema");
         let index_name: String = row.get("index_name");
         let table_schema: String = row.get("table_schema");
         let table_name: String = row.get("table_name");
-        
+
         cache.indexes.push(IndexCache {
             index_id: ObjectId::new(&index_schema, &index_name),
             table_id: ObjectId::new(&table_schema, &table_name),
@@ -208,7 +209,7 @@ pub fn sync_cache(out_path: &Path) -> Result<()> {
     // Atomic write via temp file
     let json = serde_json::to_string_pretty(&cache)?;
     let tmp_path = out_path.with_extension("tmp");
-    
+
     fs::write(&tmp_path, json).context("Failed to write temporary cache file")?;
     fs::rename(&tmp_path, out_path).context("Failed to atomically rename cache file")?;
 

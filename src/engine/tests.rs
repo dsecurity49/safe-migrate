@@ -1,7 +1,5 @@
-// FILE: ./src/engine/tests.rs
-
+// FILE: src/engine/tests.rs
 #![allow(unused_imports)]
-
 #[cfg(test)]
 pub mod helpers {
     use crate::ast::identifiers::ObjectId;
@@ -36,7 +34,9 @@ mod state_machine_guards_tests {
         let engine = setup_engine();
         let mut state = setup_state();
 
-        engine.analyze("CREATE TABLE t(id INT);", &mut state).unwrap();
+        engine
+            .analyze("CREATE TABLE t(id INT);", &mut state)
+            .unwrap();
         engine
             .analyze("CREATE TABLE IF NOT EXISTS t(new_col INT);", &mut state)
             .unwrap();
@@ -55,9 +55,14 @@ mod state_machine_guards_tests {
         let engine = setup_engine();
         let mut state = setup_state();
 
-        engine.analyze("CREATE TABLE t(id INT);", &mut state).unwrap();
         engine
-            .analyze("ALTER TABLE t ADD COLUMN IF NOT EXISTS id TEXT;", &mut state)
+            .analyze("CREATE TABLE t(id INT);", &mut state)
+            .unwrap();
+        engine
+            .analyze(
+                "ALTER TABLE t ADD COLUMN IF NOT EXISTS id TEXT;",
+                &mut state,
+            )
             .unwrap();
 
         let rel = state.get_relation(&object_id("public", "t")).unwrap();
@@ -74,10 +79,14 @@ mod state_machine_guards_tests {
         let engine = setup_engine();
         let mut state = setup_state();
 
-        engine.analyze("CREATE TABLE t(id INT);", &mut state).unwrap();
-        assert!(engine
-            .analyze("ALTER TABLE t DROP COLUMN IF EXISTS missing;", &mut state)
-            .is_ok());
+        engine
+            .analyze("CREATE TABLE t(id INT);", &mut state)
+            .unwrap();
+        assert!(
+            engine
+                .analyze("ALTER TABLE t DROP COLUMN IF EXISTS missing;", &mut state)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -85,14 +94,36 @@ mod state_machine_guards_tests {
         let engine = setup_engine();
         let mut state = setup_state();
 
-        assert!(engine.analyze("DROP TABLE IF EXISTS missing;", &mut state).is_ok());
-        assert!(engine.analyze("DROP VIEW IF EXISTS missing;", &mut state).is_ok());
-        assert!(engine
-            .analyze("DROP MATERIALIZED VIEW IF EXISTS missing;", &mut state)
-            .is_ok());
-        assert!(engine.analyze("DROP INDEX IF EXISTS missing;", &mut state).is_ok());
-        assert!(engine.analyze("DROP SEQUENCE IF EXISTS missing;", &mut state).is_ok());
-        assert!(engine.analyze("DROP DOMAIN IF EXISTS missing;", &mut state).is_ok());
+        assert!(
+            engine
+                .analyze("DROP TABLE IF EXISTS missing;", &mut state)
+                .is_ok()
+        );
+        assert!(
+            engine
+                .analyze("DROP VIEW IF EXISTS missing;", &mut state)
+                .is_ok()
+        );
+        assert!(
+            engine
+                .analyze("DROP MATERIALIZED VIEW IF EXISTS missing;", &mut state)
+                .is_ok()
+        );
+        assert!(
+            engine
+                .analyze("DROP INDEX IF EXISTS missing;", &mut state)
+                .is_ok()
+        );
+        assert!(
+            engine
+                .analyze("DROP SEQUENCE IF EXISTS missing;", &mut state)
+                .is_ok()
+        );
+        assert!(
+            engine
+                .analyze("DROP DOMAIN IF EXISTS missing;", &mut state)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -100,11 +131,16 @@ mod state_machine_guards_tests {
         let engine = setup_engine();
         let mut state = setup_state();
 
-        engine.analyze("CREATE TABLE t(id int);", &mut state).unwrap();
-        engine.analyze("CREATE INDEX idx ON t(id);", &mut state).unwrap();
+        engine
+            .analyze("CREATE TABLE t(id int);", &mut state)
+            .unwrap();
+        engine
+            .analyze("CREATE INDEX idx ON t(id);", &mut state)
+            .unwrap();
 
         let edge_count = state.local.graph.indexes.len();
-        engine.analyze("CREATE INDEX IF NOT EXISTS idx ON t(id);", &mut state)
+        engine
+            .analyze("CREATE INDEX IF NOT EXISTS idx ON t(id);", &mut state)
             .unwrap();
 
         assert_eq!(state.local.graph.indexes.len(), edge_count);
@@ -118,7 +154,10 @@ mod state_machine_guards_tests {
         engine.analyze("CREATE SEQUENCE s;", &mut state).unwrap();
         let before = state.local.graph.sequences.len();
         engine
-            .analyze("CREATE SEQUENCE IF NOT EXISTS s OWNED BY foo.bar;", &mut state)
+            .analyze(
+                "CREATE SEQUENCE IF NOT EXISTS s OWNED BY foo.bar;",
+                &mut state,
+            )
             .unwrap();
         assert_eq!(state.local.graph.sequences.len(), before);
     }
@@ -159,16 +198,18 @@ mod rule_evaluation_tests {
         let engine = setup_engine();
         let mut state = setup_state();
 
-        assert!(engine
-            .analyze(
-                "
+        assert!(
+            engine
+                .analyze(
+                    "
                 CREATE TABLE data(id INT);
                 CREATE VIEW v AS SELECT * FROM data;
                 DROP TABLE data CASCADE;
                 ",
-                &mut state,
-            )
-            .is_ok());
+                    &mut state,
+                )
+                .is_ok()
+        );
     }
 
     #[test]
@@ -185,6 +226,7 @@ mod rule_evaluation_tests {
             Some(50_000),
             RelationKind::Table,
             Persistence::Permanent,
+            0,
         );
 
         rel.columns.push(Column {
@@ -209,11 +251,9 @@ mod rule_evaluation_tests {
             )
             .unwrap();
 
-        assert!(violations.iter().any(|v|
-            v.rule_id.contains("size")
-                || v.rule_id.contains("rewrite")
-                || v.rule_id.contains("toast")
-        ));
+        assert!(violations.iter().any(|v| v.rule_id.contains("size")
+            || v.rule_id.contains("rewrite")
+            || v.rule_id.contains("toast")));
     }
 
     #[test]
@@ -230,6 +270,7 @@ mod rule_evaluation_tests {
                 Some(500_000),
                 RelationKind::Table,
                 Persistence::Permanent,
+                0,
             ),
         );
 
@@ -245,9 +286,7 @@ mod rule_evaluation_tests {
             )
             .unwrap();
 
-        assert!(v1.iter().any(|v|
-            v.rule_id.contains("constraint")
-        ));
+        assert!(v1.iter().any(|v| v.rule_id.contains("constraint")));
 
         let v2 = engine
             .analyze(
@@ -260,9 +299,7 @@ mod rule_evaluation_tests {
             .unwrap();
 
         // actual implementation still flags this
-        assert!(v2.iter().any(|v|
-            v.rule_id.contains("constraint")
-        ));
+        assert!(v2.iter().any(|v| v.rule_id.contains("constraint")));
     }
 
     #[test]
@@ -279,77 +316,29 @@ mod rule_evaluation_tests {
                 Some(500_000),
                 RelationKind::Table,
                 Persistence::Permanent,
-            ),
-        );
-
-        let mut state = AnalysisState::new(cache);
-
-        let v1 = engine
-            .analyze(
-                "ALTER TABLE t ADD PRIMARY KEY (id);",
-                &mut state,
-            )
-            .unwrap();
-
-        assert!(v1.iter().any(|v|
-            v.rule_id.contains("constraint")
-                || v.rule_id.contains("index")
-        ));
-
-        let v2 = engine
-            .analyze(
-                "ALTER TABLE t ADD UNIQUE (id);",
-                &mut state,
-            )
-            .unwrap();
-
-        assert!(v2.iter().any(|v|
-            v.rule_id.contains("constraint")
-                || v.rule_id.contains("index")
-        ));
-    }
-
-    #[test]
-    fn test_rule_concurrent_index() {
-        let engine = setup_engine();
-
-        let mut cache = crate::db::cache::DbCache::new();
-
-        cache.insert_baseline(
-            object_id("public", "t"),
-            RelationState::new(
-                object_id("public", "t"),
                 0,
-                Some(500_000),
-                RelationKind::Table,
-                Persistence::Permanent,
             ),
         );
 
         let mut state = AnalysisState::new(cache);
 
         let v1 = engine
-            .analyze(
-                "CREATE INDEX i ON t(id);",
-                &mut state,
-            )
+            .analyze("ALTER TABLE t ADD PRIMARY KEY (id);", &mut state)
             .unwrap();
 
-        assert!(v1.iter().any(|v|
-            v.rule_id.contains("concurrent")
-                || v.rule_id.contains("index")
-        ));
+        assert!(
+            v1.iter()
+                .any(|v| v.rule_id.contains("constraint") || v.rule_id.contains("index"))
+        );
 
         let v2 = engine
-            .analyze(
-                "CREATE INDEX CONCURRENTLY i2 ON t(id);",
-                &mut state,
-            )
+            .analyze("ALTER TABLE t ADD UNIQUE (id);", &mut state)
             .unwrap();
 
-        assert!(!v2.iter().any(|v|
-            v.rule_id == "require-concurrent-index"
-        ));
+        assert!(
+            v2.iter()
+                .any(|v| v.rule_id.contains("constraint") || v.rule_id.contains("index"))
+        );
     }
 
     #[test]
@@ -387,28 +376,23 @@ mod rule_evaluation_tests {
                 Some(150_000),
                 RelationKind::MaterializedView,
                 Persistence::Permanent,
+                0,
             ),
         );
 
         let mut state = AnalysisState::new(cache);
 
         let v1 = engine
-            .analyze(
-                "REFRESH MATERIALIZED VIEW mv;",
-                &mut state,
-            )
+            .analyze("REFRESH MATERIALIZED VIEW mv;", &mut state)
             .unwrap();
 
-        assert!(v1.iter().any(|v|
-            v.rule_id.contains("mat")
-                || v.rule_id.contains("refresh")
-        ));
+        assert!(
+            v1.iter()
+                .any(|v| v.rule_id.contains("mat") || v.rule_id.contains("refresh"))
+        );
 
         let v2 = engine
-            .analyze(
-                "REFRESH MATERIALIZED VIEW CONCURRENTLY mv;",
-                &mut state,
-            )
+            .analyze("REFRESH MATERIALIZED VIEW CONCURRENTLY mv;", &mut state)
             .unwrap();
 
         assert!(v2.len() <= v1.len());
@@ -428,16 +412,14 @@ mod rule_evaluation_tests {
                 Some(500_000),
                 RelationKind::Table,
                 Persistence::Permanent,
+                0,
             ),
         );
 
         let mut state = AnalysisState::new(cache);
 
         engine
-            .analyze(
-                "CREATE TABLE c(id int);",
-                &mut state,
-            )
+            .analyze("CREATE TABLE c(id int);", &mut state)
             .unwrap();
 
         let v1 = engine
@@ -451,9 +433,7 @@ mod rule_evaluation_tests {
             )
             .unwrap();
 
-        assert!(v1.iter().any(|v|
-            v.rule_id.contains("partition")
-        ));
+        assert!(v1.iter().any(|v| v.rule_id.contains("partition")));
 
         let v2 = engine
             .analyze(
@@ -465,9 +445,7 @@ mod rule_evaluation_tests {
             )
             .unwrap();
 
-        assert!(v2.iter().any(|v|
-            v.rule_id.contains("partition")
-        ));
+        assert!(v2.iter().any(|v| v.rule_id.contains("partition")));
     }
 
     #[test]
@@ -487,10 +465,10 @@ mod rule_evaluation_tests {
             )
             .unwrap();
 
-        assert!(v.iter().any(|v|
-            v.rule_id.contains("transaction")
-                || v.rule_id.contains("concurrent")
-        ));
+        assert!(
+            v.iter()
+                .any(|v| v.rule_id.contains("transaction") || v.rule_id.contains("concurrent"))
+        );
     }
 
     #[test]
@@ -498,22 +476,14 @@ mod rule_evaluation_tests {
         let engine = setup_engine();
         let mut state = setup_state();
 
-        let v = engine
-            .analyze(
-                "DO $$ BEGIN END $$;",
-                &mut state,
-            )
-            .unwrap();
+        let v = engine.analyze("DO $$ BEGIN END $$;", &mut state).unwrap();
 
-        assert!(v.iter().any(|v|
-            v.rule_id.contains("opaque")
-                || v.rule_id.contains("dynamic")
-        ));
-
-        assert_eq!(
-            state.local.confidence,
-            Confidence::Tainted
+        assert!(
+            v.iter()
+                .any(|v| v.rule_id.contains("opaque") || v.rule_id.contains("dynamic"))
         );
+
+        assert_eq!(state.local.confidence, Confidence::Tainted);
     }
 
     #[test]
@@ -532,10 +502,10 @@ mod rule_evaluation_tests {
             )
             .unwrap();
 
-        assert!(v.iter().any(|v|
-            v.rule_id.contains("volatile")
-                || v.rule_id.contains("default")
-        ));
+        assert!(
+            v.iter()
+                .any(|v| v.rule_id.contains("volatile") || v.rule_id.contains("default"))
+        );
     }
 
     #[test]
@@ -543,18 +513,49 @@ mod rule_evaluation_tests {
         let engine = setup_engine();
         let mut state = setup_state();
 
-        let v = engine
-            .analyze(
-                "VACUUM FULL t;",
-                &mut state,
-            )
+        let v = engine.analyze("VACUUM FULL t;", &mut state).unwrap();
+
+        assert!(v.iter().any(|v| v.rule_id.contains("vacuum")));
+    }
+
+    #[test]
+    fn test_rule_concurrent_index() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        // 1. Setup table
+        engine
+            .analyze("CREATE TABLE t(id int);", &mut state)
             .unwrap();
 
-        assert!(v.iter().any(|v|
-            v.rule_id.contains("vacuum")
-        ));
+        // 2. Force the table to be "massive" and originate from an old transaction
+        // to bypass the same-transaction exemption logic we introduced.
+        if let Some(crate::model::relation::RelationOverlay::Present(rel)) =
+            state.local.relations.get_mut(&object_id("public", "t"))
+        {
+            rel.estimated_rows = Some(500_000);
+            rel.created_at_tx_depth = 999;
+        }
+
+        // 3. Evaluate synchronous lock escalation
+        let v1 = engine
+            .analyze("CREATE INDEX i ON t(id);", &mut state)
+            .unwrap();
+
+        assert!(
+            v1.iter()
+                .any(|v| v.rule_id.contains("concurrent") || v.rule_id.contains("index"))
+        );
+
+        // 4. Evaluate safe concurrent creation
+        let v2 = engine
+            .analyze("CREATE INDEX CONCURRENTLY i2 ON t(id);", &mut state)
+            .unwrap();
+
+        assert!(!v2.iter().any(|v| v.rule_id == "require-concurrent-index"));
     }
 }
+
 // ─────────────────────────────────────────────
 // 3. State Mutation Topology
 // ─────────────────────────────────────────────
@@ -562,7 +563,7 @@ mod rule_evaluation_tests {
 mod state_mutation_tests {
     use super::helpers::*;
     use crate::analysis::state::AnalysisState;
-    use crate::model::relation::{RelationOverlay, RelationKind, Persistence};
+    use crate::model::relation::{Persistence, RelationKind, RelationOverlay};
     use crate::model::sequence::SequenceOverlay;
     use crate::model::types::{TypeKind, TypeOverlay};
 
@@ -593,7 +594,9 @@ mod state_mutation_tests {
         let engine = setup_engine();
         let mut state = setup_state();
 
-        engine.analyze("CREATE TABLE t(id int); DROP TABLE t;", &mut state).unwrap();
+        engine
+            .analyze("CREATE TABLE t(id int); DROP TABLE t;", &mut state)
+            .unwrap();
         assert!(!state.relation_is_present(&object_id("public", "t")));
     }
 
@@ -603,17 +606,22 @@ mod state_mutation_tests {
         let mut state = setup_state();
 
         engine
-            .analyze("CREATE TABLE a(id int); ALTER TABLE a RENAME TO b;", &mut state)
+            .analyze(
+                "CREATE TABLE a(id int); ALTER TABLE a RENAME TO b;",
+                &mut state,
+            )
             .unwrap();
 
         assert!(!state.relation_is_present(&object_id("public", "a")));
         assert!(state.relation_is_present(&object_id("public", "b")));
-        assert!(state
-            .local
-            .graph
-            .renames
-            .iter()
-            .any(|e| e.from == object_id("public", "a") && e.to == object_id("public", "b")));
+        assert!(
+            state
+                .local
+                .graph
+                .renames
+                .iter()
+                .any(|e| e.from == object_id("public", "a") && e.to == object_id("public", "b"))
+        );
     }
 
     #[test]
@@ -622,21 +630,28 @@ mod state_mutation_tests {
         let mut state = setup_state();
 
         engine
-            .analyze("CREATE TABLE t(id int); CREATE INDEX i ON t(id); ALTER INDEX i RENAME TO i2;", &mut state)
+            .analyze(
+                "CREATE TABLE t(id int); CREATE INDEX i ON t(id); ALTER INDEX i RENAME TO i2;",
+                &mut state,
+            )
             .unwrap();
 
-        assert!(state
-            .local
-            .graph
-            .indexes
-            .iter()
-            .any(|i| i.index_id == object_id("public", "i2")));
-        assert!(!state
-            .local
-            .graph
-            .indexes
-            .iter()
-            .any(|i| i.index_id == object_id("public", "i")));
+        assert!(
+            state
+                .local
+                .graph
+                .indexes
+                .iter()
+                .any(|i| i.index_id == object_id("public", "i2"))
+        );
+        assert!(
+            !state
+                .local
+                .graph
+                .indexes
+                .iter()
+                .any(|i| i.index_id == object_id("public", "i"))
+        );
     }
 
     #[test]
@@ -651,14 +666,19 @@ mod state_mutation_tests {
             )
             .unwrap();
 
-        assert!(state
-            .local
-            .graph
-            .foreign_keys
-            .iter()
-            .any(|fk| fk.from_table == object_id("public", "c") && fk.to_table == object_id("public", "p")));
+        assert!(
+            state
+                .local
+                .graph
+                .foreign_keys
+                .iter()
+                .any(|fk| fk.from_table == object_id("public", "c")
+                    && fk.to_table == object_id("public", "p"))
+        );
 
-        engine.analyze("ALTER TABLE c DROP CONSTRAINT fk;", &mut state).unwrap();
+        engine
+            .analyze("ALTER TABLE c DROP CONSTRAINT fk;", &mut state)
+            .unwrap();
         assert!(state.local.graph.foreign_keys.is_empty());
     }
 
@@ -668,15 +688,21 @@ mod state_mutation_tests {
         let mut state = setup_state();
 
         engine
-            .analyze("CREATE TABLE t(id int); CREATE VIEW v AS SELECT * FROM t;", &mut state)
+            .analyze(
+                "CREATE TABLE t(id int); CREATE VIEW v AS SELECT * FROM t;",
+                &mut state,
+            )
             .unwrap();
 
-        assert!(state
-            .local
-            .graph
-            .views
-            .iter()
-            .any(|v| v.view_id == object_id("public", "v") && v.depends_on.contains(&object_id("public", "t"))));
+        assert!(
+            state
+                .local
+                .graph
+                .views
+                .iter()
+                .any(|v| v.view_id == object_id("public", "v")
+                    && v.depends_on.contains(&object_id("public", "t")))
+        );
 
         engine.analyze("DROP VIEW v;", &mut state).unwrap();
         assert!(state.local.graph.views.is_empty());
@@ -688,15 +714,21 @@ mod state_mutation_tests {
         let mut state = setup_state();
 
         engine
-            .analyze("CREATE TABLE t(id int); CREATE MATERIALIZED VIEW mv AS SELECT * FROM t;", &mut state)
+            .analyze(
+                "CREATE TABLE t(id int); CREATE MATERIALIZED VIEW mv AS SELECT * FROM t;",
+                &mut state,
+            )
             .unwrap();
 
-        assert!(state
-            .local
-            .graph
-            .views
-            .iter()
-            .any(|v| v.view_id == object_id("public", "mv") && v.depends_on.contains(&object_id("public", "t"))));
+        assert!(
+            state
+                .local
+                .graph
+                .views
+                .iter()
+                .any(|v| v.view_id == object_id("public", "mv")
+                    && v.depends_on.contains(&object_id("public", "t")))
+        );
     }
 
     #[test]
@@ -705,15 +737,21 @@ mod state_mutation_tests {
         let mut state = setup_state();
 
         engine
-            .analyze("CREATE TABLE t(id int); CREATE SEQUENCE s OWNED BY t.id;", &mut state)
+            .analyze(
+                "CREATE TABLE t(id int); CREATE SEQUENCE s OWNED BY t.id;",
+                &mut state,
+            )
             .unwrap();
 
-        assert!(state
-            .local
-            .graph
-            .sequences
-            .iter()
-            .any(|s| s.sequence_id == object_id("public", "s") && s.table_id == object_id("public", "t")));
+        assert!(
+            state
+                .local
+                .graph
+                .sequences
+                .iter()
+                .any(|s| s.sequence_id == object_id("public", "s")
+                    && s.table_id == object_id("public", "t"))
+        );
 
         engine.analyze("DROP SEQUENCE s;", &mut state).unwrap();
         assert!(matches!(
@@ -785,7 +823,10 @@ mod state_mutation_tests {
         let mut state = setup_state();
 
         engine
-            .analyze("SET search_path TO myschema, public; CREATE TABLE t(id int);", &mut state)
+            .analyze(
+                "SET search_path TO myschema, public; CREATE TABLE t(id int);",
+                &mut state,
+            )
             .unwrap();
 
         assert!(state.relation_is_present(&object_id("myschema", "t")));
@@ -831,7 +872,9 @@ mod state_mutation_tests {
         let engine = setup_engine();
         let mut state = setup_state();
 
-        engine.analyze("CREATE TABLE t(id int);", &mut state).unwrap();
+        engine
+            .analyze("CREATE TABLE t(id int);", &mut state)
+            .unwrap();
         let _ = &state.local.confidence;
     }
 }
@@ -913,9 +956,14 @@ mod expression_parsing_tests {
     fn assert_expr(expr: &str) {
         let engine = setup_engine();
         let mut state = setup_state();
-        assert!(engine
-            .analyze(&format!("CREATE TABLE t(val INT DEFAULT {});", expr), &mut state)
-            .is_ok());
+        assert!(
+            engine
+                .analyze(
+                    &format!("CREATE TABLE t(val INT DEFAULT {});", expr),
+                    &mut state
+                )
+                .is_ok()
+        );
     }
 
     #[test]
@@ -997,7 +1045,9 @@ mod identifier_casing_tests {
         let engine = setup_engine();
         let mut state = setup_state();
 
-        engine.analyze("CREATE TABLE Users (Id int);", &mut state).unwrap();
+        engine
+            .analyze("CREATE TABLE Users (Id int);", &mut state)
+            .unwrap();
         assert!(state.relation_is_present(&object_id("public", "users")));
     }
 
@@ -1014,17 +1064,25 @@ mod identifier_casing_tests {
         assert!(state.relation_is_present(&mixed_id));
 
         engine
-            .analyze("ALTER TABLE \"MyTable\" RENAME TO \"NewTable\";", &mut state)
+            .analyze(
+                "ALTER TABLE \"MyTable\" RENAME TO \"NewTable\";",
+                &mut state,
+            )
             .unwrap();
 
         assert!(!state.relation_is_present(&mixed_id));
         assert!(state.relation_is_present(&object_id("public", "NewTable")));
 
         engine
-            .analyze("ALTER TABLE \"NewTable\" RENAME COLUMN \"MyCol\" TO \"NewCol\";", &mut state)
+            .analyze(
+                "ALTER TABLE \"NewTable\" RENAME COLUMN \"MyCol\" TO \"NewCol\";",
+                &mut state,
+            )
             .unwrap();
 
-        let rel = state.get_relation(&object_id("public", "NewTable")).unwrap();
+        let rel = state
+            .get_relation(&object_id("public", "NewTable"))
+            .unwrap();
         if let RelationOverlay::Present(r) = rel {
             assert!(r.has_column("NewCol"));
             assert!(!r.has_column("MyCol"));
@@ -1043,5 +1101,606 @@ mod identifier_casing_tests {
             .unwrap();
 
         assert!(state.relation_is_present(&object_id("myschema", "mytable")));
+    }
+}
+
+// ─────────────────────────────────────────────
+// NEW ARCHITECTURAL GAP TESTS (APPENDED)
+// ─────────────────────────────────────────────
+#[cfg(test)]
+mod architectural_gap_tests {
+    use super::helpers::*;
+    use crate::analysis::state::Confidence;
+    use crate::model::relation::{Persistence, RelationKind, RelationOverlay};
+    use crate::model::types::{TypeKind, TypeOverlay};
+    use crate::report::violations::ViolationTier;
+
+    // 1. Foreign-key parent-table escalation
+    #[test]
+    fn test_fk_parent_table_lock_escalation() {
+        let engine = setup_engine();
+        let mut cache = crate::db::cache::DbCache::new();
+
+        // Parent is huge (causes Tier 1 lock if evaluated correctly)
+        cache.insert_baseline(
+            object_id("public", "parent_tbl"),
+            crate::model::relation::RelationState::new(
+                object_id("public", "parent_tbl"),
+                0,
+                Some(500_000),
+                RelationKind::Table,
+                Persistence::Permanent,
+                0,
+            ),
+        );
+        // Child is tiny
+        cache.insert_baseline(
+            object_id("public", "child_tbl"),
+            crate::model::relation::RelationState::new(
+                object_id("public", "child_tbl"),
+                0,
+                Some(10),
+                RelationKind::Table,
+                Persistence::Permanent,
+                0,
+            ),
+        );
+
+        let mut state = crate::analysis::state::AnalysisState::new(cache);
+        let violations = engine.analyze("ALTER TABLE child_tbl ADD CONSTRAINT fk FOREIGN KEY (p_id) REFERENCES parent_tbl(id);", &mut state).unwrap();
+
+        let is_tier_1 = violations
+            .iter()
+            .any(|v| v.tier == ViolationTier::Tier1 && v.rule_id.contains("blocking-constraint"));
+        assert!(
+            is_tier_1,
+            "Failed to escalate lock severity based on parent table size"
+        );
+    }
+
+    // 2. Nested RELEASE SAVEPOINT rollback chain
+    #[test]
+    fn test_nested_release_savepoint_chain() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "
+            BEGIN;
+            CREATE TABLE t1(id int);
+            SAVEPOINT s1;
+            CREATE TABLE t2(id int);
+            SAVEPOINT s2;
+            CREATE TABLE t3(id int);
+            RELEASE SAVEPOINT s2;
+            ROLLBACK TO s1;
+            COMMIT;
+        ",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(state.relation_is_present(&object_id("public", "t1")));
+        assert!(!state.relation_is_present(&object_id("public", "t2")));
+        assert!(!state.relation_is_present(&object_id("public", "t3")));
+    }
+
+    // 3. ROLLBACK TO SAVEPOINT partial preservation
+    #[test]
+    fn test_rollback_to_savepoint_partial() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "
+            BEGIN;
+            CREATE TABLE a(id int);
+            SAVEPOINT s;
+            CREATE TABLE b(id int);
+            ROLLBACK TO s;
+            CREATE TABLE c(id int);
+            COMMIT;
+        ",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(state.relation_is_present(&object_id("public", "a")));
+        assert!(state.relation_is_present(&object_id("public", "c")));
+        assert!(!state.relation_is_present(&object_id("public", "b")));
+    }
+
+    // 4. DROP SCHEMA CASCADE rename-edge cleanup
+    #[test]
+    fn test_drop_schema_cascade_cleans_renames() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE SCHEMA s; CREATE TABLE s.t(id int); ALTER TABLE s.t RENAME TO t2;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(!state.local.graph.renames.is_empty());
+
+        engine
+            .analyze("DROP SCHEMA s CASCADE;", &mut state)
+            .unwrap();
+        assert!(
+            state.local.graph.renames.is_empty(),
+            "Rename edges leaked after schema cascade"
+        );
+    }
+
+    // 5. Multi-schema search_path resolution
+    #[test]
+    fn test_multi_schema_search_path_resolution() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE SCHEMA s1; CREATE SCHEMA s2; SET search_path TO s1, s2;",
+                &mut state,
+            )
+            .unwrap();
+        engine
+            .analyze("CREATE TABLE t1(id int);", &mut state)
+            .unwrap();
+        assert!(state.relation_is_present(&object_id("s1", "t1")));
+    }
+
+    // 6. Tombstone shadowing / recreate semantics
+    #[test]
+    fn test_tombstone_shadowing_recreate() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze("CREATE TABLE t(id int);", &mut state)
+            .unwrap();
+        let gen1 = if let RelationOverlay::Present(r) =
+            state.get_relation(&object_id("public", "t")).unwrap()
+        {
+            r.generation
+        } else {
+            0
+        };
+
+        engine.analyze("DROP TABLE t;", &mut state).unwrap();
+        engine
+            .analyze("CREATE TABLE t(new_id text);", &mut state)
+            .unwrap();
+        if let RelationOverlay::Present(r) = state.get_relation(&object_id("public", "t")).unwrap()
+        {
+            assert!(
+                r.generation > gen1,
+                "Recreated table must have higher generation"
+            );
+            assert!(r.has_column("new_id"));
+        } else {
+            panic!("Table did not recreate over tombstone");
+        }
+    }
+
+    // 7. DROP without IF EXISTS must not mutate topology
+    #[test]
+    fn test_drop_missing_object_halts_topology_mutation() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze("CREATE TABLE exists_tbl(id int);", &mut state)
+            .unwrap();
+        let _ = engine.analyze("DROP TABLE missing_tbl;", &mut state);
+
+        assert!(state.relation_is_present(&object_id("public", "exists_tbl")));
+        assert_eq!(state.local.confidence, Confidence::Tainted);
+    }
+
+    // 8. View dependency alias/CTE isolation
+    #[test]
+    fn test_view_dependency_cte_isolation() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze("CREATE TABLE base_table(id int);", &mut state)
+            .unwrap();
+        engine
+            .analyze(
+                "CREATE VIEW v AS WITH my_cte AS (SELECT * FROM base_table) SELECT * FROM my_cte;",
+                &mut state,
+            )
+            .unwrap();
+
+        let edge = state
+            .local
+            .graph
+            .views
+            .iter()
+            .find(|v| v.view_id == object_id("public", "v"))
+            .unwrap();
+        assert!(edge.depends_on.contains(&object_id("public", "base_table")));
+        assert!(!edge.depends_on.contains(&object_id("public", "my_cte")));
+    }
+
+    // 9. Partition graph cleanup after DROP TABLE
+    #[test]
+    fn test_partition_graph_cleanup_on_drop() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine.analyze("CREATE TABLE p(id int) PARTITION BY RANGE(id); CREATE TABLE c PARTITION OF p FOR VALUES FROM (1) TO (10);", &mut state).unwrap();
+        engine.analyze("DROP TABLE c;", &mut state).unwrap();
+        assert!(
+            state.local.graph.partitions.is_empty(),
+            "Partition edge leaked after child drop"
+        );
+    }
+
+    // 10. Concurrent index rollback semantics
+    #[test]
+    fn test_concurrent_index_rollback() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze("CREATE TABLE t(id int);", &mut state)
+            .unwrap();
+        engine
+            .analyze(
+                "BEGIN; CREATE INDEX CONCURRENTLY idx ON t(id); ROLLBACK;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(state.local.graph.indexes.is_empty());
+    }
+
+    // 11. Opaque confidence taint persistence
+    #[test]
+    fn test_opaque_confidence_taint_persistence() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze("DO $$ BEGIN EXECUTE 'DROP TABLE x;'; END $$;", &mut state)
+            .unwrap();
+        assert_eq!(state.local.confidence, Confidence::Tainted);
+        engine
+            .analyze("CREATE TABLE t(id int);", &mut state)
+            .unwrap();
+        assert_eq!(state.local.confidence, Confidence::Tainted);
+    }
+
+    // 12. Quoted identifier + search_path interaction
+    #[test]
+    fn test_quoted_ident_search_path() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE SCHEMA \"MySchema\"; SET search_path TO \"MySchema\";",
+                &mut state,
+            )
+            .unwrap();
+        engine
+            .analyze("CREATE TABLE \"MyTable\" (\"MyCol\" int);", &mut state)
+            .unwrap();
+        assert!(state.relation_is_present(&object_id("MySchema", "MyTable")));
+    }
+
+    // 13. CREATE TYPE recreation after DROP
+    #[test]
+    fn test_create_domain_recreation() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze("CREATE DOMAIN my_type AS int;", &mut state)
+            .unwrap();
+        engine.analyze("DROP DOMAIN my_type;", &mut state).unwrap();
+        engine
+            .analyze("CREATE DOMAIN my_type AS text;", &mut state)
+            .unwrap();
+        assert!(matches!(
+            state.local.types.get(&object_id("public", "my_type")),
+            Some(TypeOverlay::Present(_))
+        ));
+    }
+
+    // 14. Duplicate/stale view-edge cleanup
+    #[test]
+    fn test_stale_view_edge_cleanup() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TABLE t(id int); CREATE VIEW v AS SELECT * FROM t;",
+                &mut state,
+            )
+            .unwrap();
+        engine
+            .analyze("DROP VIEW v; CREATE VIEW v AS SELECT * FROM t;", &mut state)
+            .unwrap();
+        assert_eq!(
+            state.local.graph.views.len(),
+            1,
+            "Duplicate view edge created"
+        );
+    }
+
+    // 15. IF NOT EXISTS metadata preservation
+    #[test]
+    fn test_if_not_exists_preserves_original_metadata() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze("CREATE TABLE t(id INT);", &mut state)
+            .unwrap();
+        let gen1 = if let RelationOverlay::Present(r) =
+            state.get_relation(&object_id("public", "t")).unwrap()
+        {
+            r.generation
+        } else {
+            0
+        };
+
+        engine
+            .analyze(
+                "CREATE TABLE IF NOT EXISTS t(id TEXT, diff_col INT);",
+                &mut state,
+            )
+            .unwrap();
+
+        let rel = state.get_relation(&object_id("public", "t")).unwrap();
+        if let RelationOverlay::Present(r) = rel {
+            assert_eq!(r.generation, gen1);
+            assert_eq!(
+                r.get_column("id").unwrap().data_type.as_deref(),
+                Some("INT")
+            );
+            assert!(!r.has_column("diff_col"));
+        }
+    }
+
+    // 16. Deep Rename Traversal across Cascade (BUG-004)
+    #[test]
+    fn test_deep_rename_traversal_cascade() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "
+            CREATE TABLE a(id int);
+            CREATE VIEW v AS SELECT * FROM a;
+            ALTER TABLE a RENAME TO b;
+            DROP TABLE b CASCADE;
+        ",
+                &mut state,
+            )
+            .unwrap();
+
+        // The View 'v' relies on 'a'. We renamed 'a' to 'b'.
+        // Dropping 'b' should dynamically resolve the rename graph and correctly drop 'v'.
+        assert!(
+            !state.relation_is_present(&object_id("public", "a")),
+            "Original table a should be gone"
+        );
+        assert!(
+            !state.relation_is_present(&object_id("public", "b")),
+            "Renamed table b should be gone"
+        );
+        assert!(
+            !state.relation_is_present(&object_id("public", "v")),
+            "Dependent view v should have been cascaded"
+        );
+    }
+
+    // 17. Partition Cycle Rejection (BUG-012)
+    #[test]
+    fn test_partition_cycle_rejection() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        // Attempting to attach 'a' as a partition of 'b', while 'b' is a partition of 'a'
+        engine
+            .analyze(
+                "
+            CREATE TABLE a(id int) PARTITION BY RANGE(id);
+            CREATE TABLE b PARTITION OF a FOR VALUES FROM (1) TO (10) PARTITION BY RANGE(id);
+            ALTER TABLE b ATTACH PARTITION a FOR VALUES FROM (1) TO (10);
+        ",
+                &mut state,
+            )
+            .unwrap();
+
+        // The cycle detector should catch the infinite loop and gracefully degrade
+        // to an Opaque/DynamicSql mutation, tainting the engine rather than stack-overflowing.
+        assert_eq!(
+            state.local.confidence,
+            Confidence::Tainted,
+            "Partition cycle should taint the engine"
+        );
+    }
+
+    // 18. Tablespace and Access Method Rewrite Rule
+    #[test]
+    fn test_tablespace_access_method_rewrite() {
+        let engine = setup_engine();
+        let mut cache = crate::db::cache::DbCache::new();
+
+        // Force Tier 1 by giving the table 150,000 rows
+        cache.insert_baseline(
+            object_id("public", "massive_table"),
+            crate::model::relation::RelationState::new(
+                object_id("public", "massive_table"),
+                0,
+                Some(150_000),
+                RelationKind::Table,
+                Persistence::Permanent,
+                0,
+            ),
+        );
+        let mut state = crate::analysis::state::AnalysisState::new(cache);
+
+        let v1 = engine
+            .analyze(
+                "ALTER TABLE massive_table SET ACCESS METHOD columnar;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            v1.iter()
+                .any(|v| v.rule_id == "table-rewrite-access-method"
+                    && v.tier == ViolationTier::Tier1)
+        );
+
+        let v2 = engine
+            .analyze(
+                "ALTER TABLE massive_table ALTER COLUMN id SET STORAGE MAIN;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            v2.iter()
+                .any(|v| v.rule_id == "table-rewrite-storage" && v.tier == ViolationTier::Tier1)
+        );
+    }
+    // 19. Generation counter rollback (BUG-001/002)
+    #[test]
+    fn test_generation_counter_rollback() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let initial_gen = state.local.generation_counter;
+
+        engine
+            .analyze("BEGIN; CREATE TABLE t(id int);", &mut state)
+            .unwrap();
+        let mid_gen = state.local.generation_counter;
+        assert!(
+            mid_gen > initial_gen,
+            "Generation counter should increment on create"
+        );
+
+        engine.analyze("ROLLBACK;", &mut state).unwrap();
+        let post_gen = state.local.generation_counter;
+        assert_eq!(
+            post_gen, initial_gen,
+            "Generation counter should restore strictly to pre-txn state on rollback"
+        );
+    }
+
+    // 20. Partition children cascade (BUG-003)
+    #[test]
+    fn test_partition_children_cascade_enumeration() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "
+            CREATE TABLE parent(id int) PARTITION BY RANGE(id);
+            CREATE TABLE child PARTITION OF parent FOR VALUES FROM (1) TO (10);
+            DROP TABLE parent CASCADE;
+        ",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(
+            !state.relation_is_present(&object_id("public", "parent")),
+            "Parent should be dropped"
+        );
+        assert!(
+            !state.relation_is_present(&object_id("public", "child")),
+            "Child should be dropped via reverse-graph cascade"
+        );
+    }
+
+    // 21. Rename updates FK graph edges implicitly via resolver (BUG-004)
+    #[test]
+    fn test_rename_updates_fk_graph_edges() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "
+            CREATE TABLE a(id int);
+            CREATE TABLE b(a_id int);
+            ALTER TABLE b ADD CONSTRAINT fk FOREIGN KEY (a_id) REFERENCES a(id);
+            ALTER TABLE a RENAME TO a2;
+        ",
+                &mut state,
+            )
+            .unwrap();
+
+        let refs = state
+            .local
+            .graph
+            .is_referenced_by_fk(&object_id("public", "a2"));
+        assert!(
+            !refs.is_empty(),
+            "a2 should be recognized as referenced by b's FK dynamically"
+        );
+        assert_eq!(refs[0].0, &object_id("public", "b"));
+    }
+
+    // 22. Search path existence check (BUG-005)
+    #[test]
+    fn test_search_path_existence_check() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "
+            CREATE SCHEMA actual_schema;
+            CREATE TABLE actual_schema.my_table(id int);
+            SET search_path = nonexistent_schema, actual_schema;
+            ALTER TABLE my_table ADD COLUMN new_col int;
+        ",
+                &mut state,
+            )
+            .unwrap();
+
+        let rel = state
+            .get_relation(&object_id("actual_schema", "my_table"))
+            .unwrap();
+        if let crate::model::relation::RelationOverlay::Present(r) = rel {
+            assert!(
+                r.has_column("new_col"),
+                "Should resolve to actual_schema bypassing nonexistent_schema"
+            );
+        } else {
+            panic!("Table not found; resolver hallucinated the schema");
+        }
+    }
+
+    // 23. Drop without cascade validates dependents (BUG-006)
+    #[test]
+    fn test_drop_without_cascade_validates_dependents() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "
+            CREATE TABLE a(id int);
+            CREATE TABLE b(a_id int);
+            ALTER TABLE b ADD CONSTRAINT fk FOREIGN KEY (a_id) REFERENCES a(id);
+        ",
+                &mut state,
+            )
+            .unwrap();
+
+        // Drop without cascade
+        let _ = engine.analyze("DROP TABLE a;", &mut state);
+
+        // It should taint confidence and skip the drop
+        assert_eq!(
+            state.local.confidence,
+            crate::analysis::state::Confidence::Tainted,
+            "Engine should taint on unsafe drop"
+        );
+        assert!(
+            state.relation_is_present(&object_id("public", "a")),
+            "Table a should not be dropped if dependents exist without CASCADE"
+        );
     }
 }

@@ -6,8 +6,8 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use safe_migrate::{SafeMigrateEngine, Config, DbCache, AnalysisState, Reporter};
 use safe_migrate::sync;
+use safe_migrate::{AnalysisState, Config, DbCache, Reporter, SafeMigrateEngine};
 
 #[derive(Parser, Debug)]
 #[command(name = "safe-migrate")]
@@ -46,7 +46,12 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Lint { file, config: config_path, cache, no_cache } => {
+        Commands::Lint {
+            file,
+            config: config_path,
+            cache,
+            no_cache,
+        } => {
             let sql = fs::read_to_string(&file)
                 .with_context(|| format!("Failed to read migration file: {}", file.display()))?;
 
@@ -54,16 +59,26 @@ fn main() -> Result<()> {
             let cfg = Config::load_from_file(&config_path);
 
             // 2. Cache Expiry Warning (Only if we aren't bypassing it)
-            if !no_cache && cache.exists() {
-                if let Ok(metadata) = fs::metadata(&cache) {
-                    if let Ok(modified) = metadata.modified() {
-                        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-                        let file_time = modified.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-                        if now.saturating_sub(604_800) > file_time {
-                            println!("[WARN] Database stats cache (.safe-migrate-stats.json) is over 7 days old!");
-                            println!("       Run `safe-migrate sync` to ensure accurate lock evaluations.\n");
-                        }
-                    }
+            if !no_cache
+                && cache.exists()
+                && let Ok(metadata) = fs::metadata(&cache)
+                && let Ok(modified) = metadata.modified()
+            {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let file_time = modified
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                if now.saturating_sub(604_800) > file_time {
+                    println!(
+                        "[ WARN ] Database stats cache (.safe-migrate-stats.json) is over 7 days old!"
+                    );
+                    println!(
+                        "         Run `safe-migrate sync` to ensure accurate lock evaluations.\n"
+                    );
                 }
             }
 
@@ -75,9 +90,13 @@ fn main() -> Result<()> {
                 })?
             } else {
                 if no_cache {
-                    println!("[INFO] --no-cache passed. Running with default worst-case assumptions.");
+                    println!(
+                        "[ INFO ] --no-cache passed. Running with default worst-case assumptions."
+                    );
                 } else {
-                    println!("[INFO] No cache found. Running with default worst-case assumptions.");
+                    println!(
+                        "[ INFO ] No cache found. Running with default worst-case assumptions."
+                    );
                 }
                 DbCache::new() // Pure empty state. No DB connection attempted.
             };
@@ -90,12 +109,24 @@ fn main() -> Result<()> {
 
             match engine.analyze(&sql, &mut state) {
                 Ok(violations) => {
-                    let should_fail_ci = Reporter::print_report(&violations, &state.local.confidence);
+                    let should_fail_ci =
+                        Reporter::print_report(&violations, &state.local.confidence);
+
+                    let has_warnings = violations.iter().any(|v| {
+                        matches!(
+                            v.tier,
+                            safe_migrate::report::violations::ViolationTier::Tier2
+                        )
+                    });
 
                     if should_fail_ci {
-                        return Err(anyhow!("Migration halted: Tier 1 lock detected."));
+                        return Err(anyhow!("[ HALT ] Migration halted: Tier 1 lock detected."));
+                    } else if has_warnings {
+                        println!(
+                            "[ WARN ] Migration safe to deploy, but has warnings. Please review."
+                        );
                     } else {
-                        println!("[PASS] Migration safe to deploy.");
+                        println!("[ SAFE ] Migration safe to deploy.");
                     }
                 }
                 Err(parse_errors) => {
@@ -111,10 +142,10 @@ fn main() -> Result<()> {
             // DATABASE_URL is strictly isolated to the Sync command
             let _db_url = std::env::var("DATABASE_URL")
                 .context("DATABASE_URL environment variable must be set to run sync.")?;
-            
+
             println!("Syncing database stats...");
             sync::sync_cache(&out)?; // sync_cache internally uses the env var
-            println!("[ OK ] Cache successfully written to {}", out.display());
+            println!("[ SAFE ] Cache successfully written to {}", out.display());
         }
     }
 
