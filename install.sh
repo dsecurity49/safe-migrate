@@ -41,7 +41,7 @@ TAR_FILE="${TMP_DIR}/${BIN_NAME}.tar.gz"
 echo "Downloading ${BIN_NAME} ${VERSION}..."
 curl -sL "$DOWNLOAD_URL" -o "$TAR_FILE"
 
-if ! grep -q "gzip compressed data" <(file "$TAR_FILE"); then
+if ! file "$TAR_FILE" | grep -q "gzip compressed data"; then
     echo "Error: Downloaded file is not a valid archive. The release might still be building on GitHub Actions. Try again in a few minutes."
     exit 1
 fi
