@@ -91,7 +91,7 @@ safe-migrate/
 │   ├── ci.yml                    # Test on push/PR, cargo fmt/clippy checks
 │   └── release.yml               # Build & release multi-platform binaries on tag
 │
-├── Cargo.toml                    # v0.3.0, dependencies (squawk-syntax 2.56.0, postgres 0.19, etc.)
+├── Cargo.toml                    # v0.3.1, dependencies (squawk-syntax 2.56.0, postgres 0.19, etc.)
 ├── Cargo.lock                    # Locked dependency versions
 ├── README.md                     # User documentation
 ├── CHANGELOG.md                  # Release history
