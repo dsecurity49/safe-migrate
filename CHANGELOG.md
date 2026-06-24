@@ -2,6 +2,14 @@
 
 All notable changes to safe-migrate are documented here.
 
+## v0.3.2
+
+Official support for `squawk-syntax` v2.58.0. 
+
+- Unpinned the `squawk-syntax` dependency from `=2.56.0` and updated the expression visitor to handle upstream breaking AST changes. 
+- `CallExpr` argument lists are now correctly mapped through the newly introduced `Arg` struct wrapper, and the `BinOp::Escape` variant is now exhaustively handled.
+- This ensures `cargo install safe-migrate` works natively with the latest parser ecosystem out-of-the-box without requiring the `--locked` flag.
+
 ## v0.3.1
 
 Hotfix for a broken `cargo install` on v0.3.0.

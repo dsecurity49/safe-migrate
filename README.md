@@ -1,4 +1,4 @@
-# safe-migrate v0.3.1
+# safe-migrate v0.3.2
 
 A PostgreSQL migration linter that **executes a bi-directional state machine simulation** over your SQL, combining static typed AST analysis with live database statistics to prevent blocking locks before they reach production.
 
@@ -6,9 +6,9 @@ A PostgreSQL migration linter that **executes a bi-directional state machine sim
 
 ---
 
-## What's New in v0.3.1
+## What's New in v0.3.2
 
-v0.3.1 is a complete internal rewrite. Earlier versions parsed migrations with regex and substring matching, which broke on quoted identifiers, schemas, and anything non-trivial. safe-migrate now walks a typed PostgreSQL AST and runs a full state machine simulation of the migration — including transaction rollbacks, cascading drops, and partition hierarchies — before evaluating any rule.
+v0.3.2 is a complete internal rewrite. Earlier versions parsed migrations with regex and substring matching, which broke on quoted identifiers, schemas, and anything non-trivial. safe-migrate now walks a typed PostgreSQL AST and runs a full state machine simulation of the migration — including transaction rollbacks, cascading drops, and partition hierarchies — before evaluating any rule.
 
 Highlights:
 - Typed AST parsing via `squawk_syntax` (no more string matching)

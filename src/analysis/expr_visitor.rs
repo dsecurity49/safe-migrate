@@ -49,9 +49,15 @@ impl ExprVisitor {
             })
             .unwrap_or_else(|| "<fn>".into());
 
+        // FIX for squawk_syntax >= 2.58.0: filter_map through the new `Arg` wrapper
         let args = ce
             .arg_list()
-            .map(|al| al.args().map(Self::convert).collect())
+            .map(|al| {
+                al.args()
+                    .filter_map(|arg| arg.expr())
+                    .map(Self::convert)
+                    .collect()
+            })
             .unwrap_or_default();
 
         ExprIr::FunctionCall { name, args }
@@ -106,6 +112,8 @@ impl ExprVisitor {
                 BinOp::NotSimilarTo(n) => n.syntax().text().to_string(),
                 BinOp::OperatorCall(n) => n.syntax().text().to_string(),
                 BinOp::SimilarTo(n) => n.syntax().text().to_string(),
+                // FIX for squawk_syntax >= 2.58.0: New Escape operator coverage
+                BinOp::Escape(t) => t.text().to_string(),
             })
             .unwrap_or_else(|| "<op>".into());
 
@@ -134,7 +142,6 @@ impl ExprVisitor {
     fn convert_case_expr(ce: squawk_syntax::ast::CaseExpr) -> ExprIr {
         let mut branches: Vec<ExprIr> = Vec::new();
 
-        // Index 0: Base expression (or omitted if standalone WHEN clauses)
         branches.push(ce.expr().map(Self::convert).unwrap_or(ExprIr::Omitted));
 
         if let Some(wcl) = ce.when_clause_list() {
@@ -148,7 +155,6 @@ impl ExprVisitor {
             }
         }
 
-        // Final Index: Else clause (or omitted)
         branches.push(
             ce.else_clause()
                 .and_then(|ec| ec.expr())
