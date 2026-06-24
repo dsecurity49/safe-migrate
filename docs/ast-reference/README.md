@@ -175,7 +175,7 @@ When updating to a new `squawk_syntax` version:
 
 ## Document Maintenance Notes
 
-- **No new grammar parsing needed** for v0.3.0 — all gaps are parser-level limitations, not extraction problems
+- **No new grammar parsing needed** for v0.3.1 — all gaps are parser-level limitations, not extraction problems
 - These docs are **reference, not tutorial** — assume familiarity with PostgreSQL DDL and the squawk AST structure
 - **Update frequency:** After squawk_syntax updates or when new rule types require expanded extraction
 - **Verification method:** Compare document examples against `src/ast/visitor.rs` implementations and test suite coverage
