@@ -755,7 +755,7 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
 name = "safe-migrate"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -884,15 +884,15 @@ dependencies = [
 
 [[package]]
 name = "squawk-lexer"
-version = "2.56.0"
+version = "2.58.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c019281b8185f25795ae4dfc3d34a6836e5315b2f13cc8470e89d0defb4d255"
+checksum = "9168b420f5824108d6f649960b3f1670eba962c02641308accd269ffaa1b22bd"
 
 [[package]]
 name = "squawk-parser"
-version = "2.56.0"
+version = "2.58.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e859fc4aa993abe1c633022aabad7809358152d33c35a4076fd6077d7dcf5439"
+checksum = "f48f2f5adb16209a27e893a805b4f6484fc2661b6688d543b459decfd4022097"
 dependencies = [
  "drop_bomb",
  "squawk-lexer",
@@ -900,9 +900,9 @@ dependencies = [
 
 [[package]]
 name = "squawk-syntax"
-version = "2.56.0"
+version = "2.58.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "66be04f4e58d8d95d4bc228bbbcf22a4f49498d6ceaf35d14df0ac771c541db5"
+checksum = "cf037644c8398de4f1548cc76f6bcd7f22fb623fb90890f35698d95c8be72ae1"
 dependencies = [
  "either",
  "rowan 0.15.18",
