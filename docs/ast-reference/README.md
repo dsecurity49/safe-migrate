@@ -14,8 +14,8 @@ This directory contains verified PostgreSQL grammar and AST node extraction guid
 - Grammar-confirmed limitations and gaps
 
 **Verified against:** `squawk_syntax` v2.56.0  
-**PostgreSQL grammar version:** PostgreSQL 17 (latest at time of review)  
-**Last reviewed:** [DATE]
+**PostgreSQL grammar version:** PostgreSQL 17
+**Last reviewed:** 22-06-2026
 
 ---
 
