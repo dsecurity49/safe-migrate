@@ -2,12 +2,9 @@
 
 use crate::analysis::mutations::Mutation;
 use crate::analysis::state::{AnalysisState, CascadeResult, MutationResult};
-use crate::ast::identifiers::ObjectId;
 use crate::engine::config::Config;
-use crate::model::relation::RelationState;
 use crate::report::violations::{Violation, ViolationTier};
 use crate::rules::Rule;
-use std::collections::HashMap;
 
 pub struct VolatileDefaultRule;
 
@@ -26,7 +23,7 @@ impl Rule for VolatileDefaultRule {
         &self,
         mutation: &Mutation,
         result: &MutationResult,
-        _pre_relations: &HashMap<ObjectId, RelationState>,
+        _pre_state: &crate::analysis::state::PreState,
         _state: &AnalysisState,
         _config: &Config,
         _cascade: Option<&CascadeResult>,

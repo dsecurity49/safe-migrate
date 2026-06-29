@@ -3,15 +3,21 @@ use crate::analysis::facts::{
     AlterIndexActionFact, AlterTableActionFact, PersistenceFact, StatementFact, TypeCreationKind,
 };
 use crate::analysis::mutations::{
-    AlterDomainMutation, AlterSequenceMutation, AlterTable, AlterTableActionMutation,
-    AlterTypeActionMutation, AlterTypeMutation, ColumnMutation, CreateDomainMutation, CreateIndex,
-    CreateMaterializedView, CreatePolicyMutation, CreateSchemaMutation, CreateSequenceMutation,
-    CreateTable, CreateTriggerMutation, CreateTypeMutation, CreateView, DropDomainMutation,
-    DropIndex, DropMaterializedViewMutation, DropPolicyMutation, DropSchemaMutation,
-    DropSequenceMutation, DropTable, DropTriggerMutation, DropViewMutation, FkMutation, Mutation,
-    OpaqueMutation, PersistenceMutation, RefreshMaterializedViewMutation, ReleaseSavepointMutation,
-    Rename, RollbackToSavepointMutation, SavepointMutation, SearchPathChange,
-};
+    AlterDatabaseMutation, AlterDomainMutation, AlterFunctionMutation, AlterProcedureMutation,
+    AlterPublicationMutation, AlterRoleMutation, AlterSequenceMutation, AlterSubscriptionMutation,
+    AlterTable, AlterTableActionMutation, AlterTypeActionMutation, AlterTypeMutation,
+    ColumnMutation, CreateDatabaseMutation, CreateDomainMutation, CreateFunctionMutation,
+    CreateIndex, CreateMaterializedView, CreatePolicyMutation, CreateProcedureMutation,
+    CreatePublicationMutation, CreateRoleMutation, CreateSchemaMutation, CreateSequenceMutation,
+    CreateTable, CreateSubscriptionMutation, CreateTriggerMutation, CreateTypeMutation,
+    CreateView, DropDatabaseMutation, DropDomainMutation, DropFunctionMutation,
+    DropIndex, DropMaterializedViewMutation, DropPolicyMutation, DropProcedureMutation,
+    DropPublicationMutation, DropRoleMutation, DropSchemaMutation, DropSequenceMutation,
+    DropSubscriptionMutation, DropTable, DropTriggerMutation, DropViewMutation,
+    FkMutation, GrantMutation, Mutation, OpaqueMutation, PersistenceMutation,
+    RefreshMaterializedViewMutation, ReleaseSavepointMutation, Rename,
+    ResolvedGrantTarget, RevokeMutation, RollbackToSavepointMutation, SavepointMutation, SearchPathChange,
+} ;
 use crate::analysis::state::AnalysisState;
 use crate::ast::identifiers::{ObjectId, QualifiedName};
 use crate::model::types::TypeKind;
@@ -58,6 +64,7 @@ impl Resolver {
             if state.local.relations.contains_key(&candidate)
                 || state.local.types.contains_key(&candidate)
                 || state.local.sequences.contains_key(&candidate)
+                || state.local.functions.contains_key(&candidate)
             {
                 return candidate;
             }
@@ -76,6 +83,35 @@ impl Resolver {
         }
     }
 
+    fn resolve_function_id(name: &QualifiedName, params: &[crate::analysis::facts::ParamFact], state: &AnalysisState) -> ObjectId {
+        let base_id = Self::resolve_creation_name(name, state);
+        let sig = params.iter()
+            .map(|p| p.ty.clone())
+            .collect::<Vec<_>>()
+            .join(",");
+        Self::resolve_function_id_by_sig(&base_id, &sig)
+    }
+
+    fn resolve_function_id_by_sig(base_id: &ObjectId, sig: &str) -> ObjectId {
+        ObjectId {
+            schema: base_id.schema.clone(),
+            name: format!("{}({})", base_id.name, sig),
+        }
+    }
+
+    fn resolve_grant_target(target: &crate::analysis::facts::GrantTarget, state: &AnalysisState) -> ResolvedGrantTarget {
+        match target {
+            crate::analysis::facts::GrantTarget::Tables(names) => {
+                ResolvedGrantTarget::Tables(
+                    names.iter().map(|n| Self::resolve_lookup_name(n, state)).collect(),
+                )
+            }
+            crate::analysis::facts::GrantTarget::AllTablesInSchema(schemas) => {
+                ResolvedGrantTarget::AllTablesInSchema(schemas.clone())
+            }
+        }
+    }
+
     pub fn resolve(fact: &StatementFact, state: &AnalysisState) -> Vec<Mutation> {
         let mut mutations = Vec::new();
         match fact {
@@ -88,8 +124,23 @@ impl Resolver {
                     if_not_exists: *if_not_exists,
                 }));
             }
-            StatementFact::AlterSchema { .. } => {
-                mutations.push(Mutation::Opaque(OpaqueMutation::DynamicSql));
+            StatementFact::AlterSchema {
+                name,
+                new_name,
+            } => {
+                if let Some(nn) = new_name {
+                    let id = Self::resolve_lookup_name(name, state);
+                    let new_id = ObjectId {
+                        schema: id.schema.clone(),
+                        name: nn.resolve(),
+                    };
+                    mutations.push(Mutation::Rename(Rename {
+                        old_id: id,
+                        new_id,
+                    }));
+                } else {
+                    mutations.push(Mutation::Opaque(OpaqueMutation::DynamicSql));
+                }
             }
             StatementFact::DropSchema {
                 names,
@@ -256,6 +307,7 @@ impl Resolver {
                 concurrently,
                 using_method,
                 has_predicate,
+                unique,
             } => {
                 let id = Self::resolve_creation_name(name, state);
 
@@ -270,12 +322,15 @@ impl Resolver {
                     concurrently: *concurrently,
                     using_method: using_method.clone(),
                     has_predicate: *has_predicate,
+                    unique: *unique,
                 }));
             }
-            StatementFact::CreatePolicy { name, table } => {
+            StatementFact::CreatePolicy { name, table, permissive, command } => {
                 mutations.push(Mutation::CreatePolicy(CreatePolicyMutation {
                     name: name.clone(),
                     table: Self::resolve_lookup_name(table, state),
+                    permissive: *permissive,
+                    command: command.clone(),
                 }));
             }
             StatementFact::DropPolicy {
@@ -289,10 +344,19 @@ impl Resolver {
                     if_exists: *if_exists,
                 }));
             }
-            StatementFact::CreateTrigger { name, table } => {
+            StatementFact::CreateTrigger { name, table, function } => {
+                // Function references in triggers are bare names (e.g., "notify_func")
+                // but functions are stored with signature (e.g., "notify_func()").
+                // Use resolve_function_id_by_sig with empty params for consistent lookup.
+                let function_base = function
+                    .as_ref()
+                    .map(|f| Self::resolve_lookup_name(f, state))
+                    .unwrap_or_else(|| ObjectId::new("public", "unknown_function"));
+                let function_id = Self::resolve_function_id_by_sig(&function_base, "");
                 mutations.push(Mutation::CreateTrigger(CreateTriggerMutation {
                     name: name.clone(),
                     table: Self::resolve_lookup_name(table, state),
+                    function_id,
                 }));
             }
             StatementFact::DropTrigger {
@@ -377,12 +441,13 @@ impl Resolver {
                     base_type: base_type.clone(),
                 }));
             }
-            StatementFact::AlterDomain { name } => {
+            StatementFact::AlterDomain { name, action } => {
                 mutations.push(Mutation::AlterDomain(AlterDomainMutation {
                     id: Self::resolve_lookup_name(name, state),
+                    action: action.clone(),
                 }));
             }
-            StatementFact::DropDomain { names, if_exists } => {
+            StatementFact::DropDomain { names, if_exists, cascade } => {
                 let ids = names
                     .iter()
                     .map(|n| Self::resolve_lookup_name(n, state))
@@ -390,6 +455,7 @@ impl Resolver {
                 mutations.push(Mutation::DropDomain(DropDomainMutation {
                     ids,
                     if_exists: *if_exists,
+                    cascade: *cascade,
                 }));
             }
             StatementFact::CreateSequence {
@@ -426,7 +492,7 @@ impl Resolver {
                     owned_by: resolved_owned_by,
                 }));
             }
-            StatementFact::DropSequence { names, if_exists } => {
+            StatementFact::DropSequence { names, if_exists, cascade } => {
                 let ids = names
                     .iter()
                     .map(|n| Self::resolve_lookup_name(n, state))
@@ -434,6 +500,7 @@ impl Resolver {
                 mutations.push(Mutation::DropSequence(DropSequenceMutation {
                     ids,
                     if_exists: *if_exists,
+                    cascade: *cascade,
                 }));
             }
             StatementFact::AlterTable { name, actions } => {
@@ -452,6 +519,7 @@ impl Resolver {
                             if_not_exists: *if_not_exists,
                             not_null: *not_null,
                             default: default.clone(),
+                            depends_on: None, // Logic for extraction can be added later if needed
                         },
                         AlterTableActionFact::DropColumn {
                             name: col_name,
@@ -577,9 +645,13 @@ impl Resolver {
                                 column: column.clone(),
                             }
                         }
-                        AlterTableActionFact::SetAccessMethod => {
-                            AlterTableActionMutation::SetAccessMethod
-                        }
+                        AlterTableActionFact::SetAccessMethod => AlterTableActionMutation::SetAccessMethod,
+                        AlterTableActionFact::DisableTrigger { trigger_name } => AlterTableActionMutation::DisableTrigger { trigger_name: trigger_name.clone() },
+                        AlterTableActionFact::EnableTrigger { trigger_name } => AlterTableActionMutation::EnableTrigger { trigger_name: trigger_name.clone() },
+                        AlterTableActionFact::SetExpression { .. } |
+                        AlterTableActionFact::SetOptions { .. } |
+                        AlterTableActionFact::Inherit { .. } |
+                        AlterTableActionFact::NoInherit { .. } => AlterTableActionMutation::Opaque,
                     };
                     mutations.push(Mutation::AlterTable(AlterTable {
                         id: id.clone(),
@@ -592,23 +664,28 @@ impl Resolver {
                 if_exists,
                 cascade,
             } => {
+                let id = Self::resolve_lookup_name(name, state);
+                if !state.relation_is_present(&id) {
+                    if *if_exists {
+                        return vec![];
+                    } else {
+                        return vec![Mutation::Opaque(OpaqueMutation::DynamicSql)];
+                    }
+                }
                 mutations.push(Mutation::DropTable(DropTable {
-                    id: Self::resolve_lookup_name(name, state),
+                    id,
                     if_exists: *if_exists,
                     cascade: *cascade,
                 }));
             }
-            StatementFact::DropView { names, if_exists } => {
-                let ids = names
-                    .iter()
-                    .map(|n| Self::resolve_lookup_name(n, state))
-                    .collect();
+            StatementFact::DropView { name, if_exists, cascade } => {
                 mutations.push(Mutation::DropView(DropViewMutation {
-                    ids,
+                    ids: vec![Self::resolve_lookup_name(name, state)],
                     if_exists: *if_exists,
+                    cascade: *cascade,
                 }));
             }
-            StatementFact::DropMaterializedView { names, if_exists } => {
+            StatementFact::DropMaterializedView { names, if_exists, cascade } => {
                 let ids = names
                     .iter()
                     .map(|n| Self::resolve_lookup_name(n, state))
@@ -617,6 +694,7 @@ impl Resolver {
                     DropMaterializedViewMutation {
                         ids,
                         if_exists: *if_exists,
+                        cascade: *cascade,
                     },
                 ));
             }
@@ -675,6 +753,152 @@ impl Resolver {
             StatementFact::Execute => mutations.push(Mutation::Opaque(OpaqueMutation::Execute)),
             StatementFact::Vacuum { is_full } => {
                 mutations.push(Mutation::Vacuum { is_full: *is_full })
+            }
+            StatementFact::CreateFunction(f) => {
+                let id = Self::resolve_function_id(&f.name, &f.params, state);
+                mutations.push(Mutation::CreateFunction(CreateFunctionMutation {
+                    id,
+                    or_replace: f.or_replace,
+                    params: f.params.clone(),
+                    return_type: f.return_type.clone(),
+                    options: f.options.clone(),
+                }));
+            }
+            StatementFact::AlterFunction(f) => {
+                let base_id = Self::resolve_lookup_name(&f.name, state);
+                let sig = f.params.join(",");
+                let id = Self::resolve_function_id_by_sig(&base_id, &sig);
+                mutations.push(Mutation::AlterFunction(AlterFunctionMutation {
+                    id,
+                    action: f.action.clone(),
+                }));
+            }
+            StatementFact::DropFunction(f) => {
+                mutations.push(Mutation::DropFunction(DropFunctionMutation {
+                    signatures: f.signatures.clone(),
+                    if_exists: f.if_exists,
+                    cascade: f.cascade,
+                }));
+            }
+            StatementFact::CreateProcedure(p) => {
+                let id = Self::resolve_function_id(&p.name, &p.params, state);
+                mutations.push(Mutation::CreateProcedure(CreateProcedureMutation {
+                    id,
+                    or_replace: p.or_replace,
+                    params: p.params.clone(),
+                    options: p.options.clone(),
+                }));
+            }
+            StatementFact::AlterProcedure(p) => {
+                let base_id = Self::resolve_lookup_name(&p.name, state);
+                let sig = p.params.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",");
+                let id = Self::resolve_function_id_by_sig(&base_id, &sig);
+                mutations.push(Mutation::AlterProcedure(AlterProcedureMutation {
+                    id,
+                    action: p.action.clone(),
+                }));
+            }
+            StatementFact::DropProcedure(p) => {
+                mutations.push(Mutation::DropProcedure(DropProcedureMutation {
+                    signatures: p.signatures.clone(),
+                    if_exists: p.if_exists,
+                    cascade: p.cascade,
+                }));
+            }
+            StatementFact::CreatePublication(p) => {
+                mutations.push(Mutation::CreatePublication(CreatePublicationMutation {
+                    name: p.name.clone(),
+                    scope: p.scope.clone(),
+                    params: p.params.clone(),
+                }));
+            }
+            StatementFact::AlterPublication(p) => {
+                mutations.push(Mutation::AlterPublication(AlterPublicationMutation {
+                    name: p.name.clone(),
+                }));
+            }
+            StatementFact::DropPublication(p) => {
+                mutations.push(Mutation::DropPublication(DropPublicationMutation {
+                    names: p.names.clone(),
+                    if_exists: p.if_exists,
+                    cascade: p.cascade,
+                }));
+            }
+            StatementFact::CreateSubscription(s) => {
+                mutations.push(Mutation::CreateSubscription(CreateSubscriptionMutation {
+                    name: s.name.clone(),
+                    connection: s.connection.clone(),
+                    publications: s.publications.clone(),
+                    params: s.params.clone(),
+                }));
+            }
+            StatementFact::AlterSubscription(s) => {
+                mutations.push(Mutation::AlterSubscription(AlterSubscriptionMutation {
+                    name: s.name.clone(),
+                }));
+            }
+            StatementFact::DropSubscription(s) => {
+                mutations.push(Mutation::DropSubscription(DropSubscriptionMutation {
+                    name: s.name.clone(),
+                    if_exists: s.if_exists,
+                }));
+            }
+            StatementFact::CreateRole(r) => {
+                mutations.push(Mutation::CreateRole(CreateRoleMutation {
+                    name: r.name.clone(),
+                    inherits: r.inherits,
+                }));
+            }
+            StatementFact::AlterRole(r) => {
+                mutations.push(Mutation::AlterRole(AlterRoleMutation {
+                    name: r.name.clone(),
+                    inherits: r.inherits,
+                }));
+            }
+            StatementFact::DropRole(r) => {
+                mutations.push(Mutation::DropRole(DropRoleMutation {
+                    names: r.names.clone(),
+                    if_exists: r.if_exists,
+                }));
+            }
+            StatementFact::Grant(g) => {
+                mutations.push(Mutation::Grant(GrantMutation {
+                    privileges: g.privileges.clone(),
+                    target: Self::resolve_grant_target(&g.target, state),
+                    grantees: g.grantees.clone(),
+                    with_grant_option: g.with_grant_option,
+                    granted_by: g.granted_by.clone(),
+                }));
+            }
+            StatementFact::Revoke(r) => {
+                mutations.push(Mutation::Revoke(RevokeMutation {
+                    grant_option_only: r.grant_option_only,
+                    privileges: r.privileges.clone(),
+                    target: Self::resolve_grant_target(&r.target, state),
+                    revokees: r.revokees.clone(),
+                    granted_by: r.granted_by.clone(),
+                    cascade: r.cascade,
+                }));
+            }
+            StatementFact::CreateDatabase(d) => {
+                mutations.push(Mutation::CreateDatabase(CreateDatabaseMutation {
+                    name: d.name.clone(),
+                    options: d.options.clone(),
+                }));
+            }
+            StatementFact::AlterDatabase(d) => {
+                let id = Self::resolve_lookup_name(&d.name, state);
+                mutations.push(Mutation::AlterDatabase(AlterDatabaseMutation {
+                    id,
+                    action: d.action.clone(),
+                }));
+            }
+            StatementFact::DropDatabase(d) => {
+                let id = Self::resolve_lookup_name(&d.name, state);
+                mutations.push(Mutation::DropDatabase(DropDatabaseMutation {
+                    id,
+                    if_exists: d.if_exists,
+                }));
             }
         }
         mutations

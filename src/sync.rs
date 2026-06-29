@@ -77,7 +77,7 @@ pub fn sync_cache(out_path: &Path) -> Result<()> {
         };
 
         let mut state =
-            RelationState::new(object_id.clone(), 0, estimated_rows, kind, persistence, 0);
+            RelationState::new(object_id.clone(), ObjectId::new("public", "postgres"), 0, estimated_rows, kind, persistence, 0);
         state.relpages = Some(relpages as u64);
         state.last_analyze = last_analyze;
         state.last_autoanalyze = last_autoanalyze;

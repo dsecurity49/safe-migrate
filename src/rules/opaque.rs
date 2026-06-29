@@ -1,12 +1,9 @@
 // FILE: src/rules/opaque.rs
 use crate::analysis::mutations::Mutation;
 use crate::analysis::state::{AnalysisState, CascadeResult, MutationResult};
-use crate::ast::identifiers::ObjectId;
 use crate::engine::config::Config;
-use crate::model::relation::RelationState;
 use crate::report::violations::{Violation, ViolationTier};
 use crate::rules::Rule;
-use std::collections::HashMap;
 
 pub struct OpaqueDynamicSqlRule;
 
@@ -25,7 +22,7 @@ impl Rule for OpaqueDynamicSqlRule {
         &self,
         mutation: &Mutation,
         _result: &MutationResult,
-        _pre_relations: &HashMap<ObjectId, RelationState>,
+        _pre_state: &crate::analysis::state::PreState,
         _state: &AnalysisState,
         _config: &Config,
         _cascade: Option<&CascadeResult>,

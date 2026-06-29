@@ -5,6 +5,17 @@ use crate::report::violations::{Violation, ViolationTier};
 pub struct Reporter;
 
 impl Reporter {
+    pub fn print_json_report(violations: &[Violation], confidence: &Confidence) {
+        let output = serde_json::json!({
+            "confidence": match confidence {
+                Confidence::Exact => "Exact",
+                Confidence::Tainted => "Tainted",
+            },
+            "violations": violations,
+        });
+        println!("{}", serde_json::to_string_pretty(&output).unwrap());
+    }
+
     pub fn print_report(violations: &[Violation], confidence: &Confidence) -> bool {
         let mut tier1 = 0;
         let mut tier2 = 0;

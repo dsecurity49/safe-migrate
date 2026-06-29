@@ -1,12 +1,9 @@
 // FILE: src/rules/destructive.rs
 use crate::analysis::mutations::{AlterTableActionMutation, Mutation};
 use crate::analysis::state::{AnalysisState, CascadeResult, MutationResult};
-use crate::ast::identifiers::ObjectId;
 use crate::engine::config::Config;
-use crate::model::relation::RelationState;
 use crate::report::violations::{Violation, ViolationTier};
 use crate::rules::Rule;
-use std::collections::HashMap;
 
 pub struct CascadingDropRule;
 
@@ -25,7 +22,7 @@ impl Rule for CascadingDropRule {
         &self,
         mutation: &Mutation,
         result: &MutationResult,
-        _pre_relations: &HashMap<ObjectId, RelationState>,
+        _pre_state: &crate::analysis::state::PreState,
         state: &AnalysisState,
         _config: &Config,
         cascade_closure: Option<&CascadeResult>,
@@ -89,7 +86,7 @@ impl Rule for SizeAwareAddColumnRule {
         &self,
         mutation: &Mutation,
         result: &MutationResult,
-        pre_relations: &HashMap<ObjectId, RelationState>,
+        pre_state: &crate::analysis::state::PreState,
         state: &AnalysisState,
         config: &Config,
         _cascade_closure: Option<&CascadeResult>,
@@ -110,7 +107,7 @@ impl Rule for SizeAwareAddColumnRule {
             let requires_rewrite = is_volatile || pg_version < 110000;
 
             if requires_rewrite {
-                let (has_wide_columns, is_stale, rows) = match pre_relations.get(&alter.id) {
+                let (has_wide_columns, is_stale, rows) = match pre_state.relations.get(&alter.id) {
                     Some(rel) => {
                         let wide = rel.columns.iter().any(|c| {
                             c.avg_width.unwrap_or(0) >= config.toast_width_threshold_bytes
@@ -184,6 +181,157 @@ impl Rule for SizeAwareAddColumnRule {
     }
 }
 
+pub struct DropDatabaseRule;
+
+impl Rule for DropDatabaseRule {
+    fn id(&self) -> &'static str {
+        "drop-database"
+    }
+    fn default_tier(&self) -> ViolationTier {
+        ViolationTier::Tier1
+    }
+    fn recipe(&self) -> &'static str {
+        "DROP DATABASE is an irreversible, high-blast-radius operation that destroys the entire database context."
+    }
+
+    fn evaluate(
+        &self,
+        _mutation: &Mutation,
+        _result: &MutationResult,
+        _pre_state: &crate::analysis::state::PreState,
+        _state: &AnalysisState,
+        _config: &Config,
+        _cascade: Option<&CascadeResult>,
+    ) -> Vec<Violation> {
+        vec![Violation {
+            rule_id: self.id(),
+            title: "DROP DATABASE detected".to_string(),
+            tier: self.default_tier(),
+            recipe: self.recipe(),
+            dedup_key: None,
+        }]
+    }
+}
+
+pub struct DropSchemaCascadeRule;
+
+impl Rule for DropSchemaCascadeRule {
+    fn id(&self) -> &'static str {
+        "drop-schema-cascade"
+    }
+    fn default_tier(&self) -> ViolationTier {
+        ViolationTier::Tier1
+    }
+    fn recipe(&self) -> &'static str {
+        "DROP SCHEMA ... CASCADE recursively destroys every object in the schema. Handle dependencies explicitly."
+    }
+
+    fn evaluate(
+        &self,
+        mutation: &Mutation,
+        _result: &MutationResult,
+        _pre_state: &crate::analysis::state::PreState,
+        _state: &AnalysisState,
+        _config: &Config,
+        _cascade: Option<&CascadeResult>,
+    ) -> Vec<Violation> {
+        let mut violations = Vec::new();
+
+        if let Mutation::DropSchema(drop) = mutation && drop.cascade {
+            violations.push(Violation {
+                rule_id: self.id(),
+                title: format!("DROP SCHEMA {} CASCADE detected", drop.names.join(", ")),
+                tier: self.default_tier(),
+                recipe: self.recipe(),
+                dedup_key: None,
+            });
+        }
+
+        violations
+    }
+}
+
+pub struct CreateTableAsSelectRule;
+
+impl Rule for CreateTableAsSelectRule {
+    fn id(&self) -> &'static str {
+        "create-table-as-select"
+    }
+    fn default_tier(&self) -> ViolationTier {
+        ViolationTier::Tier2
+    }
+    fn recipe(&self) -> &'static str {
+        "CREATE TABLE AS SELECT can be extremely slow and resource-intensive on large datasets. Consider creating the table first and using INSERT INTO ... SELECT in batches."
+    }
+
+    fn evaluate(
+        &self,
+        mutation: &Mutation,
+        _result: &MutationResult,
+        _pre_state: &crate::analysis::state::PreState,
+        _state: &AnalysisState,
+        _config: &Config,
+        _cascade: Option<&CascadeResult>,
+    ) -> Vec<Violation> {
+        if let Mutation::CreateTable(c) = mutation && c.as_select {
+            return vec![Violation {
+                rule_id: self.id(),
+                title: format!("CREATE TABLE AS SELECT detected for {}", c.id),
+                tier: self.default_tier(),
+                recipe: self.recipe(),
+                dedup_key: None,
+            }];
+        }
+        vec![]
+    }
+}
+
+pub struct GeneralCascadeRule;
+
+impl Rule for GeneralCascadeRule {
+    fn id(&self) -> &'static str {
+        "destructive-general-cascade"
+    }
+    fn default_tier(&self) -> ViolationTier {
+        ViolationTier::Tier1
+    }
+    fn recipe(&self) -> &'static str {
+        "Using CASCADE on DROP operations can silently delete dependent objects. Explicitly drop dependencies to avoid accidental data loss."
+    }
+
+    fn evaluate(
+        &self,
+        mutation: &Mutation,
+        _result: &MutationResult,
+        _pre_state: &crate::analysis::state::PreState,
+        _state: &AnalysisState,
+        _config: &Config,
+        _cascade: Option<&CascadeResult>,
+    ) -> Vec<Violation> {
+        let is_cascade = match mutation {
+            Mutation::DropView(d) => d.cascade,
+            Mutation::DropMaterializedView(d) => d.cascade,
+            Mutation::DropSequence(d) => d.cascade,
+            Mutation::DropDomain(d) => d.cascade,
+            Mutation::DropFunction(d) => d.cascade,
+            Mutation::DropProcedure(d) => d.cascade,
+            Mutation::DropPublication(d) => d.cascade,
+            _ => false,
+        };
+
+        if is_cascade {
+            return vec![Violation {
+                rule_id: self.id(),
+                title: "Destructive CASCADE operation detected".to_string(),
+                tier: self.default_tier(),
+                recipe: self.recipe(),
+                dedup_key: None,
+            }];
+        }
+        vec![]
+    }
+}
+
 pub struct TypeChangeRewriteRule;
 
 impl TypeChangeRewriteRule {
@@ -231,7 +379,7 @@ impl Rule for TypeChangeRewriteRule {
         &self,
         mutation: &Mutation,
         result: &MutationResult,
-        pre_relations: &HashMap<ObjectId, RelationState>,
+        pre_state: &crate::analysis::state::PreState,
         state: &AnalysisState,
         config: &Config,
         _cascade_closure: Option<&CascadeResult>,
@@ -251,7 +399,7 @@ impl Rule for TypeChangeRewriteRule {
         {
             let pg_version = state.pg_version_num.unwrap_or(config.assume_pg_version);
 
-            let (is_safe, rows, old_type_str) = match pre_relations.get(&alter.id) {
+            let (is_safe, rows, old_type_str) = match pre_state.relations.get(&alter.id) {
                 Some(rel) => {
                     let old_ty = rel
                         .columns

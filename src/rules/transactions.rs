@@ -1,12 +1,9 @@
 // FILE: src/rules/transactions.rs
 use crate::analysis::mutations::Mutation;
 use crate::analysis::state::{AnalysisState, CascadeResult, MutationResult};
-use crate::ast::identifiers::ObjectId;
 use crate::engine::config::Config;
-use crate::model::relation::RelationState;
 use crate::report::violations::{Violation, ViolationTier};
 use crate::rules::Rule;
-use std::collections::HashMap;
 
 pub struct ConcurrentInsideTransactionRule;
 
@@ -25,7 +22,7 @@ impl Rule for ConcurrentInsideTransactionRule {
         &self,
         mutation: &Mutation,
         _result: &MutationResult,
-        _pre_relations: &HashMap<ObjectId, RelationState>,
+        _pre_state: &crate::analysis::state::PreState,
         state: &AnalysisState,
         _config: &Config,
         _cascade: Option<&CascadeResult>,
@@ -63,6 +60,43 @@ impl Rule for ConcurrentInsideTransactionRule {
     }
 }
 
+pub struct AlterTypeAddValueRule;
+
+impl Rule for AlterTypeAddValueRule {
+    fn id(&self) -> &'static str {
+        "alter-type-add-value-txn"
+    }
+    fn default_tier(&self) -> ViolationTier {
+        ViolationTier::Tier1
+    }
+    fn recipe(&self) -> &'static str {
+        "ALTER TYPE ... ADD VALUE cannot be executed inside a transaction block in PostgreSQL."
+    }
+
+    fn evaluate(
+        &self,
+        mutation: &Mutation,
+        _result: &MutationResult,
+        _pre_state: &crate::analysis::state::PreState,
+        state: &AnalysisState,
+        _config: &Config,
+        _cascade: Option<&CascadeResult>,
+    ) -> Vec<Violation> {
+        if !state.local.transactions.is_empty()
+            && let Mutation::AlterType(alter) = mutation
+        {
+            return vec![Violation {
+                rule_id: self.id(),
+                title: format!("ALTER TYPE {} ADD VALUE inside transaction", alter.id),
+                tier: self.default_tier(),
+                recipe: self.recipe(),
+                dedup_key: None,
+            }];
+        }
+        vec![]
+    }
+}
+
 pub struct VacuumFullRule;
 
 impl Rule for VacuumFullRule {
@@ -80,7 +114,7 @@ impl Rule for VacuumFullRule {
         &self,
         mutation: &Mutation,
         _result: &MutationResult,
-        _pre_relations: &HashMap<ObjectId, RelationState>,
+        _pre_state: &crate::analysis::state::PreState,
         _state: &AnalysisState,
         _config: &Config,
         _cascade: Option<&CascadeResult>,

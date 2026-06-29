@@ -6,7 +6,7 @@ use crate::model::sequence::SequenceOverlay;
 use crate::model::types::TypeOverlay;
 // Added RenameEdge here to support the new RenameGraphSnapshot
 use crate::analysis::graph::{
-    FkEdge, IndexEdge, PartitionEdge, RenameEdge, SequenceEdge, ViewEdge,
+    ColumnDependencyEdge, FkEdge, IndexEdge, PartitionEdge, PublicationEdge, RenameEdge, SequenceEdge, ViewEdge,
 };
 // Added HashSet to support the PendingValidationSnapshot
 use std::collections::HashSet;
@@ -70,11 +70,46 @@ pub enum StateChange {
     SequenceGraphSnapshot {
         previous: Vec<SequenceEdge>,
     },
-    PartitionGraphLengthMarker {
+    ColumnGraphLengthMarker {
+        len: usize,
+    },
+    ColumnGraphSnapshot {
+        previous: Vec<ColumnDependencyEdge>,
+    },
+    PartitionGraphMarker {
         len: usize,
     },
     PartitionGraphSnapshot {
         previous: Vec<PartitionEdge>,
+    },
+    FunctionSnapshot {
+        id: ObjectId,
+        previous: Option<crate::model::function::FunctionOverlay>,
+    },
+    PublicationSnapshot {
+        id: ObjectId,
+        previous: Option<crate::model::replication::PublicationOverlay>,
+    },
+    SubscriptionSnapshot {
+        id: ObjectId,
+        previous: Option<crate::model::replication::SubscriptionOverlay>,
+    },
+    RoleSnapshot {
+        id: ObjectId,
+        previous: Option<crate::model::role::RoleOverlay>,
+    },
+    TriggerSnapshot {
+        id: ObjectId,
+        previous: Option<crate::model::trigger::TriggerOverlay>,
+    },
+    TriggerGraphSnapshot {
+        previous: Vec<crate::analysis::graph::TriggerEdge>,
+    },
+    PublicationGraphSnapshot {
+        previous: Vec<PublicationEdge>,
+    },
+    CurrentRoleSnapshot {
+        previous: String,
     },
 }
 

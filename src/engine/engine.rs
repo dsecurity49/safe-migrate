@@ -1,24 +1,26 @@
 // FILE: src/engine/engine.rs
-use crate::analysis::mutations::{AlterTableActionMutation, Mutation};
+use crate::analysis::mutations::Mutation;
 use crate::analysis::resolver::Resolver;
 use crate::analysis::state::AnalysisState;
-use crate::ast::identifiers::ObjectId;
 use crate::ast::visitor::AstVisitor;
 use crate::engine::config::Config;
-use crate::model::relation::{RelationOverlay, RelationState};
 use crate::report::violations::Violation;
 use crate::rules::Rule;
 use crate::rules::constraints::BlockingConstraintRule;
-use crate::rules::destructive::{CascadingDropRule, SizeAwareAddColumnRule, TypeChangeRewriteRule};
+use crate::rules::destructive::{CascadingDropRule, SizeAwareAddColumnRule, TypeChangeRewriteRule, DropDatabaseRule, DropSchemaCascadeRule, GeneralCascadeRule, CreateTableAsSelectRule};
 use crate::rules::expressions::VolatileDefaultRule;
 use crate::rules::idempotency::IdempotencyRule;
 use crate::rules::indexes::ConcurrentIndexRule;
 use crate::rules::opaque::OpaqueDynamicSqlRule;
+use crate::rules::functions::{BrokenComputeRule, FunctionVolatilityRule};
 use crate::rules::partitions::PartitionLockRule;
-use crate::rules::transactions::{ConcurrentInsideTransactionRule, VacuumFullRule};
+use crate::rules::policies::RestrictivePolicyRule;
+use crate::rules::triggers::DisableTriggerRule;
+use crate::rules::transactions::{ConcurrentInsideTransactionRule, VacuumFullRule, AlterTypeAddValueRule};
+use crate::rules::security::OverbroadGrantRule;
 use crate::rules::views::MaterializedViewRefreshRule;
 use squawk_syntax::ast::{AstNode, SourceFile};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 pub struct SafeMigrateEngine {
     config: Config,
@@ -30,18 +32,28 @@ impl SafeMigrateEngine {
         Self {
             config,
             rules: vec![
+                Box::new(DropDatabaseRule),
+                Box::new(DropSchemaCascadeRule),
+                Box::new(GeneralCascadeRule),
                 Box::new(CascadingDropRule),
+                Box::new(CreateTableAsSelectRule),
                 Box::new(SizeAwareAddColumnRule),
                 Box::new(TypeChangeRewriteRule),
                 Box::new(BlockingConstraintRule),
                 Box::new(ConcurrentIndexRule),
                 Box::new(MaterializedViewRefreshRule),
                 Box::new(PartitionLockRule),
+                Box::new(RestrictivePolicyRule),
+                Box::new(DisableTriggerRule),
+                Box::new(BrokenComputeRule),
+                Box::new(FunctionVolatilityRule),
                 Box::new(IdempotencyRule),
                 Box::new(ConcurrentInsideTransactionRule),
+                Box::new(AlterTypeAddValueRule),
                 Box::new(VacuumFullRule),
                 Box::new(OpaqueDynamicSqlRule),
                 Box::new(VolatileDefaultRule),
+                Box::new(OverbroadGrantRule),
             ],
         }
     }
@@ -127,68 +139,6 @@ impl SafeMigrateEngine {
                 let mutations = Resolver::resolve(&fact, state);
 
                 for mutation in mutations {
-                    let pre_relations: HashMap<ObjectId, RelationState> = match &mutation {
-                        Mutation::AlterTable(a) => {
-                            let mut snapshot = HashMap::new();
-                            if let Some(RelationOverlay::Present(r)) =
-                                state.local.relations.get(&a.id)
-                            {
-                                snapshot.insert(a.id.clone(), r.clone());
-                            }
-
-                            if let AlterTableActionMutation::AddForeignKey { to_table, .. } =
-                                &a.action
-                                && let Some(RelationOverlay::Present(parent_rel)) =
-                                    state.local.relations.get(to_table)
-                            {
-                                snapshot.insert(to_table.clone(), parent_rel.clone());
-                            }
-                            snapshot
-                        }
-                        Mutation::CreateIndex(c) => state
-                            .local
-                            .relations
-                            .get(&c.table)
-                            .and_then(|o| {
-                                if let RelationOverlay::Present(r) = o {
-                                    Some((c.table.clone(), r.clone()))
-                                } else {
-                                    None
-                                }
-                            })
-                            .into_iter()
-                            .collect(),
-                        Mutation::RefreshMaterializedView(r) => state
-                            .local
-                            .relations
-                            .get(&r.id)
-                            .and_then(|o| {
-                                if let RelationOverlay::Present(rel) = o {
-                                    Some((r.id.clone(), rel.clone()))
-                                } else {
-                                    None
-                                }
-                            })
-                            .into_iter()
-                            .collect(),
-                        Mutation::DropIndex(d) => state
-                            .local
-                            .graph
-                            .is_referenced_by_index(&d.id)
-                            .into_iter()
-                            .filter_map(|tid| {
-                                state.local.relations.get(tid).and_then(|o| {
-                                    if let RelationOverlay::Present(r) = o {
-                                        Some((tid.clone(), r.clone()))
-                                    } else {
-                                        None
-                                    }
-                                })
-                            })
-                            .collect(),
-                        _ => HashMap::new(),
-                    };
-
                     let pre_cascade = match &mutation {
                         Mutation::DropTable(d) if d.cascade => {
                             Some(state.get_cascade_closure(&d.id))
@@ -196,6 +146,7 @@ impl SafeMigrateEngine {
                         _ => None,
                     };
 
+                    let pre_state = state.capture_pre_state();
                     let result = state.apply(&mutation, pre_cascade.as_ref());
 
                     for rule in &self.rules {
@@ -209,7 +160,7 @@ impl SafeMigrateEngine {
                         let violations = rule.evaluate(
                             &mutation,
                             &result,
-                            &pre_relations,
+                            &pre_state,
                             state,
                             &self.config,
                             pre_cascade.as_ref(),

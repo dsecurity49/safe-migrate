@@ -4,38 +4,28 @@ use crate::analysis::facts::{
     CreateTypeFact, FkFact, PersistenceFact, SearchPathTarget, StatementFact, TableConstraintFact,
     TypeCreationKind,
 };
+use crate::analysis::expr_ir::ExprIr;
 use crate::ast::identifiers::{Ident, QualifiedName};
 use squawk_syntax::ast::{
-    self, AddValue, AlterColumnOption, AlterConstraint, AlterDomain, AlterIndex, AlterSequence,
+    self, AlterColumnOption, AlterConstraint, AlterDomain, AlterIndex, AlterSequence,
     AlterTable, AlterTableAction, AlterType, AstNode, AttachPartition, Column, ColumnConstraint,
-    Constraint, CreateDomain, CreateIndex, CreateMaterializedView, CreatePolicy, CreateSequence,
-    CreateTable, CreateTableAs, CreateTrigger, CreateType, CreateView, DetachPartition, DropDomain,
-    DropIndex, DropMaterializedView, DropPolicy, DropSequence, DropTable, DropTrigger, DropView,
-    Name, NameRef, Path, PathSegment, ReleaseSavepoint, RenameTo, Rollback, Savepoint, Set, Stmt,
-    TableArg, TableConstraint, UsingMethod, WhereClause,
+    Constraint, CreateDatabase, CreateDomain, CreateIndex, CreateMaterializedView, CreatePolicy,
+    CreateSequence, CreateTable, CreateTableAs,
+    CreateTrigger, CreateType, CreateView, DetachPartition, DropDomain, DropIndex,
+    DropMaterializedView, DropPolicy, DropSequence,
+    DropTable, DropTrigger, DropView, Grant, Name, NameRef, Path, PathSegment, ReleaseSavepoint,
+    RenameTo, Revoke, Rollback, Savepoint, Set, Stmt, TableArg, TableConstraint,
 };
 
 pub struct AstVisitor;
 
 impl AstVisitor {
-    /// Safely resolves and trims an unquoted/quoted Name into a string
-    /// following Postgres casing rules
     fn resolve_name(n: Name) -> String {
-        Ident::new(
-            n.text().to_string().trim_matches('"').to_string(),
-            n.is_quoted(),
-        )
-        .resolve()
+        Ident::new(n.text().to_string(), n.is_quoted()).resolve()
     }
 
-    /// Safely resolves and trims an unquoted/quoted NameRef into a string
-    /// following Postgres casing rules
-    fn resolve_name_ref(nr: NameRef) -> String {
-        Ident::new(
-            nr.text().to_string().trim_matches('"').to_string(),
-            nr.is_quoted(),
-        )
-        .resolve()
+    fn resolve_name_ref(nr: &NameRef) -> String {
+        Ident::new(nr.text().to_string(), nr.is_quoted()).resolve()
     }
 
     pub fn extract(stmt: &Stmt) -> Option<StatementFact> {
@@ -68,7 +58,6 @@ impl AstVisitor {
             _ => {}
         }
 
-        // Dynamically Cast Syntax Nodes for schema entities
         if let Some(node) = ast::CreateSchema::cast(syntax.clone()) {
             return Self::extract_create_schema(&node);
         }
@@ -79,7 +68,6 @@ impl AstVisitor {
             return Self::extract_drop_schema(&node);
         }
 
-        // Dynamically Cast Syntax Nodes for extended View/MatView operations
         if let Some(node) = ast::AlterView::cast(syntax.clone()) {
             return Self::extract_alter_view(&node);
         }
@@ -90,7 +78,6 @@ impl AstVisitor {
             return Self::extract_refresh(&node);
         }
 
-        // Dynamically Cast Syntax Nodes for secondary entities
         if let Some(node) = CreateSequence::cast(syntax.clone()) {
             return Self::extract_create_sequence(&node);
         }
@@ -128,7 +115,6 @@ impl AstVisitor {
             return Self::extract_drop_trigger(&node);
         }
 
-        // Dynamically Cast Syntax Nodes for advanced transaction blocks
         if ast::PrepareTransaction::cast(syntax.clone()).is_some() {
             let name = syntax
                 .descendants()
@@ -150,7 +136,67 @@ impl AstVisitor {
             return Some(StatementFact::SetConstraints);
         }
 
-        // Absolute Fallbacks for dynamic blocks
+        if let Some(node) = ast::CreateFunction::cast(syntax.clone()) {
+            return Self::extract_create_function(&node);
+        }
+        if let Some(node) = ast::AlterFunction::cast(syntax.clone()) {
+            return Self::extract_alter_function(&node);
+        }
+        if let Some(node) = ast::DropFunction::cast(syntax.clone()) {
+            return Self::extract_drop_function(&node);
+        }
+        if let Some(node) = ast::CreateProcedure::cast(syntax.clone()) {
+            return Self::extract_create_procedure(&node);
+        }
+        if let Some(node) = ast::AlterProcedure::cast(syntax.clone()) {
+            return Self::extract_alter_procedure(&node);
+        }
+        if let Some(node) = ast::DropProcedure::cast(syntax.clone()) {
+            return Self::extract_drop_procedure(&node);
+        }
+        if let Some(node) = ast::CreatePublication::cast(syntax.clone()) {
+            return Self::extract_create_publication(&node);
+        }
+        if let Some(node) = ast::AlterPublication::cast(syntax.clone()) {
+            return Self::extract_alter_publication(&node);
+        }
+        if let Some(node) = ast::DropPublication::cast(syntax.clone()) {
+            return Self::extract_drop_publication(&node);
+        }
+        if let Some(node) = ast::CreateSubscription::cast(syntax.clone()) {
+            return Self::extract_create_subscription(&node);
+        }
+        if let Some(node) = ast::AlterSubscription::cast(syntax.clone()) {
+            return Self::extract_alter_subscription(&node);
+        }
+        if let Some(node) = ast::DropSubscription::cast(syntax.clone()) {
+            return Self::extract_drop_subscription(&node);
+        }
+        if let Some(node) = ast::CreateRole::cast(syntax.clone()) {
+            return Self::extract_create_role(&node);
+        }
+        if let Some(node) = ast::AlterRole::cast(syntax.clone()) {
+            return Self::extract_alter_role(&node);
+        }
+        if let Some(node) = ast::DropRole::cast(syntax.clone()) {
+            return Self::extract_drop_role(&node);
+        }
+        if let Some(node) = Grant::cast(syntax.clone()) {
+            return Self::extract_grant(&node);
+        }
+        if let Some(node) = Revoke::cast(syntax.clone()) {
+            return Self::extract_revoke(&node);
+        }
+        if let Some(node) = CreateDatabase::cast(syntax.clone()) {
+            return Self::extract_create_database(&node);
+        }
+        if let Some(node) = ast::AlterDatabase::cast(syntax.clone()) {
+            return Self::extract_alter_database(&node);
+        }
+        if let Some(node) = ast::DropDatabase::cast(syntax.clone()) {
+            return Self::extract_drop_database(&node);
+        }
+
         let text = syntax.text().to_string();
         let upper = text.to_uppercase();
 
@@ -161,110 +207,67 @@ impl AstVisitor {
             return Some(StatementFact::Execute);
         }
 
-        // BUG FIX: Strict "Unknown" Gate
-        // Any valid SQL that is not explicitly mapped defaults to an opaque block
-        // to ensure it does not bypass the migration simulator silently.
         Some(StatementFact::OpaqueBlock)
     }
 
-    // ─────────────────────────────────────────────
-    // Schema Extractors
-    // ─────────────────────────────────────────────
-
     fn extract_create_schema(node: &ast::CreateSchema) -> Option<StatementFact> {
-        let ident = if let Some(n) = node.syntax().descendants().find_map(Name::cast) {
+        let name = node.name().map(|n| {
             Ident::new(
                 n.text().to_string().trim_matches('"').to_string(),
                 n.is_quoted(),
             )
-        } else if let Some(nr) = node.syntax().descendants().find_map(NameRef::cast) {
-            Ident::new(
-                nr.text().to_string().trim_matches('"').to_string(),
-                nr.is_quoted(),
-            )
-        } else {
-            return None;
-        };
+        })?;
 
         Some(StatementFact::CreateSchema {
-            name: QualifiedName::new(None, ident),
-            if_not_exists: node
-                .syntax()
-                .text()
-                .to_string()
-                .to_uppercase()
-                .contains("IF NOT EXISTS"),
+            name: QualifiedName::new(None, name),
+            if_not_exists: node.if_not_exists().is_some(),
         })
     }
 
     fn extract_alter_schema(node: &ast::AlterSchema) -> Option<StatementFact> {
-        let path = node.syntax().descendants().find_map(Path::cast)?;
-        let new_name = if let Some(rt) = node.syntax().descendants().find_map(RenameTo::cast) {
+        let nr = node.name_ref()?;
+        let name = QualifiedName::new(
+            None,
+            Ident::new(
+                nr.text().to_string().trim_matches('"').to_string(),
+                nr.is_quoted(),
+            ),
+        );
+        let new_name = node.rename_to().and_then(|rt| {
             rt.name().map(|n| {
                 Ident::new(
                     n.text().to_string().trim_matches('"').to_string(),
                     n.is_quoted(),
                 )
             })
-        } else {
-            None
-        };
-        Some(StatementFact::AlterSchema {
-            name: Self::path_to_qualified_name(&path)?,
-            new_name,
-        })
+        });
+        Some(StatementFact::AlterSchema { name, new_name })
     }
 
     fn extract_drop_schema(node: &ast::DropSchema) -> Option<StatementFact> {
-        let mut names = Vec::new();
-        for n in node.syntax().descendants().filter_map(NameRef::cast) {
-            let txt = n.text().to_string();
-            let upper = txt.to_uppercase();
-            if upper != "SCHEMA"
-                && upper != "IF"
-                && upper != "EXISTS"
-                && upper != "CASCADE"
-                && upper != "RESTRICT"
-            {
-                names.push(QualifiedName::new(
-                    None,
-                    Ident::new(txt.trim_matches('"').to_string(), n.is_quoted()),
-                ));
-            }
-        }
-
-        // Fallback for Name just in case the parser binds it as a declaration
-        for n in node.syntax().descendants().filter_map(Name::cast) {
-            let txt = n.text().to_string();
-            let upper = txt.to_uppercase();
-            if upper != "SCHEMA"
-                && upper != "IF"
-                && upper != "EXISTS"
-                && upper != "CASCADE"
-                && upper != "RESTRICT"
-            {
-                names.push(QualifiedName::new(
-                    None,
-                    Ident::new(txt.trim_matches('"').to_string(), n.is_quoted()),
-                ));
-            }
-        }
+        // DROP SCHEMA uses NameRef nodes (bare identifiers), NOT Path nodes.
+        // Squawk's DropSchema accessor exposes name_refs() for exactly this reason.
+        let names: Vec<QualifiedName> = node
+            .name_refs()
+            .map(|nr| {
+                let ident = Ident::new(
+                    nr.text().to_string().trim_matches('"').to_string(),
+                    nr.is_quoted(),
+                );
+                QualifiedName::new(None, ident)
+            })
+            .collect();
 
         if names.is_empty() {
             return None;
         }
 
-        let text = node.syntax().text().to_string().to_uppercase();
         Some(StatementFact::DropSchema {
             names,
-            if_exists: text.contains("IF EXISTS"),
-            cascade: text.contains("CASCADE"),
+            if_exists: node.if_exists().is_some(),
+            cascade: node.cascade_token().is_some(),
         })
     }
-
-    // ─────────────────────────────────────────────
-    // Table Extractors
-    // ─────────────────────────────────────────────
 
     fn extract_create_table(node: &CreateTable) -> Option<StatementFact> {
         let path = node.syntax().descendants().find_map(Path::cast)?;
@@ -280,17 +283,10 @@ impl AstVisitor {
             _ => PersistenceFact::Permanent,
         };
 
-        let partition_by = node
-            .syntax()
-            .descendants()
-            .find_map(ast::PartitionBy::cast)
-            .map(|p| p.syntax().text().to_string());
-
+        let partition_by = node.partition_by().map(|p| p.syntax().text().to_string());
         let partition_of = node
-            .syntax()
-            .descendants()
-            .find_map(ast::PartitionOf::cast)
-            .and_then(|p| p.syntax().descendants().find_map(Path::cast))
+            .partition_of()
+            .and_then(|p| p.path())
             .and_then(|p| Self::path_to_qualified_name(&p));
 
         let (columns, foreign_keys, table_constraints) = node
@@ -312,7 +308,7 @@ impl AstVisitor {
     }
 
     fn extract_create_table_as(node: &CreateTableAs) -> Option<StatementFact> {
-        let path = node.syntax().descendants().find_map(Path::cast)?;
+        let path = node.path()?;
         let persistence = match node
             .persistence()
             .map(|p| p.syntax().text().to_string().to_lowercase())
@@ -336,7 +332,7 @@ impl AstVisitor {
     }
 
     fn extract_drop_table(node: &DropTable) -> Option<StatementFact> {
-        let path = node.syntax().descendants().find_map(Path::cast)?;
+        let path = node.paths().next()?;
         Some(StatementFact::DropTable {
             name: Self::path_to_qualified_name(&path)?,
             if_exists: node.if_exists().is_some(),
@@ -349,17 +345,12 @@ impl AstVisitor {
         let table_name = Self::path_to_qualified_name(&path)?;
         let mut actions = Vec::new();
 
-        // BUG FIX: The parser drops the SetAccessMethod node completely in some scenarios.
-        // We capture it reliably via syntax text check at the table level.
         let full_text = node.syntax().text().to_string().to_lowercase();
         if full_text.contains("set access method") {
             actions.push(AlterTableActionFact::SetAccessMethod);
         }
 
         for action in node.actions() {
-            // ARCHITECTURAL WARNING: `PartitionForValuesFrom` bounds for multi-column partitions
-            // are structurally ambiguous in the AST. If bound overlap rules are added in the future,
-            // do not naively split `exprs()`. They must be mapped against the parent table's partition key.
             if let Some(ap) = AttachPartition::cast(action.syntax().clone()) {
                 if let Some(child_path) = ap.syntax().descendants().find_map(Path::cast)
                     && let Some(child) = Self::path_to_qualified_name(&child_path)
@@ -377,16 +368,16 @@ impl AstVisitor {
                 continue;
             }
             if let Some(ac) = AlterConstraint::cast(action.syntax().clone()) {
-                if let Some(name_ref) = ac.syntax().descendants().find_map(NameRef::cast) {
-                    let name = Self::resolve_name_ref(name_ref);
-                    let deferrable = ac
-                        .syntax()
-                        .text()
-                        .to_string()
-                        .to_lowercase()
-                        .contains("deferrable");
-                    actions.push(AlterTableActionFact::AlterConstraint { name, deferrable });
-                }
+                let deferrable = ac
+                    .syntax()
+                    .text()
+                    .to_string()
+                    .to_lowercase()
+                    .contains("deferrable");
+                actions.push(AlterTableActionFact::AlterConstraint {
+                    name: None,
+                    deferrable,
+                });
                 continue;
             }
             if let Some(rc) = ast::RenameConstraint::cast(action.syntax().clone()) {
@@ -394,7 +385,7 @@ impl AstVisitor {
                     .syntax()
                     .descendants()
                     .find_map(NameRef::cast)
-                    .map(Self::resolve_name_ref);
+                    .map(|nr| Self::resolve_name_ref(&nr));
                 let new_name = rc
                     .syntax()
                     .descendants()
@@ -433,7 +424,7 @@ impl AstVisitor {
                     }
                 }
                 AlterTableAction::DropColumn(drop) => {
-                    if let Some(name) = drop.name_ref().map(Self::resolve_name_ref) {
+                    if let Some(name) = drop.name_ref().map(|nr| Self::resolve_name_ref(&nr)) {
                         actions.push(AlterTableActionFact::DropColumn {
                             name,
                             if_exists: drop.if_exists().is_some(),
@@ -466,7 +457,6 @@ impl AstVisitor {
                                 nr.is_quoted(),
                             )
                         })
-                        // FIX: Corrected nr to n below
                         .or_else(|| {
                             rc.syntax().descendants().find_map(Name::cast).map(|n| {
                                 Ident::new(
@@ -496,17 +486,16 @@ impl AstVisitor {
                     }
                 }
                 AlterTableAction::DropConstraint(dc) => {
-                    if let Some(name) = dc.name_ref().map(Self::resolve_name_ref) {
+                    if let Some(name) = dc.name_ref().map(|nr| Self::resolve_name_ref(&nr)) {
                         actions.push(AlterTableActionFact::DropConstraint { name });
                     }
                 }
                 AlterTableAction::AlterColumn(alter_col) => {
-                    // Provide multiple fallbacks for the column identifier parsing
                     let col_ident = alter_col
                         .syntax()
                         .descendants()
                         .find_map(NameRef::cast)
-                        .map(Self::resolve_name_ref)
+                        .map(|nr| Self::resolve_name_ref(&nr))
                         .or_else(|| {
                             alter_col
                                 .syntax()
@@ -516,7 +505,6 @@ impl AstVisitor {
                         });
 
                     if let Some(col_name) = col_ident {
-                        // BUG FIX: SET STORAGE might lack the option() payload
                         let txt = alter_col.syntax().text().to_string().to_lowercase();
                         if txt.contains("set storage") {
                             actions.push(AlterTableActionFact::SetStorage {
@@ -534,14 +522,23 @@ impl AstVisitor {
                         .syntax()
                         .descendants()
                         .find_map(NameRef::cast)
-                        .map(Self::resolve_name_ref)
+                        .map(|nr| Self::resolve_name_ref(&nr))
                     {
                         actions.push(AlterTableActionFact::ValidateConstraint { constraint_name });
                     }
                 }
                 _ => {
-                    // Ultimate action-level text fallback for SET STORAGE if it failed strong typing entirely
                     let txt = action.syntax().text().to_string().to_lowercase();
+                    if txt.contains("disable trigger") {
+                        let trigger_name = txt.split("disable trigger").last()
+                            .map(|s| s.trim().trim_matches('"').to_string());
+                        actions.push(AlterTableActionFact::DisableTrigger { trigger_name });
+                    } else if txt.contains("enable trigger") {
+                        let trigger_name = txt.split("enable trigger").last()
+                            .map(|s| s.trim().trim_matches('"').to_string());
+                        actions.push(AlterTableActionFact::EnableTrigger { trigger_name });
+                    }
+
                     if txt.contains("set storage") {
                         let parts: Vec<&str> = txt.split_whitespace().collect();
                         if let Some(idx) = parts.iter().position(|&p| p == "column")
@@ -555,7 +552,6 @@ impl AstVisitor {
             }
         }
 
-        // Global fallback for SET STORAGE if node.actions() completely rejected it
         if actions.is_empty() && full_text.contains("set storage") {
             let parts: Vec<&str> = full_text.split_whitespace().collect();
             if let Some(idx) = parts.iter().position(|&p| p == "column")
@@ -579,9 +575,6 @@ impl AstVisitor {
         let mut foreign_keys = Vec::new();
         let mut table_constraints = Vec::new();
 
-        // ARCHITECTURAL WARNING: Do NOT use `arg.can_cast()` as a pre-filter here.
-        // squawk's TableArg::can_cast() returns false for table constraints due to a parser
-        // code-gen bug, but actual enum casting via `match` works perfectly.
         for arg in args {
             match arg {
                 TableArg::Column(col) => {
@@ -592,6 +585,16 @@ impl AstVisitor {
                         columns.push(fact);
                     }
                 }
+                TableArg::LikeClause(like) => {
+                    if let Some(path) = like.syntax().descendants().find_map(Path::cast)
+                        && let Some(_parent) = Self::path_to_qualified_name(&path)
+                    {
+                        // In the future, we may need to track 'Like' clauses as a specific
+                        // mutation fact to properly model schema dependency and inheritance.
+                        // For now, we omit them from the core table creation facts as
+                        // they do not create column definitions in the current AST.
+                    }
+                }
                 TableArg::TableConstraint(tc) => {
                     if let Some(fk) = Self::extract_table_fk_fact(&tc) {
                         foreign_keys.push(fk);
@@ -600,7 +603,6 @@ impl AstVisitor {
                         table_constraints.push(tc_fact);
                     }
                 }
-                _ => {}
             }
         }
         (columns, foreign_keys, table_constraints)
@@ -667,6 +669,45 @@ impl AstVisitor {
                 default: sd
                     .expr()
                     .map(crate::analysis::expr_visitor::ExprVisitor::convert),
+            }),
+            AlterColumnOption::SetExpression(se) => Some(AlterTableActionFact::SetExpression {
+                column: col_name,
+                expr: se
+                    .expr()
+                    .map(crate::analysis::expr_visitor::ExprVisitor::convert)
+                    .unwrap_or(ExprIr::Omitted),
+            }),
+            AlterColumnOption::SetOptions(so) => Some(AlterTableActionFact::SetOptions {
+                column: col_name,
+                attributes: so
+                    .attribute_list()
+                    .map(|al| {
+                        al.attribute_options()
+                            .map(|ao| crate::analysis::facts::AttributeFact {
+                                name: ao.name().map(|n| n.text().to_string()).unwrap_or_default(),
+                                value: ao.syntax().descendants().find_map(ast::Literal::cast).map(|l| l.syntax().text().to_string()).unwrap_or_default(),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            }),
+            AlterColumnOption::Inherit(i) => Some(AlterTableActionFact::Inherit {
+                column: col_name,
+                parent: i
+                    .syntax()
+                    .descendants()
+                    .find_map(Path::cast)
+                    .and_then(|p| Self::path_to_qualified_name(&p))
+                    .unwrap_or_else(|| QualifiedName::new(None, Ident::new("unknown".to_string(), false))),
+            }),
+            AlterColumnOption::NoInherit(ni) => Some(AlterTableActionFact::NoInherit {
+                column: col_name,
+                parent: ni
+                    .syntax()
+                    .descendants()
+                    .find_map(Path::cast)
+                    .and_then(|p| Self::path_to_qualified_name(&p))
+                    .unwrap_or_else(|| QualifiedName::new(None, Ident::new("unknown".to_string(), false))),
             }),
             _ => None,
         }
@@ -789,7 +830,7 @@ impl AstVisitor {
                 .constraint_name()
                 .and_then(|cn| cn.name())
                 .map(Self::resolve_name);
-            let path = fkc.syntax().descendants().find_map(Path::cast)?;
+            let path = fkc.path()?;
             let references = Self::path_to_qualified_name(&path)?;
             let from_columns = fkc
                 .from_columns()
@@ -812,20 +853,15 @@ impl AstVisitor {
 
     fn extract_column_list_names(cl: ast::ColumnList) -> Vec<String> {
         cl.columns()
-            .filter_map(|col| col.name_ref().map(Self::resolve_name_ref))
+            .filter_map(|col| col.name_ref().map(|nr| Self::resolve_name_ref(&nr)))
             .collect()
     }
-
-    // ─────────────────────────────────────────────
-    // Index Extractors
-    // ─────────────────────────────────────────────
 
     fn extract_create_index(node: &CreateIndex) -> Option<StatementFact> {
         let relation_path = node.syntax().descendants().find_map(Path::cast)?;
         let relation = Self::path_to_qualified_name(&relation_path)?;
 
-        // BUG FIX: Support unnamed indexes (auto-generated by PostgreSQL)
-        let index_ident = if let Some(name) = node.syntax().descendants().find_map(Name::cast) {
+        let index_ident = if let Some(name) = node.name() {
             Ident::new(
                 name.text().to_string().trim_matches('"').to_string(),
                 name.is_quoted(),
@@ -838,22 +874,11 @@ impl AstVisitor {
         };
 
         let using_method = node
-            .syntax()
-            .descendants()
-            .find_map(UsingMethod::cast)
-            .map(|um| {
-                um.syntax()
-                    .text()
-                    .to_string()
-                    .to_lowercase()
-                    .replace("using", "")
-                    .trim()
-                    .to_string()
-            });
-        let has_predicate = node
-            .syntax()
-            .descendants()
-            .any(|d| WhereClause::can_cast(d.kind()));
+            .using_method()
+            .map(|um| um.name_ref().map(|nr| nr.text().to_string().to_uppercase()).unwrap_or_default());
+
+        let has_predicate = node.where_clause().is_some();
+        let unique = node.unique_token().is_some();
 
         Some(StatementFact::CreateIndex {
             name: QualifiedName::new(None, index_ident),
@@ -862,11 +887,12 @@ impl AstVisitor {
             concurrently: node.concurrently_token().is_some(),
             using_method,
             has_predicate,
+            unique,
         })
     }
 
     fn extract_alter_index(node: &AlterIndex) -> Option<StatementFact> {
-        let path = node.syntax().descendants().find_map(Path::cast)?;
+        let path = node.path()?;
         let name = Self::path_to_qualified_name(&path)?;
         let mut actions = Vec::new();
 
@@ -889,9 +915,7 @@ impl AstVisitor {
 
     fn extract_drop_index(node: &DropIndex) -> Option<StatementFact> {
         let names: Vec<QualifiedName> = node
-            .syntax()
-            .children()
-            .filter_map(Path::cast)
+            .paths()
             .filter_map(|p| Self::path_to_qualified_name(&p))
             .collect();
         if names.is_empty() {
@@ -904,36 +928,25 @@ impl AstVisitor {
         })
     }
 
-    // ─────────────────────────────────────────────
-    // View Extractors
-    // ─────────────────────────────────────────────
-
     fn extract_create_view(node: &CreateView) -> Option<StatementFact> {
-        let path = node.syntax().descendants().find_map(Path::cast)?;
+        let path = node.path()?;
         Some(StatementFact::CreateView {
             name: Self::path_to_qualified_name(&path)?,
-            or_replace: node
-                .syntax()
-                .text()
-                .to_string()
-                .to_lowercase()
-                .contains("or replace"),
+            or_replace: node.or_replace().is_some(),
             depends_on: Self::extract_view_dependencies(node.syntax()),
         })
     }
 
     fn extract_alter_view(node: &ast::AlterView) -> Option<StatementFact> {
-        let path = node.syntax().descendants().find_map(Path::cast)?;
-        let new_name = if let Some(rt) = node.syntax().descendants().find_map(RenameTo::cast) {
+        let path = node.path()?;
+        let new_name = node.syntax().descendants().find_map(RenameTo::cast).and_then(|rt| {
             rt.name().map(|n| {
                 Ident::new(
                     n.text().to_string().trim_matches('"').to_string(),
                     n.is_quoted(),
                 )
             })
-        } else {
-            None
-        };
+        });
         Some(StatementFact::AlterView {
             name: Self::path_to_qualified_name(&path)?,
             new_name,
@@ -941,7 +954,7 @@ impl AstVisitor {
     }
 
     fn extract_create_materialized_view(node: &CreateMaterializedView) -> Option<StatementFact> {
-        let path = node.syntax().descendants().find_map(Path::cast)?;
+        let path = node.path()?;
         Some(StatementFact::CreateMaterializedView {
             name: Self::path_to_qualified_name(&path)?,
             depends_on: Self::extract_view_dependencies(node.syntax()),
@@ -949,17 +962,19 @@ impl AstVisitor {
     }
 
     fn extract_alter_materialized_view(node: &ast::AlterMaterializedView) -> Option<StatementFact> {
-        let path = node.syntax().descendants().find_map(Path::cast)?;
-        let new_name = if let Some(rt) = node.syntax().descendants().find_map(RenameTo::cast) {
-            rt.name().map(|n| {
-                Ident::new(
-                    n.text().to_string().trim_matches('"').to_string(),
-                    n.is_quoted(),
-                )
-            })
-        } else {
-            None
-        };
+        let path = node.path()?;
+        let new_name = node.action().find_map(|action| {
+            if let squawk_syntax::ast::AlterMaterializedViewAction::RenameTo(rt) = action {
+                rt.name().map(|n| {
+                    Ident::new(
+                        n.text().to_string().trim_matches('"').to_string(),
+                        n.is_quoted(),
+                    )
+                })
+            } else {
+                None
+            }
+        });
         Some(StatementFact::AlterMaterializedView {
             name: Self::path_to_qualified_name(&path)?,
             new_name,
@@ -967,42 +982,25 @@ impl AstVisitor {
     }
 
     fn extract_refresh(node: &ast::Refresh) -> Option<StatementFact> {
-        let path = node.syntax().descendants().find_map(Path::cast)?;
+        let path = node.path()?;
         Some(StatementFact::RefreshMaterializedView {
             name: Self::path_to_qualified_name(&path)?,
-            concurrently: node
-                .syntax()
-                .text()
-                .to_string()
-                .to_uppercase()
-                .contains("CONCURRENTLY"),
+            concurrently: node.concurrently_token().is_some(),
         })
     }
 
     fn extract_drop_view(node: &DropView) -> Option<StatementFact> {
-        // ARCHITECTURAL WARNING: squawk's DropView::path() accessor has a code-gen bug
-        // and only returns the first view in a `DROP VIEW v1, v2` statement.
-        // We intentionally bypass it and sweep the raw syntax tree to find all paths.
-        let names: Vec<QualifiedName> = node
-            .syntax()
-            .children()
-            .filter_map(Path::cast)
-            .filter_map(|p| Self::path_to_qualified_name(&p))
-            .collect();
-        if names.is_empty() {
-            return None;
-        }
+        let path = node.paths().next()?;
         Some(StatementFact::DropView {
-            names,
+            name: Self::path_to_qualified_name(&path)?,
             if_exists: node.if_exists().is_some(),
+            cascade: node.cascade_token().is_some(),
         })
     }
 
     fn extract_drop_materialized_view(node: &DropMaterializedView) -> Option<StatementFact> {
         let names: Vec<QualifiedName> = node
-            .syntax()
-            .children()
-            .filter_map(Path::cast)
+            .paths()
             .filter_map(|p| Self::path_to_qualified_name(&p))
             .collect();
         if names.is_empty() {
@@ -1011,43 +1009,18 @@ impl AstVisitor {
         Some(StatementFact::DropMaterializedView {
             names,
             if_exists: node.if_exists().is_some(),
+            cascade: node.cascade_token().is_some(),
         })
     }
 
     fn extract_view_dependencies(syntax: &squawk_syntax::SyntaxNode) -> Vec<QualifiedName> {
         let mut depends_on = Vec::new();
         let keywords = [
-            "SELECT",
-            "FROM",
-            "WHERE",
-            "JOIN",
-            "ON",
-            "AND",
-            "OR",
-            "AS",
-            "WITH",
-            "GROUP",
-            "BY",
-            "HAVING",
-            "LIMIT",
-            "OFFSET",
-            "ORDER",
-            "ASC",
-            "DESC",
-            "IN",
-            "NOT",
-            "IS",
-            "NULL",
-            "UNION",
-            "ALL",
-            "EXCEPT",
-            "INTERSECT",
-            "TRUE",
-            "FALSE",
+            "SELECT", "FROM", "WHERE", "JOIN", "ON", "AND", "OR", "AS", "WITH", "GROUP", "BY",
+            "HAVING", "LIMIT", "OFFSET", "ORDER", "ASC", "DESC", "IN", "NOT", "IS", "NULL",
+            "UNION", "ALL", "EXCEPT", "INTERSECT", "TRUE", "FALSE",
         ];
 
-        // BUG FIX: Isolate external dependencies by excluding locally defined aliases and CTEs.
-        // In the squawk AST, `Name` nodes represent declarations, while `NameRef` represents usages.
         let mut local_declarations = Vec::new();
         for name_node in syntax.descendants().filter_map(Name::cast) {
             local_declarations.push(name_node.text().to_string().trim_matches('"').to_string());
@@ -1059,12 +1032,10 @@ impl AstVisitor {
             let is_quoted = n.is_quoted();
             let clean_text = text.trim_matches('"').to_string();
 
-            // Ignore SQL keywords
             if !is_quoted && keywords.contains(&upper.as_str()) {
                 continue;
             }
 
-            // If this NameRef matches a locally declared CTE or alias, skip it!
             if local_declarations.contains(&clean_text) {
                 continue;
             }
@@ -1077,27 +1048,18 @@ impl AstVisitor {
         depends_on
     }
 
-    // ─────────────────────────────────────────────
-    // Sequence Extractors
-    // ─────────────────────────────────────────────
-
     fn extract_create_sequence(node: &CreateSequence) -> Option<StatementFact> {
-        let path = node.syntax().descendants().find_map(Path::cast)?;
+        let path = node.path()?;
         let name = Self::path_to_qualified_name(&path)?;
         Some(StatementFact::CreateSequence {
             name,
-            if_not_exists: node
-                .syntax()
-                .text()
-                .to_string()
-                .to_lowercase()
-                .contains("if not exists"),
+            if_not_exists: node.if_not_exists().is_some(),
             owned_by: Self::extract_owned_by(node.syntax()),
         })
     }
 
     fn extract_alter_sequence(node: &AlterSequence) -> Option<StatementFact> {
-        let path = node.syntax().descendants().find_map(Path::cast)?;
+        let path = node.path()?;
         let name = Self::path_to_qualified_name(&path)?;
         Some(StatementFact::AlterSequence {
             name,
@@ -1106,27 +1068,21 @@ impl AstVisitor {
     }
 
     fn extract_drop_sequence(node: &DropSequence) -> Option<StatementFact> {
-        let names = node
-            .syntax()
-            .children()
-            .filter_map(Path::cast)
+        let names: Vec<QualifiedName> = node
+            .paths()
             .filter_map(|p| Self::path_to_qualified_name(&p))
             .collect();
+
         Some(StatementFact::DropSequence {
             names,
-            if_exists: node
-                .syntax()
-                .text()
-                .to_string()
-                .to_lowercase()
-                .contains("if exists"),
+            if_exists: node.if_exists().is_some(),
+            cascade: node.cascade_token().is_some(),
         })
     }
 
     fn extract_owned_by(node: &squawk_syntax::SyntaxNode) -> Option<(QualifiedName, String)> {
         for opt in node.descendants().filter_map(ast::SequenceOption::cast) {
             if opt.owned_token().is_some() {
-                // If it's OWNED BY NONE, path() will be None.
                 let path = opt.path()?;
 
                 let segments: Vec<PathSegment> = path
@@ -1154,48 +1110,53 @@ impl AstVisitor {
         None
     }
 
-    // ─────────────────────────────────────────────
-    // Type & Domain Extractors
-    // ─────────────────────────────────────────────
-
     fn extract_create_domain(node: &CreateDomain) -> Option<StatementFact> {
-        let path = node.syntax().descendants().find_map(Path::cast)?;
+        let path = node.path()?;
+        let base_type = node.ty().map(|t| t.syntax().text().to_string()).unwrap_or_else(|| "<domain>".to_string());
         Some(StatementFact::CreateDomain {
             name: Self::path_to_qualified_name(&path)?,
-            base_type: "<domain>".to_string(),
+            base_type,
         })
     }
 
     fn extract_alter_domain(node: &AlterDomain) -> Option<StatementFact> {
-        let path = node.syntax().descendants().find_map(Path::cast)?;
+        let path = node.path()?;
+        let action = node.action().map(|a| match a {
+            squawk_syntax::ast::AlterDomainAction::AddConstraint(_) => crate::analysis::facts::AlterDomainActionFact::AddConstraint,
+            squawk_syntax::ast::AlterDomainAction::DropConstraint(_) => crate::analysis::facts::AlterDomainActionFact::DropConstraint,
+            squawk_syntax::ast::AlterDomainAction::DropDefault(_) => crate::analysis::facts::AlterDomainActionFact::DropDefault,
+            squawk_syntax::ast::AlterDomainAction::DropNotNull(_) => crate::analysis::facts::AlterDomainActionFact::DropNotNull,
+            squawk_syntax::ast::AlterDomainAction::OwnerTo(_) => crate::analysis::facts::AlterDomainActionFact::OwnerChange,
+            squawk_syntax::ast::AlterDomainAction::RenameConstraint(_) => crate::analysis::facts::AlterDomainActionFact::RenameConstraint,
+            squawk_syntax::ast::AlterDomainAction::RenameTo(_) => crate::analysis::facts::AlterDomainActionFact::RenameTo,
+            squawk_syntax::ast::AlterDomainAction::SetDefault(_) => crate::analysis::facts::AlterDomainActionFact::SetDefault,
+            squawk_syntax::ast::AlterDomainAction::SetNotNull(_) => crate::analysis::facts::AlterDomainActionFact::SetNotNull,
+            squawk_syntax::ast::AlterDomainAction::SetSchema(_) => crate::analysis::facts::AlterDomainActionFact::SetSchema,
+            squawk_syntax::ast::AlterDomainAction::ValidateConstraint(_) => crate::analysis::facts::AlterDomainActionFact::ValidateConstraint,
+        });
         Some(StatementFact::AlterDomain {
             name: Self::path_to_qualified_name(&path)?,
+            action,
         })
     }
 
     fn extract_drop_domain(node: &DropDomain) -> Option<StatementFact> {
-        let names = node
-            .syntax()
-            .children()
-            .filter_map(Path::cast)
+        let names: Vec<QualifiedName> = node
+            .paths()
             .filter_map(|p| Self::path_to_qualified_name(&p))
             .collect();
+
         Some(StatementFact::DropDomain {
             names,
-            if_exists: node
-                .syntax()
-                .text()
-                .to_string()
-                .to_lowercase()
-                .contains("if exists"),
+            if_exists: node.if_exists().is_some(),
+            cascade: node.cascade_token().is_some(),
         })
     }
 
     fn extract_create_type(node: &CreateType) -> Option<StatementFact> {
-        let path = node.syntax().descendants().find_map(Path::cast)?;
+        let path = node.path()?;
         let name = Self::path_to_qualified_name(&path)?;
 
-        // BUG FIX: Explicit kind extraction (avoids dropping Base/Composite/Range types)
         let kind = if node.enum_token().is_some() {
             TypeCreationKind::Enum
         } else if node.range_token().is_some() {
@@ -1210,92 +1171,700 @@ impl AstVisitor {
     }
 
     fn extract_alter_type(node: &AlterType) -> Option<StatementFact> {
-        let path = node.syntax().descendants().find_map(Path::cast)?;
+        let path = node.path()?;
         let name = Self::path_to_qualified_name(&path)?;
         let mut actions = Vec::new();
-        for child in node.syntax().children() {
-            if let Some(av) = child.descendants().find_map(AddValue::cast)
-                && let Some(lit) = av.literal()
-            {
-                actions.push(AlterTypeActionFact::AddValue {
-                    new_value: lit
-                        .syntax()
-                        .text()
-                        .to_string()
-                        .trim_matches('\'')
-                        .to_string(),
-                });
-            }
+
+        if let Some(av) = node.add_value()
+            && let Some(lit) = av.literal()
+        {
+            actions.push(AlterTypeActionFact::AddValue {
+                new_value: lit
+                    .syntax()
+                    .text()
+                    .to_string()
+                    .trim_matches('\'')
+                    .to_string(),
+            });
         }
+
         Some(StatementFact::AlterType(AlterTypeFact { name, actions }))
     }
 
-    // ─────────────────────────────────────────────
-    // Policy & Trigger Extractors
-    // ─────────────────────────────────────────────
-
     fn extract_create_policy(node: &CreatePolicy) -> Option<StatementFact> {
-        let name = Self::resolve_name(node.syntax().descendants().find_map(Name::cast)?);
+        let name = node.name().map(Self::resolve_name)?;
         let path = node.syntax().descendants().find_map(Path::cast)?;
         let table = Self::path_to_qualified_name(&path)?;
-        Some(StatementFact::CreatePolicy { name, table })
+        
+        let permissive = if let Some(as_type) = node.as_policy_type() {
+            as_type.ident_token()
+                .map(|t| t.text().to_lowercase())
+                .map(|t| t == "permissive")
+                .unwrap_or(true)
+        } else {
+            true
+        };
+
+        let command = if node.all_token().is_some() {
+            crate::analysis::facts::PolicyCommand::All
+        } else if node.select_token().is_some() {
+            crate::analysis::facts::PolicyCommand::Select
+        } else if node.insert_token().is_some() {
+            crate::analysis::facts::PolicyCommand::Insert
+        } else if node.update_token().is_some() {
+            crate::analysis::facts::PolicyCommand::Update
+        } else if node.delete_token().is_some() {
+            crate::analysis::facts::PolicyCommand::Delete
+        } else {
+            crate::analysis::facts::PolicyCommand::All
+        };
+
+        Some(StatementFact::CreatePolicy {
+            name,
+            table,
+            permissive,
+            command,
+        })
     }
 
     fn extract_drop_policy(node: &DropPolicy) -> Option<StatementFact> {
-        let paths: Vec<_> = node.syntax().descendants().filter_map(Path::cast).collect();
-        let table = Self::path_to_qualified_name(paths.last()?)?;
-        let text = node.syntax().text().to_string();
-        let name = Self::extract_name_before_on(&text)?;
+        let path = node.syntax().descendants().find_map(Path::cast)?;
+        let table = Self::path_to_qualified_name(&path)?;
+        let name = Self::resolve_name_ref(&node.name_ref()?);
         Some(StatementFact::DropPolicy {
             name,
             table,
-            if_exists: text.to_lowercase().contains("if exists"),
+            if_exists: node.if_exists().is_some(),
         })
     }
 
     fn extract_create_trigger(node: &CreateTrigger) -> Option<StatementFact> {
-        let name = Self::resolve_name(node.syntax().descendants().find_map(Name::cast)?);
-        let path = node.syntax().descendants().find_map(Path::cast)?;
-        let table = Self::path_to_qualified_name(&path)?;
-        Some(StatementFact::CreateTrigger { name, table })
+        let name = node.name().map(Self::resolve_name)?;
+        // The ON table path is the LAST path descendant (after the trigger events clause)
+        let table = node
+            .on_table()
+            .and_then(|on| on.path())
+            .and_then(|p| Self::path_to_qualified_name(&p))?;
+        let function = node.call_expr().and_then(|call| {
+            let node_ref = call.syntax();
+            let fn_name = node_ref.descendants().find_map(Name::cast)
+                .map(|n| {
+                    let ident = Ident::new(
+                        n.text().to_string().trim_matches('"').to_string(),
+                        n.is_quoted(),
+                    );
+                    QualifiedName::new(None, ident)
+                });
+            if fn_name.is_some() {
+                return fn_name;
+            }
+            node_ref.descendants().find_map(NameRef::cast).map(|n| {
+                let ident = Ident::new(
+                    n.text().to_string().trim_matches('"').to_string(),
+                    n.is_quoted(),
+                );
+                QualifiedName::new(None, ident)
+            })
+        });
+        Some(StatementFact::CreateTrigger { name, table, function })
     }
 
     fn extract_drop_trigger(node: &DropTrigger) -> Option<StatementFact> {
-        let paths: Vec<_> = node.syntax().descendants().filter_map(Path::cast).collect();
-        let table = Self::path_to_qualified_name(paths.last()?)?;
-        let text = node.syntax().text().to_string();
-        let name = Self::extract_name_before_on(&text)?;
+        let trigger_path = node.path()?;
+        let trigger_name = Self::path_to_qualified_name(&trigger_path)?.name.resolve();
+        let table_path = node.on_table()?.path()?;
+        let table = Self::path_to_qualified_name(&table_path)?;
         Some(StatementFact::DropTrigger {
-            name,
+            name: trigger_name,
             table,
-            if_exists: text.to_lowercase().contains("if exists"),
+            if_exists: node.if_exists().is_some(),
         })
     }
 
-    fn extract_name_before_on(text: &str) -> Option<String> {
-        let upper = text.to_uppercase();
-        let on_idx = upper.find(" ON ")?;
-        let before_on = &text[..on_idx];
-        let raw_name = before_on.split_whitespace().last()?;
-        Some(
-            Ident::new(
-                raw_name.trim_matches('"').to_string(),
-                raw_name.starts_with('"'),
-            )
-            .resolve(),
-        )
+    fn extract_param(param: &squawk_syntax::ast::Param) -> crate::analysis::facts::ParamFact {
+        crate::analysis::facts::ParamFact {
+            mode: match param.mode() {
+                Some(ast::ParamMode::ParamVariadic(_)) => crate::analysis::facts::ParamModeFact::Variadic,
+                Some(ast::ParamMode::ParamInOut(_)) => crate::analysis::facts::ParamModeFact::InOut,
+                Some(ast::ParamMode::ParamOut(_)) => crate::analysis::facts::ParamModeFact::Out,
+                _ => crate::analysis::facts::ParamModeFact::In,
+            },
+            name: param.name().map(Self::resolve_name),
+            ty: param.ty().map(|t| t.syntax().text().to_string()).unwrap_or_else(|| "unknown".into()),
+            default: param.param_default().and_then(|pd| pd.expr().map(crate::analysis::expr_visitor::ExprVisitor::convert)),
+        }
     }
 
-    // ─────────────────────────────────────────────
-    // Transaction & Environment Extractors
-    // ─────────────────────────────────────────────
+    fn extract_ret_type(ret: &squawk_syntax::ast::RetType) -> crate::analysis::facts::RetTypeFact {
+        if let Some(tal) = ret.table_arg_list() {
+            let cols = tal.args()
+                .filter_map(|arg| match arg {
+                    TableArg::Column(col) => Self::extract_column_fact(&col),
+                    _ => None,
+                })
+                .collect();
+            crate::analysis::facts::RetTypeFact::Table(cols)
+        } else {
+            let ty = ret.ty().map(|t| t.syntax().text().to_string()).unwrap_or_else(|| "unknown".into());
+            crate::analysis::facts::RetTypeFact::Scalar(ty)
+        }
+    }
+
+    fn extract_func_option(opt: &squawk_syntax::ast::FuncOption) -> crate::analysis::facts::FuncOptionFact {
+        match opt {
+            ast::FuncOption::LanguageFuncOption(f) => {
+                crate::analysis::facts::FuncOptionFact::Language(
+                    f.name_ref()
+                        .map(|n| n.text().to_string())
+                        .unwrap_or_default(),
+                )
+            }
+            ast::FuncOption::VolatilityFuncOption(f) => {
+                let vol = if f.immutable_token().is_some() {
+                    crate::analysis::facts::VolatilityKind::Immutable
+                } else if f.stable_token().is_some() {
+                    crate::analysis::facts::VolatilityKind::Stable
+                } else {
+                    crate::analysis::facts::VolatilityKind::Volatile
+                };
+                crate::analysis::facts::FuncOptionFact::Volatility(vol)
+            }
+            ast::FuncOption::SecurityFuncOption(f) => {
+                let sec = if f.invoker_token().is_some() {
+                    crate::analysis::facts::SecurityKind::Invoker
+                } else {
+                    crate::analysis::facts::SecurityKind::Definer
+                };
+                crate::analysis::facts::FuncOptionFact::Security(sec)
+            }
+            ast::FuncOption::StrictFuncOption(f) => {
+                let strct = if f.called_token().is_some() {
+                    crate::analysis::facts::StrictKind::CalledOnNull
+                } else if f.returns_token().is_some() {
+                    crate::analysis::facts::StrictKind::ReturnsNullOnNull
+                } else {
+                    crate::analysis::facts::StrictKind::Strict
+                };
+                crate::analysis::facts::FuncOptionFact::Strict(strct)
+            }
+            ast::FuncOption::LeakproofFuncOption(f) => {
+                let is_leakproof = f.leakproof_token().is_some();
+                crate::analysis::facts::FuncOptionFact::Leakproof(is_leakproof)
+            }
+            ast::FuncOption::ParallelFuncOption(f) => {
+                crate::analysis::facts::FuncOptionFact::Parallel(
+                    f.syntax()
+                        .descendants()
+                        .find_map(ast::NameRef::cast)
+                        .map(|n| n.text())
+                        .unwrap_or_default(),
+                )
+            }
+            ast::FuncOption::CostFuncOption(_) => {
+                crate::analysis::facts::FuncOptionFact::Cost
+            }
+            ast::FuncOption::RowsFuncOption(_) => {
+                crate::analysis::facts::FuncOptionFact::Rows
+            }
+            ast::FuncOption::ResetFuncOption(f) => {
+                crate::analysis::facts::FuncOptionFact::Reset(
+                    f.name_ref()
+                        .map(|n| n.text().to_string())
+                        .unwrap_or_default(),
+                )
+            }
+            ast::FuncOption::AsFuncOption(f) => {
+                let lit = f.syntax().descendants().find_map(ast::Literal::cast).map(|l| l.syntax().text().to_string().trim_matches('\'').to_string());
+                crate::analysis::facts::FuncOptionFact::As {
+                    definition: lit,
+                    obj_file: None,
+                    link_symbol: None,
+                }
+            }
+            ast::FuncOption::TransformFuncOption(_) => {
+                crate::analysis::facts::FuncOptionFact::Transform
+            }
+            ast::FuncOption::WindowFuncOption(_) => {
+                crate::analysis::facts::FuncOptionFact::Window
+            }
+            ast::FuncOption::SupportFuncOption(_) => {
+                crate::analysis::facts::FuncOptionFact::Support
+            }
+            _ => crate::analysis::facts::FuncOptionFact::Unknown,
+        }
+    }
+
+    fn extract_create_function(node: &squawk_syntax::ast::CreateFunction) -> Option<StatementFact> {
+        let path = node.path()?;
+        let name = Self::path_to_qualified_name(&path)?;
+        let or_replace = node.or_replace().is_some();
+        let params = node.param_list().map(|pl| pl.params().map(|p| Self::extract_param(&p)).collect()).unwrap_or_default();
+        let return_type = node.ret_type().map(|r| Self::extract_ret_type(&r));
+        let options = node.option_list().map(|ol| ol.options().map(|o| Self::extract_func_option(&o)).collect()).unwrap_or_default();
+
+        Some(StatementFact::CreateFunction(crate::analysis::facts::CreateFunctionFact {
+            name,
+            or_replace,
+            params,
+            return_type,
+            options,
+        }))
+    }
+
+    fn extract_alter_function(node: &ast::AlterFunction) -> Option<StatementFact> {
+        let path = node.function_sig().and_then(|sig| sig.path())?;
+        let name = Self::path_to_qualified_name(&path)?;
+        let params = node.function_sig().and_then(|sig| sig.param_list()).map(|pl| pl.params().map(|p| p.syntax().text().to_string()).collect()).unwrap_or_default();
+        let action = if let Some(rt) = node.rename_to() {
+            crate::analysis::facts::AlterFunctionAction::Rename {
+                from: name.name.resolve(),
+                to: rt.name().map(|n| n.text()).unwrap_or_default(),
+            }
+        } else if let Some(ot) = node.owner_to() {
+            crate::analysis::facts::AlterFunctionAction::OwnerChange(Self::extract_role(&ot.role_ref().unwrap()))
+        } else if let Some(ss) = node.set_schema() {
+            crate::analysis::facts::AlterFunctionAction::SchemaChange {
+                new_schema: ss.name_ref().map(|n| n.text()).unwrap_or_default(),
+            }
+        } else if let Some(de) = node.depends_on_extension() {
+            crate::analysis::facts::AlterFunctionAction::DependsOnExtension { extension: de.name_ref().map(|n| n.text().to_string()).unwrap_or_default() }
+        } else if let Some(nde) = node.no_depends_on_extension() {
+            crate::analysis::facts::AlterFunctionAction::NoDependsOnExtension { extension: nde.name_ref().map(|n| n.text().to_string()).unwrap_or_default() }
+        } else if let Some(ol) = node.func_option_list() {
+            crate::analysis::facts::AlterFunctionAction::OptionsChange(ol.options().map(|o| Self::extract_func_option(&o)).collect())
+        } else {
+            return None;
+        };
+
+        Some(StatementFact::AlterFunction(crate::analysis::facts::AlterFunctionFact {
+            name,
+            params,
+            action,
+        }))
+    }
+
+    fn extract_drop_function(node: &squawk_syntax::ast::DropFunction) -> Option<StatementFact> {
+        let sigs = node.function_sig_list().map(|sl| {
+            sl.function_sigs().filter_map(|sig| {
+                let path = sig.path()?;
+                Some(crate::analysis::facts::FunctionSigFact {
+                    name: Self::path_to_qualified_name(&path).unwrap_or_else(|| QualifiedName::new(None, Ident::new("unknown".to_string(), false))),
+                    params: sig.param_list().map(|pl| pl.params().map(|p| p.ty().map(|t| t.syntax().text().to_string()).unwrap_or_else(|| "unknown".into())).collect()).unwrap_or_default(),
+                })
+            }).collect::<Vec<_>>()
+        }).unwrap_or_default();
+
+        Some(StatementFact::DropFunction(crate::analysis::facts::DropFunctionFact {
+            signatures: sigs,
+            if_exists: node.if_exists().is_some(),
+            cascade: node.cascade_token().is_some(),
+        }))
+    }
+
+    fn extract_create_procedure(node: &squawk_syntax::ast::CreateProcedure) -> Option<StatementFact> {
+        let path = node.path()?;
+        let name = Self::path_to_qualified_name(&path)?;
+        let or_replace = node.or_replace().is_some();
+        let params = node.param_list().map(|pl| pl.params().map(|p| Self::extract_param(&p)).collect()).unwrap_or_default();
+        let options = node.option_list().map(|ol| ol.options().map(|o| Self::extract_func_option(&o)).collect()).unwrap_or_default();
+
+        Some(StatementFact::CreateProcedure(crate::analysis::facts::CreateProcedureFact {
+            name,
+            or_replace,
+            params,
+            options,
+        }))
+    }
+
+    fn extract_alter_procedure(node: &squawk_syntax::ast::AlterProcedure) -> Option<StatementFact> {
+        let sig = node.function_sig()?;
+        let path = sig.path()?;
+        let name = Self::path_to_qualified_name(&path)?;
+        let params = sig.param_list().map(|pl| pl.params().map(|p| p.syntax().text().to_string()).collect()).unwrap_or_default();
+
+        let action = if let Some(rt) = node.rename_to() {
+            crate::analysis::facts::AlterFunctionAction::Rename {
+                from: name.name.resolve(),
+                to: rt.name().map(|n| n.text()).unwrap_or_default(),
+            }
+        } else if let Some(ot) = node.owner_to() {
+            crate::analysis::facts::AlterFunctionAction::OwnerChange(Self::extract_role(&ot.role_ref().unwrap()))
+        } else if let Some(ss) = node.set_schema() {
+            crate::analysis::facts::AlterFunctionAction::SchemaChange {
+                new_schema: ss.name_ref().map(|n| n.text()).unwrap_or_default(),
+            }
+        } else if let Some(de) = node.depends_on_extension() {
+            crate::analysis::facts::AlterFunctionAction::DependsOnExtension { extension: de.name_ref().map(|n| n.text().to_string()).unwrap_or_default() }
+        } else if let Some(nde) = node.no_depends_on_extension() {
+            crate::analysis::facts::AlterFunctionAction::NoDependsOnExtension { extension: nde.name_ref().map(|n| n.text().to_string()).unwrap_or_default() }
+        } else if let Some(ol) = node.func_option_list() {
+            crate::analysis::facts::AlterFunctionAction::OptionsChange(ol.options().map(|o| Self::extract_func_option(&o)).collect())
+        } else {
+            return None;
+        };
+
+        Some(StatementFact::AlterProcedure(crate::analysis::facts::AlterProcedureFact {
+            name,
+            params,
+            action,
+        }))
+    }
+
+    fn extract_drop_procedure(node: &squawk_syntax::ast::DropProcedure) -> Option<StatementFact> {
+        let sigs = node.function_sig_list().map(|sl| {
+            sl.function_sigs().filter_map(|sig| {
+                let path = sig.path()?;
+                Some(crate::analysis::facts::FunctionSigFact {
+                    name: Self::path_to_qualified_name(&path).unwrap_or_else(|| QualifiedName::new(None, Ident::new("unknown".to_string(), false))),
+                    params: sig.param_list().map(|pl| pl.params().map(|p| p.ty().map(|t| t.syntax().text().to_string()).unwrap_or_else(|| "unknown".into())).collect()).unwrap_or_default(),
+                })
+            }).collect::<Vec<_>>()
+        }).unwrap_or_default();
+
+        Some(StatementFact::DropProcedure(crate::analysis::facts::DropProcedureFact {
+            signatures: sigs,
+            if_exists: node.if_exists().is_some(),
+            cascade: node.cascade_token().is_some(),
+        }))
+    }
+
+    fn extract_create_publication(node: &squawk_syntax::ast::CreatePublication) -> Option<StatementFact> {
+        let name = node.name().map(Self::resolve_name).unwrap_or_default();
+        let scope = if node.all_token().is_some() && node.tables_token().is_some() {
+            crate::analysis::facts::PublicationScope::AllTables {
+                except: node.except_table_clause().map(|c| {
+                    c.syntax().descendants().filter_map(NameRef::cast).map(|nr| Self::resolve_name_ref(&nr)).collect()
+                }).unwrap_or_default(),
+            }
+        } else {
+            let objects = node
+                .publication_objects()
+                .map(|obj| {
+                    if obj.path().is_some() {
+                        crate::analysis::facts::PublicationObjectFact::Table {
+                            only: obj.only_token().is_some(),
+                            include_partitions: obj.star_token().is_some(),
+                            columns: obj.column_list().map(|cl| cl.columns().filter_map(|c| c.name().map(Self::resolve_name)).collect()),
+                            row_filter: obj.where_condition_clause().and_then(|w| w.expr().map(crate::analysis::expr_visitor::ExprVisitor::convert)),
+                        }
+                    } else if obj.in_token().is_some() {
+                        crate::analysis::facts::PublicationObjectFact::SchemaTables {
+                            schema: obj.name_ref().map(|n| n.text().to_string()).or_else(|| obj.current_schema_token().map(|_| "CURRENT_SCHEMA".to_string())).unwrap_or_default(),
+                            row_filter: obj.where_condition_clause().and_then(|w| w.expr().map(crate::analysis::expr_visitor::ExprVisitor::convert)),
+                        }
+                    } else if obj.current_schema_token().is_some() {
+                        crate::analysis::facts::PublicationObjectFact::CurrentSchemaShorthand
+                    } else {
+                        crate::analysis::facts::PublicationObjectFact::Unknown
+                    }
+                })
+                .collect();
+            crate::analysis::facts::PublicationScope::Explicit(objects)
+        };
+        let params = node.with_params().map(|wp| {
+            wp.attribute_list().map(|al| {
+                al.attribute_options().map(|p| crate::analysis::facts::AttributeFact {
+                    name: p.name().map(|n| n.text().to_string()).unwrap_or_default(),
+                    value: p.syntax().descendants().find_map(ast::Literal::cast).map(|l| l.syntax().text().to_string()).unwrap_or_default(),
+                }).collect()
+            }).unwrap_or_default()
+        }).unwrap_or_default();
+
+        Some(StatementFact::CreatePublication(crate::analysis::facts::CreatePublicationFact {
+            name,
+            scope,
+            params,
+        }))
+    }
+
+    fn extract_alter_publication(node: &squawk_syntax::ast::AlterPublication) -> Option<StatementFact> {
+        let name = node.name_ref().map(|nr| Self::resolve_name_ref(&nr)).unwrap_or_default();
+        Some(StatementFact::AlterPublication(crate::analysis::facts::AlterPublicationFact { name }))
+    }
+
+    fn extract_drop_publication(node: &squawk_syntax::ast::DropPublication) -> Option<StatementFact> {
+        let names = node.name_refs().map(|nr| Self::resolve_name_ref(&nr)).collect();
+        Some(StatementFact::DropPublication(crate::analysis::facts::DropPublicationFact {
+            names,
+            if_exists: node.if_exists().is_some(),
+            cascade: node.cascade_token().is_some(),
+        }))
+    }
+
+    fn extract_create_subscription(node: &squawk_syntax::ast::CreateSubscription) -> Option<StatementFact> {
+        let name = node.name().map(Self::resolve_name);
+        let connection = if node.server_token().is_some() {
+            crate::analysis::facts::ConnectionTarget::Server(node.name_ref().map(|n| n.text()))
+        } else {
+            crate::analysis::facts::ConnectionTarget::Literal(node.literal().map(|l| l.syntax().text().to_string().trim_matches('\'').to_string()))
+        };
+        let publications = node.name_refs().map(|nr| Self::resolve_name_ref(&nr)).collect();
+        let params = node.with_params().map(|wp| {
+            wp.attribute_list().map(|al| {
+                al.attribute_options().map(|p| crate::analysis::facts::AttributeFact {
+                    name: p.name().map(|n| n.text().to_string()).unwrap_or_default(),
+                    value: p
+                        .syntax()
+                        .descendants()
+                        .find_map(ast::Literal::cast)
+                        .map(|l| l.syntax().text().to_string())
+                        .unwrap_or_default(),
+                }).collect()
+            }).unwrap_or_default()
+        });
+
+        Some(StatementFact::CreateSubscription(crate::analysis::facts::CreateSubscriptionFact {
+            name,
+            connection,
+            publications,
+            params,
+        }))
+    }
+
+    fn extract_alter_subscription(node: &squawk_syntax::ast::AlterSubscription) -> Option<StatementFact> {
+        let name = node.name_ref().map(|nr| Self::resolve_name_ref(&nr)).unwrap_or_default();
+        Some(StatementFact::AlterSubscription(crate::analysis::facts::AlterSubscriptionFact { name }))
+    }
+
+    fn extract_drop_subscription(node: &squawk_syntax::ast::DropSubscription) -> Option<StatementFact> {
+        let name = Self::resolve_name_ref(&node.name_ref()?);
+        Some(StatementFact::DropSubscription(crate::analysis::facts::DropSubscriptionFact {
+            name,
+            if_exists: node.if_exists().is_some(),
+        }))
+    }
+
+    fn extract_role(role_ref: &squawk_syntax::ast::RoleRef) -> crate::analysis::facts::RoleFact {
+        if let Some(name) = role_ref.name_ref() {
+            crate::analysis::facts::RoleFact::Named {
+                name: Self::resolve_name_ref(&name),
+                via_legacy_group_syntax: role_ref.group_token().is_some(),
+            }
+        } else if role_ref.current_role_token().is_some() {
+            crate::analysis::facts::RoleFact::CurrentRole
+        } else if role_ref.current_user_token().is_some() {
+            crate::analysis::facts::RoleFact::CurrentUser
+        } else if role_ref.session_user_token().is_some() {
+            crate::analysis::facts::RoleFact::SessionUser
+        } else {
+            crate::analysis::facts::RoleFact::Unknown
+        }
+    }
+
+    fn extract_create_role(node: &squawk_syntax::ast::CreateRole) -> Option<StatementFact> {
+        let name = Self::resolve_name(node.name()?);
+        let inherits = node.role_option_list().map(|ol| ol.role_options().any(|o| o.inherit_token().is_some())).unwrap_or(false);
+        Some(StatementFact::CreateRole(crate::analysis::facts::CreateRoleFact {
+            name,
+            inherits,
+        }))
+    }
+
+    fn extract_alter_role(node: &squawk_syntax::ast::AlterRole) -> Option<StatementFact> {
+        let name = Self::extract_role(&node.role_ref()?);
+        let inherits = node.role_option_list().and_then(|ol| {
+            let mut found = None;
+            for o in ol.role_options() {
+                if o.inherit_token().is_some() {
+                    found = Some(true);
+                }
+            }
+            found
+        });
+        Some(StatementFact::AlterRole(crate::analysis::facts::AlterRoleFact { name, inherits }))
+    }
+
+    fn extract_drop_role(node: &squawk_syntax::ast::DropRole) -> Option<StatementFact> {
+        let names = node.name_refs().map(|nr| Self::resolve_name_ref(&nr)).collect();
+        Some(StatementFact::DropRole(crate::analysis::facts::DropRoleFact {
+            names,
+            if_exists: node.if_exists().is_some(),
+        }))
+    }
+
+    fn extract_privilege(priv_node: &squawk_syntax::SyntaxNode) -> crate::analysis::facts::PrivilegeFact {
+        let text = priv_node.text().to_string().to_uppercase();
+        if let Some(role_ref) = priv_node.descendants().find_map(ast::RoleRef::cast) {
+            crate::analysis::facts::PrivilegeFact::RoleMembership(Self::resolve_name_ref(&role_ref.name_ref().unwrap()))
+        } else if text.contains("SELECT") {
+            crate::analysis::facts::PrivilegeFact::Select
+        } else if text.contains("INSERT") {
+            crate::analysis::facts::PrivilegeFact::Insert
+        } else if text.contains("UPDATE") {
+            crate::analysis::facts::PrivilegeFact::Update
+        } else if text.contains("DELETE") {
+            crate::analysis::facts::PrivilegeFact::Delete
+        } else if text.contains("TRUNCATE") {
+            crate::analysis::facts::PrivilegeFact::Truncate
+        } else if text.contains("REFERENCES") {
+            crate::analysis::facts::PrivilegeFact::References
+        } else if text.contains("TRIGGER") {
+            crate::analysis::facts::PrivilegeFact::Trigger
+        } else if text.contains("EXECUTE") {
+            crate::analysis::facts::PrivilegeFact::Execute
+        } else if text.contains("CREATE") {
+            crate::analysis::facts::PrivilegeFact::Create
+        } else if text.contains("TEMP") || text.contains("TEMPORARY") {
+            crate::analysis::facts::PrivilegeFact::Temporary
+        } else if text.contains("ALTER") && text.contains("SYSTEM") {
+            crate::analysis::facts::PrivilegeFact::AlterSystem
+        } else if text.contains("ALL") {
+            crate::analysis::facts::PrivilegeFact::All
+        } else if let Some(ident) = priv_node.descendants().find_map(ast::Name::cast) {
+            crate::analysis::facts::PrivilegeFact::Named(ident.text().to_string())
+        } else {
+            crate::analysis::facts::PrivilegeFact::Unknown
+        }
+    }
+
+    fn extract_grant(node: &Grant) -> Option<StatementFact> {
+        let privileges = if node.all_token().is_some() {
+            crate::analysis::facts::PrivilegeSpec::All
+        } else {
+            crate::analysis::facts::PrivilegeSpec::List(
+                node.syntax().descendants().find_map(ast::Privileges::cast).map(|pl| pl.syntax().children().map(|c| Self::extract_privilege(&c)).collect()).unwrap_or_default(),
+            )
+        };
+
+        let paths: Vec<_> = node.syntax().descendants().filter_map(Path::cast).collect();
+        let name_refs: Vec<_> = node.syntax().descendants().filter_map(NameRef::cast).collect();
+
+        let target = if !paths.is_empty() {
+            crate::analysis::facts::GrantTarget::Tables(
+                paths.iter().filter_map(Self::path_to_qualified_name).collect(),
+            )
+        } else if !name_refs.is_empty() {
+            crate::analysis::facts::GrantTarget::AllTablesInSchema(
+                name_refs.iter().map(Self::resolve_name_ref).collect(),
+            )
+        } else {
+            return None;
+        };
+
+        let grantees = node.role_ref_list().map(|rrl| {
+            rrl.role_refs().map(|r| Self::extract_role(&r)).collect()
+        }).unwrap_or_default();
+        let with_grant_option = node.syntax().text().to_string().to_uppercase().contains("WITH GRANT OPTION");
+        let granted_by = node.role_ref().map(|r| Self::extract_role(&r));
+
+        Some(StatementFact::Grant(crate::analysis::facts::GrantFact {
+            privileges,
+            target,
+            grantees,
+            with_grant_option,
+            granted_by,
+        }))
+    }
+
+    fn extract_revoke(node: &Revoke) -> Option<StatementFact> {
+        let grant_option_only = node.for_token().is_some() && node.grant_token().is_some() && node.option_token().is_some();
+        let privileges = if node.syntax().text().to_string().to_uppercase().contains("ALL PRIVILEGES") {
+            crate::analysis::facts::PrivilegeSpec::All
+        } else {
+            crate::analysis::facts::PrivilegeSpec::List(
+                node.syntax().descendants().find_map(ast::Privileges::cast).map(|pl| pl.syntax().children().map(|c| Self::extract_privilege(&c)).collect()).unwrap_or_default(),
+            )
+        };
+
+        let paths: Vec<_> = node.syntax().descendants().filter_map(Path::cast).collect();
+        let name_refs: Vec<_> = node.syntax().descendants().filter_map(NameRef::cast).collect();
+
+        let target = if !paths.is_empty() {
+            crate::analysis::facts::GrantTarget::Tables(
+                paths.iter().filter_map(Self::path_to_qualified_name).collect(),
+            )
+        } else if !name_refs.is_empty() {
+            crate::analysis::facts::GrantTarget::AllTablesInSchema(
+                name_refs.iter().map(Self::resolve_name_ref).collect(),
+            )
+        } else {
+            return None;
+        };
+
+        let revokees = node.role_ref_list().map(|rrl| {
+            rrl.role_refs().map(|r| Self::extract_role(&r)).collect()
+        }).unwrap_or_default();
+        let granted_by = node.role_ref().map(|r| Self::extract_role(&r));
+        let cascade = node.cascade_token().is_some();
+
+        Some(StatementFact::Revoke(crate::analysis::facts::RevokeFact {
+            grant_option_only,
+            privileges,
+            target,
+            revokees,
+            granted_by,
+            cascade,
+        }))
+    }
+
+    fn extract_db_option(opt: squawk_syntax::ast::DatabaseOption) -> crate::analysis::facts::DatabaseOptionFact {
+        let value = if opt.default_token().is_some() {
+            crate::analysis::facts::DatabaseOptionValue::Default
+        } else {
+            crate::analysis::facts::DatabaseOptionValue::Literal(opt.literal().map(|l| l.syntax().text().to_string().trim_matches('\'').to_string()))
+        };
+
+        if opt.owner_token().is_some() { crate::analysis::facts::DatabaseOptionFact::Owner(value) }
+        else if opt.template_token().is_some() { crate::analysis::facts::DatabaseOptionFact::Template(value) }
+        else if opt.encoding_token().is_some() { crate::analysis::facts::DatabaseOptionFact::Encoding(value) }
+        else if opt.tablespace_token().is_some() { crate::analysis::facts::DatabaseOptionFact::Tablespace(value) }
+        else if opt.connection_token().is_some() && opt.limit_token().is_some() { crate::analysis::facts::DatabaseOptionFact::ConnectionLimit(value) }
+        else if let Some(ident) = opt.ident_token() { crate::analysis::facts::DatabaseOptionFact::Named(ident.text().to_string(), value) }
+        else { crate::analysis::facts::DatabaseOptionFact::Unknown(value) }
+    }
+
+    fn extract_create_database(node: &CreateDatabase) -> Option<StatementFact> {
+        let name = node.name().map(Self::resolve_name).unwrap_or_default();
+        let options = node.database_option_list().map(|ol| ol.database_options().map(Self::extract_db_option).collect()).unwrap_or_default();
+        Some(StatementFact::CreateDatabase(crate::analysis::facts::CreateDatabaseFact {
+            name,
+            options,
+        }))
+    }
+
+    fn extract_alter_database(node: &ast::AlterDatabase) -> Option<StatementFact> {
+        let name_ref = node.name_ref()?;
+        let name = QualifiedName::new(None, Ident::new(name_ref.text().to_string(), name_ref.is_quoted()));
+
+        let action = if let Some(rt) = node.rename_to() {
+            crate::analysis::facts::AlterDatabaseAction::Rename { to: rt.name().map(|n| n.text()).unwrap_or_default() }
+        } else if let Some(ot) = node.owner_to() {
+            crate::analysis::facts::AlterDatabaseAction::OwnerChange(Self::extract_role(&ot.role_ref().unwrap()))
+        } else if let Some(st) = node.set_tablespace() {
+            crate::analysis::facts::AlterDatabaseAction::TablespaceChange { new_tablespace: st.path().map(|p| p.syntax().text().to_string()).unwrap_or_default() }
+        } else if let Some(scp) = node.set_config_param() {
+            crate::analysis::facts::AlterDatabaseAction::SetConfigParam { param: scp.path().map(|p| p.syntax().text().to_string()).unwrap_or_default() }
+        } else if let Some(rcp) = node.reset_config_param() {
+            crate::analysis::facts::AlterDatabaseAction::ResetConfigParam { param: rcp.path().map(|p| p.syntax().text().to_string()) }
+        } else if node.refresh_collation_version().is_some() {
+            crate::analysis::facts::AlterDatabaseAction::RefreshCollationVersion
+        } else if let Some(ol) = node.database_option_list() {
+            crate::analysis::facts::AlterDatabaseAction::OptionChanges(ol.database_options().map(Self::extract_db_option).collect())
+        } else {
+            return None;
+        };
+
+        Some(StatementFact::AlterDatabase(crate::analysis::facts::AlterDatabaseFact {
+            name,
+            action,
+        }))
+    }
+
+    fn extract_drop_database(node: &ast::DropDatabase) -> Option<StatementFact> {
+        let name_ref = node.name_ref()?;
+        let name = QualifiedName::new(None, Ident::new(name_ref.text().to_string(), name_ref.is_quoted()));
+        Some(StatementFact::DropDatabase(crate::analysis::facts::DropDatabaseFact {
+            name,
+            if_exists: node.if_exists().is_some(),
+        }))
+    }
 
     fn extract_set(node: &Set) -> Option<StatementFact> {
         let setting_name = node
+            .path()?
             .syntax()
-            .descendants()
-            .find_map(NameRef::cast)?
             .text()
+            .to_string()
             .to_lowercase();
         if setting_name != "search_path" {
             return None;
@@ -1303,7 +1872,6 @@ impl AstVisitor {
 
         let text = node.syntax().text().to_string().to_lowercase();
 
-        // BUG FIX: Handle explicit DEFAULT token rather than searching NameRefs
         if text.contains("default") {
             return Some(StatementFact::SetSearchPath {
                 target: SearchPathTarget::Default,
@@ -1314,7 +1882,7 @@ impl AstVisitor {
             .syntax()
             .descendants()
             .filter_map(NameRef::cast)
-            .map(Self::resolve_name_ref)
+            .map(|nr| Self::resolve_name_ref(&nr))
             .filter(|s| {
                 s.to_lowercase() != "search_path"
                     && s.to_lowercase() != "to"
@@ -1328,14 +1896,11 @@ impl AstVisitor {
     }
 
     fn extract_rollback(node: &Rollback) -> Option<StatementFact> {
-        // BUG FIX: Two-phase commit rollbacks (ROLLBACK PREPARED 'gid') resolve a detached
-        // transaction from another session, NOT the current local session.
-        // We treat it as an opaque block to avoid popping the local transaction frame.
         if node.prepared_token().is_some() {
             return Some(StatementFact::OpaqueBlock);
         }
 
-        match node.name_ref().map(Self::resolve_name_ref) {
+        match node.name_ref().map(|nr| Self::resolve_name_ref(&nr)) {
             Some(name) => Some(StatementFact::RollbackToSavepoint { name }),
             None => Some(StatementFact::RollbackTransaction),
         }
@@ -1359,27 +1924,15 @@ impl AstVisitor {
         }
     }
 
-    // ─────────────────────────────────────────────
-    // Identifier Helpers
-    // ─────────────────────────────────────────────
-
     fn segment_ident(segment: PathSegment) -> Option<Ident> {
         if let Some(nr) = segment.syntax().descendants().find_map(NameRef::cast) {
-            Some(Ident::new(
-                nr.text().to_string().trim_matches('"').to_string(),
-                nr.is_quoted(),
-            ))
+            Some(Ident::new(nr.text().to_string(), nr.is_quoted()))
         } else {
             segment
                 .syntax()
                 .descendants()
                 .find_map(Name::cast)
-                .map(|n| {
-                    Ident::new(
-                        n.text().to_string().trim_matches('"').to_string(),
-                        n.is_quoted(),
-                    )
-                })
+                .map(|n| Ident::new(n.text().to_string(), n.is_quoted()))
         }
     }
 

@@ -45,6 +45,26 @@ pub enum Mutation {
     RollbackToSavepoint(RollbackToSavepointMutation),
     Savepoint(SavepointMutation),
     ReleaseSavepoint(ReleaseSavepointMutation),
+    CreateFunction(CreateFunctionMutation),
+    AlterFunction(AlterFunctionMutation),
+    DropFunction(DropFunctionMutation),
+    CreateProcedure(CreateProcedureMutation),
+    AlterProcedure(AlterProcedureMutation),
+    DropProcedure(DropProcedureMutation),
+    CreatePublication(CreatePublicationMutation),
+    AlterPublication(AlterPublicationMutation),
+    DropPublication(DropPublicationMutation),
+    CreateSubscription(CreateSubscriptionMutation),
+    AlterSubscription(AlterSubscriptionMutation),
+    DropSubscription(DropSubscriptionMutation),
+    CreateRole(CreateRoleMutation),
+    AlterRole(AlterRoleMutation),
+    DropRole(DropRoleMutation),
+    Grant(GrantMutation),
+    Revoke(RevokeMutation),
+    CreateDatabase(CreateDatabaseMutation),
+    AlterDatabase(AlterDatabaseMutation),
+    DropDatabase(DropDatabaseMutation),
     Opaque(OpaqueMutation),
     Vacuum { is_full: bool },
 }
@@ -66,6 +86,8 @@ pub struct DropSchemaMutation {
 pub struct CreatePolicyMutation {
     pub name: String,
     pub table: ObjectId,
+    pub permissive: bool,
+    pub command: crate::analysis::facts::PolicyCommand,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -79,6 +101,7 @@ pub struct DropPolicyMutation {
 pub struct CreateTriggerMutation {
     pub name: String,
     pub table: ObjectId,
+    pub function_id: ObjectId,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -92,12 +115,14 @@ pub struct DropTriggerMutation {
 pub struct DropViewMutation {
     pub ids: Vec<ObjectId>,
     pub if_exists: bool,
+    pub cascade: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct DropMaterializedViewMutation {
     pub ids: Vec<ObjectId>,
     pub if_exists: bool,
+    pub cascade: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -129,6 +154,7 @@ pub struct AlterSequenceMutation {
 pub struct DropSequenceMutation {
     pub ids: Vec<ObjectId>,
     pub if_exists: bool,
+    pub cascade: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -140,12 +166,14 @@ pub struct CreateDomainMutation {
 #[derive(Clone, Debug, PartialEq)]
 pub struct AlterDomainMutation {
     pub id: ObjectId,
+    pub action: Option<crate::analysis::facts::AlterDomainActionFact>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct DropDomainMutation {
     pub ids: Vec<ObjectId>,
     pub if_exists: bool,
+    pub cascade: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -210,6 +238,7 @@ pub struct CreateIndex {
     pub concurrently: bool,
     pub using_method: Option<String>,
     pub has_predicate: bool,
+    pub unique: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -259,6 +288,148 @@ pub struct RollbackToSavepointMutation {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct CreateFunctionMutation {
+    pub id: ObjectId,
+    pub or_replace: bool,
+    pub params: Vec<crate::analysis::facts::ParamFact>,
+    pub return_type: Option<crate::analysis::facts::RetTypeFact>,
+    pub options: Vec<crate::analysis::facts::FuncOptionFact>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AlterFunctionMutation {
+    pub id: ObjectId,
+    pub action: crate::analysis::facts::AlterFunctionAction,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DropFunctionMutation {
+    pub signatures: Vec<crate::analysis::facts::FunctionSigFact>,
+    pub if_exists: bool,
+    pub cascade: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CreateProcedureMutation {
+    pub id: ObjectId,
+    pub or_replace: bool,
+    pub params: Vec<crate::analysis::facts::ParamFact>,
+    pub options: Vec<crate::analysis::facts::FuncOptionFact>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AlterProcedureMutation {
+    pub id: ObjectId,
+    pub action: crate::analysis::facts::AlterFunctionAction,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DropProcedureMutation {
+    pub signatures: Vec<crate::analysis::facts::FunctionSigFact>,
+    pub if_exists: bool,
+    pub cascade: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CreatePublicationMutation {
+    pub name: String,
+    pub scope: crate::analysis::facts::PublicationScope,
+    pub params: Vec<crate::analysis::facts::AttributeFact>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AlterPublicationMutation {
+    pub name: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DropPublicationMutation {
+    pub names: Vec<String>,
+    pub if_exists: bool,
+    pub cascade: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CreateSubscriptionMutation {
+    pub name: Option<String>,
+    pub connection: crate::analysis::facts::ConnectionTarget,
+    pub publications: Vec<String>,
+    pub params: Option<Vec<crate::analysis::facts::AttributeFact>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AlterSubscriptionMutation {
+    pub name: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DropSubscriptionMutation {
+    pub name: String,
+    pub if_exists: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CreateRoleMutation {
+    pub name: String,
+    pub inherits: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AlterRoleMutation {
+    pub name: crate::analysis::facts::RoleFact,
+    pub inherits: Option<bool>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DropRoleMutation {
+    pub names: Vec<String>,
+    pub if_exists: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ResolvedGrantTarget {
+    Tables(Vec<ObjectId>),
+    AllTablesInSchema(Vec<String>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GrantMutation {
+    pub privileges: crate::analysis::facts::PrivilegeSpec,
+    pub target: ResolvedGrantTarget,
+    pub grantees: Vec<crate::analysis::facts::RoleFact>,
+    pub with_grant_option: bool,
+    pub granted_by: Option<crate::analysis::facts::RoleFact>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RevokeMutation {
+    pub grant_option_only: bool,
+    pub privileges: crate::analysis::facts::PrivilegeSpec,
+    pub target: ResolvedGrantTarget,
+    pub revokees: Vec<crate::analysis::facts::RoleFact>,
+    pub granted_by: Option<crate::analysis::facts::RoleFact>,
+    pub cascade: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CreateDatabaseMutation {
+    pub name: String,
+    pub options: Vec<crate::analysis::facts::DatabaseOptionFact>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AlterDatabaseMutation {
+    pub id: ObjectId,
+    pub action: crate::analysis::facts::AlterDatabaseAction,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DropDatabaseMutation {
+    pub id: ObjectId,
+    pub if_exists: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum OpaqueMutation {
     DoBlock,
     Execute,
@@ -276,6 +447,7 @@ pub enum AlterTableActionMutation {
         if_not_exists: bool,
         not_null: bool,
         default: Option<ExprIr>,
+        depends_on: Option<(ObjectId, String)>,
     },
     DropColumn {
         name: String,
@@ -293,7 +465,7 @@ pub enum AlterTableActionMutation {
         not_valid: bool,
     },
     AlterConstraint {
-        name: String,
+        name: Option<String>,
         deferrable: bool,
     },
     RenameConstraint {
@@ -328,6 +500,12 @@ pub enum AlterTableActionMutation {
     ValidateConstraint {
         constraint_name: String,
     },
+    DisableTrigger {
+        trigger_name: Option<String>,
+    },
+    EnableTrigger {
+        trigger_name: Option<String>,
+    },
     AttachPartition {
         child: ObjectId,
     },
@@ -338,4 +516,5 @@ pub enum AlterTableActionMutation {
         column: String,
     },
     SetAccessMethod,
+    Opaque,
 }

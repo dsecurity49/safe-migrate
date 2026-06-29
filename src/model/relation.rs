@@ -2,7 +2,47 @@
 use crate::ast::identifiers::ObjectId;
 use crate::model::column::Column;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Privilege {
+    Select,
+    Insert,
+    Update,
+    Delete,
+    Truncate,
+    References,
+    Trigger,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PrivilegeMatrix {
+    /// Maps role identity to the set of privileges they possess on this relation
+    pub grants: HashMap<ObjectId, HashSet<Privilege>>,
+}
+
+impl PrivilegeMatrix {
+    pub fn grant(&mut self, role: ObjectId, privileges: HashSet<Privilege>) {
+        self.grants
+            .entry(role)
+            .or_default()
+            .extend(privileges);
+    }
+
+    pub fn revoke(&mut self, role: &ObjectId, privileges: &HashSet<Privilege>) {
+        if let Some(owned) = self.grants.get_mut(role) {
+            for p in privileges {
+                owned.remove(p);
+            }
+        }
+    }
+
+    pub fn has_privilege(&self, role: &ObjectId, privilege: Privilege) -> bool {
+        self.grants
+            .get(role)
+            .is_some_and(|set| set.contains(&privilege))
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RelationKind {
@@ -21,6 +61,7 @@ pub enum Persistence {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RelationState {
     pub id: ObjectId,
+    pub owner: ObjectId,
     pub columns: Vec<Column>,
     pub generation: u64,
     pub estimated_rows: Option<u64>,
@@ -32,12 +73,14 @@ pub struct RelationState {
     pub last_analyze: Option<String>,
     pub last_autoanalyze: Option<String>,
     pub created_at_tx_depth: usize, // Phase 1 FIX: Same-Transaction index tracking
+    pub privileges: PrivilegeMatrix,
 }
 
 impl Default for RelationState {
     fn default() -> Self {
         Self {
             id: ObjectId::new("public", "dummy"),
+            owner: ObjectId::new("public", "postgres"),
             columns: Vec::new(),
             generation: 0,
             estimated_rows: Some(0),
@@ -49,6 +92,7 @@ impl Default for RelationState {
             last_analyze: None,
             last_autoanalyze: None,
             created_at_tx_depth: 0,
+            privileges: PrivilegeMatrix::default(),
         }
     }
 }
@@ -56,6 +100,7 @@ impl Default for RelationState {
 impl RelationState {
     pub fn new(
         id: ObjectId,
+        owner: ObjectId,
         generation: u64,
         estimated_rows: Option<u64>,
         kind: RelationKind,
@@ -64,6 +109,7 @@ impl RelationState {
     ) -> Self {
         Self {
             id,
+            owner,
             columns: Vec::new(),
             generation,
             estimated_rows,
@@ -75,6 +121,7 @@ impl RelationState {
             last_analyze: None,
             last_autoanalyze: None,
             created_at_tx_depth,
+            privileges: PrivilegeMatrix::default(),
         }
     }
 

@@ -1,0 +1,45 @@
+use crate::analysis::mutations::Mutation;
+use crate::analysis::state::{AnalysisState, CascadeResult, MutationResult};
+use crate::engine::config::Config;
+use crate::report::violations::{Violation, ViolationTier};
+use crate::rules::Rule;
+
+pub struct RestrictivePolicyRule;
+
+impl Rule for RestrictivePolicyRule {
+    fn id(&self) -> &'static str {
+        "restrictive-policy"
+    }
+    fn default_tier(&self) -> ViolationTier {
+        ViolationTier::Tier2
+    }
+    fn recipe(&self) -> &'static str {
+        "Adding a RESTRICTIVE policy narrows access for all users. This can silently make rows invisible that were previously accessible."
+    }
+
+    fn evaluate(
+        &self,
+        mutation: &Mutation,
+        _result: &MutationResult,
+        _pre_state: &crate::analysis::state::PreState,
+        _state: &AnalysisState,
+        _config: &Config,
+        _cascade: Option<&CascadeResult>,
+    ) -> Vec<Violation> {
+        let mut violations = Vec::new();
+
+        if let Mutation::CreatePolicy(policy) = mutation
+            && !policy.permissive
+        {
+            violations.push(Violation {
+                rule_id: self.id(),
+                title: format!("Adding RESTRICTIVE policy {} on {}", policy.name, policy.table),
+                tier: self.default_tier(),
+                recipe: self.recipe(),
+                dedup_key: None,
+            });
+        }
+
+        violations
+    }
+}

@@ -34,6 +34,10 @@ enum Commands {
         /// Bypass the local cache file and evaluate with default worst-case assumptions
         #[arg(long)]
         no_cache: bool,
+
+        /// Output results in JSON format for CI/CD integration
+        #[arg(long)]
+        json: bool,
     },
     /// Sync database table statistics for accurate lock evaluation
     Sync {
@@ -45,23 +49,24 @@ enum Commands {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    match cli.command {
+    match &cli.command {
         Commands::Lint {
             file,
             config: config_path,
             cache,
             no_cache,
+            json: _,
         } => {
-            let sql = fs::read_to_string(&file)
+            let sql = fs::read_to_string(file)
                 .with_context(|| format!("Failed to read migration file: {}", file.display()))?;
 
             // 1. Load config
-            let cfg = Config::load_from_file(&config_path);
+            let cfg = Config::load_from_file(config_path);
 
             // 2. Cache Expiry Warning (Only if we aren't bypassing it)
-            if !no_cache
+            if !*no_cache
                 && cache.exists()
-                && let Ok(metadata) = fs::metadata(&cache)
+                && let Ok(metadata) = fs::metadata(cache)
                 && let Ok(modified) = metadata.modified()
             {
                 let now = SystemTime::now()
@@ -83,13 +88,13 @@ fn main() -> Result<()> {
             }
 
             // 3. Safely Load Cache OR Fallback to Empty State
-            let db_cache = if !no_cache && cache.exists() {
-                let json = fs::read_to_string(&cache).context("Failed to read cache file")?;
+            let db_cache = if !*no_cache && cache.exists() {
+                let json = fs::read_to_string(cache).context("Failed to read cache file")?;
                 serde_json::from_str::<DbCache>(&json).map_err(|_| {
                     anyhow!("Cache file '{}' is corrupted (Invalid JSON). Run `safe-migrate sync` to rebuild it.", cache.display())
                 })?
             } else {
-                if no_cache {
+                if *no_cache {
                     println!(
                         "[ INFO ] --no-cache passed. Running with default worst-case assumptions."
                     );
@@ -109,6 +114,11 @@ fn main() -> Result<()> {
 
             match engine.analyze(&sql, &mut state) {
                 Ok(violations) => {
+                    if let Commands::Lint { json: true, .. } = &cli.command {
+                        Reporter::print_json_report(&violations, &state.local.confidence);
+                        return Ok(());
+                    }
+
                     let should_fail_ci =
                         Reporter::print_report(&violations, &state.local.confidence);
 
@@ -144,7 +154,7 @@ fn main() -> Result<()> {
                 .context("DATABASE_URL environment variable must be set to run sync.")?;
 
             println!("Syncing database stats...");
-            sync::sync_cache(&out)?; // sync_cache internally uses the env var
+            sync::sync_cache(out)?; // sync_cache internally uses the env var
             println!("[ SAFE ] Cache successfully written to {}", out.display());
         }
     }

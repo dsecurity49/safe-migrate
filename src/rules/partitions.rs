@@ -1,12 +1,10 @@
 // FILE: src/rules/partitions.rs
 use crate::analysis::mutations::{AlterTableActionMutation, Mutation};
 use crate::analysis::state::{AnalysisState, CascadeResult, MutationResult};
-use crate::ast::identifiers::ObjectId;
 use crate::engine::config::Config;
-use crate::model::relation::{Persistence, RelationState};
+use crate::model::relation::Persistence;
 use crate::report::violations::{Violation, ViolationTier};
 use crate::rules::Rule;
-use std::collections::HashMap;
 
 pub struct PartitionLockRule;
 
@@ -25,7 +23,7 @@ impl Rule for PartitionLockRule {
         &self,
         mutation: &Mutation,
         result: &MutationResult,
-        pre_relations: &HashMap<ObjectId, RelationState>,
+        pre_state: &crate::analysis::state::PreState,
         state: &AnalysisState,
         config: &Config,
         _cascade: Option<&CascadeResult>,
@@ -40,7 +38,7 @@ impl Rule for PartitionLockRule {
             match &alter.action {
                 AlterTableActionMutation::AttachPartition { .. }
                 | AlterTableActionMutation::DetachPartition { .. } => {
-                    let (is_temp, is_stale, rows) = match pre_relations.get(&alter.id) {
+                    let (is_temp, is_stale, rows) = match pre_state.relations.get(&alter.id) {
                         Some(rel) => {
                             let stale =
                                 rel.is_stale() && state.baseline_relations.contains(&alter.id);

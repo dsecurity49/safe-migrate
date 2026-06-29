@@ -2,20 +2,21 @@
 pub mod constraints;
 pub mod destructive;
 pub mod expressions;
+pub mod functions;
 pub mod idempotency;
 pub mod indexes;
 pub mod opaque;
 pub mod partitions;
+pub mod policies;
 pub mod transactions;
+pub mod triggers;
 pub mod views;
+pub mod security;
 
 use crate::analysis::mutations::Mutation;
 use crate::analysis::state::{AnalysisState, CascadeResult, MutationResult};
-use crate::ast::identifiers::ObjectId;
 use crate::engine::config::Config;
-use crate::model::relation::RelationState;
 use crate::report::violations::{Violation, ViolationTier};
-use std::collections::HashMap;
 
 pub trait Rule {
     fn id(&self) -> &'static str;
@@ -26,9 +27,9 @@ pub trait Rule {
         &self,
         mutation: &Mutation,
         result: &MutationResult,
-        pre_relations: &HashMap<ObjectId, RelationState>,
-        state: &AnalysisState, // ENFORCED: Upgraded to pass DB baseline context
+        pre_state: &crate::analysis::state::PreState,
+        state: &AnalysisState,
         config: &Config,
-        cascade_closure: Option<&CascadeResult>, // NEW: Orchestrator-managed pre-state
+        cascade_closure: Option<&CascadeResult>,
     ) -> Vec<Violation>;
 }

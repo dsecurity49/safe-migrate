@@ -1,12 +1,10 @@
 // FILE: src/rules/indexes.rs
 use crate::analysis::mutations::Mutation;
 use crate::analysis::state::{AnalysisState, CascadeResult, MutationResult};
-use crate::ast::identifiers::ObjectId;
 use crate::engine::config::Config;
-use crate::model::relation::{Persistence, RelationState};
+use crate::model::relation::Persistence;
 use crate::report::violations::{Violation, ViolationTier};
 use crate::rules::Rule;
-use std::collections::HashMap;
 
 pub struct ConcurrentIndexRule;
 
@@ -25,7 +23,7 @@ impl Rule for ConcurrentIndexRule {
         &self,
         mutation: &Mutation,
         result: &MutationResult,
-        pre_relations: &HashMap<ObjectId, RelationState>,
+        pre_state: &crate::analysis::state::PreState,
         state: &AnalysisState,
         config: &Config,
         _cascade: Option<&CascadeResult>,
@@ -38,7 +36,7 @@ impl Rule for ConcurrentIndexRule {
 
         match mutation {
             Mutation::CreateIndex(create) if !create.concurrently => {
-                let (is_temp, is_stale, rows, tx_depth) = match pre_relations.get(&create.table) {
+                let (is_temp, is_stale, rows, tx_depth) = match pre_state.relations.get(&create.table) {
                     Some(rel) => {
                         let stale =
                             rel.is_stale() && state.baseline_relations.contains(&create.table);
@@ -98,7 +96,7 @@ impl Rule for ConcurrentIndexRule {
                 let tier1_threshold = config.rule_tier1_threshold(rule_id);
                 let tier2_threshold = config.rule_tier2_threshold(rule_id);
 
-                if pre_relations.is_empty() {
+                if pre_state.relations.is_empty() {
                     let rows = config.default_rows;
                     let tier = if rows >= tier1_threshold {
                         ViolationTier::Tier1
@@ -118,7 +116,7 @@ impl Rule for ConcurrentIndexRule {
                         });
                     }
                 } else {
-                    for rel in pre_relations.values() {
+                    for rel in pre_state.relations.values() {
                         if rel.persistence == Persistence::Temporary {
                             continue;
                         }

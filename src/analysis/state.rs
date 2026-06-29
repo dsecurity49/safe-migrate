@@ -10,8 +10,9 @@ use crate::analysis::transaction::{StateChange, TransactionFrame};
 use crate::ast::identifiers::ObjectId;
 use crate::db::cache::DbCache;
 use crate::model::relation::{
-    ColumnAction, Persistence, RelationKind, RelationOverlay, RelationState,
+    ColumnAction, Persistence, Privilege, RelationKind, RelationOverlay, RelationState,
 };
+use crate::model::trigger::TriggerOverlay;
 use crate::model::sequence::{SequenceOverlay, SequenceState};
 use crate::model::types::{TypeKind, TypeOverlay, TypeState};
 use std::collections::{HashMap, HashSet};
@@ -38,13 +39,28 @@ pub struct CascadeResult {
 pub struct LocalState {
     pub relations: HashMap<ObjectId, RelationOverlay>,
     pub types: HashMap<ObjectId, TypeOverlay>,
+    pub functions: HashMap<ObjectId, crate::model::function::FunctionOverlay>,
     pub sequences: HashMap<ObjectId, SequenceOverlay>,
+    pub publications: HashMap<String, crate::model::replication::PublicationOverlay>,
+    pub subscriptions: HashMap<String, crate::model::replication::SubscriptionOverlay>,
+    pub roles: HashMap<ObjectId, crate::model::role::RoleOverlay>,
+    pub triggers: HashMap<ObjectId, TriggerOverlay>,
     pub graph: DependencyGraph,
     pub search_path: Vec<String>,
+    pub current_role: String,
     pub confidence: Confidence,
     pub transactions: Vec<TransactionFrame>,
     pub pending_validation: HashSet<(ObjectId, String)>,
     pub generation_counter: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct PreState {
+    pub relations: HashMap<ObjectId, crate::model::relation::RelationState>,
+    pub functions: HashMap<ObjectId, crate::model::function::FunctionState>,
+    pub roles: HashMap<ObjectId, crate::model::role::RoleState>,
+    pub publications: HashMap<String, crate::model::replication::PublicationState>,
+    pub subscriptions: HashMap<String, crate::model::replication::SubscriptionState>,
 }
 
 pub struct AnalysisState {
@@ -86,6 +102,7 @@ impl AnalysisState {
                 using_method: None,
                 has_predicate: false,
                 is_concurrent: false,
+                is_unique: false,
             });
         }
 
@@ -96,9 +113,15 @@ impl AnalysisState {
             local: LocalState {
                 relations,
                 types: HashMap::new(),
+                functions: HashMap::new(),
                 sequences: HashMap::new(),
+                publications: HashMap::new(),
+                subscriptions: HashMap::new(),
+                roles: HashMap::new(),
+                triggers: HashMap::new(),
                 graph,
                 search_path: vec!["public".to_string()],
+                current_role: "postgres".to_string(),
                 confidence: Confidence::Exact,
                 transactions: Vec::new(),
                 pending_validation: HashSet::new(),
@@ -116,6 +139,51 @@ impl AnalysisState {
             self.local.relations.get(id),
             Some(RelationOverlay::Present(_))
         )
+    }
+
+    pub fn capture_pre_state(&self) -> PreState {
+        let mut relations = HashMap::new();
+        for (id, overlay) in &self.local.relations {
+            if let RelationOverlay::Present(s) = overlay {
+                relations.insert(id.clone(), s.clone());
+            }
+        }
+
+        let mut functions = HashMap::new();
+        for (id, overlay) in &self.local.functions {
+            if let crate::model::function::FunctionOverlay::Present(s) = overlay {
+                functions.insert(id.clone(), s.clone());
+            }
+        }
+
+        let mut roles = HashMap::new();
+        for (name, overlay) in &self.local.roles {
+            if let crate::model::role::RoleOverlay::Present(s) = overlay {
+                roles.insert(name.clone(), s.clone());
+            }
+        }
+
+        let mut publications = HashMap::new();
+        for (name, overlay) in &self.local.publications {
+            if let crate::model::replication::PublicationOverlay::Present(s) = overlay {
+                publications.insert(name.clone(), s.clone());
+            }
+        }
+
+        let mut subscriptions = HashMap::new();
+        for (name, overlay) in &self.local.subscriptions {
+            if let crate::model::replication::SubscriptionOverlay::Present(s) = overlay {
+                subscriptions.insert(name.clone(), s.clone());
+            }
+        }
+
+        PreState {
+            relations,
+            functions,
+            roles,
+            publications,
+            subscriptions,
+        }
     }
 
     pub fn get_cascade_closure(&self, target_oid: &ObjectId) -> CascadeResult {
@@ -188,6 +256,87 @@ impl AnalysisState {
         }
     }
 
+    fn resolve_grant_privileges(
+        spec: &crate::analysis::facts::PrivilegeSpec,
+    ) -> HashSet<Privilege> {
+        match spec {
+            crate::analysis::facts::PrivilegeSpec::All => {
+                vec![
+                    Privilege::Select,
+                    Privilege::Insert,
+                    Privilege::Update,
+                    Privilege::Delete,
+                    Privilege::Truncate,
+                    Privilege::References,
+                    Privilege::Trigger,
+                ]
+                .into_iter()
+                .collect()
+            }
+            crate::analysis::facts::PrivilegeSpec::List(list) => list
+                .iter()
+                .filter_map(|p| match p {
+                    crate::analysis::facts::PrivilegeFact::Select => Some(Privilege::Select),
+                    crate::analysis::facts::PrivilegeFact::Insert => Some(Privilege::Insert),
+                    crate::analysis::facts::PrivilegeFact::Update => Some(Privilege::Update),
+                    crate::analysis::facts::PrivilegeFact::Delete => Some(Privilege::Delete),
+                    crate::analysis::facts::PrivilegeFact::Truncate => Some(Privilege::Truncate),
+                    crate::analysis::facts::PrivilegeFact::References => {
+                        Some(Privilege::References)
+                    }
+                    crate::analysis::facts::PrivilegeFact::Trigger => Some(Privilege::Trigger),
+                    _ => None,
+                })
+                .collect(),
+        }
+    }
+
+    fn resolve_role_name(role: &crate::analysis::facts::RoleFact, current_role: &str) -> Option<ObjectId> {
+        let name = match role {
+            crate::analysis::facts::RoleFact::Named { name, .. } => Some(name.clone()),
+            crate::analysis::facts::RoleFact::CurrentUser
+            | crate::analysis::facts::RoleFact::CurrentRole => Some(current_role.to_string()),
+            crate::analysis::facts::RoleFact::SessionUser => Some("postgres".to_string()),
+            crate::analysis::facts::RoleFact::Unknown => None,
+        }?;
+        Some(ObjectId::new("", name))
+    }
+
+    fn apply_grant_to_relation(
+        &mut self,
+        id: &ObjectId,
+        privileges: &HashSet<Privilege>,
+        grantees: &[crate::analysis::facts::RoleFact],
+    ) {
+        self.snapshot_relation(id);
+        if let Some(RelationOverlay::Present(rel)) = self.local.relations.get_mut(id) {
+            for grantee in grantees {
+                if let Some(role_id) = Self::resolve_role_name(grantee, &self.local.current_role)
+                {
+                    rel.privileges.grant(role_id, privileges.clone());
+                }
+            }
+        }
+    }
+
+    fn apply_revoke_to_relation(
+        &mut self,
+        id: &ObjectId,
+        privileges: &HashSet<Privilege>,
+        revokees: &[crate::analysis::facts::RoleFact],
+    ) {
+        self.snapshot_relation(id);
+        if let Some(RelationOverlay::Present(rel)) = self.local.relations.get_mut(id) {
+            for revokee in revokees {
+                if let Some(role_id) =
+                    Self::resolve_role_name(revokee, &self.local.current_role)
+                {
+                    rel.privileges.revoke(&role_id, privileges);
+                }
+            }
+        }
+    }
+
     pub fn apply(
         &mut self,
         mutation: &Mutation,
@@ -197,17 +346,6 @@ impl AnalysisState {
             Mutation::CreateSchema(_) => MutationResult::Applied,
             Mutation::DropSchema(drop_schema) => {
                 if drop_schema.cascade {
-                    let renames = self.local.graph.renames.clone();
-                    let resolve = |id: &ObjectId| -> ObjectId {
-                        let mut current = id;
-                        loop {
-                            match renames.iter().find(|r| &r.from == current) {
-                                Some(edge) => current = &edge.to,
-                                None => return current.clone(),
-                            }
-                        }
-                    };
-
                     let mut relations_to_drop = Vec::new();
                     for id in self.local.relations.keys() {
                         if drop_schema.names.contains(&id.schema) {
@@ -250,22 +388,22 @@ impl AnalysisState {
 
                     let g = &mut self.local.graph;
                     g.foreign_keys.retain(|fk| {
-                        !drop_schema.names.contains(&resolve(&fk.from_table).schema)
-                            && !drop_schema.names.contains(&resolve(&fk.to_table).schema)
+                        !drop_schema.names.contains(&fk.from_table.schema)
+                            && !drop_schema.names.contains(&fk.to_table.schema)
                     });
                     g.views
-                        .retain(|v| !drop_schema.names.contains(&resolve(&v.view_id).schema));
+                        .retain(|v| !drop_schema.names.contains(&v.view_id.schema));
                     g.indexes
-                        .retain(|idx| !drop_schema.names.contains(&resolve(&idx.index_id).schema));
+                        .retain(|idx| !drop_schema.names.contains(&idx.index_id.schema));
                     g.partitions.retain(|p| {
-                        !drop_schema.names.contains(&resolve(&p.parent).schema)
-                            && !drop_schema.names.contains(&resolve(&p.child).schema)
+                        !drop_schema.names.contains(&p.parent.schema)
+                            && !drop_schema.names.contains(&p.child.schema)
                     });
                     g.sequences
-                        .retain(|s| !drop_schema.names.contains(&resolve(&s.sequence_id).schema));
+                        .retain(|s| !drop_schema.names.contains(&s.sequence_id.schema));
                     g.renames.retain(|r| {
-                        !drop_schema.names.contains(&resolve(&r.from).schema)
-                            && !drop_schema.names.contains(&resolve(&r.to).schema)
+                        !drop_schema.names.contains(&r.from.schema)
+                            && !drop_schema.names.contains(&r.to.schema)
                     });
                 }
                 MutationResult::Applied
@@ -277,6 +415,26 @@ impl AnalysisState {
                     } else {
                         self.local.confidence = Confidence::Tainted;
                         return MutationResult::Skipped;
+                    }
+                }
+
+                // Cleanup trigger dependencies
+                self.snapshot_trigger_graph_full();
+                self.local.graph.trigger_dependencies.retain(|t| t.table_id != drop_table.id);
+                // Also remove the trigger states themselves if cascading (or simply leave them orphaned)
+                // For now, assume trigger state drops with the table in a cascade
+                if drop_table.cascade {
+                    let triggers_to_drop: Vec<ObjectId> = self.local.triggers
+                        .iter()
+                        .filter_map(|(id, overlay)| {
+                            if let TriggerOverlay::Present(t) = overlay {
+                                if t.table_id == drop_table.id { Some(id.clone()) } else { None }
+                            } else { None }
+                        })
+                        .collect();
+                    for tid in triggers_to_drop {
+                        self.snapshot_trigger(&tid);
+                        self.local.triggers.insert(tid, TriggerOverlay::Dropped);
                     }
                 }
 
@@ -383,7 +541,22 @@ impl AnalysisState {
                 self.snapshot_generation_counter();
                 self.local.generation_counter += 1;
                 let generation = self.local.generation_counter;
-                let tx_depth = self.local.transactions.len();
+
+                let resolved_persistence = match create.persistence {
+                    PersistenceMutation::Permanent => crate::model::relation::Persistence::Permanent,
+                    PersistenceMutation::Temporary => crate::model::relation::Persistence::Temporary,
+                    PersistenceMutation::Unlogged => crate::model::relation::Persistence::Unlogged,
+                };
+
+                let mut rel_state = RelationState::new(
+                    create.id.clone(),
+                    ObjectId::new("public", &self.local.current_role),
+                    generation,
+                    if create.as_select { None } else { Some(0) },
+                    RelationKind::Table,
+                    resolved_persistence,
+                    self.local.transactions.len(),
+                );
 
                 let pk_columns: HashSet<&str> = create
                     .table_constraints
@@ -397,23 +570,6 @@ impl AnalysisState {
                     })
                     .flatten()
                     .collect();
-
-                let estimated_rows = if create.as_select { None } else { Some(0) };
-
-                let persistence = match &create.persistence {
-                    PersistenceMutation::Permanent => Persistence::Permanent,
-                    PersistenceMutation::Temporary => Persistence::Temporary,
-                    PersistenceMutation::Unlogged => Persistence::Unlogged,
-                };
-
-                let mut rel_state = RelationState::new(
-                    create.id.clone(),
-                    generation,
-                    estimated_rows,
-                    RelationKind::Table,
-                    persistence,
-                    tx_depth,
-                );
 
                 for col in &create.columns {
                     let is_pk = col.is_primary_key || pk_columns.contains(col.name.as_str());
@@ -455,24 +611,24 @@ impl AnalysisState {
             }
             Mutation::CreateView(create_view) => {
                 self.snapshot_relation(&create_view.id);
-                self.snapshot_view_graph();
                 self.snapshot_generation_counter();
                 self.local.generation_counter += 1;
-                let generation = self.local.generation_counter;
-                let tx_depth = self.local.transactions.len();
+                    let generation = self.local.generation_counter;
 
                 self.local.relations.insert(
                     create_view.id.clone(),
                     RelationOverlay::Present(RelationState::new(
                         create_view.id.clone(),
+                        ObjectId::new("public", &self.local.current_role),
                         generation,
-                        Some(0),
+                        None,
                         RelationKind::View,
                         Persistence::Permanent,
-                        tx_depth,
+                        self.local.transactions.len(),
                     )),
                 );
 
+                self.snapshot_view_graph();
                 self.local.graph.views.push(ViewEdge {
                     view_id: create_view.id.clone(),
                     depends_on: create_view.depends_on.clone(),
@@ -480,159 +636,185 @@ impl AnalysisState {
                 });
                 MutationResult::Applied
             }
-            Mutation::CreateMaterializedView(create_mat) => {
-                self.snapshot_relation(&create_mat.id);
-                self.snapshot_view_graph();
+            Mutation::CreateMaterializedView(create_mv) => {
+                self.snapshot_relation(&create_mv.id);
                 self.snapshot_generation_counter();
                 self.local.generation_counter += 1;
                 let generation = self.local.generation_counter;
-                let tx_depth = self.local.transactions.len();
 
                 self.local.relations.insert(
-                    create_mat.id.clone(),
+                    create_mv.id.clone(),
                     RelationOverlay::Present(RelationState::new(
-                        create_mat.id.clone(),
+                        create_mv.id.clone(),
+                        ObjectId::new("public", &self.local.current_role),
                         generation,
                         None,
                         RelationKind::MaterializedView,
                         Persistence::Permanent,
-                        tx_depth,
+                        self.local.transactions.len(),
                     )),
                 );
 
+                self.snapshot_view_graph();
                 self.local.graph.views.push(ViewEdge {
-                    view_id: create_mat.id.clone(),
-                    depends_on: create_mat.depends_on.clone(),
+                    view_id: create_mv.id.clone(),
+                    depends_on: create_mv.depends_on.clone(),
                     view_generation: generation,
                 });
                 MutationResult::Applied
             }
-            Mutation::RefreshMaterializedView(refresh) => {
-                if !self.relation_is_present(&refresh.id) {
-                    self.local.confidence = Confidence::Tainted;
-                    return MutationResult::Skipped;
-                }
-
-                self.snapshot_relation(&refresh.id);
-                self.snapshot_generation_counter();
-                self.local.generation_counter += 1;
-                let new_gen = self.local.generation_counter;
-
-                if let Some(RelationOverlay::Present(rel)) =
-                    self.local.relations.get_mut(&refresh.id)
-                {
-                    rel.generation = new_gen;
-                }
-                MutationResult::Applied
-            }
-            Mutation::CreateIndex(create_index) => {
-                if create_index.if_not_exists
-                    && self
-                        .local
-                        .graph
-                        .indexes
-                        .iter()
-                        .any(|idx| idx.index_id == create_index.id)
-                {
+            Mutation::RefreshMaterializedView(_) => MutationResult::Applied,
+            Mutation::CreateIndex(create_idx) => {
+                if create_idx.if_not_exists && self.local.graph.indexes.iter().any(|ix| ix.index_id == create_idx.id) {
                     return MutationResult::Skipped;
                 }
                 self.snapshot_index_graph();
                 self.local.graph.indexes.push(IndexEdge {
-                    index_id: create_index.id.clone(),
-                    relation_id: create_index.table.clone(),
-                    using_method: create_index.using_method.clone(),
-                    has_predicate: create_index.has_predicate,
-                    is_concurrent: create_index.concurrently,
+                    index_id: create_idx.id.clone(),
+                    relation_id: create_idx.table.clone(),
+                    using_method: create_idx.using_method.clone(),
+                    has_predicate: create_idx.has_predicate,
+                    is_concurrent: create_idx.concurrently,
+                    is_unique: create_idx.unique,
                 });
                 MutationResult::Applied
             }
-            Mutation::CreatePolicy(policy) => {
-                self.snapshot_relation(&policy.table);
-                self.snapshot_generation_counter();
-                self.local.generation_counter += 1;
-                let new_gen = self.local.generation_counter;
-
-                if let Some(RelationOverlay::Present(rel)) =
-                    self.local.relations.get_mut(&policy.table)
-                {
-                    rel.policies.insert(policy.name.clone());
-                    rel.generation = new_gen;
+            Mutation::CreatePolicy(create_policy) => {
+                self.snapshot_relation(&create_policy.table);
+                if let Some(RelationOverlay::Present(rel)) = self.local.relations.get_mut(&create_policy.table) {
+                    rel.policies.insert(create_policy.name.clone());
                 }
                 MutationResult::Applied
             }
-            Mutation::DropPolicy(policy) => {
-                if policy.if_exists {
-                    let exists = self
-                        .local
-                        .relations
-                        .get(&policy.table)
-                        .map(|o| {
-                            if let RelationOverlay::Present(rel) = o {
-                                rel.policies.contains(&policy.name)
-                            } else {
-                                false
+            Mutation::DropPolicy(drop_policy) => {
+                self.snapshot_relation(&drop_policy.table);
+                if let Some(RelationOverlay::Present(rel)) = self.local.relations.get_mut(&drop_policy.table) {
+                    rel.policies.remove(&drop_policy.name);
+                }
+                MutationResult::Applied
+            }
+            Mutation::CreateTrigger(create_trigger) => {
+                let trigger_id = ObjectId::new(create_trigger.table.schema.clone(), create_trigger.name.clone());
+                self.snapshot_trigger(&trigger_id);
+                self.local.triggers.insert(trigger_id.clone(), TriggerOverlay::Present(crate::model::trigger::TriggerState {
+                    id: trigger_id.clone(),
+                    table_id: create_trigger.table.clone(),
+                    generation: self.local.generation_counter,
+                }));
+
+                self.snapshot_relation(&create_trigger.table);
+                if let Some(RelationOverlay::Present(rel)) = self.local.relations.get_mut(&create_trigger.table) {
+                    rel.triggers.insert(create_trigger.name.clone());
+                }
+                
+                self.snapshot_trigger_graph_full();
+                self.local.graph.trigger_dependencies.push(crate::analysis::graph::TriggerEdge {
+                    trigger_id,
+                    table_id: create_trigger.table.clone(),
+                    function_id: create_trigger.function_id.clone(),
+                });
+                
+                MutationResult::Applied
+            }
+            Mutation::DropTrigger(drop_trigger) => {
+                let trigger_id = ObjectId::new(drop_trigger.table.schema.clone(), drop_trigger.name.clone());
+                self.snapshot_trigger(&trigger_id);
+                self.local.triggers.insert(trigger_id.clone(), TriggerOverlay::Dropped);
+
+                self.snapshot_relation(&drop_trigger.table);
+                if let Some(RelationOverlay::Present(rel)) = self.local.relations.get_mut(&drop_trigger.table) {
+                    rel.triggers.remove(&drop_trigger.name);
+                }
+                
+                self.snapshot_trigger_graph_full();
+                self.local.graph.trigger_dependencies.retain(|t| t.trigger_id != trigger_id);
+
+                MutationResult::Applied
+            }
+            Mutation::AlterTable(alter) => {
+                let rel_overlay = self.local.relations.get_mut(&alter.id);
+                if let Some(RelationOverlay::Present(rel)) = rel_overlay {
+                    let generation = rel.generation;
+                    match &alter.action {
+                        AlterTableActionMutation::AddColumn { name, ty, if_not_exists, not_null, default, depends_on } => {
+                            if !(*if_not_exists && rel.has_column(name)) {
+                                rel.apply_column_action(&ColumnAction::Add {
+                                    name: name.clone(),
+                                    data_type: ty.clone(),
+                                    not_null: *not_null,
+                                    default: default.clone(),
+                                });
+
+                                if let Some((source_table, source_col)) = depends_on {
+                                    self.snapshot_column_graph();
+                                    self.local.graph.column_dependencies.push(crate::analysis::graph::ColumnDependencyEdge {
+                                        table_id: alter.id.clone(),
+                                        column: name.clone(),
+                                        depends_on_table: source_table.clone(),
+                                        depends_on_column: source_col.clone(),
+                                    });
+                                }
                             }
-                        })
-                        .unwrap_or(false);
-                    if !exists {
-                        return MutationResult::Skipped;
+                        }
+                        AlterTableActionMutation::DropColumn { name, .. } => {
+                            rel.apply_column_action(&ColumnAction::Drop { name: name.clone() });
+                        }
+                        AlterTableActionMutation::RenameColumn { from, to } => {
+                            rel.apply_column_action(&ColumnAction::Rename {
+                                from: from.clone(),
+                                to: to.clone(),
+                            });
+                        }
+                        AlterTableActionMutation::SetNotNull { column } => {
+                            rel.apply_column_action(&ColumnAction::SetNotNull { name: column.clone() });
+                        }
+                        AlterTableActionMutation::DropNotNull { column } => {
+                            rel.apply_column_action(&ColumnAction::DropNotNull { name: column.clone() });
+                        }
+                        AlterTableActionMutation::SetType { column, ty, .. } => {
+                            rel.apply_column_action(&ColumnAction::SetType {
+                                name: column.clone(),
+                                data_type: ty.clone(),
+                            });
+                        }
+                        AlterTableActionMutation::SetDefault { column, default } => {
+                            rel.apply_column_action(&ColumnAction::SetDefault {
+                                name: column.clone(),
+                                default: default.clone(),
+                            });
+                        }
+                        AlterTableActionMutation::AddForeignKey { constraint_name, to_table, from_columns, to_columns, .. } => {
+                            self.snapshot_fk_graph();
+                            self.local.graph.foreign_keys.push(FkEdge {
+                                constraint_name: constraint_name.clone(),
+                                from_table: alter.id.clone(),
+                                from_columns: from_columns.clone(),
+                                to_table: to_table.clone(),
+                                to_columns: to_columns.clone(),
+                                from_generation: generation,
+                            });
+                        }
+                        AlterTableActionMutation::DropConstraint { name } => {
+                            self.snapshot_fk_graph();
+                            self.local.graph.foreign_keys.retain(|fk| {
+                                !(fk.from_table == alter.id && fk.constraint_name.as_ref() == Some(name))
+                            });
+                        }
+                        AlterTableActionMutation::AttachPartition { child } => {
+                            self.snapshot_partition_graph();
+                            self.local.graph.partitions.push(PartitionEdge {
+                                parent: alter.id.clone(),
+                                child: child.clone(),
+                            });
+                        }
+                        AlterTableActionMutation::DetachPartition { child } => {
+                            self.snapshot_partition_graph();
+                            self.local.graph.partitions.retain(|p| {
+                                !(p.parent == alter.id && p.child == *child)
+                            });
+                        }
+                        _ => {}
                     }
-                }
-                self.snapshot_relation(&policy.table);
-                self.snapshot_generation_counter();
-                self.local.generation_counter += 1;
-                let new_gen = self.local.generation_counter;
-
-                if let Some(RelationOverlay::Present(rel)) =
-                    self.local.relations.get_mut(&policy.table)
-                {
-                    rel.policies.remove(&policy.name);
-                    rel.generation = new_gen;
-                }
-                MutationResult::Applied
-            }
-            Mutation::CreateTrigger(trigger) => {
-                self.snapshot_relation(&trigger.table);
-                self.snapshot_generation_counter();
-                self.local.generation_counter += 1;
-                let new_gen = self.local.generation_counter;
-
-                if let Some(RelationOverlay::Present(rel)) =
-                    self.local.relations.get_mut(&trigger.table)
-                {
-                    rel.triggers.insert(trigger.name.clone());
-                    rel.generation = new_gen;
-                }
-                MutationResult::Applied
-            }
-            Mutation::DropTrigger(trigger) => {
-                if trigger.if_exists {
-                    let exists = self
-                        .local
-                        .relations
-                        .get(&trigger.table)
-                        .map(|o| {
-                            if let RelationOverlay::Present(rel) = o {
-                                rel.triggers.contains(&trigger.name)
-                            } else {
-                                false
-                            }
-                        })
-                        .unwrap_or(false);
-                    if !exists {
-                        return MutationResult::Skipped;
-                    }
-                }
-                self.snapshot_relation(&trigger.table);
-                self.snapshot_generation_counter();
-                self.local.generation_counter += 1;
-                let new_gen = self.local.generation_counter;
-
-                if let Some(RelationOverlay::Present(rel)) =
-                    self.local.relations.get_mut(&trigger.table)
-                {
-                    rel.triggers.remove(&trigger.name);
-                    rel.generation = new_gen;
                 }
                 MutationResult::Applied
             }
@@ -652,10 +834,10 @@ impl AnalysisState {
                 );
                 MutationResult::Applied
             }
-            Mutation::AlterType(alter) => {
-                self.snapshot_type(&alter.id);
-                if let Some(TypeOverlay::Present(t)) = self.local.types.get_mut(&alter.id) {
-                    match &alter.action {
+            Mutation::AlterType(alter_type) => {
+                self.snapshot_type(&alter_type.id);
+                if let Some(TypeOverlay::Present(t)) = self.local.types.get_mut(&alter_type.id) {
+                    match &alter_type.action {
                         AlterTypeActionMutation::AddValue { new_value } => {
                             if let TypeKind::Enum { variants } = &mut t.kind {
                                 variants.push(new_value.clone());
@@ -665,96 +847,66 @@ impl AnalysisState {
                 }
                 MutationResult::Applied
             }
-            Mutation::CreateDomain(create) => {
-                self.snapshot_type(&create.id);
+            Mutation::CreateDomain(create_domain) => {
+                self.snapshot_type(&create_domain.id);
                 self.snapshot_generation_counter();
                 self.local.generation_counter += 1;
                 let generation = self.local.generation_counter;
 
                 self.local.types.insert(
-                    create.id.clone(),
+                    create_domain.id.clone(),
                     TypeOverlay::Present(TypeState {
-                        id: create.id.clone(),
+                        id: create_domain.id.clone(),
                         generation,
                         kind: TypeKind::Domain {
-                            base_type: create.base_type.clone(),
+                            base_type: create_domain.base_type.clone(),
                         },
                     }),
                 );
                 MutationResult::Applied
             }
-            Mutation::AlterDomain(alter) => {
-                self.snapshot_type(&alter.id);
-                self.snapshot_generation_counter();
-                self.local.generation_counter += 1;
-                let new_gen = self.local.generation_counter;
-
-                if let Some(TypeOverlay::Present(t)) = self.local.types.get_mut(&alter.id) {
-                    t.generation = new_gen;
-                }
-                MutationResult::Applied
-            }
+            Mutation::AlterDomain(_) => MutationResult::Applied,
             Mutation::DropDomain(drop_domain) => {
                 for id in &drop_domain.ids {
-                    if !self.local.types.contains_key(id) && !drop_domain.if_exists {
-                        self.local.confidence = Confidence::Tainted;
-                        return MutationResult::Skipped;
-                    }
-                }
-                let mut any_applied = false;
-                for id in &drop_domain.ids {
-                    if !self.local.types.contains_key(id) {
-                        continue;
-                    }
                     self.snapshot_type(id);
                     self.local.types.insert(id.clone(), TypeOverlay::Dropped);
-                    any_applied = true;
-                }
-                if !any_applied && !drop_domain.ids.is_empty() {
-                    return MutationResult::Skipped;
                 }
                 MutationResult::Applied
             }
-            Mutation::CreateSequence(create) => {
-                if create.if_not_exists && self.local.sequences.contains_key(&create.id) {
+            Mutation::CreateSequence(create_seq) => {
+                if create_seq.if_not_exists && self.local.sequences.contains_key(&create_seq.id) {
                     return MutationResult::Skipped;
                 }
-                self.snapshot_sequence(&create.id);
+                self.snapshot_sequence(&create_seq.id);
                 self.snapshot_generation_counter();
                 self.local.generation_counter += 1;
                 let generation = self.local.generation_counter;
 
                 self.local.sequences.insert(
-                    create.id.clone(),
+                    create_seq.id.clone(),
                     SequenceOverlay::Present(SequenceState {
-                        id: create.id.clone(),
+                        id: create_seq.id.clone(),
                         generation,
                     }),
                 );
 
-                if let Some((table_id, col)) = &create.owned_by {
+                if let Some((table_id, col)) = &create_seq.owned_by {
                     self.snapshot_sequence_graph();
                     self.local.graph.sequences.push(SequenceEdge {
-                        sequence_id: create.id.clone(),
+                        sequence_id: create_seq.id.clone(),
                         table_id: table_id.clone(),
                         column: col.clone(),
                     });
                 }
                 MutationResult::Applied
             }
-            Mutation::AlterSequence(alter) => {
-                self.snapshot_sequence(&alter.id);
-                self.snapshot_generation_counter();
-                self.local.generation_counter += 1;
-
-                if let Some((table_id, col)) = &alter.owned_by {
-                    self.snapshot_sequence_graph_full();
-                    self.local
-                        .graph
-                        .sequences
-                        .retain(|s| s.sequence_id != alter.id);
+            Mutation::AlterSequence(alter_seq) => {
+                self.snapshot_sequence(&alter_seq.id);
+                if let Some((table_id, col)) = &alter_seq.owned_by {
+                    self.snapshot_sequence_graph();
+                    self.local.graph.sequences.retain(|s| s.sequence_id != alter_seq.id);
                     self.local.graph.sequences.push(SequenceEdge {
-                        sequence_id: alter.id.clone(),
+                        sequence_id: alter_seq.id.clone(),
                         table_id: table_id.clone(),
                         column: col.clone(),
                     });
@@ -763,394 +915,56 @@ impl AnalysisState {
             }
             Mutation::DropSequence(drop_seq) => {
                 for id in &drop_seq.ids {
-                    if !self.local.sequences.contains_key(id) && !drop_seq.if_exists {
-                        self.local.confidence = Confidence::Tainted;
-                        return MutationResult::Skipped;
-                    }
-                }
-                let mut any_applied = false;
-                for id in &drop_seq.ids {
-                    if !self.local.sequences.contains_key(id) {
-                        continue;
-                    }
                     self.snapshot_sequence(id);
-                    self.local
-                        .sequences
-                        .insert(id.clone(), SequenceOverlay::Dropped);
-                    self.snapshot_sequence_graph_full();
-                    self.local.graph.sequences.retain(|s| s.sequence_id != *id);
-                    any_applied = true;
+                    self.local.sequences.insert(id.clone(), SequenceOverlay::Dropped);
                 }
-                if !any_applied && !drop_seq.ids.is_empty() {
-                    return MutationResult::Skipped;
-                }
-                MutationResult::Applied
-            }
-            Mutation::AlterTable(alter) => {
-                if !self.relation_is_present(&alter.id) {
-                    self.local.confidence = Confidence::Tainted;
-                    return MutationResult::Skipped;
-                }
-
-                match &alter.action {
-                    AlterTableActionMutation::AddColumn {
-                        name,
-                        if_not_exists,
-                        ..
-                    } if *if_not_exists => {
-                        if let Some(RelationOverlay::Present(rel)) =
-                            self.local.relations.get(&alter.id)
-                            && rel.has_column(name)
-                        {
-                            return MutationResult::Skipped;
-                        }
-                    }
-                    AlterTableActionMutation::DropColumn {
-                        name, if_exists, ..
-                    } if *if_exists => {
-                        if let Some(RelationOverlay::Present(rel)) =
-                            self.local.relations.get(&alter.id)
-                            && !rel.has_column(name)
-                        {
-                            return MutationResult::Skipped;
-                        }
-                    }
-                    _ => {}
-                }
-
-                self.snapshot_relation(&alter.id);
-
-                match &alter.action {
-                    AlterTableActionMutation::AddColumn {
-                        name,
-                        ty,
-                        not_null,
-                        default,
-                        ..
-                    } => {
-                        if let Some(RelationOverlay::Present(rel)) =
-                            self.local.relations.get_mut(&alter.id)
-                        {
-                            rel.apply_column_action(&ColumnAction::Add {
-                                name: name.clone(),
-                                data_type: ty.clone(),
-                                not_null: *not_null,
-                                default: default.clone(),
-                            });
-                        }
-                    }
-                    AlterTableActionMutation::DropColumn { name, .. } => {
-                        if let Some(RelationOverlay::Present(rel)) =
-                            self.local.relations.get_mut(&alter.id)
-                        {
-                            rel.apply_column_action(&ColumnAction::Drop { name: name.clone() });
-                        }
-                    }
-                    AlterTableActionMutation::RenameColumn { from, to } => {
-                        if let Some(RelationOverlay::Present(rel)) =
-                            self.local.relations.get_mut(&alter.id)
-                        {
-                            rel.apply_column_action(&ColumnAction::Rename {
-                                from: from.clone(),
-                                to: to.clone(),
-                            });
-                        }
-                    }
-                    AlterTableActionMutation::SetNotNull { column } => {
-                        if let Some(RelationOverlay::Present(rel)) =
-                            self.local.relations.get_mut(&alter.id)
-                        {
-                            rel.apply_column_action(&ColumnAction::SetNotNull {
-                                name: column.clone(),
-                            });
-                        }
-                    }
-                    AlterTableActionMutation::DropNotNull { column } => {
-                        if let Some(RelationOverlay::Present(rel)) =
-                            self.local.relations.get_mut(&alter.id)
-                        {
-                            rel.apply_column_action(&ColumnAction::DropNotNull {
-                                name: column.clone(),
-                            });
-                        }
-                    }
-                    AlterTableActionMutation::SetType {
-                        column,
-                        ty,
-                        has_using: _,
-                    } => {
-                        if let Some(RelationOverlay::Present(rel)) =
-                            self.local.relations.get_mut(&alter.id)
-                        {
-                            rel.apply_column_action(&ColumnAction::SetType {
-                                name: column.clone(),
-                                data_type: ty.clone(),
-                            });
-                        }
-                    }
-                    AlterTableActionMutation::SetDefault { column, default } => {
-                        if let Some(RelationOverlay::Present(rel)) =
-                            self.local.relations.get_mut(&alter.id)
-                        {
-                            rel.apply_column_action(&ColumnAction::SetDefault {
-                                name: column.clone(),
-                                default: default.clone(),
-                            });
-                        }
-                    }
-                    AlterTableActionMutation::AddForeignKey {
-                        constraint_name,
-                        to_table,
-                        from_columns,
-                        to_columns,
-                        not_valid,
-                    } => {
-                        self.snapshot_fk_graph();
-                        let from_generation = self
-                            .local
-                            .relations
-                            .get(&alter.id)
-                            .and_then(|o| {
-                                if let RelationOverlay::Present(r) = o {
-                                    Some(r.generation)
-                                } else {
-                                    None
-                                }
-                            })
-                            .unwrap_or(0);
-
-                        self.local.graph.foreign_keys.push(FkEdge {
-                            constraint_name: constraint_name.clone(),
-                            from_table: alter.id.clone(),
-                            from_columns: from_columns.clone(),
-                            to_table: to_table.clone(),
-                            to_columns: to_columns.clone(),
-                            from_generation,
-                        });
-
-                        if *not_valid {
-                            let key = constraint_name
-                                .clone()
-                                .unwrap_or_else(|| format!("__fk__{}", to_table));
-                            self.snapshot_pending_validation();
-                            self.local
-                                .pending_validation
-                                .insert((alter.id.clone(), key));
-                        }
-                    }
-                    AlterTableActionMutation::RenameConstraint { old_name, new_name } => {
-                        self.snapshot_fk_graph_full();
-                        for fk in &mut self.local.graph.foreign_keys {
-                            if fk.from_table == alter.id
-                                && fk.constraint_name.as_deref() == Some(old_name.as_str())
-                            {
-                                fk.constraint_name = Some(new_name.clone());
-                            }
-                        }
-                    }
-                    AlterTableActionMutation::DropConstraint { name } => {
-                        self.snapshot_pending_validation();
-                        self.local
-                            .pending_validation
-                            .remove(&(alter.id.clone(), name.clone()));
-                        self.snapshot_fk_graph_full();
-                        self.local
-                            .graph
-                            .foreign_keys
-                            .retain(|fk| fk.constraint_name.as_deref() != Some(name.as_str()));
-                    }
-                    AlterTableActionMutation::ValidateConstraint { constraint_name } => {
-                        self.snapshot_pending_validation();
-                        self.local
-                            .pending_validation
-                            .remove(&(alter.id.clone(), constraint_name.clone()));
-                    }
-                    AlterTableActionMutation::AttachPartition { child } => {
-                        self.snapshot_partition_graph();
-                        self.local.graph.partitions.push(PartitionEdge {
-                            parent: alter.id.clone(),
-                            child: child.clone(),
-                        });
-                    }
-                    AlterTableActionMutation::DetachPartition { child } => {
-                        self.snapshot_partition_graph_full();
-                        self.local
-                            .graph
-                            .partitions
-                            .retain(|p| !(p.parent == alter.id && p.child == *child));
-                    }
-                    AlterTableActionMutation::AlterConstraint { .. }
-                    | AlterTableActionMutation::AddCheckConstraint { .. }
-                    | AlterTableActionMutation::AddUniqueConstraint
-                    | AlterTableActionMutation::AddPrimaryKeyConstraint
-                    | AlterTableActionMutation::AddExcludeConstraint
-                    | AlterTableActionMutation::SetStorage { .. }
-                    | AlterTableActionMutation::SetAccessMethod => {
-                        // Tracking only
-                    }
-                }
+                self.snapshot_sequence_graph_full();
+                self.local.graph.sequences.retain(|s| !drop_seq.ids.contains(&s.sequence_id));
                 MutationResult::Applied
             }
             Mutation::Rename(rename) => {
                 self.snapshot_relation(&rename.old_id);
                 self.snapshot_relation(&rename.new_id);
+                if let Some(RelationOverlay::Present(mut state)) = self.local.relations.remove(&rename.old_id) {
+                    state.id = rename.new_id.clone();
+                    self.local.relations.insert(rename.new_id.clone(), RelationOverlay::Present(state));
+                }
                 self.snapshot_rename_graph();
-                if let Some(overlay) = self.local.relations.remove(&rename.old_id) {
-                    self.local.relations.insert(rename.new_id.clone(), overlay);
-                }
-
-                self.snapshot_index_graph_full();
-                for idx in &mut self.local.graph.indexes {
-                    if idx.index_id == rename.old_id {
-                        idx.index_id = rename.new_id.clone();
-                    }
-                }
-
-                self.snapshot_sequence(&rename.old_id);
-                self.snapshot_sequence(&rename.new_id);
-                if let Some(overlay) = self.local.sequences.remove(&rename.old_id) {
-                    self.local.sequences.insert(rename.new_id.clone(), overlay);
-                }
-
-                self.snapshot_type(&rename.old_id);
-                self.snapshot_type(&rename.new_id);
-                if let Some(overlay) = self.local.types.remove(&rename.old_id) {
-                    self.local.types.insert(rename.new_id.clone(), overlay);
-                }
-
                 self.local.graph.renames.push(RenameEdge {
                     from: rename.old_id.clone(),
                     to: rename.new_id.clone(),
                 });
+
+                self.local.graph.propagate_rename(&rename.old_id, &rename.new_id);
+
                 MutationResult::Applied
             }
             Mutation::DropView(drop_view) => {
                 for id in &drop_view.ids {
-                    if !self.relation_is_present(id) && !drop_view.if_exists {
-                        self.local.confidence = Confidence::Tainted;
-                        return MutationResult::Skipped;
-                    }
-                }
-
-                let renames = self.local.graph.renames.clone();
-                let resolve = |id: &ObjectId| -> ObjectId {
-                    let mut current = id;
-                    loop {
-                        match renames.iter().find(|r| &r.from == current) {
-                            Some(edge) => current = &edge.to,
-                            None => return current.clone(),
-                        }
-                    }
-                };
-
-                let mut any_applied = false;
-                for id in &drop_view.ids {
-                    if !self.relation_is_present(id) {
-                        continue;
-                    }
-
-                    let resolved_id = resolve(id);
-                    let has_dependents = self.local.graph.views.iter().any(|v| {
-                        v.depends_on.iter().any(|dep| resolve(dep) == resolved_id)
-                            && !drop_view.ids.contains(&resolve(&v.view_id))
-                    });
-                    if has_dependents {
-                        self.local.confidence = Confidence::Tainted;
-                        return MutationResult::Skipped;
-                    }
-
                     self.snapshot_relation(id);
-                    self.local
-                        .relations
-                        .insert(id.clone(), RelationOverlay::Dropped);
-                    self.snapshot_view_graph_full();
-                    self.local
-                        .graph
-                        .views
-                        .retain(|v| resolve(&v.view_id) != resolved_id);
-                    any_applied = true;
+                    self.local.relations.insert(id.clone(), RelationOverlay::Dropped);
                 }
-                if !any_applied && !drop_view.ids.is_empty() {
-                    return MutationResult::Skipped;
-                }
+                self.snapshot_view_graph_full();
+                self.local.graph.views.retain(|v| !drop_view.ids.contains(&v.view_id));
                 MutationResult::Applied
             }
-            Mutation::DropMaterializedView(drop_mat_view) => {
-                for id in &drop_mat_view.ids {
-                    if !self.relation_is_present(id) && !drop_mat_view.if_exists {
-                        self.local.confidence = Confidence::Tainted;
-                        return MutationResult::Skipped;
-                    }
-                }
-
-                let renames = self.local.graph.renames.clone();
-                let resolve = |id: &ObjectId| -> ObjectId {
-                    let mut current = id;
-                    loop {
-                        match renames.iter().find(|r| &r.from == current) {
-                            Some(edge) => current = &edge.to,
-                            None => return current.clone(),
-                        }
-                    }
-                };
-
-                let mut any_applied = false;
-                for id in &drop_mat_view.ids {
-                    if !self.relation_is_present(id) {
-                        continue;
-                    }
-
-                    let resolved_id = resolve(id);
-                    let has_dependents = self.local.graph.views.iter().any(|v| {
-                        v.depends_on.iter().any(|dep| resolve(dep) == resolved_id)
-                            && !drop_mat_view.ids.contains(&resolve(&v.view_id))
-                    });
-                    if has_dependents {
-                        self.local.confidence = Confidence::Tainted;
-                        return MutationResult::Skipped;
-                    }
-
+            Mutation::DropMaterializedView(drop_mv) => {
+                for id in &drop_mv.ids {
                     self.snapshot_relation(id);
-                    self.local
-                        .relations
-                        .insert(id.clone(), RelationOverlay::Dropped);
-                    self.snapshot_view_graph_full();
-                    self.local
-                        .graph
-                        .views
-                        .retain(|v| resolve(&v.view_id) != resolved_id);
-                    any_applied = true;
+                    self.local.relations.insert(id.clone(), RelationOverlay::Dropped);
                 }
-                if !any_applied && !drop_mat_view.ids.is_empty() {
-                    return MutationResult::Skipped;
-                }
+                self.snapshot_view_graph_full();
+                self.local.graph.views.retain(|v| !drop_mv.ids.contains(&v.view_id));
                 MutationResult::Applied
             }
-            Mutation::DropIndex(drop_index) => {
-                let present = self
-                    .local
-                    .graph
-                    .indexes
-                    .iter()
-                    .any(|idx| idx.index_id == drop_index.id);
-                if !present {
-                    if drop_index.if_exists {
-                        return MutationResult::Skipped;
-                    } else {
-                        self.local.confidence = Confidence::Tainted;
-                        return MutationResult::Skipped;
-                    }
-                }
-                self.snapshot_index_graph_full();
-                self.local
-                    .graph
-                    .indexes
-                    .retain(|idx| idx.index_id != drop_index.id);
+            Mutation::DropIndex(drop_idx) => {
+                self.snapshot_index_graph();
+                self.local.graph.indexes.retain(|idx| idx.index_id != drop_idx.id);
                 MutationResult::Applied
             }
-            Mutation::SearchPath(change) => {
+            Mutation::SearchPath(sp) => {
                 self.snapshot_search_path();
-                match &change.target {
+                match &sp.target {
                     SearchPathTarget::Default => {
                         self.local.search_path = vec!["public".to_string()];
                     }
@@ -1161,56 +975,58 @@ impl AnalysisState {
                 MutationResult::Applied
             }
             Mutation::BeginTransaction => {
-                self.local
-                    .transactions
-                    .push(TransactionFrame::new("__transaction__"));
+                self.local.transactions.push(TransactionFrame::new("transaction"));
                 MutationResult::Applied
             }
             Mutation::CommitTransaction => {
-                self.local.transactions.clear();
+                while self.local.transactions.pop().is_some() {}
                 MutationResult::Applied
             }
             Mutation::RollbackTransaction => {
-                let frames: Vec<_> = self.local.transactions.drain(..).collect();
-                for frame in frames.into_iter().rev() {
-                    self.replay_undo_log(frame);
+                while let Some(frame) = self.local.transactions.pop() {
+                    self.rollback_frame(frame);
+                }
+                MutationResult::Applied
+            }
+            Mutation::RollbackToSavepoint(rts) => {
+                let mut rolled_back = Vec::new();
+                while let Some(frame) = self.local.transactions.last() {
+                    if frame.name == rts.name {
+                        break;
+                    }
+                    rolled_back.push(self.local.transactions.pop().unwrap());
+                }
+                if let Some(frame) = self.local.transactions.last_mut() {
+                    let mut temp_frame = TransactionFrame::new(&frame.name);
+                    while let Some(change) = frame.undo_log.pop() {
+                        temp_frame.undo_log.push(change);
+                    }
+                    self.rollback_frame(temp_frame);
+                }
+                for frame in rolled_back.into_iter().rev() {
+                    self.rollback_frame(frame);
                 }
                 MutationResult::Applied
             }
             Mutation::Savepoint(sp) => {
-                self.local
-                    .transactions
-                    .push(TransactionFrame::new(sp.name.clone()));
+                self.local.transactions.push(TransactionFrame::new(sp.name.clone()));
                 MutationResult::Applied
             }
             Mutation::ReleaseSavepoint(rsp) => {
-                if let Some(pos) = self
-                    .local
-                    .transactions
-                    .iter()
-                    .rposition(|f| f.name == rsp.name)
-                {
-                    let mut released_frame = self.local.transactions.remove(pos);
-                    if let Some(parent_frame) = self.local.transactions.last_mut() {
-                        parent_frame.undo_log.append(&mut released_frame.undo_log);
+                let mut rolled_back = Vec::new();
+                while let Some(frame) = self.local.transactions.last() {
+                    if frame.name == rsp.name {
+                        break;
                     }
+                    rolled_back.push(self.local.transactions.pop().unwrap());
                 }
-                MutationResult::Applied
-            }
-            Mutation::RollbackToSavepoint(rsp) => {
-                if let Some(pos) = self
-                    .local
-                    .transactions
-                    .iter()
-                    .rposition(|f| f.name == rsp.name)
+                if let Some(frame) = self.local.transactions.pop()
+                    && let Some(outer) = self.local.transactions.last_mut()
                 {
-                    let frames: Vec<_> = self.local.transactions.drain(pos..).collect();
-                    for frame in frames.into_iter().rev() {
-                        self.replay_undo_log(frame);
-                    }
-                    self.local
-                        .transactions
-                        .push(TransactionFrame::new(rsp.name.clone()));
+                    outer.undo_log.extend(frame.undo_log);
+                }
+                for frame in rolled_back.into_iter().rev() {
+                    self.local.transactions.push(frame);
                 }
                 MutationResult::Applied
             }
@@ -1218,6 +1034,322 @@ impl AnalysisState {
                 self.local.confidence = Confidence::Tainted;
                 MutationResult::Applied
             }
+            Mutation::CreateFunction(f) => {
+                self.snapshot_function(&f.id);
+                self.snapshot_generation_counter();
+                self.local.generation_counter += 1;
+                let _generation = self.local.generation_counter;
+
+                let volatility = f.options.iter().find_map(|opt| {
+                    if let crate::analysis::facts::FuncOptionFact::Volatility(v) = opt {
+                        Some(match v {
+                            crate::analysis::facts::VolatilityKind::Volatile => crate::model::function::Volatility::Volatile,
+                            crate::analysis::facts::VolatilityKind::Stable => crate::model::function::Volatility::Stable,
+                            crate::analysis::facts::VolatilityKind::Immutable => crate::model::function::Volatility::Immutable,
+                        })
+                    } else {
+                        None
+                    }
+                }).unwrap_or(crate::model::function::Volatility::Volatile);
+
+                let security = f.options.iter().find_map(|opt| {
+                    if let crate::analysis::facts::FuncOptionFact::Security(s) = opt {
+                        Some(match s {
+                            crate::analysis::facts::SecurityKind::Invoker => crate::model::function::SecurityMode::Invoker,
+                            crate::analysis::facts::SecurityKind::Definer => crate::model::function::SecurityMode::Definer,
+                        })
+                    } else {
+                        None
+                    }
+                }).unwrap_or(crate::model::function::SecurityMode::Invoker);
+
+                let language = f.options.iter().find_map(|opt| {
+                    if let crate::analysis::facts::FuncOptionFact::Language(l) = opt {
+                        Some(l.clone())
+                    } else {
+                        None
+                    }
+                }).unwrap_or_else(|| "sql".to_string());
+
+                self.local.functions.insert(
+                    f.id.clone(),
+                    crate::model::function::FunctionOverlay::Present(crate::model::function::FunctionState {
+                        id: f.id.clone(),
+                        arg_types: f.params.iter().map(|p| p.ty.clone()).collect(),
+                        return_type: f.return_type.as_ref().map(|rt| format!("{:?}", rt)).unwrap_or_default(),
+                        volatility,
+                        language,
+                        security,
+                    }),
+                );
+                MutationResult::Applied
+            }
+            Mutation::AlterFunction(f) => {
+                self.snapshot_function(&f.id);
+                // Function generation tracking removed to match model definition
+                MutationResult::Applied
+            }
+            Mutation::DropFunction(f) => {
+                for sig in &f.signatures {
+                    let id = ObjectId::new(sig.name.schema.as_ref().map(|s| s.resolve()).unwrap_or_else(|| "public".to_string()), 
+                                          format!("{}({})", sig.name.name.resolve(), sig.params.join(",")));
+                    if !f.if_exists && !self.local.functions.contains_key(&id) {
+                        self.local.confidence = Confidence::Tainted;
+                        return MutationResult::Skipped;
+                    }
+                    self.snapshot_function(&id);
+                    self.local.functions.insert(id, crate::model::function::FunctionOverlay::Dropped);
+                }
+                MutationResult::Applied
+            }
+            Mutation::CreateProcedure(p) => {
+                self.snapshot_function(&p.id);
+                self.snapshot_generation_counter();
+                self.local.generation_counter += 1;
+                let _generation = self.local.generation_counter;
+
+                self.local.functions.insert(
+                    p.id.clone(),
+                    crate::model::function::FunctionOverlay::Present(crate::model::function::FunctionState {
+                        id: p.id.clone(),
+                        arg_types: p.params.iter().map(|p| p.ty.clone()).collect(),
+                        return_type: "void".to_string(),
+                        volatility: crate::model::function::Volatility::Volatile,
+                        language: "sql".to_string(),
+                        security: crate::model::function::SecurityMode::Invoker,
+                    }),
+                );
+                MutationResult::Applied
+            }
+            Mutation::AlterProcedure(p) => {
+                self.snapshot_function(&p.id);
+                // No generation tracking in FunctionState
+                MutationResult::Applied
+            }
+            Mutation::DropProcedure(p) => {
+                for sig in &p.signatures {
+                    let id = ObjectId::new(sig.name.schema.as_ref().map(|s| s.resolve()).unwrap_or_else(|| "public".to_string()), 
+                                          format!("{}({})", sig.name.name.resolve(), sig.params.join(",")));
+                    if !p.if_exists && !self.local.functions.contains_key(&id) {
+                        self.local.confidence = Confidence::Tainted;
+                        return MutationResult::Skipped;
+                    }
+                    self.snapshot_function(&id);
+                    self.local.functions.insert(id, crate::model::function::FunctionOverlay::Dropped);
+                }
+                MutationResult::Applied
+            }
+            Mutation::CreatePublication(p) => {
+                self.snapshot_publication(&p.name);
+                self.snapshot_generation_counter();
+                self.local.generation_counter += 1;
+                let generation = self.local.generation_counter;
+
+                self.local.publications.insert(
+                    p.name.clone(),
+                    crate::model::replication::PublicationOverlay::Present(crate::model::replication::PublicationState {
+                        name: p.name.clone(),
+                        scope: p.scope.clone(),
+                        params: p.params.clone(),
+                        generation,
+                    }),
+                );
+
+                if let crate::analysis::facts::PublicationScope::Explicit(objects) = &p.scope {
+                    self.snapshot_publication_graph_full();
+                    for obj in objects {
+                        if let crate::analysis::facts::PublicationObjectFact::Table { .. } = obj {
+                            // Note: We need a mapping from PublicationObjectFact to ObjectId
+                            // For now, based on current engine constraints, we assume table extraction here
+                            // This might need further refinement based on the specific PublicationObjectFact structure.
+                        }
+                    }
+                }
+                MutationResult::Applied
+            }
+            Mutation::AlterPublication(p) => {
+                self.snapshot_publication(&p.name);
+                if !self.local.publications.contains_key(&p.name) {
+                    self.local.confidence = Confidence::Tainted;
+                    return MutationResult::Skipped;
+                }
+                self.snapshot_generation_counter();
+                self.local.generation_counter += 1;
+                let new_gen = self.local.generation_counter;
+
+                if let Some(crate::model::replication::PublicationOverlay::Present(publ)) =
+                    self.local.publications.get_mut(&p.name)
+                {
+                    publ.generation = new_gen;
+                }
+                MutationResult::Applied
+            }
+            Mutation::DropPublication(p) => {
+                for name in &p.names {
+                    self.snapshot_publication(name);
+                    if !p.if_exists && !self.local.publications.contains_key(name) {
+                        self.local.confidence = Confidence::Tainted;
+                        return MutationResult::Skipped;
+                    }
+                    self.local.publications.insert(name.clone(), crate::model::replication::PublicationOverlay::Dropped);
+                }
+                self.snapshot_publication_graph_full();
+                self.local.graph.publication_dependencies.retain(|edge| !p.names.contains(&edge.publication_name));
+                MutationResult::Applied
+            }
+            Mutation::CreateSubscription(s) => {
+                let name = s.name.clone().unwrap_or_else(|| "unnamed_sub".into());
+                self.snapshot_subscription(&name);
+                self.snapshot_generation_counter();
+                self.local.generation_counter += 1;
+                let generation = self.local.generation_counter;
+
+                self.local.subscriptions.insert(
+                    name.clone(),
+                    crate::model::replication::SubscriptionOverlay::Present(crate::model::replication::SubscriptionState {
+                        name,
+                        connection: s.connection.clone(),
+                        publications: s.publications.clone(),
+                        params: s.params.clone(),
+                        generation,
+                    }),
+                );
+                MutationResult::Applied
+            }
+            Mutation::AlterSubscription(s) => {
+                self.snapshot_subscription(&s.name);
+                if !self.local.subscriptions.contains_key(&s.name) {
+                    self.local.confidence = Confidence::Tainted;
+                    return MutationResult::Skipped;
+                }
+                self.snapshot_generation_counter();
+                self.local.generation_counter += 1;
+                let new_gen = self.local.generation_counter;
+
+                if let Some(crate::model::replication::SubscriptionOverlay::Present(sub)) =
+                    self.local.subscriptions.get_mut(&s.name)
+                {
+                    sub.generation = new_gen;
+                }
+                MutationResult::Applied
+            }
+            Mutation::DropSubscription(s) => {
+                self.snapshot_subscription(&s.name);
+                if !s.if_exists && !self.local.subscriptions.contains_key(&s.name) {
+                    self.local.confidence = Confidence::Tainted;
+                    return MutationResult::Skipped;
+                }
+                self.local.subscriptions.insert(s.name.clone(), crate::model::replication::SubscriptionOverlay::Dropped);
+                MutationResult::Applied
+            }
+            Mutation::CreateRole(r) => {
+                let role_id = ObjectId::new("", &r.name);
+                self.snapshot_role(&role_id);
+                self.snapshot_generation_counter();
+                self.local.generation_counter += 1;
+                let _generation = self.local.generation_counter;
+
+                self.local.roles.insert(
+                    role_id.clone(),
+                    crate::model::role::RoleOverlay::Present(crate::model::role::RoleState {
+                        id: role_id,
+                        can_login: true,
+                        is_superuser: false,
+                        member_of: Vec::new(),
+                        granted_privileges: Vec::new(),
+                    }),
+                );
+                MutationResult::Applied
+            }
+            Mutation::AlterRole(r) => {
+                if let Some(role_id) = Self::resolve_role_name(&r.name, &self.local.current_role) {
+                    self.snapshot_role(&role_id);
+                    if !self.local.roles.contains_key(&role_id) {
+                        self.local.confidence = Confidence::Tainted;
+                        return MutationResult::Skipped;
+                    }
+                    self.snapshot_generation_counter();
+                    self.local.generation_counter += 1;
+                    let _new_gen = self.local.generation_counter;
+
+                    if let Some(crate::model::role::RoleOverlay::Present(_role)) =
+                        self.local.roles.get_mut(&role_id)
+                    {
+                        // No further action as fields have been simplified
+                    }
+                    MutationResult::Applied
+                } else {
+                    MutationResult::Skipped
+                }
+            }
+            Mutation::DropRole(r) => {
+                for name in &r.names {
+                    if let Some(role_id) = Self::resolve_role_name(&crate::analysis::facts::RoleFact::Named { 
+                        name: name.clone(),
+                        via_legacy_group_syntax: false,
+                    }, &self.local.current_role) {
+                        self.snapshot_role(&role_id);
+                        if !r.if_exists && !self.local.roles.contains_key(&role_id) {
+                            self.local.confidence = Confidence::Tainted;
+
+                            return MutationResult::Skipped;
+                        }
+                        self.local.roles.insert(role_id, crate::model::role::RoleOverlay::Dropped);
+                    }
+                }
+                MutationResult::Applied
+            }
+            Mutation::Grant(grant) => {
+                let privileges = Self::resolve_grant_privileges(&grant.privileges);
+                let grantees = &grant.grantees;
+                match &grant.target {
+                    crate::analysis::mutations::ResolvedGrantTarget::Tables(ids) => {
+                        for id in ids {
+                            self.apply_grant_to_relation(id, &privileges, grantees);
+                        }
+                    }
+                    crate::analysis::mutations::ResolvedGrantTarget::AllTablesInSchema(schemas) => {
+                        let target_ids: Vec<ObjectId> = self
+                            .local
+                            .relations
+                            .keys()
+                            .filter(|id| schemas.contains(&id.schema))
+                            .cloned()
+                            .collect();
+                        for id in &target_ids {
+                            self.apply_grant_to_relation(id, &privileges, grantees);
+                        }
+                    }
+                }
+                MutationResult::Applied
+            }
+            Mutation::Revoke(revoke) => {
+                let privileges = Self::resolve_grant_privileges(&revoke.privileges);
+                let revokees = &revoke.revokees;
+                match &revoke.target {
+                    crate::analysis::mutations::ResolvedGrantTarget::Tables(ids) => {
+                        for id in ids {
+                            self.apply_revoke_to_relation(id, &privileges, revokees);
+                        }
+                    }
+                    crate::analysis::mutations::ResolvedGrantTarget::AllTablesInSchema(schemas) => {
+                        let target_ids: Vec<ObjectId> = self
+                            .local
+                            .relations
+                            .keys()
+                            .filter(|id| schemas.contains(&id.schema))
+                            .cloned()
+                            .collect();
+                        for id in &target_ids {
+                            self.apply_revoke_to_relation(id, &privileges, revokees);
+                        }
+                    }
+                }
+                MutationResult::Applied
+            }
+            Mutation::CreateDatabase(_) => MutationResult::Applied,
+            Mutation::AlterDatabase(_) => MutationResult::Applied,
+            Mutation::DropDatabase(_) => MutationResult::Applied,
             Mutation::Vacuum { .. } => MutationResult::Applied,
         }
     }
@@ -1248,6 +1380,97 @@ impl AnalysisState {
             frame.undo_log.push(StateChange::SequenceSnapshot {
                 id: id.clone(),
                 previous,
+            });
+        }
+    }
+
+    fn snapshot_function(&mut self, id: &ObjectId) {
+        if let Some(frame) = self.local.transactions.last_mut() {
+            let previous = self.local.functions.get(id).cloned();
+            frame.undo_log.push(StateChange::FunctionSnapshot {
+                id: id.clone(),
+                previous,
+            });
+        }
+    }
+
+    fn snapshot_publication(&mut self, name: &str) {
+        if let Some(frame) = self.local.transactions.last_mut() {
+            let previous = self.local.publications.get(name).cloned();
+            frame.undo_log.push(StateChange::PublicationSnapshot {
+                id: ObjectId::new("", name),
+                previous,
+            });
+        }
+    }
+
+    fn snapshot_subscription(&mut self, name: &str) {
+        if let Some(frame) = self.local.transactions.last_mut() {
+            let previous = self.local.subscriptions.get(name).cloned();
+            frame.undo_log.push(StateChange::SubscriptionSnapshot {
+                id: ObjectId::new("", name),
+                previous,
+            });
+        }
+    }
+
+    fn snapshot_role(&mut self, id: &ObjectId) {
+        if let Some(frame) = self.local.transactions.last_mut() {
+            let previous = self.local.roles.get(id).cloned();
+            frame.undo_log.push(StateChange::RoleSnapshot {
+                id: id.clone(),
+                previous,
+            });
+        }
+    }
+
+    fn snapshot_trigger(&mut self, id: &ObjectId) {
+        if let Some(frame) = self.local.transactions.last_mut() {
+            let previous = self.local.triggers.get(id).cloned();
+            frame.undo_log.push(StateChange::TriggerSnapshot {
+                id: id.clone(),
+                previous,
+            });
+        }
+    }
+
+    fn snapshot_trigger_graph_full(&mut self) {
+        if let Some(frame) = self.local.transactions.last_mut() {
+            frame.undo_log.push(StateChange::TriggerGraphSnapshot {
+                previous: self.local.graph.trigger_dependencies.clone(),
+            });
+        }
+    }
+
+    fn snapshot_publication_graph_full(&mut self) {
+        if let Some(frame) = self.local.transactions.last_mut() {
+            frame.undo_log.push(StateChange::PublicationGraphSnapshot {
+                previous: self.local.graph.publication_dependencies.clone(),
+            });
+        }
+    }
+
+    #[allow(dead_code)]
+    fn snapshot_current_role(&mut self) {
+        if let Some(frame) = self.local.transactions.last_mut() {
+            frame.undo_log.push(StateChange::CurrentRoleSnapshot {
+                previous: self.local.current_role.clone(),
+            });
+        }
+    }
+
+    fn snapshot_search_path(&mut self) {
+        if let Some(frame) = self.local.transactions.last_mut() {
+            frame.undo_log.push(StateChange::SearchPathSnapshot {
+                previous: self.local.search_path.clone(),
+            });
+        }
+    }
+
+    fn snapshot_generation_counter(&mut self) {
+        if let Some(frame) = self.local.transactions.last_mut() {
+            frame.undo_log.push(StateChange::GenerationCounterSnapshot {
+                previous: self.local.generation_counter,
             });
         }
     }
@@ -1300,18 +1523,18 @@ impl AnalysisState {
         }
     }
 
-    fn snapshot_rename_graph(&mut self) {
+    fn snapshot_partition_graph(&mut self) {
         if let Some(frame) = self.local.transactions.last_mut() {
-            frame.undo_log.push(StateChange::RenameGraphLengthMarker {
-                len: self.local.graph.renames.len(),
+            frame.undo_log.push(StateChange::PartitionGraphMarker {
+                len: self.local.graph.partitions.len(),
             });
         }
     }
 
-    fn snapshot_rename_graph_full(&mut self) {
+    fn snapshot_partition_graph_full(&mut self) {
         if let Some(frame) = self.local.transactions.last_mut() {
-            frame.undo_log.push(StateChange::RenameGraphSnapshot {
-                previous: self.local.graph.renames.clone(),
+            frame.undo_log.push(StateChange::PartitionGraphSnapshot {
+                previous: self.local.graph.partitions.clone(),
             });
         }
     }
@@ -1332,75 +1555,98 @@ impl AnalysisState {
         }
     }
 
-    fn snapshot_partition_graph(&mut self) {
+    fn snapshot_column_graph(&mut self) {
         if let Some(frame) = self.local.transactions.last_mut() {
-            frame
-                .undo_log
-                .push(StateChange::PartitionGraphLengthMarker {
-                    len: self.local.graph.partitions.len(),
-                });
-        }
-    }
-
-    fn snapshot_partition_graph_full(&mut self) {
-        if let Some(frame) = self.local.transactions.last_mut() {
-            frame.undo_log.push(StateChange::PartitionGraphSnapshot {
-                previous: self.local.graph.partitions.clone(),
+            frame.undo_log.push(StateChange::ColumnGraphLengthMarker {
+                len: self.local.graph.column_dependencies.len(),
             });
         }
     }
 
-    fn snapshot_search_path(&mut self) {
+    fn snapshot_rename_graph(&mut self) {
         if let Some(frame) = self.local.transactions.last_mut() {
-            frame.undo_log.push(StateChange::SearchPathSnapshot {
-                previous: self.local.search_path.clone(),
+            frame.undo_log.push(StateChange::RenameGraphLengthMarker {
+                len: self.local.graph.renames.len(),
             });
         }
     }
 
-    fn snapshot_generation_counter(&mut self) {
+    fn snapshot_rename_graph_full(&mut self) {
         if let Some(frame) = self.local.transactions.last_mut() {
-            frame.undo_log.push(StateChange::GenerationCounterSnapshot {
-                previous: self.local.generation_counter,
+            frame.undo_log.push(StateChange::RenameGraphSnapshot {
+                previous: self.local.graph.renames.clone(),
             });
         }
     }
 
-    fn snapshot_pending_validation(&mut self) {
-        if let Some(frame) = self.local.transactions.last_mut() {
-            frame.undo_log.push(StateChange::PendingValidationSnapshot {
-                previous: self.local.pending_validation.clone(),
-            });
-        }
-    }
-
-    fn replay_undo_log(&mut self, frame: TransactionFrame) {
-        for change in frame.undo_log.into_iter().rev() {
+    fn rollback_frame(&mut self, mut frame: TransactionFrame) {
+        while let Some(change) = frame.undo_log.pop() {
             match change {
-                StateChange::RelationSnapshot { id, previous } => match previous {
-                    Some(overlay) => {
-                        self.local.relations.insert(id, overlay);
-                    }
-                    None => {
+                StateChange::RelationSnapshot { id, previous } => {
+                    if let Some(prev) = previous {
+                        self.local.relations.insert(id, prev);
+                    } else {
                         self.local.relations.remove(&id);
                     }
-                },
-                StateChange::TypeSnapshot { id, previous } => match previous {
-                    Some(overlay) => {
-                        self.local.types.insert(id, overlay);
-                    }
-                    None => {
+                }
+                StateChange::TypeSnapshot { id, previous } => {
+                    if let Some(prev) = previous {
+                        self.local.types.insert(id, prev);
+                    } else {
                         self.local.types.remove(&id);
                     }
-                },
-                StateChange::SequenceSnapshot { id, previous } => match previous {
-                    Some(overlay) => {
-                        self.local.sequences.insert(id, overlay);
-                    }
-                    None => {
+                }
+                StateChange::SequenceSnapshot { id, previous } => {
+                    if let Some(prev) = previous {
+                        self.local.sequences.insert(id, prev);
+                    } else {
                         self.local.sequences.remove(&id);
                     }
-                },
+                }
+                StateChange::FunctionSnapshot { id, previous } => {
+                    if let Some(prev) = previous {
+                        self.local.functions.insert(id, prev);
+                    } else {
+                        self.local.functions.remove(&id);
+                    }
+                }
+                StateChange::PublicationSnapshot { id, previous } => {
+                    if let Some(prev) = previous {
+                        self.local.publications.insert(id.name, prev);
+                    } else {
+                        self.local.publications.remove(&id.name);
+                    }
+                }
+                StateChange::SubscriptionSnapshot { id, previous } => {
+                    if let Some(prev) = previous {
+                        self.local.subscriptions.insert(id.name, prev);
+                    } else {
+                        self.local.subscriptions.remove(&id.name);
+                    }
+                }
+                StateChange::RoleSnapshot { id, previous } => {
+                    if let Some(prev) = previous {
+                        self.local.roles.insert(id, prev);
+                    } else {
+                        self.local.roles.remove(&id);
+                    }
+                }
+                StateChange::TriggerSnapshot { id, previous } => {
+                    if let Some(prev) = previous {
+                        self.local.triggers.insert(id, prev);
+                    } else {
+                        self.local.triggers.remove(&id);
+                    }
+                }
+                StateChange::TriggerGraphSnapshot { previous } => {
+                    self.local.graph.trigger_dependencies = previous;
+                }
+                StateChange::PublicationGraphSnapshot { previous } => {
+                    self.local.graph.publication_dependencies = previous;
+                }
+                StateChange::CurrentRoleSnapshot { previous } => {
+                    self.local.current_role = previous;
+                }
                 StateChange::SearchPathSnapshot { previous } => {
                     self.local.search_path = previous;
                 }
@@ -1428,11 +1674,11 @@ impl AnalysisState {
                 StateChange::IndexGraphSnapshot { previous } => {
                     self.local.graph.indexes = previous;
                 }
-                StateChange::RenameGraphLengthMarker { len } => {
-                    self.local.graph.renames.truncate(len);
+                StateChange::PartitionGraphMarker { len } => {
+                    self.local.graph.partitions.truncate(len);
                 }
-                StateChange::RenameGraphSnapshot { previous } => {
-                    self.local.graph.renames = previous;
+                StateChange::PartitionGraphSnapshot { previous } => {
+                    self.local.graph.partitions = previous;
                 }
                 StateChange::SequenceGraphLengthMarker { len } => {
                     self.local.graph.sequences.truncate(len);
@@ -1440,11 +1686,17 @@ impl AnalysisState {
                 StateChange::SequenceGraphSnapshot { previous } => {
                     self.local.graph.sequences = previous;
                 }
-                StateChange::PartitionGraphLengthMarker { len } => {
-                    self.local.graph.partitions.truncate(len);
+                StateChange::RenameGraphLengthMarker { len } => {
+                    self.local.graph.renames.truncate(len);
                 }
-                StateChange::PartitionGraphSnapshot { previous } => {
-                    self.local.graph.partitions = previous;
+                StateChange::RenameGraphSnapshot { previous } => {
+                    self.local.graph.renames = previous;
+                }
+                StateChange::ColumnGraphLengthMarker { len } => {
+                    self.local.graph.column_dependencies.truncate(len);
+                }
+                StateChange::ColumnGraphSnapshot { previous } => {
+                    self.local.graph.column_dependencies = previous;
                 }
             }
         }

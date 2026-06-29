@@ -2,3 +2,5 @@
 
 pub mod reporter;
 pub mod violations;
+#[cfg(test)]
+mod reporter_tests;

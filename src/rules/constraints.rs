@@ -1,12 +1,10 @@
 // FILE: src/rules/constraints.rs
 use crate::analysis::mutations::{AlterTableActionMutation, Mutation};
 use crate::analysis::state::{AnalysisState, CascadeResult, MutationResult};
-use crate::ast::identifiers::ObjectId;
 use crate::engine::config::Config;
-use crate::model::relation::{Persistence, RelationState};
+use crate::model::relation::Persistence;
 use crate::report::violations::{Violation, ViolationTier};
 use crate::rules::Rule;
-use std::collections::HashMap;
 
 pub struct BlockingConstraintRule;
 
@@ -25,7 +23,7 @@ impl Rule for BlockingConstraintRule {
         &self,
         mutation: &Mutation,
         result: &MutationResult,
-        pre_relations: &HashMap<ObjectId, RelationState>,
+        pre_state: &crate::analysis::state::PreState,
         state: &AnalysisState,
         config: &Config,
         _cascade: Option<&CascadeResult>,
@@ -38,7 +36,7 @@ impl Rule for BlockingConstraintRule {
 
         if let Mutation::AlterTable(alter) = mutation {
             // Get child table properties
-            let (is_temp, mut is_stale, child_rows) = match pre_relations.get(&alter.id) {
+            let (is_temp, mut is_stale, child_rows) = match pre_state.relations.get(&alter.id) {
                 Some(rel) => {
                     // BUG FIX: Only mark as stale if it actually existed in the baseline database!
                     let stale = rel.is_stale() && state.baseline_relations.contains(&alter.id);
@@ -61,7 +59,7 @@ impl Rule for BlockingConstraintRule {
                 AlterTableActionMutation::AddForeignKey { to_table, .. } => {
                     // BUG FIX: Foreign keys lock BOTH the child and the parent table.
                     // We must escalate the lock tier if the parent table is massive, even if the child is empty.
-                    let parent_rows = match pre_relations.get(to_table) {
+                    let parent_rows = match pre_state.relations.get(to_table) {
                         Some(parent_rel) => {
                             if parent_rel.is_stale() && state.baseline_relations.contains(to_table)
                             {
@@ -156,7 +154,7 @@ impl Rule for BlockingConstraintRule {
                     });
                 }
                 AlterTableActionMutation::SetNotNull { column } => {
-                    let has_fast_path = pre_relations
+                    let has_fast_path = pre_state.relations
                         .get(&alter.id)
                         .map(|r| {
                             r.get_column(column)

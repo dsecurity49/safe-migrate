@@ -2,6 +2,9 @@
 
 // FILE: src/lib.rs
 
+#[cfg(test)]
+pub mod sync_tests;
+pub mod sync;
 pub mod analysis;
 pub mod ast;
 pub mod db;
@@ -9,7 +12,6 @@ pub mod engine;
 pub mod model;
 pub mod report;
 pub mod rules;
-pub mod sync;
 
 pub use analysis::state::AnalysisState;
 pub use db::cache::DbCache;
