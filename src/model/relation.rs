@@ -140,6 +140,8 @@ impl RelationState {
                         default: default.clone(),
                         is_nullable: !not_null,
                         avg_width: None,
+                        default_expr_text: None,
+                        type_modifier: None,
                     });
                 }
             }

@@ -1359,7 +1359,7 @@ impl AnalysisState {
             let previous = self.local.relations.get(id).cloned();
             frame.undo_log.push(StateChange::RelationSnapshot {
                 id: id.clone(),
-                previous,
+                previous: Box::new(previous),
             });
         }
     }
@@ -1583,7 +1583,7 @@ impl AnalysisState {
         while let Some(change) = frame.undo_log.pop() {
             match change {
                 StateChange::RelationSnapshot { id, previous } => {
-                    if let Some(prev) = previous {
+                    if let Some(prev) = *previous {
                         self.local.relations.insert(id, prev);
                     } else {
                         self.local.relations.remove(&id);

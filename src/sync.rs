@@ -93,11 +93,14 @@ pub fn sync_cache(out_path: &Path) -> Result<()> {
             a.attname AS column_name,
             pg_catalog.format_type(a.atttypid, a.atttypmod) AS type_name,
             a.attnotnull AS not_null,
-            s.avg_width AS avg_width
+            s.avg_width AS avg_width,
+            pg_get_expr(ad.adbin, ad.adrelid) AS default_expr_text,
+            a.atttypmod AS type_modifier
         FROM pg_attribute a
         JOIN pg_class c ON a.attrelid = c.oid
         JOIN pg_namespace n ON n.oid = c.relnamespace
         LEFT JOIN pg_stats s ON s.schemaname = n.nspname AND s.tablename = c.relname AND s.attname = a.attname
+        LEFT JOIN pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum
         WHERE a.attnum > 0 AND NOT a.attisdropped
           AND c.relkind IN ('r', 'p', 'v', 'm')
           AND n.nspname NOT IN ('pg_catalog', 'information_schema');
@@ -110,6 +113,8 @@ pub fn sync_cache(out_path: &Path) -> Result<()> {
         let type_name: String = row.get("type_name");
         let not_null: bool = row.get("not_null");
         let avg_width: Option<i32> = row.get("avg_width");
+        let default_expr_text: Option<String> = row.get("default_expr_text");
+        let type_modifier: Option<i32> = row.get("type_modifier");
 
         let object_id = ObjectId::new(&schema_name, &relation_name);
 
@@ -120,6 +125,8 @@ pub fn sync_cache(out_path: &Path) -> Result<()> {
                 is_nullable: !not_null,
                 default: None,
                 avg_width,
+                default_expr_text,
+                type_modifier,
             });
         }
     }

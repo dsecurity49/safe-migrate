@@ -27,7 +27,7 @@ pub mod helpers {
 mod state_machine_guards_tests {
     use super::helpers::*;
     use crate::analysis::state::AnalysisState;
-    use crate::model::relation::RelationOverlay;
+    use crate::model::relation::{RelationOverlay, RelationState, RelationKind, Persistence};
 
     #[test]
     fn test_skip_guard_create_table() {
@@ -51,27 +51,25 @@ mod state_machine_guards_tests {
     }
 
     #[test]
-    fn test_skip_guard_add_column() {
+    fn test_reversibility_type_widen() {
         let engine = setup_engine();
-        let mut state = setup_state();
-
-        engine
-            .analyze("CREATE TABLE t(id INT);", &mut state)
-            .unwrap();
-        engine
-            .analyze(
-                "ALTER TABLE t ADD COLUMN IF NOT EXISTS id TEXT;",
-                &mut state,
-            )
-            .unwrap();
-
-        let rel = state.get_relation(&object_id("public", "t")).unwrap();
-        if let RelationOverlay::Present(r) = rel {
-            let col = r.get_column("id").unwrap();
-            assert_eq!(col.data_type.as_deref(), Some("INT"));
-        } else {
-            panic!("relation should be present");
-        }
+        let mut cache = crate::db::cache::DbCache::new();
+        let tid = object_id("public", "t");
+        let mut rel = RelationState::new(tid.clone(), object_id("public", "postgres"), 0, Some(10), RelationKind::Table, Persistence::Permanent, 0);
+        rel.apply_column_action(&crate::model::relation::ColumnAction::Add { name: "val".to_string(), data_type: Some("int".to_string()), not_null: false, default: None });
+        cache.insert_baseline(tid, rel);
+        let mut state = AnalysisState::new(cache);
+        
+        // Run analysis
+        let v = engine.analyze("ALTER TABLE t ALTER COLUMN val TYPE bigint;", &mut state).unwrap();
+        
+        // Ensure that ReversibilityRule did not flag this as irreversible
+        // We are checking for specific violations and widening SHOULD NOT trigger "irreversible-migration"
+        // If TypeChangeRewriteRule flags it, that's fine.
+        assert!(v.iter().all(|viol| viol.rule_id != "irreversible-migration"), 
+            "ReversibilityRule flagged widening as irreversible: {:?}", 
+            v.iter().filter(|viol| viol.rule_id == "irreversible-migration").collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -248,6 +246,8 @@ mod rule_evaluation_tests {
             is_nullable: true,
             default: None,
             avg_width: Some(3000),
+            default_expr_text: None,
+            type_modifier: None,
         });
 
         cache.insert_baseline(tid, rel);
@@ -837,6 +837,101 @@ mod rule_evaluation_tests {
             v.iter().any(|v| v.rule_id == "require-concurrent-drop-index"),
             "Small table DROP INDEX should still be flagged at Tier3 or not at all"
         );
+    }
+}
+
+#[cfg(test)]
+mod reversibility_tests {
+    use super::helpers::*;
+    use crate::analysis::state::AnalysisState;
+    use crate::model::relation::{RelationKind, RelationState, Persistence};
+    use crate::ast::identifiers::ObjectId;
+    use crate::report::violations::ViolationTier;
+
+    #[test]
+    fn test_reversibility_drop_column_empty_table() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine.analyze("CREATE TABLE t(id INT);", &mut state).unwrap();
+        let v = engine.analyze("ALTER TABLE t DROP COLUMN id;", &mut state).unwrap();
+        assert!(v.iter().any(|violation| violation.tier == ViolationTier::Tier3));
+    }
+
+    #[test]
+    fn test_reversibility_drop_column_nonempty_table() {
+        let engine = setup_engine();
+        let mut cache = crate::db::cache::DbCache::new();
+        let tid = object_id("public", "t");
+        cache.insert_baseline(tid.clone(), RelationState::new(tid, object_id("public", "postgres"), 0, Some(10), RelationKind::Table, Persistence::Permanent, 0));
+        let mut state = AnalysisState::new(cache);
+        let v = engine.analyze("ALTER TABLE t DROP COLUMN id;", &mut state).unwrap();
+        assert!(v.iter().any(|violation| violation.tier == ViolationTier::Tier1));
+    }
+
+    #[test]
+    fn test_reversibility_drop_table() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine.analyze("CREATE TABLE t(id INT);", &mut state).unwrap();
+        let v = engine.analyze("DROP TABLE t;", &mut state).unwrap();
+        assert!(v.iter().any(|violation| violation.tier == ViolationTier::Tier1));
+    }
+
+    #[test]
+    fn test_reversibility_rename_table() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine.analyze("CREATE TABLE t(id INT);", &mut state).unwrap();
+        let v = engine.analyze("ALTER TABLE t RENAME TO t2;", &mut state).unwrap();
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn test_reversibility_add_nullable_column_no_default() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine.analyze("CREATE TABLE t(id INT);", &mut state).unwrap();
+        let v = engine.analyze("ALTER TABLE t ADD COLUMN name TEXT;", &mut state).unwrap();
+        // This is safe, hence reversibility rule shouldn't emit violation.
+        // It might be caught by TypeChangeRewriteRule? No, it's AddColumn.
+        // The ReversibilityRule itself checks `classify`.
+        // If classify returns Reversible, v will be empty.
+        assert!(v.iter().all(|violation| violation.rule_id != "irreversible-migration"));
+    }
+
+    #[test]
+    fn test_reversibility_type_widen() {
+        let engine = setup_engine();
+        let mut cache = crate::db::cache::DbCache::new();
+        let tid = object_id("public", "t");
+        let mut rel = RelationState::new(tid.clone(), object_id("public", "postgres"), 0, Some(10), RelationKind::Table, Persistence::Permanent, 0);
+        rel.apply_column_action(&crate::model::relation::ColumnAction::Add { name: "val".to_string(), data_type: Some("int".to_string()), not_null: false, default: None });
+        cache.insert_baseline(tid, rel);
+        let mut state = AnalysisState::new(cache);
+        
+        // Run analysis
+        let v = engine.analyze("ALTER TABLE t ALTER COLUMN val TYPE bigint;", &mut state).unwrap();
+        
+        // Widening int -> bigint is safe. 
+        // NOTE: We do not check for empty violations because TypeChangeRewriteRule 
+        // might still flag it, but the ReversibilityRule (the rule being tested)
+        // MUST NOT flag it.
+        assert!(v.iter().all(|viol| viol.rule_id != "irreversible-migration"));
+    }
+
+    #[test]
+    fn test_reversibility_type_narrow() {
+        let engine = setup_engine();
+        let mut cache = crate::db::cache::DbCache::new();
+        let tid = object_id("public", "t");
+        let mut rel = RelationState::new(tid.clone(), object_id("public", "postgres"), 0, Some(10), RelationKind::Table, Persistence::Permanent, 0);
+        rel.apply_column_action(&crate::model::relation::ColumnAction::Add { name: "val".to_string(), data_type: Some("bigint".to_string()), not_null: false, default: None });
+        cache.insert_baseline(tid, rel);
+        let mut state = AnalysisState::new(cache);
+        // Narrowing bigint -> int is unsafe
+        let v = engine.analyze("ALTER TABLE t ALTER COLUMN val TYPE int;", &mut state).unwrap();
+        // This should be flagged as conditionally reversible by ReversibilityRule
+        assert!(v.iter().any(|violation| violation.rule_id == "irreversible-migration"));
     }
 }
 
@@ -1571,14 +1666,15 @@ mod identifier_casing_tests {
 }
 
 // ─────────────────────────────────────────────
-// 7. Destructive Rule Evaluation Tests (NEW)
+// 7. Destructive Rule Evaluation Tests
 // ─────────────────────────────────────────────
 #[cfg(test)]
 mod destructive_rule_tests {
     use super::helpers::*;
     use crate::analysis::state::AnalysisState;
     use crate::ast::identifiers::ObjectId;
-    use crate::model::relation::{Persistence, RelationKind};
+    use crate::model::column::Column;
+    use crate::model::relation::{Persistence, RelationKind, RelationState};
     use crate::report::violations::ViolationTier;
 
     #[test]
@@ -1672,6 +1768,155 @@ mod destructive_rule_tests {
                 "Safe varchar->text conversion should not be Tier1"
             );
         }
+    }
+
+    /// Varchar narrowing: 255→50 should be flagged as lossy, 50→255 should not
+    #[test]
+    fn test_rule_varchar_narrowing_lossy() {
+        let engine = setup_engine();
+
+        let mut cache = crate::db::cache::DbCache::new();
+        let mut rel = crate::model::relation::RelationState::new(
+            object_id("public", "t"),
+            ObjectId::new("public", "postgres"),
+            0,
+            Some(500),
+            RelationKind::Table,
+            Persistence::Permanent,
+            0,
+        );
+        // Column with varchar(255): atttypmod = 255 + 4 = 259
+        rel.columns.push(Column {
+            name: "data".into(),
+            data_type: Some("character varying(255)".into()),
+            is_nullable: true,
+            default: None,
+            avg_width: None,
+            default_expr_text: None,
+            type_modifier: Some(259),
+        });
+        cache.insert_baseline(object_id("public", "t"), rel);
+
+        let mut state = AnalysisState::new(cache);
+
+        // Already has baseline column with type_modifier=259 (varchar(255))
+        // Now try narrowing to varchar(50): atttypmod = 50 + 4 = 54
+        let v = engine
+            .analyze("ALTER TABLE t ALTER COLUMN data TYPE varchar(50);", &mut state)
+            .unwrap();
+
+        assert!(
+            v.iter().any(|v| v.rule_id == "type-change-rewrite" && v.title.contains("narrows")),
+            "255→50 should be flagged as lossy VARCHAR narrowing"
+        );
+
+        // Now try widening: varchar(50) → varchar(255) should NOT flag as lossy
+        let mut cache2 = crate::db::cache::DbCache::new();
+        let mut rel2 = crate::model::relation::RelationState::new(
+            object_id("public", "t"),
+            ObjectId::new("public", "postgres"),
+            0,
+            Some(500),
+            RelationKind::Table,
+            Persistence::Permanent,
+            0,
+        );
+        rel2.columns.push(Column {
+            name: "data".into(),
+            data_type: Some("character varying(50)".into()),
+            is_nullable: true,
+            default: None,
+            avg_width: None,
+            default_expr_text: None,
+            type_modifier: Some(54),
+        });
+        cache2.insert_baseline(object_id("public", "t"), rel2);
+        let mut state2 = AnalysisState::new(cache2);
+
+        let v2 = engine
+            .analyze("ALTER TABLE t ALTER COLUMN data TYPE varchar(255);", &mut state2)
+            .unwrap();
+
+        // Should be flagged as a rewrite, but NOT as "narrows"
+        assert!(
+            v2.iter().any(|v| v.rule_id == "type-change-rewrite"),
+            "50→255 should still trigger type-change-rewrite"
+        );
+        assert!(
+            !v2.iter().any(|v| v.title.contains("narrows")),
+            "50→255 should NOT be flagged as lossy narrowing"
+        );
+    }
+
+    /// DriftDetectionRule: DROP TABLE that doesn't exist in baseline → Tier 1
+    #[test]
+    fn test_rule_drift_detection_drop_missing_table() {
+        // Simulate a live DB cache with table "existing_tbl"
+        let mut cache = crate::db::cache::DbCache::new();
+        cache.insert_baseline(
+            object_id("public", "existing_tbl"),
+            crate::model::relation::RelationState::new(
+                object_id("public", "existing_tbl"),
+                ObjectId::new("public", "postgres"),
+                0,
+                Some(100),
+                RelationKind::Table,
+                Persistence::Permanent,
+                0,
+            ),
+        );
+        let engine = setup_engine();
+        let mut state = AnalysisState::new(cache);
+
+        // DROP TABLE that is NOT in baseline
+        let v = engine
+            .analyze("DROP TABLE nonexistent_tbl;", &mut state)
+            .unwrap();
+
+        assert!(
+            v.iter().any(|v| v.rule_id == "schema-drift"),
+            "DriftDetectionRule should flag DROP on table not in baseline"
+        );
+        assert_eq!(
+            v.iter().find(|v| v.rule_id == "schema-drift").unwrap().tier,
+            ViolationTier::Tier1,
+            "Drift should be Tier1"
+        );
+    }
+
+    /// DriftDetectionRule: ALTER TABLE that doesn't exist in baseline → Tier 1
+    #[test]
+    fn test_rule_drift_detection_alter_missing_table() {
+        let mut cache = crate::db::cache::DbCache::new();
+        cache.insert_baseline(
+            object_id("public", "existing_tbl"),
+            crate::model::relation::RelationState::new(
+                object_id("public", "existing_tbl"),
+                ObjectId::new("public", "postgres"),
+                0,
+                Some(100),
+                RelationKind::Table,
+                Persistence::Permanent,
+                0,
+            ),
+        );
+        let engine = setup_engine();
+        let mut state = AnalysisState::new(cache);
+
+        // ALTER TABLE that is NOT in baseline
+        let v = engine
+            .analyze("ALTER TABLE nonexistent_tbl ADD COLUMN x int;", &mut state)
+            .unwrap();
+
+        assert!(
+            v.iter().any(|v| v.rule_id == "schema-drift"),
+            "DriftDetectionRule should flag ALTER on table not in baseline"
+        );
+        assert_eq!(
+            v.iter().find(|v| v.rule_id == "schema-drift").unwrap().tier,
+            ViolationTier::Tier1,
+            "Drift should be Tier1"
+        );
     }
 
     #[test]

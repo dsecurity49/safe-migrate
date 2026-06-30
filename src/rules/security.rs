@@ -59,18 +59,18 @@ impl Rule for OverbroadGrantRule {
                 let mut is_owner = false;
                 if let crate::analysis::mutations::ResolvedGrantTarget::Tables(tables) = &grant.target {
                     for table_id in tables {
-                        if let Some(crate::model::relation::RelationOverlay::Present(rel)) = state.local.relations.get(table_id) {
-                            if grant.grantees.iter().any(|g| {
+                        if let Some(crate::model::relation::RelationOverlay::Present(rel)) = state.local.relations.get(table_id)
+                            && grant.grantees.iter().any(|g| {
                                 if let crate::analysis::facts::RoleFact::Named { name, .. } = g {
                                     // Simple name match for owner check
                                     rel.owner.name == *name
                                 } else {
                                     false
                                 }
-                            }) {
-                                is_owner = true;
-                                break;
-                            }
+                            })
+                        {
+                            is_owner = true;
+                            break;
                         }
                     }
                 }

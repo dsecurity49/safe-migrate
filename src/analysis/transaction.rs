@@ -15,7 +15,7 @@ use std::collections::HashSet;
 pub enum StateChange {
     RelationSnapshot {
         id: ObjectId,
-        previous: Option<RelationOverlay>,
+        previous: Box<Option<RelationOverlay>>,
     },
     TypeSnapshot {
         id: ObjectId,

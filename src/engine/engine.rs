@@ -7,7 +7,8 @@ use crate::engine::config::Config;
 use crate::report::violations::Violation;
 use crate::rules::Rule;
 use crate::rules::constraints::BlockingConstraintRule;
-use crate::rules::destructive::{CascadingDropRule, SizeAwareAddColumnRule, TypeChangeRewriteRule, DropDatabaseRule, DropSchemaCascadeRule, GeneralCascadeRule, CreateTableAsSelectRule};
+use crate::rules::destructive::{CascadingDropRule, SizeAwareAddColumnRule, TypeChangeRewriteRule, DropDatabaseRule, DropSchemaCascadeRule, GeneralCascadeRule, CreateTableAsSelectRule, ReversibilityRule};
+use crate::rules::drift::DriftDetectionRule;
 use crate::rules::expressions::VolatileDefaultRule;
 use crate::rules::idempotency::IdempotencyRule;
 use crate::rules::indexes::ConcurrentIndexRule;
@@ -32,6 +33,7 @@ impl SafeMigrateEngine {
         Self {
             config,
             rules: vec![
+                Box::new(ReversibilityRule),
                 Box::new(DropDatabaseRule),
                 Box::new(DropSchemaCascadeRule),
                 Box::new(GeneralCascadeRule),
@@ -54,6 +56,7 @@ impl SafeMigrateEngine {
                 Box::new(OpaqueDynamicSqlRule),
                 Box::new(VolatileDefaultRule),
                 Box::new(OverbroadGrantRule),
+                Box::new(DriftDetectionRule),
             ],
         }
     }

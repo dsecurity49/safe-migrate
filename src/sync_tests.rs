@@ -45,6 +45,8 @@ mod tests {
             is_nullable: false,
             default: None,
             avg_width: Some(4),
+            default_expr_text: None,
+            type_modifier: None,
         });
         cache.insert_baseline(id.clone(), rel);
 

@@ -1,6 +1,7 @@
 // FILE: src/rules/mod.rs
 pub mod constraints;
 pub mod destructive;
+pub mod drift;
 pub mod expressions;
 pub mod functions;
 pub mod idempotency;

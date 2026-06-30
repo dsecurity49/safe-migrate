@@ -1,0 +1,6 @@
+default_rows = 1000
+
+[rules]
+# Make the engine extremely sensitive to table sizes for the test
+large_table_threshold_rows = 500 
+assume_pg_version = 150000

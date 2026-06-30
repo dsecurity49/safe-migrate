@@ -196,20 +196,23 @@ impl Rule for DropDatabaseRule {
 
     fn evaluate(
         &self,
-        _mutation: &Mutation,
+        mutation: &Mutation,
         _result: &MutationResult,
         _pre_state: &crate::analysis::state::PreState,
         _state: &AnalysisState,
         _config: &Config,
         _cascade: Option<&CascadeResult>,
     ) -> Vec<Violation> {
-        vec![Violation {
-            rule_id: self.id(),
-            title: "DROP DATABASE detected".to_string(),
-            tier: self.default_tier(),
-            recipe: self.recipe(),
-            dedup_key: None,
-        }]
+        if let Mutation::DropDatabase(_) = mutation {
+            return vec![Violation {
+                rule_id: self.id(),
+                title: "DROP DATABASE detected".to_string(),
+                tier: self.default_tier(),
+                recipe: self.recipe(),
+                dedup_key: None,
+            }];
+        }
+        vec![]
     }
 }
 
@@ -271,7 +274,7 @@ impl Rule for CreateTableAsSelectRule {
         _pre_state: &crate::analysis::state::PreState,
         _state: &AnalysisState,
         _config: &Config,
-        _cascade: Option<&CascadeResult>,
+        _cascade_closure: Option<&CascadeResult>,
     ) -> Vec<Violation> {
         if let Mutation::CreateTable(c) = mutation && c.as_select {
             return vec![Violation {
@@ -283,6 +286,169 @@ impl Rule for CreateTableAsSelectRule {
             }];
         }
         vec![]
+    }
+}
+
+pub enum Reversibility {
+    Reversible,
+    ConditionallyReversible,
+    Irreversible,
+}
+
+pub fn classify(mutation: &Mutation) -> Reversibility {
+    match mutation {
+        Mutation::Rename(_) => Reversibility::Reversible,
+        Mutation::CreateIndex(_) | Mutation::CreateTable(_) => Reversibility::Reversible,
+        Mutation::AlterTable(a) => match &a.action {
+            AlterTableActionMutation::AddColumn { .. } => Reversibility::Reversible,
+            AlterTableActionMutation::DropColumn { .. } => Reversibility::Irreversible,
+            AlterTableActionMutation::SetType { .. } => Reversibility::ConditionallyReversible,
+            _ => Reversibility::Reversible,
+        },
+        Mutation::DropTable(_) | Mutation::DropDatabase(_) => Reversibility::Irreversible,
+        _ => Reversibility::ConditionallyReversible,
+    }
+}
+
+pub struct ReversibilityRule;
+
+impl Rule for ReversibilityRule {
+    fn id(&self) -> &'static str {
+        "irreversible-migration"
+    }
+    fn default_tier(&self) -> ViolationTier {
+        ViolationTier::Tier1
+    }
+    fn recipe(&self) -> &'static str {
+        "This operation is irreversible. Ensure backups are available."
+    }
+
+    fn evaluate(
+        &self,
+        mutation: &Mutation,
+        _result: &MutationResult,
+        pre_state: &crate::analysis::state::PreState,
+        _state: &AnalysisState,
+        config: &Config,
+        _cascade_closure: Option<&CascadeResult>,
+    ) -> Vec<Violation> {
+        let mut violations = Vec::new();
+
+        if let Mutation::AlterTable(a) = mutation
+            && let AlterTableActionMutation::SetType { column, ty, .. } = &a.action
+            && let Some(rel) = pre_state.relations.get(&a.id)
+            && let Some(old_ty) = rel.get_column(column).and_then(|c| c.data_type.as_ref())
+        {
+            // Only flag as "conditionally reversible" if there's actual data loss risk
+            // (e.g., narrowing, not widening). Table rewrites are handled by TypeChangeRewriteRule.
+            if is_type_change_lossy(old_ty, ty) {
+                let rows = rel.estimated_rows.unwrap_or(config.default_rows);
+                let tier = if rows >= config.rule_tier1_threshold(self.id()) {
+                    ViolationTier::Tier1
+                } else {
+                    ViolationTier::Tier2
+                };
+                violations.push(Violation {
+                    rule_id: self.id(),
+                    title: "Conditionally reversible type change detected".to_string(),
+                    tier,
+                    recipe: "This type change may be lossy. Verify data compatibility.",
+                    dedup_key: None,
+                });
+            }
+        }
+
+        if let Reversibility::Irreversible = classify(mutation) {
+            let rows = if let Mutation::AlterTable(a) = mutation {
+                pre_state.relations.get(&a.id).and_then(|r| r.estimated_rows).unwrap_or(config.default_rows)
+            } else if let Mutation::DropTable(d) = mutation {
+                pre_state.relations.get(&d.id).and_then(|r| r.estimated_rows).unwrap_or(config.default_rows)
+            } else {
+                config.default_rows
+            };
+
+            let tier = if rows == 0 { ViolationTier::Tier3 } else { ViolationTier::Tier1 };
+
+            violations.push(Violation {
+                rule_id: self.id(),
+                title: "Irreversible data-destructive operation detected".to_string(),
+                tier,
+                recipe: self.recipe(),
+                dedup_key: None,
+            });
+        }
+        violations
+    }
+}
+
+/// Checks if a type change represents actual data loss (narrowing), not just a rewrite.
+/// This is used by ReversibilityRule to distinguish between "safe widening" (e.g., INT->BIGINT)
+/// and genuinely lossy changes (e.g., BIGINT->INT, VARCHAR(255)->VARCHAR(50)).
+fn is_type_change_lossy(old_type: &str, new_type: &str) -> bool {
+    let old = old_type.to_lowercase().trim().to_string();
+    let new = new_type.to_lowercase().trim().to_string();
+
+    // Same type is trivially safe
+    if old == new {
+        return false;
+    }
+
+    // Extract base types (without parameters)
+    let old_base = old.split('(').next().unwrap_or(&old).trim();
+    let new_base = new.split('(').next().unwrap_or(&new).trim();
+
+    // VARCHAR narrowing check
+    if let (Some(old_lim), Some(new_lim)) = (extract_varchar_limit(&old), extract_varchar_limit(&new)) {
+        // Both are varchar - check if narrowing
+        return new_lim < old_lim;
+    }
+
+    // Varchar to something smaller/narrower - check if target type can hold all values
+    let old_varchar_limit = extract_varchar_limit(&old);
+    if old_varchar_limit.is_some() {
+        // varchar -> text is safe (widening)
+        if new == "text" || new == "varchar" || new == "character varying" {
+            return false;
+        }
+        // varchar -> other types might be lossy
+        return true;
+    }
+
+    // Widening integer types are safe (though they require a rewrite)
+    // int2 (smallint) -> int4 -> int8 (bigint) are all safe
+    if let (Some(old_sz), Some(new_sz)) = (integer_type_size_bits(old_base), integer_type_size_bits(new_base)) {
+        // Narrowing is unsafe
+        return new_sz < old_sz;
+    }
+
+    // For other types, assume safe unless we have specific knowledge
+    false
+}
+
+/// Extracts the character limit from a varchar type string.
+/// Returns the limit in bytes (for comparison purposes).
+fn extract_varchar_limit(ty: &str) -> Option<i32> {
+    if ty.starts_with("varchar(") || ty.starts_with("character varying(") {
+        let paren_start = ty.find('(')?;
+        let paren_end = ty[paren_start..].find(')')?;
+        let num_str = &ty[paren_start + 1..paren_start + paren_end];
+        let limit: i32 = num_str.parse().ok()?;
+        Some(limit)
+    } else if ty == "varchar" || ty == "character varying" {
+        // VARCHAR without limit is like TEXT - unbounded
+        None
+    } else {
+        None
+    }
+}
+
+/// Returns the size of integer types in bits.
+fn integer_type_size_bits(ty: &str) -> Option<i32> {
+    match ty {
+        "smallint" | "int2" => Some(16),
+        "integer" | "int4" | "int" => Some(32),
+        "bigint" | "int8" => Some(64),
+        _ => None,
     }
 }
 
@@ -362,6 +528,39 @@ impl TypeChangeRewriteRule {
 
         false
     }
+
+    /// Detects whether a type change narrows a VARCHAR(n) column
+    /// using type_modifier values from the cache.
+    ///
+    /// atttypmod for VARCHAR(n) encodes the length limit:
+    ///   typmod = (limit + 4) for VARCHAR, so limit = typmod - 4
+    ///
+    /// A smaller typmod means a smaller limit, which is lossy.
+    /// Returns true if the new modifier represents a smaller limit than the old.
+    pub fn is_lossy_varchar_narrowing(old_modifier: Option<i32>, new_modifier: Option<i32>) -> bool {
+        match (old_modifier, new_modifier) {
+            (Some(old), Some(new)) => new < old,
+            _ => false,
+        }
+    }
+}
+
+/// Extracts a synthetic type_modifier-like value from a type string.
+/// Used when the new type comes from the migration SQL (not from the cache).
+/// For varchar(N) types, approximates the atttypmod value.
+pub fn extract_type_modifier_from_type_string(ty: &str) -> Option<i32> {
+    let lower = ty.to_lowercase().trim().to_string();
+    // Check for varchar(N) or character varying(N)
+    if lower.starts_with("varchar(") || lower.starts_with("character varying(") {
+        let paren_start = lower.find('(')?;
+        let paren_end = lower[paren_start..].find(')')?;
+        let num_str = &lower[paren_start + 1..paren_start + paren_end];
+        let limit: i32 = num_str.parse().ok()?;
+        // atttypmod = limit + 4 for varchar
+        Some(limit + 4)
+    } else {
+        None
+    }
 }
 
 impl Rule for TypeChangeRewriteRule {
@@ -399,13 +598,10 @@ impl Rule for TypeChangeRewriteRule {
         {
             let pg_version = state.pg_version_num.unwrap_or(config.assume_pg_version);
 
-            let (is_safe, rows, old_type_str) = match pre_state.relations.get(&alter.id) {
+            let (is_safe, rows, old_type_str, old_modifier) = match pre_state.relations.get(&alter.id) {
                 Some(rel) => {
-                    let old_ty = rel
-                        .columns
-                        .iter()
-                        .find(|c| c.name == *column)
-                        .and_then(|col| col.data_type.as_ref());
+                    let col_info = rel.columns.iter().find(|c| c.name == *column);
+                    let old_ty = col_info.and_then(|col| col.data_type.as_ref());
 
                     let safe = old_ty
                         .map(|o| Self::is_type_change_safe(o, ty, pg_version))
@@ -414,9 +610,10 @@ impl Rule for TypeChangeRewriteRule {
                         safe,
                         rel.estimated_rows.unwrap_or(config.default_rows),
                         old_ty.cloned().unwrap_or_else(|| "unknown".to_string()),
+                        col_info.and_then(|col| col.type_modifier),
                     )
                 }
-                None => (false, config.default_rows, "unknown".to_string()),
+                None => (false, config.default_rows, "unknown".to_string(), None),
             };
 
             if !is_safe {
@@ -428,16 +625,31 @@ impl Rule for TypeChangeRewriteRule {
                     ViolationTier::Tier2
                 };
 
-                violations.push(Violation {
-                    rule_id: self.id(),
-                    title: format!(
-                        "Changing column {}.{} type from {} to {} causes a table rewrite",
-                        alter.id, column, old_type_str, ty
-                    ),
-                    tier,
-                    recipe: self.recipe(),
-                    dedup_key: None,
-                });
+                let new_modifier = extract_type_modifier_from_type_string(ty);
+
+                if Self::is_lossy_varchar_narrowing(old_modifier, new_modifier) {
+                    violations.push(Violation {
+                        rule_id: self.id(),
+                        title: format!(
+                            "Changing column {}.{} type from {} to {} narrows VARCHAR precision (lossy)",
+                            alter.id, column, old_type_str, ty
+                        ),
+                        tier,
+                        recipe: "Narrowing VARCHAR(n) precision may cause data truncation. Consider adding a new column, backfilling, and then dropping the old one.",
+                        dedup_key: None,
+                    });
+                } else {
+                    violations.push(Violation {
+                        rule_id: self.id(),
+                        title: format!(
+                            "Changing column {}.{} type from {} to {} causes a table rewrite",
+                            alter.id, column, old_type_str, ty
+                        ),
+                        tier,
+                        recipe: self.recipe(),
+                        dedup_key: None,
+                    });
+                }
             }
         }
         violations

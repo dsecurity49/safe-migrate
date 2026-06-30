@@ -665,13 +665,12 @@ impl Resolver {
                 cascade,
             } => {
                 let id = Self::resolve_lookup_name(name, state);
-                if !state.relation_is_present(&id) {
-                    if *if_exists {
-                        return vec![];
-                    } else {
-                        return vec![Mutation::Opaque(OpaqueMutation::DynamicSql)];
-                    }
+                if !state.relation_is_present(&id) && *if_exists {
+                    return vec![];
                 }
+                // Still emit a DropTable mutation for rule evaluation (e.g. DriftDetectionRule)
+                // even when the table is not present locally. The state machine will handle
+                // tainting confidence in apply().
                 mutations.push(Mutation::DropTable(DropTable {
                     id,
                     if_exists: *if_exists,
