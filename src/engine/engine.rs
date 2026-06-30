@@ -6,6 +6,7 @@ use crate::ast::visitor::AstVisitor;
 use crate::engine::config::Config;
 use crate::report::violations::Violation;
 use crate::rules::Rule;
+use crate::rules::conflict::ConflictRule;
 use crate::rules::constraints::BlockingConstraintRule;
 use crate::rules::destructive::{CascadingDropRule, SizeAwareAddColumnRule, TypeChangeRewriteRule, DropDatabaseRule, DropSchemaCascadeRule, GeneralCascadeRule, CreateTableAsSelectRule, ReversibilityRule};
 use crate::rules::drift::DriftDetectionRule;
@@ -57,40 +58,35 @@ impl SafeMigrateEngine {
                 Box::new(VolatileDefaultRule),
                 Box::new(OverbroadGrantRule),
                 Box::new(DriftDetectionRule),
+                Box::new(ConflictRule),
             ],
         }
     }
 
-    fn parse_directives(
-        text: &str,
-        file_ignores: &mut HashSet<String>,
-        stmt_ignores: &mut HashSet<String>,
-    ) {
-        let mut search = text;
-        while let Some(idx) = search.find("safe-migrate: ignore-file(") {
-            let start = idx + "safe-migrate: ignore-file(".len();
-            if let Some(end) = search[start..].find(')') {
-                file_ignores.insert(search[start..start + end].trim().to_string());
-                search = &search[start + end + 1..];
-            } else {
-                break;
-            }
+    pub fn analyze_chain(
+        &self,
+        files: &[(String, String)],
+        state: &mut AnalysisState,
+    ) -> Result<Vec<Violation>, Vec<String>> {
+        let mut all_violations = Vec::new();
+        for (filename, sql) in files {
+            let violations = self.analyze_single_file(filename, sql, state)?;
+            all_violations.extend(violations);
         }
-
-        let mut search = text;
-        while let Some(idx) = search.find("safe-migrate: ignore(") {
-            let start = idx + "safe-migrate: ignore(".len();
-            if let Some(end) = search[start..].find(')') {
-                stmt_ignores.insert(search[start..start + end].trim().to_string());
-                search = &search[start + end + 1..];
-            } else {
-                break;
-            }
-        }
+        Ok(all_violations)
     }
 
     pub fn analyze(
         &self,
+        sql: &str,
+        state: &mut AnalysisState,
+    ) -> Result<Vec<Violation>, Vec<String>> {
+        self.analyze_chain(&[("<inline>".to_string(), sql.to_string())], state)
+    }
+
+    fn analyze_single_file(
+        &self,
+        _filename: &str,
         sql: &str,
         state: &mut AnalysisState,
     ) -> Result<Vec<Violation>, Vec<String>> {
@@ -178,10 +174,47 @@ impl SafeMigrateEngine {
                             all_violations.push(v);
                         }
                     }
+
+                    if state.local.confidence == crate::analysis::state::Confidence::Tainted {
+                        for v in &mut all_violations {
+                            if v.tier == crate::report::violations::ViolationTier::Tier1 {
+                                v.tier = crate::report::violations::ViolationTier::Tier2;
+                                v.title.push_str(" [DOWNGRADED: confidence tainted by earlier opaque SQL, cannot guarantee this is unsafe]");
+                            }
+                        }
+                    }
                 }
             }
         }
 
         Ok(all_violations)
+    }
+
+    fn parse_directives(
+        text: &str,
+        file_ignores: &mut HashSet<String>,
+        stmt_ignores: &mut HashSet<String>,
+    ) {
+        let mut search = text;
+        while let Some(idx) = search.find("safe-migrate: ignore-file(") {
+            let start = idx + "safe-migrate: ignore-file(".len();
+            if let Some(end) = search[start..].find(')') {
+                file_ignores.insert(search[start..start + end].trim().to_string());
+                search = &search[start + end + 1..];
+            } else {
+                break;
+            }
+        }
+
+        let mut search = text;
+        while let Some(idx) = search.find("safe-migrate: ignore(") {
+            let start = idx + "safe-migrate: ignore(".len();
+            if let Some(end) = search[start..].find(')') {
+                stmt_ignores.insert(search[start..start + end].trim().to_string());
+                search = &search[start + end + 1..];
+            } else {
+                break;
+            }
+        }
     }
 }

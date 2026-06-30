@@ -222,6 +222,7 @@ mod rule_evaluation_tests {
         );
     }
 
+
     #[test]
     fn test_rule_size_aware_toast_escalation() {
         let engine = setup_engine();
@@ -501,6 +502,54 @@ mod rule_evaluation_tests {
         );
 
         assert_eq!(state.local.confidence, Confidence::Tainted);
+    }
+
+    #[test]
+    fn test_tainted_confidence_downgrades_tier1_to_tier2() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze("DO $$ BEGIN EXECUTE 'DROP TABLE users'; END $$;", &mut state)
+            .unwrap();
+
+        let v = engine
+            .analyze("DROP TABLE t CASCADE;", &mut state)
+            .unwrap();
+
+        assert!(
+            v.iter().any(|v| v.tier == ViolationTier::Tier2),
+            "expected Tier2 after tainted confidence: {:?}",
+            v
+        );
+        assert!(
+            v.iter().any(|v| v.title.contains("[DOWNGRADED: confidence tainted by earlier opaque SQL, cannot guarantee this is unsafe]")),
+            "expected downgrade notice in titles: {:?}",
+            v.iter().map(|v| &v.title).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_exact_confidence_keeps_tier1() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine.analyze("CREATE TABLE t(id INT);", &mut state).unwrap();
+
+        let v = engine
+            .analyze("DROP TABLE t CASCADE;", &mut state)
+            .unwrap();
+
+        assert!(
+            v.iter().any(|v| v.tier == ViolationTier::Tier1),
+            "expected Tier1 with exact confidence: {:?}",
+            v
+        );
+        assert!(
+            v.iter().all(|v| !v.title.contains("DOWNGRADED")),
+            "expected no downgrade notices with exact confidence: {:?}",
+            v.iter().map(|v| &v.title).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -1877,10 +1926,11 @@ mod destructive_rule_tests {
             v.iter().any(|v| v.rule_id == "schema-drift"),
             "DriftDetectionRule should flag DROP on table not in baseline"
         );
+        // Dropping a nonexistent table taints confidence, which downgrades Tier1->Tier2
         assert_eq!(
             v.iter().find(|v| v.rule_id == "schema-drift").unwrap().tier,
-            ViolationTier::Tier1,
-            "Drift should be Tier1"
+            ViolationTier::Tier2,
+            "Drift becomes Tier2 after confidence is tainted by missing DROP"
         );
     }
 
@@ -2591,5 +2641,139 @@ mod architectural_gap_tests {
             state.relation_is_present(&object_id("public", "a")),
             "Table a should not be dropped if dependents exist without CASCADE"
         );
+    }
+}
+
+// ─────────────────────────────────────────────
+// 10. Multi-File Execution (analyze_chain)
+// ─────────────────────────────────────────────
+#[cfg(test)]
+mod chain_execution_tests {
+    use super::helpers::*;
+    use crate::analysis::state::AnalysisState;
+    use crate::model::relation::RelationOverlay;
+    use crate::report::violations::ViolationTier;
+
+    #[test]
+    fn test_chain_state_persists_across_files() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let files = vec![
+            ("V1__create.sql".to_string(), "CREATE TABLE IF NOT EXISTS users (id INT);".to_string()),
+            ("V2__alter.sql".to_string(), "ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT;".to_string()),
+        ];
+
+        let violations = engine.analyze_chain(&files, &mut state).unwrap();
+        assert!(violations.is_empty(), "Expected no violations, got: {:?}", violations);
+
+        let rel = state.get_relation(&object_id("public", "users")).unwrap();
+        if let RelationOverlay::Present(r) = rel {
+            assert!(r.has_column("id"));
+            assert!(r.has_column("email"));
+        } else {
+            panic!("users table should be present after chain");
+        }
+    }
+
+    #[test]
+    fn test_chain_rename_visible_across_files() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let files = vec![
+            ("V1__base.sql".to_string(), "CREATE TABLE IF NOT EXISTS orders (id INT);".to_string()),
+            ("V2__rename.sql".to_string(), "ALTER TABLE orders RENAME TO purchases;".to_string()),
+            ("V3__post_rename.sql".to_string(), "ALTER TABLE purchases ADD COLUMN IF NOT EXISTS total NUMERIC;".to_string()),
+        ];
+
+        let violations = engine.analyze_chain(&files, &mut state).unwrap();
+        assert!(violations.is_empty(), "Expected no violations, got: {:?}", violations);
+
+        assert!(!state.relation_is_present(&object_id("public", "orders")));
+        assert!(state.relation_is_present(&object_id("public", "purchases")));
+
+        let rel = state
+            .get_relation(&object_id("public", "purchases"))
+            .unwrap();
+        if let RelationOverlay::Present(r) = rel {
+            assert!(r.has_column("total"));
+        } else {
+            panic!("purchases table should be present");
+        }
+    }
+
+    #[test]
+    fn test_chain_conflict_same_column_different_type() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let files = vec![
+            ("V1__create.sql".to_string(), "CREATE TABLE products (id INT);".to_string()),
+            ("V2__add_price.sql".to_string(), "ALTER TABLE products ADD COLUMN price INT;".to_string()),
+            ("V3__change_price.sql".to_string(), "ALTER TABLE products ADD COLUMN price TEXT;".to_string()),
+        ];
+
+        let violations = engine.analyze_chain(&files, &mut state).unwrap();
+
+        let conflict_violations: Vec<_> = violations
+            .iter()
+            .filter(|v| v.rule_id == "chain-conflict")
+            .collect();
+
+        assert!(
+            !conflict_violations.is_empty(),
+            "Expected chain-conflict violation, got: {:?}",
+            violations
+        );
+
+        let conflict = conflict_violations.iter().find(|v| v.tier == ViolationTier::Tier1);
+        assert!(conflict.is_some(), "Conflict should be Tier1");
+        assert!(
+            conflict.unwrap().title.contains("price"),
+            "Conflict message should mention column 'price'"
+        );
+        assert!(
+            conflict.unwrap().title.contains("INT"),
+            "Conflict message should mention existing type INT"
+        );
+        assert!(
+            conflict.unwrap().title.contains("TEXT"),
+            "Conflict message should mention conflicting type TEXT"
+        );
+    }
+
+    #[test]
+    fn test_chain_no_conflict_same_column_same_type() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let files = vec![
+            ("V1__create.sql".to_string(), "CREATE TABLE IF NOT EXISTS items (id INT);".to_string()),
+            ("V1__add.sql".to_string(), "ALTER TABLE items ADD COLUMN IF NOT EXISTS code TEXT;".to_string()),
+            ("V2__idempotent.sql".to_string(), "ALTER TABLE items ADD COLUMN IF NOT EXISTS code TEXT;".to_string()),
+        ];
+
+        let violations = engine.analyze_chain(&files, &mut state).unwrap();
+
+        let conflict_violations: Vec<_> = violations
+            .iter()
+            .filter(|v| v.rule_id == "chain-conflict")
+            .collect();
+
+        assert!(
+            conflict_violations.is_empty(),
+            "Expected no chain-conflict violation for same-type re-add, got: {:?}",
+            violations
+        );
+
+        let rel = state.get_relation(&object_id("public", "items")).unwrap();
+        if let RelationOverlay::Present(r) = rel {
+            assert!(r.has_column("code"));
+            let col = r.get_column("code").unwrap();
+            assert_eq!(col.data_type.as_deref(), Some("TEXT"));
+        } else {
+            panic!("items table should be present");
+        }
     }
 }

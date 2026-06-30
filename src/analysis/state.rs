@@ -27,6 +27,7 @@ pub enum Confidence {
 pub enum MutationResult {
     Applied,
     Skipped,
+    Conflict { reason: String },
 }
 
 #[derive(Debug, Default, Clone)]
@@ -738,6 +739,18 @@ impl AnalysisState {
                     match &alter.action {
                         AlterTableActionMutation::AddColumn { name, ty, if_not_exists, not_null, default, depends_on } => {
                             if !(*if_not_exists && rel.has_column(name)) {
+                                if let Some(existing_col) = rel.columns.iter().find(|c| c.name == *name)
+                                    && existing_col.data_type.as_deref() != ty.as_deref()
+                                {
+                                    return MutationResult::Conflict {
+                                        reason: format!(
+                                            "column '{}' already added with type {} (likely an earlier file in this chain), this file adds it again with type {}",
+                                            name,
+                                            existing_col.data_type.as_deref().unwrap_or("unknown"),
+                                            ty.as_deref().unwrap_or("unknown")
+                                        ),
+                                    };
+                                }
                                 rel.apply_column_action(&ColumnAction::Add {
                                     name: name.clone(),
                                     data_type: ty.clone(),

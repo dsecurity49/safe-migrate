@@ -86,6 +86,37 @@ mod tests {
     }
 
     #[test]
+    fn test_db_cache_column_sync_fields() {
+        let mut cache = DbCache::new();
+        let id = ObjectId::new("public", "test_table");
+        let mut rel = RelationState::new(
+            id.clone(),
+            ObjectId::new("public", "postgres"),
+            0,
+            None,
+            RelationKind::Table,
+            Persistence::Permanent,
+            0,
+        );
+        rel.columns.push(crate::model::column::Column {
+            name: "val".into(),
+            data_type: Some("varchar".into()),
+            is_nullable: true,
+            default: None,
+            avg_width: Some(10),
+            default_expr_text: Some("now()".into()),
+            type_modifier: Some(255 + 4),
+        });
+        cache.insert_baseline(id.clone(), rel);
+
+        let json = serde_json::to_string_pretty(&cache).unwrap();
+        let deserialized: DbCache = serde_json::from_str(&json).unwrap();
+        let rel = deserialized.relations.get(&id).unwrap();
+        assert_eq!(rel.columns[0].default_expr_text, Some("now()".into()));
+        assert_eq!(rel.columns[0].type_modifier, Some(259));
+    }
+
+    #[test]
     fn test_db_cache_empty_serialization() {
         let cache = DbCache::new();
         let json = serde_json::to_string_pretty(&cache).unwrap();
