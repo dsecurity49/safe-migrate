@@ -1,7 +1,7 @@
 use crate::analysis::mutations::Mutation;
 use crate::analysis::state::{AnalysisState, CascadeResult, MutationResult, PreState};
 use crate::engine::config::Config;
-use crate::report::violations::{Violation, ViolationTier};
+use crate::report::violations::{Violation, ViolationTier, OperationKind, ObjectKind};
 use crate::rules::Rule;
 
 pub struct FunctionVolatilityRule;
@@ -50,13 +50,17 @@ impl Rule for FunctionVolatilityRule {
             {
                 violations.push(Violation {
                     rule_id: self.id(),
-                    title: format!(
+                    operation_kind: OperationKind::AlterFunction,
+                    object_kind: ObjectKind::Function,
+                    object_name: alter.id.to_string(),
+                    tier: self.default_tier(),
+                    reason: format!(
                         "Function {} volatility changed from {:?} to {:?}",
                         alter.id, ov, nv
                     ),
-                    tier: self.default_tier(),
                     recipe: self.recipe(),
                     dedup_key: None,
+                            sql: None,
                 });
             }
         }
@@ -90,10 +94,9 @@ impl Rule for BrokenComputeRule {
         if let Mutation::DropFunction(drop) = mutation {
             for sig in &drop.signatures {
                 // Construct ID in same way as during creation
-                let function_id = crate::ast::identifiers::ObjectId::new(
-                    sig.name.schema.as_ref().map(|s| s.resolve()).unwrap_or_else(|| "public".to_string()),
-                    format!("{}({})", sig.name.name.resolve(), sig.params.join(","))
-                );
+                let sig_str = format!("{}({})", sig.name.name.resolve(), sig.params.join(","));
+                let schema = state.resolve_function_schema(&sig.name, &sig_str);
+                let function_id = crate::ast::identifiers::ObjectId::new(schema, sig_str);
 
                 let affected = state.local.graph.triggers_for_function(&function_id);
 
@@ -104,10 +107,14 @@ impl Rule for BrokenComputeRule {
 
                     return vec![Violation {
                         rule_id: self.id(),
-                        title: format!("Broken Compute: Dropping Function Used by Trigger: {}", triggers_info.join(", ")),
+                        operation_kind: OperationKind::DropFunction,
+                        object_kind: ObjectKind::Function,
+                        object_name: function_id.to_string(),
                         tier: self.default_tier(),
+                        reason: format!("Broken Compute: Dropping Function Used by Trigger: {}", triggers_info.join(", ")),
                         recipe: self.recipe(),
                         dedup_key: None,
+                                    sql: None,
                     }];
                 }
             }

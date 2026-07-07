@@ -523,18 +523,19 @@ mod rule_evaluation_tests {
             v
         );
         assert!(
-            v.iter().any(|v| v.title.contains("[DOWNGRADED: confidence tainted by earlier opaque SQL, cannot guarantee this is unsafe]")),
+            v.iter().any(|v| v.reason.contains("[DOWNGRADED: confidence tainted by earlier opaque SQL, cannot guarantee this is unsafe]")),
             "expected downgrade notice in titles: {:?}",
-            v.iter().map(|v| &v.title).collect::<Vec<_>>()
+            v.iter().map(|v| &v.reason).collect::<Vec<_>>()
         );
     }
 
     #[test]
     fn test_exact_confidence_keeps_tier1() {
         let engine = setup_engine();
-        let mut state = setup_state();
-
-        engine.analyze("CREATE TABLE t(id INT);", &mut state).unwrap();
+        let mut cache = crate::db::cache::DbCache::new();
+        let tid = object_id("public", "t");
+        cache.insert_baseline(tid.clone(), RelationState::new(tid, object_id("public", "postgres"), 0, Some(10), RelationKind::Table, Persistence::Permanent, 0));
+        let mut state = AnalysisState::new(cache);
 
         let v = engine
             .analyze("DROP TABLE t CASCADE;", &mut state)
@@ -546,9 +547,9 @@ mod rule_evaluation_tests {
             v
         );
         assert!(
-            v.iter().all(|v| !v.title.contains("DOWNGRADED")),
+            v.iter().all(|v| !v.reason.contains("DOWNGRADED")),
             "expected no downgrade notices with exact confidence: {:?}",
-            v.iter().map(|v| &v.title).collect::<Vec<_>>()
+            v.iter().map(|v| &v.reason).collect::<Vec<_>>()
         );
     }
 
@@ -613,6 +614,32 @@ mod rule_evaluation_tests {
             v.iter()
                 .any(|v| v.rule_id.contains("volatile") || v.rule_id.contains("default"))
         );
+    }
+
+    #[test]
+    fn test_rule_volatile_default_alter() {
+        let engine = setup_engine();
+        let mut cache = crate::db::cache::DbCache::new();
+        let tid = object_id("public", "t");
+        let rel = RelationState::new(
+            tid.clone(),
+            object_id("public", "postgres"),
+            0,
+            Some(10),
+            crate::model::relation::RelationKind::Table,
+            crate::model::relation::Persistence::Permanent,
+            0,
+        );
+        cache.insert_baseline(tid, rel);
+        let mut state = AnalysisState::new(cache);
+
+        // test ADD COLUMN
+        let v = engine.analyze("ALTER TABLE t ADD COLUMN new_col int DEFAULT random();", &mut state).unwrap();
+        assert!(v.iter().any(|v| v.rule_id == "volatile-default"));
+
+        // test SET DEFAULT
+        let v2 = engine.analyze("ALTER TABLE t ALTER COLUMN new_col SET DEFAULT random();", &mut state).unwrap();
+        assert!(v2.iter().any(|v| v.rule_id == "volatile-default"));
     }
 
     #[test]
@@ -702,6 +729,29 @@ mod rule_evaluation_tests {
     }
 
     #[test]
+    fn test_overloaded_function_search_path() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine.analyze("CREATE SCHEMA myschema;", &mut state).unwrap();
+        engine.analyze("SET search_path TO myschema, public;", &mut state).unwrap();
+        engine.analyze(
+            "CREATE FUNCTION myschema.my_overloaded_func(x integer) RETURNS int LANGUAGE plpgsql IMMUTABLE AS 'BEGIN RETURN x; END';",
+            &mut state
+        ).unwrap();
+
+        // Resolve function using search path and alter it
+        let v = engine.analyze(
+            "ALTER FUNCTION my_overloaded_func(integer) IMMUTABLE;",
+            &mut state
+        ).unwrap();
+
+        assert!(v.is_empty());
+        let target_id = ObjectId::new("myschema", "my_overloaded_func(integer)");
+        assert!(state.local.functions.contains_key(&target_id));
+    }
+
+    #[test]
     fn test_rule_drop_function_recreate() {
         let engine = setup_engine();
         let mut state = setup_state();
@@ -773,8 +823,8 @@ mod rule_evaluation_tests {
 
         let violation = v.iter().find(|violation| violation.rule_id == "broken-compute").unwrap();
         assert_eq!(violation.tier, ViolationTier::Tier1);
-        assert!(violation.title.contains("trg_events"));
-        assert!(violation.title.contains("events"));
+        assert!(violation.reason.contains("trg_events"));
+        assert!(violation.reason.contains("events"));
     }
 
     #[test]
@@ -822,6 +872,33 @@ mod rule_evaluation_tests {
             .unwrap();
 
         assert!(!v2.iter().any(|v| v.rule_id == "require-concurrent-index"));
+    }
+
+    #[test]
+    fn test_rule_concurrent_index_outside_transaction() {
+
+        let engine = setup_engine();
+        let mut state = setup_state();
+        
+        state.baseline_relations.insert(object_id("public", "t"));
+        state.local.relations.insert(
+            object_id("public", "t"), 
+            crate::model::relation::RelationOverlay::Present(crate::model::relation::RelationState::new(
+                object_id("public", "t"), 
+                object_id("public", "postgres"), 
+                0, 
+                Some(500_000), 
+                crate::model::relation::RelationKind::Table, 
+                crate::model::relation::Persistence::Permanent, 
+                0
+            ))
+        );
+        
+        let v1 = engine
+            .analyze("CREATE INDEX i ON t(id);", &mut state)
+            .unwrap();
+            
+        assert!(v1.iter().any(|v| v.rule_id == "require-concurrent-index"));
     }
 
     #[test]
@@ -918,10 +995,27 @@ mod reversibility_tests {
     }
 
     #[test]
+    fn test_reversibility_drop_column_added_in_transaction() {
+        let engine = setup_engine();
+        let mut cache = crate::db::cache::DbCache::new();
+        let tid = object_id("public", "t");
+        cache.insert_baseline(tid.clone(), RelationState::new(tid, object_id("public", "postgres"), 0, Some(10), RelationKind::Table, Persistence::Permanent, 0));
+        let mut state = AnalysisState::new(cache);
+
+        // Run BEGIN; ADD COLUMN; DROP COLUMN; COMMIT;
+        let v = engine.analyze("BEGIN; ALTER TABLE t ADD COLUMN val int; ALTER TABLE t DROP COLUMN val; COMMIT;", &mut state).unwrap();
+
+        // DROP COLUMN should be Tier3, not Tier1
+        assert!(v.iter().all(|violation| violation.rule_id != "irreversible-migration" || violation.tier != ViolationTier::Tier1));
+    }
+
+    #[test]
     fn test_reversibility_drop_table() {
         let engine = setup_engine();
-        let mut state = setup_state();
-        engine.analyze("CREATE TABLE t(id INT);", &mut state).unwrap();
+        let mut cache = crate::db::cache::DbCache::new();
+        let tid = object_id("public", "t");
+        cache.insert_baseline(tid.clone(), RelationState::new(tid, object_id("public", "postgres"), 0, Some(10), RelationKind::Table, Persistence::Permanent, 0));
+        let mut state = AnalysisState::new(cache);
         let v = engine.analyze("DROP TABLE t;", &mut state).unwrap();
         assert!(v.iter().any(|violation| violation.tier == ViolationTier::Tier1));
     }
@@ -1280,6 +1374,11 @@ mod state_mutation_tests {
 
         engine.analyze("CREATE PUBLICATION pub FOR TABLE t1, t2;", &mut state).unwrap();
         assert!(state.local.publications.contains_key("pub"));
+
+        let deps = &state.local.graph.publication_dependencies;
+        assert_eq!(deps.len(), 2);
+        assert!(deps.iter().any(|d| d.publication_name == "pub" && d.table_id == object_id("public", "t1")));
+        assert!(deps.iter().any(|d| d.publication_name == "pub" && d.table_id == object_id("public", "t2")));
     }
 
     #[test]
@@ -1553,6 +1652,55 @@ mod transaction_lifecycle_tests {
         assert!(state.local.transactions.is_empty());
         assert!(!state.relation_is_present(&object_id("public", "t")));
     }
+
+    #[test]
+    fn test_rename_propagation_rollback() {
+        let engine = setup_engine();
+        let mut cache = crate::db::cache::DbCache::new();
+        
+        let t1_id = object_id("public", "t1");
+        let v1_id = object_id("public", "v1");
+        
+        cache.insert_baseline(t1_id.clone(), crate::model::relation::RelationState::new(
+            t1_id.clone(),
+            object_id("public", "postgres"),
+            0,
+            Some(10),
+            crate::model::relation::RelationKind::Table,
+            crate::model::relation::Persistence::Permanent,
+            0,
+        ));
+        cache.insert_baseline(v1_id.clone(), crate::model::relation::RelationState::new(
+            v1_id.clone(),
+            object_id("public", "postgres"),
+            0,
+            Some(1),
+            crate::model::relation::RelationKind::View,
+            crate::model::relation::Persistence::Permanent,
+            0,
+        ));
+        
+        let mut state = AnalysisState::new(cache);
+        
+        state.local.graph.views.push(crate::analysis::graph::ViewEdge {
+            view_id: v1_id.clone(),
+            depends_on: vec![t1_id.clone()],
+            view_generation: 0,
+        });
+        
+        // Assert initial view dependency points to t1
+        assert_eq!(state.local.graph.views[0].depends_on[0], t1_id);
+        
+        // Run rename under transaction and rollback
+        engine
+            .analyze("BEGIN; ALTER TABLE t1 RENAME TO t2; ROLLBACK;", &mut state)
+            .unwrap();
+            
+        // Check that table name is restored to t1, and the view dependency is restored to t1
+        assert!(state.relation_is_present(&t1_id));
+        assert!(!state.relation_is_present(&object_id("public", "t2")));
+        assert_eq!(state.local.graph.views[0].depends_on[0], t1_id);
+    }
 }
 
 // ─────────────────────────────────────────────
@@ -1819,6 +1967,41 @@ mod destructive_rule_tests {
         }
     }
 
+    #[test]
+    fn test_rule_type_change_narrow_varchar_unbounded() {
+        let engine = setup_engine();
+        let mut cache = crate::db::cache::DbCache::new();
+        let tid = object_id("public", "t");
+        let mut rel = RelationState::new(
+            tid.clone(),
+            object_id("public", "postgres"),
+            0,
+            Some(100),
+            RelationKind::Table,
+            Persistence::Permanent,
+            0,
+        );
+        rel.apply_column_action(&crate::model::relation::ColumnAction::Add {
+            name: "val".to_string(),
+            data_type: Some("varchar".to_string()),
+            not_null: false,
+            default: None,
+        });
+        cache.insert_baseline(tid, rel);
+        let mut state = AnalysisState::new(cache);
+
+        let v = engine
+            .analyze("ALTER TABLE t ALTER COLUMN val TYPE varchar(10);", &mut state)
+            .unwrap();
+
+        assert!(
+            v.iter().any(|viol| viol.rule_id == "type-change-rewrite"
+                && viol.reason.contains("narrows VARCHAR precision (lossy)")),
+            "Unbounded to bounded varchar change should be flagged as lossy narrowing: {:?}",
+            v
+        );
+    }
+
     /// Varchar narrowing: 255→50 should be flagged as lossy, 50→255 should not
     #[test]
     fn test_rule_varchar_narrowing_lossy() {
@@ -1855,7 +2038,7 @@ mod destructive_rule_tests {
             .unwrap();
 
         assert!(
-            v.iter().any(|v| v.rule_id == "type-change-rewrite" && v.title.contains("narrows")),
+            v.iter().any(|v| v.rule_id == "type-change-rewrite" && v.reason.contains("narrows")),
             "255→50 should be flagged as lossy VARCHAR narrowing"
         );
 
@@ -1886,14 +2069,11 @@ mod destructive_rule_tests {
             .analyze("ALTER TABLE t ALTER COLUMN data TYPE varchar(255);", &mut state2)
             .unwrap();
 
-        // Should be flagged as a rewrite, but NOT as "narrows"
+        // Should NOT be flagged as a rewrite
         assert!(
-            v2.iter().any(|v| v.rule_id == "type-change-rewrite"),
-            "50→255 should still trigger type-change-rewrite"
-        );
-        assert!(
-            !v2.iter().any(|v| v.title.contains("narrows")),
-            "50→255 should NOT be flagged as lossy narrowing"
+            !v2.iter().any(|v| v.rule_id == "type-change-rewrite"),
+            "50→255 should be safe and NOT trigger type-change-rewrite: {:?}",
+            v2
         );
     }
 
@@ -1967,6 +2147,58 @@ mod destructive_rule_tests {
             ViolationTier::Tier1,
             "Drift should be Tier1"
         );
+    }
+
+    #[test]
+    fn test_rule_drift_detection_drop_existing_table() {
+        let mut cache = crate::db::cache::DbCache::new();
+        cache.insert_baseline(
+            object_id("public", "existing_tbl"),
+            crate::model::relation::RelationState::new(
+                object_id("public", "existing_tbl"),
+                ObjectId::new("public", "postgres"),
+                0,
+                Some(100),
+                RelationKind::Table,
+                Persistence::Permanent,
+                0,
+            ),
+        );
+        let engine = setup_engine();
+        let mut state = AnalysisState::new(cache);
+
+        // DROP TABLE that is in baseline should NOT flag schema-drift
+        let v = engine
+            .analyze("DROP TABLE existing_tbl;", &mut state)
+            .unwrap();
+
+        assert!(
+            !v.iter().any(|v| v.rule_id == "schema-drift"),
+            "DriftDetectionRule should NOT flag DROP on table present in baseline: {:?}",
+            v
+        );
+    }
+
+    #[test]
+    fn test_rule_drift_detection_non_table_objects() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        // 1. DROP INDEX
+        let v = engine.analyze("DROP INDEX nonexistent_idx;", &mut state).unwrap();
+        assert!(v.iter().any(|v| v.rule_id == "schema-drift" && v.reason.contains("index")));
+
+        // 2. DROP SEQUENCE
+        let v = engine.analyze("DROP SEQUENCE nonexistent_seq;", &mut state).unwrap();
+        assert!(v.iter().any(|v| v.rule_id == "schema-drift" && v.reason.contains("sequence")));
+
+        // 3. ALTER TYPE
+        let v = engine.analyze("ALTER TYPE nonexistent_type ADD VALUE 'val';", &mut state).unwrap();
+        assert!(v.iter().any(|v| v.rule_id == "schema-drift" && v.reason.contains("type")));
+
+        // 4. ALTER FUNCTION
+        let v = engine.analyze("ALTER FUNCTION nonexistent_func() IMMUTABLE;", &mut state).unwrap();
+        assert!(v.iter().any(|v| v.rule_id == "schema-drift" && v.reason.contains("function")));
     }
 
     #[test]
@@ -2730,15 +2962,15 @@ mod chain_execution_tests {
         let conflict = conflict_violations.iter().find(|v| v.tier == ViolationTier::Tier1);
         assert!(conflict.is_some(), "Conflict should be Tier1");
         assert!(
-            conflict.unwrap().title.contains("price"),
+            conflict.unwrap().reason.contains("price"),
             "Conflict message should mention column 'price'"
         );
         assert!(
-            conflict.unwrap().title.contains("INT"),
+            conflict.unwrap().reason.contains("INT"),
             "Conflict message should mention existing type INT"
         );
         assert!(
-            conflict.unwrap().title.contains("TEXT"),
+            conflict.unwrap().reason.contains("TEXT"),
             "Conflict message should mention conflicting type TEXT"
         );
     }

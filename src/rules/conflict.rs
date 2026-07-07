@@ -2,7 +2,7 @@
 
 use crate::analysis::state::MutationResult;
 use crate::engine::config::Config;
-use crate::report::violations::{Violation, ViolationTier};
+use crate::report::violations::{Violation, ViolationTier, OperationKind, ObjectKind};
 use crate::rules::Rule;
 use crate::analysis::mutations::Mutation;
 
@@ -46,10 +46,14 @@ impl Rule for ConflictRule {
         match Self::extract_conflict_reason(result) {
             Some(reason) => vec![Violation {
                 rule_id: Self::ID,
-                title: format!("Migration chain conflict: {}", reason),
+                operation_kind: OperationKind::Other("conflict".to_string()),
+                object_kind: ObjectKind::Unknown,
+                object_name: "unknown".to_string(),
                 tier: Self::DEFAULT_TIER,
+                reason: format!("Migration chain conflict: {}", reason),
                 recipe: Self::RECIPE,
                 dedup_key: None,
+                    sql: None,
             }],
             None => Vec::new(),
         }
@@ -78,6 +82,9 @@ mod tests {
                 roles: HashMap::new(),
                 publications: HashMap::new(),
                 subscriptions: HashMap::new(),
+                sequences: HashMap::new(),
+                types: HashMap::new(),
+                indexes: Vec::new(),
             },
             &crate::analysis::state::AnalysisState::new(crate::db::cache::DbCache::new()),
             &Config::default(),
@@ -86,7 +93,7 @@ mod tests {
         assert_eq!(violations.len(), 1);
         assert_eq!(violations[0].rule_id, "chain-conflict");
         assert_eq!(violations[0].tier, ViolationTier::Tier1);
-        assert!(violations[0].title.contains("Migration chain conflict"));
+        assert!(violations[0].reason.contains("Migration chain conflict"));
     }
 
     #[test]
@@ -102,6 +109,9 @@ mod tests {
                 roles: HashMap::new(),
                 publications: HashMap::new(),
                 subscriptions: HashMap::new(),
+                sequences: HashMap::new(),
+                types: HashMap::new(),
+                indexes: Vec::new(),
             },
             &crate::analysis::state::AnalysisState::new(crate::db::cache::DbCache::new()),
             &Config::default(),

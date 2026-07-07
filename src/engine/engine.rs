@@ -73,6 +73,12 @@ impl SafeMigrateEngine {
             let violations = self.analyze_single_file(filename, sql, state)?;
             all_violations.extend(violations);
         }
+        // Phase 10.6: Deterministic violation ordering
+        all_violations.sort_by(|a, b| {
+            a.tier.cmp(&b.tier)
+                .then_with(|| a.object_name.cmp(&b.object_name))
+                .then_with(|| a.rule_id.cmp(b.rule_id))
+        });
         Ok(all_violations)
     }
 
@@ -134,6 +140,9 @@ impl SafeMigrateEngine {
                 Self::parse_directives(token.text(), &mut dummy, &mut stmt_ignores);
             }
 
+            // Capture raw statement text for sql field on violations
+            let stmt_text = stmt.syntax().text().to_string();
+
             if let Some(fact) = AstVisitor::extract(&stmt) {
                 let mutations = Resolver::resolve(&fact, state);
 
@@ -171,6 +180,10 @@ impl SafeMigrateEngine {
                             {
                                 continue;
                             }
+                            let mut v = v;
+                            if v.sql.is_none() {
+                                v.sql = Some(stmt_text.trim().to_string());
+                            }
                             all_violations.push(v);
                         }
                     }
@@ -179,7 +192,7 @@ impl SafeMigrateEngine {
                         for v in &mut all_violations {
                             if v.tier == crate::report::violations::ViolationTier::Tier1 {
                                 v.tier = crate::report::violations::ViolationTier::Tier2;
-                                v.title.push_str(" [DOWNGRADED: confidence tainted by earlier opaque SQL, cannot guarantee this is unsafe]");
+                                v.reason.push_str(" [DOWNGRADED: confidence tainted by earlier opaque SQL, cannot guarantee this is unsafe]");
                             }
                         }
                     }

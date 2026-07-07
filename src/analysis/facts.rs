@@ -387,6 +387,7 @@ pub enum PublicationScope {
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum PublicationObjectFact {
     Table {
+        name: QualifiedName,
         only: bool,
         include_partitions: bool,
         columns: Option<Vec<String>>,

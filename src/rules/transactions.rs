@@ -2,7 +2,7 @@
 use crate::analysis::mutations::Mutation;
 use crate::analysis::state::{AnalysisState, CascadeResult, MutationResult};
 use crate::engine::config::Config;
-use crate::report::violations::{Violation, ViolationTier};
+use crate::report::violations::{Violation, ViolationTier, OperationKind, ObjectKind};
 use crate::rules::Rule;
 
 pub struct ConcurrentInsideTransactionRule;
@@ -34,22 +34,30 @@ impl Rule for ConcurrentInsideTransactionRule {
                 Mutation::CreateIndex(c) if c.concurrently => {
                     violations.push(Violation {
                         rule_id: self.id(),
-                        title: format!("CREATE INDEX CONCURRENTLY on {} inside a transaction block", c.table),
+                        operation_kind: OperationKind::CreateIndex,
+                        object_kind: ObjectKind::Index,
+                        object_name: c.id.to_string(),
                         tier: self.default_tier(),
+                        reason: format!("CREATE INDEX CONCURRENTLY on {} inside a transaction block", c.table),
                         recipe: "Move CONCURRENTLY index creation outside of explicit transaction blocks.",
                         dedup_key: Some(format!("{}_{}", self.id(), c.id)),
+                                    sql: None,
                     });
                 }
                 Mutation::DropIndex(d) if d.concurrently => {
                     violations.push(Violation {
                         rule_id: self.id(),
-                        title: format!(
+                        operation_kind: OperationKind::DropIndex,
+                        object_kind: ObjectKind::Index,
+                        object_name: d.id.to_string(),
+                        tier: self.default_tier(),
+                        reason: format!(
                             "DROP INDEX CONCURRENTLY on {} inside a transaction block",
                             d.id
                         ),
-                        tier: self.default_tier(),
                         recipe: self.recipe(),
                         dedup_key: None,
+                                    sql: None,
                     });
                 }
                 _ => {}
@@ -87,10 +95,14 @@ impl Rule for AlterTypeAddValueRule {
         {
             return vec![Violation {
                 rule_id: self.id(),
-                title: format!("ALTER TYPE {} ADD VALUE inside transaction", alter.id),
+                operation_kind: OperationKind::AlterType,
+                object_kind: ObjectKind::Type,
+                object_name: alter.id.to_string(),
                 tier: self.default_tier(),
+                reason: format!("ALTER TYPE {} ADD VALUE inside transaction", alter.id),
                 recipe: self.recipe(),
                 dedup_key: None,
+                    sql: None,
             }];
         }
         vec![]
@@ -122,10 +134,14 @@ impl Rule for VacuumFullRule {
         if let Mutation::Vacuum { is_full: true } = mutation {
             return vec![Violation {
                 rule_id: self.id(),
-                title: "VACUUM FULL requires an ACCESS EXCLUSIVE lock".to_string(),
+                operation_kind: OperationKind::VacuumFull,
+                object_kind: ObjectKind::Table,
+                object_name: "<vacuum>".to_string(),
                 tier: self.default_tier(),
+                reason: "VACUUM FULL requires an ACCESS EXCLUSIVE lock".to_string(),
                 recipe: self.recipe(),
                 dedup_key: None,
+                    sql: None,
             }];
         }
         vec![]

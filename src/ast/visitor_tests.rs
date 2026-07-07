@@ -65,7 +65,7 @@ mod tests {
                 assert_eq!(columns.len(), 2);
                 // Check default expression
                 if let Some(default) = &columns[1].default {
-                    assert!(default.is_volatile()); // NOW() is volatile
+                    assert!(!default.is_volatile()); // NOW() is STABLE
                 }
             }
             _ => panic!("Expected CreateTable fact"),
@@ -597,7 +597,7 @@ mod tests {
             name: "now".into(),
             args: vec![],
         };
-        assert!(expr.is_volatile());
+        assert!(!expr.is_volatile());
     }
 
     #[test]
@@ -623,7 +623,7 @@ mod tests {
         let expr = ExprIr::FunctionCall {
             name: "<case>".into(),
             args: vec![ExprIr::FunctionCall {
-                name: "now".into(),
+                name: "random".into(),
                 args: vec![],
             }],
         };
@@ -634,7 +634,7 @@ mod tests {
     fn test_expr_ir_is_volatile_binary_op() {
         let expr = ExprIr::BinaryOp {
             left: Box::new(ExprIr::FunctionCall {
-                name: "now".into(),
+                name: "random".into(),
                 args: vec![],
             }),
             op: "||".into(),
@@ -647,12 +647,39 @@ mod tests {
     fn test_expr_ir_is_volatile_cast() {
         let expr = ExprIr::Cast {
             expr: Box::new(ExprIr::FunctionCall {
-                name: "now".into(),
+                name: "random".into(),
                 args: vec![],
             }),
             target_type: "text".into(),
         };
         assert!(expr.is_volatile());
+    }
+
+    #[test]
+    fn test_now_is_stable_not_volatile() {
+        let expr = ExprIr::FunctionCall {
+            name: "now".to_string(),
+            args: vec![],
+        };
+        assert!(!expr.is_volatile(), "now() should be STABLE, not VOLATILE");
+    }
+
+    #[test]
+    fn test_current_timestamp_is_stable() {
+        let expr = ExprIr::FunctionCall {
+            name: "current_timestamp".to_string(),
+            args: vec![],
+        };
+        assert!(!expr.is_volatile(), "current_timestamp should be STABLE");
+    }
+
+    #[test]
+    fn test_clock_timestamp_is_volatile() {
+        let expr = ExprIr::FunctionCall {
+            name: "clock_timestamp".to_string(),
+            args: vec![],
+        };
+        assert!(expr.is_volatile(), "clock_timestamp() should be VOLATILE");
     }
 
     // ========================================================================

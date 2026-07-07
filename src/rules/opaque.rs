@@ -2,7 +2,7 @@
 use crate::analysis::mutations::Mutation;
 use crate::analysis::state::{AnalysisState, CascadeResult, MutationResult};
 use crate::engine::config::Config;
-use crate::report::violations::{Violation, ViolationTier};
+use crate::report::violations::{Violation, ViolationTier, OperationKind, ObjectKind};
 use crate::rules::Rule;
 
 pub struct OpaqueDynamicSqlRule;
@@ -43,10 +43,14 @@ impl Rule for OpaqueDynamicSqlRule {
 
             violations.push(Violation {
                 rule_id: self.id(),
-                title: format!("Encountered opaque {}", block_type),
+                operation_kind: OperationKind::OpaqueSql,
+                object_kind: ObjectKind::Unknown,
+                object_name: "<dynamic>".to_string(),
                 tier: self.default_tier(),
+                reason: format!("Encountered opaque {}", block_type),
                 recipe: self.recipe(),
                 dedup_key: None,
+                    sql: None,
             });
         }
 

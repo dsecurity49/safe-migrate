@@ -64,7 +64,11 @@ impl Resolver {
             if state.local.relations.contains_key(&candidate)
                 || state.local.types.contains_key(&candidate)
                 || state.local.sequences.contains_key(&candidate)
-                || state.local.functions.contains_key(&candidate)
+                || state.local.functions.keys().any(|k| {
+                    k.schema == candidate.schema
+                        && (k.name == candidate.name
+                            || k.name.starts_with(&format!("{}(", candidate.name)))
+                })
             {
                 return candidate;
             }

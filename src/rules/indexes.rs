@@ -3,7 +3,7 @@ use crate::analysis::mutations::Mutation;
 use crate::analysis::state::{AnalysisState, CascadeResult, MutationResult};
 use crate::engine::config::Config;
 use crate::model::relation::Persistence;
-use crate::report::violations::{Violation, ViolationTier};
+use crate::report::violations::{Violation, ViolationTier, OperationKind, ObjectKind};
 use crate::rules::Rule;
 
 pub struct ConcurrentIndexRule;
@@ -50,7 +50,7 @@ impl Rule for ConcurrentIndexRule {
                     None => (false, true, config.default_rows, 0),
                 };
 
-                if is_temp || tx_depth == state.local.transactions.len() {
+                if is_temp || (tx_depth > 0 && tx_depth <= state.local.transactions.len()) {
                     return violations;
                 }
 
@@ -58,10 +58,14 @@ impl Rule for ConcurrentIndexRule {
                     let key = format!("{}_stale_{}", self.id(), create.table);
                     violations.push(Violation {
                         rule_id: self.id(),
-                        title: format!("Table {} statistics are stale. Lock evaluations may be inaccurate.", create.table),
+                        operation_kind: OperationKind::CreateIndex,
+                        object_kind: ObjectKind::Index,
+                        object_name: create.id.to_string(),
                         tier: ViolationTier::Tier2,
+                        reason: format!("Table {} statistics are stale. Lock evaluations may be inaccurate.", create.table),
                         recipe: "Run ANALYZE to ensure accurate row estimates before structural changes.",
                         dedup_key: Some(key),
+                                    sql: None,
                     });
                 }
 
@@ -76,25 +80,30 @@ impl Rule for ConcurrentIndexRule {
                     ViolationTier::Tier3
                 };
 
-                if tier != ViolationTier::Tier3 {
-                    let mut title = format!("Synchronous index creation on {}", create.table);
-                    if is_stale {
-                        title.push_str(" [WARNING: Based on offline/stale statistics]");
-                    }
-
-                    violations.push(Violation {
-                        rule_id: self.id(),
-                        title,
-                        tier,
-                        recipe: self.recipe(),
-                        dedup_key: None,
-                    });
+                let mut reason = format!("Synchronous index creation on {}", create.table);
+                if is_stale {
+                    reason.push_str(" [WARNING: Based on offline/stale statistics]");
                 }
+
+                violations.push(Violation {
+                    rule_id: self.id(),
+                    operation_kind: OperationKind::CreateIndex,
+                    object_kind: ObjectKind::Index,
+                    object_name: create.id.to_string(),
+                    tier,
+                    reason,
+                    recipe: self.recipe(),
+                    dedup_key: None,
+                            sql: None,
+                });
             }
             Mutation::DropIndex(drop) if !drop.concurrently => {
                 let rule_id = "require-concurrent-drop-index";
                 let tier1_threshold = config.rule_tier1_threshold(rule_id);
                 let tier2_threshold = config.rule_tier2_threshold(rule_id);
+
+                // BUG-010: Do not check or push stale statistics warning for DROP INDEX.
+                // We only perform size evaluation for the drop index violation tier.
 
                 if pre_state.relations.is_empty() {
                     let rows = config.default_rows;
@@ -106,35 +115,29 @@ impl Rule for ConcurrentIndexRule {
                         ViolationTier::Tier3
                     };
 
-                    if tier != ViolationTier::Tier3 {
-                        violations.push(Violation {
-                            rule_id,
-                            title: format!("Synchronous index drop for {}", drop.id),
-                            tier,
-                            recipe: self.recipe(),
-                            dedup_key: None,
-                        });
-                    }
+                    violations.push(Violation {
+                        rule_id,
+                        operation_kind: OperationKind::DropIndex,
+                        object_kind: ObjectKind::Index,
+                        object_name: drop.id.to_string(),
+                        tier,
+                        reason: format!("Synchronous index drop for {}", drop.id),
+                        recipe: self.recipe(),
+                        dedup_key: None,
+                                    sql: None,
+                    });
                 } else {
-                    for rel in pre_state.relations.values() {
-                        if rel.persistence == Persistence::Temporary {
-                            continue;
+                    let mut target_relations = Vec::new();
+                    for idx in &pre_state.indexes {
+                        if idx.index_id == drop.id
+                            && let Some(rel) = pre_state.relations.get(&idx.relation_id)
+                        {
+                            target_relations.push(rel);
                         }
+                    }
 
-                        let is_stale = rel.is_stale() && state.baseline_relations.contains(&rel.id);
-
-                        if is_stale {
-                            let key = format!("{}_stale_{}", rule_id, rel.id);
-                            violations.push(Violation {
-                                rule_id,
-                                title: format!("Table {} statistics are stale. Lock evaluations may be inaccurate.", rel.id),
-                                tier: ViolationTier::Tier2,
-                                recipe: "Run ANALYZE to ensure accurate row estimates before structural changes.",
-                                dedup_key: Some(key),
-                            });
-                        }
-
-                        let rows = rel.estimated_rows.unwrap_or(config.default_rows);
+                    if target_relations.is_empty() {
+                        let rows = config.default_rows;
                         let tier = if rows >= tier1_threshold {
                             ViolationTier::Tier1
                         } else if rows >= tier2_threshold {
@@ -143,19 +146,45 @@ impl Rule for ConcurrentIndexRule {
                             ViolationTier::Tier3
                         };
 
-                        if tier != ViolationTier::Tier3 {
-                            let mut title =
-                                format!("Synchronous index drop for {} on {}", drop.id, rel.id);
-                            if is_stale {
-                                title.push_str(" [WARNING: Based on offline/stale statistics]");
+                        violations.push(Violation {
+                            rule_id,
+                            operation_kind: OperationKind::DropIndex,
+                            object_kind: ObjectKind::Index,
+                            object_name: drop.id.to_string(),
+                            tier,
+                            reason: format!("Synchronous index drop for {}", drop.id),
+                            recipe: self.recipe(),
+                            dedup_key: None,
+                                            sql: None,
+                        });
+                    } else {
+                        for rel in target_relations {
+                            if rel.persistence == Persistence::Temporary {
+                                continue;
                             }
+
+                            let rows = rel.estimated_rows.unwrap_or(config.default_rows);
+                            let tier = if rows >= tier1_threshold {
+                                ViolationTier::Tier1
+                            } else if rows >= tier2_threshold {
+                                ViolationTier::Tier2
+                            } else {
+                                ViolationTier::Tier3
+                            };
+
+                            let reason =
+                                format!("Synchronous index drop for {} on {}", drop.id, rel.id);
 
                             violations.push(Violation {
                                 rule_id,
-                                title,
+                                operation_kind: OperationKind::DropIndex,
+                                object_kind: ObjectKind::Index,
+                                object_name: drop.id.to_string(),
                                 tier,
+                                reason,
                                 recipe: self.recipe(),
                                 dedup_key: None,
+                                                    sql: None,
                             });
                         }
                     }

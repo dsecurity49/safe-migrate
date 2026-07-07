@@ -3,7 +3,7 @@ use crate::analysis::mutations::{AlterTableActionMutation, Mutation};
 use crate::analysis::state::{AnalysisState, CascadeResult, MutationResult};
 use crate::engine::config::Config;
 use crate::model::relation::Persistence;
-use crate::report::violations::{Violation, ViolationTier};
+use crate::report::violations::{Violation, ViolationTier, OperationKind, ObjectKind};
 use crate::rules::Rule;
 
 pub struct PartitionLockRule;
@@ -55,14 +55,27 @@ impl Rule for PartitionLockRule {
                         return violations;
                     }
 
+                    let op_kind = if matches!(
+                        alter.action,
+                        AlterTableActionMutation::AttachPartition { .. }
+                    ) {
+                        OperationKind::AttachPartition
+                    } else {
+                        OperationKind::DetachPartition
+                    };
+
                     if is_stale {
                         let key = format!("{}_stale_{}", self.id(), alter.id);
                         violations.push(Violation {
                             rule_id: self.id(),
-                            title: format!("Table {} statistics are stale. Lock evaluations may be inaccurate.", alter.id),
+                            operation_kind: op_kind.clone(),
+                            object_kind: ObjectKind::Table,
+                            object_name: alter.id.to_string(),
                             tier: ViolationTier::Tier2,
+                            reason: format!("Table {} statistics are stale. Lock evaluations may be inaccurate.", alter.id),
                             recipe: "Run ANALYZE to ensure accurate row estimates before structural changes.",
                             dedup_key: Some(key),
+                                            sql: None,
                         });
                     }
 
@@ -86,20 +99,24 @@ impl Rule for PartitionLockRule {
                         } else {
                             "Detaching"
                         };
-                        let mut title = format!(
+                        let mut reason = format!(
                             "{} a partition on heavily utilized parent table {}",
                             op_name, alter.id
                         );
                         if is_stale {
-                            title.push_str(" [WARNING: Based on offline/stale statistics]");
+                            reason.push_str(" [WARNING: Based on offline/stale statistics]");
                         }
 
                         violations.push(Violation {
                             rule_id: self.id(),
-                            title,
+                            operation_kind: op_kind,
+                            object_kind: ObjectKind::Table,
+                            object_name: alter.id.to_string(),
                             tier,
+                            reason,
                             recipe: self.recipe(),
                             dedup_key: None,
+                                            sql: None,
                         });
                     }
                 }

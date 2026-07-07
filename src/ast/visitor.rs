@@ -1540,8 +1540,9 @@ impl AstVisitor {
             let objects = node
                 .publication_objects()
                 .map(|obj| {
-                    if obj.path().is_some() {
+                    if let Some(path) = obj.path() {
                         crate::analysis::facts::PublicationObjectFact::Table {
+                            name: Self::path_to_qualified_name(&path).unwrap_or_else(|| QualifiedName::new(None, Ident::new("unknown".to_string(), false))),
                             only: obj.only_token().is_some(),
                             include_partitions: obj.star_token().is_some(),
                             columns: obj.column_list().map(|cl| cl.columns().filter_map(|c| c.name().map(Self::resolve_name)).collect()),

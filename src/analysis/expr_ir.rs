@@ -32,10 +32,8 @@ impl ExprIr {
                 }
 
                 const VOLATILE: &[&str] = &[
-                    "now",
+                    // Truly VOLATILE: return different values on every call
                     "clock_timestamp",
-                    "transaction_timestamp",
-                    "statement_timestamp",
                     "timeofday",
                     "random",
                     "setseed",
@@ -52,6 +50,10 @@ impl ExprIr {
                     "uuid_generate_v1",
                     "uuid_generate_v1mc",
                     "uuid_generate_v4",
+                    // Note: now(), current_timestamp, current_date, current_user,
+                    // transaction_timestamp(), statement_timestamp() are all STABLE —
+                    // they return the transaction start time and are constant within
+                    // a statement. They do NOT require a table rewrite on PG11+.
                 ];
 
                 VOLATILE.contains(&name.to_lowercase().as_str())

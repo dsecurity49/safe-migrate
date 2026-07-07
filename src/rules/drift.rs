@@ -1,7 +1,8 @@
 use crate::analysis::mutations::Mutation;
 use crate::analysis::state::{AnalysisState, CascadeResult, MutationResult};
+use crate::ast::identifiers::ObjectId;
 use crate::engine::config::Config;
-use crate::report::violations::{Violation, ViolationTier};
+use crate::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
 use crate::rules::Rule;
 
 pub struct DriftDetectionRule;
@@ -14,47 +15,254 @@ impl Rule for DriftDetectionRule {
         ViolationTier::Tier1
     }
     fn recipe(&self) -> &'static str {
-        "This migration references a table that does not exist in the production baseline. If this table exists in production, sync the cache with `safe-migrate sync`. If it does not, this migration may fail."
+        "This migration references a database object that does not exist in the production baseline. If this object exists in production, sync the cache with `safe-migrate sync`. If it does not, this migration may fail."
     }
 
     fn evaluate(
         &self,
         mutation: &Mutation,
         _result: &MutationResult,
-        _pre_state: &crate::analysis::state::PreState,
+        pre_state: &crate::analysis::state::PreState,
         state: &AnalysisState,
         _config: &Config,
         _cascade_closure: Option<&CascadeResult>,
     ) -> Vec<Violation> {
+        let mut violations = Vec::new();
+
         match mutation {
             Mutation::DropTable(d) => {
-                if !state.relation_is_present(&d.id) {
-                    return vec![Violation {
+                if !pre_state.relations.contains_key(&d.id) {
+                    violations.push(Violation {
                         rule_id: self.id(),
-                        title: format!(
+                        operation_kind: OperationKind::DropTable,
+                        object_kind: ObjectKind::Table,
+                        object_name: d.id.to_string(),
+                        tier: self.default_tier(),
+                        reason: format!(
                             "Migration DROPs table \"{}\" which does not exist in the production baseline",
                             d.id
                         ),
-                        tier: self.default_tier(),
                         recipe: self.recipe(),
                         dedup_key: None,
-                    }];
+                                    sql: None,
+                    });
                 }
             }
-            Mutation::AlterTable(a) if !state.relation_is_present(&a.id) => {
-                return vec![Violation {
+            Mutation::AlterTable(a) => {
+                if !pre_state.relations.contains_key(&a.id) {
+                    violations.push(Violation {
+                        rule_id: self.id(),
+                        operation_kind: OperationKind::Other("alter_table".to_string()),
+                        object_kind: ObjectKind::Table,
+                        object_name: a.id.to_string(),
+                        tier: self.default_tier(),
+                        reason: format!(
+                            "Migration ALTERs table \"{}\" which does not exist in the production baseline",
+                            a.id
+                        ),
+                        recipe: self.recipe(),
+                        dedup_key: None,
+                                    sql: None,
+                    });
+                }
+            }
+            Mutation::DropView(d) => {
+                for id in &d.ids {
+                    if !pre_state.relations.contains_key(id) {
+                        violations.push(Violation {
+                            rule_id: self.id(),
+                            operation_kind: OperationKind::DropView,
+                            object_kind: ObjectKind::View,
+                            object_name: id.to_string(),
+                            tier: self.default_tier(),
+                            reason: format!(
+                                "Migration DROPs view \"{}\" which does not exist in the production baseline",
+                                id
+                            ),
+                            recipe: self.recipe(),
+                            dedup_key: None,
+                                            sql: None,
+                        });
+                    }
+                }
+            }
+            Mutation::DropMaterializedView(d) => {
+                for id in &d.ids {
+                    if !pre_state.relations.contains_key(id) {
+                        violations.push(Violation {
+                            rule_id: self.id(),
+                            operation_kind: OperationKind::DropMaterializedView,
+                            object_kind: ObjectKind::MaterializedView,
+                            object_name: id.to_string(),
+                            tier: self.default_tier(),
+                            reason: format!(
+                                "Migration DROPs materialized view \"{}\" which does not exist in the production baseline",
+                                id
+                            ),
+                            recipe: self.recipe(),
+                            dedup_key: None,
+                                            sql: None,
+                        });
+                    }
+                }
+            }
+            Mutation::DropSequence(d) => {
+                for id in &d.ids {
+                    if !pre_state.sequences.contains_key(id) {
+                        violations.push(Violation {
+                            rule_id: self.id(),
+                            operation_kind: OperationKind::DropSequence,
+                            object_kind: ObjectKind::Sequence,
+                            object_name: id.to_string(),
+                            tier: self.default_tier(),
+                            reason: format!(
+                                "Migration DROPs sequence \"{}\" which does not exist in the production baseline",
+                                id
+                            ),
+                            recipe: self.recipe(),
+                            dedup_key: None,
+                                            sql: None,
+                        });
+                    }
+                }
+            }
+            Mutation::DropFunction(d) => {
+                for sig in &d.signatures {
+                    let sig_str =
+                        format!("{}({})", sig.name.name.resolve(), sig.params.join(","));
+                    let schema = state.resolve_function_schema(&sig.name, &sig_str);
+                    let id = ObjectId::new(schema, sig_str);
+                    if !pre_state.functions.contains_key(&id) {
+                        violations.push(Violation {
+                            rule_id: self.id(),
+                            operation_kind: OperationKind::DropFunction,
+                            object_kind: ObjectKind::Function,
+                            object_name: id.to_string(),
+                            tier: self.default_tier(),
+                            reason: format!(
+                                "Migration DROPs function \"{}\" which does not exist in the production baseline",
+                                id
+                            ),
+                            recipe: self.recipe(),
+                            dedup_key: None,
+                                            sql: None,
+                        });
+                    }
+                }
+            }
+            Mutation::DropProcedure(d) => {
+                for sig in &d.signatures {
+                    let sig_str =
+                        format!("{}({})", sig.name.name.resolve(), sig.params.join(","));
+                    let schema = state.resolve_function_schema(&sig.name, &sig_str);
+                    let id = ObjectId::new(schema, sig_str);
+                    if !pre_state.functions.contains_key(&id) {
+                        violations.push(Violation {
+                            rule_id: self.id(),
+                            operation_kind: OperationKind::DropProcedure,
+                            object_kind: ObjectKind::Procedure,
+                            object_name: id.to_string(),
+                            tier: self.default_tier(),
+                            reason: format!(
+                                "Migration DROPs procedure \"{}\" which does not exist in the production baseline",
+                                id
+                            ),
+                            recipe: self.recipe(),
+                            dedup_key: None,
+                                            sql: None,
+                        });
+                    }
+                }
+            }
+            Mutation::DropIndex(d) => {
+                if !pre_state.indexes.iter().any(|idx| idx.index_id == d.id) {
+                    violations.push(Violation {
+                        rule_id: self.id(),
+                        operation_kind: OperationKind::DropIndex,
+                        object_kind: ObjectKind::Index,
+                        object_name: d.id.to_string(),
+                        tier: self.default_tier(),
+                        reason: format!(
+                            "Migration DROPs index \"{}\" which does not exist in the production baseline",
+                            d.id
+                        ),
+                        recipe: self.recipe(),
+                        dedup_key: None,
+                                    sql: None,
+                    });
+                }
+            }
+            Mutation::DropDomain(d) => {
+                for id in &d.ids {
+                    if !pre_state.types.contains_key(id) {
+                        violations.push(Violation {
+                            rule_id: self.id(),
+                            operation_kind: OperationKind::DropDomain,
+                            object_kind: ObjectKind::Domain,
+                            object_name: id.to_string(),
+                            tier: self.default_tier(),
+                            reason: format!(
+                                "Migration DROPs domain \"{}\" which does not exist in the production baseline",
+                                id
+                            ),
+                            recipe: self.recipe(),
+                            dedup_key: None,
+                                            sql: None,
+                        });
+                    }
+                }
+            }
+            Mutation::AlterType(a) if !pre_state.types.contains_key(&a.id) => {
+                violations.push(Violation {
                     rule_id: self.id(),
-                    title: format!(
-                        "Migration ALTERs table \"{}\" which does not exist in the production baseline",
+                    operation_kind: OperationKind::AlterType,
+                    object_kind: ObjectKind::Type,
+                    object_name: a.id.to_string(),
+                    tier: self.default_tier(),
+                    reason: format!(
+                        "Migration ALTERs type \"{}\" which does not exist in the production baseline",
                         a.id
                     ),
-                    tier: self.default_tier(),
                     recipe: self.recipe(),
                     dedup_key: None,
-                }];
+                            sql: None,
+                });
+            }
+            Mutation::AlterFunction(f) if !pre_state.functions.contains_key(&f.id) => {
+                violations.push(Violation {
+                    rule_id: self.id(),
+                    operation_kind: OperationKind::AlterFunction,
+                    object_kind: ObjectKind::Function,
+                    object_name: f.id.to_string(),
+                    tier: self.default_tier(),
+                    reason: format!(
+                        "Migration ALTERs function \"{}\" which does not exist in the production baseline",
+                        f.id
+                    ),
+                    recipe: self.recipe(),
+                    dedup_key: None,
+                            sql: None,
+                });
+            }
+            Mutation::AlterProcedure(p) if !pre_state.functions.contains_key(&p.id) => {
+                violations.push(Violation {
+                    rule_id: self.id(),
+                    operation_kind: OperationKind::AlterProcedure,
+                    object_kind: ObjectKind::Procedure,
+                    object_name: p.id.to_string(),
+                    tier: self.default_tier(),
+                    reason: format!(
+                        "Migration ALTERs procedure \"{}\" which does not exist in the production baseline",
+                        p.id
+                    ),
+                    recipe: self.recipe(),
+                    dedup_key: None,
+                            sql: None,
+                });
             }
             _ => {}
         }
-        vec![]
+
+        violations
     }
 }

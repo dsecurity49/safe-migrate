@@ -1,7 +1,7 @@
 use crate::analysis::mutations::Mutation;
 use crate::analysis::state::{AnalysisState, CascadeResult, MutationResult};
 use crate::engine::config::Config;
-use crate::report::violations::{Violation, ViolationTier};
+use crate::report::violations::{Violation, ViolationTier, OperationKind, ObjectKind};
 use crate::rules::Rule;
 
 pub struct RestrictivePolicyRule;
@@ -33,10 +33,14 @@ impl Rule for RestrictivePolicyRule {
         {
             violations.push(Violation {
                 rule_id: self.id(),
-                title: format!("Adding RESTRICTIVE policy {} on {}", policy.name, policy.table),
+                operation_kind: OperationKind::CreatePolicy,
+                object_kind: ObjectKind::Policy,
+                object_name: format!("{} on {}", policy.name, policy.table),
                 tier: self.default_tier(),
+                reason: format!("Adding RESTRICTIVE policy {} on {}", policy.name, policy.table),
                 recipe: self.recipe(),
                 dedup_key: None,
+                    sql: None,
             });
         }
 

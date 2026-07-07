@@ -1,7 +1,7 @@
 // FILE: src/analysis/state.rs
 use crate::analysis::facts::{SearchPathTarget, TableConstraintFact};
 use crate::analysis::graph::{
-    DependencyGraph, FkEdge, IndexEdge, PartitionEdge, RenameEdge, SequenceEdge, ViewEdge,
+    DependencyGraph, FkEdge, IndexEdge, PartitionEdge, PublicationEdge, RenameEdge, SequenceEdge, ViewEdge,
 };
 use crate::analysis::mutations::{
     AlterTableActionMutation, AlterTypeActionMutation, Mutation, PersistenceMutation,
@@ -62,11 +62,15 @@ pub struct PreState {
     pub roles: HashMap<ObjectId, crate::model::role::RoleState>,
     pub publications: HashMap<String, crate::model::replication::PublicationState>,
     pub subscriptions: HashMap<String, crate::model::replication::SubscriptionState>,
+    pub sequences: HashMap<ObjectId, crate::model::sequence::SequenceState>,
+    pub types: HashMap<ObjectId, crate::model::types::TypeState>,
+    pub indexes: Vec<crate::analysis::graph::IndexEdge>,
 }
 
 pub struct AnalysisState {
     pub pg_version_num: Option<u32>,
     pub baseline_relations: HashSet<ObjectId>,
+    pub baseline_indexes: HashSet<ObjectId>,
     pub baseline_foreign_keys: HashSet<(ObjectId, String)>,
     pub local: LocalState,
 }
@@ -75,6 +79,7 @@ impl AnalysisState {
     pub fn new(cache: DbCache) -> Self {
         let mut relations: HashMap<ObjectId, RelationOverlay> = HashMap::new();
         let mut baseline_relations = HashSet::new();
+        let mut baseline_indexes = HashSet::new();
         let mut baseline_foreign_keys = HashSet::new();
         let mut graph = DependencyGraph::new();
 
@@ -96,7 +101,8 @@ impl AnalysisState {
         }
 
         for idx in cache.indexes {
-            baseline_relations.insert(idx.index_id.clone());
+            // BUG-008: index ObjectIds go into baseline_indexes, not baseline_relations
+            baseline_indexes.insert(idx.index_id.clone());
             graph.indexes.push(IndexEdge {
                 index_id: idx.index_id,
                 relation_id: idx.table_id,
@@ -110,6 +116,7 @@ impl AnalysisState {
         Self {
             pg_version_num: cache.pg_version_num,
             baseline_relations,
+            baseline_indexes,
             baseline_foreign_keys,
             local: LocalState {
                 relations,
@@ -135,11 +142,65 @@ impl AnalysisState {
         self.local.relations.get(id)
     }
 
+    pub fn resolve_function_schema(&self, name: &crate::ast::identifiers::QualifiedName, sig_str: &str) -> String {
+        if let Some(schema) = &name.schema {
+            return schema.resolve();
+        }
+        for schema in &self.local.search_path {
+            let candidate = ObjectId::new(schema.clone(), sig_str.to_string());
+            if self.local.functions.contains_key(&candidate) {
+                return schema.clone();
+            }
+        }
+        self.local.search_path.first().cloned().unwrap_or_else(|| "public".to_string())
+    }
+
+    pub fn resolve_relation_id(&self, name: &crate::ast::identifiers::QualifiedName) -> ObjectId {
+        if let Some(schema) = &name.schema {
+            return ObjectId::new(schema.resolve(), name.name.resolve());
+        }
+        let resolved_name = name.name.resolve();
+        for schema in &self.local.search_path {
+            let candidate = ObjectId::new(schema.clone(), resolved_name.clone());
+            if self.local.relations.contains_key(&candidate) {
+                return candidate;
+            }
+        }
+        let schema = self.local.search_path.first().cloned().unwrap_or_else(|| "public".to_string());
+        ObjectId::new(schema, resolved_name)
+    }
+
     pub fn relation_is_present(&self, id: &ObjectId) -> bool {
         matches!(
             self.local.relations.get(id),
             Some(RelationOverlay::Present(_))
         )
+    }
+
+    pub fn column_was_added_in_transaction(&self, table_id: &ObjectId, column: &str) -> bool {
+        if self.local.transactions.is_empty() {
+            return false;
+        }
+
+        // Search from the oldest transaction frame to the newest
+        for frame in &self.local.transactions {
+            for change in &frame.undo_log {
+                if let StateChange::RelationSnapshot { id, previous } = change
+                    && id == table_id
+                {
+                    match previous.as_ref() {
+                        None | Some(RelationOverlay::Dropped) => {
+                            return true;
+                        }
+                        Some(RelationOverlay::Present(r)) => {
+                            let col_existed = r.columns.iter().any(|c| c.name == column);
+                            return !col_existed;
+                        }
+                    }
+                }
+            }
+        }
+        false
     }
 
     pub fn capture_pre_state(&self) -> PreState {
@@ -178,12 +239,31 @@ impl AnalysisState {
             }
         }
 
+        let mut sequences = HashMap::new();
+        for (id, overlay) in &self.local.sequences {
+            if let SequenceOverlay::Present(s) = overlay {
+                sequences.insert(id.clone(), s.clone());
+            }
+        }
+
+        let mut types = HashMap::new();
+        for (id, overlay) in &self.local.types {
+            if let TypeOverlay::Present(s) = overlay {
+                types.insert(id.clone(), s.clone());
+            }
+        }
+
+        let indexes = self.local.graph.indexes.clone();
+
         PreState {
             relations,
             functions,
             roles,
             publications,
             subscriptions,
+            sequences,
+            types,
+            indexes,
         }
     }
 
@@ -733,6 +813,7 @@ impl AnalysisState {
                 MutationResult::Applied
             }
             Mutation::AlterTable(alter) => {
+                self.snapshot_relation(&alter.id);
                 let rel_overlay = self.local.relations.get_mut(&alter.id);
                 if let Some(RelationOverlay::Present(rel)) = rel_overlay {
                     let generation = rel.generation;
@@ -948,6 +1029,16 @@ impl AnalysisState {
                     to: rename.new_id.clone(),
                 });
 
+                // Snapshot all 8 affected graph edge lists before calling propagate_rename
+                self.snapshot_fk_graph_full();
+                self.snapshot_view_graph_full();
+                self.snapshot_index_graph_full();
+                self.snapshot_partition_graph_full();
+                self.snapshot_sequence_graph_full();
+                self.snapshot_column_graph_full();
+                self.snapshot_trigger_graph_full();
+                self.snapshot_publication_graph_full();
+
                 self.local.graph.propagate_rename(&rename.old_id, &rename.new_id);
 
                 MutationResult::Applied
@@ -1104,8 +1195,9 @@ impl AnalysisState {
             }
             Mutation::DropFunction(f) => {
                 for sig in &f.signatures {
-                    let id = ObjectId::new(sig.name.schema.as_ref().map(|s| s.resolve()).unwrap_or_else(|| "public".to_string()), 
-                                          format!("{}({})", sig.name.name.resolve(), sig.params.join(",")));
+                    let sig_str = format!("{}({})", sig.name.name.resolve(), sig.params.join(","));
+                    let schema = self.resolve_function_schema(&sig.name, &sig_str);
+                    let id = ObjectId::new(schema, sig_str);
                     if !f.if_exists && !self.local.functions.contains_key(&id) {
                         self.local.confidence = Confidence::Tainted;
                         return MutationResult::Skipped;
@@ -1141,8 +1233,9 @@ impl AnalysisState {
             }
             Mutation::DropProcedure(p) => {
                 for sig in &p.signatures {
-                    let id = ObjectId::new(sig.name.schema.as_ref().map(|s| s.resolve()).unwrap_or_else(|| "public".to_string()), 
-                                          format!("{}({})", sig.name.name.resolve(), sig.params.join(",")));
+                    let sig_str = format!("{}({})", sig.name.name.resolve(), sig.params.join(","));
+                    let schema = self.resolve_function_schema(&sig.name, &sig_str);
+                    let id = ObjectId::new(schema, sig_str);
                     if !p.if_exists && !self.local.functions.contains_key(&id) {
                         self.local.confidence = Confidence::Tainted;
                         return MutationResult::Skipped;
@@ -1171,10 +1264,12 @@ impl AnalysisState {
                 if let crate::analysis::facts::PublicationScope::Explicit(objects) = &p.scope {
                     self.snapshot_publication_graph_full();
                     for obj in objects {
-                        if let crate::analysis::facts::PublicationObjectFact::Table { .. } = obj {
-                            // Note: We need a mapping from PublicationObjectFact to ObjectId
-                            // For now, based on current engine constraints, we assume table extraction here
-                            // This might need further refinement based on the specific PublicationObjectFact structure.
+                        if let crate::analysis::facts::PublicationObjectFact::Table { name, .. } = obj {
+                            let table_id = self.resolve_relation_id(name);
+                            self.local.graph.publication_dependencies.push(PublicationEdge {
+                                publication_name: p.name.clone(),
+                                table_id,
+                            });
                         }
                     }
                 }
@@ -1572,6 +1667,14 @@ impl AnalysisState {
         if let Some(frame) = self.local.transactions.last_mut() {
             frame.undo_log.push(StateChange::ColumnGraphLengthMarker {
                 len: self.local.graph.column_dependencies.len(),
+            });
+        }
+    }
+
+    fn snapshot_column_graph_full(&mut self) {
+        if let Some(frame) = self.local.transactions.last_mut() {
+            frame.undo_log.push(StateChange::ColumnGraphSnapshot {
+                previous: self.local.graph.column_dependencies.clone(),
             });
         }
     }

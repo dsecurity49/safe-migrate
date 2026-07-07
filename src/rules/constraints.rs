@@ -3,7 +3,7 @@ use crate::analysis::mutations::{AlterTableActionMutation, Mutation};
 use crate::analysis::state::{AnalysisState, CascadeResult, MutationResult};
 use crate::engine::config::Config;
 use crate::model::relation::Persistence;
-use crate::report::violations::{Violation, ViolationTier};
+use crate::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
 use crate::rules::Rule;
 
 pub struct BlockingConstraintRule;
@@ -94,10 +94,14 @@ impl Rule for BlockingConstraintRule {
                 let key = format!("{}_stale_{}", self.id(), alter.id);
                 violations.push(Violation {
                     rule_id: self.id(),
-                    title: "Table statistics are offline/stale. Lock evaluations may be inaccurate.".to_string(),
+                    operation_kind: OperationKind::AddConstraint,
+                    object_kind: ObjectKind::Table,
+                    object_name: alter.id.to_string(),
                     tier: ViolationTier::Tier2,
+                    reason: "Table statistics are offline/stale. Lock evaluations may be inaccurate.".to_string(),
                     recipe: "Run ANALYZE to ensure accurate row estimates before structural changes.",
                     dedup_key: Some(key),
+                            sql: None,
                 });
             }
 
@@ -112,20 +116,24 @@ impl Rule for BlockingConstraintRule {
                     not_valid: false,
                 } => {
                     let name_str = constraint_name.as_deref().unwrap_or("<unnamed>");
-                    let mut title = format!(
+                    let mut reason = format!(
                         "Synchronous CHECK constraint '{}' addition on {}",
                         name_str, alter.id
                     );
                     if is_stale {
-                        title.push_str(" [WARNING: Based on offline/stale statistics]");
+                        reason.push_str(" [WARNING: Based on offline/stale statistics]");
                     }
 
                     violations.push(Violation {
                         rule_id: self.id(),
-                        title,
+                        operation_kind: OperationKind::AddConstraint,
+                        object_kind: ObjectKind::Table,
+                        object_name: alter.id.to_string(),
                         tier,
+                        reason,
                         recipe: self.recipe(),
                         dedup_key: None,
+                                    sql: None,
                     });
                 }
                 AlterTableActionMutation::AddForeignKey {
@@ -136,25 +144,29 @@ impl Rule for BlockingConstraintRule {
                 } => {
                     let name_str = constraint_name.as_deref().unwrap_or("<unnamed>");
 
-                    // Update title to explicitly mention the parent table that caused the escalation
-                    let mut title = format!(
+                    let mut reason = format!(
                         "Synchronous FOREIGN KEY constraint '{}' addition locks {} and {}",
                         name_str, alter.id, to_table
                     );
                     if is_stale {
-                        title.push_str(" [WARNING: Based on offline/stale statistics]");
+                        reason.push_str(" [WARNING: Based on offline/stale statistics]");
                     }
 
                     violations.push(Violation {
                         rule_id: self.id(),
-                        title,
+                        operation_kind: OperationKind::AddConstraint,
+                        object_kind: ObjectKind::Table,
+                        object_name: alter.id.to_string(),
                         tier,
+                        reason,
                         recipe: self.recipe(),
                         dedup_key: None,
+                                    sql: None,
                     });
                 }
                 AlterTableActionMutation::SetNotNull { column } => {
-                    let has_fast_path = pre_state.relations
+                    let has_fast_path = pre_state
+                        .relations
                         .get(&alter.id)
                         .map(|r| {
                             r.get_column(column)
@@ -166,61 +178,77 @@ impl Rule for BlockingConstraintRule {
                     if !has_fast_path {
                         violations.push(Violation {
                             rule_id: self.id(),
-                            title: format!("Synchronous SET NOT NULL on {}.{}", alter.id, column),
+                            operation_kind: OperationKind::AddConstraint,
+                            object_kind: ObjectKind::Table,
+                            object_name: format!("{}.{}", alter.id, column),
                             tier,
+                            reason: format!("Synchronous SET NOT NULL on {}.{}", alter.id, column),
                             recipe: "Add CHECK constraint NOT VALID, then VALIDATE separately.",
                             dedup_key: None,
+                                            sql: None,
                         });
                     }
                 }
                 AlterTableActionMutation::AddUniqueConstraint
                 | AlterTableActionMutation::AddPrimaryKeyConstraint => {
-                    let mut title =
+                    let mut reason =
                         format!("Adding a UNIQUE or PRIMARY KEY constraint to {}", alter.id);
                     if is_stale {
-                        title.push_str(" [WARNING: Based on offline/stale statistics]");
+                        reason.push_str(" [WARNING: Based on offline/stale statistics]");
                     }
 
                     violations.push(Violation {
-                        rule_id: "blocking-index-constraint", // Maps to a different recipe/rule functionally
-                        title,
+                        rule_id: "blocking-index-constraint",
+                        operation_kind: OperationKind::AddConstraint,
+                        object_kind: ObjectKind::Table,
+                        object_name: alter.id.to_string(),
                         tier,
+                        reason,
                         recipe: "Build a UNIQUE index CONCURRENTLY first, then add the constraint USING INDEX.",
                         dedup_key: None,
+                                    sql: None,
                     });
                 }
                 AlterTableActionMutation::SetStorage { column } => {
-                    let mut title = format!(
+                    let mut reason = format!(
                         "Changing storage parameter for {}.{} causes a table rewrite",
                         alter.id, column
                     );
                     if is_stale {
-                        title.push_str(" [WARNING: Based on offline/stale statistics]");
+                        reason.push_str(" [WARNING: Based on offline/stale statistics]");
                     }
 
                     violations.push(Violation {
                         rule_id: "table-rewrite-storage",
-                        title,
+                        operation_kind: OperationKind::AlterColumnType,
+                        object_kind: ObjectKind::Table,
+                        object_name: format!("{}.{}", alter.id, column),
                         tier,
+                        reason,
                         recipe: "Changing column storage requires an ACCESS EXCLUSIVE lock. Execute during a planned maintenance window.",
                         dedup_key: None,
+                                    sql: None,
                     });
                 }
                 AlterTableActionMutation::SetAccessMethod => {
-                    let mut title = format!(
+                    let mut reason = format!(
                         "Changing access method for {} causes a table rewrite",
                         alter.id
                     );
                     if is_stale {
-                        title.push_str(" [WARNING: Based on offline/stale statistics]");
+                        reason.push_str(" [WARNING: Based on offline/stale statistics]");
                     }
 
                     violations.push(Violation {
                         rule_id: "table-rewrite-access-method",
-                        title,
+                        operation_kind: OperationKind::AlterColumnType,
+                        object_kind: ObjectKind::Table,
+                        object_name: alter.id.to_string(),
                         tier,
+                        reason,
                         recipe: "Changing table access method requires an ACCESS EXCLUSIVE lock. Execute during a planned maintenance window.",
                         dedup_key: None,
+                                    sql: None,
                     });
                 }
                 _ => {}
