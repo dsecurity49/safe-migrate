@@ -1,6 +1,7 @@
 // FILE: src/report/reporter.rs
 use crate::analysis::state::Confidence;
 use crate::report::violations::{Violation, ViolationTier};
+use comfy_table::Table;
 use owo_colors::{OwoColorize, Style};
 
 /// Four-way verdict classification based on violation tiers.
@@ -36,9 +37,9 @@ impl Verdict {
 pub fn compute_verdict(violations: &[Violation]) -> Verdict {
     let has_tier1 = violations.iter().any(|v| v.tier == ViolationTier::Tier1);
     let has_tier2 = violations.iter().any(|v| v.tier == ViolationTier::Tier2);
-    let has_irreversible_tier3 = violations.iter().any(|v| {
-        v.tier == ViolationTier::Tier3 && v.rule_id == "irreversible-migration"
-    });
+    let has_irreversible_tier3 = violations
+        .iter()
+        .any(|v| v.tier == ViolationTier::Tier3 && v.rule_id == "irreversible-migration");
 
     match (has_tier1, has_tier2, has_irreversible_tier3) {
         (true, _, _) => Verdict::Halt,
@@ -51,8 +52,7 @@ pub fn compute_verdict(violations: &[Violation]) -> Verdict {
 fn no_color() -> bool {
     std::env::var("NO_COLOR").is_ok()
 }
-
-fn tier_label_colored(tier: &ViolationTier) -> String {
+pub(crate) fn tier_label_colored(tier: &ViolationTier) -> String {
     let label = match tier {
         ViolationTier::Tier1 => "HALT",
         ViolationTier::Tier2 => "WARN",
@@ -74,17 +74,6 @@ fn terminal_width() -> usize {
         .map(|(w, _)| w.0 as usize)
         .unwrap_or(80)
         .max(60)
-}
-
-/// Build a fixed-width box border of exactly `width` chars (including corners).
-fn hline(width: usize) -> String {
-    "─".repeat(width.saturating_sub(2))
-}
-
-/// Pad a string to fit inside a box of `width` chars (including borders and 1 space each side).
-fn box_line(content: &str, width: usize) -> String {
-    let inner = width.saturating_sub(4); // 2 for borders + 2 for spaces
-    format!("│ {:<inner$} │", &content[..content.len().min(inner)], inner = inner)
 }
 
 pub struct Reporter;
@@ -123,20 +112,23 @@ impl Reporter {
         };
 
         let width = terminal_width();
-        let border = hline(width);
 
-        // Header box
-        println!("┌{}┐", border);
-        println!("{}", box_line("safe-migrate lint", width));
-        let verdict_line = format!(
-            "Verdict: {:<16} Confidence: {:<13}",
+        // Header box using comfy-table
+        let mut header_table = Table::new();
+        header_table.load_preset(comfy_table::presets::UTF8_BORDERS_ONLY);
+        header_table.set_content_arrangement(comfy_table::ContentArrangement::DynamicFullWidth);
+        header_table.set_width(width as u16);
+        header_table.set_header(vec!["safe-migrate lint"]);
+        header_table.add_row(vec![format!(
+            "Verdict: {}   Confidence: {}",
             verdict.label(),
             conf_str
-        );
-        println!("{}", box_line(&verdict_line, width));
-        let counts_line = format!("HALT: {:<6} WARN: {:<6} SAFE: {:<6}", tier1, tier2, tier3);
-        println!("{}", box_line(&counts_line, width));
-        println!("└{}┘", border);
+        )]);
+        header_table.add_row(vec![format!(
+            "HALT: {}   WARN: {}   SAFE: {}",
+            tier1, tier2, tier3
+        )]);
+        println!("{}", header_table);
 
         if violations.is_empty() {
             println!("\n  No violations detected.\n");
@@ -145,8 +137,8 @@ impl Reporter {
 
         println!();
 
-        // Separator width: ~77% of terminal width
-        let sep_width = (width as f32 * 0.77) as usize;
+        // Separator width: 80-85% of terminal width
+        let sep_width = (width as f32 * 0.82) as usize;
 
         // Group violations by sql key (same sql text + same object_name = same statement)
         // Each group is (primary_idx, Vec<secondary_idxs>)
@@ -162,15 +154,13 @@ impl Reporter {
             // Find other violations with identical sql (if sql is Some)
             if let Some(sql_i) = &violations[i].sql {
                 for j in (i + 1)..violations.len() {
-                    if !used[j] {
-                        if let Some(sql_j) = &violations[j].sql {
-                            if sql_i == sql_j
-                                && violations[j].object_name == violations[i].object_name
-                            {
-                                used[j] = true;
-                                secondaries.push(j);
-                            }
-                        }
+                    if !used[j]
+                        && let Some(sql_j) = &violations[j].sql
+                        && sql_i == sql_j
+                        && violations[j].object_name == violations[i].object_name
+                    {
+                        used[j] = true;
+                        secondaries.push(j);
                     }
                 }
             }
@@ -182,7 +172,31 @@ impl Reporter {
             let tier_str = tier_label_colored(&v.tier);
 
             println!(" [{}] {}", tier_str, v.rule_id);
-            println!("   object : {} {}", v.object_kind, v.object_name);
+
+            let display_name = match &v.object_kind {
+                crate::report::violations::ObjectKind::Database
+                | crate::report::violations::ObjectKind::Role
+                | crate::report::violations::ObjectKind::Publication
+                | crate::report::violations::ObjectKind::Subscription => {
+                    let step1 = if let Some(idx) = v.object_name.find('.') {
+                        &v.object_name[idx + 1..]
+                    } else {
+                        &v.object_name
+                    };
+                    step1
+                        .strip_suffix(" (inferred)")
+                        .unwrap_or(step1)
+                        .to_string()
+                }
+                _ => v.object_name.clone(),
+            };
+
+            if v.object_kind == crate::report::violations::ObjectKind::Unknown {
+                println!("   object : {}", display_name);
+            } else {
+                println!("   object : {} {}", v.object_kind, display_name);
+            }
+
             println!("   reason : {}", v.reason);
 
             // recipe: clean up multi-line strings
@@ -206,10 +220,9 @@ impl Reporter {
             for &sec_idx in secondary_idxs {
                 let sv = &violations[sec_idx];
                 println!(
-                    "   also   : [{}] {} — {}",
+                    "   also   : [{}] {}",
                     tier_label_colored(&sv.tier),
-                    sv.rule_id,
-                    sv.reason
+                    sv.rule_id
                 );
             }
 
@@ -222,31 +235,22 @@ impl Reporter {
 
         println!();
 
-        // Summary box
-        let sum_label = "SUMMARY";
-        let inner = width
-            .saturating_sub(4)
-            .saturating_sub(sum_label.len() + 4);
-        let pad_left = inner / 2;
-        let pad_right = inner.saturating_sub(pad_left);
-        println!(
-            "┌{}─ {} ─{}┐",
-            "─".repeat(pad_left),
-            sum_label,
-            "─".repeat(pad_right)
-        );
-        let val_width = width.saturating_sub(22);
-        println!("│ Verdict        : {:<val_width$} │", verdict.label(), val_width = val_width);
-        println!(
-            "│ Recommendation : {:<val_width$} │",
-            verdict.recommendation(),
-            val_width = val_width
-        );
-        println!("│ HALT (Tier 1)  : {:<val_width$} │", tier1, val_width = val_width);
-        println!("│ WARN (Tier 2)  : {:<val_width$} │", tier2, val_width = val_width);
-        println!("│ SAFE (Tier 3)  : {:<val_width$} │", tier3, val_width = val_width);
-        println!("└{}┘", border);
+        // Summary box using comfy-table
+        let mut summary_table = Table::new();
+        summary_table.load_preset(comfy_table::presets::UTF8_BORDERS_ONLY);
+        summary_table.set_content_arrangement(comfy_table::ContentArrangement::DynamicFullWidth);
+        summary_table.set_width(width as u16);
+        summary_table.set_header(vec!["SUMMARY", ""]);
+        summary_table.add_row(vec!["Verdict", &format!(": {}", verdict.label())]);
+        summary_table.add_row(vec![
+            "Recommendation",
+            &format!(": {}", verdict.recommendation()),
+        ]);
+        summary_table.add_row(vec!["HALT (Tier 1)", &format!(": {}", tier1)]);
+        summary_table.add_row(vec!["WARN (Tier 2)", &format!(": {}", tier2)]);
+        summary_table.add_row(vec!["SAFE (Tier 3)", &format!(": {}", tier3)]);
+        println!("{}", summary_table);
 
-        tier1 > 0
+        verdict == Verdict::Halt
     }
 }

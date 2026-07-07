@@ -14,6 +14,10 @@ use safe_migrate::{AnalysisState, Config, DbCache, Reporter, SafeMigrateEngine};
 #[command(version)]
 #[command(about = "Lint PostgreSQL migrations to prevent blocking locks", long_about = None)]
 struct Cli {
+    /// Disable colored output
+    #[arg(long, global = true)]
+    no_color: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -67,6 +71,11 @@ enum Commands {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if cli.no_color {
+        unsafe {
+            std::env::set_var("NO_COLOR", "1");
+        }
+    }
 
     match &cli.command {
         Commands::Lint {
@@ -141,21 +150,8 @@ fn main() -> Result<()> {
                     let should_fail_ci =
                         Reporter::print_report(&violations, &state.local.confidence);
 
-                    let has_warnings = violations.iter().any(|v| {
-                        matches!(
-                            v.tier,
-                            safe_migrate::report::violations::ViolationTier::Tier2
-                        )
-                    });
-
                     if should_fail_ci {
                         return Err(anyhow!("[ HALT ] Migration halted: Tier 1 lock detected."));
-                    } else if has_warnings {
-                        println!(
-                            "[ WARN ] Migration safe to deploy, but has warnings. Please review."
-                        );
-                    } else {
-                        println!("[ SAFE ] Migration safe to deploy.");
                     }
                 }
                 Err(parse_errors) => {
@@ -193,8 +189,9 @@ fn main() -> Result<()> {
                     .and_then(|n| n.to_str())
                     .unwrap_or("unknown")
                     .to_string();
-                let sql = fs::read_to_string(&path)
-                    .with_context(|| format!("Failed to read migration file: {}", path.display()))?;
+                let sql = fs::read_to_string(&path).with_context(|| {
+                    format!("Failed to read migration file: {}", path.display())
+                })?;
                 file_pairs.push((filename, sql));
             }
 
@@ -209,9 +206,13 @@ fn main() -> Result<()> {
                 })?
             } else {
                 if *no_cache {
-                    println!("[ INFO ] --no-cache passed. Running with default worst-case assumptions.");
+                    println!(
+                        "[ INFO ] --no-cache passed. Running with default worst-case assumptions."
+                    );
                 } else {
-                    println!("[ INFO ] No cache found. Running with default worst-case assumptions.");
+                    println!(
+                        "[ INFO ] No cache found. Running with default worst-case assumptions."
+                    );
                 }
                 DbCache::new()
             };
@@ -226,24 +227,12 @@ fn main() -> Result<()> {
                         return Ok(());
                     }
 
-                    let should_fail =
-                        Reporter::print_report(&violations, &state.local.confidence);
-
-                    let has_warnings = violations.iter().any(|v| {
-                        matches!(
-                            v.tier,
-                            safe_migrate::report::violations::ViolationTier::Tier2
-                        )
-                    });
+                    let should_fail = Reporter::print_report(&violations, &state.local.confidence);
 
                     if should_fail {
-                        return Err(anyhow!("[ HALT ] Migration chain halted: Tier 1 lock detected."));
-                    } else if has_warnings {
-                        println!(
-                            "[ WARN ] Migration chain safe to deploy, but has warnings. Please review."
-                        );
-                    } else {
-                        println!("[ SAFE ] Migration chain safe to deploy.");
+                        return Err(anyhow!(
+                            "[ HALT ] Migration chain halted: Tier 1 lock detected."
+                        ));
                     }
                 }
                 Err(parse_errors) => {

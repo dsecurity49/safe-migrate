@@ -66,7 +66,10 @@ pub enum Mutation {
     AlterDatabase(AlterDatabaseMutation),
     DropDatabase(DropDatabaseMutation),
     Opaque(OpaqueMutation),
-    Vacuum { is_full: bool },
+    Vacuum {
+        table_id: Option<ObjectId>,
+        is_full: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -437,6 +440,10 @@ pub enum OpaqueMutation {
     PrepareTransaction,
     SetTransaction,
     SetConstraints,
+    UnresolvedReference {
+        object_kind: crate::report::violations::ObjectKind,
+        object_name: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]

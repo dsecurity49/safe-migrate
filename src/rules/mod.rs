@@ -10,10 +10,10 @@ pub mod indexes;
 pub mod opaque;
 pub mod partitions;
 pub mod policies;
+pub mod security;
 pub mod transactions;
 pub mod triggers;
 pub mod views;
-pub mod security;
 
 use crate::analysis::mutations::Mutation;
 use crate::analysis::state::{AnalysisState, CascadeResult, MutationResult};

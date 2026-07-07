@@ -143,6 +143,8 @@ pub enum ViolationTier {
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Violation {
+    #[serde(skip)]
+    pub source_range: Option<rowan::TextRange>,
     pub rule_id: &'static str,
     pub operation_kind: OperationKind,
     pub object_kind: ObjectKind,

@@ -1,7 +1,7 @@
 use crate::analysis::mutations::{AlterTableActionMutation, Mutation};
 use crate::analysis::state::{AnalysisState, CascadeResult, MutationResult};
 use crate::engine::config::Config;
-use crate::report::violations::{Violation, ViolationTier, OperationKind, ObjectKind};
+use crate::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
 use crate::rules::Rule;
 
 pub struct DisableTriggerRule;
@@ -20,12 +20,15 @@ impl Rule for DisableTriggerRule {
     fn evaluate(
         &self,
         mutation: &Mutation,
-        _result: &MutationResult,
+        result: &MutationResult,
         _pre_state: &crate::analysis::state::PreState,
         _state: &AnalysisState,
         _config: &Config,
         _cascade: Option<&CascadeResult>,
     ) -> Vec<Violation> {
+        if *result == MutationResult::Skipped {
+            return vec![];
+        }
         let mut violations = Vec::new();
 
         if let Mutation::AlterTable(alter) = mutation {
@@ -33,6 +36,7 @@ impl Rule for DisableTriggerRule {
                 AlterTableActionMutation::DisableTrigger { trigger_name } => {
                     let name = trigger_name.as_deref().unwrap_or("ALL");
                     violations.push(Violation {
+                        source_range: None,
                         rule_id: self.id(),
                         operation_kind: OperationKind::DisableTrigger,
                         object_kind: ObjectKind::Trigger,
@@ -41,12 +45,12 @@ impl Rule for DisableTriggerRule {
                         reason: format!("Disabling trigger {} on {}", name, alter.id),
                         recipe: self.recipe(),
                         dedup_key: None,
-                                    sql: None,
+                        sql: None,
                     });
                 }
                 AlterTableActionMutation::EnableTrigger { trigger_name } => {
                     let name = trigger_name.as_deref().unwrap_or("ALL");
-                    violations.push(Violation {
+                    violations.push(Violation { source_range: None,
                         rule_id: self.id(),
                         operation_kind: OperationKind::EnableTrigger,
                         object_kind: ObjectKind::Trigger,

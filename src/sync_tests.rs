@@ -1,5 +1,5 @@
-use crate::db::cache::DbCache;
 use crate::ast::identifiers::ObjectId;
+use crate::db::cache::DbCache;
 use crate::model::relation::{Persistence, RelationKind, RelationState};
 
 #[cfg(test)]
@@ -13,12 +13,12 @@ mod tests {
     fn test_sync_cache_failure_no_db_url() {
         let tmp = NamedTempFile::new().unwrap();
         let path = tmp.path();
-        
+
         // Ensure DATABASE_URL is not set
         unsafe {
             std::env::remove_var("DATABASE_URL");
         }
-        
+
         let result = sync_cache(path);
         assert!(result.is_err());
     }
@@ -74,12 +74,19 @@ mod tests {
         // Deserialize back
         let deserialized: DbCache = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.pg_version_num, Some(160000));
-        assert!(deserialized.relations.contains_key(&ObjectId::new("public", "test_table")));
+        assert!(
+            deserialized
+                .relations
+                .contains_key(&ObjectId::new("public", "test_table"))
+        );
         assert_eq!(deserialized.foreign_keys.len(), 1);
         assert_eq!(deserialized.indexes.len(), 1);
 
         // Verify relation stats survived
-        let rel = deserialized.relations.get(&ObjectId::new("public", "test_table")).unwrap();
+        let rel = deserialized
+            .relations
+            .get(&ObjectId::new("public", "test_table"))
+            .unwrap();
         assert_eq!(rel.estimated_rows, Some(1000));
         assert_eq!(rel.columns.len(), 1);
         assert_eq!(rel.columns[0].name, "id");
@@ -121,7 +128,7 @@ mod tests {
         let cache = DbCache::new();
         let json = serde_json::to_string_pretty(&cache).unwrap();
         assert!(json.contains("pg_version_num"));
-        
+
         let deserialized: DbCache = serde_json::from_str(&json).unwrap();
         assert!(deserialized.pg_version_num.is_none());
         assert!(deserialized.relations.is_empty());

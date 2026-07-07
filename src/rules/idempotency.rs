@@ -38,6 +38,7 @@ impl Rule for IdempotencyRule {
         let mut add_violation =
             |op: OperationKind, obj: ObjectKind, name: String, reason: String| {
                 violations.push(Violation {
+                    source_range: None,
                     rule_id: self.id(),
                     operation_kind: op,
                     object_kind: obj,
@@ -46,7 +47,7 @@ impl Rule for IdempotencyRule {
                     reason,
                     recipe: self.recipe(),
                     dedup_key: None,
-                            sql: None,
+                    sql: None,
                 });
             };
 
@@ -164,7 +165,10 @@ impl Rule for IdempotencyRule {
                         OperationKind::AddColumn,
                         ObjectKind::Table,
                         format!("{}.{}", a.id, name),
-                        format!("ALTER TABLE {} ADD COLUMN {} without IF NOT EXISTS", a.id, name),
+                        format!(
+                            "ALTER TABLE {} ADD COLUMN {} without IF NOT EXISTS",
+                            a.id, name
+                        ),
                     );
                 }
                 AlterTableActionMutation::DropColumn {
@@ -174,7 +178,10 @@ impl Rule for IdempotencyRule {
                         OperationKind::DropColumn,
                         ObjectKind::Table,
                         format!("{}.{}", a.id, name),
-                        format!("ALTER TABLE {} DROP COLUMN {} without IF EXISTS", a.id, name),
+                        format!(
+                            "ALTER TABLE {} DROP COLUMN {} without IF EXISTS",
+                            a.id, name
+                        ),
                     );
                 }
                 _ => {}

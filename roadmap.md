@@ -464,20 +464,21 @@ This is a one-line derive addition. The enum variant declaration order defines t
 
 ### Phase 10 release criteria
 
-- [ ] BUG-008 fixed and tested — index ObjectIds no longer in `baseline_relations`
-- [ ] BUG-009 fixed and tested — `now()` classified STABLE, not VOLATILE
-- [ ] BUG-010 fixed and tested — no stale-stats warning on lock-behavior-only rules
-- [ ] `operation_kind` and `object_kind` fields on `Violation` — all rules updated
-- [ ] `Verdict` enum with four-way classification
-- [ ] Deterministic violation ordering — `violations.sort_by(tier → source_range → object → rule_id)`
-- [ ] `ViolationTier` derives `Ord` with correct variant order
-- [ ] CLI output matches confirmed design (header box, per-finding blocks with recipe, summary box)
-- [ ] `comfy-table`, `owo-colors`, `terminal_size` added and used correctly
-- [ ] Color only on tier labels, `NO_COLOR` respected
-- [ ] Same-source-range grouping with `also :` line
-- [ ] All existing 185 tests still passing (updated for new format)
-- [ ] New tests for all fixes and format changes passing
-- [ ] `cargo clippy -- -D warnings` clean
+- [x] BUG-008 fixed and tested — index ObjectIds no longer in `baseline_relations`
+- [x] BUG-009 fixed and tested — `now()` classified STABLE, not VOLATILE
+- [x] BUG-010 fixed and tested — no stale-stats warning on lock-behavior-only rules
+- [x] `operation_kind` and `object_kind` fields on `Violation` — all rules updated
+- [x] `Verdict` enum with four-way classification
+- [x] Deterministic violation ordering — `violations.sort_by(tier → source_range → object → rule_id)`
+- [x] `ViolationTier` derives `Ord` with correct variant order
+- [x] CLI output matches confirmed design (header box, per-finding blocks with recipe, summary box)
+- [x] `comfy-table`, `owo-colors`, `terminal_size` added and used correctly
+- [x] Color only on tier labels, `NO_COLOR` respected
+- [x] Same-source-range grouping with `also :` line
+- [x] All existing 185 tests still passing (updated for new format)
+- [x] New tests for all fixes and format changes passing
+- [x] `cargo clippy -- -D warnings` clean
+- [x] FIX: Resolve `opaque-dynamic-sql` source-range mismatch (ensure `sql :` shows the actual `DO` block or `EXECUTE` statement instead of the next statement when the finding was triggered by dynamic/opaque code detection)
 
 ---
 

@@ -5,5 +5,5 @@ pub mod relation;
 pub mod replication;
 pub mod role;
 pub mod sequence;
-pub mod types;
 pub mod trigger;
+pub mod types;

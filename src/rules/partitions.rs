@@ -3,7 +3,7 @@ use crate::analysis::mutations::{AlterTableActionMutation, Mutation};
 use crate::analysis::state::{AnalysisState, CascadeResult, MutationResult};
 use crate::engine::config::Config;
 use crate::model::relation::Persistence;
-use crate::report::violations::{Violation, ViolationTier, OperationKind, ObjectKind};
+use crate::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
 use crate::rules::Rule;
 
 pub struct PartitionLockRule;
@@ -66,7 +66,7 @@ impl Rule for PartitionLockRule {
 
                     if is_stale {
                         let key = format!("{}_stale_{}", self.id(), alter.id);
-                        violations.push(Violation {
+                        violations.push(Violation { source_range: None,
                             rule_id: self.id(),
                             operation_kind: op_kind.clone(),
                             object_kind: ObjectKind::Table,
@@ -108,6 +108,7 @@ impl Rule for PartitionLockRule {
                         }
 
                         violations.push(Violation {
+                            source_range: None,
                             rule_id: self.id(),
                             operation_kind: op_kind,
                             object_kind: ObjectKind::Table,
@@ -116,7 +117,7 @@ impl Rule for PartitionLockRule {
                             reason,
                             recipe: self.recipe(),
                             dedup_key: None,
-                                            sql: None,
+                            sql: None,
                         });
                     }
                 }

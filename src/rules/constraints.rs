@@ -92,7 +92,7 @@ impl Rule for BlockingConstraintRule {
             // Emit staleness warning if required (and if it's not going to be completely silent)
             if is_stale && tier != ViolationTier::Tier3 {
                 let key = format!("{}_stale_{}", self.id(), alter.id);
-                violations.push(Violation {
+                violations.push(Violation { source_range: None,
                     rule_id: self.id(),
                     operation_kind: OperationKind::AddConstraint,
                     object_kind: ObjectKind::Table,
@@ -125,6 +125,7 @@ impl Rule for BlockingConstraintRule {
                     }
 
                     violations.push(Violation {
+                        source_range: None,
                         rule_id: self.id(),
                         operation_kind: OperationKind::AddConstraint,
                         object_kind: ObjectKind::Table,
@@ -133,7 +134,7 @@ impl Rule for BlockingConstraintRule {
                         reason,
                         recipe: self.recipe(),
                         dedup_key: None,
-                                    sql: None,
+                        sql: None,
                     });
                 }
                 AlterTableActionMutation::AddForeignKey {
@@ -153,6 +154,7 @@ impl Rule for BlockingConstraintRule {
                     }
 
                     violations.push(Violation {
+                        source_range: None,
                         rule_id: self.id(),
                         operation_kind: OperationKind::AddConstraint,
                         object_kind: ObjectKind::Table,
@@ -161,7 +163,7 @@ impl Rule for BlockingConstraintRule {
                         reason,
                         recipe: self.recipe(),
                         dedup_key: None,
-                                    sql: None,
+                        sql: None,
                     });
                 }
                 AlterTableActionMutation::SetNotNull { column } => {
@@ -177,6 +179,7 @@ impl Rule for BlockingConstraintRule {
 
                     if !has_fast_path {
                         violations.push(Violation {
+                            source_range: None,
                             rule_id: self.id(),
                             operation_kind: OperationKind::AddConstraint,
                             object_kind: ObjectKind::Table,
@@ -185,7 +188,7 @@ impl Rule for BlockingConstraintRule {
                             reason: format!("Synchronous SET NOT NULL on {}.{}", alter.id, column),
                             recipe: "Add CHECK constraint NOT VALID, then VALIDATE separately.",
                             dedup_key: None,
-                                            sql: None,
+                            sql: None,
                         });
                     }
                 }
@@ -197,7 +200,7 @@ impl Rule for BlockingConstraintRule {
                         reason.push_str(" [WARNING: Based on offline/stale statistics]");
                     }
 
-                    violations.push(Violation {
+                    violations.push(Violation { source_range: None,
                         rule_id: "blocking-index-constraint",
                         operation_kind: OperationKind::AddConstraint,
                         object_kind: ObjectKind::Table,
@@ -218,7 +221,7 @@ impl Rule for BlockingConstraintRule {
                         reason.push_str(" [WARNING: Based on offline/stale statistics]");
                     }
 
-                    violations.push(Violation {
+                    violations.push(Violation { source_range: None,
                         rule_id: "table-rewrite-storage",
                         operation_kind: OperationKind::AlterColumnType,
                         object_kind: ObjectKind::Table,
@@ -239,7 +242,7 @@ impl Rule for BlockingConstraintRule {
                         reason.push_str(" [WARNING: Based on offline/stale statistics]");
                     }
 
-                    violations.push(Violation {
+                    violations.push(Violation { source_range: None,
                         rule_id: "table-rewrite-access-method",
                         operation_kind: OperationKind::AlterColumnType,
                         object_kind: ObjectKind::Table,

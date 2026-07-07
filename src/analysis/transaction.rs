@@ -6,7 +6,8 @@ use crate::model::sequence::SequenceOverlay;
 use crate::model::types::TypeOverlay;
 // Added RenameEdge here to support the new RenameGraphSnapshot
 use crate::analysis::graph::{
-    ColumnDependencyEdge, FkEdge, IndexEdge, PartitionEdge, PublicationEdge, RenameEdge, SequenceEdge, ViewEdge,
+    ColumnDependencyEdge, FkEdge, IndexEdge, PartitionEdge, PublicationEdge, RenameEdge,
+    SequenceEdge, ViewEdge,
 };
 // Added HashSet to support the PendingValidationSnapshot
 use std::collections::HashSet;
@@ -110,6 +111,9 @@ pub enum StateChange {
     },
     CurrentRoleSnapshot {
         previous: String,
+    },
+    ConfidenceSnapshot {
+        previous: crate::analysis::state::Confidence,
     },
 }
 

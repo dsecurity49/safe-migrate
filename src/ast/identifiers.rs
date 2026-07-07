@@ -41,10 +41,27 @@ impl QualifiedName {
 
 /// ObjectId represents a fully resolved, state-machine tracked database object.
 /// By the time an ObjectId is constructed, its schema and name must already be properly case-folded.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObjectId {
     pub schema: String,
     pub name: String,
+    #[serde(default)]
+    pub inferred_schema: bool,
+}
+
+impl PartialEq for ObjectId {
+    fn eq(&self, other: &Self) -> bool {
+        self.schema == other.schema && self.name == other.name
+    }
+}
+
+impl Eq for ObjectId {}
+
+impl std::hash::Hash for ObjectId {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.schema.hash(state);
+        self.name.hash(state);
+    }
 }
 
 impl ObjectId {
@@ -52,12 +69,17 @@ impl ObjectId {
         Self {
             schema: schema.into(),
             name: name.into(),
+            inferred_schema: false,
         }
     }
 }
 
 impl std::fmt::Display for ObjectId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}.{}", self.schema, self.name)
+        if self.inferred_schema {
+            write!(f, "{}.{} (inferred)", self.schema, self.name)
+        } else {
+            write!(f, "{}.{}", self.schema, self.name)
+        }
     }
 }

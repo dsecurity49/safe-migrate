@@ -3,7 +3,7 @@ use crate::analysis::mutations::Mutation;
 use crate::analysis::state::{AnalysisState, CascadeResult, MutationResult};
 use crate::engine::config::Config;
 use crate::model::relation::Persistence;
-use crate::report::violations::{Violation, ViolationTier, OperationKind, ObjectKind};
+use crate::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
 use crate::rules::Rule;
 
 pub struct ConcurrentIndexRule;
@@ -36,19 +36,20 @@ impl Rule for ConcurrentIndexRule {
 
         match mutation {
             Mutation::CreateIndex(create) if !create.concurrently => {
-                let (is_temp, is_stale, rows, tx_depth) = match pre_state.relations.get(&create.table) {
-                    Some(rel) => {
-                        let stale =
-                            rel.is_stale() && state.baseline_relations.contains(&create.table);
-                        (
-                            rel.persistence == Persistence::Temporary,
-                            stale,
-                            rel.estimated_rows.unwrap_or(config.default_rows),
-                            rel.created_at_tx_depth,
-                        )
-                    }
-                    None => (false, true, config.default_rows, 0),
-                };
+                let (is_temp, is_stale, rows, tx_depth) =
+                    match pre_state.relations.get(&create.table) {
+                        Some(rel) => {
+                            let stale =
+                                rel.is_stale() && state.baseline_relations.contains(&create.table);
+                            (
+                                rel.persistence == Persistence::Temporary,
+                                stale,
+                                rel.estimated_rows.unwrap_or(config.default_rows),
+                                rel.created_at_tx_depth,
+                            )
+                        }
+                        None => (false, true, config.default_rows, 0),
+                    };
 
                 if is_temp || (tx_depth > 0 && tx_depth <= state.local.transactions.len()) {
                     return violations;
@@ -56,7 +57,7 @@ impl Rule for ConcurrentIndexRule {
 
                 if is_stale {
                     let key = format!("{}_stale_{}", self.id(), create.table);
-                    violations.push(Violation {
+                    violations.push(Violation { source_range: None,
                         rule_id: self.id(),
                         operation_kind: OperationKind::CreateIndex,
                         object_kind: ObjectKind::Index,
@@ -86,6 +87,7 @@ impl Rule for ConcurrentIndexRule {
                 }
 
                 violations.push(Violation {
+                    source_range: None,
                     rule_id: self.id(),
                     operation_kind: OperationKind::CreateIndex,
                     object_kind: ObjectKind::Index,
@@ -94,7 +96,7 @@ impl Rule for ConcurrentIndexRule {
                     reason,
                     recipe: self.recipe(),
                     dedup_key: None,
-                            sql: None,
+                    sql: None,
                 });
             }
             Mutation::DropIndex(drop) if !drop.concurrently => {
@@ -116,6 +118,7 @@ impl Rule for ConcurrentIndexRule {
                     };
 
                     violations.push(Violation {
+                        source_range: None,
                         rule_id,
                         operation_kind: OperationKind::DropIndex,
                         object_kind: ObjectKind::Index,
@@ -124,7 +127,7 @@ impl Rule for ConcurrentIndexRule {
                         reason: format!("Synchronous index drop for {}", drop.id),
                         recipe: self.recipe(),
                         dedup_key: None,
-                                    sql: None,
+                        sql: None,
                     });
                 } else {
                     let mut target_relations = Vec::new();
@@ -147,6 +150,7 @@ impl Rule for ConcurrentIndexRule {
                         };
 
                         violations.push(Violation {
+                            source_range: None,
                             rule_id,
                             operation_kind: OperationKind::DropIndex,
                             object_kind: ObjectKind::Index,
@@ -155,7 +159,7 @@ impl Rule for ConcurrentIndexRule {
                             reason: format!("Synchronous index drop for {}", drop.id),
                             recipe: self.recipe(),
                             dedup_key: None,
-                                            sql: None,
+                            sql: None,
                         });
                     } else {
                         for rel in target_relations {
@@ -176,6 +180,7 @@ impl Rule for ConcurrentIndexRule {
                                 format!("Synchronous index drop for {} on {}", drop.id, rel.id);
 
                             violations.push(Violation {
+                                source_range: None,
                                 rule_id,
                                 operation_kind: OperationKind::DropIndex,
                                 object_kind: ObjectKind::Index,
@@ -184,7 +189,7 @@ impl Rule for ConcurrentIndexRule {
                                 reason,
                                 recipe: self.recipe(),
                                 dedup_key: None,
-                                                    sql: None,
+                                sql: None,
                             });
                         }
                     }

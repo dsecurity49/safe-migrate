@@ -2,7 +2,7 @@
 use crate::analysis::mutations::Mutation;
 use crate::analysis::state::{AnalysisState, CascadeResult, MutationResult};
 use crate::engine::config::Config;
-use crate::report::violations::{Violation, ViolationTier, OperationKind, ObjectKind};
+use crate::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
 use crate::rules::Rule;
 
 pub struct ConcurrentInsideTransactionRule;
@@ -21,18 +21,21 @@ impl Rule for ConcurrentInsideTransactionRule {
     fn evaluate(
         &self,
         mutation: &Mutation,
-        _result: &MutationResult,
+        result: &MutationResult,
         _pre_state: &crate::analysis::state::PreState,
         state: &AnalysisState,
         _config: &Config,
         _cascade: Option<&CascadeResult>,
     ) -> Vec<Violation> {
+        if *result == MutationResult::Skipped {
+            return vec![];
+        }
         let mut violations = Vec::new();
 
         if !state.local.transactions.is_empty() {
             match mutation {
                 Mutation::CreateIndex(c) if c.concurrently => {
-                    violations.push(Violation {
+                    violations.push(Violation { source_range: None,
                         rule_id: self.id(),
                         operation_kind: OperationKind::CreateIndex,
                         object_kind: ObjectKind::Index,
@@ -46,6 +49,7 @@ impl Rule for ConcurrentInsideTransactionRule {
                 }
                 Mutation::DropIndex(d) if d.concurrently => {
                     violations.push(Violation {
+                        source_range: None,
                         rule_id: self.id(),
                         operation_kind: OperationKind::DropIndex,
                         object_kind: ObjectKind::Index,
@@ -57,7 +61,7 @@ impl Rule for ConcurrentInsideTransactionRule {
                         ),
                         recipe: self.recipe(),
                         dedup_key: None,
-                                    sql: None,
+                        sql: None,
                     });
                 }
                 _ => {}
@@ -94,6 +98,7 @@ impl Rule for AlterTypeAddValueRule {
             && let Mutation::AlterType(alter) = mutation
         {
             return vec![Violation {
+                source_range: None,
                 rule_id: self.id(),
                 operation_kind: OperationKind::AlterType,
                 object_kind: ObjectKind::Type,
@@ -102,7 +107,7 @@ impl Rule for AlterTypeAddValueRule {
                 reason: format!("ALTER TYPE {} ADD VALUE inside transaction", alter.id),
                 recipe: self.recipe(),
                 dedup_key: None,
-                    sql: None,
+                sql: None,
             }];
         }
         vec![]
@@ -131,17 +136,26 @@ impl Rule for VacuumFullRule {
         _config: &Config,
         _cascade: Option<&CascadeResult>,
     ) -> Vec<Violation> {
-        if let Mutation::Vacuum { is_full: true } = mutation {
+        if let Mutation::Vacuum {
+            is_full: true,
+            table_id,
+        } = mutation
+        {
+            let object_name = table_id
+                .as_ref()
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "<all tables>".to_string());
             return vec![Violation {
+                source_range: None,
                 rule_id: self.id(),
                 operation_kind: OperationKind::VacuumFull,
                 object_kind: ObjectKind::Table,
-                object_name: "<vacuum>".to_string(),
+                object_name,
                 tier: self.default_tier(),
                 reason: "VACUUM FULL requires an ACCESS EXCLUSIVE lock".to_string(),
                 recipe: self.recipe(),
                 dedup_key: None,
-                    sql: None,
+                sql: None,
             }];
         }
         vec![]

@@ -8,18 +8,23 @@ use crate::report::violations::Violation;
 use crate::rules::Rule;
 use crate::rules::conflict::ConflictRule;
 use crate::rules::constraints::BlockingConstraintRule;
-use crate::rules::destructive::{CascadingDropRule, SizeAwareAddColumnRule, TypeChangeRewriteRule, DropDatabaseRule, DropSchemaCascadeRule, GeneralCascadeRule, CreateTableAsSelectRule, ReversibilityRule};
+use crate::rules::destructive::{
+    CascadingDropRule, CreateTableAsSelectRule, DropDatabaseRule, DropSchemaCascadeRule,
+    GeneralCascadeRule, ReversibilityRule, SizeAwareAddColumnRule, TypeChangeRewriteRule,
+};
 use crate::rules::drift::DriftDetectionRule;
 use crate::rules::expressions::VolatileDefaultRule;
+use crate::rules::functions::{BrokenComputeRule, FunctionVolatilityRule};
 use crate::rules::idempotency::IdempotencyRule;
 use crate::rules::indexes::ConcurrentIndexRule;
 use crate::rules::opaque::OpaqueDynamicSqlRule;
-use crate::rules::functions::{BrokenComputeRule, FunctionVolatilityRule};
 use crate::rules::partitions::PartitionLockRule;
 use crate::rules::policies::RestrictivePolicyRule;
-use crate::rules::triggers::DisableTriggerRule;
-use crate::rules::transactions::{ConcurrentInsideTransactionRule, VacuumFullRule, AlterTypeAddValueRule};
 use crate::rules::security::OverbroadGrantRule;
+use crate::rules::transactions::{
+    AlterTypeAddValueRule, ConcurrentInsideTransactionRule, VacuumFullRule,
+};
+use crate::rules::triggers::DisableTriggerRule;
 use crate::rules::views::MaterializedViewRefreshRule;
 use squawk_syntax::ast::{AstNode, SourceFile};
 use std::collections::HashSet;
@@ -75,7 +80,17 @@ impl SafeMigrateEngine {
         }
         // Phase 10.6: Deterministic violation ordering
         all_violations.sort_by(|a, b| {
-            a.tier.cmp(&b.tier)
+            a.tier
+                .cmp(&b.tier)
+                .then_with(|| match (&a.source_range, &b.source_range) {
+                    (Some(ar), Some(br)) => ar
+                        .start()
+                        .cmp(&br.start())
+                        .then_with(|| ar.end().cmp(&br.end())),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                })
                 .then_with(|| a.object_name.cmp(&b.object_name))
                 .then_with(|| a.rule_id.cmp(b.rule_id))
         });
@@ -181,8 +196,34 @@ impl SafeMigrateEngine {
                                 continue;
                             }
                             let mut v = v;
+                            if v.source_range.is_none() {
+                                let start = stmt
+                                    .syntax()
+                                    .descendants_with_tokens()
+                                    .filter_map(|element| element.into_token())
+                                    .find(|token| {
+                                        let text = token.text().trim();
+                                        !text.is_empty()
+                                            && !text.starts_with("--")
+                                            && !text.starts_with("/*")
+                                    })
+                                    .map(|token| token.text_range().start())
+                                    .unwrap_or_else(|| stmt.syntax().text_range().start());
+                                let end = stmt.syntax().text_range().end();
+                                v.source_range = Some(rowan::TextRange::new(start, end));
+                            }
                             if v.sql.is_none() {
-                                v.sql = Some(stmt_text.trim().to_string());
+                                if let Some(range) = v.source_range {
+                                    let start = usize::from(range.start());
+                                    let end = usize::from(range.end());
+                                    if start < sql.len() && end <= sql.len() {
+                                        v.sql = Some(sql[start..end].trim().to_string());
+                                    } else {
+                                        v.sql = Some(stmt_text.trim().to_string());
+                                    }
+                                } else {
+                                    v.sql = Some(stmt_text.trim().to_string());
+                                }
                             }
                             all_violations.push(v);
                         }
@@ -192,7 +233,6 @@ impl SafeMigrateEngine {
                         for v in &mut all_violations {
                             if v.tier == crate::report::violations::ViolationTier::Tier1 {
                                 v.tier = crate::report::violations::ViolationTier::Tier2;
-                                v.reason.push_str(" [DOWNGRADED: confidence tainted by earlier opaque SQL, cannot guarantee this is unsafe]");
                             }
                         }
                     }

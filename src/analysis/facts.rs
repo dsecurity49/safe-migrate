@@ -189,6 +189,7 @@ pub enum StatementFact {
     OpaqueBlock,
     Execute,
     Vacuum {
+        relation: Option<QualifiedName>,
         is_full: bool,
     },
     CreateFunction(CreateFunctionFact),
@@ -239,7 +240,10 @@ pub enum AlterTypeActionFact {
 pub enum RoleFact {
     #[default]
     Unknown,
-    Named { name: String, via_legacy_group_syntax: bool },
+    Named {
+        name: String,
+        via_legacy_group_syntax: bool,
+    },
     CurrentUser,
     CurrentRole,
     SessionUser,
@@ -305,7 +309,11 @@ pub enum FuncOptionFact {
     Cost,
     Rows,
     Reset(String),
-    As { definition: Option<String>, obj_file: Option<String>, link_symbol: Option<String> },
+    As {
+        definition: Option<String>,
+        obj_file: Option<String>,
+        link_symbol: Option<String>,
+    },
     Transform,
     Window,
     Support,
@@ -313,11 +321,22 @@ pub enum FuncOptionFact {
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-pub enum VolatilityKind { Immutable, Stable, Volatile }
+pub enum VolatilityKind {
+    Immutable,
+    Stable,
+    Volatile,
+}
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-pub enum SecurityKind { Invoker, Definer }
+pub enum SecurityKind {
+    Invoker,
+    Definer,
+}
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-pub enum StrictKind { Strict, CalledOnNull, ReturnsNullOnNull }
+pub enum StrictKind {
+    Strict,
+    CalledOnNull,
+    ReturnsNullOnNull,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AlterFunctionFact {
@@ -465,7 +484,18 @@ pub enum PrivilegeSpec {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum PrivilegeFact {
-    Select, Insert, Update, Delete, Truncate, References, Trigger, Execute, Create, Temporary, AlterSystem, All,
+    Select,
+    Insert,
+    Update,
+    Delete,
+    Truncate,
+    References,
+    Trigger,
+    Execute,
+    Create,
+    Temporary,
+    AlterSystem,
+    All,
     Named(String),
     RoleMembership(String),
     Unknown,

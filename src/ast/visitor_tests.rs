@@ -23,7 +23,11 @@ mod tests {
 
     fn parse_and_extract_statement(sql: &str) -> Option<StatementFact> {
         let parsed = SourceFile::parse(sql);
-        parsed.tree().stmts().next().and_then(|stmt| AstVisitor::extract(&stmt))
+        parsed
+            .tree()
+            .stmts()
+            .next()
+            .and_then(|stmt| AstVisitor::extract(&stmt))
     }
 
     #[test]
@@ -78,9 +82,14 @@ mod tests {
         let facts = parse_and_extract_statement(sql);
         assert!(facts.is_some());
         match facts.unwrap() {
-            StatementFact::CreateTable { name, persistence, .. } => {
+            StatementFact::CreateTable {
+                name, persistence, ..
+            } => {
                 assert_eq!(name.name.resolve(), "temp_table");
-                assert!(matches!(persistence, crate::analysis::facts::PersistenceFact::Temporary));
+                assert!(matches!(
+                    persistence,
+                    crate::analysis::facts::PersistenceFact::Temporary
+                ));
             }
             _ => panic!("Expected CreateTable fact"),
         }
@@ -92,9 +101,14 @@ mod tests {
         let facts = parse_and_extract_statement(sql);
         assert!(facts.is_some());
         match facts.unwrap() {
-            StatementFact::CreateTable { name, persistence, .. } => {
+            StatementFact::CreateTable {
+                name, persistence, ..
+            } => {
                 assert_eq!(name.name.resolve(), "unlogged_table");
-                assert!(matches!(persistence, crate::analysis::facts::PersistenceFact::Unlogged));
+                assert!(matches!(
+                    persistence,
+                    crate::analysis::facts::PersistenceFact::Unlogged
+                ));
             }
             _ => panic!("Expected CreateTable fact"),
         }
@@ -106,7 +120,11 @@ mod tests {
         let facts = parse_and_extract_statement(sql);
         assert!(facts.is_some());
         match facts.unwrap() {
-            StatementFact::CreateTable { name, if_not_exists, .. } => {
+            StatementFact::CreateTable {
+                name,
+                if_not_exists,
+                ..
+            } => {
                 assert_eq!(name.name.resolve(), "existing_table");
                 assert!(if_not_exists);
             }
@@ -217,7 +235,9 @@ mod tests {
         let facts = parse_and_extract_statement(sql);
         assert!(facts.is_some());
         match facts.unwrap() {
-            StatementFact::DropTable { name, if_exists, .. } => {
+            StatementFact::DropTable {
+                name, if_exists, ..
+            } => {
                 assert_eq!(name.name.resolve(), "users");
                 assert!(if_exists);
             }
@@ -245,7 +265,9 @@ mod tests {
         let facts = parse_and_extract_statement(sql);
         assert!(facts.is_some());
         match facts.unwrap() {
-            StatementFact::CreateIndex { name: _, relation, .. } => {
+            StatementFact::CreateIndex {
+                name: _, relation, ..
+            } => {
                 assert_eq!(relation.name.resolve(), "users");
             }
             _ => panic!("Expected CreateIndex fact"),
@@ -324,8 +346,9 @@ mod tests {
         let facts = parse_and_extract_statement(sql);
         assert!(facts.is_some());
         match facts.unwrap() {
-            StatementFact::Vacuum { is_full } => {
+            StatementFact::Vacuum { relation, is_full } => {
                 assert!(is_full);
+                assert!(relation.is_none());
             }
             _ => panic!("Expected Vacuum fact"),
         }
@@ -337,8 +360,26 @@ mod tests {
         let facts = parse_and_extract_statement(sql);
         assert!(facts.is_some());
         match facts.unwrap() {
-            StatementFact::Vacuum { is_full } => {
+            StatementFact::Vacuum { relation, is_full } => {
                 assert!(!is_full);
+                assert!(relation.is_none());
+            }
+            _ => panic!("Expected Vacuum fact"),
+        }
+    }
+
+    #[test]
+    fn test_vacuum_with_table() {
+        let sql = "VACUUM FULL accounts;";
+        let facts = parse_and_extract_statement(sql);
+        assert!(facts.is_some());
+        match facts.unwrap() {
+            StatementFact::Vacuum { relation, is_full } => {
+                assert!(is_full);
+                assert!(relation.is_some());
+                let rel = relation.unwrap();
+                assert_eq!(rel.name.resolve(), "accounts");
+                assert!(rel.schema.is_none());
             }
             _ => panic!("Expected Vacuum fact"),
         }

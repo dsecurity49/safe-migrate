@@ -3,7 +3,7 @@ use crate::analysis::mutations::Mutation;
 use crate::analysis::state::{AnalysisState, CascadeResult, MutationResult};
 use crate::engine::config::Config;
 use crate::model::relation::Persistence;
-use crate::report::violations::{Violation, ViolationTier, OperationKind, ObjectKind};
+use crate::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
 use crate::rules::Rule;
 
 pub struct MaterializedViewRefreshRule;
@@ -38,7 +38,8 @@ impl Rule for MaterializedViewRefreshRule {
             if !refresh.concurrently {
                 let (is_temp, is_stale, rows) = match pre_state.relations.get(&refresh.id) {
                     Some(rel) => {
-                        let stale = rel.is_stale() && state.baseline_relations.contains(&refresh.id);
+                        let stale =
+                            rel.is_stale() && state.baseline_relations.contains(&refresh.id);
                         (
                             rel.persistence == Persistence::Temporary,
                             stale,
@@ -54,7 +55,7 @@ impl Rule for MaterializedViewRefreshRule {
 
                 if is_stale {
                     let key = format!("{}_stale_{}", self.id(), refresh.id);
-                    violations.push(Violation {
+                    violations.push(Violation { source_range: None,
                         rule_id: self.id(),
                         operation_kind: OperationKind::RefreshMaterializedView,
                         object_kind: ObjectKind::MaterializedView,
@@ -79,12 +80,14 @@ impl Rule for MaterializedViewRefreshRule {
                 };
 
                 if tier != ViolationTier::Tier3 {
-                    let mut reason = format!("Blocking materialized view refresh on {}", refresh.id);
+                    let mut reason =
+                        format!("Blocking materialized view refresh on {}", refresh.id);
                     if is_stale {
                         reason.push_str(" [WARNING: Based on offline/stale statistics]");
                     }
 
                     violations.push(Violation {
+                        source_range: None,
                         rule_id: self.id(),
                         operation_kind: OperationKind::RefreshMaterializedView,
                         object_kind: ObjectKind::MaterializedView,
@@ -93,17 +96,20 @@ impl Rule for MaterializedViewRefreshRule {
                         reason,
                         recipe: self.recipe(),
                         dedup_key: None,
-                                    sql: None,
+                        sql: None,
                     });
                 }
             } else {
                 // CONCURRENTLY refresh requires at least one unique index
-                let has_unique_index = state.local.graph.indexes.iter().any(|idx| {
-                    idx.relation_id == refresh.id && idx.is_unique
-                });
+                let has_unique_index = state
+                    .local
+                    .graph
+                    .indexes
+                    .iter()
+                    .any(|idx| idx.relation_id == refresh.id && idx.is_unique);
 
                 if !has_unique_index {
-                    violations.push(Violation {
+                    violations.push(Violation { source_range: None,
                         rule_id: self.id(),
                         operation_kind: OperationKind::RefreshMaterializedView,
                         object_kind: ObjectKind::MaterializedView,

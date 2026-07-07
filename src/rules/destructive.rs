@@ -56,7 +56,7 @@ impl Rule for CascadingDropRule {
             }
 
             if affects_baseline {
-                violations.push(Violation {
+                violations.push(Violation { source_range: None,
                     rule_id: self.id(),
                     operation_kind: OperationKind::DropTable,
                     object_kind: ObjectKind::Table,
@@ -121,8 +121,7 @@ impl Rule for SizeAwareAddColumnRule {
                         });
                         // BUG FIX: Only mark as stale if it actually existed in the baseline database!
                         // Tables created in this migration script are 0-rows fresh, not stale.
-                        let stale =
-                            rel.is_stale() && state.baseline_relations.contains(&alter.id);
+                        let stale = rel.is_stale() && state.baseline_relations.contains(&alter.id);
                         (
                             wide,
                             stale,
@@ -137,7 +136,7 @@ impl Rule for SizeAwareAddColumnRule {
 
                 if is_stale {
                     let key = format!("{}_stale_{}", self.id(), alter.id);
-                    violations.push(Violation {
+                    violations.push(Violation { source_range: None,
                         rule_id: self.id(),
                         operation_kind: OperationKind::AddColumn,
                         object_kind: ObjectKind::Table,
@@ -184,6 +183,7 @@ impl Rule for SizeAwareAddColumnRule {
                 }
 
                 violations.push(Violation {
+                    source_range: None,
                     rule_id: self.id(),
                     operation_kind: OperationKind::AddColumn,
                     object_kind: ObjectKind::Table,
@@ -192,7 +192,7 @@ impl Rule for SizeAwareAddColumnRule {
                     reason,
                     recipe: self.recipe(),
                     dedup_key: None,
-                            sql: None,
+                    sql: None,
                 });
             }
         }
@@ -224,6 +224,7 @@ impl Rule for DropDatabaseRule {
     ) -> Vec<Violation> {
         if let Mutation::DropDatabase(d) = mutation {
             return vec![Violation {
+                source_range: None,
                 rule_id: self.id(),
                 operation_kind: OperationKind::DropDatabase,
                 object_kind: ObjectKind::Database,
@@ -232,7 +233,7 @@ impl Rule for DropDatabaseRule {
                 reason: "DROP DATABASE detected".to_string(),
                 recipe: self.recipe(),
                 dedup_key: None,
-                    sql: None,
+                sql: None,
             }];
         }
         vec![]
@@ -263,8 +264,11 @@ impl Rule for DropSchemaCascadeRule {
     ) -> Vec<Violation> {
         let mut violations = Vec::new();
 
-        if let Mutation::DropSchema(drop) = mutation && drop.cascade {
+        if let Mutation::DropSchema(drop) = mutation
+            && drop.cascade
+        {
             violations.push(Violation {
+                source_range: None,
                 rule_id: self.id(),
                 operation_kind: OperationKind::DropSchema,
                 object_kind: ObjectKind::Schema,
@@ -273,7 +277,7 @@ impl Rule for DropSchemaCascadeRule {
                 reason: format!("DROP SCHEMA {} CASCADE detected", drop.names.join(", ")),
                 recipe: self.recipe(),
                 dedup_key: None,
-                    sql: None,
+                sql: None,
             });
         }
 
@@ -297,14 +301,20 @@ impl Rule for CreateTableAsSelectRule {
     fn evaluate(
         &self,
         mutation: &Mutation,
-        _result: &MutationResult,
+        result: &MutationResult,
         _pre_state: &crate::analysis::state::PreState,
         _state: &AnalysisState,
         _config: &Config,
         _cascade_closure: Option<&CascadeResult>,
     ) -> Vec<Violation> {
-        if let Mutation::CreateTable(c) = mutation && c.as_select {
+        if *result == MutationResult::Skipped {
+            return vec![];
+        }
+        if let Mutation::CreateTable(c) = mutation
+            && c.as_select
+        {
             return vec![Violation {
+                source_range: None,
                 rule_id: self.id(),
                 operation_kind: OperationKind::CreateTable,
                 object_kind: ObjectKind::Table,
@@ -313,7 +323,7 @@ impl Rule for CreateTableAsSelectRule {
                 reason: format!("CREATE TABLE AS SELECT detected for {}", c.id),
                 recipe: self.recipe(),
                 dedup_key: None,
-                    sql: None,
+                sql: None,
             }];
         }
         vec![]
@@ -380,6 +390,7 @@ impl Rule for ReversibilityRule {
                     ViolationTier::Tier2
                 };
                 violations.push(Violation {
+                    source_range: None,
                     rule_id: self.id(),
                     operation_kind: OperationKind::AlterColumnType,
                     object_kind: ObjectKind::Table,
@@ -388,7 +399,7 @@ impl Rule for ReversibilityRule {
                     reason: "Conditionally reversible type change detected".to_string(),
                     recipe: "This type change may be lossy. Verify data compatibility.",
                     dedup_key: None,
-                            sql: None,
+                    sql: None,
                 });
             }
         }
@@ -437,9 +448,11 @@ impl Rule for ReversibilityRule {
                         a.id.to_string(),
                     ),
                 },
-                Mutation::DropTable(d) => {
-                    (OperationKind::DropTable, ObjectKind::Table, d.id.to_string())
-                }
+                Mutation::DropTable(d) => (
+                    OperationKind::DropTable,
+                    ObjectKind::Table,
+                    d.id.to_string(),
+                ),
                 Mutation::DropDatabase(d) => (
                     OperationKind::DropDatabase,
                     ObjectKind::Database,
@@ -453,6 +466,7 @@ impl Rule for ReversibilityRule {
             };
 
             violations.push(Violation {
+                source_range: None,
                 rule_id: self.id(),
                 operation_kind,
                 object_kind,
@@ -461,7 +475,7 @@ impl Rule for ReversibilityRule {
                 reason: "Irreversible data-destructive operation detected".to_string(),
                 recipe: self.recipe(),
                 dedup_key: None,
-                    sql: None,
+                sql: None,
             });
         }
         violations
@@ -570,22 +584,38 @@ impl Rule for GeneralCascadeRule {
             Mutation::DropView(d) if d.cascade => Some((
                 OperationKind::DropView,
                 ObjectKind::View,
-                d.ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", "),
+                d.ids
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
             )),
             Mutation::DropMaterializedView(d) if d.cascade => Some((
                 OperationKind::DropMaterializedView,
                 ObjectKind::MaterializedView,
-                d.ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", "),
+                d.ids
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
             )),
             Mutation::DropSequence(d) if d.cascade => Some((
                 OperationKind::DropSequence,
                 ObjectKind::Sequence,
-                d.ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", "),
+                d.ids
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
             )),
             Mutation::DropDomain(d) if d.cascade => Some((
                 OperationKind::DropDomain,
                 ObjectKind::Domain,
-                d.ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", "),
+                d.ids
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
             )),
             Mutation::DropFunction(d) if d.cascade => Some((
                 OperationKind::DropFunction,
@@ -607,6 +637,7 @@ impl Rule for GeneralCascadeRule {
 
         if let Some((operation_kind, object_kind, object_name)) = cascade_info {
             return vec![Violation {
+                source_range: None,
                 rule_id: self.id(),
                 operation_kind,
                 object_kind,
@@ -615,7 +646,7 @@ impl Rule for GeneralCascadeRule {
                 reason: "Destructive CASCADE operation detected".to_string(),
                 recipe: self.recipe(),
                 dedup_key: None,
-                    sql: None,
+                sql: None,
             }];
         }
         vec![]
@@ -668,7 +699,10 @@ impl TypeChangeRewriteRule {
     ///
     /// A smaller typmod means a smaller limit, which is lossy.
     /// Returns true if the new modifier represents a smaller limit than the old.
-    pub fn is_lossy_varchar_narrowing(old_modifier: Option<i32>, new_modifier: Option<i32>) -> bool {
+    pub fn is_lossy_varchar_narrowing(
+        old_modifier: Option<i32>,
+        new_modifier: Option<i32>,
+    ) -> bool {
         match (old_modifier, new_modifier) {
             (Some(old), Some(new)) => new < old,
             (None, Some(_)) => true,
@@ -761,7 +795,7 @@ impl Rule for TypeChangeRewriteRule {
                 let new_modifier = extract_type_modifier_from_type_string(ty);
 
                 if Self::is_lossy_varchar_narrowing(old_modifier, new_modifier) {
-                    violations.push(Violation {
+                    violations.push(Violation { source_range: None,
                         rule_id: self.id(),
                         operation_kind: OperationKind::AlterColumnType,
                         object_kind: ObjectKind::Table,
@@ -777,6 +811,7 @@ impl Rule for TypeChangeRewriteRule {
                     });
                 } else {
                     violations.push(Violation {
+                        source_range: None,
                         rule_id: self.id(),
                         operation_kind: OperationKind::AlterColumnType,
                         object_kind: ObjectKind::Table,
@@ -788,7 +823,7 @@ impl Rule for TypeChangeRewriteRule {
                         ),
                         recipe: self.recipe(),
                         dedup_key: None,
-                                    sql: None,
+                        sql: None,
                     });
                 }
             }

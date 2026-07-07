@@ -2,7 +2,7 @@
 use crate::analysis::mutations::Mutation;
 use crate::analysis::state::{AnalysisState, CascadeResult, MutationResult};
 use crate::engine::config::Config;
-use crate::report::violations::{Violation, ViolationTier, OperationKind, ObjectKind};
+use crate::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
 use crate::rules::Rule;
 
 pub struct OpaqueDynamicSqlRule;
@@ -30,6 +30,12 @@ impl Rule for OpaqueDynamicSqlRule {
         let mut violations = Vec::new();
 
         if let Mutation::Opaque(op) = mutation {
+            if matches!(
+                op,
+                crate::analysis::mutations::OpaqueMutation::UnresolvedReference { .. }
+            ) {
+                return vec![];
+            }
             let block_type = match op {
                 crate::analysis::mutations::OpaqueMutation::DoBlock => "DO block",
                 crate::analysis::mutations::OpaqueMutation::Execute => "EXECUTE statement",
@@ -39,9 +45,13 @@ impl Rule for OpaqueDynamicSqlRule {
                 }
                 crate::analysis::mutations::OpaqueMutation::SetTransaction => "SET TRANSACTION",
                 crate::analysis::mutations::OpaqueMutation::SetConstraints => "SET CONSTRAINTS",
+                crate::analysis::mutations::OpaqueMutation::UnresolvedReference { .. } => {
+                    unreachable!()
+                }
             };
 
             violations.push(Violation {
+                source_range: None,
                 rule_id: self.id(),
                 operation_kind: OperationKind::OpaqueSql,
                 object_kind: ObjectKind::Unknown,
@@ -50,7 +60,7 @@ impl Rule for OpaqueDynamicSqlRule {
                 reason: format!("Encountered opaque {}", block_type),
                 recipe: self.recipe(),
                 dedup_key: None,
-                    sql: None,
+                sql: None,
             });
         }
 

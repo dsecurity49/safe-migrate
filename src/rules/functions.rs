@@ -1,7 +1,7 @@
 use crate::analysis::mutations::Mutation;
 use crate::analysis::state::{AnalysisState, CascadeResult, MutationResult, PreState};
 use crate::engine::config::Config;
-use crate::report::violations::{Violation, ViolationTier, OperationKind, ObjectKind};
+use crate::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
 use crate::rules::Rule;
 
 pub struct FunctionVolatilityRule;
@@ -30,15 +30,22 @@ impl Rule for FunctionVolatilityRule {
 
         if let Mutation::AlterFunction(alter) = mutation
             && let Some(old_func) = pre_state.functions.get(&alter.id)
-            && let crate::analysis::facts::AlterFunctionAction::OptionsChange(new_opts) = &alter.action
+            && let crate::analysis::facts::AlterFunctionAction::OptionsChange(new_opts) =
+                &alter.action
         {
             let ov = old_func.volatility.clone();
             let new_vol = new_opts.iter().find_map(|opt| {
                 if let crate::analysis::facts::FuncOptionFact::Volatility(v) = opt {
                     match v {
-                        crate::analysis::facts::VolatilityKind::Volatile => Some(crate::model::function::Volatility::Volatile),
-                        crate::analysis::facts::VolatilityKind::Stable => Some(crate::model::function::Volatility::Stable),
-                        crate::analysis::facts::VolatilityKind::Immutable => Some(crate::model::function::Volatility::Immutable),
+                        crate::analysis::facts::VolatilityKind::Volatile => {
+                            Some(crate::model::function::Volatility::Volatile)
+                        }
+                        crate::analysis::facts::VolatilityKind::Stable => {
+                            Some(crate::model::function::Volatility::Stable)
+                        }
+                        crate::analysis::facts::VolatilityKind::Immutable => {
+                            Some(crate::model::function::Volatility::Immutable)
+                        }
                     }
                 } else {
                     None
@@ -49,6 +56,7 @@ impl Rule for FunctionVolatilityRule {
                 && ov != nv
             {
                 violations.push(Violation {
+                    source_range: None,
                     rule_id: self.id(),
                     operation_kind: OperationKind::AlterFunction,
                     object_kind: ObjectKind::Function,
@@ -60,7 +68,7 @@ impl Rule for FunctionVolatilityRule {
                     ),
                     recipe: self.recipe(),
                     dedup_key: None,
-                            sql: None,
+                    sql: None,
                 });
             }
         }
@@ -85,12 +93,15 @@ impl Rule for BrokenComputeRule {
     fn evaluate(
         &self,
         mutation: &Mutation,
-        _result: &MutationResult,
+        result: &MutationResult,
         _pre_state: &PreState,
         state: &AnalysisState,
         _config: &Config,
         _cascade_closure: Option<&CascadeResult>,
     ) -> Vec<Violation> {
+        if *result == MutationResult::Skipped {
+            return vec![];
+        }
         if let Mutation::DropFunction(drop) = mutation {
             for sig in &drop.signatures {
                 // Construct ID in same way as during creation
@@ -101,20 +112,25 @@ impl Rule for BrokenComputeRule {
                 let affected = state.local.graph.triggers_for_function(&function_id);
 
                 if !affected.is_empty() {
-                    let triggers_info: Vec<String> = affected.iter()
+                    let triggers_info: Vec<String> = affected
+                        .iter()
                         .map(|t| format!("trigger {} on table {}", t.trigger_id, t.table_id))
                         .collect();
 
                     return vec![Violation {
+                        source_range: None,
                         rule_id: self.id(),
                         operation_kind: OperationKind::DropFunction,
                         object_kind: ObjectKind::Function,
                         object_name: function_id.to_string(),
                         tier: self.default_tier(),
-                        reason: format!("Broken Compute: Dropping Function Used by Trigger: {}", triggers_info.join(", ")),
+                        reason: format!(
+                            "Broken Compute: Dropping Function Used by Trigger: {}",
+                            triggers_info.join(", ")
+                        ),
                         recipe: self.recipe(),
                         dedup_key: None,
-                                    sql: None,
+                        sql: None,
                     }];
                 }
             }

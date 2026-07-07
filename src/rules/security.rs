@@ -1,7 +1,7 @@
 use crate::analysis::mutations::Mutation;
 use crate::analysis::state::{AnalysisState, CascadeResult, MutationResult, PreState};
 use crate::engine::config::Config;
-use crate::report::violations::{Violation, ViolationTier, OperationKind, ObjectKind};
+use crate::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
 use crate::rules::Rule;
 
 pub struct OverbroadGrantRule;
@@ -20,20 +20,28 @@ impl Rule for OverbroadGrantRule {
     fn evaluate(
         &self,
         mutation: &Mutation,
-        _result: &MutationResult,
+        result: &MutationResult,
         _pre_state: &PreState,
         state: &AnalysisState,
         _config: &Config,
         _cascade_closure: Option<&CascadeResult>,
     ) -> Vec<Violation> {
+        if *result == MutationResult::Skipped {
+            return vec![];
+        }
         let mut violations = Vec::new();
 
         if let Mutation::Grant(grant) = mutation {
             // Determine object_name and object_kind if possible
             let (obj_kind, obj_name) = match &grant.target {
-                crate::analysis::mutations::ResolvedGrantTarget::Tables(tables) => {
-                    (ObjectKind::Table, tables.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(", "))
-                }
+                crate::analysis::mutations::ResolvedGrantTarget::Tables(tables) => (
+                    ObjectKind::Table,
+                    tables
+                        .iter()
+                        .map(|t| t.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ),
                 crate::analysis::mutations::ResolvedGrantTarget::AllTablesInSchema(schemas) => {
                     (ObjectKind::Schema, schemas.join(", "))
                 }
@@ -49,6 +57,7 @@ impl Rule for OverbroadGrantRule {
             });
             if is_public {
                 violations.push(Violation {
+                    source_range: None,
                     rule_id: self.id(),
                     operation_kind: OperationKind::Grant,
                     object_kind: obj_kind.clone(),
@@ -57,23 +66,26 @@ impl Rule for OverbroadGrantRule {
                     reason: "Grant to PUBLIC".to_string(),
                     recipe: "GRANT to PUBLIC is almost never intended as it applies to every role.",
                     dedup_key: None,
-                            sql: None,
+                    sql: None,
                 });
             }
 
             // Case 2: GRANT ALL PRIVILEGES to a non-owner role -> Tier 2
             let is_all_privs = match &grant.privileges {
                 crate::analysis::facts::PrivilegeSpec::All => true,
-                crate::analysis::facts::PrivilegeSpec::List(privs) => {
-                    privs.iter().any(|p| matches!(p, crate::analysis::facts::PrivilegeFact::All))
-                }
+                crate::analysis::facts::PrivilegeSpec::List(privs) => privs
+                    .iter()
+                    .any(|p| matches!(p, crate::analysis::facts::PrivilegeFact::All)),
             };
 
             if is_all_privs {
                 let mut is_owner = false;
-                if let crate::analysis::mutations::ResolvedGrantTarget::Tables(tables) = &grant.target {
+                if let crate::analysis::mutations::ResolvedGrantTarget::Tables(tables) =
+                    &grant.target
+                {
                     for table_id in tables {
-                        if let Some(crate::model::relation::RelationOverlay::Present(rel)) = state.local.relations.get(table_id)
+                        if let Some(crate::model::relation::RelationOverlay::Present(rel)) =
+                            state.local.relations.get(table_id)
                             && grant.grantees.iter().any(|g| {
                                 if let crate::analysis::facts::RoleFact::Named { name, .. } = g {
                                     // Simple name match for owner check
@@ -81,7 +93,7 @@ impl Rule for OverbroadGrantRule {
                                 } else {
                                     false
                                 }
-                              })
+                            })
                         {
                             is_owner = true;
                             break;
@@ -90,6 +102,7 @@ impl Rule for OverbroadGrantRule {
                 }
                 if !is_owner {
                     violations.push(Violation {
+                        source_range: None,
                         rule_id: self.id(),
                         operation_kind: OperationKind::Grant,
                         object_kind: obj_kind.clone(),
@@ -98,14 +111,14 @@ impl Rule for OverbroadGrantRule {
                         reason: "Overbroad Grant: ALL PRIVILEGES".to_string(),
                         recipe: "GRANT ALL PRIVILEGES to a role that is not the owner is risky.",
                         dedup_key: None,
-                                    sql: None,
+                        sql: None,
                     });
                 }
             }
 
             // Case 3: WITH GRANT OPTION -> Tier 2
             if grant.with_grant_option {
-                violations.push(Violation {
+                violations.push(Violation { source_range: None,
                     rule_id: self.id(),
                     operation_kind: OperationKind::Grant,
                     object_kind: obj_kind,

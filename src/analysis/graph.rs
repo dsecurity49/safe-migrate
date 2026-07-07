@@ -166,46 +166,97 @@ impl DependencyGraph {
 
     pub fn propagate_rename(&mut self, old_id: &ObjectId, new_id: &ObjectId) {
         for idx in &mut self.indexes {
-            if idx.index_id == *old_id { idx.index_id = new_id.clone(); }
-            if idx.relation_id == *old_id { idx.relation_id = new_id.clone(); }
+            if idx.index_id == *old_id {
+                idx.index_id = new_id.clone();
+            }
+            if idx.relation_id == *old_id {
+                idx.relation_id = new_id.clone();
+            }
         }
         for view in &mut self.views {
-            if view.view_id == *old_id { view.view_id = new_id.clone(); }
+            if view.view_id == *old_id {
+                view.view_id = new_id.clone();
+            }
             view.depends_on.iter_mut().for_each(|dep| {
-                if *dep == *old_id { *dep = new_id.clone(); }
+                if *dep == *old_id {
+                    *dep = new_id.clone();
+                }
             });
         }
         for fk in &mut self.foreign_keys {
-            if fk.from_table == *old_id { fk.from_table = new_id.clone(); }
-            if fk.to_table == *old_id { fk.to_table = new_id.clone(); }
+            if fk.from_table == *old_id {
+                fk.from_table = new_id.clone();
+            }
+            if fk.to_table == *old_id {
+                fk.to_table = new_id.clone();
+            }
         }
         for part in &mut self.partitions {
-            if part.parent == *old_id { part.parent = new_id.clone(); }
-            if part.child == *old_id { part.child = new_id.clone(); }
+            if part.parent == *old_id {
+                part.parent = new_id.clone();
+            }
+            if part.child == *old_id {
+                part.child = new_id.clone();
+            }
         }
         for seq in &mut self.sequences {
-            if seq.sequence_id == *old_id { seq.sequence_id = new_id.clone(); }
-            if seq.table_id == *old_id { seq.table_id = new_id.clone(); }
+            if seq.sequence_id == *old_id {
+                seq.sequence_id = new_id.clone();
+            }
+            if seq.table_id == *old_id {
+                seq.table_id = new_id.clone();
+            }
         }
         for col_dep in &mut self.column_dependencies {
-            if col_dep.table_id == *old_id { col_dep.table_id = new_id.clone(); }
-            if col_dep.depends_on_table == *old_id { col_dep.depends_on_table = new_id.clone(); }
+            if col_dep.table_id == *old_id {
+                col_dep.table_id = new_id.clone();
+            }
+            if col_dep.depends_on_table == *old_id {
+                col_dep.depends_on_table = new_id.clone();
+            }
         }
         for trg in &mut self.trigger_dependencies {
-            if trg.table_id == *old_id { trg.table_id = new_id.clone(); }
-            if trg.trigger_id == *old_id { trg.trigger_id = new_id.clone(); }
-            if trg.function_id == *old_id { trg.function_id = new_id.clone(); }
+            if trg.table_id == *old_id {
+                trg.table_id = new_id.clone();
+            }
+            if trg.trigger_id == *old_id {
+                trg.trigger_id = new_id.clone();
+            }
+            if trg.function_id == *old_id {
+                trg.function_id = new_id.clone();
+            }
         }
         for publ in &mut self.publication_dependencies {
-            if publ.table_id == *old_id { publ.table_id = new_id.clone(); }
+            if publ.table_id == *old_id {
+                publ.table_id = new_id.clone();
+            }
         }
     }
 
     pub fn triggers_on(&self, table_id: &ObjectId) -> Vec<&TriggerEdge> {
-        self.trigger_dependencies.iter().filter(|t| &t.table_id == table_id).collect()
+        self.trigger_dependencies
+            .iter()
+            .filter(|t| &t.table_id == table_id)
+            .collect()
     }
-    
+
     pub fn triggers_for_function(&self, function_id: &ObjectId) -> Vec<&TriggerEdge> {
-        self.trigger_dependencies.iter().filter(|t| &t.function_id == function_id).collect()
+        let normalize = |id: &ObjectId| -> ObjectId {
+            let name = if let Some(idx) = id.name.find('(') {
+                format!("{}()", &id.name[..idx])
+            } else {
+                id.name.clone()
+            };
+            ObjectId {
+                schema: id.schema.clone(),
+                name,
+                inferred_schema: id.inferred_schema,
+            }
+        };
+        let target_id = normalize(function_id);
+        self.trigger_dependencies
+            .iter()
+            .filter(|t| normalize(&t.function_id) == target_id)
+            .collect()
     }
 }

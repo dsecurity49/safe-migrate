@@ -3,7 +3,7 @@
 use crate::analysis::mutations::Mutation;
 use crate::analysis::state::{AnalysisState, CascadeResult, MutationResult};
 use crate::engine::config::Config;
-use crate::report::violations::{Violation, ViolationTier, OperationKind, ObjectKind};
+use crate::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
 use crate::rules::Rule;
 
 pub struct VolatileDefaultRule;
@@ -40,6 +40,7 @@ impl Rule for VolatileDefaultRule {
                     && def.is_volatile()
                 {
                     violations.push(Violation {
+                        source_range: None,
                         rule_id: self.id(),
                         operation_kind: OperationKind::CreateTable,
                         object_kind: ObjectKind::Table,
@@ -48,7 +49,7 @@ impl Rule for VolatileDefaultRule {
                         reason: format!("Volatile default expression on {}.{}", c.id, col.name),
                         recipe: self.recipe(),
                         dedup_key: None,
-                                    sql: None,
+                        sql: None,
                     });
                 }
             }
@@ -56,8 +57,13 @@ impl Rule for VolatileDefaultRule {
 
         if let Mutation::AlterTable(a) = mutation {
             match &a.action {
-                crate::analysis::mutations::AlterTableActionMutation::AddColumn { name, default: Some(def), .. } if def.is_volatile() => {
+                crate::analysis::mutations::AlterTableActionMutation::AddColumn {
+                    name,
+                    default: Some(def),
+                    ..
+                } if def.is_volatile() => {
                     violations.push(Violation {
+                        source_range: None,
                         rule_id: self.id(),
                         operation_kind: OperationKind::AddColumn,
                         object_kind: ObjectKind::Table,
@@ -66,11 +72,15 @@ impl Rule for VolatileDefaultRule {
                         reason: format!("Volatile default expression on {}.{}", a.id, name),
                         recipe: self.recipe(),
                         dedup_key: None,
-                                    sql: None,
+                        sql: None,
                     });
                 }
-                crate::analysis::mutations::AlterTableActionMutation::SetDefault { column, default: Some(def) } if def.is_volatile() => {
+                crate::analysis::mutations::AlterTableActionMutation::SetDefault {
+                    column,
+                    default: Some(def),
+                } if def.is_volatile() => {
                     violations.push(Violation {
+                        source_range: None,
                         rule_id: self.id(),
                         operation_kind: OperationKind::Other("set_default".to_string()),
                         object_kind: ObjectKind::Table,
@@ -79,7 +89,7 @@ impl Rule for VolatileDefaultRule {
                         reason: format!("Volatile default expression on {}.{}", a.id, column),
                         recipe: self.recipe(),
                         dedup_key: None,
-                                    sql: None,
+                        sql: None,
                     });
                 }
                 _ => {}

@@ -23,10 +23,7 @@ pub struct PrivilegeMatrix {
 
 impl PrivilegeMatrix {
     pub fn grant(&mut self, role: ObjectId, privileges: HashSet<Privilege>) {
-        self.grants
-            .entry(role)
-            .or_default()
-            .extend(privileges);
+        self.grants.entry(role).or_default().extend(privileges);
     }
 
     pub fn revoke(&mut self, role: &ObjectId, privileges: &HashSet<Privilege>) {

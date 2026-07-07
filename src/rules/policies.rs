@@ -1,7 +1,7 @@
 use crate::analysis::mutations::Mutation;
 use crate::analysis::state::{AnalysisState, CascadeResult, MutationResult};
 use crate::engine::config::Config;
-use crate::report::violations::{Violation, ViolationTier, OperationKind, ObjectKind};
+use crate::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
 use crate::rules::Rule;
 
 pub struct RestrictivePolicyRule;
@@ -20,27 +20,34 @@ impl Rule for RestrictivePolicyRule {
     fn evaluate(
         &self,
         mutation: &Mutation,
-        _result: &MutationResult,
+        result: &MutationResult,
         _pre_state: &crate::analysis::state::PreState,
         _state: &AnalysisState,
         _config: &Config,
         _cascade: Option<&CascadeResult>,
     ) -> Vec<Violation> {
+        if *result == MutationResult::Skipped {
+            return vec![];
+        }
         let mut violations = Vec::new();
 
         if let Mutation::CreatePolicy(policy) = mutation
             && !policy.permissive
         {
             violations.push(Violation {
+                source_range: None,
                 rule_id: self.id(),
                 operation_kind: OperationKind::CreatePolicy,
                 object_kind: ObjectKind::Policy,
                 object_name: format!("{} on {}", policy.name, policy.table),
                 tier: self.default_tier(),
-                reason: format!("Adding RESTRICTIVE policy {} on {}", policy.name, policy.table),
+                reason: format!(
+                    "Adding RESTRICTIVE policy {} on {}",
+                    policy.name, policy.table
+                ),
                 recipe: self.recipe(),
                 dedup_key: None,
-                    sql: None,
+                sql: None,
             });
         }
 

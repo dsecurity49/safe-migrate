@@ -30,9 +30,29 @@ impl Rule for DriftDetectionRule {
         let mut violations = Vec::new();
 
         match mutation {
+            Mutation::Opaque(crate::analysis::mutations::OpaqueMutation::UnresolvedReference {
+                object_kind,
+                object_name,
+            }) => {
+                violations.push(Violation { source_range: None,
+                    rule_id: self.id(),
+                    operation_kind: OperationKind::Other("unresolved_reference".to_string()),
+                    object_kind: object_kind.clone(),
+                    object_name: object_name.clone(),
+                    tier: self.default_tier(),
+                    reason: format!(
+                        "Migration references {} \"{}\" which does not exist in the production baseline",
+                        object_kind,
+                        object_name
+                    ),
+                    recipe: self.recipe(),
+                    dedup_key: None,
+                    sql: None,
+                });
+            }
             Mutation::DropTable(d) => {
                 if !pre_state.relations.contains_key(&d.id) {
-                    violations.push(Violation {
+                    violations.push(Violation { source_range: None,
                         rule_id: self.id(),
                         operation_kind: OperationKind::DropTable,
                         object_kind: ObjectKind::Table,
@@ -50,7 +70,7 @@ impl Rule for DriftDetectionRule {
             }
             Mutation::AlterTable(a) => {
                 if !pre_state.relations.contains_key(&a.id) {
-                    violations.push(Violation {
+                    violations.push(Violation { source_range: None,
                         rule_id: self.id(),
                         operation_kind: OperationKind::Other("alter_table".to_string()),
                         object_kind: ObjectKind::Table,
@@ -69,7 +89,7 @@ impl Rule for DriftDetectionRule {
             Mutation::DropView(d) => {
                 for id in &d.ids {
                     if !pre_state.relations.contains_key(id) {
-                        violations.push(Violation {
+                        violations.push(Violation { source_range: None,
                             rule_id: self.id(),
                             operation_kind: OperationKind::DropView,
                             object_kind: ObjectKind::View,
@@ -89,7 +109,7 @@ impl Rule for DriftDetectionRule {
             Mutation::DropMaterializedView(d) => {
                 for id in &d.ids {
                     if !pre_state.relations.contains_key(id) {
-                        violations.push(Violation {
+                        violations.push(Violation { source_range: None,
                             rule_id: self.id(),
                             operation_kind: OperationKind::DropMaterializedView,
                             object_kind: ObjectKind::MaterializedView,
@@ -109,7 +129,7 @@ impl Rule for DriftDetectionRule {
             Mutation::DropSequence(d) => {
                 for id in &d.ids {
                     if !pre_state.sequences.contains_key(id) {
-                        violations.push(Violation {
+                        violations.push(Violation { source_range: None,
                             rule_id: self.id(),
                             operation_kind: OperationKind::DropSequence,
                             object_kind: ObjectKind::Sequence,
@@ -128,12 +148,11 @@ impl Rule for DriftDetectionRule {
             }
             Mutation::DropFunction(d) => {
                 for sig in &d.signatures {
-                    let sig_str =
-                        format!("{}({})", sig.name.name.resolve(), sig.params.join(","));
+                    let sig_str = format!("{}({})", sig.name.name.resolve(), sig.params.join(","));
                     let schema = state.resolve_function_schema(&sig.name, &sig_str);
                     let id = ObjectId::new(schema, sig_str);
                     if !pre_state.functions.contains_key(&id) {
-                        violations.push(Violation {
+                        violations.push(Violation { source_range: None,
                             rule_id: self.id(),
                             operation_kind: OperationKind::DropFunction,
                             object_kind: ObjectKind::Function,
@@ -152,12 +171,11 @@ impl Rule for DriftDetectionRule {
             }
             Mutation::DropProcedure(d) => {
                 for sig in &d.signatures {
-                    let sig_str =
-                        format!("{}({})", sig.name.name.resolve(), sig.params.join(","));
+                    let sig_str = format!("{}({})", sig.name.name.resolve(), sig.params.join(","));
                     let schema = state.resolve_function_schema(&sig.name, &sig_str);
                     let id = ObjectId::new(schema, sig_str);
                     if !pre_state.functions.contains_key(&id) {
-                        violations.push(Violation {
+                        violations.push(Violation { source_range: None,
                             rule_id: self.id(),
                             operation_kind: OperationKind::DropProcedure,
                             object_kind: ObjectKind::Procedure,
@@ -176,7 +194,7 @@ impl Rule for DriftDetectionRule {
             }
             Mutation::DropIndex(d) => {
                 if !pre_state.indexes.iter().any(|idx| idx.index_id == d.id) {
-                    violations.push(Violation {
+                    violations.push(Violation { source_range: None,
                         rule_id: self.id(),
                         operation_kind: OperationKind::DropIndex,
                         object_kind: ObjectKind::Index,
@@ -195,7 +213,7 @@ impl Rule for DriftDetectionRule {
             Mutation::DropDomain(d) => {
                 for id in &d.ids {
                     if !pre_state.types.contains_key(id) {
-                        violations.push(Violation {
+                        violations.push(Violation { source_range: None,
                             rule_id: self.id(),
                             operation_kind: OperationKind::DropDomain,
                             object_kind: ObjectKind::Domain,
@@ -213,7 +231,7 @@ impl Rule for DriftDetectionRule {
                 }
             }
             Mutation::AlterType(a) if !pre_state.types.contains_key(&a.id) => {
-                violations.push(Violation {
+                violations.push(Violation { source_range: None,
                     rule_id: self.id(),
                     operation_kind: OperationKind::AlterType,
                     object_kind: ObjectKind::Type,
@@ -229,7 +247,7 @@ impl Rule for DriftDetectionRule {
                 });
             }
             Mutation::AlterFunction(f) if !pre_state.functions.contains_key(&f.id) => {
-                violations.push(Violation {
+                violations.push(Violation { source_range: None,
                     rule_id: self.id(),
                     operation_kind: OperationKind::AlterFunction,
                     object_kind: ObjectKind::Function,
@@ -245,7 +263,7 @@ impl Rule for DriftDetectionRule {
                 });
             }
             Mutation::AlterProcedure(p) if !pre_state.functions.contains_key(&p.id) => {
-                violations.push(Violation {
+                violations.push(Violation { source_range: None,
                     rule_id: self.id(),
                     operation_kind: OperationKind::AlterProcedure,
                     object_kind: ObjectKind::Procedure,

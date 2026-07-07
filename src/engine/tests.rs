@@ -27,7 +27,7 @@ pub mod helpers {
 mod state_machine_guards_tests {
     use super::helpers::*;
     use crate::analysis::state::AnalysisState;
-    use crate::model::relation::{RelationOverlay, RelationState, RelationKind, Persistence};
+    use crate::model::relation::{Persistence, RelationKind, RelationOverlay, RelationState};
 
     #[test]
     fn test_skip_guard_create_table() {
@@ -55,20 +55,39 @@ mod state_machine_guards_tests {
         let engine = setup_engine();
         let mut cache = crate::db::cache::DbCache::new();
         let tid = object_id("public", "t");
-        let mut rel = RelationState::new(tid.clone(), object_id("public", "postgres"), 0, Some(10), RelationKind::Table, Persistence::Permanent, 0);
-        rel.apply_column_action(&crate::model::relation::ColumnAction::Add { name: "val".to_string(), data_type: Some("int".to_string()), not_null: false, default: None });
+        let mut rel = RelationState::new(
+            tid.clone(),
+            object_id("public", "postgres"),
+            0,
+            Some(10),
+            RelationKind::Table,
+            Persistence::Permanent,
+            0,
+        );
+        rel.apply_column_action(&crate::model::relation::ColumnAction::Add {
+            name: "val".to_string(),
+            data_type: Some("int".to_string()),
+            not_null: false,
+            default: None,
+        });
         cache.insert_baseline(tid, rel);
         let mut state = AnalysisState::new(cache);
-        
+
         // Run analysis
-        let v = engine.analyze("ALTER TABLE t ALTER COLUMN val TYPE bigint;", &mut state).unwrap();
-        
+        let v = engine
+            .analyze("ALTER TABLE t ALTER COLUMN val TYPE bigint;", &mut state)
+            .unwrap();
+
         // Ensure that ReversibilityRule did not flag this as irreversible
         // We are checking for specific violations and widening SHOULD NOT trigger "irreversible-migration"
         // If TypeChangeRewriteRule flags it, that's fine.
-        assert!(v.iter().all(|viol| viol.rule_id != "irreversible-migration"), 
-            "ReversibilityRule flagged widening as irreversible: {:?}", 
-            v.iter().filter(|viol| viol.rule_id == "irreversible-migration").collect::<Vec<_>>()
+        assert!(
+            v.iter()
+                .all(|viol| viol.rule_id != "irreversible-migration"),
+            "ReversibilityRule flagged widening as irreversible: {:?}",
+            v.iter()
+                .filter(|viol| viol.rule_id == "irreversible-migration")
+                .collect::<Vec<_>>()
         );
     }
 
@@ -167,22 +186,19 @@ mod state_machine_guards_tests {
 #[cfg(test)]
 mod rule_evaluation_tests {
     use super::helpers::*;
-    use crate::analysis::mutations::{
-        AlterFunctionMutation, CreateFunctionMutation, Mutation,
-    };
     use crate::analysis::facts::{
-        AlterFunctionAction, FuncOptionFact, ParamFact, ParamModeFact, RetTypeFact,
-        VolatilityKind,
+        AlterFunctionAction, FuncOptionFact, ParamFact, ParamModeFact, RetTypeFact, VolatilityKind,
     };
+    use crate::analysis::mutations::{AlterFunctionMutation, CreateFunctionMutation, Mutation};
     use crate::analysis::state::{AnalysisState, Confidence, MutationResult};
-    use crate::engine::config::Config;
     use crate::ast::identifiers::ObjectId;
+    use crate::engine::config::Config;
     use crate::model::column::Column;
     use crate::model::function::{FunctionOverlay, FunctionState};
     use crate::model::relation::{Persistence, RelationKind, RelationState};
     use crate::report::violations::ViolationTier;
-    use crate::rules::functions::FunctionVolatilityRule;
     use crate::rules::Rule;
+    use crate::rules::functions::FunctionVolatilityRule;
 
     #[test]
     fn test_rule_idempotency() {
@@ -221,7 +237,6 @@ mod rule_evaluation_tests {
                 .is_ok()
         );
     }
-
 
     #[test]
     fn test_rule_size_aware_toast_escalation() {
@@ -510,12 +525,13 @@ mod rule_evaluation_tests {
         let mut state = setup_state();
 
         engine
-            .analyze("DO $$ BEGIN EXECUTE 'DROP TABLE users'; END $$;", &mut state)
+            .analyze(
+                "DO $$ BEGIN EXECUTE 'DROP TABLE users'; END $$;",
+                &mut state,
+            )
             .unwrap();
 
-        let v = engine
-            .analyze("DROP TABLE t CASCADE;", &mut state)
-            .unwrap();
+        let v = engine.analyze("DROP TABLE t CASCADE;", &mut state).unwrap();
 
         assert!(
             v.iter().any(|v| v.tier == ViolationTier::Tier2),
@@ -523,8 +539,8 @@ mod rule_evaluation_tests {
             v
         );
         assert!(
-            v.iter().any(|v| v.reason.contains("[DOWNGRADED: confidence tainted by earlier opaque SQL, cannot guarantee this is unsafe]")),
-            "expected downgrade notice in titles: {:?}",
+            v.iter().all(|v| !v.reason.contains("DOWNGRADED")),
+            "expected no downgrade notice in reason: {:?}",
             v.iter().map(|v| &v.reason).collect::<Vec<_>>()
         );
     }
@@ -534,12 +550,21 @@ mod rule_evaluation_tests {
         let engine = setup_engine();
         let mut cache = crate::db::cache::DbCache::new();
         let tid = object_id("public", "t");
-        cache.insert_baseline(tid.clone(), RelationState::new(tid, object_id("public", "postgres"), 0, Some(10), RelationKind::Table, Persistence::Permanent, 0));
+        cache.insert_baseline(
+            tid.clone(),
+            RelationState::new(
+                tid,
+                object_id("public", "postgres"),
+                0,
+                Some(10),
+                RelationKind::Table,
+                Persistence::Permanent,
+                0,
+            ),
+        );
         let mut state = AnalysisState::new(cache);
 
-        let v = engine
-            .analyze("DROP TABLE t CASCADE;", &mut state)
-            .unwrap();
+        let v = engine.analyze("DROP TABLE t CASCADE;", &mut state).unwrap();
 
         assert!(
             v.iter().any(|v| v.tier == ViolationTier::Tier1),
@@ -558,10 +583,12 @@ mod rule_evaluation_tests {
         let engine = setup_engine();
         let mut state = setup_state();
 
-        let v = engine.analyze(
-            "CREATE POLICY p ON t AS RESTRICTIVE FOR SELECT TO public USING (true);",
-            &mut state,
-        ).unwrap();
+        let v = engine
+            .analyze(
+                "CREATE POLICY p ON t AS RESTRICTIVE FOR SELECT TO public USING (true);",
+                &mut state,
+            )
+            .unwrap();
 
         assert!(v.iter().any(|v| v.rule_id == "restrictive-policy"));
     }
@@ -571,10 +598,9 @@ mod rule_evaluation_tests {
         let engine = setup_engine();
         let mut state = setup_state();
 
-        let v = engine.analyze(
-            "ALTER TABLE t DISABLE TRIGGER tr;",
-            &mut state,
-        ).unwrap();
+        let v = engine
+            .analyze("ALTER TABLE t DISABLE TRIGGER tr;", &mut state)
+            .unwrap();
 
         assert!(v.iter().any(|v| v.rule_id == "disable-trigger"));
     }
@@ -584,12 +610,13 @@ mod rule_evaluation_tests {
         let engine = setup_engine();
         let mut state = setup_state();
 
-        engine.analyze("CREATE TABLE t(id int);", &mut state).unwrap();
+        engine
+            .analyze("CREATE TABLE t(id int);", &mut state)
+            .unwrap();
 
-        let v = engine.analyze(
-            "GRANT ALL ON t TO public;",
-            &mut state,
-        ).unwrap();
+        let v = engine
+            .analyze("GRANT ALL ON t TO public;", &mut state)
+            .unwrap();
 
         assert!(v.iter().any(|v| v.rule_id == "overbroad-grant"));
     }
@@ -634,11 +661,21 @@ mod rule_evaluation_tests {
         let mut state = AnalysisState::new(cache);
 
         // test ADD COLUMN
-        let v = engine.analyze("ALTER TABLE t ADD COLUMN new_col int DEFAULT random();", &mut state).unwrap();
+        let v = engine
+            .analyze(
+                "ALTER TABLE t ADD COLUMN new_col int DEFAULT random();",
+                &mut state,
+            )
+            .unwrap();
         assert!(v.iter().any(|v| v.rule_id == "volatile-default"));
 
         // test SET DEFAULT
-        let v2 = engine.analyze("ALTER TABLE t ALTER COLUMN new_col SET DEFAULT random();", &mut state).unwrap();
+        let v2 = engine
+            .analyze(
+                "ALTER TABLE t ALTER COLUMN new_col SET DEFAULT random();",
+                &mut state,
+            )
+            .unwrap();
         assert!(v2.iter().any(|v| v.rule_id == "volatile-default"));
     }
 
@@ -660,10 +697,7 @@ mod rule_evaluation_tests {
 
         // Alter volatility
         let v = engine
-            .analyze(
-                "ALTER FUNCTION add(int, int) VOLATILE;",
-                &mut state,
-            )
+            .analyze("ALTER FUNCTION add(int, int) VOLATILE;", &mut state)
             .unwrap();
 
         assert!(
@@ -687,10 +721,7 @@ mod rule_evaluation_tests {
 
         // Alter the function with same volatility (no change)
         let v = engine
-            .analyze(
-                "ALTER FUNCTION stable_func() STABLE;",
-                &mut state,
-            )
+            .analyze("ALTER FUNCTION stable_func() STABLE;", &mut state)
             .unwrap();
 
         assert!(
@@ -716,10 +747,7 @@ mod rule_evaluation_tests {
 
         // ALTER FUNCTION ... SET SCHEMA should work without volatility violation
         let v = engine
-            .analyze(
-                "ALTER FUNCTION my_func() SET SCHEMA myschema;",
-                &mut state,
-            )
+            .analyze("ALTER FUNCTION my_func() SET SCHEMA myschema;", &mut state)
             .unwrap();
 
         assert!(
@@ -733,18 +761,24 @@ mod rule_evaluation_tests {
         let engine = setup_engine();
         let mut state = setup_state();
 
-        engine.analyze("CREATE SCHEMA myschema;", &mut state).unwrap();
-        engine.analyze("SET search_path TO myschema, public;", &mut state).unwrap();
+        engine
+            .analyze("CREATE SCHEMA myschema;", &mut state)
+            .unwrap();
+        engine
+            .analyze("SET search_path TO myschema, public;", &mut state)
+            .unwrap();
         engine.analyze(
             "CREATE FUNCTION myschema.my_overloaded_func(x integer) RETURNS int LANGUAGE plpgsql IMMUTABLE AS 'BEGIN RETURN x; END';",
             &mut state
         ).unwrap();
 
         // Resolve function using search path and alter it
-        let v = engine.analyze(
-            "ALTER FUNCTION my_overloaded_func(integer) IMMUTABLE;",
-            &mut state
-        ).unwrap();
+        let v = engine
+            .analyze(
+                "ALTER FUNCTION my_overloaded_func(integer) IMMUTABLE;",
+                &mut state,
+            )
+            .unwrap();
 
         assert!(v.is_empty());
         let target_id = ObjectId::new("myschema", "my_overloaded_func(integer)");
@@ -817,11 +851,15 @@ mod rule_evaluation_tests {
             .unwrap();
 
         assert!(
-            v.iter().any(|violation| violation.rule_id == "broken-compute"),
+            v.iter()
+                .any(|violation| violation.rule_id == "broken-compute"),
             "Dropping a function used by a trigger should fire 'broken-compute' rule"
         );
 
-        let violation = v.iter().find(|violation| violation.rule_id == "broken-compute").unwrap();
+        let violation = v
+            .iter()
+            .find(|violation| violation.rule_id == "broken-compute")
+            .unwrap();
         assert_eq!(violation.tier, ViolationTier::Tier1);
         assert!(violation.reason.contains("trg_events"));
         assert!(violation.reason.contains("events"));
@@ -876,28 +914,29 @@ mod rule_evaluation_tests {
 
     #[test]
     fn test_rule_concurrent_index_outside_transaction() {
-
         let engine = setup_engine();
         let mut state = setup_state();
-        
+
         state.baseline_relations.insert(object_id("public", "t"));
         state.local.relations.insert(
-            object_id("public", "t"), 
-            crate::model::relation::RelationOverlay::Present(crate::model::relation::RelationState::new(
-                object_id("public", "t"), 
-                object_id("public", "postgres"), 
-                0, 
-                Some(500_000), 
-                crate::model::relation::RelationKind::Table, 
-                crate::model::relation::Persistence::Permanent, 
-                0
-            ))
+            object_id("public", "t"),
+            crate::model::relation::RelationOverlay::Present(
+                crate::model::relation::RelationState::new(
+                    object_id("public", "t"),
+                    object_id("public", "postgres"),
+                    0,
+                    Some(500_000),
+                    crate::model::relation::RelationKind::Table,
+                    crate::model::relation::Persistence::Permanent,
+                    0,
+                ),
+            ),
         );
-        
+
         let v1 = engine
             .analyze("CREATE INDEX i ON t(id);", &mut state)
             .unwrap();
-            
+
         assert!(v1.iter().any(|v| v.rule_id == "require-concurrent-index"));
     }
 
@@ -928,7 +967,8 @@ mod rule_evaluation_tests {
         let v = engine.analyze("DROP INDEX i;", &mut state).unwrap();
 
         assert!(
-            v.iter().any(|v| v.rule_id == "require-concurrent-drop-index"),
+            v.iter()
+                .any(|v| v.rule_id == "require-concurrent-drop-index"),
             "Non-concurrent DROP INDEX on large table should be flagged"
         );
     }
@@ -960,7 +1000,8 @@ mod rule_evaluation_tests {
         let v = engine.analyze("DROP INDEX i;", &mut state).unwrap();
 
         assert!(
-            v.iter().any(|v| v.rule_id == "require-concurrent-drop-index"),
+            v.iter()
+                .any(|v| v.rule_id == "require-concurrent-drop-index"),
             "Small table DROP INDEX should still be flagged at Tier3 or not at all"
         );
     }
@@ -970,17 +1011,24 @@ mod rule_evaluation_tests {
 mod reversibility_tests {
     use super::helpers::*;
     use crate::analysis::state::AnalysisState;
-    use crate::model::relation::{RelationKind, RelationState, Persistence};
     use crate::ast::identifiers::ObjectId;
+    use crate::model::relation::{Persistence, RelationKind, RelationState};
     use crate::report::violations::ViolationTier;
 
     #[test]
     fn test_reversibility_drop_column_empty_table() {
         let engine = setup_engine();
         let mut state = setup_state();
-        engine.analyze("CREATE TABLE t(id INT);", &mut state).unwrap();
-        let v = engine.analyze("ALTER TABLE t DROP COLUMN id;", &mut state).unwrap();
-        assert!(v.iter().any(|violation| violation.tier == ViolationTier::Tier3));
+        engine
+            .analyze("CREATE TABLE t(id INT);", &mut state)
+            .unwrap();
+        let v = engine
+            .analyze("ALTER TABLE t DROP COLUMN id;", &mut state)
+            .unwrap();
+        assert!(
+            v.iter()
+                .any(|violation| violation.tier == ViolationTier::Tier3)
+        );
     }
 
     #[test]
@@ -988,10 +1036,26 @@ mod reversibility_tests {
         let engine = setup_engine();
         let mut cache = crate::db::cache::DbCache::new();
         let tid = object_id("public", "t");
-        cache.insert_baseline(tid.clone(), RelationState::new(tid, object_id("public", "postgres"), 0, Some(10), RelationKind::Table, Persistence::Permanent, 0));
+        cache.insert_baseline(
+            tid.clone(),
+            RelationState::new(
+                tid,
+                object_id("public", "postgres"),
+                0,
+                Some(10),
+                RelationKind::Table,
+                Persistence::Permanent,
+                0,
+            ),
+        );
         let mut state = AnalysisState::new(cache);
-        let v = engine.analyze("ALTER TABLE t DROP COLUMN id;", &mut state).unwrap();
-        assert!(v.iter().any(|violation| violation.tier == ViolationTier::Tier1));
+        let v = engine
+            .analyze("ALTER TABLE t DROP COLUMN id;", &mut state)
+            .unwrap();
+        assert!(
+            v.iter()
+                .any(|violation| violation.tier == ViolationTier::Tier1)
+        );
     }
 
     #[test]
@@ -999,14 +1063,34 @@ mod reversibility_tests {
         let engine = setup_engine();
         let mut cache = crate::db::cache::DbCache::new();
         let tid = object_id("public", "t");
-        cache.insert_baseline(tid.clone(), RelationState::new(tid, object_id("public", "postgres"), 0, Some(10), RelationKind::Table, Persistence::Permanent, 0));
+        cache.insert_baseline(
+            tid.clone(),
+            RelationState::new(
+                tid,
+                object_id("public", "postgres"),
+                0,
+                Some(10),
+                RelationKind::Table,
+                Persistence::Permanent,
+                0,
+            ),
+        );
         let mut state = AnalysisState::new(cache);
 
         // Run BEGIN; ADD COLUMN; DROP COLUMN; COMMIT;
-        let v = engine.analyze("BEGIN; ALTER TABLE t ADD COLUMN val int; ALTER TABLE t DROP COLUMN val; COMMIT;", &mut state).unwrap();
+        let v = engine
+            .analyze(
+                "BEGIN; ALTER TABLE t ADD COLUMN val int; ALTER TABLE t DROP COLUMN val; COMMIT;",
+                &mut state,
+            )
+            .unwrap();
 
         // DROP COLUMN should be Tier3, not Tier1
-        assert!(v.iter().all(|violation| violation.rule_id != "irreversible-migration" || violation.tier != ViolationTier::Tier1));
+        assert!(
+            v.iter()
+                .all(|violation| violation.rule_id != "irreversible-migration"
+                    || violation.tier != ViolationTier::Tier1)
+        );
     }
 
     #[test]
@@ -1014,18 +1098,36 @@ mod reversibility_tests {
         let engine = setup_engine();
         let mut cache = crate::db::cache::DbCache::new();
         let tid = object_id("public", "t");
-        cache.insert_baseline(tid.clone(), RelationState::new(tid, object_id("public", "postgres"), 0, Some(10), RelationKind::Table, Persistence::Permanent, 0));
+        cache.insert_baseline(
+            tid.clone(),
+            RelationState::new(
+                tid,
+                object_id("public", "postgres"),
+                0,
+                Some(10),
+                RelationKind::Table,
+                Persistence::Permanent,
+                0,
+            ),
+        );
         let mut state = AnalysisState::new(cache);
         let v = engine.analyze("DROP TABLE t;", &mut state).unwrap();
-        assert!(v.iter().any(|violation| violation.tier == ViolationTier::Tier1));
+        assert!(
+            v.iter()
+                .any(|violation| violation.tier == ViolationTier::Tier1)
+        );
     }
 
     #[test]
     fn test_reversibility_rename_table() {
         let engine = setup_engine();
         let mut state = setup_state();
-        engine.analyze("CREATE TABLE t(id INT);", &mut state).unwrap();
-        let v = engine.analyze("ALTER TABLE t RENAME TO t2;", &mut state).unwrap();
+        engine
+            .analyze("CREATE TABLE t(id INT);", &mut state)
+            .unwrap();
+        let v = engine
+            .analyze("ALTER TABLE t RENAME TO t2;", &mut state)
+            .unwrap();
         assert!(v.is_empty());
     }
 
@@ -1033,13 +1135,20 @@ mod reversibility_tests {
     fn test_reversibility_add_nullable_column_no_default() {
         let engine = setup_engine();
         let mut state = setup_state();
-        engine.analyze("CREATE TABLE t(id INT);", &mut state).unwrap();
-        let v = engine.analyze("ALTER TABLE t ADD COLUMN name TEXT;", &mut state).unwrap();
+        engine
+            .analyze("CREATE TABLE t(id INT);", &mut state)
+            .unwrap();
+        let v = engine
+            .analyze("ALTER TABLE t ADD COLUMN name TEXT;", &mut state)
+            .unwrap();
         // This is safe, hence reversibility rule shouldn't emit violation.
         // It might be caught by TypeChangeRewriteRule? No, it's AddColumn.
         // The ReversibilityRule itself checks `classify`.
         // If classify returns Reversible, v will be empty.
-        assert!(v.iter().all(|violation| violation.rule_id != "irreversible-migration"));
+        assert!(
+            v.iter()
+                .all(|violation| violation.rule_id != "irreversible-migration")
+        );
     }
 
     #[test]
@@ -1047,19 +1156,37 @@ mod reversibility_tests {
         let engine = setup_engine();
         let mut cache = crate::db::cache::DbCache::new();
         let tid = object_id("public", "t");
-        let mut rel = RelationState::new(tid.clone(), object_id("public", "postgres"), 0, Some(10), RelationKind::Table, Persistence::Permanent, 0);
-        rel.apply_column_action(&crate::model::relation::ColumnAction::Add { name: "val".to_string(), data_type: Some("int".to_string()), not_null: false, default: None });
+        let mut rel = RelationState::new(
+            tid.clone(),
+            object_id("public", "postgres"),
+            0,
+            Some(10),
+            RelationKind::Table,
+            Persistence::Permanent,
+            0,
+        );
+        rel.apply_column_action(&crate::model::relation::ColumnAction::Add {
+            name: "val".to_string(),
+            data_type: Some("int".to_string()),
+            not_null: false,
+            default: None,
+        });
         cache.insert_baseline(tid, rel);
         let mut state = AnalysisState::new(cache);
-        
+
         // Run analysis
-        let v = engine.analyze("ALTER TABLE t ALTER COLUMN val TYPE bigint;", &mut state).unwrap();
-        
-        // Widening int -> bigint is safe. 
-        // NOTE: We do not check for empty violations because TypeChangeRewriteRule 
+        let v = engine
+            .analyze("ALTER TABLE t ALTER COLUMN val TYPE bigint;", &mut state)
+            .unwrap();
+
+        // Widening int -> bigint is safe.
+        // NOTE: We do not check for empty violations because TypeChangeRewriteRule
         // might still flag it, but the ReversibilityRule (the rule being tested)
         // MUST NOT flag it.
-        assert!(v.iter().all(|viol| viol.rule_id != "irreversible-migration"));
+        assert!(
+            v.iter()
+                .all(|viol| viol.rule_id != "irreversible-migration")
+        );
     }
 
     #[test]
@@ -1067,14 +1194,32 @@ mod reversibility_tests {
         let engine = setup_engine();
         let mut cache = crate::db::cache::DbCache::new();
         let tid = object_id("public", "t");
-        let mut rel = RelationState::new(tid.clone(), object_id("public", "postgres"), 0, Some(10), RelationKind::Table, Persistence::Permanent, 0);
-        rel.apply_column_action(&crate::model::relation::ColumnAction::Add { name: "val".to_string(), data_type: Some("bigint".to_string()), not_null: false, default: None });
+        let mut rel = RelationState::new(
+            tid.clone(),
+            object_id("public", "postgres"),
+            0,
+            Some(10),
+            RelationKind::Table,
+            Persistence::Permanent,
+            0,
+        );
+        rel.apply_column_action(&crate::model::relation::ColumnAction::Add {
+            name: "val".to_string(),
+            data_type: Some("bigint".to_string()),
+            not_null: false,
+            default: None,
+        });
         cache.insert_baseline(tid, rel);
         let mut state = AnalysisState::new(cache);
         // Narrowing bigint -> int is unsafe
-        let v = engine.analyze("ALTER TABLE t ALTER COLUMN val TYPE int;", &mut state).unwrap();
+        let v = engine
+            .analyze("ALTER TABLE t ALTER COLUMN val TYPE int;", &mut state)
+            .unwrap();
         // This should be flagged as conditionally reversible by ReversibilityRule
-        assert!(v.iter().any(|violation| violation.rule_id == "irreversible-migration"));
+        assert!(
+            v.iter()
+                .any(|violation| violation.rule_id == "irreversible-migration")
+        );
     }
 }
 
@@ -1328,7 +1473,9 @@ mod state_mutation_tests {
         assert!(state.local.publications.contains_key("p"));
         assert!(state.local.subscriptions.contains_key("s"));
 
-        engine.analyze("DROP PUBLICATION p; DROP SUBSCRIPTION s;", &mut state).unwrap();
+        engine
+            .analyze("DROP PUBLICATION p; DROP SUBSCRIPTION s;", &mut state)
+            .unwrap();
 
         assert!(matches!(
             state.local.publications.get("p"),
@@ -1372,13 +1519,21 @@ mod state_mutation_tests {
         let engine = setup_engine();
         let mut state = setup_state();
 
-        engine.analyze("CREATE PUBLICATION pub FOR TABLE t1, t2;", &mut state).unwrap();
+        engine
+            .analyze("CREATE PUBLICATION pub FOR TABLE t1, t2;", &mut state)
+            .unwrap();
         assert!(state.local.publications.contains_key("pub"));
 
         let deps = &state.local.graph.publication_dependencies;
         assert_eq!(deps.len(), 2);
-        assert!(deps.iter().any(|d| d.publication_name == "pub" && d.table_id == object_id("public", "t1")));
-        assert!(deps.iter().any(|d| d.publication_name == "pub" && d.table_id == object_id("public", "t2")));
+        assert!(
+            deps.iter()
+                .any(|d| d.publication_name == "pub" && d.table_id == object_id("public", "t1"))
+        );
+        assert!(
+            deps.iter()
+                .any(|d| d.publication_name == "pub" && d.table_id == object_id("public", "t2"))
+        );
     }
 
     #[test]
@@ -1386,7 +1541,12 @@ mod state_mutation_tests {
         let engine = setup_engine();
         let mut state = setup_state();
 
-        engine.analyze("CREATE SUBSCRIPTION sub CONNECTION 'host=localhost' PUBLICATION pub;", &mut state).unwrap();
+        engine
+            .analyze(
+                "CREATE SUBSCRIPTION sub CONNECTION 'host=localhost' PUBLICATION pub;",
+                &mut state,
+            )
+            .unwrap();
         assert!(state.local.subscriptions.contains_key("sub"));
     }
 
@@ -1401,8 +1561,12 @@ mod state_mutation_tests {
         assert!(state.local.roles.contains_key(&role_id));
 
         // Alter
-        engine.analyze("ALTER ROLE app_user WITH INHERIT;", &mut state).unwrap();
-        if let Some(crate::model::role::RoleOverlay::Present(role)) = state.local.roles.get(&role_id) {
+        engine
+            .analyze("ALTER ROLE app_user WITH INHERIT;", &mut state)
+            .unwrap();
+        if let Some(crate::model::role::RoleOverlay::Present(role)) =
+            state.local.roles.get(&role_id)
+        {
             assert!(role.can_login);
         } else {
             panic!("role app_user should be present");
@@ -1410,7 +1574,10 @@ mod state_mutation_tests {
 
         // Drop
         engine.analyze("DROP ROLE app_user;", &mut state).unwrap();
-        assert!(matches!(state.local.roles.get(&role_id), Some(crate::model::role::RoleOverlay::Dropped)));
+        assert!(matches!(
+            state.local.roles.get(&role_id),
+            Some(crate::model::role::RoleOverlay::Dropped)
+        ));
     }
 
     #[test]
@@ -1418,7 +1585,12 @@ mod state_mutation_tests {
         let engine = setup_engine();
         let mut state = setup_state();
 
-        engine.analyze("CREATE FUNCTION f(int) RETURNS int AS '...' LANGUAGE plpgsql;", &mut state).unwrap();
+        engine
+            .analyze(
+                "CREATE FUNCTION f(int) RETURNS int AS '...' LANGUAGE plpgsql;",
+                &mut state,
+            )
+            .unwrap();
         let id = object_id("public", "f(int)");
         assert!(state.local.functions.contains_key(&id));
     }
@@ -1428,7 +1600,12 @@ mod state_mutation_tests {
         let engine = setup_engine();
         let mut state = setup_state();
 
-        engine.analyze("CREATE PROCEDURE p(int) AS '...' LANGUAGE plpgsql;", &mut state).unwrap();
+        engine
+            .analyze(
+                "CREATE PROCEDURE p(int) AS '...' LANGUAGE plpgsql;",
+                &mut state,
+            )
+            .unwrap();
         let id = object_id("public", "p(int)");
         assert!(state.local.functions.contains_key(&id));
     }
@@ -1484,6 +1661,21 @@ mod state_mutation_tests {
     }
 
     #[test]
+    fn test_bug011_set_storage_multiple_spaces() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        assert!(
+            engine
+                .analyze(
+                    "CREATE TABLE t(id int); ALTER TABLE t ALTER COLUMN id SET    STORAGE MAIN;",
+                    &mut state,
+                )
+                .is_ok()
+        );
+    }
+
+    #[test]
     fn test_state_confidence_is_accessible() {
         let engine = setup_engine();
         let mut state = setup_state();
@@ -1526,9 +1718,18 @@ mod state_mutation_tests {
             .unwrap();
 
         assert!(state.relation_is_present(&object_id("public", "mv")));
-        assert!(state.local.graph.indexes.iter().any(|i| i.relation_id == object_id("public", "mv")));
+        assert!(
+            state
+                .local
+                .graph
+                .indexes
+                .iter()
+                .any(|i| i.relation_id == object_id("public", "mv"))
+        );
 
-        engine.analyze("DROP MATERIALIZED VIEW mv;", &mut state).unwrap();
+        engine
+            .analyze("DROP MATERIALIZED VIEW mv;", &mut state)
+            .unwrap();
         assert!(!state.relation_is_present(&object_id("public", "mv")));
         assert!(state.relation_is_present(&object_id("public", "t")));
     }
@@ -1540,7 +1741,9 @@ mod state_mutation_tests {
 
         // Should not taint when dropping nonexistent function with IF EXISTS
         assert_eq!(state.local.confidence, Confidence::Exact);
-        engine.analyze("DROP FUNCTION IF EXISTS missing_func();", &mut state).unwrap();
+        engine
+            .analyze("DROP FUNCTION IF EXISTS missing_func();", &mut state)
+            .unwrap();
         assert_eq!(state.local.confidence, Confidence::Exact);
     }
 
@@ -1550,7 +1753,9 @@ mod state_mutation_tests {
         let mut state = setup_state();
 
         assert_eq!(state.local.confidence, Confidence::Exact);
-        engine.analyze("DROP PROCEDURE IF EXISTS missing_proc();", &mut state).unwrap();
+        engine
+            .analyze("DROP PROCEDURE IF EXISTS missing_proc();", &mut state)
+            .unwrap();
         assert_eq!(state.local.confidence, Confidence::Exact);
     }
 
@@ -1561,13 +1766,20 @@ mod state_mutation_tests {
 
         // Create the publication first (it needs to exist before we alter it)
         // Then alter with a non-existent one will taint
-        engine.analyze("CREATE PUBLICATION existing_pub FOR ALL TABLES;", &mut state).unwrap();
+        engine
+            .analyze(
+                "CREATE PUBLICATION existing_pub FOR ALL TABLES;",
+                &mut state,
+            )
+            .unwrap();
         assert!(state.local.publications.contains_key("existing_pub"));
 
         // Alter a non-existent publication should taint
         // We catch this via the engine's resolve path which returns Opaque
         // This is already tested in the resolver - here we verify confidence
-        engine.analyze("ALTER PUBLICATION missing_pub SET TABLE t;", &mut state).unwrap();
+        engine
+            .analyze("ALTER PUBLICATION missing_pub SET TABLE t;", &mut state)
+            .unwrap();
         assert_eq!(state.local.confidence, Confidence::Tainted);
     }
 
@@ -1577,13 +1789,18 @@ mod state_mutation_tests {
         let mut state = setup_state();
 
         engine
-            .analyze("CREATE TABLE t(id int); GRANT SELECT ON t TO public;", &mut state)
+            .analyze(
+                "CREATE TABLE t(id int); GRANT SELECT ON t TO public;",
+                &mut state,
+            )
             .unwrap();
 
         assert!(state.relation_is_present(&object_id("public", "t")));
         assert_eq!(state.local.confidence, Confidence::Exact);
 
-        engine.analyze("REVOKE SELECT ON t FROM public;", &mut state).unwrap();
+        engine
+            .analyze("REVOKE SELECT ON t FROM public;", &mut state)
+            .unwrap();
         assert!(state.relation_is_present(&object_id("public", "t")));
     }
 }
@@ -1657,45 +1874,55 @@ mod transaction_lifecycle_tests {
     fn test_rename_propagation_rollback() {
         let engine = setup_engine();
         let mut cache = crate::db::cache::DbCache::new();
-        
+
         let t1_id = object_id("public", "t1");
         let v1_id = object_id("public", "v1");
-        
-        cache.insert_baseline(t1_id.clone(), crate::model::relation::RelationState::new(
+
+        cache.insert_baseline(
             t1_id.clone(),
-            object_id("public", "postgres"),
-            0,
-            Some(10),
-            crate::model::relation::RelationKind::Table,
-            crate::model::relation::Persistence::Permanent,
-            0,
-        ));
-        cache.insert_baseline(v1_id.clone(), crate::model::relation::RelationState::new(
+            crate::model::relation::RelationState::new(
+                t1_id.clone(),
+                object_id("public", "postgres"),
+                0,
+                Some(10),
+                crate::model::relation::RelationKind::Table,
+                crate::model::relation::Persistence::Permanent,
+                0,
+            ),
+        );
+        cache.insert_baseline(
             v1_id.clone(),
-            object_id("public", "postgres"),
-            0,
-            Some(1),
-            crate::model::relation::RelationKind::View,
-            crate::model::relation::Persistence::Permanent,
-            0,
-        ));
-        
+            crate::model::relation::RelationState::new(
+                v1_id.clone(),
+                object_id("public", "postgres"),
+                0,
+                Some(1),
+                crate::model::relation::RelationKind::View,
+                crate::model::relation::Persistence::Permanent,
+                0,
+            ),
+        );
+
         let mut state = AnalysisState::new(cache);
-        
-        state.local.graph.views.push(crate::analysis::graph::ViewEdge {
-            view_id: v1_id.clone(),
-            depends_on: vec![t1_id.clone()],
-            view_generation: 0,
-        });
-        
+
+        state
+            .local
+            .graph
+            .views
+            .push(crate::analysis::graph::ViewEdge {
+                view_id: v1_id.clone(),
+                depends_on: vec![t1_id.clone()],
+                view_generation: 0,
+            });
+
         // Assert initial view dependency points to t1
         assert_eq!(state.local.graph.views[0].depends_on[0], t1_id);
-        
+
         // Run rename under transaction and rollback
         engine
             .analyze("BEGIN; ALTER TABLE t1 RENAME TO t2; ROLLBACK;", &mut state)
             .unwrap();
-            
+
         // Check that table name is restored to t1, and the view dependency is restored to t1
         assert!(state.relation_is_present(&t1_id));
         assert!(!state.relation_is_present(&object_id("public", "t2")));
@@ -1887,9 +2114,7 @@ mod destructive_rule_tests {
             .unwrap();
 
         // Drop view with cascade
-        let v = engine
-            .analyze("DROP VIEW v CASCADE;", &mut state)
-            .unwrap();
+        let v = engine.analyze("DROP VIEW v CASCADE;", &mut state).unwrap();
 
         assert!(
             v.iter().any(|v| v.rule_id == "destructive-general-cascade"),
@@ -1918,7 +2143,10 @@ mod destructive_rule_tests {
         let mut state = setup_state();
 
         let v = engine
-            .analyze("CREATE TABLE backup AS SELECT * FROM source_table;", &mut state)
+            .analyze(
+                "CREATE TABLE backup AS SELECT * FROM source_table;",
+                &mut state,
+            )
             .unwrap();
 
         assert!(
@@ -1991,7 +2219,10 @@ mod destructive_rule_tests {
         let mut state = AnalysisState::new(cache);
 
         let v = engine
-            .analyze("ALTER TABLE t ALTER COLUMN val TYPE varchar(10);", &mut state)
+            .analyze(
+                "ALTER TABLE t ALTER COLUMN val TYPE varchar(10);",
+                &mut state,
+            )
             .unwrap();
 
         assert!(
@@ -2034,11 +2265,15 @@ mod destructive_rule_tests {
         // Already has baseline column with type_modifier=259 (varchar(255))
         // Now try narrowing to varchar(50): atttypmod = 50 + 4 = 54
         let v = engine
-            .analyze("ALTER TABLE t ALTER COLUMN data TYPE varchar(50);", &mut state)
+            .analyze(
+                "ALTER TABLE t ALTER COLUMN data TYPE varchar(50);",
+                &mut state,
+            )
             .unwrap();
 
         assert!(
-            v.iter().any(|v| v.rule_id == "type-change-rewrite" && v.reason.contains("narrows")),
+            v.iter()
+                .any(|v| v.rule_id == "type-change-rewrite" && v.reason.contains("narrows")),
             "255→50 should be flagged as lossy VARCHAR narrowing"
         );
 
@@ -2066,7 +2301,10 @@ mod destructive_rule_tests {
         let mut state2 = AnalysisState::new(cache2);
 
         let v2 = engine
-            .analyze("ALTER TABLE t ALTER COLUMN data TYPE varchar(255);", &mut state2)
+            .analyze(
+                "ALTER TABLE t ALTER COLUMN data TYPE varchar(255);",
+                &mut state2,
+            )
             .unwrap();
 
         // Should NOT be flagged as a rewrite
@@ -2185,20 +2423,40 @@ mod destructive_rule_tests {
         let mut state = setup_state();
 
         // 1. DROP INDEX
-        let v = engine.analyze("DROP INDEX nonexistent_idx;", &mut state).unwrap();
-        assert!(v.iter().any(|v| v.rule_id == "schema-drift" && v.reason.contains("index")));
+        let v = engine
+            .analyze("DROP INDEX nonexistent_idx;", &mut state)
+            .unwrap();
+        assert!(
+            v.iter()
+                .any(|v| v.rule_id == "schema-drift" && v.reason.contains("index"))
+        );
 
         // 2. DROP SEQUENCE
-        let v = engine.analyze("DROP SEQUENCE nonexistent_seq;", &mut state).unwrap();
-        assert!(v.iter().any(|v| v.rule_id == "schema-drift" && v.reason.contains("sequence")));
+        let v = engine
+            .analyze("DROP SEQUENCE nonexistent_seq;", &mut state)
+            .unwrap();
+        assert!(
+            v.iter()
+                .any(|v| v.rule_id == "schema-drift" && v.reason.contains("sequence"))
+        );
 
         // 3. ALTER TYPE
-        let v = engine.analyze("ALTER TYPE nonexistent_type ADD VALUE 'val';", &mut state).unwrap();
-        assert!(v.iter().any(|v| v.rule_id == "schema-drift" && v.reason.contains("type")));
+        let v = engine
+            .analyze("ALTER TYPE nonexistent_type ADD VALUE 'val';", &mut state)
+            .unwrap();
+        assert!(
+            v.iter()
+                .any(|v| v.rule_id == "schema-drift" && v.reason.contains("type"))
+        );
 
         // 4. ALTER FUNCTION
-        let v = engine.analyze("ALTER FUNCTION nonexistent_func() IMMUTABLE;", &mut state).unwrap();
-        assert!(v.iter().any(|v| v.rule_id == "schema-drift" && v.reason.contains("function")));
+        let v = engine
+            .analyze("ALTER FUNCTION nonexistent_func() IMMUTABLE;", &mut state)
+            .unwrap();
+        assert!(
+            v.iter()
+                .any(|v| v.rule_id == "schema-drift" && v.reason.contains("function"))
+        );
     }
 
     #[test]
@@ -2237,7 +2495,8 @@ mod destructive_rule_tests {
         // For small tables, it should be Tier2 (not escalated)
         if let Some(viol) = v.iter().find(|v| v.rule_id == "type-change-rewrite") {
             assert_eq!(
-                viol.tier, ViolationTier::Tier2,
+                viol.tier,
+                ViolationTier::Tier2,
                 "Small table unsafe type change should be Tier2"
             );
         }
@@ -2892,12 +3151,22 @@ mod chain_execution_tests {
         let mut state = setup_state();
 
         let files = vec![
-            ("V1__create.sql".to_string(), "CREATE TABLE IF NOT EXISTS users (id INT);".to_string()),
-            ("V2__alter.sql".to_string(), "ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT;".to_string()),
+            (
+                "V1__create.sql".to_string(),
+                "CREATE TABLE IF NOT EXISTS users (id INT);".to_string(),
+            ),
+            (
+                "V2__alter.sql".to_string(),
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT;".to_string(),
+            ),
         ];
 
         let violations = engine.analyze_chain(&files, &mut state).unwrap();
-        assert!(violations.is_empty(), "Expected no violations, got: {:?}", violations);
+        assert!(
+            violations.is_empty(),
+            "Expected no violations, got: {:?}",
+            violations
+        );
 
         let rel = state.get_relation(&object_id("public", "users")).unwrap();
         if let RelationOverlay::Present(r) = rel {
@@ -2914,13 +3183,26 @@ mod chain_execution_tests {
         let mut state = setup_state();
 
         let files = vec![
-            ("V1__base.sql".to_string(), "CREATE TABLE IF NOT EXISTS orders (id INT);".to_string()),
-            ("V2__rename.sql".to_string(), "ALTER TABLE orders RENAME TO purchases;".to_string()),
-            ("V3__post_rename.sql".to_string(), "ALTER TABLE purchases ADD COLUMN IF NOT EXISTS total NUMERIC;".to_string()),
+            (
+                "V1__base.sql".to_string(),
+                "CREATE TABLE IF NOT EXISTS orders (id INT);".to_string(),
+            ),
+            (
+                "V2__rename.sql".to_string(),
+                "ALTER TABLE orders RENAME TO purchases;".to_string(),
+            ),
+            (
+                "V3__post_rename.sql".to_string(),
+                "ALTER TABLE purchases ADD COLUMN IF NOT EXISTS total NUMERIC;".to_string(),
+            ),
         ];
 
         let violations = engine.analyze_chain(&files, &mut state).unwrap();
-        assert!(violations.is_empty(), "Expected no violations, got: {:?}", violations);
+        assert!(
+            violations.is_empty(),
+            "Expected no violations, got: {:?}",
+            violations
+        );
 
         assert!(!state.relation_is_present(&object_id("public", "orders")));
         assert!(state.relation_is_present(&object_id("public", "purchases")));
@@ -2941,9 +3223,18 @@ mod chain_execution_tests {
         let mut state = setup_state();
 
         let files = vec![
-            ("V1__create.sql".to_string(), "CREATE TABLE products (id INT);".to_string()),
-            ("V2__add_price.sql".to_string(), "ALTER TABLE products ADD COLUMN price INT;".to_string()),
-            ("V3__change_price.sql".to_string(), "ALTER TABLE products ADD COLUMN price TEXT;".to_string()),
+            (
+                "V1__create.sql".to_string(),
+                "CREATE TABLE products (id INT);".to_string(),
+            ),
+            (
+                "V2__add_price.sql".to_string(),
+                "ALTER TABLE products ADD COLUMN price INT;".to_string(),
+            ),
+            (
+                "V3__change_price.sql".to_string(),
+                "ALTER TABLE products ADD COLUMN price TEXT;".to_string(),
+            ),
         ];
 
         let violations = engine.analyze_chain(&files, &mut state).unwrap();
@@ -2959,7 +3250,9 @@ mod chain_execution_tests {
             violations
         );
 
-        let conflict = conflict_violations.iter().find(|v| v.tier == ViolationTier::Tier1);
+        let conflict = conflict_violations
+            .iter()
+            .find(|v| v.tier == ViolationTier::Tier1);
         assert!(conflict.is_some(), "Conflict should be Tier1");
         assert!(
             conflict.unwrap().reason.contains("price"),
@@ -2981,9 +3274,18 @@ mod chain_execution_tests {
         let mut state = setup_state();
 
         let files = vec![
-            ("V1__create.sql".to_string(), "CREATE TABLE IF NOT EXISTS items (id INT);".to_string()),
-            ("V1__add.sql".to_string(), "ALTER TABLE items ADD COLUMN IF NOT EXISTS code TEXT;".to_string()),
-            ("V2__idempotent.sql".to_string(), "ALTER TABLE items ADD COLUMN IF NOT EXISTS code TEXT;".to_string()),
+            (
+                "V1__create.sql".to_string(),
+                "CREATE TABLE IF NOT EXISTS items (id INT);".to_string(),
+            ),
+            (
+                "V1__add.sql".to_string(),
+                "ALTER TABLE items ADD COLUMN IF NOT EXISTS code TEXT;".to_string(),
+            ),
+            (
+                "V2__idempotent.sql".to_string(),
+                "ALTER TABLE items ADD COLUMN IF NOT EXISTS code TEXT;".to_string(),
+            ),
         ];
 
         let violations = engine.analyze_chain(&files, &mut state).unwrap();
@@ -3007,5 +3309,495 @@ mod chain_execution_tests {
         } else {
             panic!("items table should be present");
         }
+    }
+}
+
+#[cfg(test)]
+mod phase10_bug_fixes_and_sorting_tests {
+    use super::helpers::*;
+    use crate::analysis::state::AnalysisState;
+    use crate::ast::identifiers::ObjectId;
+    use crate::db::cache::DbCache;
+    use crate::model::relation::{Persistence, RelationKind, RelationOverlay};
+    use crate::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
+
+    #[test]
+    fn test_bug008_index_not_in_baseline_relations() {
+        let mut cache = DbCache::new();
+        cache.indexes.push(crate::db::cache::IndexCache {
+            index_id: object_id("public", "idx_accounts_username"),
+            table_id: object_id("public", "accounts"),
+        });
+        let state = AnalysisState::new(cache);
+        assert!(
+            !state
+                .baseline_relations
+                .contains(&object_id("public", "idx_accounts_username"))
+        );
+    }
+
+    #[test]
+    fn test_bug008_index_in_baseline_indexes() {
+        let mut cache = DbCache::new();
+        cache.indexes.push(crate::db::cache::IndexCache {
+            index_id: object_id("public", "idx_accounts_username"),
+            table_id: object_id("public", "accounts"),
+        });
+        let state = AnalysisState::new(cache);
+        assert!(
+            state
+                .baseline_indexes
+                .contains(&object_id("public", "idx_accounts_username"))
+        );
+    }
+
+    #[test]
+    fn test_bug008_stale_stats_does_not_fire_on_index() {
+        let engine = setup_engine();
+        let mut cache = DbCache::new();
+        cache.insert_baseline(
+            object_id("public", "accounts"),
+            crate::model::relation::RelationState::new(
+                object_id("public", "accounts"),
+                ObjectId::new("public", "postgres"),
+                0,
+                Some(500_000),
+                RelationKind::Table,
+                Persistence::Permanent,
+                0,
+            ),
+        );
+        cache.indexes.push(crate::db::cache::IndexCache {
+            index_id: object_id("public", "idx_accounts_username"),
+            table_id: object_id("public", "accounts"),
+        });
+
+        let mut state = AnalysisState::new(cache);
+
+        let violations = engine
+            .analyze("DROP INDEX idx_accounts_username;", &mut state)
+            .unwrap();
+
+        for v in &violations {
+            if v.reason.contains("statistics are stale") {
+                assert!(
+                    !v.reason.contains("idx_accounts_username"),
+                    "Should not fire stale stats warning on the index itself"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_add_column_now_default_not_flagged() {
+        let engine = setup_engine();
+        let mut cache = DbCache::new();
+        cache.pg_version_num = Some(110000);
+        cache.insert_baseline(
+            object_id("public", "t"),
+            crate::model::relation::RelationState::new(
+                object_id("public", "t"),
+                ObjectId::new("public", "postgres"),
+                0,
+                Some(500_000),
+                RelationKind::Table,
+                Persistence::Permanent,
+                0,
+            ),
+        );
+
+        let mut state = AnalysisState::new(cache);
+
+        let violations = engine
+            .analyze(
+                "ALTER TABLE t ADD COLUMN created_at TIMESTAMP DEFAULT NOW();",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(
+            !violations
+                .iter()
+                .any(|v| v.rule_id == "size-aware-add-column"),
+            "Expected no size-aware-add-column violation for stable DEFAULT NOW() on PG11+, got: {:?}",
+            violations
+        );
+    }
+
+    #[test]
+    fn test_drop_index_no_stale_stats_warning() {
+        let engine = setup_engine();
+        let mut cache = DbCache::new();
+        cache.insert_baseline(
+            object_id("public", "t"),
+            crate::model::relation::RelationState::new(
+                object_id("public", "t"),
+                ObjectId::new("public", "postgres"),
+                0,
+                Some(500_000),
+                RelationKind::Table,
+                Persistence::Permanent,
+                0,
+            ),
+        );
+        cache.indexes.push(crate::db::cache::IndexCache {
+            index_id: object_id("public", "idx_t_id"),
+            table_id: object_id("public", "t"),
+        });
+
+        let mut state = AnalysisState::new(cache);
+
+        let violations = engine.analyze("DROP INDEX idx_t_id;", &mut state).unwrap();
+
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.rule_id == "require-concurrent-drop-index"),
+            "Expected require-concurrent-drop-index violation"
+        );
+
+        assert!(
+            !violations
+                .iter()
+                .any(|v| v.reason.contains("statistics are stale") || v.reason.contains("stale")),
+            "Should not emit stale statistics warning on DROP INDEX, got: {:?}",
+            violations
+        );
+    }
+
+    #[test]
+    fn test_deterministic_violation_sorting() {
+        let engine = setup_engine();
+
+        let mut cache = DbCache::new();
+        cache.insert_baseline(
+            object_id("public", "t"),
+            crate::model::relation::RelationState::new(
+                object_id("public", "t"),
+                ObjectId::new("public", "postgres"),
+                0,
+                Some(500_000),
+                RelationKind::Table,
+                Persistence::Permanent,
+                0,
+            ),
+        );
+        let mut state = AnalysisState::new(cache);
+
+        let sql = "CREATE INDEX idx2 ON t(a); CREATE INDEX idx1 ON t(b);";
+        let violations = engine.analyze(sql, &mut state).unwrap();
+
+        let idx_violations: Vec<&Violation> = violations
+            .iter()
+            .filter(|v| {
+                v.rule_id == "require-concurrent-index"
+                    && v.reason.contains("Synchronous index creation")
+            })
+            .collect();
+
+        assert_eq!(idx_violations.len(), 2);
+        assert_eq!(idx_violations[0].object_name, "public.idx2");
+        assert_eq!(idx_violations[1].object_name, "public.idx1");
+    }
+
+    #[test]
+    #[allow(clippy::useless_vec)]
+    fn test_manual_violation_sorting() {
+        let v_tier3 = Violation {
+            source_range: Some(rowan::TextRange::new(0.into(), 10.into())),
+            rule_id: "rule_a",
+            operation_kind: OperationKind::DropTable,
+            object_kind: ObjectKind::Table,
+            object_name: "a".to_string(),
+            tier: ViolationTier::Tier3,
+            reason: "tier 3".to_string(),
+            recipe: "recipe",
+            dedup_key: None,
+            sql: None,
+        };
+        let v_tier1 = Violation {
+            source_range: Some(rowan::TextRange::new(0.into(), 10.into())),
+            rule_id: "rule_b",
+            operation_kind: OperationKind::DropTable,
+            object_kind: ObjectKind::Table,
+            object_name: "b".to_string(),
+            tier: ViolationTier::Tier1,
+            reason: "tier 1".to_string(),
+            recipe: "recipe",
+            dedup_key: None,
+            sql: None,
+        };
+        let v_range_later = Violation {
+            source_range: Some(rowan::TextRange::new(20.into(), 30.into())),
+            rule_id: "rule_c",
+            operation_kind: OperationKind::DropTable,
+            object_kind: ObjectKind::Table,
+            object_name: "c".to_string(),
+            tier: ViolationTier::Tier1,
+            reason: "tier 1 later range".to_string(),
+            recipe: "recipe",
+            dedup_key: None,
+            sql: None,
+        };
+        let v_name_later = Violation {
+            source_range: Some(rowan::TextRange::new(0.into(), 10.into())),
+            rule_id: "rule_b",
+            operation_kind: OperationKind::DropTable,
+            object_kind: ObjectKind::Table,
+            object_name: "z".to_string(),
+            tier: ViolationTier::Tier1,
+            reason: "tier 1 name later".to_string(),
+            recipe: "recipe",
+            dedup_key: None,
+            sql: None,
+        };
+
+        let mut violations = vec![
+            v_tier3.clone(),
+            v_tier1.clone(),
+            v_range_later.clone(),
+            v_name_later.clone(),
+        ];
+
+        violations.sort_by(|a, b| {
+            a.tier
+                .cmp(&b.tier)
+                .then_with(|| match (&a.source_range, &b.source_range) {
+                    (Some(ar), Some(br)) => ar
+                        .start()
+                        .cmp(&br.start())
+                        .then_with(|| ar.end().cmp(&br.end())),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                })
+                .then_with(|| a.object_name.cmp(&b.object_name))
+                .then_with(|| a.rule_id.cmp(b.rule_id))
+        });
+
+        assert_eq!(violations[0].reason, "tier 1");
+        assert_eq!(violations[1].reason, "tier 1 name later");
+        assert_eq!(violations[2].reason, "tier 1 later range");
+        assert_eq!(violations[3].reason, "tier 3");
+    }
+
+    #[test]
+    fn test_source_range_excludes_preceding_comments() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let sql = "-- This is a preceding comment\n   /* block comment */\n   DROP DATABASE my_db;";
+        let violations = engine.analyze(sql, &mut state).unwrap();
+
+        assert!(
+            !violations.is_empty(),
+            "expected a violation for DROP DATABASE"
+        );
+        let v = &violations[0];
+        let range = v.source_range.expect("expected source_range to be set");
+
+        let expected_start = sql.find("DROP DATABASE").unwrap();
+        assert_eq!(usize::from(range.start()), expected_start);
+        assert_eq!(usize::from(range.end()), sql.len());
+    }
+
+    #[test]
+    fn test_bug003_broken_compute_fires_on_drop_function() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE FUNCTION notify_func(int, text) RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';",
+                &mut state,
+            )
+            .unwrap();
+
+        engine
+            .analyze(
+                "CREATE TABLE events(id int);
+                 CREATE TRIGGER trg_events AFTER INSERT ON events FOR EACH ROW EXECUTE FUNCTION notify_func();",
+                &mut state,
+            )
+            .unwrap();
+
+        // Dropping the function with hypothetical parameter types to test normalization
+        let v = engine
+            .analyze("DROP FUNCTION notify_func(int, text);", &mut state)
+            .unwrap();
+
+        assert!(
+            v.iter()
+                .any(|violation| violation.rule_id == "broken-compute"),
+            "Expected broken-compute violation when dropping function used by trigger, even with parameter list"
+        );
+    }
+
+    #[test]
+    fn test_bug004_concurrent_in_txn_skips_on_skipped_mutation() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE TABLE tbl(id int);
+                 CREATE INDEX idx_t ON tbl(id);",
+                &mut state,
+            )
+            .unwrap();
+
+        let v = engine
+            .analyze(
+                "BEGIN;
+                 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_t ON tbl(id);
+                 COMMIT;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(
+            !v.iter()
+                .any(|violation| violation.rule_id == "concurrent-in-transaction"),
+            "Expected no concurrent-in-transaction violation because the index already exists and statement was skipped"
+        );
+    }
+
+    #[test]
+    fn test_bug005_create_table_as_select_skips_on_skipped_mutation() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze("CREATE TABLE tbl(id int);", &mut state)
+            .unwrap();
+
+        let v = engine
+            .analyze("CREATE TABLE IF NOT EXISTS tbl AS SELECT 1;", &mut state)
+            .unwrap();
+
+        assert!(
+            !v.iter()
+                .any(|violation| violation.rule_id == "create-table-as-select"),
+            "Expected no create-table-as-select violation because the table already exists and statement was skipped"
+        );
+    }
+
+    #[test]
+    fn test_bug007_broken_compute_no_fire_on_skipped_drop() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let v = engine
+            .analyze("DROP FUNCTION IF EXISTS nonexistent_func();", &mut state)
+            .unwrap();
+
+        assert!(
+            !v.iter()
+                .any(|violation| violation.rule_id == "broken-compute"),
+            "Expected no broken-compute violation for nonexistent function"
+        );
+    }
+
+    #[test]
+    fn test_bug013_confidence_restored_on_rollback() {
+        let engine = setup_engine();
+        let mut cache = crate::db::cache::DbCache::new();
+        let tid = object_id("public", "t");
+        cache.insert_baseline(
+            tid.clone(),
+            crate::model::relation::RelationState::new(
+                tid.clone(),
+                object_id("public", "postgres"),
+                0,
+                Some(10),
+                crate::model::relation::RelationKind::Table,
+                crate::model::relation::Persistence::Permanent,
+                0,
+            ),
+        );
+        let mut state = AnalysisState::new(cache);
+
+        // Opaque statement (like DO block) inside transaction block, then ROLLBACK
+        engine
+            .analyze(
+                "BEGIN;
+                 DO $$ BEGIN END $$;
+                 ROLLBACK;",
+                &mut state,
+            )
+            .unwrap();
+
+        // Dropping table cascade which normally is Tier 1, but would be downgraded to Tier 2 if confidence is tainted.
+        let v = engine.analyze("DROP TABLE t CASCADE;", &mut state).unwrap();
+
+        assert!(
+            v.iter()
+                .any(|violation| violation.tier == crate::report::violations::ViolationTier::Tier1),
+            "Expected Tier1 because confidence should be restored to Exact after rollback"
+        );
+    }
+
+    #[test]
+    fn test_bug014_drop_schema_cascade_cleans_trigger_edges() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        // 1. Create schema, table, trigger function, trigger, and publication
+        engine
+            .analyze(
+                "CREATE SCHEMA s;
+                 CREATE FUNCTION s.notify_func() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';
+                 CREATE TABLE s.t1(id int);
+                 CREATE TRIGGER trg AFTER INSERT ON s.t1 FOR EACH ROW EXECUTE FUNCTION s.notify_func();
+                 CREATE PUBLICATION pub FOR TABLE s.t1;",
+                &mut state,
+            )
+            .unwrap();
+
+        // Verify trigger and publication edges are present
+        assert!(!state.local.graph.trigger_dependencies.is_empty());
+        assert!(!state.local.graph.publication_dependencies.is_empty());
+
+        // 2. Drop schema cascade
+        engine
+            .analyze("DROP SCHEMA s CASCADE;", &mut state)
+            .unwrap();
+
+        // Verify trigger and publication edges are cleaned up
+        assert!(state.local.graph.trigger_dependencies.is_empty());
+        assert!(state.local.graph.publication_dependencies.is_empty());
+
+        // 3. Drop a completely unrelated function (say public.unrelated())
+        engine
+            .analyze(
+                "CREATE FUNCTION unrelated() RETURNS void LANGUAGE plpgsql AS 'BEGIN END';",
+                &mut state,
+            )
+            .unwrap();
+
+        let v = engine
+            .analyze("DROP FUNCTION unrelated();", &mut state)
+            .unwrap();
+
+        assert!(
+            !v.iter()
+                .any(|violation| violation.rule_id == "broken-compute"),
+            "Expected no broken-compute violation for unrelated function after schema drop cascade"
+        );
+    }
+
+    #[test]
+    fn test_bug001_vacuum_full_all_tables() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let v = engine.analyze("VACUUM FULL;", &mut state).unwrap();
+
+        let violation = v
+            .iter()
+            .find(|v| v.rule_id == "vacuum-full")
+            .expect("Expected vacuum-full violation");
+
+        assert_eq!(violation.object_name, "<all tables>");
     }
 }

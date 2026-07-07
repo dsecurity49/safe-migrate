@@ -1,10 +1,10 @@
 // FILE: src/rules/conflict.rs
 
+use crate::analysis::mutations::Mutation;
 use crate::analysis::state::MutationResult;
 use crate::engine::config::Config;
-use crate::report::violations::{Violation, ViolationTier, OperationKind, ObjectKind};
+use crate::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
 use crate::rules::Rule;
-use crate::analysis::mutations::Mutation;
 
 pub struct ConflictRule;
 
@@ -45,6 +45,7 @@ impl Rule for ConflictRule {
     ) -> Vec<Violation> {
         match Self::extract_conflict_reason(result) {
             Some(reason) => vec![Violation {
+                source_range: None,
                 rule_id: Self::ID,
                 operation_kind: OperationKind::Other("conflict".to_string()),
                 object_kind: ObjectKind::Unknown,
@@ -53,7 +54,7 @@ impl Rule for ConflictRule {
                 reason: format!("Migration chain conflict: {}", reason),
                 recipe: Self::RECIPE,
                 dedup_key: None,
-                    sql: None,
+                sql: None,
             }],
             None => Vec::new(),
         }
@@ -71,7 +72,9 @@ mod tests {
     fn test_conflict_rule_emits_tier1_on_conflict() {
         let rule = ConflictRule;
         let result = MutationResult::Conflict {
-            reason: "column 'x' already added with type int, this file adds it again with type text".to_string(),
+            reason:
+                "column 'x' already added with type int, this file adds it again with type text"
+                    .to_string(),
         };
         let violations = rule.evaluate(
             &Mutation::Opaque(crate::analysis::mutations::OpaqueMutation::DynamicSql),
