@@ -2,12 +2,7 @@
 
 ## Status
 
-Inspection status: complete for all transaction control nodes.
-
-This document is derived from direct inspection of squawk.rs and should be treated as the
-current source of truth for safe-migrate transaction handling.
-
-All claims are AST-verified via grep and line-range inspection.
+Verified against squawk_syntax 2.58.0 — July 2026
 
 ---
 
@@ -71,7 +66,7 @@ The verified AST surface exposes:
 
 ## Begin
 
-### Verified Accessors (line 2693)
+### Verified Accessors (src/ast/generated/nodes.rs line 3394)
 
 ```rust
 pub fn transaction_mode_list(&self) -> Option<TransactionModeList>
@@ -112,7 +107,7 @@ Critical for safe-migrate: **statements that cannot run inside a transaction blo
 
 ## Commit
 
-### Verified Accessors (line 3656)
+### Verified Accessors (src/ast/generated/nodes.rs line 4426)
 
 ```rust
 pub fn literal(&self) -> Option<Literal>          // for COMMIT PREPARED 'gid'
@@ -120,6 +115,7 @@ pub fn semicolon_token(&self) -> Option<SyntaxToken>
 pub fn and_token(&self) -> Option<SyntaxToken>
 pub fn chain_token(&self) -> Option<SyntaxToken>
 pub fn commit_token(&self) -> Option<SyntaxToken>
+pub fn end_token(&self) -> Option<SyntaxToken>
 pub fn no_token(&self) -> Option<SyntaxToken>
 pub fn prepared_token(&self) -> Option<SyntaxToken>
 pub fn transaction_token(&self) -> Option<SyntaxToken>
@@ -159,7 +155,7 @@ On `Commit AND CHAIN`, pop and immediately push a new frame.
 
 ## Rollback
 
-### Verified Accessors (line 15769)
+### Verified Accessors (src/ast/generated/nodes.rs line 17840)
 
 ```rust
 pub fn literal(&self) -> Option<Literal>      // for ROLLBACK PREPARED 'gid'
@@ -225,7 +221,7 @@ Full `ROLLBACK` pops and discards the entire `TransactionFrame` stack down to
 
 ## PrepareTransaction
 
-### Verified Accessors (line 14405)
+### Verified Accessors (src/ast/generated/nodes.rs line 16149)
 
 ```rust
 pub fn literal(&self) -> Option<Literal>
@@ -254,7 +250,7 @@ finalization, or flag as opaque/unsupported depending on simulator scope.
 
 ## Savepoint
 
-### Verified Accessors (line 15946)
+### Verified Accessors (src/ast/generated/nodes.rs line 18051)
 
 ```rust
 pub fn name(&self) -> Option<Name>
@@ -283,7 +279,7 @@ marking the position to which `ROLLBACK TO SAVEPOINT name` can rewind.
 
 ## ReleaseSavepoint
 
-### Verified Accessors (line 14984)
+### Verified Accessors (src/ast/generated/nodes.rs line 16947)
 
 ```rust
 pub fn name_ref(&self) -> Option<NameRef>
@@ -318,7 +314,7 @@ Merges the undo-log segment since the named savepoint into the parent segment
 
 ## SetTransaction
 
-### Verified Accessors (line 17043)
+### Verified Accessors (src/ast/generated/nodes.rs line 19304)
 
 ```rust
 pub fn literal(&self) -> Option<Literal>                          // for SET TRANSACTION SNAPSHOT
@@ -360,7 +356,7 @@ StateChange::TransactionModeSet {
 
 ## TransactionModeList / TransactionMode
 
-### TransactionModeList (line 17718)
+### TransactionModeList (src/ast/generated/nodes.rs line 20113)
 
 ```rust
 pub fn transaction_modes(&self) -> AstChildren<TransactionMode>
@@ -404,7 +400,7 @@ should be a tier-1 block.
 
 ## SetConstraints
 
-### Verified Accessors (line 16590)
+### Verified Accessors (src/ast/generated/nodes.rs line 18815)
 
 ```rust
 pub fn paths(&self) -> AstChildren<Path>

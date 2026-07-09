@@ -2,9 +2,10 @@
 
 ## Status
 
-Inspection status: complete for all core sequence nodes.
+Verified against squawk_syntax 2.58.0 — July 2026
 
-This document is derived from direct inspection of squawk.rs and should be treated as the
+This document is derived from direct inspection of src/ast/generated/nodes.rs
+and src/ast/node_ext.rs in squawk-syntax-2.58.0 and should be treated as the
 current source of truth for safe-migrate sequence handling.
 
 All claims are AST-verified via grep and line-range inspection.
@@ -184,24 +185,25 @@ pub fn name_ref(&self) -> Option<NameRef>
 pub fn path(&self) -> Option<Path>
 pub fn ty(&self) -> Option<Type>
 
-// Keyword tokens — identify the option kind
-pub fn as_token(&self) -> Option<SyntaxToken>
-pub fn by_token(&self) -> Option<SyntaxToken>
-pub fn cycle_token(&self) -> Option<SyntaxToken>
-pub fn increment_token(&self) -> Option<SyntaxToken>
-pub fn logged_token(&self) -> Option<SyntaxToken>
-pub fn maxvalue_token(&self) -> Option<SyntaxToken>
-pub fn minvalue_token(&self) -> Option<SyntaxToken>
-pub fn name_token(&self) -> Option<SyntaxToken>
-pub fn no_token(&self) -> Option<SyntaxToken>
-pub fn none_token(&self) -> Option<SyntaxToken>
-pub fn owned_token(&self) -> Option<SyntaxToken>
-pub fn restart_token(&self) -> Option<SyntaxToken>
-pub fn sequence_token(&self) -> Option<SyntaxToken>
-pub fn start_token(&self) -> Option<SyntaxToken>
-pub fn unlogged_token(&self) -> Option<SyntaxToken>
-pub fn with_token(&self) -> Option<SyntaxToken>
-```
+ // Keyword tokens — identify the option kind
+ pub fn as_token(&self) -> Option<SyntaxToken>
+ pub fn cache_token(&self) -> Option<SyntaxToken>
+ pub fn by_token(&self) -> Option<SyntaxToken>
+ pub fn cycle_token(&self) -> Option<SyntaxToken>
+ pub fn increment_token(&self) -> Option<SyntaxToken>
+ pub fn logged_token(&self) -> Option<SyntaxToken>
+ pub fn maxvalue_token(&self) -> Option<SyntaxToken>
+ pub fn minvalue_token(&self) -> Option<SyntaxToken>
+ pub fn name_token(&self) -> Option<SyntaxToken>
+ pub fn no_token(&self) -> Option<SyntaxToken>
+ pub fn none_token(&self) -> Option<SyntaxToken>
+ pub fn owned_token(&self) -> Option<SyntaxToken>
+ pub fn restart_token(&self) -> Option<SyntaxToken>
+ pub fn sequence_token(&self) -> Option<SyntaxToken>
+ pub fn start_token(&self) -> Option<SyntaxToken>
+ pub fn unlogged_token(&self) -> Option<SyntaxToken>
+ pub fn with_token(&self) -> Option<SyntaxToken>
+ ```
 
 ### Important Finding
 
@@ -214,6 +216,7 @@ The option type must be inferred by inspecting which keyword token is present.
 | Option | Detection | Value Accessor |
 |--------|-----------|----------------|
 | `AS type` | `as_token().is_some()` | `ty()` |
+| `CACHE n` | `cache_token().is_some()` | `literal()` |
 | `START [WITH] n` | `start_token().is_some()` | `literal()` |
 | `INCREMENT [BY] n` | `increment_token().is_some()` | `literal()` |
 | `MINVALUE n` | `minvalue_token().is_some()` + `no_token().is_none()` | `literal()` |
@@ -222,7 +225,7 @@ The option type must be inferred by inspecting which keyword token is present.
 | `NO MAXVALUE` | `maxvalue_token().is_some()` + `no_token().is_some()` | — |
 | `CYCLE` | `cycle_token().is_some()` + `no_token().is_none()` | — |
 | `NO CYCLE` | `cycle_token().is_some()` + `no_token().is_some()` | — |
-| `OWNED BY col` | `owned_token().is_some()` | `path()` |
+| `OWNED BY col` | `owned_token().is_some()` + `none_token().is_none()` | `path()` |
 | `OWNED BY NONE` | `owned_token().is_some()` + `none_token().is_some()` | — |
 | `RESTART [WITH] n` | `restart_token().is_some()` | `literal()` |
 | `SEQUENCE NAME ident` | `sequence_token().is_some()` + `name_token().is_some()` | `name_ref()` |
@@ -231,18 +234,15 @@ The option type must be inferred by inspecting which keyword token is present.
 
 ### Grammar Confirmation
 
-Cross-checked against postgresql.ungram. The grammar confirms this exact option
-set with no `CACHE` variant present. An earlier draft of this document incorrectly
-listed `CACHE` as a possible option — this has been removed as it does not exist
-in the grammar or the verified accessor surface. PostgreSQL's `CACHE` clause for
-sequences, if supported by this grammar version, is not represented as a distinct
-`SequenceOption` keyword token in the inspected surface.
+Cross-checked against postgresql.ungram. The grammar confirms the complete option
+set including CACHE. The accessor surface matches the grammar exactly — CACHE is
+fully extractable via `cache_token()`.
 
 ### Status
 
 ```
 AST verified
-Grammar-cross-checked: confirmed option set, CACHE variant does not exist in this grammar
+Grammar-cross-checked: confirmed complete option set including CACHE
 ```
 
 ### safe-migrate guidance
@@ -373,8 +373,6 @@ None remaining — all previously partial findings have been grammar-resolved.
 
 - `AlterSequence`: confirmed by postgresql.ungram to carry no options clause —
   not an extraction gap, a parser-level limitation
-- `SequenceOption`: confirmed by postgresql.ungram — no CACHE variant exists,
-  full option set verified
 - `SetSequenceOption`: confirmed by postgresql.ungram — the sequence option
   payload is genuinely absent from both this node and its parent `AlterColumn`,
   not extractable in any form from this grammar
@@ -383,10 +381,11 @@ None remaining — all previously partial findings have been grammar-resolved.
 
 This document has been fully cross-checked against postgresql.ungram.
 `CreateSequence`, `DropSequence`, `SequenceOption`, `SequenceOptionList`,
-`SetSequenceOption`, and `AlterSequence` all verified. Two corrections were
-required: removal of the fabricated CACHE option, and reframing of
-`AlterSequence`'s sparse surface as a confirmed grammar limitation rather
-than an unresolved extraction gap.
+`SetSequenceOption`, and `AlterSequence` all verified. CACHE option is now
+properly documented with `cache_token()` accessor confirmed in both grammar and
+source. The single correction required was removing the false claim that CACHE
+was absent.
+```
 
 ---
 

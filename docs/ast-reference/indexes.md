@@ -2,9 +2,10 @@
 
 ## Status
 
-Inspection status: complete for all core index nodes and AlterIndexAction variants.
+Verified against squawk_syntax 2.58.0 — July 2026
 
-This document is derived from direct inspection of squawk.rs and should be treated as the
+This document is derived from direct inspection of src/ast/generated/nodes.rs
+and src/ast/node_ext.rs in squawk-syntax-2.58.0 and should be treated as the
 current source of truth for safe-migrate index handling.
 
 All claims are AST-verified via grep and line-range inspection.
@@ -112,15 +113,15 @@ This is the primary extraction point for indexed expressions and columns.
 `using_method()` → `UsingMethod` → `name_ref()`.
 Method name is accessible as a `NameRef`.
 
-**INCLUDE clause — GRAMMAR-CONFIRMED GAP:**
+**INCLUDE clause — EXTRACTABLE:**
 `constraint_include_clause()` → `ConstraintIncludeClause`.
-postgresql.ungram confirms `ConstraintIncludeClause = 'include'` — only the
-keyword token exists in the grammar, and no sibling column-list node is
-adjacent to it in `CreateIndex`'s grammar rule either. The covering column
-list in `CREATE INDEX ... INCLUDE (col1, col2)` is **not captured anywhere**
-in this AST. A migration adding a covering index with INCLUDE columns can be
-detected (`constraint_include_clause().is_some()`), but the specific included
-columns cannot be extracted. See constraints.md for full detail.
+`ConstraintIncludeClause` exposes both `include_token()` (the `INCLUDE`
+keyword) and `column_list()` returning `Option<ColumnList>`. The covering
+column list in `CREATE INDEX ... INCLUDE (col1, col2)` **is captured** — the
+included columns are fully extractable via `column_list()`. A migration adding
+a covering index with INCLUDE columns can be detected
+(`constraint_include_clause().is_some()`) and the specific included columns
+enumerated. Verified directly against `src/ast/generated/nodes.rs` (line 4714).
 
 **WHERE clause:**
 `where_clause()` → `WhereClause` → `expr()`.
@@ -323,42 +324,57 @@ Primary extraction point for index column expressions in `CreateIndex`.
 
 ## PartitionItem
 
-### Verified Accessors (line 14133)
+### Verified Accessors (line 15822)
 
 ```rust
+pub fn attribute_list(&self) -> Option<AttributeList>
 pub fn collate(&self) -> Option<Collate>
 pub fn expr(&self) -> Option<Expr>
+pub fn nulls_first(&self) -> Option<NullsFirst>
+pub fn nulls_last(&self) -> Option<NullsLast>
+pub fn path(&self) -> Option<Path>
+pub fn sort_asc(&self) -> Option<SortAsc>
+pub fn sort_desc(&self) -> Option<SortDesc>
+pub fn sort_using(&self) -> Option<SortUsing>
 ```
 
-Represents a single index column or expression with optional collation.
+Represents a single index column or expression with optional collation,
+sort order, nulls ordering, and operator class.
 
-### Grammar Confirmation — RESOLVED
-
-postgresql.ungram confirms the complete rule:
+### Grammar Confirmation — CORRECTION
 
 ```
 PartitionItem =
   Expr Collate?
+  (SortAsc | SortDesc)?
+  (NullsFirst | NullsLast)?
+  SortUsing?          # operator class via USING
 ```
 
-This is genuinely the entire grammar for this node. Sort order (ASC/DESC),
-nulls ordering (NULLS FIRST/LAST), and operator class are confirmed absent
-from the grammar entirely — not an accessor gap.
+**Correction:** An earlier draft claimed `PartitionItem` captured only
+`expr()` and `collate()`, with sort order, nulls ordering, and operator
+class "confirmed absent from the grammar entirely." That was incorrect. The
+actual node (line 15822) exposes:
+- `sort_asc()` / `sort_desc()` → ASC / DESC sort order
+- `nulls_first()` / `nulls_last()` → NULLS FIRST / NULLS LAST ordering
+- `sort_using()` → the `USING opclass` operator-class node
+- `path()` → a referenced path (may carry operator-class name)
+- `attribute_list()` → any WITH-style attributes
 
-**Significant finding for safe-migrate:** real PostgreSQL `CREATE INDEX`
-syntax supports `CREATE INDEX ON t (col DESC NULLS LAST opclass)`, but this
-AST grammar does not capture any of those modifiers on `PartitionItem`. Since
-`PartitionItemList`/`PartitionItem` is shared between `CreateIndex` and
-`PartitionBy` (see partitions.md), this limitation applies to both index
-column definitions and partition key column definitions equally.
+**Significant finding for safe-migrate (corrected):** real PostgreSQL
+`CREATE INDEX ON t (col DESC NULLS LAST opclass)` modifiers ARE extractable
+from `PartitionItem` via the accessors above. Since `PartitionItemList`/
+`PartitionItem` is shared between `CreateIndex` and `PartitionBy` (see
+partitions.md), this capability applies to both index column definitions and
+partition key column definitions equally.
 
 ### Status
 
 ```
-Grammar verified — FULLY RESOLVED
-Sort order, nulls ordering, and operator class confirmed absent from grammar.
-Not extractable from this AST in any form, for either CREATE INDEX or
-PARTITION BY column lists.
+Grammar verified — CORRECTED
+Sort order (sort_asc/sort_desc), nulls ordering (nulls_first/nulls_last), and
+operator class (sort_using / path) ARE extractable via the accessors listed
+above. The node is fully structured, not a bare Expr+Collate.
 ```
 
 ---
@@ -429,8 +445,9 @@ Both the base expression and the index expression are fully accessible.
 - `AlterIndex`: fully resolved
 - `AlterIndexAction` enum: all 8 members verified
 - `PartitionItemList`: fully resolved
-- `PartitionItem`: fully resolved (grammar-confirmed — sort order, nulls
-  ordering, operator class confirmed absent from grammar entirely)
+- `PartitionItem`: fully resolved (line 15822) — sort order (`sort_asc`/
+  `sort_desc`), nulls ordering (`nulls_first`/`nulls_last`), and operator
+  class (`sort_using`/`path`) ARE extractable via accessors
 - `UsingMethod`: fully resolved
 - `UsingIndex`: fully resolved
 - `IndexExpr`: fully resolved via handwritten extension at line 38390
@@ -442,14 +459,16 @@ Both the base expression and the index expression are fully accessible.
 
 ## Grammar-Confirmed Limitations
 
-- `PartitionItem`: sort order (ASC/DESC), nulls ordering (NULLS FIRST/LAST),
-  and operator class are confirmed absent from the grammar entirely. This is
-  not an extraction gap — PostgreSQL's `CREATE INDEX ON t (col DESC NULLS LAST)`
-  syntax simply does not capture these modifiers in this AST version, for
-  either index columns or partition key columns.
-- `ConstraintIncludeClause`: postgresql.ungram confirms the INCLUDE column list
-  is genuinely absent from this grammar — not an extraction gap. Covering
-  indexes can be detected but their included columns cannot be extracted.
+- `PartitionItem` (CORRECTED): sort order (`sort_asc`/`sort_desc`), nulls
+  ordering (`nulls_first`/`nulls_last`), and operator class (`sort_using`/
+  `path`) ARE extractable via the accessors at line 15822. The earlier claim
+  that these are "absent from the grammar entirely" was incorrect. The only
+  genuine limitation is that fine-grained WITH attributes (if any) would be
+  nested under `attribute_list()`.
+- `ConstraintIncludeClause`: exposes a `column_list()` accessor
+  (`Option<ColumnList>`) carrying the INCLUDE columns of a covering index.
+  Both the presence of an INCLUDE clause and its specific included columns are
+  fully extractable.
 
 ---
 

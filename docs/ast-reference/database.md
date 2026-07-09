@@ -2,8 +2,7 @@
 
 ## Status
 
-Inspection status: complete. Cross-checked directly against postgresql.ungram
-and squawk.rs in a single pass.
+Verified against squawk_syntax 2.58.0 — July 2026
 
 ---
 
@@ -221,32 +220,23 @@ ResetConfigParam =
   'reset' ('all' | Path)
 ```
 
-**Critical finding for search_path integration:** `SetConfigParam` carries
-only the parameter name (`path()`), not the value being set. This is the
-**same gap as `SetFuncOption`** (functions.md) — grammar-confirmed empty
-value slot. `ALTER DATABASE db SET search_path = public, myschema` can be
-detected as a config param change (the `path()` text normalizes to
-`"search_path"` using the identifier folding rules from schemas.md), but
-the new value list (`public, myschema`) **cannot be extracted** from this
-node.
+**Correction:** Earlier draft claimed the value "cannot be extracted" — this
+was incorrect. `SetConfigParam` exposes `literals()` (`AstChildren<Literal>`)
+and `name_refs()` carrying the assigned value(s). `ALTER DATABASE db SET
+search_path = public, myschema` can be detected (param name via `path()`)
+and the new value list (`public, myschema`) IS extractable via
+`literals()`. This matches the same rich extraction available via
+`SetFuncOption` (functions.md).
 
-This contrasts with the statement-level `Set` node (search_path.md) which
-does carry the value via `config_values()`. `ALTER DATABASE ... SET` uses
-a different, value-less node.
+### Relevance to safe-migrate
 
-**Relevance to safe-migrate:** `ALTER DATABASE db SET search_path = ...`
-changes the default search_path for all future connections to `db`, which
-affects how schema-qualified names are resolved in subsequent migrations.
-This is a future-session effect (not the current session) — comparable to
-`ALTER DEFAULT PRIVILEGES` in that it silently changes context for future
-operations, not immediately visible ones. The simulator should flag this
-as a context-changing operation affecting confidence in subsequent
-object-resolution, but cannot determine the new search_path value from
-the AST.
+`ALTER DATABASE db SET search_path = ...` changes the default search_path for
+all future connections to `db`. The param name and string values are fully
+extractable via `path()` and `literals()`. The simulator can know the exact
+search_path tuple being set — enabling better downstream context awareness.
 
 `ResetConfigParam.all_token()` detects `RESET ALL` — resetting every
-configuration parameter simultaneously, including search_path. Should be
-treated with the same conservative handling as individual resets.
+configuration parameter simultaneously, including search_path.
 
 ### safe-migrate guidance
 
@@ -255,10 +245,10 @@ enum AlterDatabaseFact {
     Rename { from: String, to: String },
     OwnerChange(RoleFact),
     TablespaceChange { new_tablespace: String },
-    SetConfigParam { param: String },         // value NOT extractable
+    SetConfigParam { param: String, values: Vec<String> }, // fully extractable via literals()
     ResetConfigParam { param: Option<String> }, // None = RESET ALL
     RefreshCollationVersion,
-    OptionChanges(Vec<DatabaseOptionFact>),   // via create_database_option_list()
+    OptionChanges(Vec<DatabaseOptionFact>),
 }
 ```
 
@@ -326,19 +316,17 @@ as an extremely high-impact external operation.
 
 ## Grammar-Confirmed Limitations
 
-- `SetConfigParam`: parameter name extractable via `path()`, but the new
-  value is **not captured** — `ALTER DATABASE db SET param = value` only
-  exposes the param name. Identical gap to `SetFuncOption` in functions.md.
-  Specifically relevant for `ALTER DATABASE db SET search_path = ...` where
-  the new search_path value matters for subsequent object resolution.
+- `SetConfigParam`: value **is captured** via `literals()` and `name_refs()`,
+  correcting earlier "value gap". The param name is extractable via `path()`
+  and the assigned value(s) via the accessors above.
 
 ## Key Architectural Findings
 
-1. **`SetConfigParam` value gap directly impacts search_path modeling** —
-   an `ALTER DATABASE db SET search_path = ...` statement can be detected
-   (param name resolves to `"search_path"`) but the new value cannot be
-   extracted. The simulator must treat this as an unknown search_path change
-   and downgrade confidence, not assume the value is unchanged.
+1. **`SetConfigParam` value IS extractable** — `ALTER DATABASE db SET
+   search_path = ...` can be fully resolved: param via `path()` and value
+   via `literals()` (or `name_refs()` for identifier references). This
+   enables downstream context awareness. Note: the value arrives as an
+   `AstChildren<Literal>` list, not a single `value()` accessor.
 2. **`DROP DATABASE` warrants unconditional tier-1 blocking** — no further
    analysis is meaningful if the current database is dropped.
 3. **`CreateDatabase` during a migration is unusual and context-opaque** —

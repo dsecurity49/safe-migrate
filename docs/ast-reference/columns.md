@@ -2,9 +2,10 @@
 
 ## Status
 
-Inspection status: complete for all core column nodes and AlterColumnOption variants.
+Verified against squawk_syntax 2.58.0 — July 2026
 
-This document is derived from direct inspection of squawk.rs and should be treated as the
+This document is derived from direct inspection of src/ast/generated/nodes.rs
+and src/ast/node_ext.rs in squawk-syntax-2.58.0 and should be treated as the
 current source of truth for safe-migrate column handling.
 
 All claims are AST-verified via grep and line-range inspection.
@@ -25,56 +26,57 @@ All claims are AST-verified via grep and line-range inspection.
 One handwritten extension exists for column nodes:
 
 ```
-impl ast::RenameColumn  (line 38429)
+impl ast::RenameColumn  (src/ast/node_ext.rs line 347)
 ```
 
 No handwritten extensions exist for `Column`, `AddColumn`, `AlterColumn`, or `DropColumn`.
 
-This was established by exhaustive grep of all `impl ast::*` blocks in squawk.rs:
+This was established by exhaustive grep of all `impl ast::*` blocks in `src/ast/node_ext.rs`
+(squawk-syntax-2.58.0):
 
 ```bash
-grep -n "^impl ast::" squawk.rs
+grep -n "^impl ast::" src/ast/node_ext.rs
 ```
 
-This grep covers lines 38145-39260 and is the authoritative source for all handwritten
+This grep covers the full handwritten extension surface and is the authoritative source for all
 extensions across the entire codebase. The complete inventory:
 
-| Line  | Node                  | Methods                                      |
-|-------|-----------------------|----------------------------------------------|
-| 38145 | `ast::Literal`        | `kind()`                                     |
-| 38168 | `ast::Constraint`     | `constraint_name()`                          |
-| 38233 | `ast::BinExpr`        | `lhs()`, `rhs()`, `op()`                    |
-| 38313 | `ast::PostfixExpr`    | `op()`                                       |
-| 38376 | `ast::FieldExpr`      | `base()`, `field()`                          |
-| 38390 | `ast::IndexExpr`      | `base()`, `index()`                          |
-| 38401 | `ast::SliceExpr`      | `base()`, `start()`, `end()`                |
-| 38429 | `ast::RenameColumn`   | `from()`, `to()`                             |
-| 38440 | `ast::ForeignKeyConstraint` | `from_columns()`, `to_columns()`       |
-| 38451 | `ast::BetweenExpr`    | `target()`, `start()`, `end()`              |
-| 38466 | `ast::WhenClause`     | `condition()`, `then()`                      |
-| 38477 | `ast::CompoundSelect` | `lhs()`, `rhs()`                             |
-| 38488 | `ast::NameRef`        | `text()`, `is_quoted()`                      |
-| 38500 | `ast::Name`           | `text()`, `is_quoted()`                      |
-| 38565 | `ast::CharType`       | `text()`                                     |
-| 38576 | `ast::Vacuum`         | `is_full()`                                  |
-| 38599 | `ast::OpSig`          | `lhs()`, `rhs()`                             |
-| 38611 | `ast::CastSig`        | `lhs()`, `rhs()`                             |
-| 38638 | `ast::WithQuery`      | `with_clause()`                              |
-| 38645 | `ast::SelectVariant`  | `target_list()`                              |
-| 38663 | `ast::FunctionSig`    | `HasParamList` trait impl                    |
-| 38664 | `ast::Aggregate`      | `HasParamList` trait impl                    |
-| 38666 | `ast::Name`           | `NameLike` trait impl                        |
-| 38672 | `ast::NameRef`        | `NameLike` trait impl                        |
-| 38679 | `ast::Select`         | `HasWithClause` trait impl                   |
-| 38680 | `ast::SelectInto`     | `HasWithClause` trait impl                   |
-| 38681 | `ast::Insert`         | `HasWithClause` trait impl                   |
-| 38682 | `ast::Update`         | `HasWithClause` trait impl                   |
-| 38683 | `ast::Delete`         | `HasWithClause` trait impl                   |
-| 38685 | `ast::CreateTable`    | `HasCreateTable` trait impl                  |
-| 38686 | `ast::CreateForeignTable` | `HasCreateTable` trait impl              |
-| 38687 | `ast::CreateTableLike`| `HasCreateTable` trait impl                  |
-| 39252 | `ast::Whitespace`     | `spans_multiple_lines()`                     |
-| 39260 | `ast::Comment`        | `kind()`                                     |
+| node_ext Line | Node                  | Methods                                      |
+|---------------|-----------------------|----------------------------------------------|
+| 61            | `ast::Literal`        | `kind()`                                     |
+| 84            | `ast::Constraint`     | `constraint_name()`                          |
+| 150           | `ast::BinExpr`        | `lhs()`, `rhs()`, `op()`                    |
+| 231           | `ast::PostfixExpr`    | `op()`                                       |
+| 294           | `ast::FieldExpr`      | `base()`, `field()`                          |
+| 308           | `ast::IndexExpr`      | `base()`, `index()`                          |
+| 319           | `ast::SliceExpr`      | `base()`, `start()`, `end()`                |
+| 347           | `ast::RenameColumn`   | `from()`, `to()`                             |
+| 358           | `ast::ForeignKeyConstraint` | `from_columns()`, `to_columns()`       |
+| 369           | `ast::BetweenExpr`    | `target()`, `start()`, `end()`              |
+| 384           | `ast::FrameBetween`   | `start()`, `end()`                           |
+| 395           | `ast::WhenClause`     | `condition()`, `then()`                      |
+| 406           | `ast::CompoundSelect` | `lhs()`, `rhs()`                             |
+| 417           | `ast::NameRef`        | `text()`, `is_quoted()`                      |
+| 429           | `ast::Name`           | `text()`, `is_quoted()`                      |
+| 494           | `ast::CharType`       | `text()`                                     |
+| 505           | `ast::Vacuum`         | `is_full()`                                  |
+| 528           | `ast::OpSig`          | `lhs()`, `rhs()`                             |
+| 540           | `ast::CastSig`        | `lhs()`, `rhs()`                             |
+| 567           | `ast::WithQuery`      | `with_clause()`                              |
+| 574           | `ast::SelectVariant`  | `target_list()`                              |
+| 584           | `ast::CreateTableAsQuery` | `create_table_like()`                    |
+| 602           | `ast::FunctionSig`    | `HasParamList` trait impl                    |
+| 603           | `ast::Aggregate`      | `HasParamList` trait impl                    |
+| 605           | `ast::Name`           | `NameLike` trait impl                        |
+| 611           | `ast::NameRef`        | `NameLike` trait impl                        |
+| 618           | `ast::Select`         | `HasWithClause` trait impl                   |
+| 619           | `ast::SelectInto`     | `HasWithClause` trait impl                   |
+| 620           | `ast::Insert`         | `HasWithClause` trait impl                   |
+| 621           | `ast::Update`         | `HasWithClause` trait impl                   |
+| 622           | `ast::Delete`         | `HasWithClause` trait impl                   |
+| 624           | `ast::CreateTable`    | `HasCreateTable` trait impl                  |
+| 625           | `ast::CreateForeignTable` | `HasCreateTable` trait impl              |
+| 626           | `ast::CreateTableLike`| `HasCreateTable` trait impl                  |
 
 All other AST files reference this table rather than re-running the grep.
 
@@ -779,7 +781,7 @@ None remaining. Both previously open questions have been resolved or
 appropriately reclassified:
 
 1. **`TableArg::can_cast()` returning `false` for table-constraint kinds**:
-   This is a real implementation quirk, confirmed in squawk.rs at line 37477
+   This is a real implementation quirk, confirmed in src/ast/generated/nodes.rs at line 37505
    and documented extensively in the `TableArg` section above. It does NOT
    affect safe-migrate directly, since safe-migrate must call
    `TableArgList.args()` (which returns `AstChildren<TableArg>` via
@@ -792,9 +794,9 @@ appropriately reclassified:
    No action required in safe-migrate's visitor code beyond using the
    standard `AstChildren` iteration pattern.
 
-2. **Handwritten extensions beyond line 38429**: The exhaustive `impl ast::*`
+2. **Handwritten extensions beyond the node_ext.rs table above**: The exhaustive `impl ast::*`
    grep established in this document already covers the complete handwritten
-   extension surface as of the squawk.rs version inspected. This is properly
-   a maintenance caveat (re-run the grep if squawk.rs is upgraded), not an
+   extension surface as of the squawk-syntax-2.58.0 version inspected. This is properly
+   a maintenance caveat (re-run the grep if squawk_syntax is upgraded), not an
    open question requiring further investigation now. Reclassified as a
    standing maintenance note rather than an active open question.

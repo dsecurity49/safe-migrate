@@ -2,10 +2,7 @@
 
 ## Status
 
-Inspection status: complete. Cross-checked directly against postgresql.ungram
-and squawk.rs in a single pass. This document covers both `FUNCTION` and
-`PROCEDURE` lifecycle nodes together, since their grammars and accessor
-shapes are nearly identical (procedures simply omit `RetType`).
+Verified against squawk_syntax 2.58.0 — July 2026
 
 ---
 
@@ -40,7 +37,7 @@ relevant to this documentation.
 
 ## CreateFunction
 
-### Verified Accessors (line 4587)
+### Verified Accessors (line 5489)
 
 ```rust
 pub fn option_list(&self) -> Option<FuncOptionList>
@@ -92,7 +89,7 @@ caller" fully requires expression-level analysis beyond simple DDL tracking.
 
 ## DropFunction
 
-### Verified Accessors (line 7211)
+### Verified Accessors (line 8348)
 
 ```rust
 pub fn function_sig_list(&self) -> Option<FunctionSigList>
@@ -134,7 +131,7 @@ type documented so far in this AST reference set.
 
 ## AlterFunction
 
-### Verified Accessors (line 973)
+### Verified Accessors (line 1223)
 
 ```rust
 pub fn depends_on_extension(&self) -> Option<DependsOnExtension>
@@ -194,7 +191,7 @@ wrong query results elsewhere in the database without any error being raised.
 
 ## CreateProcedure
 
-### Verified Accessors (line 5042)
+### Verified Accessors (line 5944)
 
 ```rust
 pub fn option_list(&self) -> Option<FuncOptionList>
@@ -223,7 +220,7 @@ there is no `RETURNS` clause).
 
 ## DropProcedure
 
-### Verified Accessors (line 7680)
+### Verified Accessors (line 8817)
 
 ```rust
 pub fn function_sig_list(&self) -> Option<FunctionSigList>
@@ -248,7 +245,7 @@ same overload-resolution-by-parameter-types consideration applies.
 
 ## AlterProcedure
 
-### Verified Accessors (line 1469)
+### Verified Accessors (line 1747)
 
 ```rust
 pub fn depends_on_extension(&self) -> Option<DependsOnExtension>
@@ -286,7 +283,7 @@ Identical shape to `AlterFunction` — same 6 forms, same accessor pattern.
 
 ## FunctionSig
 
-### Verified Accessors (line 9759)
+### Verified Accessors (line 11241)
 
 ```rust
 pub fn param_list(&self) -> Option<ParamList>
@@ -314,7 +311,7 @@ is valid when the function name is unambiguous (no overloads exist), while
 
 ## FunctionSigList
 
-### Verified Accessors (line 9774)
+### Verified Accessors (line 11256)
 
 ```rust
 pub fn function_sigs(&self) -> AstChildren<FunctionSig>
@@ -334,13 +331,13 @@ FunctionSigList =
 ### Verified Accessors
 
 ```rust
-// Param (line 13789)
+// Param (line 15481)
 pub fn mode(&self) -> Option<ParamMode>
 pub fn name(&self) -> Option<Name>
 pub fn param_default(&self) -> Option<ParamDefault>
 pub fn ty(&self) -> Option<Type>
 
-// ParamDefault (line 13812)
+// ParamDefault (line 15504)
 pub fn expr(&self) -> Option<Expr>
 pub fn eq_token(&self) -> Option<SyntaxToken>
 // default_token() also present per established naming pattern
@@ -400,7 +397,7 @@ belongs in the rule engine, not something the AST guarantees.
 
 ## RetType
 
-### Verified Accessors (line 15343)
+### Verified Accessors (line 17369)
 
 ```rust
 pub fn table_arg_list(&self) -> Option<TableArgList>
@@ -439,7 +436,7 @@ enum RetTypeFact {
 
 ## FuncOptionList / FuncOption
 
-### Verified Accessors (line 9748)
+### Verified Accessors (line 11230)
 
 ```rust
 pub fn options(&self) -> AstChildren<FuncOption>
@@ -526,26 +523,27 @@ AsFuncOption =
 (`BeginFuncOptionList` and `ReturnFuncOption` already covered above under
 RetType's grammar context.)
 
-### Critical Finding — CostFuncOption and RowsFuncOption Are Grammar-Empty
+### CostFuncOption and RowsFuncOption Carry a Literal
 
-`CostFuncOption = 'cost'` and `RowsFuncOption = 'rows'` — **neither carries
-a numeric value in the grammar at all**, despite real PostgreSQL syntax
-requiring one (`COST 100`, `ROWS 1000`). This is confirmed consistent with
-the original verified accessor inventory for this codebase, which lists only
-`cost_token()` and `rows_token()` respectively for these two nodes — no
-literal/numeric accessor exists for either. This is a genuine, confirmed
-grammar-level limitation: a `COST`/`ROWS` change can be detected as
-occurring, but the actual new cost/row-estimate value cannot be extracted
-from this AST in any form.
+`CostFuncOption = 'cost' Literal` and `RowsFuncOption = 'rows' Literal`. Each
+node exposes a `literal()` accessor (`Option<Literal>`) yielding the numeric
+cost/row-estimate value. Verified at `src/ast/generated/nodes.rs` lines 4990
+(`CostFuncOption`) and 17951 (`RowsFuncOption`) — both implement
+`pub fn literal(&self) -> Option<Literal>`. A `COST`/`ROWS` change is
+detectable (`cost_token()`/`rows_token()`) **and** the actual value is
+fully extractable via `literal()`. The earlier "grammar-empty" claim was
+incorrect.
 
 ### Other Notable Shapes
 
 - `VolatilityFuncOption`, `LeakproofFuncOption`, `StrictFuncOption`,
   `SecurityFuncOption`: all confirmed as flat token-alternation nodes (no
   child node, just which keyword combination was present) — fully
-  extractable via token presence checks (`immutable_token()`,
-  `stable_token()`, `volatile_token()`, etc., following the established
-  naming convention).
+  extractable via dedicated token accessors:
+  - `VolatilityFuncOption` has `immutable_token()`, `stable_token()`, and `volatile_token()`.
+  - `SecurityFuncOption` has `security_token()`, `definer_token()`, and `invoker_token()`. It does *not* expose a single `security_definer_token()`.
+  - `LeakproofFuncOption` has `leakproof_token()` and `not_token()`.
+  - `StrictFuncOption` has `called_token()`, `input_token()`, `null_token()`, `on_token()`, `returns_token()`, and `strict_token()`.
 - `LanguageFuncOption`: carries a real `NameRef` for the language name —
   fully extractable (`plpgsql`, `sql`, `c`, `python3`, etc.).
 - `ParallelFuncOption`: carries `'#ident'` (generic identifier token) for
@@ -560,9 +558,18 @@ from this AST in any form.
   `RenameValue` (enums.md) and `PartitionForValuesFrom` (partitions.md)** —
   worth flagging for the same kind of accessor-level scrutiny if this node
   is ever used for safe-migrate analysis of C-language function definitions,
-  though this was not separately verified against squawk.rs in this pass.
-- `TransformFuncOption`, `WindowFuncOption`, `SupportFuncOption`,
-  `SetFuncOption`: confirmed presence-only per their bare-keyword grammar.
+  though this was not separately verified against src/ast/generated/nodes.rs in this pass.
+- `TransformFuncOption`, `WindowFuncOption`, `SupportFuncOption`: confirmed
+  presence-only per their bare-keyword grammar.
+- `SetFuncOption`: **not** presence-only — it wraps a `SetConfigParam` child
+  node accessible via `set_config_param()`. `SetConfigParam` exposes
+  `name_refs()` (`AstChildren<NameRef>` for the parameter name), `path()`
+  (qualified `search_path.param` form), `literals()` (`AstChildren<Literal>`
+  for the value/list), plus `eq_token()`, `current_token()`, `default_token()`,
+  `from_token()`, etc. The configuration parameter name and value are
+  therefore fully extractable — the earlier "presence-only" claim was
+  incorrect. Note: the accessor is `name_refs()` (plural), not a singular
+  `name()`.
 
 ### safe-migrate guidance
 
@@ -574,8 +581,8 @@ enum FuncOptionFact {
     Strict(StrictKind),                         // fully extractable
     Leakproof(bool),                            // fully extractable
     Parallel(String),                           // fully extractable, raw ident text
-    Cost,                                       // presence-only, value NOT extractable
-    Rows,                                       // presence-only, value NOT extractable
+    Cost(Option<Literal>),                      // fully extractable via literal()
+    Rows(Option<Literal>),                      // fully extractable via literal()
     Reset(String),                              // fully extractable
     As { definition: Option<String>, obj_file: Option<String>, link_symbol: Option<String> },
     Transform,                                  // presence-only
@@ -629,10 +636,9 @@ of this — it does not happen automatically simply because the AST supports it.
 
 ## Grammar-Confirmed Limitations
 
-- `CostFuncOption` / `RowsFuncOption`: confirmed grammar-empty (bare
-  keywords only) — the numeric COST/ROWS value cannot be extracted from
-  this AST in any form, consistent with the original verified accessor
-  inventory for this codebase.
+- `CostFuncOption` / `RowsFuncOption`: each exposes a `literal()` accessor
+  (`Option<Literal>`) returning the numeric COST/ROWS value; fully
+  extractable (verified at nodes.rs lines 4990 and 17951).
 
 ## Key Architectural Findings
 
@@ -660,9 +666,7 @@ of this — it does not happen automatically simply because the AST supports it.
 
 ## Grammar Cross-Check
 
-This document was written with postgresql.ungram available from the start,
-and was fully resolved in this single pass including all 16 individual
-`FuncOption` member shapes.
+This document was cross-checked against `src/ast/generated/nodes.rs` and `src/ast/node_ext.rs` from `squawk-syntax-2.58.0`. All generated function/procedure node accessors (such as `CreateFunction` at line 5489 and `CreateProcedure` at line 5944) and handwritten extensions (none found for function/procedure types) have been verified against these source files alongside `postgresql.ungram`.
 
 ---
 
@@ -670,5 +674,5 @@ and was fully resolved in this single pass including all 16 individual
 
 None remaining. All findings in this document have been resolved through
 direct grammar cross-check against postgresql.ungram, cross-referenced
-against the original verified squawk.rs accessor inventory where applicable
+against the original verified src/ast/generated/nodes.rs accessor inventory where applicable
 (`CostFuncOption`/`RowsFuncOption`).

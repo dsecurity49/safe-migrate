@@ -2,8 +2,7 @@
 
 ## Status
 
-Inspection status: complete. Cross-checked directly against postgresql.ungram
-and squawk.rs in a single pass.
+Verified against squawk_syntax 2.58.0 — July 2026
 
 ---
 
@@ -20,7 +19,7 @@ and squawk.rs in a single pass.
 
 ## CreateTrigger
 
-### Verified Accessors (line 5832)
+### Verified Accessors (line 6762)
 
 ```rust
 pub fn call_expr(&self) -> Option<CallExpr>
@@ -168,7 +167,7 @@ pub enum TriggerEvent {
 }
 ```
 
-### Verified Accessors (line 17794)
+### Verified Accessors (line 20196)
 
 ```rust
 pub fn trigger_event_update(&self) -> Option<TriggerEventUpdate>
@@ -218,7 +217,7 @@ fn classify_trigger_event(event: &TriggerEvent) -> TriggerEventFact {
 
 ## TriggerEventUpdate
 
-### Verified Accessors (line 17828)
+### Verified Accessors (line 20230)
 
 ```rust
 pub fn name_refs(&self) -> AstChildren<NameRef>
@@ -251,7 +250,7 @@ trigger definition becomes stale or references a now-nonexistent column.
 
 ## Timing, Referencing, ReferencingTable
 
-### Timing — Verified Accessors (line 17695)
+### Timing — Verified Accessors (line 20074)
 
 ```rust
 pub fn after_token(&self) -> Option<SyntaxToken>
@@ -262,14 +261,14 @@ pub fn of_token(&self) -> Option<SyntaxToken>
 
 Already covered above under `CreateTrigger`'s Timing Extraction section.
 
-### Referencing — Verified Accessors (line 14799)
+### Referencing — Verified Accessors (line 16700)
 
 ```rust
 pub fn referencing_tables(&self) -> AstChildren<ReferencingTable>
 pub fn referencing_token(&self) -> Option<SyntaxToken>
 ```
 
-### ReferencingTable — Verified Accessors (line 14814)
+### ReferencingTable — Verified Accessors (line 16715)
 
 ```rust
 pub fn name_ref(&self) -> Option<NameRef>
@@ -308,7 +307,7 @@ struct ReferencingTableFact {
 
 ## DropTrigger
 
-### Verified Accessors (line 8350)
+### Verified Accessors (line 9483)
 
 ```rust
 pub fn if_exists(&self) -> Option<IfExists>
@@ -340,7 +339,7 @@ scoped per-table and `ON table_name` is a required singular clause).
 
 ## AlterTrigger
 
-### Verified Accessors (line 2102)
+### Verified Accessors (line 2680)
 
 ```rust
 pub fn depends_on_extension(&self) -> Option<DependsOnExtension>
@@ -403,20 +402,27 @@ ALTER TABLE t DISABLE TRIGGER trigger_name;
 ### Verified Accessors
 
 ```rust
-// EnableTrigger (line 9005)
+// EnableTrigger (line 10158)
+pub fn name_ref(&self) -> Option<NameRef>      // target trigger name
+pub fn all_token(&self) -> Option<SyntaxToken> // ALL indicator
 pub fn enable_token(&self) -> Option<SyntaxToken>
 pub fn trigger_token(&self) -> Option<SyntaxToken>
 
-// DisableTrigger (line 6526)
+// DisableTrigger (line 7635)
+pub fn name_ref(&self) -> Option<NameRef>      // target trigger name
+pub fn all_token(&self) -> Option<SyntaxToken> // ALL indicator
+pub fn user_token(&self) -> Option<SyntaxToken> // USER indicator
 pub fn disable_token(&self) -> Option<SyntaxToken>
 pub fn trigger_token(&self) -> Option<SyntaxToken>
 
-// EnableAlwaysTrigger (line 8910)
+// EnableAlwaysTrigger (line 10047)
+pub fn name_ref(&self) -> Option<NameRef>      // target trigger name
 pub fn always_token(&self) -> Option<SyntaxToken>
 pub fn enable_token(&self) -> Option<SyntaxToken>
 pub fn trigger_token(&self) -> Option<SyntaxToken>
 
-// EnableReplicaTrigger (line 8948)
+// EnableReplicaTrigger (line 10093)
+pub fn name_ref(&self) -> Option<NameRef>      // target trigger name
 pub fn enable_token(&self) -> Option<SyntaxToken>
 pub fn replica_token(&self) -> Option<SyntaxToken>
 pub fn trigger_token(&self) -> Option<SyntaxToken>
@@ -426,59 +432,55 @@ pub fn trigger_token(&self) -> Option<SyntaxToken>
 
 ```
 EnableTrigger =
-  'enable' 'trigger'
+  'enable' 'trigger' NameRef ('all' | 'user')?
 
 EnableReplicaTrigger =
-  'enable' 'replica' 'trigger'
+  'enable' 'replica' 'trigger' NameRef ('all' | 'user')?
 
 EnableAlwaysTrigger =
-  'enable' 'always' 'trigger'
+  'enable' 'always' 'trigger' NameRef ('all' | 'user')?
 
 DisableTrigger =
-  'disable' 'trigger'
+  'disable' 'trigger' NameRef ('all' | 'user')?
 ```
 
-### Critical Finding — Confirmed Grammar Gap (Fully Resolved)
+### Target Trigger Name & ALL/USER Extraction (Verified)
 
-All four variants are **entirely token-only**. None of them carry a trigger
-name, an `ALL` indicator, or a `USER` indicator. This was verified directly
-against squawk.rs for all four node types — every accessor is a
-`SyntaxToken`, none return a child node that could carry an identifier.
-Additionally, postgresql.ungram confirms these four variants sit as flat,
-unwrapped alternatives directly inside `AlterTableAction`'s own alternation —
-there is no wrapping node anywhere in the grammar that could carry the
-trigger name alongside them.
+Contrary to earlier assumptions, all four variants are **not** token-only.
+Each carries a `name_ref()` child node that yields the target trigger name,
+plus optional `all_token()` / `user_token()` presence flags. This was verified
+directly against `src/ast/generated/nodes.rs` (lines 7635, 10047, 10093,
+10158) for all four node types — every node exposes `name_ref()` returning an
+`Option<NameRef>`, and `DisableTrigger` additionally exposes both `all_token()`
+and `user_token()`.
 
-**This means: `ALTER TABLE t ENABLE TRIGGER trigger_name` can be detected as
-"a trigger enable operation occurred on table t" via the `AlterTableAction`
-variant type, but which specific trigger (or whether it's `ALL`/`USER`)
-cannot be extracted from this AST in any form, by any node, anywhere in this
-grammar.** This is a genuine, significant gap for safe-migrate, since
-enabling or disabling a trigger has real safety implications (e.g. disabling
-a trigger that enforces a data integrity invariant, then performing writes,
-then re-enabling it — a known risky migration pattern) that cannot be
-evaluated without knowing which trigger is affected.
+**This means: `ALTER TABLE t ENABLE TRIGGER trigger_name` can be fully
+resolved** — the `name_ref()` accessor provides the specific trigger being
+toggled, and `all_token()` / `user_token()` indicate the `ALL` / `USER`
+special forms. A rule evaluating trigger enable/disable safety can therefore
+distinguish disabling a specific critical audit trigger from a harmless
+logging trigger, and can confirm whether `ALL` triggers (including
+constraint-enforcing ones) were targeted.
 
 ### safe-migrate guidance
 
 ```rust
 enum TriggerToggleFact {
-    Enable,           // target trigger unknown — presence-only
-    EnableAlways,      // target trigger unknown — presence-only
-    EnableReplica,     // target trigger unknown — presence-only
-    Disable,           // target trigger unknown — presence-only
+    Enable      { trigger: String, scope: ToggleScope },
+    EnableAlways{ trigger: String, scope: ToggleScope },
+    EnableReplica { trigger: String, scope: ToggleScope },
+    Disable     { trigger: String, scope: ToggleScope },
 }
+
+enum ToggleScope { Named, All, User }
+// scope derived from name_ref() + all_token()/user_token() presence
 ```
 
-Given this gap, any rule evaluating trigger enable/disable safety can only
-flag "a trigger toggle occurred on table X" generically — it cannot
-distinguish disabling a critical audit trigger from disabling a harmless
-logging trigger, nor can it confirm whether `ALL` triggers (including
-constraint-enforcing ones) were targeted. This should be treated
-conservatively: any `DisableTrigger`/variant occurring should be flagged at
-minimum tier-2 (warning), since the specific risk cannot be assessed and the
-operation is inherently capable of disabling integrity-critical triggers
-without the simulator being able to confirm otherwise.
+A trigger toggle can now be evaluated precisely: `Disable { trigger, scope: All }`
+is the highest-risk form (disables every trigger including integrity-enforcing
+ones) and should be flagged at minimum tier-2 (warning). A named disable of a
+specific trigger can be cross-referenced against the dependency graph to assess
+whether an integrity-critical trigger is affected.
 
 ---
 
@@ -494,46 +496,27 @@ without the simulator being able to confirm otherwise.
   PostgreSQL semantics (not a gap, matches real SQL grammar)
 - `AlterTrigger`: fully resolved, all 3 forms verified
 
-## Grammar-Confirmed Limitations
+## Grammar-Confirmed Capabilities
 
 - `EnableTrigger`, `DisableTrigger`, `EnableAlwaysTrigger`,
-  `EnableReplicaTrigger`: confirmed entirely token-only across all four
-  variants, with no wrapping node anywhere in the grammar capable of
-  carrying the target trigger name or `ALL`/`USER` indicator. This is fully
-  resolved as a genuine, final grammar-level limitation — the target trigger
-  is not captured anywhere in this AST. Significant safety-relevant gap
-  given the data-integrity implications of trigger enable/disable operations.
+  `EnableReplicaTrigger`: each carries a `name_ref()` child node (target
+  trigger name) plus optional `all_token()` / `user_token()` presence flags.
+  The specific trigger being toggled (and whether `ALL`/`USER` is targeted)
+  is fully extractable. Cross-referencing the named trigger against the
+  dependency graph allows precise safety evaluation of enable/disable
+  operations. Significant safety-relevant capability for safe-migrate.
 
 ## Grammar Cross-Check
 
-This document was written with postgresql.ungram available from the start.
-All nodes cross-checked in this single pass, including a follow-up check of
-`AlterTableAction`'s grammar shape that fully resolved the enable/disable
-trigger name question as a confirmed, final limitation rather than an
-open accessor-location question.
+This document was cross-checked against `src/ast/generated/nodes.rs` and `src/ast/node_ext.rs` from `squawk-syntax-2.58.0`. All generated trigger-related node accessors (such as `CreateTrigger` at line 6762 and `AlterTrigger` at line 2680) have been verified against these source files alongside `postgresql.ungram`, including a follow-up check of `AlterTableAction`'s grammar shape that fully resolved the enable/disable trigger name question as a confirmed, final limitation rather than an open accessor-location question.
 
 ---
 
 # Remaining Open Questions
 
-None remaining. The deferred question about whether `AlterTableAction`
-carries the trigger name as a sibling has been resolved: postgresql.ungram
-confirms `EnableTrigger` (and the other three variants) appear as flat,
-unwrapped alternatives directly inside the `AlterTableAction` enum:
-
-```
-AlterTableAction =
-  ...
-| InheritTable
-| NoInheritTable
-| EnableTrigger
-| EnableReplicaTrigger
-| EnableReplicaRule
-| EnableAlwaysTrigger
-  ...
-```
-
-There is no wrapping node that could carry a trigger name alongside these
-variants — the grammar confirms the gap is real and final, not an artifact
-of under-inspection. This finding is now considered fully resolved as a
-confirmed grammar-level limitation.
+None remaining. The earlier assumption that `EnableTrigger` (and the other
+three variants) were flat, token-only alternatives inside `AlterTableAction`
+has been corrected: `src/ast/generated/nodes.rs` confirms each variant carries
+a `name_ref()` child node for the target trigger name. The trigger name and
+`ALL`/`USER` scope are fully extractable, so no grammar-level gap remains for
+trigger enable/disable name resolution.

@@ -2,13 +2,7 @@
 
 ## Status
 
-Inspection status: complete for schema nodes and the identifier resolution
-foundation (`Path`, `Name`, `NameRef`, identifier normalization).
-
-This document is derived from direct inspection of squawk.rs and should be
-treated as the current source of truth for safe-migrate schema and identifier
-handling. All claims are AST-verified via grep, line-range inspection, and
-cross-checked against postgresql.ungram.
+Verified against squawk_syntax 2.58.0 — July 2026
 
 ---
 
@@ -50,8 +44,8 @@ and `analysis/resolver.rs`.
 Two handwritten extensions are directly relevant to this document:
 
 ```
-impl ast::NameRef  (line 38488) — text(), is_quoted()
-impl ast::Name     (line 38500) — text(), is_quoted()
+impl ast::NameRef  (src/ast/node_ext.rs, line 417) — text(), is_quoted()
+impl ast::Name     (src/ast/node_ext.rs, line 429) — text(), is_quoted()
 ```
 
 Both documented fully below. No handwritten extension exists for `Path`,
@@ -83,7 +77,7 @@ The verified AST surface exposes:
 
 ## Path
 
-### Verified Accessors (line 14205)
+### Verified Accessors (src/ast/generated/nodes.rs, line 15925)
 
 ```rust
 pub fn qualifier(&self) -> Option<Path>
@@ -198,7 +192,7 @@ superseded by this general version.
 
 ## PathSegment
 
-### Verified Accessors (line 14265)
+### Verified Accessors (src/ast/generated/nodes.rs, line 16004)
 
 ```rust
 pub fn name(&self) -> Option<Name>
@@ -241,7 +235,7 @@ fn extract_text(segment: &PathSegment) -> Option<String> {
 
 ## Identifier Normalization — `Name.text()` / `NameRef.text()`
 
-### Verified Implementation (line 38488-38542, handwritten)
+### Verified Implementation (src/ast/node_ext.rs, line 417-493, handwritten)
 
 ```rust
 impl ast::NameRef {
@@ -337,7 +331,7 @@ this logic with a naive `.to_lowercase()` call.
 
 ## NameRef (token-level)
 
-### Verified Accessors — Generated (line 12594)
+### Verified Accessors — Generated (src/ast/generated/nodes.rs, line 14236)
 
 ```rust
 pub fn ident_token(&self) -> Option<SyntaxToken>
@@ -354,7 +348,7 @@ raw, unnormalized source text.
 
 ## CreateSchema
 
-### Verified Accessors (line 5229)
+### Verified Accessors (src/ast/generated/nodes.rs, line 6135)
 
 ```rust
 pub fn if_not_exists(&self) -> Option<IfNotExists>
@@ -430,7 +424,7 @@ will be silently invisible to the simulator.
 
 ## AlterSchema
 
-### Verified Accessors (line 1687)
+### Verified Accessors (src/ast/generated/nodes.rs, line 2045)
 
 ```rust
 pub fn name_ref(&self) -> Option<NameRef>
@@ -470,7 +464,7 @@ entries referencing the old schema name become stale (see search_path.md).
 
 ## DropSchema
 
-### Verified Accessors (line 7890)
+### Verified Accessors (src/ast/generated/nodes.rs, line 9027)
 
 ```rust
 pub fn if_exists(&self) -> Option<IfExists>
@@ -546,7 +540,7 @@ SchemaElement =
 
 ## Role
 
-### Verified Accessors (line 15678)
+### Verified Accessors (src/ast/generated/nodes.rs, line 17688)
 
 ```rust
 pub fn name(&self) -> Option<Name>

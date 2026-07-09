@@ -2,8 +2,7 @@
 
 ## Status
 
-Inspection status: complete. Cross-checked directly against postgresql.ungram
-and squawk.rs in a single pass.
+Verified against squawk_syntax 2.58.0 — July 2026
 
 ---
 
@@ -29,7 +28,7 @@ receiving side.
 
 ## CreatePublication
 
-### Verified Accessors (line 5116)
+### Verified Accessors (src/ast/generated/nodes.rs line 6018)
 
 ```rust
 pub fn except_table_clause(&self) -> Option<ExceptTableClause>
@@ -100,7 +99,7 @@ struct CreatePublicationFact {
 
 ## PublicationObject
 
-### Verified Accessors (line 14559)
+### Verified Accessors (src/ast/generated/nodes.rs line 16460)
 
 ```rust
 pub fn column_list(&self) -> Option<ColumnList>
@@ -187,32 +186,47 @@ dependency graph.
 
 ## ExceptTableClause
 
-### Verified Accessors (line 9073)
+### Verified Accessors (src/ast/generated/nodes.rs line 10238)
 
 ```rust
-pub fn relation_names(&self) -> AstChildren<RelationName>
+pub fn except_table_names(&self) -> AstChildren<ExceptTableName>
 pub fn l_paren_token(&self) -> Option<SyntaxToken>
 pub fn r_paren_token(&self) -> Option<SyntaxToken>
 pub fn except_token(&self) -> Option<SyntaxToken>
-// table_token() also present per established pattern
+pub fn table_token(&self) -> Option<SyntaxToken>
 ```
 
 ### Grammar Confirmation
 
 ```
 ExceptTableClause =
-  'except' 'table' '(' (RelationName (',' RelationName)*) ')'
+  'except' 'table' '(' (ExceptTableName (',' ExceptTableName)*) ')'
+```
+
+## ExceptTableName
+
+### Verified Accessors (src/ast/generated/nodes.rs line 10265)
+
+```rust
+pub fn relation_name(&self) -> Option<RelationName>
+pub fn table_token(&self) -> Option<SyntaxToken>
+```
+
+### Grammar Confirmation
+
+```
+ExceptTableName =
+  'table'? RelationName
 ```
 
 Used exclusively within `CreatePublication`'s `FOR ALL TABLES EXCEPT TABLE
-(...)` form, per the grammar's `CreatePublication` rule referencing this
-node directly (confirmed above).
+(...)` form, via the `ExceptTableClause` child node.
 
 ---
 
 ## ExceptTables — Distinct Node, Confirmed Unrelated to Publications
 
-### Verified Accessors (line 9100)
+### Verified Accessors (src/ast/generated/nodes.rs line 10280)
 
 ```rust
 pub fn name_refs(&self) -> AstChildren<NameRef>
@@ -259,7 +273,7 @@ the naming similarity.
 
 ## DropPublication
 
-### Verified Accessors (line 7754)
+### Verified Accessors (src/ast/generated/nodes.rs line 8891)
 
 ```rust
 pub fn if_exists(&self) -> Option<IfExists>

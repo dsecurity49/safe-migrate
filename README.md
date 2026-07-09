@@ -1,4 +1,4 @@
-# safe-migrate v0.3.2
+# safe-migrate v0.4.0
 
 A PostgreSQL migration linter that **executes a bi-directional state machine simulation** over your SQL, combining static typed AST analysis with live database statistics to prevent blocking locks before they reach production.
 
@@ -6,17 +6,20 @@ A PostgreSQL migration linter that **executes a bi-directional state machine sim
 
 ---
 
-## What's New in v0.3.2
+## What's New in v0.4.0
 
-v0.3.2 is a complete internal rewrite. Earlier versions parsed migrations with regex and substring matching, which broke on quoted identifiers, schemas, and anything non-trivial. safe-migrate now walks a typed PostgreSQL AST and runs a full state machine simulation of the migration — including transaction rollbacks, cascading drops, and partition hierarchies — before evaluating any rule.
+v0.4.0 is a correctness and output release. v0.3.0 was the architectural rewrite; v0.4.0 fixes 14 confirmed bugs in the rule engine and state machine, expands rule coverage to the full PostgreSQL ecosystem, and redesigns the CLI output to be unambiguous. Earlier versions parsed migrations with regex and substring matching, which broke on quoted identifiers, schemas, and anything non-trivial. safe-migrate now walks a typed PostgreSQL AST and runs a full state machine simulation of the migration — including transaction rollbacks, cascading drops, and partition hierarchies — before evaluating any rule.
 
 Highlights:
-- Typed AST parsing via `squawk_syntax` (no more string matching)
-- Transactions are simulated correctly: `BEGIN ... ROLLBACK` fully restores prior state, including generation counters and pending validations
-- `DROP TABLE ... CASCADE` is evaluated against the actual dependency graph (foreign keys, views, partitions), not just the table named in the statement
-- Table renames are tracked so foreign key and index references stay correct
-- Search path resolution checks that a schema actually exists before using it
-- 79 passing tests covering the simulator, rule engine, and CLI
+- 14 bugs fixed across the rule engine, state machine, AST extraction, and output layer
+- `now()` correctly classified as STABLE — no longer produces false positive table-rewrite warnings
+- `BrokenComputeRule` now correctly fires when you drop a function that backs a trigger (was completely silent before due to function_id mismatch)
+- Confidence correctly restored after `ROLLBACK` — a rolled-back `DO` block no longer permanently taints confidence for the rest of the run
+- `DROP SCHEMA CASCADE` now correctly cleans trigger and publication graph edges (was leaving stale edges causing false positives)
+- New rules: `overbroad-grant`, `broken-compute`, `drop-database`, `schema-drift`, `irreversible-migration`, `chain-conflict`, `restrictive-policy`, `disable-trigger`
+- Multi-file chain execution (`lint-chain --dir`) with state persisting across files
+- Redesigned CLI output: structured header box, per-finding blocks with `object`/`reason`/`recipe`/`sql` fields, four-way verdict system (`HALT`/`CAUTIOUS`/`SAFE WITH RISK`/`SAFE`)
+- 227 passing tests (up from 185)
 
 ### ✅ Live Database Statistics Integration
 
@@ -33,7 +36,7 @@ The `sync` command reads from PostgreSQL's catalog:
 
 ## Installation
 
-### From Binary
+### From Binary (Recommended)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/dsecurity49/safe-migrate/main/install.sh | bash
@@ -74,31 +77,36 @@ safe-migrate lint --file migration.sql
 Output:
 
 ```
-Analyzing migration: migration.sql
+┌────────────────────────────────────────────────────────────────┐
+│ safe-migrate lint                                              │
+╞════════════════════════════════════════════════════════════════╡
+│ Verdict: HALT       Confidence: Exact                          │
+│ HALT: 1   WARN: 1   SAFE: 0                                    │
+└────────────────────────────────────────────────────────────────┘
 
---------------------------------------------------------------------------------
-[FAIL] [TIER 1 - DANGER ] Synchronous FOREIGN KEY constraint addition locks 
-                          public.orders and public.auth_users
-                          Rule:   blocking-constraint
-                          Recipe: Adding a valid CHECK or FOREIGN KEY constraint 
-                                  takes an ACCESS EXCLUSIVE lock. Add it as NOT VALID 
-                                  first, then VALIDATE it in a separate transaction.
---------------------------------------------------------------------------------
-[WARN] [TIER 2 - WARNING] Synchronous index creation on public.orders
-                          Rule:   require-concurrent-index
-                          Recipe: Index operations block writes. Add the CONCURRENTLY 
-                                  keyword.
---------------------------------------------------------------------------------
+ [HALT] blocking-constraint
+   object : table public.orders
+   reason : synchronous FOREIGN KEY constraint addition locks public.orders and public.auth_users
+   recipe : Add it as NOT VALID first, then VALIDATE in a separate transaction.
+   sql    : ALTER TABLE orders ADD CONSTRAINT fk_user FOREIGN KEY (user_id) REFERENCES auth_users(id);
 
-==================================================
-Analysis Complete.
-Analysis Confidence : Exact
-Tier 1 (Halt Build) : 1
-Tier 2 (Warning)    : 1
-Tier 3 (Info)       : 0
-==================================================
+ ──────────────────────────────────────────────────
 
-Error: Migration halted: Tier 1 lock detected.
+ [WARN] require-concurrent-index
+   object : index public.idx_orders_user
+   reason : synchronous index creation on public.orders can block writes
+   recipe : Add the CONCURRENTLY keyword.
+   sql    : CREATE INDEX idx_orders_user ON orders(user_id);
+
+┌────────────────────────────────────────────────────────────────┐
+│ SUMMARY                                                        │
+╞════════════════════════════════════════════════════════════════╡
+│ Verdict                 : HALT                                 │
+│ Recommendation          : do not deploy                        │
+│ HALT (Tier 1)           : 1                                    │
+│ WARN (Tier 2)           : 1                                    │
+│ SAFE (Tier 3)           : 0                                    │
+└────────────────────────────────────────────────────────────────┘
 ```
 
 Exit code: **1** (Tier 1 violation) → CI build fails
@@ -154,7 +162,7 @@ Example:
 
 ## Rules Reference
 
-All 12 rules with examples:
+All 20 rules with examples:
 
 ### 1. **blocking-constraint** (Tier 1)
 Adding a valid `CHECK` or `FOREIGN KEY` constraint scans the entire table with an `ACCESS EXCLUSIVE` lock.
@@ -262,6 +270,46 @@ Using volatile functions like `random()` or `now()` as defaults can cause unexpe
 ### 12. **idempotency** (Tier 3, disabled by default)
 Recommend `CREATE TABLE IF NOT EXISTS` and `CREATE INDEX IF NOT EXISTS` for safer re-runs.
 
+### 13. **overbroad-grant** (Tier 1/2)
+Flags grants that apply too broadly — `GRANT ... TO PUBLIC` (Tier 1, applies to every role) or `GRANT ALL PRIVILEGES` to a non-owner role (Tier 2).
+
+```sql
+GRANT ALL PRIVILEGES ON orders TO PUBLIC;  -- ❌ Tier 1: PUBLIC is every role
+GRANT SELECT ON orders TO app_user;        -- ✅ Safe
+```
+
+### 14. **broken-compute** (Tier 1)
+Flags dropping a function that is used by one or more triggers. The trigger would be left pointing at a non-existent function.
+
+```sql
+CREATE TRIGGER audit BEFORE INSERT ON orders EXECUTE FUNCTION audit_fn();
+DROP FUNCTION audit_fn();  -- ❌ breaks the trigger
+```
+
+### 15. **drop-database** (Tier 1)
+`DROP DATABASE` is an irreversible, high-blast-radius operation that destroys the entire database. Should never appear in a migration file.
+
+### 16. **schema-drift** (Tier 1)
+Flags migrations that reference tables or objects not present in the synced production baseline. If `DROP TABLE orders` is in the migration but `orders` is not in the cache, the migration would fail at runtime.
+
+**Requires `safe-migrate sync` to be meaningful.** Without a cache, this rule has no baseline to compare against.
+
+### 17. **irreversible-migration** (Tier 1/3)
+Classifies `DROP COLUMN`, `DROP TABLE`, and lossy type changes (`VARCHAR(255) → VARCHAR(50)`) as irreversible. Tier is gated on row count — empty tables get Tier 3 (low risk), populated tables get Tier 1.
+
+```sql
+ALTER TABLE orders DROP COLUMN legacy_code;  -- Tier 1 if rows > 0, Tier 3 if empty
+```
+
+### 18. **restrictive-policy** (Tier 2)
+Flags RLS policies with `AS RESTRICTIVE` that could unexpectedly restrict access beyond what was intended.
+
+### 19. **disable-trigger** (Tier 2)
+Flags `ALTER TABLE ... DISABLE TRIGGER ALL` in migration files. Disabling triggers in a migration means constraints and audit trails are bypassed for the duration of the migration.
+
+### 20. **chain-conflict** (Tier 1)
+When using `lint-chain`, flags migrations in the same chain that add the same column with different types to the same table. Only applies to multi-file chain execution.
+
 ---
 
 ## Configuration
@@ -360,10 +408,18 @@ disabled = true
 | `concurrent-in-transaction` | Blocks CONCURRENTLY index operations inside explicit transaction blocks | Tier 1 |
 | `vacuum-full` | Flags VACUUM FULL usage (requires ACCESS EXCLUSIVE lock) | Tier 1 |
 | `opaque-dynamic-sql` | Detects dynamic SQL (DO blocks, EXECUTE) that hides mutations | Tier 2 |
-| `volatile-default` | Notes volatile functions like `NOW()` or `gen_random_uuid()` in defaults | Tier 3 |
+| `volatile-default` | Notes volatile functions like `clock_timestamp()` or `random()` in defaults | Tier 3 |
 | `missing-idempotency` | Recommends IF NOT EXISTS on CREATE statements (disabled by default) | Tier 3 |
 | `table-rewrite-storage` | Flags table rewrites caused by column storage parameter changes | Tier 1 |
 | `table-rewrite-access-method` | Flags table rewrites caused by access method changes | Tier 1 |
+| `overbroad-grant` | Flags GRANT ... TO PUBLIC or GRANT ALL PRIVILEGES to non-owner roles | Tier 1/2 |
+| `broken-compute` | Flags dropping a function that backs a trigger | Tier 1 |
+| `drop-database` | Flags DROP DATABASE in migration files | Tier 1 |
+| `schema-drift` | Flags references to tables absent from the production baseline | Tier 1 |
+| `irreversible-migration` | Flags DROP COLUMN, DROP TABLE, lossy type changes as irreversible | Tier 1/3 |
+| `restrictive-policy` | Flags RESTRICTIVE RLS policies that could unexpectedly restrict access | Tier 2 |
+| `disable-trigger` | Flags ALTER TABLE ... DISABLE TRIGGER ALL in migrations | Tier 2 |
+| `chain-conflict` | Flags same-chain migrations adding the same column with different types | Tier 1 |
 
 ### Version-Gating Examples
 
@@ -413,6 +469,24 @@ safe-migrate lint \
 | `--config` | `safe-migrate.toml` | Config overrides |
 | `--cache` | `.safe-migrate-stats.json` | Stats cache |
 | `--no-cache` | false | Use worst-case assumptions (offline mode) |
+
+### `safe-migrate lint-chain`
+
+Lint an ordered directory of migration files with state persisting across files. Files are processed in lexicographic order (V1__, V2__, etc.).
+
+```bash
+safe-migrate lint-chain \
+  --dir migrations/ \
+  --config safe-migrate.toml \
+  --cache .safe-migrate-stats.json
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--dir` | required | Directory of .sql files |
+| `--config` | `safe-migrate.toml` | Config overrides |
+| `--cache` | `.safe-migrate-stats.json` | Stats cache |
+| `--no-cache` | false | Use worst-case assumptions |
 
 ### `safe-migrate sync`
 
@@ -492,14 +566,16 @@ lint-migrations:
 
 ## Architecture
 
-safe-migrate parses your migration into a typed AST, then simulates it statement-by-statement against an in-memory model of your schema (tables, columns, indexes, foreign keys, views, partitions). That model starts from your synced database statistics and is updated as each statement is applied — so by the time a rule runs, it's checking against the schema as it would actually look at that point in the migration, not just the raw SQL text.
+safe-migrate parses your migration into a typed AST, then simulates it statement-by-statement against an in-memory model of your schema (tables, columns, indexes, foreign keys, views, partitions, functions, triggers, roles, policies, publications, subscriptions). That model starts from your synced database statistics and is updated as each statement is applied — so by the time a rule runs, it's checking against the schema as it would actually look at that point in the migration, not just the raw SQL text.
 
 This is what allows things like:
 - Correctly evaluating a `DROP TABLE ... CASCADE` against everything that actually depends on it
 - Knowing a table was renamed earlier in the same file when checking a later `ALTER TABLE`
-- Treating `BEGIN ... ROLLBACK` as a no-op on the schema, rather than analyzing the in-transaction state as if it persisted
+- Treating `BEGIN ... ROLLBACK` as a no-op on the schema, rather than analyzing the in-transaction state as if it persisted (confidence correctly restored after rollback)
+- Detecting that dropping a function would break a trigger that depends on it
+- Flagging migrations that reference tables absent from the production baseline
 
-DML statements (`INSERT`, `UPDATE`, `DELETE`, `SELECT`) are ignored. Dynamic SQL (`DO` blocks, `EXECUTE`) is detected and flagged, since it can hide schema changes the simulator can't see.
+DML statements (`INSERT`, `UPDATE`, `DELETE`, `SELECT`) are ignored. Dynamic SQL (`DO` blocks, `EXECUTE`) is detected and flagged, since it can hide schema changes the simulator can't see. When confidence is `Tainted` due to opaque SQL, Tier 1 violations are downgraded to Tier 2 — unless the opaque SQL was inside a transaction that was subsequently rolled back, in which case confidence is fully restored.
 
 ---
 
@@ -517,4 +593,4 @@ Dual-licensed under [MIT](LICENSE-MIT) or [Apache 2.0](LICENSE-APACHE).
 
 ## Changelog
 
-See [CHANGELOG.md](CHANGELOG.md) for release history.
+See [CHANGELOG.md](CHANGELOG.md) for full release history.

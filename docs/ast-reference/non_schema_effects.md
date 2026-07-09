@@ -2,11 +2,8 @@
 
 ## Status
 
-Conceptual synthesis document. No new AST inspection required — this document
-consolidates verified findings from across the AST reference set and defines
-the boundary between schema-structural mutations (what safe-migrate primarily
-models) and runtime-behavioral side effects (what safe-migrate must detect
-and flag even when it cannot fully simulate them).
+Verified against squawk_syntax 2.58.0 — July 2026
+
 
 Cross-references: search_path.md, transactions.md, functions.md,
 triggers.md, sequences.md, materialized_views.md, database.md,
@@ -31,7 +28,7 @@ Non-schema side effect:
   ALTER DATABASE db SET search_path = ''
   → LocalState changes: none to schema structure
   → Runtime behavioral change: all new connections resolve names differently
-  → Detectable: yes (database.md) | Value extractable: NO (grammar gap)
+  → Detectable: yes (database.md) | Value extractable: YES (via literals())
 ```
 
 The simulator's job for non-schema effects is different: rather than
@@ -56,7 +53,7 @@ affect the simulator's sequential model.
 | `SET ROLE role` | `SetRole` (roles.md) | YES | Session or LOCAL |
 | `SET SESSION AUTHORIZATION` | `SetSessionAuth` | YES | Session |
 | `RESET SESSION AUTHORIZATION` | `ResetSessionAuth` | N/A | Session |
-| `ALTER DATABASE db SET search_path` | `SetConfigParam` (database.md) | NO (grammar gap) | Future sessions only |
+| `ALTER DATABASE db SET search_path` | `SetConfigParam` (database.md) | YES (via literals()) | Future sessions only |
 | `ALTER ROLE r SET search_path` | `SetConfigParam` via `AlterRole` | NOT EXTRACTABLE (AlterRole black box) | Future sessions for role |
 
 **Simulator handling:** SESSION-scope changes apply immediately and persist
@@ -96,7 +93,7 @@ execution behavior, and connection policies.
 |-----------|----------|-------------------|-------------------|
 | `SET param = value` | `Set` (search_path.md) | YES (via path()) | YES (via config_values()) |
 | `RESET param` | `Reset` | YES | N/A |
-| `ALTER DATABASE db SET param` | `SetConfigParam` (database.md) | YES | NO (grammar gap) |
+| `ALTER DATABASE db SET param` | `SetConfigParam` (database.md) | YES | YES (via literals()) |
 | `ALTER ROLE r SET param` | inside `AlterRole` black box | NO | NO |
 | `CREATE FUNCTION ... SET param` | `SetFuncOption` (functions.md) | NO | NO (grammar gap) |
 
@@ -140,14 +137,16 @@ not captured in the schema. Two non-schema side effects are relevant:
 | Operation | AST Node | Notes |
 |-----------|----------|-------|
 | `ALTER SEQUENCE ... RESTART` | via `AlterSequence` (sequences.md) | Resets next value; `AlterSequence` carries no options (grammar gap) |
-| `ALTER COLUMN ... RESTART` | `Restart` as `AlterColumnOption` (columns.md) | Presence-only, value not captured |
+| `ALTER COLUMN ... RESTART` | `Restart` as `AlterColumnOption` (columns.md) | YES (via literal()) |
 
 **Simulator handling:** Sequence restarts can cause duplicate-key violations
 if the restarted value overlaps with existing data. This is a runtime
-concern, not structural — the simulator cannot evaluate it without knowing
-the current max value in the table (from pg_catalog, which DbCache can
-provide) vs the restart target (which the AST cannot provide due to grammar
-gaps).
+concern, not structural. For `ALTER COLUMN ... RESTART`, the restart target
+IS available via `Restart.literal()` (the AST provides it). For
+`ALTER SEQUENCE ... RESTART`, `AlterSequence` carries no options (grammar
+gap), so the restart target is not extractable. In both cases the simulator
+still needs the current max value in the table (from pg_catalog, which
+DbCache can provide) to confirm whether an overlap risk exists.
 
 ### Category 6: Materialized View Population State
 
@@ -280,7 +279,104 @@ These are tracked in addition to (not instead of) the main schema-structural
 | `DO $$ ... $$` | YES (presence) | NO (body) | High — all state unknown after this |
 | `SET ROLE` / role context | YES | YES | Medium — affects ownership resolution |
 | `RefreshMV WITH NO DATA` | YES | N/A | Medium — next query against this MV fails |
-| `ALTER DATABASE SET search_path` | Param name only | NO (value) | Medium — future sessions affected |
+| `ALTER DATABASE SET search_path` | YES (param + value via literals()) | YES (via literals()) | Medium — future sessions affected |
 | `LOCK TABLE` | YES | YES (table) | Low — operational, not correctness |
 | `SEQUENCE RESTART` | YES (presence) | NO (restart value) | Low — duplicate-key risk only if overlapping |
 | `PREPARE TRANSACTION` | YES | YES (XID) | Low — cross-session, not in current migration |
+
+---
+
+## AST Reference: Expressions, Operators, and Call Nodes
+
+### 1. The `Expr` Enum
+
+The `Expr` enum represents all SQL expressions parsed by `squawk_syntax`. Every variant of `Expr` wraps a corresponding AST node structure of the same name. In safe-migrate's [expr_visitor.rs](file:///data/data/com.termux/files/home/safe-migrate/src/analysis/expr_visitor.rs), the [ExprVisitor](file:///data/data/com.termux/files/home/safe-migrate/src/analysis/expr_visitor.rs#L5)'s [convert](file:///data/data/com.termux/files/home/safe-migrate/src/analysis/expr_visitor.rs#L8) method maps these to intermediate representation.
+
+| Variant | Wrapped AST Node | Description | Handled in [expr_visitor.rs](file:///data/data/com.termux/files/home/safe-migrate/src/analysis/expr_visitor.rs)? |
+|---------|------------------|-------------|------------------------------|
+| `ArrayExpr` | `ArrayExpr` | Array literal or constructor (e.g., `ARRAY[1, 2]`) | Yes |
+| `BetweenExpr` | `BetweenExpr` | Range comparison expression (e.g., `x BETWEEN y AND z`) | Yes |
+| `BinExpr` | `BinExpr` | Binary operator expression (e.g., `x + y`) | Yes |
+| `CallExpr` | `CallExpr` | Function or operator call expression (e.g., `func(x, y)`) | Yes (via [convert_call_expr](file:///data/data/com.termux/files/home/safe-migrate/src/analysis/expr_visitor.rs#L43)) |
+| `CaseExpr` | `CaseExpr` | Conditional CASE expression | Yes |
+| `CastExpr` | `CastExpr` | Type cast expression (e.g., `x::type` or `CAST(x AS type)`) | Yes |
+| `FieldExpr` | `FieldExpr` | Composite field selection (e.g., `(composite_val).field`) | Yes |
+| `IndexExpr` | `IndexExpr` | Array/container indexing (e.g., `arr[i]`) | Yes |
+| `Literal` | `Literal` | Constant literal value (e.g., `'text'`, `42`, `NULL`) | Yes |
+| `NameRef` | `NameRef` | Identifier reference to a column or variable | Yes |
+| `ParenExpr` | `ParenExpr` | Parenthesized expression (e.g., `(expr)`) | Yes |
+| `PostfixExpr` | `PostfixExpr` | Postfix operator expression (e.g., `expr IS NULL`) | Yes |
+| `PrefixExpr` | `PrefixExpr` | Prefix operator expression (e.g., `-expr` or `NOT expr`) | Yes |
+| `SliceExpr` | `SliceExpr` | Array slicing expression (e.g., `arr[i:j]`) | Yes |
+| `TupleExpr` | `TupleExpr` | Row/tuple constructor expression (e.g., `(x, y, z)`) | **No** (Falls back to `_` wildcard mapping to `ExprIr::Literal("<complex>")`) |
+
+> [!NOTE]
+> `TupleExpr` is the only variant not explicitly handled by [ExprVisitor](file:///data/data/com.termux/files/home/safe-migrate/src/analysis/expr_visitor.rs#L5)'s [convert](file:///data/data/com.termux/files/home/safe-migrate/src/analysis/expr_visitor.rs#L8) method. It falls back to `_` mapping to `ExprIr::Literal("<complex>".into())`.
+
+---
+
+### 2. CallExpr and Arg Nodes
+
+In `squawk_syntax` >= 2.58.0, function call syntax is structured to support complex argument clauses (such as named arguments, order-by specifications, and variadic keyword prefixes).
+
+* **`CallExpr`** represents function/procedure call expressions. Calling `arg_list()` on a `CallExpr` returns an `Option<ArgList>` rather than direct expressions.
+* **`ArgList`** acts as the container for call arguments and optional modifier tokens. It exposes:
+  * `args() -> AstChildren<Arg>`: An iterator over the argument wrapper nodes.
+  * `distinct_token() -> Option<SyntaxToken>`: Captures the `DISTINCT` keyword if present (e.g., `count(DISTINCT x)`).
+  * `all_token() -> Option<SyntaxToken>`: Captures the `ALL` keyword.
+  * `star_token() -> Option<SyntaxToken>`: Captures a star argument (e.g., `count(*)`).
+* **`Arg`** is a wrapper node that encapsulates the expression itself along with positional or semantic decorators:
+  * `expr() -> Option<Expr>`: Retrieves the underlying expression node being passed.
+  * `named_arg() -> Option<NamedArg>`: Retrieves the `NamedArg` node if the argument is named (e.g., `argname => expression`).
+  * `order_by_clause() -> Option<OrderByClause>`: Retrieves the `OrderByClause` node if the argument contains a local ordering (e.g., `string_agg(name ORDER BY name)`).
+  * `variadic_token() -> Option<SyntaxToken>`: Retrieves the `VARIADIC` keyword token if present (e.g., `func(VARIADIC arr)`).
+
+---
+
+### 3. The BinOp Enum
+
+The `BinOp` enum lists all binary operators that can appear within a `BinExpr`. 
+
+#### The Escape Operator
+In `squawk_syntax` 2.58.0, the **`Escape`** variant was added to represent the `ESCAPE` clause in pattern matches (e.g., `col LIKE 'pattern' ESCAPE '!'`). It wraps a `SyntaxToken`. This variant is handled in [convert_bin_expr](file:///data/data/com.termux/files/home/safe-migrate/src/analysis/expr_visitor.rs#L66).
+
+#### Full List of Variants
+Below is the complete catalog of `BinOp` enum variants and their corresponding inner structures in `squawk_syntax` 2.58.0:
+
+1. **`And(SyntaxToken)`**: Logical AND (`AND`)
+2. **`AtTimeZone(AtTimeZone)`**: Time zone conversion (`AT TIME ZONE`)
+3. **`Caret(SyntaxToken)`**: Exponentiation operator (`^`)
+4. **`Collate(SyntaxToken)`**: Collation override operator (`COLLATE`)
+5. **`ColonColon(ColonColon)`**: Type cast operator (`::`)
+6. **`ColonEq(SyntaxToken)`**: Variable assignment operator (`:=`)
+7. **`CustomOp(CustomOp)`**: User-defined/custom operator (e.g., `@@`, `|/`)
+8. **`Eq(SyntaxToken)`**: Equality operator (`=`)
+9. **`Escape(SyntaxToken)`**: Escape character clause operator (`ESCAPE`) *(added in 2.58.0)*
+10. **`FatArrow(SyntaxToken)`**: Named argument bind operator (`=>`)
+11. **`Gteq(SyntaxToken)`**: Greater than or equal operator (`>=`)
+12. **`Ilike(SyntaxToken)`**: Case-insensitive pattern match operator (`ILIKE`)
+13. **`In(SyntaxToken)`**: Set membership operator (`IN`)
+14. **`Is(SyntaxToken)`**: Identity comparison operator (`IS`)
+15. **`IsDistinctFrom(IsDistinctFrom)`**: Distinct comparison operator (`IS DISTINCT FROM`)
+16. **`IsNot(IsNot)`**: Negated identity comparison operator (`IS NOT`)
+17. **`IsNotDistinctFrom(IsNotDistinctFrom)`**: Negated distinct comparison operator (`IS NOT DISTINCT FROM`)
+18. **`LAngle(SyntaxToken)`**: Less than operator (`<`)
+19. **`Like(SyntaxToken)`**: Pattern match operator (`LIKE`)
+20. **`Lteq(SyntaxToken)`**: Less than or equal operator (`<=`)
+21. **`Minus(SyntaxToken)`**: Subtraction operator (`-`)
+22. **`Neq(SyntaxToken)`**: Inequality operator (`!=` / `<>`)
+23. **`Neqb(SyntaxToken)`**: Another inequality operator representation
+24. **`NotIlike(NotIlike)`**: Negated case-insensitive pattern match operator (`NOT ILIKE`)
+25. **`NotIn(NotIn)`**: Negated set membership operator (`NOT IN`)
+26. **`NotLike(NotLike)`**: Negated pattern match operator (`NOT LIKE`)
+27. **`NotSimilarTo(NotSimilarTo)`**: Negated regex-like pattern match operator (`NOT SIMILAR TO`)
+28. **`OperatorCall(OperatorCall)`**: Procedural schema-qualified operator invocation (e.g., `OPERATOR(schema.op)`)
+29. **`Or(SyntaxToken)`**: Logical OR (`OR`)
+30. **`Overlaps(SyntaxToken)`**: Temporal/range overlap operator (`OVERLAPS`)
+31. **`Percent(SyntaxToken)`**: Modulo operator (`%`)
+32. **`Plus(SyntaxToken)`**: Addition operator (`+`)
+33. **`RAngle(SyntaxToken)`**: Greater than operator (`>`)
+34. **`SimilarTo(SimilarTo)`**: Regex-like pattern match operator (`SIMILAR TO`)
+35. **`Slash(SyntaxToken)`**: Division operator (`/`)
+36. **`Star(SyntaxToken)`**: Multiplication operator (`*`)
+

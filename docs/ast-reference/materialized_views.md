@@ -2,12 +2,7 @@
 
 ## Status
 
-Inspection status: complete. This document consolidates and cross-references
-the materialized-view-specific AST surface already fully verified in
-views.md, and adds materialized-view-specific safety analysis not covered
-there. No new squawk.rs/grammar inspection was required for this document —
-all underlying accessor verification was already completed and resolved to
-zero open questions in views.md.
+Verified against squawk_syntax 2.58.0 — July 2026
 
 ---
 
@@ -136,11 +131,8 @@ full `AlterTableAction` surface structurally.
 
 See views.md for full accessor documentation. Key finding already
 established there: `DropMaterializedView` supports **multiple** view names
-per statement (`paths()`, plural) — this is the opposite cardinality from
-`DropView`, which is single-name only. This asymmetry is documented in
-detail in views.md's "Critical Asymmetry" section and is not repeated here,
-but is flagged again because it is directly relevant to any code handling
-materialized view drops specifically.
+per statement (`paths()`, plural) — in 2.58.0 this is now symmetric with
+`DropView`, which also supports multiple names via `paths()`.
 
 ---
 

@@ -2,12 +2,7 @@
 
 ## Status
 
-Inspection status: complete for all view and materialized view nodes.
-
-This document is derived from direct inspection of squawk.rs and should be treated as the
-current source of truth for safe-migrate view handling.
-
-All claims are AST-verified via grep and line-range inspection.
+Verified against squawk_syntax 2.58.0 — July 2026
 
 ---
 
@@ -56,7 +51,7 @@ The verified AST surface exposes:
 
 ## CreateView
 
-### Verified Accessors (line 6056)
+### Verified Accessors (line 6983)
 
 ```rust
 pub fn column_list(&self) -> Option<ColumnList>
@@ -79,8 +74,8 @@ pub fn with_token(&self) -> Option<SyntaxToken>
 
 ### Membership
 
-Member of `SchemaElement` enum (line 35587).
-Member of `Stmt` enum (line 36931).
+Member of `SchemaElement` enum (line 39392).
+Member of `Stmt` enum (line 40736).
 
 ### Key Accessor Notes
 
@@ -131,48 +126,80 @@ enum CheckOptionKind {
 
 ## AlterView
 
-### Verified Accessors (line 2301)
+### Verified Accessors (line 2908)
 
 ```rust
+pub fn expr(&self) -> Option<Expr>
+pub fn if_exists(&self) -> Option<IfExists>
+pub fn name(&self) -> Option<Name>
+pub fn name_ref(&self) -> Option<NameRef>
+pub fn owner_to(&self) -> Option<OwnerTo>
 pub fn path(&self) -> Option<Path>
+pub fn rename_to(&self) -> Option<RenameTo>
+pub fn reset_options(&self) -> Option<ResetOptions>
+pub fn set_options(&self) -> Option<SetOptions>
+pub fn set_schema(&self) -> Option<SetSchema>
 pub fn semicolon_token(&self) -> Option<SyntaxToken>
 pub fn alter_token(&self) -> Option<SyntaxToken>
+pub fn column_token(&self) -> Option<SyntaxToken>
+pub fn default_token(&self) -> Option<SyntaxToken>
+pub fn drop_token(&self) -> Option<SyntaxToken>
+pub fn rename_token(&self) -> Option<SyntaxToken>
+pub fn set_token(&self) -> Option<SyntaxToken>
+pub fn to_token(&self) -> Option<SyntaxToken>
 pub fn view_token(&self) -> Option<SyntaxToken>
 ```
 
 ### Membership
 
-Member of `Stmt` enum (line 36619).
+Member of `Stmt` enum (line 40424).
 
-### Important Finding — Grammar Confirmed
+### Grammar Definition
 
-The ungrammar definition confirms this is not an extraction gap:
+The ungrammar definition shows substantial action options beyond path():
 
 ```
 AlterView =
-  'alter' 'view' Path ';'?
+  'alter' 'view' IfExists? Path
+  (
+    'alter' 'column'? NameRef (('set' 'default' Expr) | ('drop' 'default'))
+  | OwnerTo
+  | RenameTo
+  | 'rename' 'column'? NameRef 'to' Name
+  | SetSchema
+  | SetOptions
+  | ResetOptions
+  ) ';'?
 ```
 
-`AlterView` genuinely carries no action or option clause in this grammar.
-`path()` and keyword tokens are the complete surface — there is nothing
-further to extract. This is a grammar-level limitation, not a missing accessor.
+### Important Finding — Grammar Confirmed Capabilities
+
+`AlterView` genuinely supports multiple action forms in this grammar:
+- Column default modification via `expr()` — `ALTER [COLUMN] col SET DEFAULT expr` or `ALTER [COLUMN] col DROP DEFAULT`
+- Ownership change via `owner_to()` — `OWNER TO role`
+- Rename via `rename_to()` — `RENAME TO new_name`
+- Column rename via `rename_token()` + `name_ref()` + `to_token()` + `name()` — `RENAME COLUMN col TO new_col`
+- Schema change via `set_schema()` — `SET SCHEMA new_schema`
+- Configuration options via `set_options()`/`reset_options()` — `SET option=value` / `RESET option`
+
+This is a grammar-confirmation of substantial capabilities, not an extraction gap.
 
 ### Status
 
 ```
 AST verified
-Grammar-confirmed: AlterView carries no actions beyond path()
+Grammar-confirmed: AlterView supports multiple action forms via dedicated accessors
 ```
 
 ---
 
 ## DropView
 
-### Verified Accessors (line 8651)
+### Verified Accessors (line 9781)
 
 ```rust
 pub fn if_exists(&self) -> Option<IfExists>
-pub fn path(&self) -> Option<Path>
+pub fn paths(&self) -> AstChildren<Path>
 pub fn semicolon_token(&self) -> Option<SyntaxToken>
 pub fn cascade_token(&self) -> Option<SyntaxToken>
 pub fn drop_token(&self) -> Option<SyntaxToken>
@@ -182,18 +209,17 @@ pub fn view_token(&self) -> Option<SyntaxToken>
 
 ### Membership
 
-Member of `Stmt` enum (line 37225).
+Member of `Stmt` enum (line 41030).
 
 ### Important Finding
 
-`DropView.path()` returns a single `Option<Path>`.
-Only one view name is accessible per statement through this accessor.
+`DropView.paths()` returns `AstChildren<Path>` — multiple names supported.
 
 ### safe-migrate guidance
 
 ```rust
 DropViewFact {
-    name: QualifiedName,    // from path()
+    names: Vec<QualifiedName>,    // from paths() — may be multiple
     if_exists: bool,
     cascade: bool,
 }
@@ -205,7 +231,7 @@ DropViewFact {
 
 ## CreateMaterializedView
 
-### Verified Accessors (line 4779)
+### Verified Accessors (line 5678)
 
 ```rust
 pub fn column_list(&self) -> Option<ColumnList>
@@ -226,8 +252,8 @@ pub fn view_token(&self) -> Option<SyntaxToken>
 
 ### Membership
 
-Member of `Stmt` enum (line 36769).
-Member of `ExplainStmt` enum (line 34154).
+Member of `Stmt` enum (line 40574).
+Member of `ExplainStmt` enum (line 37790).
 
 ### Key Accessor Notes
 
@@ -261,7 +287,7 @@ CreateMaterializedViewFact {
 
 ## AlterMaterializedView
 
-### Verified Accessors (line 1180)
+### Verified Accessors (line 1443)
 
 ```rust
 pub fn action(&self) -> AstChildren<AlterMaterializedViewAction>
@@ -283,7 +309,7 @@ pub fn view_token(&self) -> Option<SyntaxToken>
 
 ### Membership
 
-Member of `Stmt` enum (line 36457).
+Member of `Stmt` enum (line 40262).
 
 ### Key Accessor Notes
 
@@ -302,7 +328,7 @@ ALTER MATERIALIZED VIEW ALL IN TABLESPACE old [OWNED BY role] SET TABLESPACE new
 Both `name_ref()` and `path()` are present — one identifies the target view,
 the other may identify a tablespace in the ALL IN TABLESPACE form.
 
-### AlterMaterializedViewAction Enum (line 19394)
+### AlterMaterializedViewAction Enum (line 21882)
 
 ```rust
 pub enum AlterMaterializedViewAction {
@@ -315,7 +341,7 @@ pub enum AlterMaterializedViewAction {
 }
 ```
 
-Verified via `From<X> for AlterMaterializedViewAction` impls at lines 32953-32977.
+Verified via `From<X> for AlterMaterializedViewAction` impls at lines 36535-36563.
 
 ### Individual Variant Accessors — Resolved via Cross-Reference
 
@@ -373,7 +399,7 @@ AlterTableAction wrapping: confirmed intentional per grammar, with the
 
 ## DropMaterializedView
 
-### Verified Accessors (line 7370)
+### Verified Accessors (line 8504)
 
 ```rust
 pub fn if_exists(&self) -> Option<IfExists>
@@ -388,16 +414,15 @@ pub fn view_token(&self) -> Option<SyntaxToken>
 
 ### Membership
 
-Member of `Stmt` enum (line 37057).
+Member of `Stmt` enum (line 40862).
 
-### Critical Asymmetry with DropView
+### Symmetry with DropView
 
-`DropMaterializedView.paths()` returns `AstChildren<Path>` — multiple names supported.
-`DropView.path()` returns `Option<Path>` — single name only.
+Both `DropMaterializedView` and `DropView` support multiple names per statement via `paths()` returning `AstChildren<Path>`.
 
 ```sql
 DROP MATERIALIZED VIEW mv1, mv2, mv3;  -- supported, paths() gives all three
-DROP VIEW v1;                           -- single only, path() gives one
+DROP VIEW v1, v2, v3;                  -- supported, paths() gives all three
 ```
 
 ### safe-migrate guidance
@@ -414,7 +439,7 @@ DropMaterializedViewFact {
 
 ## Refresh (REFRESH MATERIALIZED VIEW)
 
-### Verified Accessors (line 14841)
+### Verified Accessors (line 16739)
 
 ```rust
 pub fn path(&self) -> Option<Path>
@@ -429,7 +454,7 @@ pub fn view_token(&self) -> Option<SyntaxToken>
 
 ### Membership
 
-Member of `Stmt` enum.
+Member of `Stmt` enum (line 41138).
 
 ### Key Accessor Notes
 
@@ -455,7 +480,7 @@ RefreshMaterializedViewFact {
 
 # CreateViewLike — Synthetic Unification Node
 
-## Definition (line 39162)
+## Definition (src/ast/nodes.rs line 52)
 
 ```rust
 impl CreateViewLike {
@@ -514,24 +539,24 @@ properties are needed (e.g. `with_data`, `or_replace`, `recursive`).
   `AlterMaterializedViewAction` variant cross-references and the confirmed
   intentionality of the `AlterTableAction` wrapping
 
-## Grammar-Confirmed Limitations
+## Grammar-Confirmed Capabilities
 
-- `AlterView`: confirmed by postgresql.ungram to carry no actions beyond path() —
-  not an extraction gap, a grammar-level limitation
+- `AlterView`: confirmed by postgresql.ungram to support multiple action forms
+  (column defaults, ownership, rename, schema, options) via dedicated accessors —
+  not an extraction gap, but originally under-documented
 
 ## Grammar Cross-Check
 
 This document has been fully cross-checked against postgresql.ungram.
 `CreateView`, `DropView`, `CreateMaterializedView`, `DropMaterializedView`,
-`Refresh`, `AlterMaterializedView`, and `AlterMaterializedViewAction` all match
-the verified accessor surface exactly. The `AlterView` grammar-confirmed empty
-action surface (above) was the only correction required.
+`Refresh`, `AlterMaterializedView`, `AlterMaterializedViewAction`, and `AlterView`
+all match the verified accessor surface exactly. The `AlterView` accessor surface
+was updated to reflect the full grammar capabilities.
+```
 
-## Critical Asymmetry
+## Symmetry
 
-`DropView` supports only a single view name per statement (`path()`).
-`DropMaterializedView` supports multiple names per statement (`paths()`).
-Any code treating these uniformly will silently miss multiple-name drops.
+Both `DropView` and `DropMaterializedView` support multiple names per statement (`paths()`).
 
 ---
 

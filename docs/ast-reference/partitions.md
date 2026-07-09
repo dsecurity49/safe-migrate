@@ -2,12 +2,7 @@
 
 ## Status
 
-Inspection status: complete for all core partition nodes.
-
-This document is derived from direct inspection of squawk.rs and should be treated as the
-current source of truth for safe-migrate partition handling.
-
-All claims are AST-verified via grep and line-range inspection.
+Verified against squawk_syntax 2.58.0 — July 2026
 
 ---
 
@@ -66,6 +61,7 @@ Partition-relevant accessors:
 ```rust
 pub fn partition_by(&self) -> Option<PartitionBy>    // present when table is partitioned
 pub fn partition_of(&self) -> Option<PartitionOf>    // present when table is a partition child
+pub fn partition_type(&self) -> Option<PartitionType> // present when table is a partition child with bounds
 pub fn inherits(&self) -> Option<Inherits>           // traditional inheritance (not partitioning)
 ```
 
@@ -79,7 +75,7 @@ These are mutually exclusive in valid SQL.
 
 ## PartitionBy
 
-### Verified Accessors (line 13990)
+### Verified Accessors (line 15682)
 
 ```rust
 pub fn partition_item_list(&self) -> Option<PartitionItemList>
@@ -127,7 +123,7 @@ PartitionByFact {
 
 ## PartitionOf
 
-### Verified Accessors (line 14186)
+### Verified Accessors (line 15906)
 
 ```rust
 pub fn path(&self) -> Option<Path>
@@ -159,7 +155,8 @@ CreateTable =
   'table' IfNotExists? Path
   PartitionOf?
   OfType?
-  TableArgList
+  TableArgList?
+  PartitionType?
   Inherits?
   PartitionBy?
   UsingMethod?
@@ -168,27 +165,21 @@ CreateTable =
   Tablespace? ';'?
 ```
 
-Neither `PartitionOf` nor `CreateTable` carries a `PartitionType` field anywhere
-in the grammar. `TableArgList` is also confirmed to contain only `TableArg`
-items (columns and `LIKE` clauses), no bound specification.
+`CreateTable` carries a `PartitionType?` field in the grammar.
 
-**This means the `FOR VALUES ...` bound clause for `CREATE TABLE ... PARTITION OF`
-is not represented in this AST grammar at all.** This is a confirmed grammar
-limitation, not an accessor gap. A migration statement like:
+**This means the `FOR VALUES ...` bound clause for `CREATE TABLE ... PARTITION OF` is represented in this AST grammar under the `CreateTable` node.** The bounds can be extracted via `CreateTable.partition_type()`. A migration statement like:
 
 ```sql
 CREATE TABLE sales_2024 PARTITION OF sales FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
 ```
 
-can be detected as a partition-child creation (`partition_of().is_some()`), but
-the bound values themselves cannot be extracted from this grammar version.
+can be detected as a partition-child creation (`partition_of().is_some()`), and the bound values themselves can be extracted via the `partition_type()` accessor of the `CreateTable` node.
 
 ### Status
 
 ```
 Grammar verified — RESOLVED
-PartitionOf bound specification: confirmed absent from grammar entirely,
-not extractable from CreateTable + PartitionOf combination
+PartitionOf bound specification: extractable from CreateTable via partition_type()
 ```
 
 ---
@@ -197,7 +188,7 @@ not extractable from CreateTable + PartitionOf combination
 
 ## AttachPartition
 
-### Verified Accessors (line 2578)
+### Verified Accessors (line 3263)
 
 ```rust
 pub fn partition_type(&self) -> Option<PartitionType>
@@ -234,7 +225,7 @@ Mutation::AttachPartition {
 
 ## DetachPartition
 
-### Verified Accessors (line 6461)
+### Verified Accessors (line 7566)
 
 ```rust
 pub fn path(&self) -> Option<Path>
@@ -275,7 +266,7 @@ Mutation::DetachPartition {
 
 ## SplitPartition
 
-### Verified Accessors (line 17363)
+### Verified Accessors (line 19696)
 
 ```rust
 pub fn partition_list(&self) -> Option<PartitionList>
@@ -299,13 +290,13 @@ ALTER TABLE t SPLIT PARTITION p INTO (partition_def, partition_def)
 ### PartitionList
 
 ```rust
-// line 14160 (from earlier grep context)
+// line 15887 (from earlier grep context)
 pub fn partitions(&self) -> AstChildren<Partition>
 pub fn l_paren_token(&self) -> Option<SyntaxToken>
 pub fn r_paren_token(&self) -> Option<SyntaxToken>
 ```
 
-### Partition (individual element, line 13971)
+### Partition (individual element, line 15663)
 
 ```rust
 pub fn partition_type(&self) -> Option<PartitionType>
@@ -328,12 +319,11 @@ Partition: fully resolved
 
 ## MergePartitions
 
-### Verified Accessors (line 12389)
+### Verified Accessors (line 13995)
 
 ```rust
 pub fn path(&self) -> Option<Path>
-pub fn l_paren_token(&self) -> Option<SyntaxToken>
-pub fn r_paren_token(&self) -> Option<SyntaxToken>
+pub fn path_list(&self) -> Option<PathList>
 pub fn into_token(&self) -> Option<SyntaxToken>
 pub fn merge_token(&self) -> Option<SyntaxToken>
 pub fn partitions_token(&self) -> Option<SyntaxToken>
@@ -351,37 +341,40 @@ ALTER TABLE t MERGE PARTITIONS (p1, p2, ...) INTO merged_partition
 
 `path()` gives the target merged partition name.
 
-### Grammar Confirmation — Genuine Grammar Gap
+### Grammar Confirmation — Resolved
 
 postgresql.ungram confirms:
 
 ```
 MergePartitions =
   'merge' 'partitions'
-  '(' ')'
-  'into'
+  PathList
+  'into'?
   Path
 ```
 
-The parentheses are present in the grammar but contain **no rule reference** —
-the source partition list between `(` and `)` is not captured as structured
-AST content. This is confirmed as a genuine grammar limitation, not a
-documentation or accessor gap. The source partitions named in
-`MERGE PARTITIONS (p1, p2, ...)` are not extractable from this AST node.
+`MergePartitions` contains `PathList` in the grammar in 2.58.0.
+
+**This means the source partition list between `(` and `)` is captured as structured AST content under the `path_list()` accessor.** The source partitions named in `MERGE PARTITIONS (p1, p2, ...)` are fully extractable from the `PathList` node, which exposes:
+
+```rust
+pub fn paths(&self) -> AstChildren<Path>
+pub fn l_paren_token(&self) -> Option<SyntaxToken>
+pub fn r_paren_token(&self) -> Option<SyntaxToken>
+```
 
 ### Status
 
 ```
-Grammar verified
-Source partition list: confirmed absent from grammar — not an accessor gap,
-the parser does not capture this content into the tree
+Grammar verified — RESOLVED
+Source partition list: fully captured in the grammar via PathList and extractable from the path_list() accessor
 ```
 
 ---
 
 # PartitionType Enum
 
-## Definition (line 19654)
+## Definition (line 22174)
 
 ```rust
 pub enum PartitionType {
@@ -412,7 +405,7 @@ Represents: `FOR VALUES DEFAULT`
 
 ## PartitionForValuesFrom
 
-### Verified Accessors (line 14028)
+### Verified Accessors (line 15720)
 
 ```rust
 pub fn exprs(&self) -> AstChildren<Expr>
@@ -490,7 +483,7 @@ that would affect every partition-bound safety rule built on top of it.
 
 ## PartitionForValuesIn
 
-### Verified Accessors (line 14063)
+### Verified Accessors (line 15755)
 
 ```rust
 pub fn exprs(&self) -> AstChildren<Expr>
@@ -523,7 +516,7 @@ ListBoundFact {
 
 ## PartitionForValuesWith
 
-### Verified Accessors (line 14094)
+### Verified Accessors (line 15786)
 
 ```rust
 pub fn literal(&self) -> Option<Literal>
@@ -586,6 +579,8 @@ confirmed in the inspected accessor block
 - `PartitionType` enum: all 4 members verified
 - `PartitionDefault`: fully resolved
 - `PartitionForValuesIn`: fully resolved
+- `MergePartitions`: fully resolved (source partitions extractable via `path_list()`)
+- `CREATE TABLE ... PARTITION OF ... FOR VALUES ...`: fully resolved (bounds extractable via `partition_type()` on `CreateTable`)
 
 ## Confirmed Partial
 
@@ -600,18 +595,14 @@ confirmed in the inspected accessor block
 
 ## Grammar-Confirmed Limitations
 
-- `MergePartitions`: postgresql.ungram confirms the source partition list is
-  genuinely not captured in the grammar — empty parens with no rule reference.
-  This is a parser-level limitation, not an accessor gap.
-- `CREATE TABLE ... PARTITION OF ... FOR VALUES ...`: confirmed by grammar that
-  the bound specification is entirely absent from the AST. Critical for
-  safe-migrate: the simulator cannot determine partition bounds for newly
-  created partition children from this grammar, which affects any rule that
-  needs to reason about partition coverage or overlap.
 - `PartitionForValuesFrom`: grammar shows two distinct parenthesized groups,
   but only one paren-token pair is exposed in the accessor surface — the
   FROM/TO boundary for multi-column partitions is not self-describing from
   this node alone.
+
+## Grammar Cross-Check
+
+This document has been fully cross-checked against postgresql.ungram. The 2.58.0 generated nodes are in `src/ast/generated/nodes.rs`, and handwritten extensions are in `src/ast/node_ext.rs`.
 
 ---
 
@@ -652,7 +643,7 @@ None remaining. Both previously open questions have been resolved:
    lowercase in generated migrations.
 
 2. **Second value accessor in `PartitionForValuesWith`**: Confirmed as a
-   final grammar gap via direct squawk.rs inspection (line 14094).
+   final grammar gap via direct src/ast/generated/nodes.rs inspection (line 15786).
    The complete verified accessor surface is:
 
    ```rust

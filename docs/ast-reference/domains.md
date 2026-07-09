@@ -2,8 +2,7 @@
 
 ## Status
 
-Inspection status: complete. Cross-checked directly against postgresql.ungram
-and squawk.rs in a single pass.
+Verified against squawk_syntax 2.58.0 — July 2026
 
 ---
 
@@ -31,7 +30,7 @@ re-documenting their accessor bodies.
 
 ## CreateDomain
 
-### Verified Accessors (line 4372)
+### Verified Accessors (line 5243)
 
 ```rust
 pub fn collate(&self) -> Option<Collate>
@@ -90,7 +89,7 @@ this is always safe at creation, the risk is entirely in later
 
 ## DropDomain
 
-### Verified Accessors (line 6958)
+### Verified Accessors (line 8092)
 
 ```rust
 pub fn if_exists(&self) -> Option<IfExists>
@@ -127,7 +126,7 @@ type resolves to a domain name must be tracked, not just columns with
 
 ## AlterDomain
 
-### Verified Accessors (line 782)
+### Verified Accessors (line 793)
 
 ```rust
 pub fn action(&self) -> Option<AlterDomainAction>
@@ -160,7 +159,7 @@ changes requires multiple separate `ALTER DOMAIN` statements.
 
 ## AlterDomainAction (enum)
 
-### Verified Members (11 total)
+### Verified Members (11 total) (line 21855)
 
 ```rust
 pub enum AlterDomainAction {
@@ -286,8 +285,7 @@ removal operations that do not require scanning dependent data.
 
 ## Grammar Cross-Check
 
-This document was written with postgresql.ungram available from the start.
-All nodes cross-checked in this single pass; no corrections needed.
+All nodes cross-checked against `src/postgresql.ungram` and the `squawk-syntax` source code in `src/ast/generated/nodes.rs` and `src/ast/node_ext.rs`.
 
 ---
 

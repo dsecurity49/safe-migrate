@@ -13,9 +13,9 @@ This directory contains verified PostgreSQL grammar and AST node extraction guid
 - Handwritten extensions in the crate
 - Grammar-confirmed limitations and gaps
 
-**Verified against:** `squawk_syntax` v2.56.0  
+**Verified against:** `squawk_syntax` v2.58.0  
 **PostgreSQL grammar version:** PostgreSQL 17
-**Last reviewed:** 22-06-2026
+**Last reviewed:** July 2026
 
 ---
 
@@ -29,7 +29,7 @@ This directory contains verified PostgreSQL grammar and AST node extraction guid
 | **constraints.md** | FK, CHECK, UNIQUE, PRIMARY KEY, exclusion | `Constraint` (9 variants), `ColumnConstraint` (7), `TableConstraint` (5), `ForeignKeyConstraint`, `UniqueConstraint` |
 | **indexes.md** | Index creation, alteration, dropping, concurrency | `CreateIndex`, `DropIndex`, `AlterIndex`, `PartitionItem` (missing sort order), multiple index support |
 | **partitions.md** | Partition hierarchies, RANGE/LIST/HASH, attach/detach | `CreateTable.partition_by()`, `PartitionOf.path()`, `AttachPartition`, `DetachPartition`, reverse-graph walk required |
-| **sequences.md** | Sequence creation, OWNED BY, ownership tracking | `SequenceOption` (polymorphic, 14 variants), `extract_owned_by` text-search workaround, `AlterSequence` options missing |
+| **sequences.md** | Sequence creation, OWNED BY, ownership tracking | `SequenceOption` (polymorphic, 15 variants including CACHE), `AlterSequence` options missing |
 | **schemas.md** | Schema creation/dropping, identifier normalization | `CreateSchema`, `DropSchema`, `NameRef.text()` + `is_quoted()` (handwritten), case-folding rules |
 
 ### Data Types & Domains
@@ -43,7 +43,7 @@ This directory contains verified PostgreSQL grammar and AST node extraction guid
 
 | Document | Coverage | Key Nodes |
 |----------|----------|-----------|
-| **views.md** | View creation, alteration, dropping, materialized views | `CreateView`, `AlterView`, `DropView` (single path, **asymmetry with DropIndex**), `CreateMaterializedView`, `AlterMaterializedView`, `DropMaterializedView`, `Refresh` |
+| **views.md** | View creation, alteration, dropping, materialized views | `CreateView`, `AlterView`, `DropView` (`paths()` plural, symmetric with `DropIndex`), `CreateMaterializedView`, `AlterMaterializedView`, `DropMaterializedView`, `Refresh` |
 | **materialized_views.md** | Reference to views.md with physical storage emphasis | Cross-reference document |
 
 ### Functions & Procedures
@@ -105,8 +105,8 @@ Three nodes require explicit token-combination matching instead of enum dispatch
    - Dispatch: `to_token().is_none()` + `prepared_token().is_none()`
 
 3. **`SequenceOption`** (sequences.md)
-   - 14 option types, dispatched by token presence
-   - OWNED BY extraction requires text-search workaround
+   - 15 option types, dispatched by token presence
+   - OWNED BY extraction via `owned_token()` + `path()` / `none_token()` accessors
 
 ### Handwritten Extensions (18 total)
 
@@ -125,7 +125,7 @@ These are parser limitations, not extraction gaps:
 | Limitation | Document | Impact |
 |-----------|----------|--------|
 | `PartitionItem` missing sort order (ASC/DESC), nulls ordering, operator class | partitions.md | Cannot extract partition column specifics |
-| `PartitionOf` missing FOR VALUES bounds | partitions.md | Cannot validate partition ranges |
+| `PartitionOf` FOR VALUES bounds (RESOLVED in 2.58.0) | partitions.md | Now extractable via `CreateTable.partition_type()` |
 | `AlterSequence` missing options clause | sequences.md | Cannot analyze sequence alterations |
 | `CreateIndex INCLUDE` clause missing | indexes.md | Covering columns not extractable |
 | `AlterPublication` / `AlterSubscription` value extraction missing | publications.md, subscriptions.md | Cannot determine which tables added/dropped |
@@ -179,4 +179,3 @@ When updating to a new `squawk_syntax` version:
 - These docs are **reference, not tutorial** — assume familiarity with PostgreSQL DDL and the squawk AST structure
 - **Update frequency:** After squawk_syntax updates or when new rule types require expanded extraction
 - **Verification method:** Compare document examples against `src/ast/visitor.rs` implementations and test suite coverage
-

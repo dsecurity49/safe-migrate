@@ -2,15 +2,17 @@
 
 ## Status
 
-Inspection status: extensive and verified against squawk.rs source.
+Verified against squawk_syntax 2.58.0 — July 2026
 
-This document is derived from direct inspection of the generated and handwritten Squawk AST
-in `squawk.rs` and should be treated as the current source of truth for safe-migrate constraint
-handling.
+This document is derived from direct inspection of src/ast/generated/nodes.rs
+and src/ast/node_ext.rs in squawk-syntax-2.58.0 and should be treated as the
+current source of truth for safe-migrate constraint handling.
 
-This document records only behavior that has been AST-verified via grep and line-range inspection.
+This document records only behavior that has been AST-verified via grep and
+line-range inspection.
 
-Where information is incomplete it is explicitly marked as unresolved rather than inferred.
+Where information is incomplete it is explicitly marked as unresolved rather
+than inferred.
 
 ---
 

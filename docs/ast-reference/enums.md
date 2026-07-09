@@ -2,10 +2,7 @@
 
 ## Status
 
-Inspection status: complete for all enum-relevant nodes. Cross-checked
-directly against postgresql.ungram and squawk.rs in a single pass (this file
-was written after the grammar file was already available, so no retroactive
-correction pass was needed).
+Verified against squawk_syntax 2.58.0 — July 2026
 
 ---
 
@@ -32,7 +29,7 @@ is present before treating a `CreateType` as an enum.
 
 ## CreateType
 
-### Verified Accessors (line 5939)
+### Verified Accessors (line 6870)
 
 ```rust
 pub fn attribute_list(&self) -> Option<AttributeList>
@@ -44,6 +41,7 @@ pub fn as_token(&self) -> Option<SyntaxToken>
 pub fn create_token(&self) -> Option<SyntaxToken>
 pub fn enum_token(&self) -> Option<SyntaxToken>
 pub fn range_token(&self) -> Option<SyntaxToken>
+pub fn type_token(&self) -> Option<SyntaxToken>
 ```
 
 ### Grammar Confirmation
@@ -115,7 +113,7 @@ types, and shell types as enums with zero values — or worse, crash on
 
 ## VariantList
 
-### Verified Accessors (line 18304)
+### Verified Accessors (line 20784)
 
 ```rust
 pub fn variants(&self) -> AstChildren<Variant>
@@ -138,7 +136,7 @@ Matches exactly — comma-separated list of `Variant` in parens.
 
 ## Variant
 
-### Verified Accessors (line 18293)
+### Verified Accessors (line 20773)
 
 ```rust
 pub fn literal(&self) -> Option<Literal>
@@ -169,7 +167,7 @@ fn extract_enum_values(variant_list: &VariantList) -> Vec<String> {
 
 ## DropType
 
-### Verified Accessors (line 8389)
+### Verified Accessors (line 9519)
 
 ```rust
 pub fn if_exists(&self) -> Option<IfExists>
@@ -202,7 +200,7 @@ unless the dependency graph confirms zero columns currently reference the type.
 
 ## AlterType
 
-### Verified Accessors (line 2141)
+### Verified Accessors (line 2716)
 
 ```rust
 pub fn add_value(&self) -> Option<AddValue>
@@ -276,7 +274,7 @@ enum AlterTypeFact {
 
 ## AddValue
 
-### Verified Accessors (line 310)
+### Verified Accessors (line 254)
 
 ```rust
 pub fn if_not_exists(&self) -> Option<IfNotExists>
@@ -347,9 +345,13 @@ relative to.
 ### Verified Accessors
 
 ```rust
-// BeforeValue (line 415, AfterValue similarly)
+// BeforeValue (line 3379)
 pub fn literal(&self) -> Option<Literal>
-pub fn before_token(&self) -> Option<SyntaxToken>  // or after_token() for AfterValue
+pub fn before_token(&self) -> Option<SyntaxToken>
+
+// AfterValue (line 359)
+pub fn literal(&self) -> Option<Literal>
+pub fn after_token(&self) -> Option<SyntaxToken>
 ```
 
 ### safe-migrate guidance
@@ -369,7 +371,7 @@ value is a guaranteed PostgreSQL failure, a strong tier-1 candidate.
 
 ## RenameValue
 
-### Verified Accessors (line 15099)
+### Verified Accessors (line 17070)
 
 ```rust
 pub fn literal(&self) -> Option<Literal>
@@ -404,7 +406,7 @@ same-typed children in the grammar. This means:
 
 This is a genuine, confirmed extraction gap — not resolved by checking the
 handwritten extension inventory (no `impl ast::RenameValue` extension exists
-in squawk.rs).
+in `src/ast/node_ext.rs`).
 
 ### safe-migrate guidance
 
@@ -461,9 +463,7 @@ New value (second Literal): confirmed NOT extractable — flat accessor only
 
 ## Grammar Cross-Check
 
-This document was written with postgresql.ungram available from the start,
-so all findings above already reflect a full cross-check. No retroactive
-correction pass is needed for this file.
+All nodes cross-checked against `src/postgresql.ungram` and the `squawk-syntax` source code in `src/ast/generated/nodes.rs` and `src/ast/node_ext.rs`.
 
 ---
 
@@ -473,14 +473,14 @@ None remaining. The previously listed question about `RenameValue`'s second
 `Literal` (the "to" value) has been reclassified from "open question" to
 "confirmed grammar-level limitation":
 
-The exhaustive `impl ast::*` inventory established in columns.md (lines
-38145-39260 of squawk.rs) already found no `impl ast::RenameValue` handwritten
-extension block — the same inventory that confirmed `ForeignKeyConstraint`'s
-`from_columns()`/`to_columns()` extensions DO exist at line 38440. Since
-someone clearly recognized and solved the identical "two same-typed Literal
-children" problem for `ForeignKeyConstraint` but did not write an equivalent
-for `RenameValue`, the absence is an intentional or overlooked gap, not an
-unexplored surface area. The `RenameValue` new-value extraction gap documented
-in the `RenameValue` section above is treated as confirmed, matching the same
-status as `PartitionForValuesFrom`'s multi-column boundary ambiguity
-(partitions.md) — a known, accepted limitation of this AST version.
+The exhaustive `impl ast::*` inventory in `src/ast/node_ext.rs` (lines 1-1042)
+already found no `impl ast::RenameValue` handwritten extension block — the same
+inventory that confirmed `ForeignKeyConstraint`'s `from_columns()`/`to_columns()`
+extensions DO exist at line 358 of `src/ast/node_ext.rs`. Since someone clearly
+recognized and solved the identical "two same-typed Literal children" problem for
+`ForeignKeyConstraint` but did not write an equivalent for `RenameValue`, the
+absence is an intentional or overlooked gap, not an unexplored surface area.
+The `RenameValue` new-value extraction gap documented in the `RenameValue`
+section above is treated as confirmed, matching the same status as
+`PartitionForValuesFrom`'s multi-column boundary ambiguity (partitions.md) —
+a known, accepted limitation of this AST version.

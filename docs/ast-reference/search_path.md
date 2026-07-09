@@ -2,12 +2,7 @@
 
 ## Status
 
-Inspection status: complete. No dedicated `search_path` AST node exists.
-
-This document is derived from direct inspection of squawk.rs and should be treated as the
-current source of truth for safe-migrate search_path handling.
-
-All claims are AST-verified via grep and line-range inspection.
+Verified against squawk_syntax 2.58.0 — July 2026
 
 ---
 
@@ -47,7 +42,7 @@ Verified by exhaustive grep documented in `columns.md`.
 # Critical Finding: No Dedicated search_path Node
 
 ```bash
-grep -n "search_path\|SearchPath" squawk.rs
+grep -n "search_path\|SearchPath" src/ast/generated/nodes.rs src/ast/node_ext.rs
 # no results
 ```
 
@@ -69,7 +64,7 @@ This is an architecturally significant finding: search_path detection is a
 
 ## Set
 
-### Verified Accessors (line 16420)
+### Verified Accessors (src/ast/generated/nodes.rs line 18605)
 
 ```rust
 pub fn config_value(&self) -> Option<ConfigValue>
@@ -140,7 +135,7 @@ from accessor inspection alone — the token pair must be checked together since
 both tokens have other uses on this polymorphic node (e.g. `from_token()` is
 unrelated to `FROM CURRENT` in other `Set` forms).
 
-### ConfigValue Enum (line 19486)
+### ConfigValue Enum (src/ast/generated/nodes.rs line 21979)
 
 ```rust
 pub enum ConfigValue {
@@ -189,13 +184,20 @@ fn is_search_path_set(fact: &SetConfigFact) -> bool {
 
 ## Reset
 
-### Verified Accessors (line 15218)
+### Verified Accessors (src/ast/generated/nodes.rs line 17213)
 
 ```rust
-pub fn name_ref(&self) -> Option<NameRef>
+pub fn path(&self) -> Option<Path>
 pub fn semicolon_token(&self) -> Option<SyntaxToken>
 pub fn all_token(&self) -> Option<SyntaxToken>
+pub fn authorization_token(&self) -> Option<SyntaxToken>
+pub fn isolation_token(&self) -> Option<SyntaxToken>
+pub fn level_token(&self) -> Option<SyntaxToken>
 pub fn reset_token(&self) -> Option<SyntaxToken>
+pub fn session_token(&self) -> Option<SyntaxToken>
+pub fn time_token(&self) -> Option<SyntaxToken>
+pub fn transaction_token(&self) -> Option<SyntaxToken>
+pub fn zone_token(&self) -> Option<SyntaxToken>
 ```
 
 ### Meaning
@@ -209,7 +211,7 @@ RESET ALL
 including `search_path`. This must be treated identically to an explicit
 `SET search_path TO DEFAULT` for simulator purposes.
 
-`name_ref()` gives the specific parameter name when `ALL` is not used.
+`path()` gives the specific parameter name when `ALL` is not used.
 
 ### safe-migrate guidance
 
@@ -229,7 +231,7 @@ search_path reset.
 
 ## ResetConfigParam
 
-### Verified Accessors (line 15241)
+### Verified Accessors (src/ast/generated/nodes.rs line 17264)
 
 ```rust
 pub fn path(&self) -> Option<Path>
@@ -245,10 +247,7 @@ Used within `AlterDatabase`, `AlterRole`, and similar contexts for
 
 ### Important Distinction
 
-`ResetConfigParam` uses `path()` (a `Path` node).
-`Reset` uses `name_ref()` (a `NameRef` node).
-Both ultimately resolve to a parameter name string but through different
-accessor types — the resolver needs two extraction paths.
+In 2.58.0, both `ResetConfigParam` and `Reset` use `path()` (a `Path` node), resolving to a parameter name string through the same accessor type. This simplifies the resolver's extraction paths.
 
 ### safe-migrate guidance
 
@@ -324,7 +323,7 @@ None remaining. Both previously open questions have been resolved:
 
 1. **Identifier-folding rules for `"search_path"` comparison**: Fully
    resolved in schemas.md (cross-reference). The complete verified
-   implementation is `normalize_name_node()` in squawk.rs (line 38519) —
+   implementation is `normalize_name_node()` in src/ast/node_ext.rs (line 452) —
    unquoted identifiers are lowercased via `to_ascii_lowercase()`, quoted
    identifiers preserve case. Since `search_path` (lowercase, unquoted) is
    the canonical PostgreSQL parameter name, any `path()` value that

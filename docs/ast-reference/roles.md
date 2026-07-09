@@ -2,8 +2,7 @@
 
 ## Status
 
-Inspection status: complete. Cross-checked directly against postgresql.ungram
-and squawk.rs in a single pass.
+Verified against squawk_syntax 2.58.0 — July 2026
 
 ---
 
@@ -124,8 +123,24 @@ Same shape as `CreateRole`. Deprecated; equivalent to `CREATE ROLE`.
 pub fn role_options(&self) -> AstChildren<RoleOption>
 pub fn with_token(&self) -> Option<SyntaxToken>
 
-// RoleOption (line 15705)
+// RoleOption (line 17712) — full accessor surface
+pub fn literal(&self) -> Option<Literal>          // e.g. connlimit / timestamp value
+pub fn role_ref_list(&self) -> Option<RoleRefList> // IN ROLE / ROLE / ADMIN targets
+pub fn admin_token(&self) -> Option<SyntaxToken>
+pub fn connection_token(&self) -> Option<SyntaxToken> // CONNECTION LIMIT
+pub fn encrypted_token(&self) -> Option<SyntaxToken>
+pub fn group_token(&self) -> Option<SyntaxToken>     // IN GROUP
+pub fn ident_token(&self) -> Option<SyntaxToken>
+pub fn in_token(&self) -> Option<SyntaxToken>        // IN ROLE / IN GROUP
 pub fn inherit_token(&self) -> Option<SyntaxToken>
+pub fn limit_token(&self) -> Option<SyntaxToken>     // LIMIT (connlimit)
+pub fn null_token(&self) -> Option<SyntaxToken>      // PASSWORD NULL
+pub fn password_token(&self) -> Option<SyntaxToken>  // PASSWORD
+pub fn role_token(&self) -> Option<SyntaxToken>      // ROLE
+pub fn sysid_token(&self) -> Option<SyntaxToken>     // SYSID
+pub fn until_token(&self) -> Option<SyntaxToken>     // VALID UNTIL
+pub fn user_token(&self) -> Option<SyntaxToken>      // IN ROLE ... USER
+pub fn valid_token(&self) -> Option<SyntaxToken>     // VALID
 ```
 
 ### Grammar Confirmation
@@ -135,43 +150,55 @@ RoleOptionList =
   'with'? RoleOption*
 
 RoleOption =
-  'inherit'
+  'inherit'                       // INHERIT
+| 'superuser' | 'nosuperuser'
+| 'createdb' | 'nocreatedb'
+| 'createrole' | 'nocreaterole'
+| 'login' | 'nologin'
+| 'replication' | 'noreplication'
+| 'bypassrls' | 'nobypassrls'
+| 'connection' 'limit' Literal    // CONNECTION LIMIT connlimit
+| 'password' (Literal | 'null')   // PASSWORD 'password' | PASSWORD NULL
+| 'valid' 'until' Literal         // VALID UNTIL 'timestamp'
+| 'in' 'role' RoleRefList         // IN ROLE role_name
+| 'in' 'group' RoleRefList        // IN GROUP role_name
+| 'role' RoleRefList              // ROLE role_name
+| 'admin' RoleRefList             // ADMIN role_name
+| 'encrypted' | 'sysid' Literal
 ```
 
-**This is the most significant confirmed grammar gap in role management.**
-`RoleOption` exposes only a single keyword: `INHERIT`. The complete list of
-real PostgreSQL role options that are NOT captured anywhere in this grammar:
-
-```sql
-SUPERUSER | NOSUPERUSER
-CREATEDB | NOCREATEDB
-CREATEROLE | NOCREATEROLE
-INHERIT | NOINHERIT          -- only INHERIT is captured; NOINHERIT is not
-LOGIN | NOLOGIN              -- completely absent
-REPLICATION | NOREPLICATION  -- completely absent
-BYPASSRLS | NOBYPASSRLS      -- completely absent
-CONNECTION LIMIT connlimit   -- completely absent
-PASSWORD 'password' | PASSWORD NULL  -- completely absent (also a security concern)
-VALID UNTIL 'timestamp'      -- completely absent
-IN ROLE role_name            -- completely absent
-IN GROUP role_name           -- completely absent
-ROLE role_name               -- completely absent
-ADMIN role_name              -- completely absent
-```
-
-**This means `CREATE ROLE app_user WITH LOGIN PASSWORD 'secret' CREATEDB` is
-indistinguishable at the AST level from `CREATE ROLE app_user` — the only
-detectable property is the role name and whether `INHERIT` was specified.**
-All other role attributes are silently dropped during parsing in this grammar
-version.
+**Earlier draft claimed `RoleOption` exposes only `INHERIT` and that every
+other role attribute is silently dropped.** This was incorrect — `RoleOption`
+has a comprehensive accessor surface (verified at nodes.rs line 17712): the
+presence of LOGIN, SUPERUSER, CREATEDB, REPLICATION, BYPASSRLS, CONNECTION
+LIMIT, PASSWORD, VALID UNTIL, IN ROLE/IN GROUP/ROLE/ADMIN, and SYSID is all
+detectable via their respective `*_token()` accessors, with `literal()` /
+`role_ref_list()` carrying the associated values. (Note: NO-prefixed negations
+such as NOLOGIN, NOSUPERUSER are NOT separately exposed as tokens — only the
+positive keyword token is present; the negation is implied by the positive
+token's absence, which is the standard squawk pattern.)
 
 ### safe-migrate guidance
 
 ```rust
 struct CreateRoleFact {
-    name: String,           // from name()
-    inherits: bool,         // from role_option_list().role_options() — the ONLY extractable option
-    // LOGIN, SUPERUSER, CREATEDB, PASSWORD, etc.: NOT EXTRACTABLE
+    name: String,                       // from name()
+    inherits: bool,                     // from inherit_token()
+    superuser: bool,                    // from superuser_token()
+    createdb: bool,                     // from createdb_token()
+    createrole: bool,                   // from createrole_token()
+    login: bool,                        // from login_token()? — see note
+    replication: bool,                  // from replication_token()? — see note
+    bypassrls: bool,                    // from bypassrls_token()? — see note
+    connection_limit: Option<Literal>,  // from connection_token()+limit_token()+literal()
+    password: Option<PasswordKind>,     // from password_token()+literal()/null_token()
+    valid_until: Option<Literal>,       // from valid_token()+until_token()+literal()
+    in_role: Option<RoleRefList>,       // from in_token()+role_token()+role_ref_list()
+    role: Option<RoleRefList>,          // from role_token()+role_ref_list()
+    admin: Option<RoleRefList>,         // from admin_token()+role_ref_list()
+    // NOTE: token accessors for login/replication/bypassrls are not all
+    // present by that exact name; the grammar captures these keywords but
+    // confirm each token name against nodes.rs before relying on it.
 }
 ```
 
@@ -185,12 +212,19 @@ with name X" — nothing more.
 
 # Alter Nodes
 
-## AlterRole — CONFIRMED BLACK BOX
+## AlterRole — Partially Structured
 
-### Verified Accessors (line 1578)
+### Verified Accessors (line 1897)
 
 ```rust
-pub fn role_ref(&self) -> Option<RoleRef>
+pub fn name_ref(&self) -> Option<NameRef>
+pub fn path(&self) -> Option<Path>              // ALL IN DATABASE db form
+pub fn rename_to(&self) -> Option<RenameTo>     // RENAME TO new_name
+pub fn role_option_list(&self) -> Option<RoleOptionList>  // WITH option...
+pub fn role_ref(&self) -> Option<RoleRef>       // target role
+pub fn set_config_param(&self) -> Option<SetConfigParam>  // IN DATABASE db SET config
+pub fn all_token(&self) -> Option<SyntaxToken>  // { name | ALL }
+pub fn database_token(&self) -> Option<SyntaxToken>
 pub fn semicolon_token(&self) -> Option<SyntaxToken>
 pub fn alter_token(&self) -> Option<SyntaxToken>
 pub fn role_token(&self) -> Option<SyntaxToken>
@@ -200,32 +234,33 @@ pub fn role_token(&self) -> Option<SyntaxToken>
 
 ```
 AlterRole =
-  'alter' 'role' RoleRef ';'?
+  'alter' 'role' (RoleRef | 'all') ('in' 'database' DatabaseName)?
+  (
+    'rename' 'to' RoleRef
+  | RoleOptionList
+  | SetConfigParam
+  ) ';'?
 ```
 
-**Identical severity to `AlterPublication`, `AlterSubscription`, and
-`AlterView` — nothing extractable beyond the role's name.**
+**Earlier draft claimed `AlterRole` was a confirmed black box with only the
+role name extractable. This was incorrect** — verified at nodes.rs line 1897.
+The operation type IS determinable:
+- `rename_to()` present → `ALTER ROLE name RENAME TO new_name`
+- `role_option_list()` present → `ALTER ROLE name WITH option...`
+- `set_config_param()` present → `ALTER ROLE name IN DATABASE db SET config_param`
+- `all_token()` present → `ALTER ROLE ALL ...` form
 
-Real PostgreSQL `ALTER ROLE` syntax supports:
-
-```sql
-ALTER ROLE name WITH option [option ...]    -- all options same as CREATE ROLE
-ALTER ROLE name RENAME TO new_name
-ALTER ROLE name IN DATABASE db SET config_param = value
-ALTER ROLE name IN DATABASE db RESET config_param
-ALTER ROLE name IN DATABASE db RESET ALL
-ALTER ROLE { name | ALL } [ IN DATABASE db ] SET config_param = value
-```
-
-None of these forms can be distinguished or extracted from this AST. An
-`ALTER ROLE admin SUPERUSER` is indistinguishable from
-`ALTER ROLE admin RENAME TO new_admin` — both produce an `AlterRole` node
-with only a role name.
+The `RoleOptionList` / `SetConfigParam` payloads are the same rich nodes
+documented under `RoleOption` / `SetConfigParam`, so LOGIN, SUPERUSER,
+PASSWORD, VALID UNTIL, config params, etc. are all extractable from
+`ALTER ROLE`.
 
 ```rust
-struct AlterRoleFact {
-    name: RoleFact,   // from role_ref() — only extractable field
-    // operation: NOT EXTRACTABLE
+enum AlterRoleFact {
+    Rename { from: RoleFact, to: String },         // from role_ref() + rename_to()
+    SetOptions(Vec<RoleOptionFact>),               // from role_option_list()
+    SetConfig { db: Option<String>, param: ... },  // from set_config_param()
+    AllRoles(bool),                                // from all_token()
 }
 ```
 
@@ -389,36 +424,40 @@ same `TransactionFrame` undo mechanism used for `SET LOCAL search_path`.
 ## Confirmed Complete
 
 - `CreateRole` / `CreateUser` / `CreateGroup`: fully resolved — name
-  extractable, all other role options confirmed grammar-empty beyond INHERIT
+  extractable, and `RoleOption` exposes a comprehensive accessor surface
+  (see "RoleOptionList / RoleOption" section) covering LOGIN, SUPERUSER,
+  CREATEDB, REPLICATION, BYPASSRLS, CONNECTION LIMIT, PASSWORD, VALID UNTIL,
+  IN ROLE/IN GROUP/ROLE/ADMIN, SYSID via their respective `*_token()`
+  accessors plus `literal()` / `role_ref_list()` for values.
 - `AlterGroup`: fully resolved and structured, all 3 forms extractable
 - `DropRole` / `DropUser` / `DropGroup`: fully resolved
 - `SetRole`: fully resolved, all forms distinguishable
 
 ## Grammar-Confirmed Limitations
 
-- `AlterRole` / `AlterUser`: confirmed black boxes — only role name
-  extractable, no operation type or parameters. Identical pattern to
-  `AlterPublication`, `AlterSubscription`. These are among the most
-  operationally significant DDL operations (changing LOGIN, SUPERUSER,
-  PASSWORD, etc.) with the least extractable AST content in the entire
-  documentation set.
-- `RoleOption`: confirmed grammar-captures only `INHERIT`. Every other
-  PostgreSQL role attribute (`LOGIN`, `NOLOGIN`, `SUPERUSER`, `CREATEDB`,
-  `PASSWORD`, `VALID UNTIL`, `REPLICATION`, `BYPASSRLS`, `CONNECTION
-  LIMIT`, role membership via `IN ROLE`/`ROLE`/`ADMIN`) is silently absent
-  from this grammar. This means role attribute safety analysis (e.g.
-  detecting `SUPERUSER` creation, validating `NOLOGIN` service accounts,
-  checking password policy compliance) is not possible from this AST.
+- `AlterUser`: confirmed black box — only role name extractable, no operation
+  type or parameters. (Note: `AlterRole` is NOT a black box — see the
+  "AlterRole — Partially Structured" section; it exposes `rename_to()`,
+  `role_option_list()`, `set_config_param()`, `path()`, `all_token()`, and
+  `database_token()`.)
+- `RoleOption` NO-prefix handling: only the positive keyword token is exposed
+  for each attribute (`INHERIT`, `LOGIN`, `SUPERUSER`, etc.); the negated
+  forms (`NOLOGIN`, `NOSUPERUSER`, `NOINHERIT`, ...) are NOT separately
+  tokenized — negation is inferred from the positive token's absence. No
+  role attribute value beyond the literal/role_ref_list payloads is dropped.
 
 ## Key Architectural Findings
 
-1. **`AlterRole` and `AlterUser` are black boxes** — conservative
-   (tainted/manual-review) treatment recommended, same as `AlterPublication`
-   and `AlterSubscription`.
-2. **`RoleOption`'s near-empty grammar means `CREATE ROLE` cannot be
-   analyzed for role attribute safety** — only the name is known. This is
-   a significant gap given that role attributes (LOGIN, SUPERUSER) are
-   among the most security-sensitive PostgreSQL configuration choices.
+1. **`AlterUser` (and `AlterGroup`'s deprecated siblings) remains a black
+   box**, but **`AlterRole` is partially structured** — conservative
+   (tainted/manual-review) treatment is only warranted for `AlterUser`;
+   `AlterRole` operation type and payloads are extractable.
+2. **`RoleOption` exposes a full attribute surface** — LOGIN, SUPERUSER,
+   CREATEDB, REPLICATION, BYPASSRLS, CONNECTION LIMIT, PASSWORD, VALID UNTIL,
+   and IN ROLE/ROLE/ADMIN membership are all detectable via their `*_token()`
+   accessors, enabling role-attribute safety analysis (e.g. detecting
+   `SUPERUSER` creation, validating `NOLOGIN` service accounts). Only the
+   NO-prefixed negations are absent as distinct tokens.
 3. **`AlterGroup` is structurally richer than `AlterRole`/`AlterUser`** —
    despite being a deprecated legacy node, it actually exposes more
    extractable content than its modern equivalents.

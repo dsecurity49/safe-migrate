@@ -2,12 +2,7 @@
 
 ## Status
 
-Conceptual synthesis document. No new AST inspection required — this document
-consolidates verified findings from across the AST reference set and defines
-the confidence/taint model for privilege and authentication-related mutations.
-
-Cross-references: grant_revoke.md, roles.md, policies.md, database.md,
-schemas.md, search_path.md, functions.md, triggers.md, transactions.md.
+Verified against squawk_syntax 2.58.0 — July 2026
 
 ---
 
@@ -66,17 +61,29 @@ The following AST-verified operations should trigger `Confidence::Tainted`
 on affected objects or the overall migration, because the simulator cannot
 fully determine their effect:
 
-### 1. AlterRole / AlterUser — Black Box (roles.md)
+### 1. AlterRole / AlterUser — Mixed Capability (roles.md)
 
 ```
-AlterRole = 'alter' 'role' RoleRef ';'?
-AlterUser = 'alter' 'user' RoleRef ';'?
+AlterRole = 'alter' 'role' (RoleRef | 'all') ('in' 'database' DatabaseName)?
+            ( 'rename' 'to' RoleRef | RoleOptionList | SetConfigParam ) ';'?
+AlterUser  = 'alter' 'user' RoleRef ';'?   -- still a black box
 ```
 
-Only the role name is extractable. The operation (granting SUPERUSER,
-changing PASSWORD, setting NOLOGIN, modifying role configuration) cannot
-be determined. Safe-migrate cannot know whether a login-capable role became
-unable to connect, or whether a service account gained dangerous privileges.
+**`AlterRole` is partially structured** (verified at nodes.rs line 1897): it
+exposes `rename_to()`, `role_option_list()`, `set_config_param()`, `path()`,
+`all_token()`, and `database_token()`. The operation type and payload ARE
+determinable — `ALTER ROLE x RENAME TO y`, `ALTER ROLE x WITH LOGIN/SUPERUSER/
+PASSWORD ...`, and `ALTER ROLE x IN DATABASE db SET config` are all
+distinguishable, and the `RoleOptionList`/`SetConfigParam` payloads carry the
+same rich attribute surface as `CREATE ROLE`. (`AlterUser` remains a true
+black box — only the role name is extractable.)
+
+For `AlterRole`, safe-migrate CAN know whether a login-capable role changed
+password, gained SUPERUSER, or was renamed. For `AlterUser`, the operation
+(granting SUPERUSER, changing PASSWORD, setting NOLOGIN) cannot be determined
+and the simulator cannot know whether a login-capable role became unable to
+connect or gained dangerous privileges — `AlterUser` should be treated as
+`Confidence::Tainted`.
 
 **Taint scope:** the named role and any objects owned by or accessible to
 that role should be considered "potentially affected" with no further
@@ -172,7 +179,7 @@ Due to confirmed grammar gaps:
   captured, see roles.md. The privilege state model cannot know which roles
   have login access, superuser rights, etc.
 - **ALTER ROLE operations** — the change being made is unknown, so
-  `PrivilegeState` cannot be updated correctly when `AlterRole` is
+  `PrivilegeState` cannot be updated correctly when `AlterUser` is
   encountered. Can only record "this role was modified, state is tainted."
 - **REVOKE CASCADE downstream effects** — the grammar exposes `cascade_token()`
   on `Revoke` but cannot enumerate which downstream roles lose privileges
@@ -267,7 +274,8 @@ Privilege/auth operation encountered
 │   └── YES → Tainted (cannot resolve target)
 │
 ├── Is the operation type determinable from the AST?
-│   ├── NO (AlterRole/AlterUser) → Tainted (cannot determine effect)
+│   ├── NO (AlterUser only) → Tainted (cannot determine effect)
+│   ├── AlterRole → resolve via rename_to()/role_option_list()/set_config_param()
 │   └── YES → continue
 │
 ├── Does the operation affect objects used later in the migration?
@@ -308,8 +316,9 @@ execution time under specific conditions detectable from `LocalState`:
 
 | Node | Gap | Implication |
 |------|-----|-------------|
-| `AlterRole` / `AlterUser` | Operation type not extractable | Cannot model role attribute changes |
-| `RoleOption` | Only INHERIT captured | Cannot model LOGIN/SUPERUSER/etc. at create time |
+| `AlterUser` | Operation type not extractable | Cannot model role attribute changes (Tainted) |
+| `AlterRole` | Operation type extractable | `rename_to()`/`role_option_list()`/`set_config_param()` expose RENAME / attribute / config changes |
+| `RoleOption` | Full attribute surface (LOGIN/SUPERUSER/etc. via `*_token()`) | Attribute safety analysis possible; only NO-prefix negations absent |
 | `SetConfigParam` | Value not captured | Cannot model `ALTER DATABASE SET search_path` value |
 | `AlterPublication` | Action not extractable | Cannot model replication privilege changes |
 | `AlterSubscription` | Action not extractable | Cannot model subscription state changes |

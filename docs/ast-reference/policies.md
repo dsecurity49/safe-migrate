@@ -2,8 +2,7 @@
 
 ## Status
 
-Inspection status: complete. Cross-checked directly against postgresql.ungram
-and squawk.rs in a single pass.
+Verified against squawk_syntax 2.58.0 — July 2026
 
 ---
 
@@ -38,7 +37,7 @@ dimensions must be tracked independently in `LocalState`.
 
 ## CreatePolicy
 
-### Verified Accessors (line 4971)
+### Verified Accessors (src/ast/generated/nodes.rs line 5870)
 
 ```rust
 pub fn as_policy_type(&self) -> Option<AsPolicyType>
@@ -94,7 +93,7 @@ structured enum) for `PERMISSIVE` or `RESTRICTIVE`. When `as_policy_type()`
 is `None`, PostgreSQL defaults to `PERMISSIVE`.
 
 ```rust
-// AsPolicyType verified accessors (line 2544)
+// AsPolicyType verified accessors (src/ast/generated/nodes.rs line 3180)
 pub fn as_token(&self) -> Option<SyntaxToken>
 pub fn ident_token(&self) -> Option<SyntaxToken>
 ```
@@ -116,10 +115,10 @@ distinction must be preserved through to the rule engine.
 ### USING vs WITH CHECK Clauses
 
 ```rust
-// UsingExprClause (line 18102)
+// UsingExprClause (src/ast/generated/nodes.rs line 20000)
 pub fn expr(&self) -> Option<Expr>
 
-// WithCheckExprClause (line 18637)
+// WithCheckExprClause (src/ast/generated/nodes.rs line 20535)
 pub fn expr(&self) -> Option<Expr>
 ```
 
@@ -167,7 +166,7 @@ explicitly.
 
 ## AlterPolicy
 
-### Verified Accessors (line 1422)
+### Verified Accessors (src/ast/generated/nodes.rs line 1693)
 
 ```rust
 pub fn name_ref(&self) -> Option<NameRef>
@@ -235,7 +234,7 @@ modification in the rule engine.
 
 ## DropPolicy
 
-### Verified Accessors (line 7641)
+### Verified Accessors (src/ast/generated/nodes.rs line 8775)
 
 ```rust
 pub fn if_exists(&self) -> Option<IfExists>
@@ -281,25 +280,25 @@ objects.
 ### Verified Accessors
 
 ```rust
-// EnableRls (line 8967)
+// EnableRls (src/ast/generated/nodes.rs line 10126)
 pub fn enable_token(&self) -> Option<SyntaxToken>
 pub fn level_token(&self) -> Option<SyntaxToken>
 pub fn row_token(&self) -> Option<SyntaxToken>
 pub fn security_token(&self) -> Option<SyntaxToken>
 
-// DisableRls (line 6488)
+// DisableRls (src/ast/generated/nodes.rs line 7526)
 pub fn disable_token(&self) -> Option<SyntaxToken>
 pub fn level_token(&self) -> Option<SyntaxToken>
 pub fn row_token(&self) -> Option<SyntaxToken>
 pub fn security_token(&self) -> Option<SyntaxToken>
 
-// ForceRls (line 9550)
+// ForceRls (src/ast/generated/nodes.rs line 10786)
 pub fn force_token(&self) -> Option<SyntaxToken>
 pub fn level_token(&self) -> Option<SyntaxToken>
 pub fn row_token(&self) -> Option<SyntaxToken>
 pub fn security_token(&self) -> Option<SyntaxToken>
 
-// NoForceRls (line 12696)
+// NoForceRls (src/ast/generated/nodes.rs line 14348)
 pub fn force_token(&self) -> Option<SyntaxToken>
 pub fn level_token(&self) -> Option<SyntaxToken>
 pub fn no_token(&self) -> Option<SyntaxToken>

@@ -2,8 +2,7 @@
 
 ## Status
 
-Inspection status: complete. Cross-checked directly against postgresql.ungram
-and squawk.rs in a single pass.
+Verified against squawk_syntax 2.58.0 — July 2026
 
 ---
 
@@ -228,66 +227,114 @@ the local database.
 
 ## AlterSubscription
 
-### Verified Accessors (line 1822)
+### Verified Accessors (line 2249)
 
 ```rust
+pub fn attribute_list(&self) -> Option<AttributeList>
+pub fn literal(&self) -> Option<Literal>
 pub fn name_ref(&self) -> Option<NameRef>
+pub fn name_refs(&self) -> AstChildren<NameRef>
+pub fn names(&self) -> AstChildren<Name>
+pub fn owner_to(&self) -> Option<OwnerTo>
+pub fn rename_to(&self) -> Option<RenameTo>
+pub fn set_options(&self) -> Option<SetOptions>
 pub fn semicolon_token(&self) -> Option<SyntaxToken>
+pub fn add_token(&self) -> Option<SyntaxToken>
 pub fn alter_token(&self) -> Option<SyntaxToken>
+pub fn connection_token(&self) -> Option<SyntaxToken>
+pub fn disable_token(&self) -> Option<SyntaxToken>
+pub fn drop_token(&self) -> Option<SyntaxToken>
+pub fn enable_token(&self) -> Option<SyntaxToken>
+pub fn publication_token(&self) -> Option<SyntaxToken>
+pub fn refresh_token(&self) -> Option<SyntaxToken>
+pub fn server_token(&self) -> Option<SyntaxToken>
+pub fn set_token(&self) -> Option<SyntaxToken>
+pub fn skip_token(&self) -> Option<SyntaxToken>
 pub fn subscription_token(&self) -> Option<SyntaxToken>
+pub fn with_token(&self) -> Option<SyntaxToken>
 ```
 
-### Grammar Confirmation — CRITICAL FINDING
+### Grammar Confirmation — CORRECTION
 
 ```
 AlterSubscription =
-  'alter' 'subscription' NameRef ';'?
+  'alter' 'subscription' NameRef
+  ( ConnectionTarget            # connection_token() / server_token() + literal()/name_ref()
+  | SetPublication              # set_token()/add_token()/drop_token() + publication_token() + name_refs()
+  | RefreshPublication          # refresh_token()
+  | Enable                      # enable_token()
+  | Disable                     # disable_token()
+  | SetOptions                  # set_token() + set_options()/attribute_list()
+  | Skip                        # skip_token()
+  | OwnerTo                     # owner_to()
+  | RenameTo                    # rename_to()
+  )? ';'?
 ```
 
-**This is the complete grammar rule.** Identical severity finding to
-`AlterPublication` (publications.md) and `AlterView` (views.md):
-`AlterSubscription` carries genuinely nothing beyond the subscription's own
-name. Confirmed by both grammar and squawk.rs accessor surface.
+**Correction:** An earlier draft claimed `AlterSubscription` was a black
+box carrying "genuinely nothing beyond the subscription's own name." That
+was incorrect. The actual node (line 2249) exposes a full set of token
+accessors (`enable_token()`, `disable_token()`, `refresh_token()`,
+`set_token()`, `skip_token()`, `add_token()`, `drop_token()`,
+`connection_token()`, `server_token()`, `publication_token()`) plus child
+accessors (`owner_to()`, `rename_to()`, `set_options()`, `attribute_list()`,
+`name_refs()`, `literal()`). The operation type CAN be inferred from which
+token/child accessors return `Some(...)`:
 
-Real PostgreSQL `ALTER SUBSCRIPTION` syntax supports substantial
-functionality not captured here at all:
+| Operation | Detecting accessor(s) |
+|-----------|----------------------|
+| `CONNECTION 'conninfo'` | `connection_token()` + `literal()` |
+| `SERVER name` | `server_token()` + `name_ref()` |
+| `SET PUBLICATION ...` | `set_token()` + `publication_token()` + `name_refs()` |
+| `ADD PUBLICATION ...` | `add_token()` + `publication_token()` + `name_refs()` |
+| `DROP PUBLICATION ...` | `drop_token()` + `publication_token()` + `name_refs()` |
+| `REFRESH PUBLICATION` | `refresh_token()` |
+| `ENABLE` | `enable_token()` |
+| `DISABLE` | `disable_token()` |
+| `SET (param = value)` | `set_token()` + `set_options()` / `attribute_list()` |
+| `SKIP (...)` | `skip_token()` |
+| `OWNER TO new_owner` | `owner_to()` |
+| `RENAME TO new_name` | `rename_to()` |
 
-```sql
-ALTER SUBSCRIPTION name CONNECTION 'conninfo';
-ALTER SUBSCRIPTION name SET PUBLICATION publication_name [, ...] [WITH (...)];
-ALTER SUBSCRIPTION name ADD PUBLICATION publication_name [, ...] [WITH (...)];
-ALTER SUBSCRIPTION name DROP PUBLICATION publication_name [, ...] [WITH (...)];
-ALTER SUBSCRIPTION name REFRESH PUBLICATION [WITH (...)];
-ALTER SUBSCRIPTION name ENABLE;
-ALTER SUBSCRIPTION name DISABLE;
-ALTER SUBSCRIPTION name SET (subscription_parameter [= value] [, ...]);
-ALTER SUBSCRIPTION name SKIP (skip_option = value);
-ALTER SUBSCRIPTION name OWNER TO new_owner;
-ALTER SUBSCRIPTION name RENAME TO new_name;
-```
+The publication/table list for the SET/ADD/DROP PUBLICATION forms is
+extractable via `name_refs()` (all `NameRef` children under those forms).
+This matches the same rich extraction available for `CreateSubscription`.
 
-**None of these eleven real PostgreSQL `ALTER SUBSCRIPTION` forms can be
-distinguished or extracted from this AST.** This is a parser-level
-limitation, not an accessor gap.
+Real PostgreSQL `ALTER SUBSCRIPTION` operations are therefore distinguishable
+**at the operation-type level** via the token accessors above. (Fine-grained
+parameter payloads may still require descending into `set_options()` /
+`attribute_list()` / `literal()` — verified available.)
 
 ### safe-migrate guidance
 
 ```rust
+enum AlterSubscriptionOp {
+    Connection { conn: Option<Literal> },
+    Server { server: Option<NameRef> },
+    SetPublication { pubs: Vec<String> },   // via name_refs()
+    AddPublication { pubs: Vec<String> },
+    DropPublication { pubs: Vec<String> },
+    Refresh,
+    Enable,
+    Disable,
+    SetOptions { opts: Option<SetOptions> }, // via set_options()/attribute_list()
+    Skip,
+    OwnerTo { owner: Option<OwnerTo> },
+    RenameTo { to: Option<RenameTo> },
+}
+
 struct AlterSubscriptionFact {
-    name: String,    // from name_ref() — only extractable field
-    // operation type and parameters: NOT EXTRACTABLE
+    name: String,                  // from name_ref()
+    operation: AlterSubscriptionOp, // inferred from token/child accessors
 }
 ```
 
-This gap is particularly significant because `ENABLE`/`DISABLE` and
-`DROP PUBLICATION` operations directly control whether replication is
-actively running and what data flows — exactly the kind of operationally
-critical state change safe-migrate would want to flag, and exactly what
-cannot be distinguished here. As with `AlterPublication`, recommend treating
-all `AlterSubscription` statements as `Confidence::Tainted` and/or flagged
-for manual review by default, since the simulator cannot determine whether
-a given statement disables replication, changes the connection target,
-adds/removes published tables, or merely renames the subscription.
+Because the operation type IS extractable, safe-migrate should branch on the
+detected `AlterSubscriptionOp` rather than blanket-tainting every statement.
+`ENABLE`/`DISABLE`/`DROP PUBLICATION` remain operationally critical (they
+control whether replication is running and what data flows) and should still
+be flagged for review — but now the simulator knows *which* operation
+occurred, not just that "an alter happened."
 
 ---
 
@@ -314,13 +361,17 @@ adds/removes published tables, or merely renames the subscription.
 
 ## Grammar-Confirmed Limitations
 
-- `AlterSubscription`: confirmed by both grammar and squawk.rs to carry
-  nothing beyond the subscription name. None of the eleven real PostgreSQL
-  `ALTER SUBSCRIPTION` operation forms can be distinguished or extracted.
-  Same severity as the `AlterPublication` finding in publications.md —
-  together these represent the two most significant grammar gaps found
-  across the entire Tier 3 documentation pass, both involving operationally
-  critical replication state changes that cannot be analyzed.
+- `AlterSubscription`: earlier draft claimed it carried "nothing beyond the
+  subscription name" (black box). **Corrected** — the node (line 2249)
+  exposes a full operation-distinguishing accessor surface: token accessors
+  (`enable_token()`, `disable_token()`, `refresh_token()`, `set_token()`,
+  `skip_token()`, `add_token()`, `drop_token()`, `connection_token()`,
+  `server_token()`, `publication_token()`) and child accessors
+  (`owner_to()`, `rename_to()`, `set_options()`, `attribute_list()`,
+  `name_refs()`, `literal()`). The operation type IS extractable, and the
+  publication/table list for SET/ADD/DROP PUBLICATION is extractable via
+  `name_refs()`. The only genuine limitation is that fine-grained parameter
+  payloads require descending into `set_options()`/`attribute_list()`.
 
 ## Key Architectural Findings
 
@@ -329,19 +380,20 @@ adds/removes published tables, or merely renames the subscription.
    accessors — this should be flagged for empirical testing against actual
    parsed output before any safe-migrate code relies on the proposed
    positional-splitting workaround.
-2. **`AlterSubscription`, like `AlterPublication`, is functionally a
-   black box** beyond the target object's name — both should be treated
-   conservatively (tainted confidence / manual review) given the
-   operational criticality of what they can represent (enabling/disabling
-   replication, changing data flow) versus what can actually be detected
-   (nothing beyond "an alter happened to this object").
+2. **`AlterSubscription` is a structured node, not a black box** — its
+   operation type is inferable from token/child accessors (see the
+   AlterSubscription section). `ENABLE`/`DISABLE`/`DROP PUBLICATION` remain
+   operationally critical and should still be flagged for review, but the
+   simulator can now branch on the detected operation rather than
+   blanket-tainting every statement. (The `AlterPublication` finding in
+   publications.md is a separate, still-valid black-box finding.)
 
 ## Grammar Cross-Check
 
 This document was written with postgresql.ungram available from the start.
-All nodes cross-checked in this single pass; the `AlterSubscription` finding
-was independently confirmed against both the grammar and squawk.rs accessor
-bodies, matching the same pattern already established for `AlterPublication`.
+All nodes cross-checked in this single pass. The `AlterSubscription` finding
+was re-verified against the actual node (line 2249) and corrected: it is
+structured, not a black box.
 
 ---
 

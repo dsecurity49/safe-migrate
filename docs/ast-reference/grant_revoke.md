@@ -2,8 +2,7 @@
 
 ## Status
 
-Inspection status: complete. Cross-checked directly against postgresql.ungram
-and squawk.rs in a single pass.
+Verified against squawk_syntax 2.58.0 — July 2026
 
 ---
 
@@ -45,11 +44,19 @@ access.
 
 ## Grant
 
-### Verified Accessors (line 9844)
+### Verified Accessors (src/ast/generated/nodes.rs line 11323)
+
+**2.58.0 BREAKING CHANGE:** `Grant` was restructured. `name_refs()`, `paths()`,
+`option_token()`, `schema_token()`, `table_token()`, `tables_token()`, and
+`in_token()` were **removed** from `Grant` directly. Object targets are now
+wrapped in the new `PrivilegeObjects` node; the WITH GRANT OPTION clause is
+now wrapped in the new `GrantWithClause` node.
 
 ```rust
-pub fn name_refs(&self) -> AstChildren<NameRef>
-pub fn paths(&self) -> AstChildren<Path>
+// Grant — src/ast/generated/nodes.rs line 11323
+pub fn column_list(&self) -> Option<ColumnList>           // [NEW in 2.58.0]
+pub fn grant_with_clause(&self) -> Option<GrantWithClause> // [NEW in 2.58.0 — replaces option_token()]
+pub fn privilege_objects(&self) -> Option<PrivilegeObjects> // [NEW in 2.58.0 — replaces name_refs()/paths()]
 pub fn revoke_command_list(&self) -> Option<RevokeCommandList>
 pub fn role_ref(&self) -> Option<RoleRef>
 pub fn role_ref_list(&self) -> Option<RoleRefList>
@@ -58,14 +65,27 @@ pub fn all_token(&self) -> Option<SyntaxToken>
 pub fn by_token(&self) -> Option<SyntaxToken>
 pub fn grant_token(&self) -> Option<SyntaxToken>
 pub fn granted_token(&self) -> Option<SyntaxToken>
-pub fn in_token(&self) -> Option<SyntaxToken>
 pub fn on_token(&self) -> Option<SyntaxToken>
-pub fn option_token(&self) -> Option<SyntaxToken>
 pub fn privileges_token(&self) -> Option<SyntaxToken>
-pub fn schema_token(&self) -> Option<SyntaxToken>
-pub fn table_token(&self) -> Option<SyntaxToken>
-pub fn tables_token(&self) -> Option<SyntaxToken>
 pub fn to_token(&self) -> Option<SyntaxToken>
+
+// PrivilegeObjects — src/ast/generated/nodes.rs line 16237 [NEW node in 2.58.0]
+pub fn function_sig_list(&self) -> Option<FunctionSigList>
+pub fn literals(&self) -> AstChildren<Literal>
+pub fn name_refs(&self) -> AstChildren<NameRef>    // schemas (for IN SCHEMA)
+pub fn paths(&self) -> AstChildren<Path>            // table/object paths
+pub fn types(&self) -> AstChildren<Type>
+pub fn all_token(&self) -> Option<SyntaxToken>
+pub fn data_token(&self) -> Option<SyntaxToken>
+pub fn database_token(&self) -> Option<SyntaxToken>
+pub fn domain_token(&self) -> Option<SyntaxToken>
+pub fn foreign_token(&self) -> Option<SyntaxToken>
+// ... and more type-discriminating tokens
+
+// GrantWithClause — src/ast/generated/nodes.rs line 11459 [NEW node in 2.58.0]
+pub fn grant_role_option_list(&self) -> Option<GrantRoleOptionList>
+pub fn grant_token(&self) -> Option<SyntaxToken>
+pub fn option_token(&self) -> Option<SyntaxToken>
 pub fn with_token(&self) -> Option<SyntaxToken>
 ```
 
@@ -132,31 +152,35 @@ struct GrantFact {
 
 ## Revoke
 
-### Verified Accessors (line 15450)
+### Verified Accessors (src/ast/generated/nodes.rs line 17473)
+
+**2.58.0 BREAKING CHANGE:** `Revoke` was restructured similarly to `Grant`.
+`name_refs()`, `paths()`, `revoke_command_list()`, `schema_token()`, `table_token()`,
+`tables_token()`, and `in_token()` were **removed** from `Revoke` directly.
+Object targets now come via `privilege_objects() -> Option<PrivilegeObjects>`
+(same node as in `Grant`). Added `admin_token()`, `inherit_token()`,
+`set_token()` for new REVOKE forms.
 
 ```rust
-pub fn name_refs(&self) -> AstChildren<NameRef>
-pub fn paths(&self) -> AstChildren<Path>
-pub fn revoke_command_list(&self) -> Option<RevokeCommandList>
+// Revoke — src/ast/generated/nodes.rs line 17473
+pub fn privilege_objects(&self) -> Option<PrivilegeObjects>  // [NEW — replaces name_refs()/paths()]
+pub fn privileges(&self) -> Option<Privileges>               // [NEW]
 pub fn role_ref(&self) -> Option<RoleRef>
 pub fn role_ref_list(&self) -> Option<RoleRefList>
 pub fn semicolon_token(&self) -> Option<SyntaxToken>
-pub fn all_token(&self) -> Option<SyntaxToken>
+pub fn admin_token(&self) -> Option<SyntaxToken>            // [NEW in 2.58.0]
 pub fn by_token(&self) -> Option<SyntaxToken>
 pub fn cascade_token(&self) -> Option<SyntaxToken>
 pub fn for_token(&self) -> Option<SyntaxToken>
 pub fn from_token(&self) -> Option<SyntaxToken>
 pub fn grant_token(&self) -> Option<SyntaxToken>
 pub fn granted_token(&self) -> Option<SyntaxToken>
-pub fn in_token(&self) -> Option<SyntaxToken>
+pub fn inherit_token(&self) -> Option<SyntaxToken>          // [NEW in 2.58.0]
 pub fn on_token(&self) -> Option<SyntaxToken>
 pub fn option_token(&self) -> Option<SyntaxToken>
-pub fn privileges_token(&self) -> Option<SyntaxToken>
 pub fn restrict_token(&self) -> Option<SyntaxToken>
 pub fn revoke_token(&self) -> Option<SyntaxToken>
-pub fn schema_token(&self) -> Option<SyntaxToken>
-pub fn table_token(&self) -> Option<SyntaxToken>
-pub fn tables_token(&self) -> Option<SyntaxToken>
+pub fn set_token(&self) -> Option<SyntaxToken>              // [NEW in 2.58.0]
 ```
 
 ### Grammar Confirmation
