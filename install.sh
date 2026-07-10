@@ -124,16 +124,25 @@ download_asset() {
 
   rm -f "$part"
 
+  set +e
   if [ "$VERBOSE" -eq 1 ]; then
-    curl -fL --progress-bar -o "$part" "$url" || {
-      rm -f "$part"
-      return 1
-    }
+    curl -fL --progress-bar -o "$part" "$url" 2>"${TMP_DIR}/curl_stderr"
+    rc=$?
   else
-    curl -fsSL -o "$part" "$url" || {
-      rm -f "$part"
-      return 1
-    }
+    curl -fsSL -o "$part" "$url" 2>"${TMP_DIR}/curl_stderr"
+    rc=$?
+  fi
+  set -e
+
+  if [ "$rc" -ne 0 ]; then
+    rm -f "$part"
+    if [ "$rc" -eq 22 ]; then
+      return 1  # 404 / not found — expected for fallback targets
+    fi
+    # Network/SSL error — capture details for final error message
+    errmsg=$(tr '\n' ' ' < "${TMP_DIR}/curl_stderr" 2>/dev/null || true)
+    printf '%s\n' "network-error:${target}:${rc}:${errmsg}" >&2
+    return 2
   fi
 
   # Verify checksum if available
@@ -285,20 +294,34 @@ CANDIDATES="$(candidate_targets "$OS" "$ARCH")"
 
 TAR_FILE=""
 SELECTED_TARGET=""
+NETWORK_ERROR=""
 
 for candidate in $CANDIDATES; do
-  if TAR_FILE="$(download_asset "$RESOLVED_VERSION" "$candidate")"; then
+  rc=0
+  TAR_FILE="$(download_asset "$RESOLVED_VERSION" "$candidate" 2>"${TMP_DIR}/dl_err")" || rc=$?
+  if [ "$rc" -eq 0 ]; then
     SELECTED_TARGET="$candidate"
     break
+  elif [ "$rc" -eq 2 ]; then
+    NETWORK_ERROR="$(cat "${TMP_DIR}/dl_err" 2>/dev/null || true)"
   fi
 done
 
 if [ -z "$TAR_FILE" ]; then
-  printf 'Error: no matching release asset found for %s\n' "$RESOLVED_VERSION" >&2
-  printf 'Tried targets:\n' >&2
-  for t in $CANDIDATES; do
-    printf '  - %s\n' "$t" >&2
-  done
+  if [ -n "$NETWORK_ERROR" ]; then
+    printf 'Error: network failure downloading %s\n' "$RESOLVED_VERSION" >&2
+    if echo "$NETWORK_ERROR" | grep -q '^network-error:'; then
+      printf '  Target : %s\n' "$(echo "$NETWORK_ERROR" | cut -d: -f2)" >&2
+      printf '  curl exit code : %s\n' "$(echo "$NETWORK_ERROR" | cut -d: -f3)" >&2
+      printf '  curl error     : %s\n' "$(echo "$NETWORK_ERROR" | cut -d: -f4-)" >&2
+    fi
+  else
+    printf 'Error: no matching release asset found for %s\n' "$RESOLVED_VERSION" >&2
+    printf 'Tried targets:\n' >&2
+    for t in $CANDIDATES; do
+      printf '  - %s\n' "$t" >&2
+    done
+  fi
   exit 1
 fi
 
