@@ -1664,14 +1664,13 @@ impl AstVisitor {
                     .map(|n| n.text().to_string())
                     .unwrap_or_default(),
             }
-        } else if let Some(ol) = node.func_option_list() {
+        } else {
+            let ol = node.func_option_list()?;
             crate::analysis::facts::AlterFunctionAction::OptionsChange(
                 ol.options()
                     .map(|o| Self::extract_func_option(&o))
                     .collect(),
             )
-        } else {
-            return None;
         };
 
         Some(StatementFact::AlterFunction(
@@ -1786,14 +1785,13 @@ impl AstVisitor {
                     .map(|n| n.text().to_string())
                     .unwrap_or_default(),
             }
-        } else if let Some(ol) = node.func_option_list() {
+        } else {
+            let ol = node.func_option_list()?;
             crate::analysis::facts::AlterFunctionAction::OptionsChange(
                 ol.options()
                     .map(|o| Self::extract_func_option(&o))
                     .collect(),
             )
-        } else {
-            return None;
         };
 
         Some(StatementFact::AlterProcedure(
@@ -2329,12 +2327,11 @@ impl AstVisitor {
             }
         } else if node.refresh_collation_version().is_some() {
             crate::analysis::facts::AlterDatabaseAction::RefreshCollationVersion
-        } else if let Some(ol) = node.database_option_list() {
+        } else {
+            let ol = node.database_option_list()?;
             crate::analysis::facts::AlterDatabaseAction::OptionChanges(
                 ol.database_options().map(Self::extract_db_option).collect(),
             )
-        } else {
-            return None;
         };
 
         Some(StatementFact::AlterDatabase(
