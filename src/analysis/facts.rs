@@ -33,6 +33,36 @@ pub enum TypeCreationKind {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub enum AlterViewAction {
+    RenameTo {
+        new_name: Ident,
+    },
+    OwnerTo {
+        new_owner: String,
+    },
+    SetSchema {
+        new_schema: String,
+    },
+    SetDefault {
+        column: String,
+        default: Option<ExprIr>,
+    },
+    DropDefault {
+        column: String,
+    },
+    RenameColumn {
+        from: Ident,
+        to: Ident,
+    },
+    SetOptions {
+        options: Vec<String>,
+    },
+    ResetOptions {
+        options: Vec<String>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum StatementFact {
     CreateSchema {
         name: QualifiedName,
@@ -57,6 +87,7 @@ pub enum StatementFact {
         table_constraints: Vec<TableConstraintFact>,
         partition_by: Option<String>,
         partition_of: Option<QualifiedName>,
+        partition_type: Option<String>,
     },
     CreateView {
         name: QualifiedName,
@@ -65,7 +96,7 @@ pub enum StatementFact {
     },
     AlterView {
         name: QualifiedName,
-        new_name: Option<Ident>,
+        action: AlterViewAction,
     },
     CreateMaterializedView {
         name: QualifiedName,

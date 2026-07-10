@@ -81,9 +81,32 @@ impl Rule for BlockingConstraintRule {
             let tier1_threshold = config.rule_tier1_threshold(self.id());
             let tier2_threshold = config.rule_tier2_threshold(self.id());
 
-            let tier = if max_locked_rows >= tier1_threshold {
+            // Check if either table is partitioned (partitioned tables have higher lock costs)
+            let is_partitioned =
+                if let AlterTableActionMutation::AddForeignKey { to_table, .. } = &alter.action {
+                    let child_partitioned = pre_state
+                        .relations
+                        .get(&alter.id)
+                        .is_some_and(|rel| rel.partition_type.is_some());
+                    let parent_partitioned = pre_state
+                        .relations
+                        .get(to_table)
+                        .is_some_and(|rel| rel.partition_type.is_some());
+                    child_partitioned || parent_partitioned
+                } else {
+                    false
+                };
+
+            // Partitioned tables escalate lock severity: use 50% of threshold
+            let (adjusted_tier1, adjusted_tier2) = if is_partitioned {
+                (tier1_threshold / 2, tier2_threshold / 2)
+            } else {
+                (tier1_threshold, tier2_threshold)
+            };
+
+            let tier = if max_locked_rows >= adjusted_tier1 {
                 ViolationTier::Tier1
-            } else if max_locked_rows >= tier2_threshold {
+            } else if max_locked_rows >= adjusted_tier2 {
                 ViolationTier::Tier2
             } else {
                 ViolationTier::Tier3
@@ -149,6 +172,9 @@ impl Rule for BlockingConstraintRule {
                         "Synchronous FOREIGN KEY constraint '{}' addition locks {} and {}",
                         name_str, alter.id, to_table
                     );
+                    if is_partitioned {
+                        reason.push_str(" [partitioned tables escalate lock severity]");
+                    }
                     if is_stale {
                         reason.push_str(" [WARNING: Based on offline/stale statistics]");
                     }

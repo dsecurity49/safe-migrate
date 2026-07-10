@@ -18,6 +18,26 @@ pub fn sync_cache(out_path: &Path) -> Result<()> {
         fs::remove_file(out_path).context("Failed to remove old cache file before sync")?;
     }
 
+    // Warn if connecting to a non-local host without TLS
+    let host = db_url
+        .split('@')
+        .nth(1)
+        .and_then(|h| h.split('/').next())
+        .unwrap_or("localhost");
+    if !host.starts_with("localhost")
+        && !host.starts_with("127.")
+        && !host.starts_with("/")
+        && host != "::1"
+    {
+        eprintln!(
+            "[WARN] Connecting to PostgreSQL at {} without TLS encryption.\n\
+             The database password will be sent in cleartext over the network.\n\
+             Use an SSH tunnel or a local connection for sensitive databases,\n\
+             or add native-tls support (see https://github.com/dsecurity49/safe-migrate).",
+            host
+        );
+    }
+
     let mut client = Client::connect(&db_url, NoTls).context("Failed to connect to PostgreSQL")?;
 
     let mut cache = DbCache::new();

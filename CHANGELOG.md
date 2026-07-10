@@ -4,10 +4,12 @@ All notable changes to safe-migrate are documented here.
 
 ## v0.4.0
 
-Major correctness release. 14 bugs fixed across the rule engine, state machine, AST extraction, and output layer. Test suite expanded from 185 to 227 tests. Output format redesigned to be unambiguous and readable.
+Major correctness release. 16 bugs fixed across the rule engine, state machine, AST extraction, and output layer. Test suite expanded from 185 to 235 tests. Output format redesigned to be unambiguous and readable.
 
 **Bug fixes:**
 
+- `DropColumn` with `IF EXISTS` on an absent column now correctly returns `MutationResult::Skipped` instead of performing a full drop evaluation. This prevents false-positive `irreversible-migration` violations for no-op DROP COLUMN IF EXISTS. `DropColumn` without `IF EXISTS` on a nonexistent column now marks confidence as `Tainted`.
+- Config parsing (`safe-migrate.toml`) now returns an error on invalid or unparseable files, exiting with code 1 instead of silently falling back to defaults.
 - `VacuumFullRule` showed `<vacuum>` as the object name instead of the actual table being vacuumed. Now correctly resolves and displays the table ObjectId.
 - `now()` and `current_timestamp` were incorrectly classified as VOLATILE. They are STABLE — they return the transaction start time, the same value for every row within one statement. This caused false positive table-rewrite warnings on `ALTER TABLE ... ADD COLUMN ... DEFAULT NOW()` on PG11+.
 - `BrokenComputeRule` was completely silent. The function_id constructed at drop time never matched the one stored at trigger-creation time, so the lookup always returned empty. Fixed by normalizing function_id construction to use a consistent signature format at both sites.
@@ -18,6 +20,17 @@ Major correctness release. 14 bugs fixed across the rule engine, state machine, 
 - `AlterColumnOption::SetStorage` was detected via fragile string matching before the main match statement. Replaced with a proper enum arm.
 - Confidence was not restored on `ROLLBACK`. `Mutation::Opaque` set confidence to `Tainted` without snapshotting the previous value. After `ROLLBACK`, confidence stayed `Tainted` permanently, causing all subsequent Tier 1 violations in the same run to be silently downgraded to Tier 2. Fixed by adding `StateChange::ConfidenceSnapshot` to the undo-log and restoring in `rollback_frame()`.
 - `DROP SCHEMA CASCADE` cleaned FK, view, index, partition, sequence, and rename edges but not trigger and publication edges. Stale trigger edges caused `BrokenComputeRule` to produce false positive violations after schema drops. Fixed by adding the missing `retain` calls and snapshot functions for both edge types.
+- `PartitionLockRule` (`partition-lock`): Escalated locking severity thresholds (halving the Tier 1 and Tier 2 row count limits) for operations affecting `HASH` partitioned tables since they require more aggressive locking. Appends `[HASH partitioning escalates lock severity]` to the finding reason.
+- `DriftDetectionRule` (`schema-drift`): Expanded checks to detect and warn when creating a partition (`CREATE TABLE ... PARTITION OF parent`) if the parent table does not exist in the production baseline.
+
+**Other improvements:**
+
+- `install.sh`: Fixed `detect_linux_flavor()` to correctly identify Termux/Android environments (was broken by a `*:*)` wildcard that matched everything).
+- `install.sh`: Added SHA256 checksum download and verification step for release artifacts.
+- Release workflow: Added `checksum: sha256` to release artifact generation. Removed `aarch64-pc-windows-msvc` target (no native GitHub Actions runner available).
+- CI workflow: Added `--locked` to all `cargo` commands. Added `cargo audit` step for dependency vulnerability scanning.
+- `safe-migrate sync`: Added runtime warning when `DATABASE_URL` points to a non-localhost host — the connection is unencrypted by default. Use `sslmode=require` or SSH tunnel for production databases.
+- Consolidated duplicate `rowan` dependency: direct dependency downgraded from `0.16.1` to `0.15.18` to match squawk's transitive version.
 
 **Output redesign:**
 
@@ -41,6 +54,7 @@ Major correctness release. 14 bugs fixed across the rule engine, state machine, 
 - `restrictive-policy` — flags RLS policies that could unexpectedly restrict access
 - `disable-trigger` — flags `ALTER TABLE ... DISABLE TRIGGER ALL` in migrations
 - `chain-conflict` — flags same-chain migrations adding the same column with different types
+- `partition-strategy-mismatch` — flags `ATTACH PARTITION` operations where the partition table's strategy (RANGE, LIST, or HASH) does not match the parent table's strategy. Mismatched strategies cause runtime failures during partition attachment.
 
 **New capabilities:**
 
@@ -48,7 +62,7 @@ Major correctness release. 14 bugs fixed across the rule engine, state machine, 
 - Same-chain conflict detection via `MutationResult::Conflict`
 - Ecosystem coverage: roles, ACLs, functions, triggers, policies, publications, subscriptions all tracked in state machine
 
-**Test suite:** 185 → 227 tests (223 unit + 4 CLI integration). All 14 bug regression tests named `test_bugNNN_*`.
+**Test suite:** 185 → 235 tests (231 unit + 4 CLI integration). All 16 bug regression tests named `test_findingN_*`.
 
 ## v0.3.2
 
@@ -90,7 +104,7 @@ Complete internal rewrite of the analysis engine. safe-migrate no longer just pa
 - Per-rule configuration overrides via `safe-migrate.toml`
 - Inline ignore directives (`-- safe-migrate: ignore(...)`, `-- safe-migrate: ignore-file(...)`)
 - 78-test suite covering the simulator, rule engine, and CLI
-- Multi-platform binary releases (Linux x86_64/ARM64 incl. musl, macOS Intel/Apple Silicon, Windows x86_64/ARM64)
+- Multi-platform binary releases (Linux x86_64/ARM64 incl. musl, macOS Intel/Apple Silicon, Windows x86_64)
 
 ## v0.2.0
 

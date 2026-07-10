@@ -21,7 +21,7 @@ thiserror = "1.0"
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 postgres = "0.19"
-rowan = "0.16.1"
+rowan = "0.15.18"
 owo-colors = "4"
 terminal_size = "0.3"
 comfy-table = "7"

@@ -38,18 +38,24 @@ impl Rule for PartitionLockRule {
             match &alter.action {
                 AlterTableActionMutation::AttachPartition { .. }
                 | AlterTableActionMutation::DetachPartition { .. } => {
-                    let (is_temp, is_stale, rows) = match pre_state.relations.get(&alter.id) {
-                        Some(rel) => {
-                            let stale =
-                                rel.is_stale() && state.baseline_relations.contains(&alter.id);
-                            (
-                                rel.persistence == Persistence::Temporary,
-                                stale,
-                                rel.estimated_rows.unwrap_or(config.default_rows),
-                            )
-                        }
-                        None => (false, true, config.default_rows),
-                    };
+                    let (is_temp, is_stale, rows, is_hash_partitioned) =
+                        match pre_state.relations.get(&alter.id) {
+                            Some(rel) => {
+                                let stale =
+                                    rel.is_stale() && state.baseline_relations.contains(&alter.id);
+                                let is_hash = rel
+                                    .partition_type
+                                    .as_ref()
+                                    .is_some_and(|pt| pt.to_uppercase().contains("HASH"));
+                                (
+                                    rel.persistence == Persistence::Temporary,
+                                    stale,
+                                    rel.estimated_rows.unwrap_or(config.default_rows),
+                                    is_hash,
+                                )
+                            }
+                            None => (false, true, config.default_rows, false),
+                        };
 
                     if is_temp {
                         return violations;
@@ -82,9 +88,15 @@ impl Rule for PartitionLockRule {
                     let tier1_threshold = config.rule_tier1_threshold(self.id());
                     let tier2_threshold = config.rule_tier2_threshold(self.id());
 
-                    let tier = if rows >= tier1_threshold {
+                    let (adjusted_tier1, adjusted_tier2) = if is_hash_partitioned {
+                        (tier1_threshold / 2, tier2_threshold / 2)
+                    } else {
+                        (tier1_threshold, tier2_threshold)
+                    };
+
+                    let tier = if rows >= adjusted_tier1 {
                         ViolationTier::Tier1
-                    } else if rows >= tier2_threshold {
+                    } else if rows >= adjusted_tier2 {
                         ViolationTier::Tier2
                     } else {
                         ViolationTier::Tier3
@@ -103,6 +115,9 @@ impl Rule for PartitionLockRule {
                             "{} a partition on heavily utilized parent table {}",
                             op_name, alter.id
                         );
+                        if is_hash_partitioned {
+                            reason.push_str(" [HASH partitioning escalates lock severity]");
+                        }
                         if is_stale {
                             reason.push_str(" [WARNING: Based on offline/stale statistics]");
                         }
@@ -122,6 +137,95 @@ impl Rule for PartitionLockRule {
                     }
                 }
                 _ => {}
+            }
+        }
+        violations
+    }
+}
+
+pub struct PartitionStrategyMismatchRule;
+
+impl Rule for PartitionStrategyMismatchRule {
+    fn id(&self) -> &'static str {
+        "partition-strategy-mismatch"
+    }
+    fn default_tier(&self) -> ViolationTier {
+        ViolationTier::Tier1
+    }
+    fn recipe(&self) -> &'static str {
+        "Ensure the partition being attached matches the parent table's partition strategy (RANGE/LIST/HASH). Mismatched strategies will cause ATTACH PARTITION to fail."
+    }
+
+    fn evaluate(
+        &self,
+        mutation: &Mutation,
+        result: &MutationResult,
+        pre_state: &crate::analysis::state::PreState,
+        _state: &AnalysisState,
+        _config: &Config,
+        _cascade: Option<&CascadeResult>,
+    ) -> Vec<Violation> {
+        if *result == MutationResult::Skipped {
+            return vec![];
+        }
+
+        let mut violations = Vec::new();
+
+        if let Mutation::AlterTable(alter) = mutation
+            && let AlterTableActionMutation::AttachPartition { child } = &alter.action
+        {
+            let parent_partition_type = pre_state
+                .relations
+                .get(&alter.id)
+                .and_then(|rel| rel.partition_type.clone());
+
+            let partition_partition_type = pre_state
+                .relations
+                .get(child)
+                .and_then(|rel| rel.partition_type.clone());
+
+            if let Some(parent_type) = parent_partition_type {
+                match partition_partition_type {
+                    None => {
+                        violations.push(Violation {
+                            source_range: None,
+                            rule_id: self.id(),
+                            operation_kind: OperationKind::AttachPartition,
+                            object_kind: ObjectKind::Table,
+                            object_name: format!("{} -> {}", child, alter.id),
+                            tier: self.default_tier(),
+                            reason: format!(
+                                "ATTACH PARTITION: partition {} has no partition strategy, but parent {} requires {}",
+                                child, alter.id, parent_type
+                            ),
+                            recipe: self.recipe(),
+                            dedup_key: None,
+                            sql: None,
+                        });
+                    }
+                    Some(part_type)
+                        if !part_type
+                            .to_uppercase()
+                            .contains(&parent_type.to_uppercase()) =>
+                    {
+                        violations.push(Violation {
+                            source_range: None,
+                            rule_id: self.id(),
+                            operation_kind: OperationKind::AttachPartition,
+                            object_kind: ObjectKind::Table,
+                            object_name: format!("{} -> {}", child, alter.id),
+                            tier: self.default_tier(),
+                            reason: format!(
+                                "ATTACH PARTITION: partition {} is {} but parent {} is {} (mismatch)",
+                                child, part_type, alter.id, parent_type
+                            ),
+                            recipe: self.recipe(),
+                            dedup_key: None,
+                            sql: None,
+                        });
+                    }
+                    _ => {}
+                }
             }
         }
         violations

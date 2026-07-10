@@ -40,20 +40,21 @@ impl Default for Config {
 }
 
 impl Config {
-    pub fn load_from_file(path: &Path) -> Self {
-        if path.exists()
-            && let Ok(contents) = fs::read_to_string(path)
-        {
-            if let Ok(config) = toml::from_str(&contents) {
-                return config;
-            } else {
-                eprintln!(
-                    "[WARN] Failed to parse config at {}. Using defaults.",
-                    path.display()
-                );
+    pub fn load_from_file(path: &Path) -> Result<Self, anyhow::Error> {
+        if path.exists() {
+            let contents = fs::read_to_string(path)?;
+            match toml::from_str(&contents) {
+                Ok(config) => return Ok(config),
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "Failed to parse config at {}: {}",
+                        path.display(),
+                        e
+                    ));
+                }
             }
         }
-        Self::default()
+        Ok(Self::default())
     }
 
     /// Checks if a rule is completely disabled
@@ -107,7 +108,7 @@ mod tests {
         )
         .expect("Failed to write temp config");
 
-        let config = Config::load_from_file(file.path());
+        let config = Config::load_from_file(file.path()).expect("Failed to load valid config");
 
         // Assert Global Overrides
         assert_eq!(config.tier1_threshold_rows, 500_000);

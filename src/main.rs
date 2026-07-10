@@ -89,7 +89,10 @@ fn main() -> Result<()> {
                 .with_context(|| format!("Failed to read migration file: {}", file.display()))?;
 
             // 1. Load config
-            let cfg = Config::load_from_file(config_path);
+            let cfg = Config::load_from_file(config_path).unwrap_or_else(|e| {
+                eprintln!("[ERROR] {}", e);
+                std::process::exit(1);
+            });
 
             // 2. Cache Expiry Warning (Only if we aren't bypassing it)
             if !*no_cache
@@ -197,7 +200,10 @@ fn main() -> Result<()> {
 
             println!("\nAnalyzing migration chain in: {}\n", dir.display());
 
-            let cfg = Config::load_from_file(config_path);
+            let cfg = Config::load_from_file(config_path).unwrap_or_else(|e| {
+                eprintln!("[ERROR] {}", e);
+                std::process::exit(1);
+            });
 
             let db_cache = if !*no_cache && cache.exists() {
                 let json = fs::read_to_string(cache).context("Failed to read cache file")?;

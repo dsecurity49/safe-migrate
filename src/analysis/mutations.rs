@@ -207,6 +207,7 @@ pub struct CreateTable {
     pub table_constraints: Vec<TableConstraintFact>,
     pub partition_by: Option<String>,
     pub partition_of: Option<ObjectId>,
+    pub partition_type: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

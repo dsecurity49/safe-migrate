@@ -18,7 +18,7 @@ use crate::rules::functions::{BrokenComputeRule, FunctionVolatilityRule};
 use crate::rules::idempotency::IdempotencyRule;
 use crate::rules::indexes::ConcurrentIndexRule;
 use crate::rules::opaque::OpaqueDynamicSqlRule;
-use crate::rules::partitions::PartitionLockRule;
+use crate::rules::partitions::{PartitionLockRule, PartitionStrategyMismatchRule};
 use crate::rules::policies::RestrictivePolicyRule;
 use crate::rules::security::OverbroadGrantRule;
 use crate::rules::transactions::{
@@ -51,6 +51,7 @@ impl SafeMigrateEngine {
                 Box::new(ConcurrentIndexRule),
                 Box::new(MaterializedViewRefreshRule),
                 Box::new(PartitionLockRule),
+                Box::new(PartitionStrategyMismatchRule),
                 Box::new(RestrictivePolicyRule),
                 Box::new(DisableTriggerRule),
                 Box::new(BrokenComputeRule),

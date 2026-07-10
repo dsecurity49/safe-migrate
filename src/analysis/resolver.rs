@@ -158,6 +158,7 @@ impl Resolver {
                 table_constraints,
                 partition_by,
                 partition_of,
+                partition_type,
             } => {
                 let id = Self::resolve_creation_name(name, state);
 
@@ -226,6 +227,7 @@ impl Resolver {
                     table_constraints: table_constraints.clone(),
                     partition_by: partition_by.clone(),
                     partition_of: partition_of_id,
+                    partition_type: partition_type.clone(),
                 }));
             }
             StatementFact::CreateView {
@@ -250,12 +252,28 @@ impl Resolver {
                     depends_on: resolved_depends,
                 }));
             }
-            StatementFact::AlterView { name, new_name } => {
-                if let Some(new_name) = new_name {
-                    let id = Self::resolve_lookup_name(name, state);
-                    let mut new_id = ObjectId::new(id.schema.clone(), new_name.resolve());
-                    new_id.inferred_schema = id.inferred_schema;
-                    mutations.push(Mutation::Rename(Rename { old_id: id, new_id }));
+            StatementFact::AlterView { name, action } => {
+                match action {
+                    crate::analysis::facts::AlterViewAction::RenameTo { new_name } => {
+                        let id = Self::resolve_lookup_name(name, state);
+                        let mut new_id = ObjectId::new(id.schema.clone(), new_name.resolve());
+                        new_id.inferred_schema = id.inferred_schema;
+                        mutations.push(Mutation::Rename(Rename { old_id: id, new_id }));
+                    }
+                    crate::analysis::facts::AlterViewAction::SetSchema { .. } => {
+                        // SET SCHEMA — rename tracked at object-id level is handled by state machine
+                        // No mutation needed since schema changes don't change ObjectId
+                    }
+                    crate::analysis::facts::AlterViewAction::OwnerTo { .. }
+                    | crate::analysis::facts::AlterViewAction::SetDefault { .. }
+                    | crate::analysis::facts::AlterViewAction::DropDefault { .. }
+                    | crate::analysis::facts::AlterViewAction::RenameColumn { .. }
+                    | crate::analysis::facts::AlterViewAction::SetOptions { .. }
+                    | crate::analysis::facts::AlterViewAction::ResetOptions { .. } => {
+                        // These are opaque from the state machine's perspective —
+                        // they don't create or destroy objects, just modify metadata.
+                        // No mutation emitted; rules can still check the StatementFact.
+                    }
                 }
             }
             StatementFact::CreateMaterializedView { name, depends_on } => {

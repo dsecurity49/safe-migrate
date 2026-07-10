@@ -297,6 +297,9 @@ impl AstVisitor {
             .partition_of()
             .and_then(|p| p.path())
             .and_then(|p| Self::path_to_qualified_name(&p));
+        let partition_type = node
+            .partition_type()
+            .map(|pt| pt.syntax().text().to_string());
 
         let (columns, foreign_keys, table_constraints) = node
             .table_arg_list()
@@ -313,6 +316,7 @@ impl AstVisitor {
             table_constraints,
             partition_by,
             partition_of,
+            partition_type,
         })
     }
 
@@ -337,6 +341,7 @@ impl AstVisitor {
             table_constraints: Vec::new(),
             partition_by: None,
             partition_of: None,
+            partition_type: None,
         })
     }
 
@@ -955,22 +960,140 @@ impl AstVisitor {
 
     fn extract_alter_view(node: &ast::AlterView) -> Option<StatementFact> {
         let path = node.path()?;
-        let new_name = node
-            .syntax()
-            .descendants()
-            .find_map(RenameTo::cast)
-            .and_then(|rt| {
-                rt.name().map(|n| {
+        let name = Self::path_to_qualified_name(&path)?;
+        let full_text = node.syntax().text().to_string().to_lowercase();
+
+        // Check for RenameTo
+        if let Some(rt) = node.syntax().descendants().find_map(RenameTo::cast)
+            && let Some(new_name_node) = rt.name()
+        {
+            return Some(StatementFact::AlterView {
+                name,
+                action: crate::analysis::facts::AlterViewAction::RenameTo {
+                    new_name: Ident::new(
+                        new_name_node
+                            .text()
+                            .to_string()
+                            .trim_matches('"')
+                            .to_string(),
+                        new_name_node.is_quoted(),
+                    ),
+                },
+            });
+        }
+
+        // Check for OwnerTo
+        if let Some(ot) = node.owner_to()
+            && let Some(role_ref) = ot.syntax().descendants().find_map(ast::RoleRef::cast)
+            && let Some(nr) = role_ref.name_ref()
+        {
+            return Some(StatementFact::AlterView {
+                name,
+                action: crate::analysis::facts::AlterViewAction::OwnerTo {
+                    new_owner: Self::resolve_name_ref(&nr),
+                },
+            });
+        }
+
+        // Check for SetSchema
+        if let Some(ss) = node.set_schema()
+            && let Some(nr) = ss.name_ref()
+        {
+            return Some(StatementFact::AlterView {
+                name,
+                action: crate::analysis::facts::AlterViewAction::SetSchema {
+                    new_schema: Self::resolve_name_ref(&nr),
+                },
+            });
+        }
+
+        // Check for column default modifications (SET DEFAULT / DROP DEFAULT)
+        // Grammar: 'alter' 'column'? NameRef (('set' 'default' Expr) | ('drop' 'default'))
+        if node.column_token().is_some()
+            && (full_text.contains("set default") || full_text.contains("drop default"))
+        {
+            let col_name = node
+                .name_ref()
+                .map(|nr| Self::resolve_name_ref(&nr))
+                .unwrap_or_default();
+
+            if full_text.contains("drop default") {
+                return Some(StatementFact::AlterView {
+                    name,
+                    action: crate::analysis::facts::AlterViewAction::DropDefault {
+                        column: col_name,
+                    },
+                });
+            }
+
+            // SET DEFAULT
+            if let Some(expr) = node.expr() {
+                return Some(StatementFact::AlterView {
+                    name,
+                    action: crate::analysis::facts::AlterViewAction::SetDefault {
+                        column: col_name,
+                        default: Some(crate::analysis::expr_visitor::ExprVisitor::convert(expr)),
+                    },
+                });
+            }
+        }
+
+        // Check for RENAME COLUMN
+        if node.rename_token().is_some() && node.column_token().is_some() {
+            let from = node
+                .name_ref()
+                .map(|nr| {
+                    Ident::new(
+                        nr.text().to_string().trim_matches('"').to_string(),
+                        nr.is_quoted(),
+                    )
+                })
+                .unwrap_or_else(|| Ident::new("unknown".to_string(), false));
+            let to = node
+                .name()
+                .map(|n| {
                     Ident::new(
                         n.text().to_string().trim_matches('"').to_string(),
                         n.is_quoted(),
                     )
                 })
+                .unwrap_or_else(|| Ident::new("unknown".to_string(), false));
+            return Some(StatementFact::AlterView {
+                name,
+                action: crate::analysis::facts::AlterViewAction::RenameColumn { from, to },
             });
-        Some(StatementFact::AlterView {
-            name: Self::path_to_qualified_name(&path)?,
-            new_name,
-        })
+        }
+
+        // Check for SET OPTIONS
+        if let Some(so) = node.set_options() {
+            let options: Vec<String> = so
+                .syntax()
+                .descendants()
+                .filter_map(ast::NameRef::cast)
+                .map(|nr| Self::resolve_name_ref(&nr))
+                .collect();
+            return Some(StatementFact::AlterView {
+                name,
+                action: crate::analysis::facts::AlterViewAction::SetOptions { options },
+            });
+        }
+
+        // Check for RESET OPTIONS
+        if let Some(ro) = node.reset_options() {
+            let options: Vec<String> = ro
+                .syntax()
+                .descendants()
+                .filter_map(ast::NameRef::cast)
+                .map(|nr| Self::resolve_name_ref(&nr))
+                .collect();
+            return Some(StatementFact::AlterView {
+                name,
+                action: crate::analysis::facts::AlterViewAction::ResetOptions { options },
+            });
+        }
+
+        // Fallback: emit as opaque if we can't determine the action
+        None
     }
 
     fn extract_create_materialized_view(node: &CreateMaterializedView) -> Option<StatementFact> {

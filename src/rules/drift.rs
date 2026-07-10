@@ -278,6 +278,27 @@ impl Rule for DriftDetectionRule {
                             sql: None,
                 });
             }
+            Mutation::CreateTable(c) => {
+                // Warn if parent table doesn't exist for partitioned tables
+                if let Some(parent_id) = &c.partition_of
+                    && !pre_state.relations.contains_key(parent_id)
+                {
+                    violations.push(Violation { source_range: None,
+                        rule_id: self.id(),
+                        operation_kind: OperationKind::CreateTable,
+                        object_kind: ObjectKind::Table,
+                        object_name: c.id.to_string(),
+                        tier: self.default_tier(),
+                        reason: format!(
+                            "Migration creates {} as a partition of parent \"{}\" which does not exist in the production baseline. Parent must be created first.",
+                            c.id, parent_id
+                        ),
+                        recipe: self.recipe(),
+                        dedup_key: None,
+                        sql: None,
+                    });
+                }
+            }
             _ => {}
         }
 

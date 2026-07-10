@@ -19,7 +19,7 @@ Highlights:
 - New rules: `overbroad-grant`, `broken-compute`, `drop-database`, `schema-drift`, `irreversible-migration`, `chain-conflict`, `restrictive-policy`, `disable-trigger`
 - Multi-file chain execution (`lint-chain --dir`) with state persisting across files
 - Redesigned CLI output: structured header box, per-finding blocks with `object`/`reason`/`recipe`/`sql` fields, four-way verdict system (`HALT`/`CAUTIOUS`/`SAFE WITH RISK`/`SAFE`)
-- 227 passing tests (up from 185)
+- 235 passing tests (up from 185)
 
 ### ✅ Live Database Statistics Integration
 
@@ -45,7 +45,7 @@ curl -fsSL https://raw.githubusercontent.com/dsecurity49/safe-migrate/main/insta
 Supports:
 - Linux (x86_64, ARM64, musl)
 - macOS (Intel, Apple Silicon)
-- Windows (x86_64, ARM64)
+- Windows (x86_64)
 
 ### From Cargo
 
@@ -65,6 +65,8 @@ safe-migrate sync
 ```
 
 Creates `.safe-migrate-stats.json` with table sizes, column info, constraints, and indexes. Safe to commit to source control — contains no secrets, only statistics.
+
+**TLS warning:** When `DATABASE_URL` points to a non-localhost host, safe-migrate emits a warning that the connection is unencrypted. Use `sslmode=require` in your connection string or an SSH tunnel for production databases.
 
 **Cache freshness:** Warnings if older than 7 days (configurable). Stale stats are flagged in the report.
 
@@ -162,7 +164,7 @@ Example:
 
 ## Rules Reference
 
-All 20 rules with examples:
+All 25 rules with examples:
 
 ### 1. **blocking-constraint** (Tier 1)
 Adding a valid `CHECK` or `FOREIGN KEY` constraint scans the entire table with an `ACCESS EXCLUSIVE` lock.
@@ -247,7 +249,7 @@ REFRESH MATERIALIZED VIEW CONCURRENTLY mv_order_totals;
 ```
 
 ### 8. **partition-lock** (Tier 1/2)
-Partition operations that affect large parent tables.
+Partition operations (attaching/detaching) that affect large parent tables. HASH partitioned tables escalate locking severity (the tier thresholds are halved) due to more aggressive locking.
 
 ### 9. **opaque-dynamic-sql** (Tier 2)
 `DO` blocks and `EXECUTE` statements hide mutations. Analysis confidence degrades.
@@ -290,7 +292,7 @@ DROP FUNCTION audit_fn();  -- ❌ breaks the trigger
 `DROP DATABASE` is an irreversible, high-blast-radius operation that destroys the entire database. Should never appear in a migration file.
 
 ### 16. **schema-drift** (Tier 1)
-Flags migrations that reference tables or objects not present in the synced production baseline. If `DROP TABLE orders` is in the migration but `orders` is not in the cache, the migration would fail at runtime.
+Flags migrations that reference tables or objects not present in the synced production baseline. If `DROP TABLE orders` is in the migration but `orders` is not in the cache, the migration would fail at runtime. Also flags when creating a partitioned table (`CREATE TABLE ... PARTITION OF parent`) where the parent table does not exist in the production baseline.
 
 **Requires `safe-migrate sync` to be meaningful.** Without a cache, this rule has no baseline to compare against.
 
@@ -310,11 +312,19 @@ Flags `ALTER TABLE ... DISABLE TRIGGER ALL` in migration files. Disabling trigge
 ### 20. **chain-conflict** (Tier 1)
 When using `lint-chain`, flags migrations in the same chain that add the same column with different types to the same table. Only applies to multi-file chain execution.
 
+### 21. **partition-strategy-mismatch** (Tier 1)
+Flags `ATTACH PARTITION` operations where the partition being attached does not match the parent table's partition strategy (RANGE/LIST/HASH). Mismatched strategies will cause the operation to fail at runtime.
+
+```sql
+-- If parent table is defined as PARTITION BY RANGE:
+ALTER TABLE parent_table ATTACH PARTITION child_table FOR VALUES IN ('2023-01-01'); -- ❌ if child_table is HASH partitioned or has no partition strategy
+```
+
 ---
 
 ## Configuration
 
-Create `safe-migrate.toml` in your repo root to customize rule behavior and thresholds. All settings are optional — safe-migrate ships with sensible defaults.
+Create `safe-migrate.toml` in your repo root to customize rule behavior and thresholds. All settings are optional — safe-migrate ships with sensible defaults. Invalid or unparseable config files cause safe-migrate to exit with an error (no silent fallback).
 
 ### Global Settings
 
@@ -420,6 +430,7 @@ disabled = true
 | `restrictive-policy` | Flags RESTRICTIVE RLS policies that could unexpectedly restrict access | Tier 2 |
 | `disable-trigger` | Flags ALTER TABLE ... DISABLE TRIGGER ALL in migrations | Tier 2 |
 | `chain-conflict` | Flags same-chain migrations adding the same column with different types | Tier 1 |
+| `partition-strategy-mismatch` | Flags partition attachment where strategies mismatch | Tier 1 |
 
 ### Version-Gating Examples
 

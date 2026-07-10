@@ -47,9 +47,6 @@ jobs:
           # Windows x86_64
           - target: x86_64-pc-windows-msvc
             os: windows-latest
-          # Windows ARM64
-          - target: aarch64-pc-windows-msvc
-            os: windows-latest
     runs-on: ${{ matrix.os }}
     
     steps:
@@ -67,3 +64,5 @@ jobs:
           bin: safe-migrate
           target: ${{ matrix.target }}
           token: ${{ secrets.GITHUB_TOKEN }}
+          archive: $bin-$target
+          checksum: sha256

@@ -71,6 +71,8 @@ pub struct RelationState {
     pub last_autoanalyze: Option<String>,
     pub created_at_tx_depth: usize, // Phase 1 FIX: Same-Transaction index tracking
     pub privileges: PrivilegeMatrix,
+    pub partition_type: Option<String>, // e.g., "RANGE", "LIST", "HASH"
+    pub partition_by: Option<String>,   // The partition key expression
 }
 
 impl Default for RelationState {
@@ -90,6 +92,8 @@ impl Default for RelationState {
             last_autoanalyze: None,
             created_at_tx_depth: 0,
             privileges: PrivilegeMatrix::default(),
+            partition_type: None,
+            partition_by: None,
         }
     }
 }
@@ -119,6 +123,8 @@ impl RelationState {
             last_autoanalyze: None,
             created_at_tx_depth,
             privileges: PrivilegeMatrix::default(),
+            partition_type: None,
+            partition_by: None,
         }
     }
 

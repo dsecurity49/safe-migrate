@@ -1036,18 +1036,22 @@ mod reversibility_tests {
         let engine = setup_engine();
         let mut cache = crate::db::cache::DbCache::new();
         let tid = object_id("public", "t");
-        cache.insert_baseline(
+        let mut rel = RelationState::new(
             tid.clone(),
-            RelationState::new(
-                tid,
-                object_id("public", "postgres"),
-                0,
-                Some(10),
-                RelationKind::Table,
-                Persistence::Permanent,
-                0,
-            ),
+            object_id("public", "postgres"),
+            0,
+            Some(10),
+            RelationKind::Table,
+            Persistence::Permanent,
+            0,
         );
+        rel.apply_column_action(&crate::model::relation::ColumnAction::Add {
+            name: "id".to_string(),
+            data_type: Some("int".to_string()),
+            not_null: false,
+            default: None,
+        });
+        cache.insert_baseline(tid.clone(), rel);
         let mut state = AnalysisState::new(cache);
         let v = engine
             .analyze("ALTER TABLE t DROP COLUMN id;", &mut state)
@@ -3799,5 +3803,226 @@ mod phase10_bug_fixes_and_sorting_tests {
             .expect("Expected vacuum-full violation");
 
         assert_eq!(violation.object_name, "<all tables>");
+    }
+
+    // ─────────────────────────────────────────────
+    // Finding 2 — Untested rule: PartitionStrategyMismatchRule
+    // ─────────────────────────────────────────────
+    #[test]
+    fn test_finding2_partition_strategy_mismatch_fires_on_none() {
+        let engine = setup_engine();
+        let mut cache = crate::db::cache::DbCache::new();
+        let parent_id = object_id("public", "parent");
+        let mut parent = crate::model::relation::RelationState::new(
+            parent_id.clone(),
+            object_id("public", "postgres"),
+            0,
+            Some(10),
+            crate::model::relation::RelationKind::Table,
+            crate::model::relation::Persistence::Permanent,
+            0,
+        );
+        parent.partition_type = Some("RANGE".to_string());
+        cache.insert_baseline(parent_id, parent);
+
+        let child_id = object_id("public", "child");
+        let child = crate::model::relation::RelationState::new(
+            child_id,
+            object_id("public", "postgres"),
+            0,
+            Some(0),
+            crate::model::relation::RelationKind::Table,
+            crate::model::relation::Persistence::Permanent,
+            0,
+        );
+        cache.insert_baseline(object_id("public", "child"), child);
+
+        let mut state = AnalysisState::new(cache);
+
+        let v = engine
+            .analyze(
+                "ALTER TABLE parent ATTACH PARTITION child FOR VALUES FROM (1) TO (10);",
+                &mut state,
+            )
+            .unwrap();
+
+        let rule_violations: Vec<&str> = v.iter().map(|v| v.rule_id).collect();
+        assert!(
+            v.iter().any(|v| v.rule_id == "partition-strategy-mismatch"),
+            "Expected partition-strategy-mismatch violation when child has no partition strategy. Got: {:?}",
+            rule_violations
+        );
+    }
+
+    #[test]
+    fn test_finding2_partition_strategy_mismatch_fires_on_mismatch() {
+        let engine = setup_engine();
+        let mut cache = crate::db::cache::DbCache::new();
+        let parent_id = object_id("public", "parent");
+        let mut parent = crate::model::relation::RelationState::new(
+            parent_id.clone(),
+            object_id("public", "postgres"),
+            0,
+            Some(10),
+            crate::model::relation::RelationKind::Table,
+            crate::model::relation::Persistence::Permanent,
+            0,
+        );
+        parent.partition_type = Some("RANGE".to_string());
+        cache.insert_baseline(parent_id, parent);
+
+        let child_id = object_id("public", "child");
+        let mut child = crate::model::relation::RelationState::new(
+            child_id,
+            object_id("public", "postgres"),
+            0,
+            Some(0),
+            crate::model::relation::RelationKind::Table,
+            crate::model::relation::Persistence::Permanent,
+            0,
+        );
+        child.partition_type = Some("LIST".to_string());
+        cache.insert_baseline(object_id("public", "child"), child);
+
+        let mut state = AnalysisState::new(cache);
+
+        let v = engine
+            .analyze(
+                "ALTER TABLE parent ATTACH PARTITION child FOR VALUES FROM (1) TO (10);",
+                &mut state,
+            )
+            .unwrap();
+
+        let rule_violations: Vec<&str> = v.iter().map(|v| v.rule_id).collect();
+        assert!(
+            v.iter().any(|v| v.rule_id == "partition-strategy-mismatch"),
+            "Expected partition-strategy-mismatch violation when strategies differ. Got: {:?}",
+            rule_violations
+        );
+    }
+
+    #[test]
+    fn test_finding2_partition_strategy_mismatch_silent_on_match() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let v = engine
+            .analyze(
+                "
+            CREATE TABLE parent(id int) PARTITION BY RANGE(id);
+            CREATE TABLE child(id int) PARTITION BY RANGE(id);
+            ALTER TABLE parent ATTACH PARTITION child FOR VALUES FROM (1) TO (10);
+        ",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(
+            !v.iter().any(|v| v.rule_id == "partition-strategy-mismatch"),
+            "Expected no partition-strategy-mismatch violation when strategies match"
+        );
+    }
+
+    // ─────────────────────────────────────────────
+    // Finding 2 — Untested rule: AlterTypeAddValueRule
+    // ─────────────────────────────────────────────
+    #[test]
+    fn test_finding2_alter_type_add_value_fires_inside_txn() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let v = engine
+            .analyze(
+                "BEGIN; ALTER TYPE public.mood ADD VALUE 'ok'; COMMIT;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(
+            v.iter().any(|v| v.rule_id == "alter-type-add-value-txn"),
+            "Expected alter-type-add-value-txn violation inside transaction"
+        );
+    }
+
+    #[test]
+    fn test_finding2_alter_type_add_value_silent_outside_txn() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let v = engine
+            .analyze("ALTER TYPE public.mood ADD VALUE 'ok';", &mut state)
+            .unwrap();
+
+        assert!(
+            !v.iter().any(|v| v.rule_id == "alter-type-add-value-txn"),
+            "Expected no alter-type-add-value-txn violation outside transaction"
+        );
+    }
+
+    // ─────────────────────────────────────────────
+    // Finding 8 — DropColumn IF EXISTS regression
+    // ─────────────────────────────────────────────
+    #[test]
+    fn test_finding8_drop_column_if_exists_noop() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze("CREATE TABLE t(id int);", &mut state)
+            .unwrap();
+
+        let v = engine
+            .analyze(
+                "ALTER TABLE t DROP COLUMN IF EXISTS nonexistent_col;",
+                &mut state,
+            )
+            .unwrap();
+
+        // Should not trigger irreversible-migration for a column that never existed
+        assert!(
+            !v.iter().any(|v| v.rule_id == "irreversible-migration"),
+            "ReversibilityRule should not fire on DROP COLUMN IF EXISTS of nonexistent column"
+        );
+    }
+
+    #[test]
+    fn test_finding8_drop_column_if_exists_with_existing_column() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze("CREATE TABLE t(id int, name text);", &mut state)
+            .unwrap();
+
+        let v = engine
+            .analyze("ALTER TABLE t DROP COLUMN IF EXISTS name;", &mut state)
+            .unwrap();
+
+        // Should trigger irreversible-migration because 'name' existed and was dropped
+        assert!(
+            v.iter().any(|v| v.rule_id == "irreversible-migration"),
+            "ReversibilityRule should fire on DROP COLUMN IF EXISTS of an existing column"
+        );
+    }
+
+    #[test]
+    fn test_finding8_drop_column_no_if_exists_on_nonexistent() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze("CREATE TABLE t(id int);", &mut state)
+            .unwrap();
+
+        let _v = engine
+            .analyze("ALTER TABLE t DROP COLUMN nonexistent_col;", &mut state)
+            .unwrap();
+
+        // Without IF EXISTS, confidence should be tainted (table in unknown state)
+        assert_eq!(
+            state.local.confidence,
+            crate::analysis::state::Confidence::Tainted,
+            "Confidence should be Tainted when dropping a nonexistent column without IF EXISTS"
+        );
     }
 }

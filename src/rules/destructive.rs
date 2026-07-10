@@ -367,12 +367,16 @@ impl Rule for ReversibilityRule {
     fn evaluate(
         &self,
         mutation: &Mutation,
-        _result: &MutationResult,
+        result: &MutationResult,
         pre_state: &crate::analysis::state::PreState,
         state: &AnalysisState,
         config: &Config,
         _cascade_closure: Option<&CascadeResult>,
     ) -> Vec<Violation> {
+        if *result == MutationResult::Skipped {
+            return vec![];
+        }
+
         let mut violations = Vec::new();
 
         if let Mutation::AlterTable(a) = mutation

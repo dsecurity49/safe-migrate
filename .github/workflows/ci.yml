@@ -29,8 +29,16 @@ jobs:
       - name: Check formatting
         run: cargo fmt -- --check
 
-      - name: Run tests
-        run: cargo test --verbose
+      - name: Build (locked)
+        run: cargo build --locked --verbose
+
+      - name: Run tests (locked)
+        run: cargo test --locked --verbose
 
       - name: Run Clippy (Linter)
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Install and run cargo-audit
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit

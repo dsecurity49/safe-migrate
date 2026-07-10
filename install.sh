@@ -42,20 +42,24 @@ fetch_latest_version() {
 }
 
 detect_linux_flavor() {
-  case "${TERMUX_VERSION:-}:${ANDROID_ROOT:-}" in
-    *:*) printf '%s\n' musl; return ;;
-    :) ;;
-  esac
+  # Check for Termux (Android) — always musl
+  if [ -n "${TERMUX_VERSION:-}" ] || [ -n "${ANDROID_ROOT:-}" ]; then
+    printf '%s\n' musl
+    return
+  fi
 
+  # Check for Termux prefix path
   case "${PREFIX:-}" in
     /data/data/com.termux/*) printf '%s\n' musl; return ;;
   esac
 
+  # Check if musl is detected via ldd
   if command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -qi musl; then
     printf '%s\n' musl
     return
   fi
 
+  # Default to glibc (GNU)
   printf '%s\n' gnu
 }
 
@@ -130,6 +134,23 @@ download_asset() {
       rm -f "$part"
       return 1
     }
+  fi
+
+  # Verify checksum if available
+  sha_url="${url}.sha256"
+  sha_file="${part}.sha256"
+  if curl -fsSL -o "$sha_file" "$sha_url" 2>/dev/null; then
+    expected=$(cut -d' ' -f1 < "$sha_file" 2>/dev/null || true)
+    if [ -n "$expected" ]; then
+      actual=$(sha256sum "$part" 2>/dev/null | cut -d' ' -f1 || true)
+      if [ "$actual" != "$expected" ]; then
+        rm -f "$part" "$sha_file"
+        log "Checksum mismatch for ${target}. Expected ${expected}, got ${actual}."
+        return 1
+      fi
+      [ "$VERBOSE" -eq 1 ] && log "Checksum verified for ${target}"
+    fi
+    rm -f "$sha_file"
   fi
 
   tar -tzf "$part" >/dev/null 2>&1 || {

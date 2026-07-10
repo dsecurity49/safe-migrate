@@ -9,35 +9,40 @@ safe-migrate/
 ├── src/
 │   ├── analysis/                 # State machine simulator
 │   │   ├── expr_ir.rs            # Expression intermediate representation
-│   │   ├── expr_visitor.rs       # Expression AST visitor
+│   │   ├── expr_visitor.rs       # Expression AST visitor (squawk_syntax 2.58.0)
 │   │   ├── facts.rs              # Fact extraction results
-│   │   ├── graph.rs              # Dependency graphs (FK, indexes, partitions, views)
+│   │   ├── graph.rs              # Dependency graphs (FK, indexes, partitions, views, triggers, publications)
 │   │   ├── mutations.rs          # Mutation types and resolution
 │   │   ├── resolver.rs           # Schema resolution with search_path
-│   │   ├── state.rs              # AnalysisState, LocalState, mutation application
-│   │   ├── transaction.rs        # Transaction frame management, undo-log
-│   │   └── mod.rs                # Module exports
+│   │   ├── state.rs              # AnalysisState, LocalState, mutation application, undo-log
+│   │   ├── transaction.rs        # Transaction frame management, StateChange variants
+│   │   └── mod.rs
 │   │
 │   ├── ast/                      # AST visitor pattern, extraction from squawk_syntax
 │   │   ├── visitor.rs            # Fact extraction from typed AST nodes
+│   │   ├── visitor_tests.rs      # AST extraction unit tests
 │   │   ├── identifiers.rs        # ObjectId, Path resolution, schema walking
-│   │   └── mod.rs                # Module exports
+│   │   └── mod.rs
 │   │
 │   ├── engine/                   # Rule engine and configuration
-│   │   ├── engine.rs             # Main analysis pipeline, rule dispatch
+│   │   ├── engine.rs             # Main analysis pipeline, rule dispatch, violation ordering
 │   │   ├── config.rs             # safe-migrate.toml parsing
-│   │   ├── tests.rs              # 78-test suite (architectural_gap, rule_evaluation, state_mutation, etc.)
-│   │   └── mod.rs                # Module exports
+│   │   ├── tests.rs              # 235-test suite (architectural_gap, rule_evaluation, state_mutation, chain_execution, reversibility, etc.)
+│   │   └── mod.rs
 │   │
 │   ├── model/                    # Data model for schema state
 │   │   ├── relation.rs           # RelationState (tables/views/sequences/materialized views)
-│   │   ├── column.rs             # Column metadata, width, nullability
+│   │   ├── column.rs             # Column metadata, width, nullability, default expression
+│   │   ├── function.rs           # FunctionState, Volatility, SecurityMode
+│   │   ├── role.rs               # RoleState, PrivilegeGrant
+│   │   ├── trigger.rs            # TriggerState
+│   │   ├── replication.rs        # PublicationState, SubscriptionState
 │   │   ├── sequence.rs           # Sequence state, OWNED BY tracking
 │   │   ├── types.rs              # Type definitions (enums, domains)
-│   │   └── mod.rs                # Module exports
+│   │   └── mod.rs
 │   │
-│   ├── rules/                    # Rule implementations (16 rule IDs)
-│   │   ├── destructive.rs        # destructive-cascade, size-aware-add-column, type-change-rewrite
+│   ├── rules/                    # Rule implementations (26 rule IDs)
+│   │   ├── destructive.rs        # destructive-cascade, size-aware-add-column, type-change-rewrite, drop-database, create-table-as-select
 │   │   ├── constraints.rs        # blocking-constraint, blocking-index-constraint
 │   │   ├── indexes.rs            # require-concurrent-index, require-concurrent-drop-index
 │   │   ├── views.rs              # blocking-mat-view-refresh
@@ -46,23 +51,34 @@ safe-migrate/
 │   │   ├── transactions.rs       # concurrent-in-transaction, vacuum-full
 │   │   ├── opaque.rs             # opaque-dynamic-sql
 │   │   ├── expressions.rs        # volatile-default
+│   │   ├── functions.rs          # broken-compute, function-volatility-change, function-schema-change
+│   │   ├── security.rs           # overbroad-grant
+│   │   ├── policies.rs           # restrictive-policy
+│   │   ├── triggers.rs           # disable-trigger
+│   │   ├── drift.rs              # schema-drift, irreversible-migration
+│   │   ├── conflict.rs           # chain-conflict (MutationResult::Conflict surfacing)
 │   │   └── mod.rs                # Rule trait definition, module exports
 │   │
 │   ├── report/                   # Violation reporting
-│   │   ├── violations.rs         # Violation struct, ViolationTier enum, dedup keys
-│   │   ├── reporter.rs           # CLI output formatting (print_report)
-│   │   └── mod.rs                # Module exports
+│   │   ├── violations.rs         # Violation struct, ViolationTier, OperationKind, ObjectKind, Verdict
+│   │   ├── reporter.rs           # CLI output formatting (header box, per-finding blocks, summary box)
+│   │   ├── reporter_tests.rs     # Reporter unit tests
+│   │   └── mod.rs
 │   │
 │   ├── db/                       # Database integration
 │   │   ├── cache.rs              # DbCache serialization, ForeignKeyCache, IndexCache
-│   │   └── mod.rs                # Module exports
+│   │   └── mod.rs
 │   │
 │   ├── sync.rs                   # Database stats sync (6 queries to pg_class, pg_attribute, pg_stat_user_tables, etc.)
+│   ├── sync_tests.rs             # Sync and cache unit tests
 │   ├── lib.rs                    # Library root, public API exports
-│   └── main.rs                   # CLI entry point (lint, sync subcommands)
+│   └── main.rs                   # CLI entry point (lint, lint-chain, sync subcommands)
+│
+├── tests/
+│   └── cli_tests.rs              # Integration tests for CLI exit codes and flags
 │
 ├── docs/
-│   └── ast-reference/            # 22 PostgreSQL AST reference documents
+│   └── ast-reference/            # 22 PostgreSQL AST reference documents + index
 │       ├── README.md             # Index, guide, and navigation
 │       ├── columns.md            # Column lifecycle, TableArg dispatch
 │       ├── constraints.md        # FK, CHECK, UNIQUE, PK, exclusion
@@ -70,8 +86,9 @@ safe-migrate/
 │       ├── partitions.md         # Partition hierarchies, reverse-graph walk
 │       ├── sequences.md          # SequenceOption polymorphic dispatch, OWNED BY
 │       ├── schemas.md            # Schema creation, NameRef.text() normalization
-│       ├── views.md              # View/MV creation, DropView asymmetry
-│       ├── functions.rs          # Function creation, volatility detection
+│       ├── views.md              # View/MV creation, DropView accessor
+│       ├── materialized_views.md # Reference to views.md with storage emphasis
+│       ├── functions.md          # Function creation, volatility detection
 │       ├── triggers.md           # Trigger creation, event detection
 │       ├── transactions.md       # BEGIN/COMMIT/ROLLBACK polymorphic forms, savepoints
 │       ├── search_path.md        # Set node dispatch, schema resolution
@@ -83,7 +100,6 @@ safe-migrate/
 │       ├── policies.md           # RLS policy creation, two-layer model
 │       ├── publications.md       # Logical replication publication
 │       ├── subscriptions.md      # Logical replication subscription
-│       ├── materialized_views.md # Reference to views.md with storage emphasis
 │       ├── security_model.md     # Two-axis risk model (structural vs access-control)
 │       └── non_schema_effects.md # [SYNTHESIS] Session context, replication, config side effects
 │
@@ -91,37 +107,28 @@ safe-migrate/
 │   ├── ci.yml                    # Test on push/PR, cargo fmt/clippy checks
 │   └── release.yml               # Build & release multi-platform binaries on tag
 │
-├── Cargo.toml                    # v0.3.1, dependencies (squawk-syntax 2.56.0, postgres 0.19, etc.)
-├── Cargo.lock                    # Locked dependency versions
-├── README.md                     # User documentation
-├── CHANGELOG.md                  # Release history
-├── CONTRIBUTING.md               # Contributor guide
-├── install.sh                    # Binary distribution installer
-├── LICENSE-MIT                   # Dual license
+├── Cargo.toml                    # v0.4.0, squawk-syntax = "=2.58.0"
+├── Cargo.lock
+├── README.md
+├── CHANGELOG.md
+├── CONTRIBUTING.md
+├── install.sh
+├── LICENSE-MIT
 ├── LICENSE-APACHE
-└── .gitignore                    # Cache, test files, secrets
+└── .gitignore
 ```
 
-## Understanding squawk.rs
+## Verifying against squawk_syntax source
 
-`squawk.rs` is **not part of the project** — it's a reference dump of the squawk crate source code (v2.56.0) used for offline AST documentation. It was created with:
+`docs/ast-reference/` is verified directly against the actual squawk source in Cargo's registry cache — no intermediate dump file is kept or committed. To locate the source for a given version:
 
 ```bash
-find ~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f \
-  \( \
-  -path '*/squawk-lexer-2.56.0/*.rs' -o \
-  -path '*/squawk-syntax-2.56.0/*.rs' -o \
-  -path '*/squawk-parser-2.56.0/*.rs' \
-  \) | while read -r file; do
-    echo "========================================"
-    echo "FILE: $file"
-    echo "========================================"
-    cat "$file"
-    echo
-done > ~/squawk.rs
+find ~/.cargo/registry/src -type d -name "squawk-syntax-2.58.0"
+find ~/.cargo/registry/src -type d -name "squawk-lexer-2.58.0"
+find ~/.cargo/registry/src -type d -name "squawk-parser-2.58.0"
 ```
 
-This was used as **reference material** when documenting `docs/ast-reference/` to verify accessor methods, node dispatch patterns, and grammar limitations against the actual crate source. It should **not be committed** to the repo — the published crate is the source of truth.
+Read the `.rs` files in those directories directly when verifying or updating an AST reference doc. Do not guess accessor names from memory — confirm against the actual source before documenting or relying on a method signature.
 
 ## Adding a New Rule
 
@@ -144,7 +151,14 @@ This was used as **reference material** when documenting `docs/ast-reference/` t
            config: &Config,
            cascade_closure: Option<&CascadeResult>,
        ) -> Vec<Violation> {
-           // Match on mutation type and create violations
+           // Always guard on Skipped first — every rule must do this
+           if *result == MutationResult::Skipped {
+               return vec![];
+           }
+
+           // Match on mutation type and create violations.
+           // operation_kind and object_kind should be inferred from the
+           // Mutation variant, not left as a default/unknown value.
            vec![]
        }
    }
@@ -176,10 +190,11 @@ This was used as **reference material** when documenting `docs/ast-reference/` t
 
 4. **Write tests**
 
-   Add tests to `src/engine/tests/` covering:
+   Add tests to `src/engine/tests.rs` covering:
    - The rule fires on the mutation it's designed for
+   - The rule does NOT fire when `MutationResult::Skipped` (e.g. `IF NOT EXISTS`/`IF EXISTS` on an object that already existed/didn't exist)
    - The rule respects configuration overrides
-   - Edge cases (empty tables, stale statistics, etc.)
+   - Edge cases specific to the rule (empty tables for row-count-gated rules, only if the rule actually uses row counts — a lock-behavior-only rule like index concurrency should not reference row counts or staleness at all)
 
 ## Extending AST Extraction
 
@@ -212,9 +227,11 @@ If you need to extract information from a new DDL statement:
 ## Running Tests
 
 ```bash
-cargo test                      # Full test suite (78+ tests)
+cargo test                      # Full test suite (235 tests)
 cargo test rule_evaluation      # Just rule tests
 cargo test architectural_gap    # Just simulator/state machine tests
+cargo test chain_execution      # Just multi-file chain tests
+cargo test reversibility        # Just reversibility classification tests
 cargo test --doc               # Doc tests (if any)
 ```
 

@@ -677,6 +677,24 @@ impl AnalysisState {
                     self.local.transactions.len(),
                 );
 
+                // Store partition strategy information
+                rel_state.partition_type = create
+                    .partition_by
+                    .as_ref()
+                    .and_then(|pb| pb.split_whitespace().nth(2).map(|s| s.to_uppercase()))
+                    .or_else(|| {
+                        create.partition_of.as_ref().and_then(|parent_id| {
+                            self.local.relations.get(parent_id).and_then(|r| {
+                                if let RelationOverlay::Present(rel) = r {
+                                    rel.partition_type.clone()
+                                } else {
+                                    None
+                                }
+                            })
+                        })
+                    });
+                rel_state.partition_by = create.partition_by.clone();
+
                 let pk_columns: HashSet<&str> = create
                     .table_constraints
                     .iter()
@@ -928,7 +946,16 @@ impl AnalysisState {
                                 }
                             }
                         }
-                        AlterTableActionMutation::DropColumn { name, .. } => {
+                        AlterTableActionMutation::DropColumn { name, if_exists } => {
+                            if !rel.has_column(name) {
+                                if *if_exists {
+                                    // Column doesn't exist and IF EXISTS was specified: no-op
+                                    return MutationResult::Skipped;
+                                }
+                                // Column doesn't exist and IF EXISTS not specified: PG runtime error
+                                self.local.confidence = Confidence::Tainted;
+                                return MutationResult::Skipped;
+                            }
                             rel.apply_column_action(&ColumnAction::Drop { name: name.clone() });
                         }
                         AlterTableActionMutation::RenameColumn { from, to } => {
