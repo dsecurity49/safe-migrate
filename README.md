@@ -8,10 +8,10 @@ A PostgreSQL migration linter that **executes a bi-directional state machine sim
 
 ## What's New in v0.4.0
 
-v0.4.0 is a correctness and output release. v0.3.0 was the architectural rewrite; v0.4.0 fixes 14 confirmed bugs in the rule engine and state machine, expands rule coverage to the full PostgreSQL ecosystem, and redesigns the CLI output to be unambiguous. Earlier versions parsed migrations with regex and substring matching, which broke on quoted identifiers, schemas, and anything non-trivial. safe-migrate now walks a typed PostgreSQL AST and runs a full state machine simulation of the migration — including transaction rollbacks, cascading drops, and partition hierarchies — before evaluating any rule.
+v0.4.0 is a correctness and output release. v0.3.0 was the architectural rewrite; v0.4.0 fixes 16 confirmed bugs in the rule engine and state machine, expands rule coverage to the full PostgreSQL ecosystem, and redesigns the CLI output to be unambiguous. Earlier versions parsed migrations with regex and substring matching, which broke on quoted identifiers, schemas, and anything non-trivial. safe-migrate now walks a typed PostgreSQL AST and runs a full state machine simulation of the migration — including transaction rollbacks, cascading drops, and partition hierarchies — before evaluating any rule.
 
 Highlights:
-- 14 bugs fixed across the rule engine, state machine, AST extraction, and output layer
+- 16 bugs fixed across the rule engine, state machine, AST extraction, and output layer
 - `now()` correctly classified as STABLE — no longer produces false positive table-rewrite warnings
 - `BrokenComputeRule` now correctly fires when you drop a function that backs a trigger (was completely silent before due to function_id mismatch)
 - Confidence correctly restored after `ROLLBACK` — a rolled-back `DO` block no longer permanently taints confidence for the rest of the run
