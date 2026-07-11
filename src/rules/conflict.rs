@@ -55,6 +55,7 @@ impl Rule for ConflictRule {
                 recipe: Self::RECIPE,
                 dedup_key: None,
                 sql: None,
+                fk_dependency_related: false,
             }],
             None => Vec::new(),
         }

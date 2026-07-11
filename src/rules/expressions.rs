@@ -50,6 +50,7 @@ impl Rule for VolatileDefaultRule {
                         recipe: self.recipe(),
                         dedup_key: None,
                         sql: None,
+                        fk_dependency_related: false,
                     });
                 }
             }
@@ -73,6 +74,7 @@ impl Rule for VolatileDefaultRule {
                         recipe: self.recipe(),
                         dedup_key: None,
                         sql: None,
+                        fk_dependency_related: false,
                     });
                 }
                 crate::analysis::mutations::AlterTableActionMutation::SetDefault {
@@ -90,6 +92,7 @@ impl Rule for VolatileDefaultRule {
                         recipe: self.recipe(),
                         dedup_key: None,
                         sql: None,
+                        fk_dependency_related: false,
                     });
                 }
                 _ => {}

@@ -154,4 +154,6 @@ pub struct Violation {
     pub recipe: &'static str,
     pub dedup_key: Option<String>,
     pub sql: Option<String>,
+    #[serde(default)]
+    pub fk_dependency_related: bool,
 }

@@ -48,6 +48,7 @@ impl Rule for RestrictivePolicyRule {
                 recipe: self.recipe(),
                 dedup_key: None,
                 sql: None,
+                fk_dependency_related: false,
             });
         }
 

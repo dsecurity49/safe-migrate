@@ -61,6 +61,7 @@ impl Rule for OpaqueDynamicSqlRule {
                 recipe: self.recipe(),
                 dedup_key: None,
                 sql: None,
+                fk_dependency_related: false,
             });
         }
 

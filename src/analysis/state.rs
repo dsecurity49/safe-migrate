@@ -72,6 +72,7 @@ pub struct AnalysisState {
     pub baseline_relations: HashSet<ObjectId>,
     pub baseline_indexes: HashSet<ObjectId>,
     pub baseline_foreign_keys: HashSet<(ObjectId, String)>,
+    pub baseline_fk_dependencies: HashSet<ObjectId>,
     pub local: LocalState,
 }
 
@@ -81,9 +82,13 @@ impl AnalysisState {
         let mut baseline_relations = HashSet::new();
         let mut baseline_indexes = HashSet::new();
         let mut baseline_foreign_keys = HashSet::new();
+        let mut baseline_fk_dependencies = HashSet::new();
         let mut graph = DependencyGraph::new();
 
         for (id, rel_state) in cache.baseline_relations() {
+            if rel_state.is_fk_dependency {
+                baseline_fk_dependencies.insert(id.clone());
+            }
             relations.insert(id.clone(), RelationOverlay::Present(rel_state.clone()));
             baseline_relations.insert(id.clone());
         }
@@ -118,6 +123,7 @@ impl AnalysisState {
             baseline_relations,
             baseline_indexes,
             baseline_foreign_keys,
+            baseline_fk_dependencies,
             local: LocalState {
                 relations,
                 types: HashMap::new(),

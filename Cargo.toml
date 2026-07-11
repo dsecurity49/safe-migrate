@@ -25,6 +25,8 @@ rowan = "0.15.18"
 owo-colors = "4"
 terminal_size = "0.3"
 comfy-table = "7"
+bincode = { version = "2.0", features = ["serde"] }
+zstd = "0.13"
 
 [dev-dependencies]
 tempfile = "3.10"

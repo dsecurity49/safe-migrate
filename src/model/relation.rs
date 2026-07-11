@@ -73,6 +73,8 @@ pub struct RelationState {
     pub privileges: PrivilegeMatrix,
     pub partition_type: Option<String>, // e.g., "RANGE", "LIST", "HASH"
     pub partition_by: Option<String>,   // The partition key expression
+    #[serde(default)]
+    pub is_fk_dependency: bool,
 }
 
 impl Default for RelationState {
@@ -94,6 +96,7 @@ impl Default for RelationState {
             privileges: PrivilegeMatrix::default(),
             partition_type: None,
             partition_by: None,
+            is_fk_dependency: false,
         }
     }
 }
@@ -125,7 +128,12 @@ impl RelationState {
             privileges: PrivilegeMatrix::default(),
             partition_type: None,
             partition_by: None,
+            is_fk_dependency: false,
         }
+    }
+
+    pub fn mark_fk_dependency(&mut self) {
+        self.is_fk_dependency = true;
     }
 
     pub fn apply_column_action(&mut self, action: &ColumnAction) {

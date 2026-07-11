@@ -48,6 +48,7 @@ impl Rule for DriftDetectionRule {
                     recipe: self.recipe(),
                     dedup_key: None,
                     sql: None,
+                    fk_dependency_related: false,
                 });
             }
             Mutation::DropTable(d) => {
@@ -65,6 +66,7 @@ impl Rule for DriftDetectionRule {
                         recipe: self.recipe(),
                         dedup_key: None,
                                     sql: None,
+                                    fk_dependency_related: false,
                     });
                 }
             }
@@ -83,6 +85,7 @@ impl Rule for DriftDetectionRule {
                         recipe: self.recipe(),
                         dedup_key: None,
                                     sql: None,
+                                    fk_dependency_related: false,
                     });
                 }
             }
@@ -102,6 +105,7 @@ impl Rule for DriftDetectionRule {
                             recipe: self.recipe(),
                             dedup_key: None,
                                             sql: None,
+                                            fk_dependency_related: false,
                         });
                     }
                 }
@@ -122,6 +126,7 @@ impl Rule for DriftDetectionRule {
                             recipe: self.recipe(),
                             dedup_key: None,
                                             sql: None,
+                                            fk_dependency_related: false,
                         });
                     }
                 }
@@ -142,6 +147,7 @@ impl Rule for DriftDetectionRule {
                             recipe: self.recipe(),
                             dedup_key: None,
                                             sql: None,
+                                            fk_dependency_related: false,
                         });
                     }
                 }
@@ -165,6 +171,7 @@ impl Rule for DriftDetectionRule {
                             recipe: self.recipe(),
                             dedup_key: None,
                                             sql: None,
+                                            fk_dependency_related: false,
                         });
                     }
                 }
@@ -188,6 +195,7 @@ impl Rule for DriftDetectionRule {
                             recipe: self.recipe(),
                             dedup_key: None,
                                             sql: None,
+                                            fk_dependency_related: false,
                         });
                     }
                 }
@@ -207,6 +215,7 @@ impl Rule for DriftDetectionRule {
                         recipe: self.recipe(),
                         dedup_key: None,
                                     sql: None,
+                                    fk_dependency_related: false,
                     });
                 }
             }
@@ -226,6 +235,7 @@ impl Rule for DriftDetectionRule {
                             recipe: self.recipe(),
                             dedup_key: None,
                                             sql: None,
+                                            fk_dependency_related: false,
                         });
                     }
                 }
@@ -244,6 +254,7 @@ impl Rule for DriftDetectionRule {
                     recipe: self.recipe(),
                     dedup_key: None,
                             sql: None,
+                            fk_dependency_related: false,
                 });
             }
             Mutation::AlterFunction(f) if !pre_state.functions.contains_key(&f.id) => {
@@ -260,6 +271,7 @@ impl Rule for DriftDetectionRule {
                     recipe: self.recipe(),
                     dedup_key: None,
                             sql: None,
+                            fk_dependency_related: false,
                 });
             }
             Mutation::AlterProcedure(p) if !pre_state.functions.contains_key(&p.id) => {
@@ -276,6 +288,7 @@ impl Rule for DriftDetectionRule {
                     recipe: self.recipe(),
                     dedup_key: None,
                             sql: None,
+                            fk_dependency_related: false,
                 });
             }
             Mutation::CreateTable(c) => {
@@ -296,6 +309,7 @@ impl Rule for DriftDetectionRule {
                         recipe: self.recipe(),
                         dedup_key: None,
                         sql: None,
+                        fk_dependency_related: false,
                     });
                 }
             }

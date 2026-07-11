@@ -82,6 +82,7 @@ impl Rule for PartitionLockRule {
                             recipe: "Run ANALYZE to ensure accurate row estimates before structural changes.",
                             dedup_key: Some(key),
                                             sql: None,
+                                            fk_dependency_related: false,
                         });
                     }
 
@@ -133,6 +134,7 @@ impl Rule for PartitionLockRule {
                             recipe: self.recipe(),
                             dedup_key: None,
                             sql: None,
+                            fk_dependency_related: false,
                         });
                     }
                 }
@@ -201,6 +203,7 @@ impl Rule for PartitionStrategyMismatchRule {
                             recipe: self.recipe(),
                             dedup_key: None,
                             sql: None,
+                            fk_dependency_related: false,
                         });
                     }
                     Some(part_type)
@@ -222,6 +225,7 @@ impl Rule for PartitionStrategyMismatchRule {
                             recipe: self.recipe(),
                             dedup_key: None,
                             sql: None,
+                            fk_dependency_related: false,
                         });
                     }
                     _ => {}

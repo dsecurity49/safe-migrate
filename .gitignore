@@ -16,5 +16,6 @@
 *.clinerules
 .cline*
 roadmap.md
+graph.json
 
 .git/

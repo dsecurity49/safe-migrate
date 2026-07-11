@@ -67,6 +67,7 @@ impl Rule for OverbroadGrantRule {
                     recipe: "GRANT to PUBLIC is almost never intended as it applies to every role.",
                     dedup_key: None,
                     sql: None,
+                    fk_dependency_related: false,
                 });
             }
 
@@ -112,6 +113,7 @@ impl Rule for OverbroadGrantRule {
                         recipe: "GRANT ALL PRIVILEGES to a role that is not the owner is risky.",
                         dedup_key: None,
                         sql: None,
+                        fk_dependency_related: false,
                     });
                 }
             }
@@ -128,6 +130,7 @@ impl Rule for OverbroadGrantRule {
                     recipe: "WITH GRANT OPTION allows the grantee to re-grant privileges, widening the blast radius.",
                     dedup_key: None,
                             sql: None,
+                            fk_dependency_related: false,
                 });
             }
         }

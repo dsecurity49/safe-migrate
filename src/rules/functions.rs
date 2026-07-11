@@ -69,6 +69,7 @@ impl Rule for FunctionVolatilityRule {
                     recipe: self.recipe(),
                     dedup_key: None,
                     sql: None,
+                    fk_dependency_related: false,
                 });
             }
         }
@@ -131,6 +132,7 @@ impl Rule for BrokenComputeRule {
                         recipe: self.recipe(),
                         dedup_key: None,
                         sql: None,
+                        fk_dependency_related: false,
                     }];
                 }
             }

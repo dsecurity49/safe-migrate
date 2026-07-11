@@ -3518,6 +3518,7 @@ mod phase10_bug_fixes_and_sorting_tests {
             recipe: "recipe",
             dedup_key: None,
             sql: None,
+            fk_dependency_related: false,
         };
         let v_tier1 = Violation {
             source_range: Some(rowan::TextRange::new(0.into(), 10.into())),
@@ -3530,6 +3531,7 @@ mod phase10_bug_fixes_and_sorting_tests {
             recipe: "recipe",
             dedup_key: None,
             sql: None,
+            fk_dependency_related: false,
         };
         let v_range_later = Violation {
             source_range: Some(rowan::TextRange::new(20.into(), 30.into())),
@@ -3542,6 +3544,7 @@ mod phase10_bug_fixes_and_sorting_tests {
             recipe: "recipe",
             dedup_key: None,
             sql: None,
+            fk_dependency_related: false,
         };
         let v_name_later = Violation {
             source_range: Some(rowan::TextRange::new(0.into(), 10.into())),
@@ -3554,6 +3557,7 @@ mod phase10_bug_fixes_and_sorting_tests {
             recipe: "recipe",
             dedup_key: None,
             sql: None,
+            fk_dependency_related: false,
         };
 
         let mut violations = vec![

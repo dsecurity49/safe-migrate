@@ -20,6 +20,7 @@ pub struct IndexCache {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DbCache {
     pub pg_version_num: Option<u32>,
+    pub cache_format_version: u32,
 
     // Tell Serde to convert the complex HashMap into a flat JSON array
     #[serde(with = "vectorize")]
@@ -32,6 +33,8 @@ pub struct DbCache {
     pub indexes: Vec<IndexCache>,
 }
 
+pub const CACHE_FORMAT_VERSION: u32 = 1;
+
 impl Default for DbCache {
     fn default() -> Self {
         Self::new()
@@ -42,6 +45,7 @@ impl DbCache {
     pub fn new() -> Self {
         Self {
             pg_version_num: None,
+            cache_format_version: CACHE_FORMAT_VERSION,
             relations: HashMap::new(),
             foreign_keys: Vec::new(),
             indexes: Vec::new(),

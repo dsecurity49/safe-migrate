@@ -38,37 +38,57 @@ impl Rule for CascadingDropRule {
             && let Some(closure) = cascade_closure
         {
             let mut affects_baseline = false;
+            let mut has_fk_pulled = false;
 
             for rel_id in &closure.dropped_relations {
                 if rel_id != &drop.id && state.baseline_relations.contains(rel_id) {
                     affects_baseline = true;
-                    break;
+                    if state.baseline_fk_dependencies.contains(rel_id) {
+                        has_fk_pulled = true;
+                    }
                 }
             }
 
             if !affects_baseline {
-                for constraint in &closure.dropped_constraints {
-                    if state.baseline_foreign_keys.contains(constraint) {
+                for (from_table, cname) in &closure.dropped_constraints {
+                    if state
+                        .baseline_foreign_keys
+                        .contains(&(from_table.clone(), cname.clone()))
+                    {
                         affects_baseline = true;
                         break;
                     }
                 }
             }
 
+            for (from_table, _cname) in &closure.dropped_constraints {
+                if state.baseline_fk_dependencies.contains(from_table) {
+                    has_fk_pulled = true;
+                }
+            }
+
             if affects_baseline {
-                violations.push(Violation { source_range: None,
+                let mut reason = format!(
+                    "DROP TABLE {} CASCADE silently destroys pre-existing database dependencies",
+                    drop.id
+                );
+                if has_fk_pulled {
+                    reason.push_str(
+                        " (includes FK-pulled tables from other schemas — cross-team impact)",
+                    );
+                }
+                violations.push(Violation {
+                    source_range: None,
                     rule_id: self.id(),
                     operation_kind: OperationKind::DropTable,
                     object_kind: ObjectKind::Table,
                     object_name: drop.id.to_string(),
                     tier: self.default_tier(),
-                    reason: format!(
-                        "DROP TABLE {} CASCADE silently destroys pre-existing database dependencies",
-                        drop.id
-                    ),
+                    reason,
                     recipe: self.recipe(),
                     dedup_key: None,
-                            sql: None,
+                    sql: None,
+                    fk_dependency_related: has_fk_pulled,
                 });
             }
         }
@@ -149,6 +169,7 @@ impl Rule for SizeAwareAddColumnRule {
                         recipe: "Run ANALYZE to ensure accurate TOAST width and row estimates before structural changes.",
                         dedup_key: Some(key),
                                     sql: None,
+                                    fk_dependency_related: false,
                     });
                 }
 
@@ -193,6 +214,7 @@ impl Rule for SizeAwareAddColumnRule {
                     recipe: self.recipe(),
                     dedup_key: None,
                     sql: None,
+                    fk_dependency_related: false,
                 });
             }
         }
@@ -234,6 +256,7 @@ impl Rule for DropDatabaseRule {
                 recipe: self.recipe(),
                 dedup_key: None,
                 sql: None,
+                fk_dependency_related: false,
             }];
         }
         vec![]
@@ -278,6 +301,7 @@ impl Rule for DropSchemaCascadeRule {
                 recipe: self.recipe(),
                 dedup_key: None,
                 sql: None,
+                fk_dependency_related: false,
             });
         }
 
@@ -324,6 +348,7 @@ impl Rule for CreateTableAsSelectRule {
                 recipe: self.recipe(),
                 dedup_key: None,
                 sql: None,
+                fk_dependency_related: false,
             }];
         }
         vec![]
@@ -404,6 +429,7 @@ impl Rule for ReversibilityRule {
                     recipe: "This type change may be lossy. Verify data compatibility.",
                     dedup_key: None,
                     sql: None,
+                    fk_dependency_related: false,
                 });
             }
         }
@@ -480,6 +506,7 @@ impl Rule for ReversibilityRule {
                 recipe: self.recipe(),
                 dedup_key: None,
                 sql: None,
+                fk_dependency_related: false,
             });
         }
         violations
@@ -651,6 +678,7 @@ impl Rule for GeneralCascadeRule {
                 recipe: self.recipe(),
                 dedup_key: None,
                 sql: None,
+                fk_dependency_related: false,
             }];
         }
         vec![]
@@ -812,6 +840,7 @@ impl Rule for TypeChangeRewriteRule {
                         recipe: "Narrowing VARCHAR(n) precision may cause data truncation. Consider adding a new column, backfilling, and then dropping the old one.",
                         dedup_key: None,
                                     sql: None,
+                                    fk_dependency_related: false,
                     });
                 } else {
                     violations.push(Violation {
@@ -828,6 +857,7 @@ impl Rule for TypeChangeRewriteRule {
                         recipe: self.recipe(),
                         dedup_key: None,
                         sql: None,
+                        fk_dependency_related: false,
                     });
                 }
             }

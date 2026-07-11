@@ -125,6 +125,7 @@ impl Rule for BlockingConstraintRule {
                     recipe: "Run ANALYZE to ensure accurate row estimates before structural changes.",
                     dedup_key: Some(key),
                             sql: None,
+                            fk_dependency_related: false,
                 });
             }
 
@@ -158,6 +159,7 @@ impl Rule for BlockingConstraintRule {
                         recipe: self.recipe(),
                         dedup_key: None,
                         sql: None,
+                        fk_dependency_related: false,
                     });
                 }
                 AlterTableActionMutation::AddForeignKey {
@@ -190,6 +192,7 @@ impl Rule for BlockingConstraintRule {
                         recipe: self.recipe(),
                         dedup_key: None,
                         sql: None,
+                        fk_dependency_related: false,
                     });
                 }
                 AlterTableActionMutation::SetNotNull { column } => {
@@ -215,6 +218,7 @@ impl Rule for BlockingConstraintRule {
                             recipe: "Add CHECK constraint NOT VALID, then VALIDATE separately.",
                             dedup_key: None,
                             sql: None,
+                            fk_dependency_related: false,
                         });
                     }
                 }
@@ -236,6 +240,7 @@ impl Rule for BlockingConstraintRule {
                         recipe: "Build a UNIQUE index CONCURRENTLY first, then add the constraint USING INDEX.",
                         dedup_key: None,
                                     sql: None,
+                                    fk_dependency_related: false,
                     });
                 }
                 AlterTableActionMutation::SetStorage { column } => {
@@ -257,6 +262,7 @@ impl Rule for BlockingConstraintRule {
                         recipe: "Changing column storage requires an ACCESS EXCLUSIVE lock. Execute during a planned maintenance window.",
                         dedup_key: None,
                                     sql: None,
+                                    fk_dependency_related: false,
                     });
                 }
                 AlterTableActionMutation::SetAccessMethod => {
@@ -278,6 +284,7 @@ impl Rule for BlockingConstraintRule {
                         recipe: "Changing table access method requires an ACCESS EXCLUSIVE lock. Execute during a planned maintenance window.",
                         dedup_key: None,
                                     sql: None,
+                                    fk_dependency_related: false,
                     });
                 }
                 _ => {}
