@@ -616,6 +616,12 @@ impl AnalysisState {
                         .graph
                         .views
                         .retain(|v| !closure.dropped_relations.contains(&resolve(&v.view_id)));
+
+                    self.snapshot_sequence_graph_full();
+                    self.local.graph.sequences.retain(|s| {
+                        let resolved_table = resolve(&s.table_id);
+                        !closure.dropped_relations.contains(&resolved_table)
+                    });
                 } else {
                     let has_view_deps = self
                         .local
@@ -643,6 +649,12 @@ impl AnalysisState {
                     self.local
                         .relations
                         .insert(drop_table.id.clone(), RelationOverlay::Dropped);
+
+                    self.snapshot_sequence_graph_full();
+                    self.local
+                        .graph
+                        .sequences
+                        .retain(|s| resolve(&s.table_id) != resolved_drop);
                 }
 
                 self.snapshot_partition_graph_full();
@@ -1119,12 +1131,12 @@ impl AnalysisState {
             }
             Mutation::AlterSequence(alter_seq) => {
                 self.snapshot_sequence(&alter_seq.id);
+                self.snapshot_sequence_graph();
+                self.local
+                    .graph
+                    .sequences
+                    .retain(|s| s.sequence_id != alter_seq.id);
                 if let Some((table_id, col)) = &alter_seq.owned_by {
-                    self.snapshot_sequence_graph();
-                    self.local
-                        .graph
-                        .sequences
-                        .retain(|s| s.sequence_id != alter_seq.id);
                     self.local.graph.sequences.push(SequenceEdge {
                         sequence_id: alter_seq.id.clone(),
                         table_id: table_id.clone(),
