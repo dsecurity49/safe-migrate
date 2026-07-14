@@ -435,6 +435,11 @@ impl Rule for ReversibilityRule {
         }
 
         if let Reversibility::Irreversible = classify(mutation) {
+            // Guard: ReversibilityRule should not fire for DropDatabase,
+            // as DropDatabaseRule handles it specifically.
+            if matches!(mutation, Mutation::DropDatabase(_)) {
+                return violations; // Return early, let DropDatabaseRule handle it
+            }
             let mut rows = if let Mutation::AlterTable(a) = mutation {
                 pre_state
                     .relations
@@ -515,7 +520,7 @@ impl Rule for ReversibilityRule {
 
 /// Checks if a type change represents actual data loss (narrowing), not just a rewrite.
 /// This is used by ReversibilityRule to distinguish between "safe widening" (e.g., INT->BIGINT)
-/// and genuinely lossy changes (e.g., BIGINT->INT, VARCHAR(255)->VARCHAR(50)).
+/// and genuinely lossy changes (e.g., BIGINT->INT, VARCHAR(255)->VARCHAR(50), TEXT->VARCHAR(n)).
 fn is_type_change_lossy(old_type: &str, new_type: &str) -> bool {
     let old = old_type.to_lowercase().trim().to_string();
     let new = new_type.to_lowercase().trim().to_string();
@@ -535,6 +540,15 @@ fn is_type_change_lossy(old_type: &str, new_type: &str) -> bool {
     {
         // Both are varchar - check if narrowing
         return new_lim < old_lim;
+    }
+
+    // Check for TEXT -> VARCHAR(n) narrowing (text is unbounded, varchar(n) is bounded)
+    // Also handles character varying (unbounded) -> varchar(n)
+    let new_varchar_limit = extract_varchar_limit(&new);
+    if new_varchar_limit.is_some()
+        && (old_base == "text" || old_base == "varchar" || old_base == "character varying")
+    {
+        return true;
     }
 
     // Varchar to something smaller/narrower - check if target type can hold all values

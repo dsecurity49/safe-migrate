@@ -17,5 +17,7 @@
 .cline*
 roadmap.md
 graph.json
-
+AGENTS.md
 .git/
+*.json
+test_migrations/

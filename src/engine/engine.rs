@@ -226,15 +226,14 @@ impl SafeMigrateEngine {
                                     v.sql = Some(stmt_text.trim().to_string());
                                 }
                             }
-                            all_violations.push(v);
-                        }
-                    }
-
-                    if state.local.confidence == crate::analysis::state::Confidence::Tainted {
-                        for v in &mut all_violations {
-                            if v.tier == crate::report::violations::ViolationTier::Tier1 {
+                            // Downgrade tier at push time if confidence was already tainted
+                            // BEFORE this mutation was applied.
+                            if state.local.confidence == crate::analysis::state::Confidence::Tainted
+                                && v.tier == crate::report::violations::ViolationTier::Tier1
+                            {
                                 v.tier = crate::report::violations::ViolationTier::Tier2;
                             }
+                            all_violations.push(v);
                         }
                     }
                 }
