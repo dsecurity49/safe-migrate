@@ -117,10 +117,12 @@ pub fn sync_cache(out_path: &Path, schemas: Option<&[String]>) -> Result<()> {
             CASE WHEN c.reltuples < 0 THEN -1 ELSE c.reltuples::bigint END AS estimated_rows,
             c.relpages::bigint AS relpages,
             to_char(s.last_analyze, 'YYYY-MM-DD HH24:MI:SS') AS last_analyze,
-            to_char(s.last_autoanalyze, 'YYYY-MM-DD HH24:MI:SS') AS last_autoanalyze
+            to_char(s.last_autoanalyze, 'YYYY-MM-DD HH24:MI:SS') AS last_autoanalyze,
+            p.partstrat::text AS partition_strategy
         FROM pg_class c
         JOIN pg_namespace n ON n.oid = c.relnamespace
         LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid
+        LEFT JOIN pg_partitioned_table p ON p.partrelid = c.oid
         WHERE c.relkind IN ('r', 'p', 'v', 'm')
           AND n.nspname NOT IN ('pg_catalog', 'information_schema')
           {schema_filter_with_fk};
@@ -170,6 +172,16 @@ pub fn sync_cache(out_path: &Path, schemas: Option<&[String]>) -> Result<()> {
         state.relpages = Some(relpages as u64);
         state.last_analyze = last_analyze;
         state.last_autoanalyze = last_autoanalyze;
+
+        let partition_strategy: Option<String> = row.get("partition_strategy");
+        if let Some(ref strat) = partition_strategy {
+            state.partition_type = Some(match strat.as_str() {
+                "r" => "RANGE".to_string(),
+                "l" => "LIST".to_string(),
+                "h" => "HASH".to_string(),
+                _ => strat.to_uppercase(),
+            });
+        }
 
         if let Some(s) = schemas
             && !s.contains(&schema_name)
