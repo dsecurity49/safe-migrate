@@ -90,7 +90,7 @@ for dir in $dirs; do
     fi
 
     # Build safe-migrate args
-    SM_ARGS=("lint" "-f")
+    SM_ARGS=("lint")
     if [ "$OFFLINE" -eq 1 ]; then
         SM_ARGS+=("--no-cache")
     else
@@ -103,10 +103,11 @@ for dir in $dirs; do
         fname=$(basename "$file")
 
         # Run safe-migrate lint, extract JSON (skip the "Analyzing migration:" line)
-        json=$("$BIN" "${SM_ARGS[@]}" "$file" 2>/dev/null | sed -n '/^{/,$ p')
+        raw_output=$("$BIN" "${SM_ARGS[@]}" "-f" "$file" 2>&1)
+        json=$(echo "$raw_output" | sed -n '/^{/,$ p')
         
         if [ -z "$json" ]; then
-            [ "$VERBOSE" -eq 1 ] && echo "  [!] NO JSON: $fname"
+            [ "$VERBOSE" -eq 1 ] && echo "  [!] NO JSON: $fname | Output: $raw_output"
             dir_fail=$((dir_fail + 1))
             failures="$failures  [CRASH] $rule_dir/$fname\n"
             continue
