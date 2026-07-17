@@ -478,7 +478,7 @@ impl Rule for ReversibilityRule {
                         a.id.to_string(),
                     ),
                     _ => (
-                        OperationKind::Other("irreversible".to_string()),
+                        OperationKind::Irreversible,
                         ObjectKind::Table,
                         a.id.to_string(),
                     ),
@@ -494,8 +494,8 @@ impl Rule for ReversibilityRule {
                     d.id.to_string(),
                 ),
                 _ => (
-                    OperationKind::Other("irreversible".to_string()),
-                    ObjectKind::Unknown,
+                    OperationKind::Irreversible,
+                    ObjectKind::Table,
                     "unknown".to_string(),
                 ),
             };
@@ -729,9 +729,23 @@ impl TypeChangeRewriteRule {
         if pg_version >= 120000
             && (old_base == "numeric" || old_base == "decimal")
             && (new_base == "numeric" || new_base == "decimal")
-            && !new.contains('(')
         {
-            return true;
+            // Changing to unconstrained numeric is always safe (widest form).
+            if !new.contains('(') {
+                return true;
+            }
+            // Changing to a constrained numeric(p, s) is safe if the new
+            // precision is >= the old precision and the new scale is >= the
+            // old scale (i.e. the new type can represent every value the old
+            // type could). If the old type is unconstrained we cannot prove
+            // widening, so we fall through to false.
+            if let (Some((old_p, old_s)), Some((new_p, new_s))) =
+                (parse_numeric_params(&old), parse_numeric_params(&new))
+                && new_p >= old_p
+                && new_s >= old_s
+            {
+                return true;
+            }
         }
 
         false
@@ -755,6 +769,23 @@ impl TypeChangeRewriteRule {
             _ => false,
         }
     }
+}
+
+/// Parses precision and scale from a numeric/decimal type string.
+/// Returns `Some((precision, scale))` for `numeric(p, s)` or `numeric(p)` (scale=0).
+/// Returns `None` if the type has no parameters.
+fn parse_numeric_params(ty: &str) -> Option<(i32, i32)> {
+    let lower = ty.to_lowercase();
+    let paren_start = lower.find('(')?;
+    let paren_end = lower.find(')')?;
+    let inner = &lower[paren_start + 1..paren_end];
+    let mut parts = inner.splitn(2, ',');
+    let precision: i32 = parts.next()?.trim().parse().ok()?;
+    let scale: i32 = parts
+        .next()
+        .map(|s| s.trim().parse().unwrap_or(0))
+        .unwrap_or(0);
+    Some((precision, scale))
 }
 
 /// Extracts a synthetic type_modifier-like value from a type string.

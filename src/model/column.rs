@@ -10,10 +10,10 @@ pub struct Column {
     pub avg_width: Option<i32>,
     /// Raw default expression text from pg_get_expr(), unparsed.
     /// Used for display and heuristic volatility checks without an ExprIr parser.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub default_expr_text: Option<String>,
     /// Raw type modifier integer from pg_attribute.atttypmod.
-    /// Used for precision comparisons (e.g., VARCHAR(n) narrowing).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Example: For VARCHAR(50), this stores 54 (50 + 4 length header).
+    #[serde(default)]
     pub type_modifier: Option<i32>,
 }

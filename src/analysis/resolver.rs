@@ -93,7 +93,34 @@ impl Resolver {
     }
 
     fn resolve_function_id_by_sig(base_id: &ObjectId, sig: &str) -> ObjectId {
-        let mut id = ObjectId::new(base_id.schema.clone(), format!("{}({})", base_id.name, sig));
+        // Normalize types in signature to match pg_proc standard names
+        let normalized_sig = sig
+            .split(',')
+            .map(|s| {
+                let s = s.trim().to_lowercase();
+                match s.as_str() {
+                    "int" | "int4" => "integer".to_string(),
+                    "int8" => "bigint".to_string(),
+                    "int2" => "smallint".to_string(),
+                    "float8" => "double precision".to_string(),
+                    "float4" => "real".to_string(),
+                    "bool" => "boolean".to_string(),
+                    "varchar" => "character varying".to_string(),
+                    "char" => "character".to_string(),
+                    "time" => "time without time zone".to_string(),
+                    "timestamp" => "timestamp without time zone".to_string(),
+                    "timestamptz" => "timestamp with time zone".to_string(),
+                    "decimal" => "numeric".to_string(),
+                    _ => s,
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let mut id = ObjectId::new(
+            base_id.schema.clone(),
+            format!("{}({})", base_id.name, normalized_sig),
+        );
         id.inferred_schema = base_id.inferred_schema;
         id
     }
@@ -688,7 +715,23 @@ impl Resolver {
                         AlterTableActionFact::SetExpression { .. }
                         | AlterTableActionFact::SetOptions { .. }
                         | AlterTableActionFact::Inherit { .. }
-                        | AlterTableActionFact::NoInherit { .. } => {
+                        | AlterTableActionFact::NoInherit { .. }
+                        | AlterTableActionFact::ClusterOn { .. }
+                        | AlterTableActionFact::InheritTable { .. }
+                        | AlterTableActionFact::NoInheritTable { .. }
+                        | AlterTableActionFact::MergePartitions { .. }
+                        | AlterTableActionFact::SplitPartition
+                        | AlterTableActionFact::SetSchema { .. }
+                        | AlterTableActionFact::SetTablespace { .. }
+                        | AlterTableActionFact::SetLogged
+                        | AlterTableActionFact::SetUnlogged
+                        | AlterTableActionFact::OwnerTo { .. }
+                        | AlterTableActionFact::ReplicaIdentity { .. }
+                        | AlterTableActionFact::ForceRls
+                        | AlterTableActionFact::EnableRls
+                        | AlterTableActionFact::DisableRls
+                        | AlterTableActionFact::EnableAlwaysTrigger { .. }
+                        | AlterTableActionFact::EnableReplicaTrigger { .. } => {
                             AlterTableActionMutation::Opaque
                         }
                     };
@@ -826,8 +869,35 @@ impl Resolver {
                 }));
             }
             StatementFact::DropFunction(f) => {
+                let mut signatures = Vec::new();
+                for sig in &f.signatures {
+                    let mut normalized_sig = sig.clone();
+                    normalized_sig.params = normalized_sig
+                        .params
+                        .into_iter()
+                        .map(|p| {
+                            let p = p.trim().to_lowercase();
+                            match p.as_str() {
+                                "int" | "int4" => "integer".to_string(),
+                                "int8" => "bigint".to_string(),
+                                "int2" => "smallint".to_string(),
+                                "float8" => "double precision".to_string(),
+                                "float4" => "real".to_string(),
+                                "bool" => "boolean".to_string(),
+                                "varchar" => "character varying".to_string(),
+                                "char" => "character".to_string(),
+                                "time" => "time without time zone".to_string(),
+                                "timestamp" => "timestamp without time zone".to_string(),
+                                "timestamptz" => "timestamp with time zone".to_string(),
+                                "decimal" => "numeric".to_string(),
+                                _ => p,
+                            }
+                        })
+                        .collect();
+                    signatures.push(normalized_sig);
+                }
                 mutations.push(Mutation::DropFunction(DropFunctionMutation {
-                    signatures: f.signatures.clone(),
+                    signatures,
                     if_exists: f.if_exists,
                     cascade: f.cascade,
                 }));

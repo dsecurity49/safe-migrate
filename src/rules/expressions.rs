@@ -84,7 +84,7 @@ impl Rule for VolatileDefaultRule {
                     violations.push(Violation {
                         source_range: None,
                         rule_id: self.id(),
-                        operation_kind: OperationKind::Other("set_default".to_string()),
+                        operation_kind: OperationKind::SetDefault,
                         object_kind: ObjectKind::Table,
                         object_name: a.id.to_string(),
                         tier: self.default_tier(),

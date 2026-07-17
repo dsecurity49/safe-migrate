@@ -188,24 +188,6 @@ impl Rule for PartitionStrategyMismatchRule {
 
             if let Some(parent_type) = parent_partition_type {
                 match partition_partition_type {
-                    None => {
-                        violations.push(Violation {
-                            source_range: None,
-                            rule_id: self.id(),
-                            operation_kind: OperationKind::AttachPartition,
-                            object_kind: ObjectKind::Table,
-                            object_name: format!("{} -> {}", child, alter.id),
-                            tier: self.default_tier(),
-                            reason: format!(
-                                "ATTACH PARTITION: partition {} has no partition strategy, but parent {} requires {}",
-                                child, alter.id, parent_type
-                            ),
-                            recipe: self.recipe(),
-                            dedup_key: None,
-                            sql: None,
-                            fk_dependency_related: false,
-                        });
-                    }
                     Some(part_type)
                         if !part_type
                             .to_uppercase()

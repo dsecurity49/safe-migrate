@@ -19,7 +19,7 @@ mod tests {
             std::env::remove_var("DATABASE_URL");
         }
 
-        let result = sync_cache(path);
+        let result = sync_cache(path, None);
         assert!(result.is_err());
     }
 
@@ -64,15 +64,18 @@ mod tests {
         });
 
         // Serialize to JSON
-        let json = serde_json::to_string_pretty(&cache).unwrap();
-        assert!(json.contains(r#""schema": "public""#));
-        assert!(json.contains(r#""name": "test_table""#));
-        assert!(json.contains(r#""constraint_name": "fk_test""#));
-        assert!(json.contains(r#""index_id"#));
-        assert!(json.contains(r#""pg_version_num": 160000"#));
+        let versioned = crate::db::cache::DbCacheVersioned::V1(cache);
+        let config = bincode::config::standard().with_variable_int_encoding();
+        let encoded = bincode::serde::encode_to_vec(&versioned, config).unwrap();
 
         // Deserialize back
-        let deserialized: DbCache = serde_json::from_str(&json).unwrap();
+        let decoded: crate::db::cache::DbCacheVersioned =
+            bincode::serde::decode_from_slice(&encoded, config)
+                .unwrap()
+                .0;
+        let deserialized = match decoded {
+            crate::db::cache::DbCacheVersioned::V1(c) => c,
+        };
         assert_eq!(deserialized.pg_version_num, Some(160000));
         assert!(
             deserialized
@@ -116,8 +119,16 @@ mod tests {
         });
         cache.insert_baseline(id.clone(), rel);
 
-        let json = serde_json::to_string_pretty(&cache).unwrap();
-        let deserialized: DbCache = serde_json::from_str(&json).unwrap();
+        let versioned = crate::db::cache::DbCacheVersioned::V1(cache);
+        let config = bincode::config::standard().with_variable_int_encoding();
+        let encoded = bincode::serde::encode_to_vec(&versioned, config).unwrap();
+        let decoded: crate::db::cache::DbCacheVersioned =
+            bincode::serde::decode_from_slice(&encoded, config)
+                .unwrap()
+                .0;
+        let deserialized = match decoded {
+            crate::db::cache::DbCacheVersioned::V1(c) => c,
+        };
         let rel = deserialized.relations.get(&id).unwrap();
         assert_eq!(rel.columns[0].default_expr_text, Some("now()".into()));
         assert_eq!(rel.columns[0].type_modifier, Some(259));

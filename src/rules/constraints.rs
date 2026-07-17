@@ -97,9 +97,12 @@ impl Rule for BlockingConstraintRule {
                     false
                 };
 
-            // Partitioned tables escalate lock severity: use 50% of threshold
+            // Partitioned tables escalate lock severity: use 50% of threshold (floor at 1)
             let (adjusted_tier1, adjusted_tier2) = if is_partitioned {
-                (tier1_threshold / 2, tier2_threshold / 2)
+                (
+                    std::cmp::max(1, tier1_threshold / 2),
+                    std::cmp::max(1, tier2_threshold / 2),
+                )
             } else {
                 (tier1_threshold, tier2_threshold)
             };

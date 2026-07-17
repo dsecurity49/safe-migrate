@@ -36,7 +36,7 @@ impl Rule for DriftDetectionRule {
             }) => {
                 violations.push(Violation { source_range: None,
                     rule_id: self.id(),
-                    operation_kind: OperationKind::Other("unresolved_reference".to_string()),
+                        operation_kind: OperationKind::UnresolvedReference,
                     object_kind: object_kind.clone(),
                     object_name: object_name.clone(),
                     tier: self.default_tier(),

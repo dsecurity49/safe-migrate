@@ -38,7 +38,16 @@ pub enum OperationKind {
     DisableTrigger,
     EnableTrigger,
     RenameTable,
+    RenameColumn,
     OpaqueSql,
+    CreateSchema,
+    SetDefault,
+    CreateSequence,
+    CreateDomain,
+    AlterSchema,
+    Conflict,
+    Irreversible,
+    UnresolvedReference,
     Other(String),
 }
 
@@ -81,7 +90,16 @@ impl std::fmt::Display for OperationKind {
             OperationKind::DisableTrigger => write!(f, "disable_trigger"),
             OperationKind::EnableTrigger => write!(f, "enable_trigger"),
             OperationKind::RenameTable => write!(f, "rename_table"),
+            OperationKind::RenameColumn => write!(f, "rename_column"),
             OperationKind::OpaqueSql => write!(f, "opaque_sql"),
+            OperationKind::CreateSchema => write!(f, "create_schema"),
+            OperationKind::SetDefault => write!(f, "set_default"),
+            OperationKind::CreateSequence => write!(f, "create_sequence"),
+            OperationKind::CreateDomain => write!(f, "create_domain"),
+            OperationKind::AlterSchema => write!(f, "alter_schema"),
+            OperationKind::Conflict => write!(f, "conflict"),
+            OperationKind::Irreversible => write!(f, "irreversible"),
+            OperationKind::UnresolvedReference => write!(f, "unresolved_reference"),
             OperationKind::Other(s) => write!(f, "{}", s),
         }
     }
@@ -105,6 +123,7 @@ pub enum ObjectKind {
     Domain,
     Policy,
     Type,
+    Opaque,
     Unknown,
 }
 
@@ -127,6 +146,7 @@ impl std::fmt::Display for ObjectKind {
             ObjectKind::Domain => write!(f, "domain"),
             ObjectKind::Policy => write!(f, "policy"),
             ObjectKind::Type => write!(f, "type"),
+            ObjectKind::Opaque => write!(f, "opaque"),
             ObjectKind::Unknown => write!(f, "object"),
         }
     }

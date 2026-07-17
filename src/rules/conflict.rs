@@ -47,8 +47,8 @@ impl Rule for ConflictRule {
             Some(reason) => vec![Violation {
                 source_range: None,
                 rule_id: Self::ID,
-                operation_kind: OperationKind::Other("conflict".to_string()),
-                object_kind: ObjectKind::Unknown,
+                operation_kind: OperationKind::Conflict,
+                object_kind: ObjectKind::Table,
                 object_name: "unknown".to_string(),
                 tier: Self::DEFAULT_TIER,
                 reason: format!("Migration chain conflict: {}", reason),

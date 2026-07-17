@@ -8,7 +8,7 @@ use postgres::{Client, NoTls};
 use std::fs;
 use std::path::Path;
 
-pub fn sync_cache(out_path: &Path) -> Result<()> {
+pub fn sync_cache(out_path: &Path, schemas: Option<&[String]>) -> Result<()> {
     // Strict env-only credential enforcement
     let db_url = std::env::var("DATABASE_URL")
         .context("DATABASE_URL environment variable is required to sync database stats. Do not pass credentials via CLI flags or config files.")?;
@@ -42,30 +42,92 @@ pub fn sync_cache(out_path: &Path) -> Result<()> {
 
     let mut cache = DbCache::new();
 
+    let schema_filter = if let Some(s) = schemas {
+        format!("AND n.nspname = ANY(ARRAY['{}'])", s.join("','"))
+    } else {
+        "".to_string()
+    };
+
+    let schema_filter_with_fk = if let Some(s) = schemas {
+        let arr = format!("ARRAY['{}']", s.join("','"));
+        format!(
+            "AND (
+            n.nspname = ANY({arr})
+            OR c.oid IN (
+                SELECT conrelid FROM pg_constraint cst
+                JOIN pg_class c2 ON c2.oid = cst.confrelid
+                JOIN pg_namespace n2 ON n2.oid = c2.relnamespace
+                WHERE n2.nspname = ANY({arr})
+            )
+            OR c.oid IN (
+                SELECT confrelid FROM pg_constraint cst
+                JOIN pg_class c2 ON c2.oid = cst.conrelid
+                JOIN pg_namespace n2 ON n2.oid = c2.relnamespace
+                WHERE n2.nspname = ANY({arr})
+            )
+        )"
+        )
+    } else {
+        "".to_string()
+    };
+
+    let schema_filter_n1_or_n2 = if let Some(s) = schemas {
+        let arr = format!("ARRAY['{}']", s.join("','"));
+        format!("AND (n1.nspname = ANY({arr}) OR n2.nspname = ANY({arr}))")
+    } else {
+        "".to_string()
+    };
+
+    let schema_filter_nt = if let Some(s) = schemas {
+        let arr = format!("ARRAY['{}']", s.join("','"));
+        format!(
+            "AND (
+            n_t.nspname = ANY({arr})
+            OR t.oid IN (
+                SELECT conrelid FROM pg_constraint cst
+                JOIN pg_class c2 ON c2.oid = cst.confrelid
+                JOIN pg_namespace n2 ON n2.oid = c2.relnamespace
+                WHERE n2.nspname = ANY({arr})
+            )
+            OR t.oid IN (
+                SELECT confrelid FROM pg_constraint cst
+                JOIN pg_class c2 ON c2.oid = cst.conrelid
+                JOIN pg_namespace n2 ON n2.oid = c2.relnamespace
+                WHERE n2.nspname = ANY({arr})
+            )
+        )"
+        )
+    } else {
+        "".to_string()
+    };
+
     // Query 1: Server Version
     let version_row = client.query_one("SHOW server_version_num;", &[])?;
     let version_str: String = version_row.get(0);
     cache.pg_version_num = version_str.parse::<u32>().ok();
 
     // Query 2: Relations + Staleness
-    let table_query = "
+    let table_query = format!(
+        "
         SELECT
             n.nspname AS schema_name,
             c.relname AS relation_name,
             c.relkind AS relation_kind,
             c.relpersistence AS persistence,
             CASE WHEN c.reltuples < 0 THEN -1 ELSE c.reltuples::bigint END AS estimated_rows,
-            GREATEST(c.relpages::bigint, 0) AS relpages,
+            c.relpages::bigint AS relpages,
             to_char(s.last_analyze, 'YYYY-MM-DD HH24:MI:SS') AS last_analyze,
             to_char(s.last_autoanalyze, 'YYYY-MM-DD HH24:MI:SS') AS last_autoanalyze
         FROM pg_class c
         JOIN pg_namespace n ON n.oid = c.relnamespace
         LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid
         WHERE c.relkind IN ('r', 'p', 'v', 'm')
-          AND n.nspname NOT IN ('pg_catalog', 'information_schema');
-    ";
+          AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+          {schema_filter_with_fk};
+    "
+    );
 
-    for row in client.query(table_query, &[])? {
+    for row in client.query(&table_query, &[])? {
         let schema_name: String = row.get("schema_name");
         let relation_name: String = row.get("relation_name");
         let relkind: i8 = row.get("relation_kind");
@@ -109,11 +171,17 @@ pub fn sync_cache(out_path: &Path) -> Result<()> {
         state.last_analyze = last_analyze;
         state.last_autoanalyze = last_autoanalyze;
 
+        if let Some(s) = schemas
+            && !s.contains(&schema_name)
+        {
+            state.mark_fk_dependency();
+        }
+
         cache.insert_baseline(object_id, state);
     }
 
     // Query 3: Columns + Width
-    let col_query = "
+    let col_query = format!("
         SELECT
             n.nspname AS schema_name,
             c.relname AS relation_name,
@@ -130,10 +198,11 @@ pub fn sync_cache(out_path: &Path) -> Result<()> {
         LEFT JOIN pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum
         WHERE a.attnum > 0 AND NOT a.attisdropped
           AND c.relkind IN ('r', 'p', 'v', 'm')
-          AND n.nspname NOT IN ('pg_catalog', 'information_schema');
-    ";
+          AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+          {schema_filter_with_fk};
+    ");
 
-    for row in client.query(col_query, &[])? {
+    for row in client.query(&col_query, &[])? {
         let schema_name: String = row.get("schema_name");
         let relation_name: String = row.get("relation_name");
         let column_name: String = row.get("column_name");
@@ -159,21 +228,22 @@ pub fn sync_cache(out_path: &Path) -> Result<()> {
     }
 
     // Query 4: Triggers & Policies
-    let tp_query = "
+    let tp_query = format!("
         SELECT 
             n.nspname AS schema_name,
             c.relname AS relation_name,
-            COALESCE(array_agg(DISTINCT t.tgname) FILTER (WHERE t.tgname IS NOT NULL AND t.tgisinternal = false), '{}') as triggers,
-            COALESCE(array_agg(DISTINCT p.polname) FILTER (WHERE p.polname IS NOT NULL), '{}') as policies
+            COALESCE(array_agg(DISTINCT t.tgname) FILTER (WHERE t.tgname IS NOT NULL AND t.tgisinternal = false), '{{}}') as triggers,
+            COALESCE(array_agg(DISTINCT p.polname) FILTER (WHERE p.polname IS NOT NULL), '{{}}') as policies
         FROM pg_class c
         JOIN pg_namespace n ON n.oid = c.relnamespace
         LEFT JOIN pg_trigger t ON t.tgrelid = c.oid
         LEFT JOIN pg_policy p ON p.polrelid = c.oid
         WHERE c.relkind IN ('r', 'p', 'v', 'm') AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+        {schema_filter_with_fk}
         GROUP BY n.nspname, c.relname;
-    ";
+    ");
 
-    for row in client.query(tp_query, &[])? {
+    for row in client.query(&tp_query, &[])? {
         let schema_name: String = row.get("schema_name");
         let relation_name: String = row.get("relation_name");
         let triggers: Vec<String> = row.get("triggers");
@@ -187,8 +257,43 @@ pub fn sync_cache(out_path: &Path) -> Result<()> {
         }
     }
 
+    // Query 4.5: Trigger Functions
+    let trig_query = format!(
+        "
+        SELECT 
+            n.nspname AS table_schema,
+            c.relname AS table_name,
+            t.tgname AS trigger_name,
+            fn.nspname AS function_schema,
+            f.proname || '()' AS function_name
+        FROM pg_trigger t
+        JOIN pg_class c ON c.oid = t.tgrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        JOIN pg_proc f ON f.oid = t.tgfoid
+        JOIN pg_namespace fn ON fn.oid = f.pronamespace
+        WHERE t.tgisinternal = false
+          AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+          {schema_filter_with_fk};
+    "
+    );
+
+    for row in client.query(&trig_query, &[])? {
+        let table_schema: String = row.get("table_schema");
+        let table_name: String = row.get("table_name");
+        let trigger_name: String = row.get("trigger_name");
+        let function_schema: String = row.get("function_schema");
+        let function_name: String = row.get("function_name");
+
+        cache.triggers.push(crate::db::cache::TriggerCache {
+            trigger_id: ObjectId::new(&table_schema, &trigger_name),
+            table_id: ObjectId::new(&table_schema, &table_name),
+            function_id: ObjectId::new(&function_schema, &function_name),
+        });
+    }
+
     // Query 5: Foreign Keys
-    let fk_query = "
+    let fk_query = format!(
+        "
         SELECT 
             c.conname AS constraint_name,
             n1.nspname AS from_schema, t1.relname AS from_table,
@@ -198,15 +303,37 @@ pub fn sync_cache(out_path: &Path) -> Result<()> {
         JOIN pg_namespace n1 ON n1.oid = t1.relnamespace
         JOIN pg_class t2 ON t2.oid = c.confrelid
         JOIN pg_namespace n2 ON n2.oid = t2.relnamespace
-        WHERE c.contype = 'f';
-    ";
+        WHERE c.contype = 'f'
+        {schema_filter_n1_or_n2};
+    "
+    );
 
-    for row in client.query(fk_query, &[])? {
+    for row in client.query(&fk_query, &[])? {
         let constraint_name: String = row.get("constraint_name");
         let from_schema: String = row.get("from_schema");
         let from_table: String = row.get("from_table");
         let to_schema: String = row.get("to_schema");
         let to_table: String = row.get("to_table");
+
+        if let Some(s) = schemas
+            && (!s.contains(&from_schema) || !s.contains(&to_schema))
+        {
+            // Determine which one is out of scope to print a helpful warning
+            let out_of_scope_schema = if !s.contains(&from_schema) {
+                &from_schema
+            } else {
+                &to_schema
+            };
+            let out_of_scope_table = if !s.contains(&from_schema) {
+                &from_table
+            } else {
+                &to_table
+            };
+            eprintln!(
+                "[WARN] Foreign key '{}' crosses schema boundary. Table '{}.{}' was pulled into cache as a dependency to evaluate cross-team locks.",
+                constraint_name, out_of_scope_schema, out_of_scope_table
+            );
+        }
 
         cache.foreign_keys.push(ForeignKeyCache {
             constraint_name,
@@ -216,7 +343,8 @@ pub fn sync_cache(out_path: &Path) -> Result<()> {
     }
 
     // Query 6: Indexes
-    let idx_query = "
+    let idx_query = format!(
+        "
         SELECT 
             n_i.nspname AS index_schema, i.relname AS index_name,
             n_t.nspname AS table_schema, t.relname AS table_name
@@ -225,10 +353,12 @@ pub fn sync_cache(out_path: &Path) -> Result<()> {
         JOIN pg_namespace n_i ON n_i.oid = i.relnamespace
         JOIN pg_class t ON t.oid = x.indrelid
         JOIN pg_namespace n_t ON n_t.oid = t.relnamespace
-        WHERE x.indisvalid = true;
-    ";
+        WHERE x.indisvalid = true
+        {schema_filter_nt};
+    "
+    );
 
-    for row in client.query(idx_query, &[])? {
+    for row in client.query(&idx_query, &[])? {
         let index_schema: String = row.get("index_schema");
         let index_name: String = row.get("index_name");
         let table_schema: String = row.get("table_schema");
@@ -240,11 +370,96 @@ pub fn sync_cache(out_path: &Path) -> Result<()> {
         });
     }
 
-    // Atomic write via temp file
-    let json = serde_json::to_string_pretty(&cache)?;
-    let tmp_path = out_path.with_extension("tmp");
+    // Query 7: Functions
+    let func_query = format!(
+        "
+        SELECT
+            n.nspname AS schema_name,
+            p.proname AS func_name,
+            COALESCE(
+                (SELECT string_agg(pg_catalog.format_type(t, NULL), ',' ORDER BY n)
+                 FROM unnest(p.proargtypes::int[]) WITH ORDINALITY AS u(t, n)),
+                ''
+            ) AS arg_types,
+            pg_catalog.pg_get_function_result(p.oid) AS return_type,
+            p.provolatile::text AS volatility,
+            l.lanname AS language,
+            p.prosecdef AS security_definer
+        FROM pg_proc p
+        JOIN pg_namespace n ON n.oid = p.pronamespace
+        JOIN pg_language l ON l.oid = p.prolang
+        WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
+          AND p.prokind = 'f'
+          {schema_filter};
+    "
+    );
 
-    fs::write(&tmp_path, json).context("Failed to write temporary cache file")?;
+    for row in client.query(&func_query, &[])? {
+        let schema_name: String = row.get("schema_name");
+        let func_name: String = row.get("func_name");
+        let arg_types_str: String = row.get("arg_types");
+        let return_type: Option<String> = row.get("return_type");
+        let volatility_char: String = row.get("volatility");
+        let language: String = row.get("language");
+        let security_definer: bool = row.get("security_definer");
+
+        let volatility = match volatility_char.as_str() {
+            "v" => crate::model::function::Volatility::Volatile,
+            "s" => crate::model::function::Volatility::Stable,
+            "i" => crate::model::function::Volatility::Immutable,
+            _ => crate::model::function::Volatility::Volatile,
+        };
+
+        let security = if security_definer {
+            crate::model::function::SecurityMode::Definer
+        } else {
+            crate::model::function::SecurityMode::Invoker
+        };
+
+        // Normalize argument types in sync just like in resolver
+        let arg_types_str = arg_types_str
+            .split(',')
+            .map(|s| s.trim().to_lowercase())
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let id = ObjectId::new(&schema_name, format!("{}({})", func_name, arg_types_str));
+
+        let arg_types = if arg_types_str.is_empty() {
+            Vec::new()
+        } else {
+            arg_types_str.split(',').map(|s| s.to_string()).collect()
+        };
+
+        cache.functions.insert(
+            id.clone(),
+            crate::model::function::FunctionState {
+                id,
+                arg_types,
+                return_type: return_type.unwrap_or_default(),
+                volatility,
+                language,
+                security,
+            },
+        );
+    }
+
+    // Atomic write via temp file
+    let tmp_path = out_path.with_extension("tmp");
+    let file = std::fs::File::create(&tmp_path).context("Failed to create temporary cache file")?;
+    let writer = std::io::BufWriter::new(file);
+    let mut encoder = zstd::stream::Encoder::new(writer, 3)
+        .context("Failed to init zstd compression")?
+        .auto_finish();
+
+    let versioned = crate::db::cache::DbCacheVersioned::V1(cache);
+    let bincode_config = bincode::config::standard().with_variable_int_encoding();
+
+    bincode::serde::encode_into_std_write(&versioned, &mut encoder, bincode_config)
+        .context("Failed binary bincode 2.0 schema compilation and write")?;
+
+    drop(encoder);
+
     fs::rename(&tmp_path, out_path).context("Failed to atomically rename cache file")?;
 
     Ok(())

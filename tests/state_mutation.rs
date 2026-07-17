@@ -360,11 +360,12 @@ mod state_mutation_tests {
 
         engine
             .analyze(
-                "CREATE FUNCTION f(int) RETURNS int AS '...' LANGUAGE plpgsql;",
+                "CREATE FUNCTION fn(a int) RETURNS int LANGUAGE sql AS 'SELECT 1';",
                 &mut state,
             )
             .unwrap();
-        let id = object_id("public", "f(int)");
+
+        let id = ObjectId::new("public", "fn(integer)");
         assert!(state.local.functions.contains_key(&id));
     }
 
@@ -379,7 +380,8 @@ mod state_mutation_tests {
                 &mut state,
             )
             .unwrap();
-        let id = object_id("public", "p(int)");
+
+        let id = ObjectId::new("public", "p(integer)");
         assert!(state.local.functions.contains_key(&id));
     }
 

@@ -118,6 +118,25 @@ impl AnalysisState {
             });
         }
 
+        for t in cache.triggers {
+            graph
+                .trigger_dependencies
+                .push(crate::analysis::graph::TriggerEdge {
+                    trigger_id: t.trigger_id,
+                    table_id: t.table_id,
+                    function_id: t.function_id,
+                });
+        }
+
+        let mut functions: HashMap<ObjectId, crate::model::function::FunctionOverlay> =
+            HashMap::new();
+        for (id, func_state) in &cache.functions {
+            functions.insert(
+                id.clone(),
+                crate::model::function::FunctionOverlay::Present(func_state.clone()),
+            );
+        }
+
         Self {
             pg_version_num: cache.pg_version_num,
             baseline_relations,
@@ -127,7 +146,7 @@ impl AnalysisState {
             local: LocalState {
                 relations,
                 types: HashMap::new(),
-                functions: HashMap::new(),
+                functions,
                 sequences: HashMap::new(),
                 publications: HashMap::new(),
                 subscriptions: HashMap::new(),
@@ -993,12 +1012,18 @@ impl AnalysisState {
                             });
                         }
                         AlterTableActionMutation::SetType { column, ty, .. } => {
+                            if !rel.has_column(column) {
+                                self.local.confidence = Confidence::Tainted;
+                            }
                             rel.apply_column_action(&ColumnAction::SetType {
                                 name: column.clone(),
                                 data_type: ty.clone(),
                             });
                         }
                         AlterTableActionMutation::SetDefault { column, default } => {
+                            if !rel.has_column(column) {
+                                self.local.confidence = Confidence::Tainted;
+                            }
                             rel.apply_column_action(&ColumnAction::SetDefault {
                                 name: column.clone(),
                                 default: default.clone(),

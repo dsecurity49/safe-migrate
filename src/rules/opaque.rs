@@ -54,7 +54,7 @@ impl Rule for OpaqueDynamicSqlRule {
                 source_range: None,
                 rule_id: self.id(),
                 operation_kind: OperationKind::OpaqueSql,
-                object_kind: ObjectKind::Unknown,
+                object_kind: ObjectKind::Opaque,
                 object_name: "<dynamic>".to_string(),
                 tier: self.default_tier(),
                 reason: format!("Encountered opaque {}", block_type),

@@ -216,6 +216,60 @@ mod architectural_gap_tests {
         assert!(!edge.depends_on.contains(&object_id("public", "my_cte")));
     }
 
+    #[test]
+    fn test_view_dependency_schema_qualified() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze("CREATE TABLE app_sessions(id int);", &mut state)
+            .unwrap();
+        engine
+            .analyze("CREATE VIEW v AS SELECT * FROM app_sessions;", &mut state)
+            .unwrap();
+
+        let edge = state
+            .local
+            .graph
+            .views
+            .iter()
+            .find(|v| v.view_id == object_id("public", "v"))
+            .unwrap();
+        assert!(
+            edge.depends_on
+                .contains(&object_id("public", "app_sessions"))
+        );
+    }
+
+    #[test]
+    fn test_view_dependency_intermediate_segments_skipped() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze("CREATE TABLE sessions(id int);", &mut state)
+            .unwrap();
+        engine
+            .analyze("CREATE VIEW v AS SELECT * FROM app.sessions;", &mut state)
+            .unwrap();
+
+        let edge = state
+            .local
+            .graph
+            .views
+            .iter()
+            .find(|v| v.view_id == object_id("public", "v"))
+            .unwrap();
+
+        assert!(
+            edge.depends_on.contains(&object_id("app", "sessions")),
+            "Schema-qualified table should produce qualified depends_on entry"
+        );
+
+        assert!(
+            !edge.depends_on.contains(&object_id("public", "app")),
+            "Schema segment should not appear as a phantom dependency"
+        );
+    }
+
     // 9. Partition graph cleanup after DROP TABLE
     #[test]
     fn test_partition_graph_cleanup_on_drop() {
@@ -598,6 +652,176 @@ mod architectural_gap_tests {
             state.relation_is_present(&object_id("public", "a")),
             "Table a should not be dropped if dependents exist without CASCADE"
         );
+    }
+
+    // 24. ALTER TABLE typed actions produce opaque without crashing
+    #[test]
+    fn test_alter_table_set_access_method_typed() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze("CREATE TABLE t(id int);", &mut state)
+            .unwrap();
+        let result = engine.analyze("ALTER TABLE t SET ACCESS METHOD heap;", &mut state);
+        assert!(result.is_ok(), "SetAccessMethod should not crash");
+    }
+
+    #[test]
+    fn test_alter_table_disable_enable_trigger_typed() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze("CREATE TABLE t(id int);", &mut state)
+            .unwrap();
+        let r1 = engine.analyze("ALTER TABLE t DISABLE TRIGGER ALL;", &mut state);
+        assert!(r1.is_ok(), "DisableTrigger should not crash");
+        let r2 = engine.analyze("ALTER TABLE t ENABLE TRIGGER ALL;", &mut state);
+        assert!(r2.is_ok(), "EnableTrigger should not crash");
+        let r3 = engine.analyze("ALTER TABLE t ENABLE TRIGGER my_trig;", &mut state);
+        assert!(r3.is_ok(), "EnableTrigger named should not crash");
+    }
+
+    #[test]
+    fn test_alter_table_set_schema_does_not_crash() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze("CREATE TABLE t(id int);", &mut state)
+            .unwrap();
+        let result = engine.analyze("ALTER TABLE t SET SCHEMA target;", &mut state);
+        assert!(result.is_ok(), "SetSchema should not crash");
+    }
+
+    #[test]
+    fn test_alter_table_set_tablespace_does_not_crash() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze("CREATE TABLE t(id int);", &mut state)
+            .unwrap();
+        let result = engine.analyze("ALTER TABLE t SET TABLESPACE fastspace;", &mut state);
+        assert!(result.is_ok(), "SetTablespace should not crash");
+    }
+
+    #[test]
+    fn test_alter_table_owner_to_does_not_crash() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze("CREATE TABLE t(id int);", &mut state)
+            .unwrap();
+        let result = engine.analyze("ALTER TABLE t OWNER TO app_owner;", &mut state);
+        assert!(result.is_ok(), "OwnerTo should not crash");
+    }
+
+    #[test]
+    fn test_alter_table_logged_unlogged_does_not_crash() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze("CREATE TABLE t(id int);", &mut state)
+            .unwrap();
+        let r1 = engine.analyze("ALTER TABLE t SET LOGGED;", &mut state);
+        assert!(r1.is_ok(), "SetLogged should not crash");
+        let r2 = engine.analyze("ALTER TABLE t SET UNLOGGED;", &mut state);
+        assert!(r2.is_ok(), "SetUnlogged should not crash");
+    }
+
+    #[test]
+    fn test_alter_table_replica_identity_does_not_crash() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze("CREATE TABLE t(id int);", &mut state)
+            .unwrap();
+        let r1 = engine.analyze("ALTER TABLE t REPLICA IDENTITY FULL;", &mut state);
+        assert!(r1.is_ok(), "ReplicaIdentity FULL should not crash");
+        let r2 = engine.analyze("ALTER TABLE t REPLICA IDENTITY DEFAULT;", &mut state);
+        assert!(r2.is_ok(), "ReplicaIdentity DEFAULT should not crash");
+        let r3 = engine.analyze("ALTER TABLE t REPLICA IDENTITY NOTHING;", &mut state);
+        assert!(r3.is_ok(), "ReplicaIdentity NOTHING should not crash");
+        let r4 = engine.analyze(
+            "ALTER TABLE t REPLICA IDENTITY USING INDEX my_idx;",
+            &mut state,
+        );
+        assert!(r4.is_ok(), "ReplicaIdentity USING INDEX should not crash");
+    }
+
+    #[test]
+    fn test_alter_table_cluster_on_does_not_crash() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze("CREATE TABLE t(id int);", &mut state)
+            .unwrap();
+        let result = engine.analyze("ALTER TABLE t CLUSTER ON t_pkey;", &mut state);
+        assert!(result.is_ok(), "ClusterOn should not crash");
+    }
+
+    #[test]
+    fn test_alter_table_inherit_does_not_crash() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TABLE parent(id int); CREATE TABLE child(id int);",
+                &mut state,
+            )
+            .unwrap();
+        let result = engine.analyze("ALTER TABLE child INHERIT parent;", &mut state);
+        assert!(result.is_ok(), "InheritTable should not crash");
+        let r2 = engine.analyze("ALTER TABLE child NO INHERIT parent;", &mut state);
+        assert!(r2.is_ok(), "NoInheritTable should not crash");
+    }
+
+    #[test]
+    fn test_alter_table_rls_force_does_not_crash() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze("CREATE TABLE t(id int);", &mut state)
+            .unwrap();
+        let r1 = engine.analyze("ALTER TABLE t ENABLE ROW LEVEL SECURITY;", &mut state);
+        assert!(r1.is_ok(), "EnableRls should not crash");
+        let r2 = engine.analyze("ALTER TABLE t FORCE ROW LEVEL SECURITY;", &mut state);
+        assert!(r2.is_ok(), "ForceRls should not crash");
+        let r3 = engine.analyze("ALTER TABLE t DISABLE ROW LEVEL SECURITY;", &mut state);
+        assert!(r3.is_ok(), "DisableRls should not crash");
+    }
+
+    #[test]
+    fn test_alter_table_merge_split_partition_does_not_crash() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TABLE p(id int) PARTITION BY RANGE (id);
+             CREATE TABLE p1 PARTITION OF p FOR VALUES FROM (1) TO (10);
+             CREATE TABLE p2 PARTITION OF p FOR VALUES FROM (10) TO (20);",
+                &mut state,
+            )
+            .unwrap();
+        let sql = "ALTER TABLE p MERGE PARTITIONS p1, p2 INTO p_merged;";
+        match engine.analyze(sql, &mut state) {
+            Ok(_) => {} // passes
+            Err(e) => {
+                // Parser may not support MERGE PARTITIONS syntax — skip
+                eprintln!("MergePartitions parse errors: {e:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_alter_table_enable_always_replica_trigger_does_not_crash() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze("CREATE TABLE t(id int);", &mut state)
+            .unwrap();
+        let r1 = engine.analyze("ALTER TABLE t ENABLE ALWAYS TRIGGER my_tg;", &mut state);
+        assert!(r1.is_ok(), "EnableAlwaysTrigger should not crash");
+        let r2 = engine.analyze("ALTER TABLE t ENABLE REPLICA TRIGGER my_tg;", &mut state);
+        assert!(r2.is_ok(), "EnableReplicaTrigger should not crash");
     }
 }
 

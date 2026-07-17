@@ -7,14 +7,16 @@ use crate::analysis::facts::{
 };
 use crate::ast::identifiers::{Ident, QualifiedName};
 use squawk_syntax::ast::{
-    self, AlterColumnOption, AlterConstraint, AlterDomain, AlterIndex, AlterSequence, AlterTable,
+    AlterColumnOption, AlterConstraint, AlterDomain, AlterIndex, AlterSequence, AlterTable,
     AlterTableAction, AlterType, AstNode, AttachPartition, Column, ColumnConstraint, Constraint,
     CreateDatabase, CreateDomain, CreateIndex, CreateMaterializedView, CreatePolicy,
     CreateSequence, CreateTable, CreateTableAs, CreateTrigger, CreateType, CreateView,
     DetachPartition, DropDomain, DropIndex, DropMaterializedView, DropPolicy, DropSequence,
-    DropTable, DropTrigger, DropView, Grant, Name, NameRef, Path, PathSegment, ReleaseSavepoint,
-    RenameTo, Revoke, Rollback, Savepoint, Set, Stmt, TableArg, TableConstraint,
+    DropTable, DropTrigger, DropView, FieldExpr, Grant, Name, NameRef, Path, PathSegment,
+    ReleaseSavepoint, RenameTo, Revoke, RevokeCommand, Rollback, Savepoint, Set, Stmt, TableArg,
+    TableConstraint,
 };
+use squawk_syntax::{SyntaxKind, ast};
 
 pub struct AstVisitor;
 
@@ -49,6 +51,8 @@ impl AstVisitor {
             Stmt::Rollback(node) => return Self::extract_rollback(node),
             Stmt::Savepoint(node) => return Some(Self::extract_savepoint(node)),
             Stmt::ReleaseSavepoint(node) => return Some(Self::extract_release_savepoint(node)),
+            Stmt::Do(_) => return Some(StatementFact::OpaqueBlock),
+            Stmt::Execute(_) => return Some(StatementFact::Execute),
             Stmt::Vacuum(node) => {
                 let relation = if let Some(list) = node.table_and_columns_list() {
                     list.table_and_columnss()
@@ -206,17 +210,7 @@ impl AstVisitor {
             return Self::extract_drop_database(&node);
         }
 
-        let text = syntax.text().to_string();
-        let upper = text.to_uppercase();
-
-        if upper.starts_with("DO ") {
-            return Some(StatementFact::OpaqueBlock);
-        }
-        if upper.starts_with("EXECUTE ") {
-            return Some(StatementFact::Execute);
-        }
-
-        Some(StatementFact::OpaqueBlock)
+        None
     }
 
     fn extract_create_schema(node: &ast::CreateSchema) -> Option<StatementFact> {
@@ -359,11 +353,6 @@ impl AstVisitor {
         let table_name = Self::path_to_qualified_name(&path)?;
         let mut actions = Vec::new();
 
-        let full_text = node.syntax().text().to_string().to_lowercase();
-        if full_text.contains("set access method") {
-            actions.push(AlterTableActionFact::SetAccessMethod);
-        }
-
         for action in node.actions() {
             if let Some(ap) = AttachPartition::cast(action.syntax().clone()) {
                 if let Some(child_path) = ap.syntax().descendants().find_map(Path::cast)
@@ -382,12 +371,7 @@ impl AstVisitor {
                 continue;
             }
             if let Some(ac) = AlterConstraint::cast(action.syntax().clone()) {
-                let deferrable = ac
-                    .syntax()
-                    .text()
-                    .to_string()
-                    .to_lowercase()
-                    .contains("deferrable");
+                let deferrable = ac.deferrable_constraint_option().is_some();
                 actions.push(AlterTableActionFact::AlterConstraint {
                     name: None,
                     deferrable,
@@ -535,21 +519,180 @@ impl AstVisitor {
                         actions.push(AlterTableActionFact::ValidateConstraint { constraint_name });
                     }
                 }
+                AlterTableAction::SetAccessMethod(sam) => {
+                    if sam.name_ref().is_some() {
+                        actions.push(AlterTableActionFact::SetAccessMethod);
+                    }
+                }
+                AlterTableAction::DisableTrigger(dt) => {
+                    let trigger_name = dt
+                        .name_ref()
+                        .map(|nr| Self::resolve_name_ref(&nr))
+                        .or_else(|| {
+                            if dt.all_token().is_some() {
+                                Some("ALL".to_string())
+                            } else {
+                                None
+                            }
+                        })
+                        .or_else(|| {
+                            dt.syntax()
+                                .descendants()
+                                .find_map(NameRef::cast)
+                                .map(|nr| Self::resolve_name_ref(&nr))
+                        });
+                    actions.push(AlterTableActionFact::DisableTrigger { trigger_name });
+                }
+                AlterTableAction::EnableTrigger(et) => {
+                    let trigger_name = et
+                        .name_ref()
+                        .map(|nr| Self::resolve_name_ref(&nr))
+                        .or_else(|| {
+                            if et.all_token().is_some() {
+                                Some("ALL".to_string())
+                            } else {
+                                None
+                            }
+                        })
+                        .or_else(|| {
+                            et.syntax()
+                                .descendants()
+                                .find_map(NameRef::cast)
+                                .map(|nr| Self::resolve_name_ref(&nr))
+                        });
+                    actions.push(AlterTableActionFact::EnableTrigger { trigger_name });
+                }
+                AlterTableAction::SetSchema(ss) => {
+                    if let Some(nr) = ss.name_ref() {
+                        actions.push(AlterTableActionFact::SetSchema {
+                            new_schema: Self::resolve_name_ref(&nr),
+                        });
+                    }
+                }
+                AlterTableAction::SetTablespace(st) => {
+                    if let Some(path) = st.path()
+                        && let Some(qname) = Self::path_to_qualified_name(&path)
+                    {
+                        actions.push(AlterTableActionFact::SetTablespace {
+                            tablespace: qname.name.resolve(),
+                        });
+                    }
+                }
+                AlterTableAction::OwnerTo(ot) => {
+                    if let Some(role_ref) = ot.role_ref()
+                        && let Some(nr) = role_ref.name_ref()
+                    {
+                        actions.push(AlterTableActionFact::OwnerTo {
+                            new_owner: Self::resolve_name_ref(&nr),
+                        });
+                    } else {
+                        let nr = ot.syntax().descendants().find_map(NameRef::cast);
+                        if let Some(nr) = nr {
+                            actions.push(AlterTableActionFact::OwnerTo {
+                                new_owner: Self::resolve_name_ref(&nr),
+                            });
+                        }
+                    }
+                }
+                AlterTableAction::SetLogged(_) => {
+                    actions.push(AlterTableActionFact::SetLogged);
+                }
+                AlterTableAction::SetUnlogged(_) => {
+                    actions.push(AlterTableActionFact::SetUnlogged);
+                }
+                AlterTableAction::ReplicaIdentity(ri) => {
+                    let option = ri
+                        .name_ref()
+                        .map(|nr| Self::resolve_name_ref(&nr))
+                        .or_else(|| {
+                            if ri.default_token().is_some() {
+                                Some("DEFAULT".to_string())
+                            } else if ri.full_token().is_some() {
+                                Some("FULL".to_string())
+                            } else if ri.syntax().descendants().find_map(NameRef::cast).is_some() {
+                                ri.syntax()
+                                    .descendants()
+                                    .find_map(NameRef::cast)
+                                    .map(|nr| Self::resolve_name_ref(&nr))
+                            } else {
+                                Some("NOTHING".to_string())
+                            }
+                        })
+                        .unwrap_or_default();
+                    actions.push(AlterTableActionFact::ReplicaIdentity { option });
+                }
+                AlterTableAction::ClusterOn(co) => {
+                    let index = co
+                        .name_ref()
+                        .map(|nr| Self::resolve_name_ref(&nr))
+                        .or_else(|| {
+                            co.syntax()
+                                .descendants()
+                                .find_map(NameRef::cast)
+                                .map(|nr| Self::resolve_name_ref(&nr))
+                        })
+                        .unwrap_or_default();
+                    actions.push(AlterTableActionFact::ClusterOn { index });
+                }
+                AlterTableAction::InheritTable(it) => {
+                    if let Some(path) = it.path()
+                        && let Some(parent) = Self::path_to_qualified_name(&path)
+                    {
+                        actions.push(AlterTableActionFact::InheritTable { parent });
+                    }
+                }
+                AlterTableAction::NoInheritTable(nit) => {
+                    if let Some(path) = nit.path()
+                        && let Some(parent) = Self::path_to_qualified_name(&path)
+                    {
+                        actions.push(AlterTableActionFact::NoInheritTable { parent });
+                    }
+                }
+                AlterTableAction::MergePartitions(mp) => {
+                    if let Some(path) = mp.path()
+                        && let Some(parent) = Self::path_to_qualified_name(&path)
+                    {
+                        actions.push(AlterTableActionFact::MergePartitions { parent });
+                    }
+                }
+                AlterTableAction::SplitPartition(_sp) => {
+                    actions.push(AlterTableActionFact::SplitPartition);
+                }
+                AlterTableAction::ForceRls(_) => {
+                    actions.push(AlterTableActionFact::ForceRls);
+                }
+                AlterTableAction::EnableRls(_) => {
+                    actions.push(AlterTableActionFact::EnableRls);
+                }
+                AlterTableAction::DisableRls(_) => {
+                    actions.push(AlterTableActionFact::DisableRls);
+                }
+                AlterTableAction::EnableAlwaysTrigger(eat) => {
+                    let trigger_name = eat
+                        .name_ref()
+                        .map(|nr| Self::resolve_name_ref(&nr))
+                        .or_else(|| {
+                            eat.syntax()
+                                .descendants()
+                                .find_map(NameRef::cast)
+                                .map(|nr| Self::resolve_name_ref(&nr))
+                        });
+                    actions.push(AlterTableActionFact::EnableAlwaysTrigger { trigger_name });
+                }
+                AlterTableAction::EnableReplicaTrigger(ert) => {
+                    let trigger_name = ert
+                        .name_ref()
+                        .map(|nr| Self::resolve_name_ref(&nr))
+                        .or_else(|| {
+                            ert.syntax()
+                                .descendants()
+                                .find_map(NameRef::cast)
+                                .map(|nr| Self::resolve_name_ref(&nr))
+                        });
+                    actions.push(AlterTableActionFact::EnableReplicaTrigger { trigger_name });
+                }
                 _ => {
                     let txt = action.syntax().text().to_string().to_lowercase();
-                    if txt.contains("disable trigger") {
-                        let trigger_name = txt
-                            .split("disable trigger")
-                            .last()
-                            .map(|s| s.trim().trim_matches('"').to_string());
-                        actions.push(AlterTableActionFact::DisableTrigger { trigger_name });
-                    } else if txt.contains("enable trigger") {
-                        let trigger_name = txt
-                            .split("enable trigger")
-                            .last()
-                            .map(|s| s.trim().trim_matches('"').to_string());
-                        actions.push(AlterTableActionFact::EnableTrigger { trigger_name });
-                    }
 
                     if txt.contains("set storage") {
                         let parts: Vec<&str> = txt.split_whitespace().collect();
@@ -561,16 +704,6 @@ impl AstVisitor {
                         }
                     }
                 }
-            }
-        }
-
-        if actions.is_empty() && full_text.contains("set storage") {
-            let parts: Vec<&str> = full_text.split_whitespace().collect();
-            if let Some(idx) = parts.iter().position(|&p| p == "column")
-                && idx + 1 < parts.len()
-            {
-                let c_name = parts[idx + 1].trim_matches('"').to_string();
-                actions.push(AlterTableActionFact::SetStorage { column: c_name });
             }
         }
 
@@ -664,10 +797,8 @@ impl AstVisitor {
             AlterColumnOption::SetType(st) => {
                 let has_using = st
                     .syntax()
-                    .text()
-                    .to_string()
-                    .to_lowercase()
-                    .contains("using ");
+                    .descendants()
+                    .any(|t| t.kind() == SyntaxKind::USING_KW);
                 Some(AlterTableActionFact::SetType {
                     column: col_name,
                     ty: st.ty()?.syntax().text().to_string(),
@@ -961,7 +1092,6 @@ impl AstVisitor {
     fn extract_alter_view(node: &ast::AlterView) -> Option<StatementFact> {
         let path = node.path()?;
         let name = Self::path_to_qualified_name(&path)?;
-        let full_text = node.syntax().text().to_string().to_lowercase();
 
         // Check for RenameTo
         if let Some(rt) = node.syntax().descendants().find_map(RenameTo::cast)
@@ -1010,14 +1140,15 @@ impl AstVisitor {
         // Check for column default modifications (SET DEFAULT / DROP DEFAULT)
         // Grammar: 'alter' 'column'? NameRef (('set' 'default' Expr) | ('drop' 'default'))
         if node.column_token().is_some()
-            && (full_text.contains("set default") || full_text.contains("drop default"))
+            && node.default_token().is_some()
+            && (node.set_token().is_some() || node.drop_token().is_some())
         {
             let col_name = node
                 .name_ref()
                 .map(|nr| Self::resolve_name_ref(&nr))
                 .unwrap_or_default();
 
-            if full_text.contains("drop default") {
+            if node.drop_token().is_some() {
                 return Some(StatementFact::AlterView {
                     name,
                     action: crate::analysis::facts::AlterViewAction::DropDefault {
@@ -1207,7 +1338,36 @@ impl AstVisitor {
                 continue;
             }
 
-            let qname = QualifiedName::new(None, Ident::new(clean_text, is_quoted));
+            let field_expr = n.syntax().ancestors().skip(1).find_map(FieldExpr::cast);
+
+            let qname = if let Some(fe) = field_expr {
+                let name_refs: Vec<NameRef> =
+                    fe.syntax().children().filter_map(NameRef::cast).collect();
+
+                if name_refs.len() >= 2 {
+                    let is_last = name_refs
+                        .last()
+                        .is_some_and(|last| last.syntax().text_range() == n.syntax().text_range());
+
+                    if is_last {
+                        let schema_text = name_refs[0].text().to_string();
+                        QualifiedName::new(
+                            Some(Ident::new(
+                                schema_text.trim_matches('"').to_string(),
+                                name_refs[0].is_quoted(),
+                            )),
+                            Ident::new(clean_text.clone(), is_quoted),
+                        )
+                    } else {
+                        continue;
+                    }
+                } else {
+                    QualifiedName::new(None, Ident::new(clean_text.clone(), is_quoted))
+                }
+            } else {
+                QualifiedName::new(None, Ident::new(clean_text.clone(), is_quoted))
+            };
+
             if !depends_on.contains(&qname) {
                 depends_on.push(qname);
             }
@@ -2088,42 +2248,94 @@ impl AstVisitor {
         ))
     }
 
-    fn extract_privilege(
-        priv_node: &squawk_syntax::SyntaxNode,
+    fn extract_privilege_from_revoke_command(
+        cmd: &RevokeCommand,
     ) -> crate::analysis::facts::PrivilegeFact {
-        let text = priv_node.text().to_string().to_uppercase();
-        if let Some(role_ref) = priv_node.descendants().find_map(ast::RoleRef::cast) {
+        if let Some(role_ref) = cmd.role_ref() {
             crate::analysis::facts::PrivilegeFact::RoleMembership(Self::resolve_name_ref(
                 &role_ref.name_ref().unwrap(),
             ))
-        } else if text.contains("SELECT") {
+        } else if cmd.select_token().is_some() {
             crate::analysis::facts::PrivilegeFact::Select
-        } else if text.contains("INSERT") {
+        } else if cmd.insert_token().is_some() {
             crate::analysis::facts::PrivilegeFact::Insert
-        } else if text.contains("UPDATE") {
+        } else if cmd.update_token().is_some() {
             crate::analysis::facts::PrivilegeFact::Update
-        } else if text.contains("DELETE") {
+        } else if cmd.delete_token().is_some() {
             crate::analysis::facts::PrivilegeFact::Delete
-        } else if text.contains("TRUNCATE") {
+        } else if cmd.truncate_token().is_some() {
             crate::analysis::facts::PrivilegeFact::Truncate
-        } else if text.contains("REFERENCES") {
+        } else if cmd.references_token().is_some() {
             crate::analysis::facts::PrivilegeFact::References
-        } else if text.contains("TRIGGER") {
+        } else if cmd.trigger_token().is_some() {
             crate::analysis::facts::PrivilegeFact::Trigger
-        } else if text.contains("EXECUTE") {
+        } else if cmd.execute_token().is_some() {
             crate::analysis::facts::PrivilegeFact::Execute
-        } else if text.contains("CREATE") {
+        } else if cmd.create_token().is_some() {
             crate::analysis::facts::PrivilegeFact::Create
-        } else if text.contains("TEMP") || text.contains("TEMPORARY") {
+        } else if cmd.temp_token().is_some() || cmd.temporary_token().is_some() {
             crate::analysis::facts::PrivilegeFact::Temporary
-        } else if text.contains("ALTER") && text.contains("SYSTEM") {
+        } else if cmd.alter_token().is_some() && cmd.system_token().is_some() {
             crate::analysis::facts::PrivilegeFact::AlterSystem
-        } else if text.contains("ALL") {
+        } else if cmd.all_token().is_some() {
             crate::analysis::facts::PrivilegeFact::All
-        } else if let Some(ident) = priv_node.descendants().find_map(ast::Name::cast) {
+        } else if let Some(ident) = cmd.syntax().descendants().find_map(ast::Name::cast) {
             crate::analysis::facts::PrivilegeFact::Named(ident.text().to_string())
         } else {
             crate::analysis::facts::PrivilegeFact::Unknown
+        }
+    }
+
+    fn extract_grant_target_from_privilege_objects(
+        po: Option<squawk_syntax::ast::PrivilegeObjects>,
+        syntax: &squawk_syntax::SyntaxNode,
+    ) -> Option<crate::analysis::facts::GrantTarget> {
+        if let Some(po) = po {
+            if po.table_token().is_some() || po.paths().next().is_some() {
+                let paths: Vec<_> = po
+                    .paths()
+                    .filter_map(|p| Self::path_to_qualified_name(&p))
+                    .collect();
+                if paths.is_empty() {
+                    None
+                } else {
+                    Some(crate::analysis::facts::GrantTarget::Tables(paths))
+                }
+            } else if po.tables_token().is_some()
+                && po.in_token().is_some()
+                && po.schema_token().is_some()
+            {
+                let schemas: Vec<_> = po
+                    .name_refs()
+                    .map(|nr| Self::resolve_name_ref(&nr))
+                    .collect();
+                if schemas.is_empty() {
+                    None
+                } else {
+                    Some(crate::analysis::facts::GrantTarget::AllTablesInSchema(
+                        schemas,
+                    ))
+                }
+            } else {
+                None
+            }
+        } else {
+            let paths: Vec<_> = syntax.descendants().filter_map(Path::cast).collect();
+            let name_refs: Vec<_> = syntax.descendants().filter_map(NameRef::cast).collect();
+            if !paths.is_empty() {
+                Some(crate::analysis::facts::GrantTarget::Tables(
+                    paths
+                        .iter()
+                        .filter_map(Self::path_to_qualified_name)
+                        .collect(),
+                ))
+            } else if !name_refs.is_empty() {
+                Some(crate::analysis::facts::GrantTarget::AllTablesInSchema(
+                    name_refs.iter().map(Self::resolve_name_ref).collect(),
+                ))
+            } else {
+                None
+            }
         }
     }
 
@@ -2132,51 +2344,26 @@ impl AstVisitor {
             crate::analysis::facts::PrivilegeSpec::All
         } else {
             crate::analysis::facts::PrivilegeSpec::List(
-                node.syntax()
-                    .descendants()
-                    .find_map(ast::Privileges::cast)
-                    .map(|pl| {
-                        pl.syntax()
-                            .children()
-                            .map(|c| Self::extract_privilege(&c))
+                node.revoke_command_list()
+                    .map(|rcl| {
+                        rcl.revoke_commands()
+                            .map(|rc| Self::extract_privilege_from_revoke_command(&rc))
                             .collect()
                     })
                     .unwrap_or_default(),
             )
         };
 
-        let paths: Vec<_> = node.syntax().descendants().filter_map(Path::cast).collect();
-        let name_refs: Vec<_> = node
-            .syntax()
-            .descendants()
-            .filter_map(NameRef::cast)
-            .collect();
-
-        let target = if !paths.is_empty() {
-            crate::analysis::facts::GrantTarget::Tables(
-                paths
-                    .iter()
-                    .filter_map(Self::path_to_qualified_name)
-                    .collect(),
-            )
-        } else if !name_refs.is_empty() {
-            crate::analysis::facts::GrantTarget::AllTablesInSchema(
-                name_refs.iter().map(Self::resolve_name_ref).collect(),
-            )
-        } else {
-            return None;
-        };
+        let target = Self::extract_grant_target_from_privilege_objects(
+            node.privilege_objects(),
+            node.syntax(),
+        )?;
 
         let grantees = node
             .role_ref_list()
             .map(|rrl| rrl.role_refs().map(|r| Self::extract_role(&r)).collect())
             .unwrap_or_default();
-        let with_grant_option = node
-            .syntax()
-            .text()
-            .to_string()
-            .to_uppercase()
-            .contains("WITH GRANT OPTION");
+        let with_grant_option = node.grant_with_clause().is_some();
         let granted_by = node.role_ref().map(|r| Self::extract_role(&r));
 
         Some(StatementFact::Grant(crate::analysis::facts::GrantFact {
@@ -2192,50 +2379,29 @@ impl AstVisitor {
         let grant_option_only = node.for_token().is_some()
             && node.grant_token().is_some()
             && node.option_token().is_some();
-        let privileges = if node
-            .syntax()
-            .text()
-            .to_string()
-            .to_uppercase()
-            .contains("ALL PRIVILEGES")
-        {
-            crate::analysis::facts::PrivilegeSpec::All
+
+        let privileges = if let Some(p) = node.privileges() {
+            if p.all_token().is_some() {
+                crate::analysis::facts::PrivilegeSpec::All
+            } else {
+                crate::analysis::facts::PrivilegeSpec::List(
+                    p.revoke_command_list()
+                        .map(|rcl| {
+                            rcl.revoke_commands()
+                                .map(|rc| Self::extract_privilege_from_revoke_command(&rc))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                )
+            }
         } else {
-            crate::analysis::facts::PrivilegeSpec::List(
-                node.syntax()
-                    .descendants()
-                    .find_map(ast::Privileges::cast)
-                    .map(|pl| {
-                        pl.syntax()
-                            .children()
-                            .map(|c| Self::extract_privilege(&c))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-            )
+            crate::analysis::facts::PrivilegeSpec::List(vec![])
         };
 
-        let paths: Vec<_> = node.syntax().descendants().filter_map(Path::cast).collect();
-        let name_refs: Vec<_> = node
-            .syntax()
-            .descendants()
-            .filter_map(NameRef::cast)
-            .collect();
-
-        let target = if !paths.is_empty() {
-            crate::analysis::facts::GrantTarget::Tables(
-                paths
-                    .iter()
-                    .filter_map(Self::path_to_qualified_name)
-                    .collect(),
-            )
-        } else if !name_refs.is_empty() {
-            crate::analysis::facts::GrantTarget::AllTablesInSchema(
-                name_refs.iter().map(Self::resolve_name_ref).collect(),
-            )
-        } else {
-            return None;
-        };
+        let target = Self::extract_grant_target_from_privilege_objects(
+            node.privilege_objects(),
+            node.syntax(),
+        )?;
 
         let revokees = node
             .role_ref_list()
@@ -2362,25 +2528,24 @@ impl AstVisitor {
             return None;
         }
 
-        let text = node.syntax().text().to_string().to_lowercase();
+        let schemas: Vec<String> = node
+            .config_values()
+            .filter_map(|cv| match cv {
+                ast::ConfigValue::NameRef(nr) => Some(Self::resolve_name_ref(&nr)),
+                ast::ConfigValue::Literal(_) => None,
+            })
+            .filter(|s| s.to_lowercase() != "default")
+            .collect();
 
-        if text.contains("default") {
+        let is_default = node.config_value().is_some_and(|cv| {
+            matches!(&cv, ast::ConfigValue::NameRef(nr) if nr.text().to_uppercase() == "DEFAULT")
+        });
+
+        if is_default {
             return Some(StatementFact::SetSearchPath {
                 target: SearchPathTarget::Default,
             });
         }
-
-        let schemas: Vec<String> = node
-            .syntax()
-            .descendants()
-            .filter_map(NameRef::cast)
-            .map(|nr| Self::resolve_name_ref(&nr))
-            .filter(|s| {
-                s.to_lowercase() != "search_path"
-                    && s.to_lowercase() != "to"
-                    && s.to_lowercase() != "set"
-            })
-            .collect();
 
         Some(StatementFact::SetSearchPath {
             target: SearchPathTarget::Schemas(schemas),

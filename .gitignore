@@ -21,3 +21,6 @@ AGENTS.md
 .git/
 *.json
 test_migrations/
+*.opencode/
+.safe-migrate.cache
+live_test/

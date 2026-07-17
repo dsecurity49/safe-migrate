@@ -316,6 +316,7 @@ mod phase10_bug_fixes_and_sorting_tests {
         let v = engine
             .analyze("DROP FUNCTION notify_func(int, text);", &mut state)
             .unwrap();
+        println!("DEBUG Violations: {:?}", v);
 
         assert!(
             v.iter()
@@ -496,7 +497,7 @@ mod phase10_bug_fixes_and_sorting_tests {
     // Finding 2 — Untested rule: PartitionStrategyMismatchRule
     // ─────────────────────────────────────────────
     #[test]
-    fn test_finding2_partition_strategy_mismatch_fires_on_none() {
+    fn test_finding2_partition_strategy_mismatch_silent_on_regular_child() {
         let engine = setup_engine();
         let mut cache = safe_migrate::db::cache::DbCache::new();
         let parent_id = object_id("public", "parent");
@@ -504,7 +505,7 @@ mod phase10_bug_fixes_and_sorting_tests {
             parent_id.clone(),
             object_id("public", "postgres"),
             0,
-            Some(10),
+            Some(0),
             safe_migrate::model::relation::RelationKind::Table,
             safe_migrate::model::relation::Persistence::Permanent,
             0,
@@ -533,11 +534,11 @@ mod phase10_bug_fixes_and_sorting_tests {
             )
             .unwrap();
 
-        let rule_violations: Vec<&str> = v.iter().map(|v| v.rule_id).collect();
+        // A regular (non-partitioned) table attached to a RANGE parent is valid SQL.
+        // The rule should only fire when the child HAS a partition strategy that mismatches.
         assert!(
-            v.iter().any(|v| v.rule_id == "partition-strategy-mismatch"),
-            "Expected partition-strategy-mismatch violation when child has no partition strategy. Got: {:?}",
-            rule_violations
+            !v.iter().any(|v| v.rule_id == "partition-strategy-mismatch"),
+            "partition-strategy-mismatch should NOT fire for attaching a regular table"
         );
     }
 
@@ -712,8 +713,331 @@ mod phase10_bug_fixes_and_sorting_tests {
             "Confidence should be Tainted when dropping a nonexistent column without IF EXISTS"
         );
     }
-}
 
-// ─────────────────────────────────────────────
-// 11. Exhaustive CLI-equivalent Fuzz Tests
+    // ─────────────────────────────────────────────
+    // Bug 16 — Duplicate column name on Rename
+    // ─────────────────────────────────────────────
+    #[test]
+    fn test_bug016_rename_prevents_duplicate_column_name() {
+        use safe_migrate::model::column::Column;
+        use safe_migrate::model::relation::ColumnAction;
+        use safe_migrate::model::relation::RelationState;
+
+        let mut rel = RelationState::new(
+            ObjectId::new("public", "t"),
+            ObjectId::new("public", "postgres"),
+            0,
+            Some(10),
+            RelationKind::Table,
+            Persistence::Permanent,
+            0,
+        );
+        rel.columns.push(Column {
+            name: "a".into(),
+            data_type: Some("int".into()),
+            is_nullable: true,
+            default: None,
+            avg_width: None,
+            default_expr_text: None,
+            type_modifier: None,
+        });
+        rel.columns.push(Column {
+            name: "b".into(),
+            data_type: Some("int".into()),
+            is_nullable: true,
+            default: None,
+            avg_width: None,
+            default_expr_text: None,
+            type_modifier: None,
+        });
+
+        // Rename "a" to "b" — "b" already exists, so rename should be a no-op
+        rel.apply_column_action(&ColumnAction::Rename {
+            from: "a".into(),
+            to: "b".into(),
+        });
+
+        assert_eq!(rel.columns.len(), 2, "no new column should be created");
+        assert!(
+            rel.has_column("a"),
+            "column 'a' should still exist (rename skipped)"
+        );
+        assert!(rel.has_column("b"), "column 'b' should still exist");
+    }
+
+    // ─────────────────────────────────────────────
+    // Bug 17 — SetType/SetDefault on nonexistent column
+    // ─────────────────────────────────────────────
+    #[test]
+    fn test_bug017_set_type_on_nonexistent_column_taints_confidence() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze("CREATE TABLE t(id int);", &mut state)
+            .unwrap();
+
+        let _v = engine
+            .analyze(
+                "ALTER TABLE t ALTER COLUMN nonexistent_col SET DATA TYPE text;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert_eq!(
+            state.local.confidence,
+            safe_migrate::analysis::state::Confidence::Tainted,
+            "Confidence should be Tainted when SET TYPE on a nonexistent column"
+        );
+    }
+
+    #[test]
+    fn test_bug017_set_default_on_nonexistent_column_taints_confidence() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze("CREATE TABLE t(id int);", &mut state)
+            .unwrap();
+
+        let _v = engine
+            .analyze(
+                "ALTER TABLE t ALTER COLUMN nonexistent_col SET DEFAULT 42;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert_eq!(
+            state.local.confidence,
+            safe_migrate::analysis::state::Confidence::Tainted,
+            "Confidence should be Tainted when SET DEFAULT on a nonexistent column"
+        );
+    }
+
+    #[test]
+    fn test_bug017_set_type_on_existing_column_succeeds() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze("CREATE TABLE t(id int);", &mut state)
+            .unwrap();
+
+        engine
+            .analyze(
+                "ALTER TABLE t ALTER COLUMN id SET DATA TYPE bigint;",
+                &mut state,
+            )
+            .unwrap();
+
+        // Confidence should remain Exact since the column exists
+        assert_eq!(
+            state.local.confidence,
+            safe_migrate::analysis::state::Confidence::Exact,
+            "Confidence should remain Exact when SET TYPE on existing column"
+        );
+    }
+    // ─────────────────────────────────────────────
+    // Bug 9 — Privilege enum consistency: All variant
+    // ─────────────────────────────────────────────
+    #[test]
+    fn test_bug009_privilege_all_variant_consistency() {
+        use safe_migrate::model::relation::Privilege;
+        use safe_migrate::model::relation::PrivilegeMatrix;
+        use std::collections::HashSet;
+
+        // 1. Both enums now have All (compile-time check — relation::Privilege::All exists)
+        let _all = Privilege::All;
+
+        let mut matrix = PrivilegeMatrix::default();
+        let role = object_id("public", "test_role");
+        let mut all_privileges = HashSet::new();
+        all_privileges.insert(Privilege::All);
+
+        // 2. Grant All, then check individual privileges
+        matrix.grant(role.clone(), all_privileges);
+        assert!(matrix.has_privilege(&role, Privilege::Select));
+        assert!(matrix.has_privilege(&role, Privilege::Insert));
+        assert!(matrix.has_privilege(&role, Privilege::Update));
+        assert!(matrix.has_privilege(&role, Privilege::Delete));
+        assert!(matrix.has_privilege(&role, Privilege::Truncate));
+        assert!(matrix.has_privilege(&role, Privilege::References));
+        assert!(matrix.has_privilege(&role, Privilege::Trigger));
+
+        // 3. has_privilege for All itself should also work
+        assert!(matrix.has_privilege(&role, Privilege::All));
+
+        // 4. Revoke All clears everything
+        let mut revoke_all = HashSet::new();
+        revoke_all.insert(Privilege::All);
+        matrix.revoke(&role, &revoke_all);
+        assert!(!matrix.has_privilege(&role, Privilege::Select));
+        assert!(!matrix.has_privilege(&role, Privilege::All));
+    }
+    // ─────────────────────────────────────────────
+    // Bug 14 — Directive parsing tolerates whitespace
+    // ─────────────────────────────────────────────
+    #[test]
+    fn test_bug014_directive_ignore_with_spaces() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let sql = "/* safe-migrate: ignore ( drop-database ) */ DROP DATABASE my_db;";
+        let violations = engine.analyze(sql, &mut state).unwrap();
+
+        assert!(
+            !violations.iter().any(|v| v.rule_id == "drop-database"),
+            "ignore directive with spaces before parens should suppress the rule"
+        );
+    }
+
+    #[test]
+    fn test_bug014_directive_ignore_no_spaces() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let sql = "/* safe-migrate: ignore(drop-database) */ DROP DATABASE my_db;";
+        let violations = engine.analyze(sql, &mut state).unwrap();
+
+        assert!(
+            !violations.iter().any(|v| v.rule_id == "drop-database"),
+            "ignore directive without spaces should still work"
+        );
+    }
+
+    #[test]
+    fn test_bug014_directive_ignore_file_with_spaces() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let sql = "/* safe-migrate: ignore-file ( drop-database ) */ DROP DATABASE my_db;";
+        let violations = engine.analyze(sql, &mut state).unwrap();
+
+        assert!(
+            !violations.iter().any(|v| v.rule_id == "drop-database"),
+            "ignore-file directive with spaces before parens should suppress the rule"
+        );
+    }
+
+    #[test]
+    fn test_bug014_directive_comment_variations() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        // Line comment variant
+        let sql = "-- safe-migrate: ignore(drop-database)\nDROP DATABASE my_db;";
+        let violations = engine.analyze(sql, &mut state).unwrap();
+
+        assert!(
+            !violations.iter().any(|v| v.rule_id == "drop-database"),
+            "ignore directive in line comment should suppress the rule"
+        );
+    }
+
+    // ─────────────────────────────────────────────
+    // Bug 15 — stmt_text strips leading comments
+    // ─────────────────────────────────────────────
+    #[test]
+    fn test_bug015_violation_sql_strips_leading_line_comments() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let sql = "-- preceding line comment\nDROP DATABASE my_db;";
+        let violations = engine.analyze(sql, &mut state).unwrap();
+
+        let v = violations
+            .iter()
+            .find(|v| v.rule_id == "drop-database")
+            .expect("Expected drop-database violation");
+
+        let sql_text = v.sql.as_ref().expect("Expected sql field to be set");
+        assert!(
+            !sql_text.starts_with("--"),
+            "Violation sql should not include leading comments. Got: {:?}",
+            sql_text
+        );
+    }
+
+    #[test]
+    fn test_bug015_violation_sql_strips_leading_block_comments() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let sql = "/* preceding block comment */ DROP DATABASE my_db;";
+        let violations = engine.analyze(sql, &mut state).unwrap();
+
+        let v = violations
+            .iter()
+            .find(|v| v.rule_id == "drop-database")
+            .expect("Expected drop-database violation");
+
+        let sql_text = v.sql.as_ref().expect("Expected sql field to be set");
+        assert!(
+            !sql_text.starts_with("/*"),
+            "Violation sql should not include leading block comments. Got: {:?}",
+            sql_text
+        );
+    }
+
+    // ─────────────────────────────────────────────
+    // Bug 12 — Partition threshold integer division floor at 1
+    // ─────────────────────────────────────────────
+    #[test]
+    fn test_bug012_partition_threshold_floor_at_one() {
+        let mut config = safe_migrate::engine::config::Config::default();
+        config.tier1_threshold_rows = 1;
+        config.tier2_threshold_rows = 1;
+        let engine = safe_migrate::engine::engine::SafeMigrateEngine::new(config);
+        let mut cache = safe_migrate::db::cache::DbCache::new();
+
+        let parent_id = object_id("public", "parent");
+        let child_id = object_id("public", "child");
+        let mut parent = safe_migrate::model::relation::RelationState::new(
+            parent_id.clone(),
+            object_id("public", "postgres"),
+            0,
+            Some(0),
+            safe_migrate::model::relation::RelationKind::Table,
+            safe_migrate::model::relation::Persistence::Permanent,
+            0,
+        );
+        parent.partition_type = Some("RANGE".to_string());
+        cache.insert_baseline(parent_id, parent);
+
+        let mut child = safe_migrate::model::relation::RelationState::new(
+            child_id.clone(),
+            object_id("public", "postgres"),
+            0,
+            Some(0),
+            safe_migrate::model::relation::RelationKind::Table,
+            safe_migrate::model::relation::Persistence::Permanent,
+            0,
+        );
+        child.partition_type = Some("RANGE".to_string());
+        cache.insert_baseline(child_id, child);
+
+        let mut state = safe_migrate::AnalysisState::new(cache);
+
+        let violations = engine
+            .analyze(
+                "ALTER TABLE child ADD FOREIGN KEY (parent_id) REFERENCES parent(id);",
+                &mut state,
+            )
+            .unwrap();
+
+        let tier1_violations: Vec<&safe_migrate::report::violations::Violation> = violations
+            .iter()
+            .filter(|v| {
+                v.tier == safe_migrate::report::violations::ViolationTier::Tier1
+                    && v.rule_id == "blocking-constraint"
+            })
+            .collect();
+
+        assert!(
+            tier1_violations.is_empty(),
+            "Partitioned tables with 0 rows should not trigger Tier1 with threshold=1 (adjusted threshold should floor at 1, not 0). Found: {:?}",
+            tier1_violations
+        );
+    }
+}
 // ─────────────────────────────────────────────

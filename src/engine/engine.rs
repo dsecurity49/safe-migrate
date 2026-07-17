@@ -112,7 +112,8 @@ impl SafeMigrateEngine {
         sql: &str,
         state: &mut AnalysisState,
     ) -> Result<Vec<Violation>, Vec<String>> {
-        let parsed = SourceFile::parse(sql);
+        let sql = Self::normalize_execute(sql);
+        let parsed = SourceFile::parse(&sql);
         let errors: Vec<String> = parsed.errors().iter().map(|e| e.to_string()).collect();
         if !errors.is_empty() {
             return Err(errors);
@@ -156,8 +157,8 @@ impl SafeMigrateEngine {
                 Self::parse_directives(token.text(), &mut dummy, &mut stmt_ignores);
             }
 
-            // Capture raw statement text for sql field on violations
-            let stmt_text = stmt.syntax().text().to_string();
+            // Capture raw statement text for sql field on violations (strip leading comments)
+            let stmt_text = Self::strip_sql_leading_comments(&stmt.syntax().text().to_string());
 
             if let Some(fact) = AstVisitor::extract(&stmt) {
                 let mutations = Resolver::resolve(&fact, state);
@@ -243,31 +244,89 @@ impl SafeMigrateEngine {
         Ok(all_violations)
     }
 
+    /// Pre-process SQL to handle EXECUTE '...' which Squawk's parser does not
+    /// recognize (top-level EXECUTE expects a prepared-statement name, not a
+    /// string literal).  Rewriting to DO '...' is semantically equivalent at
+    /// the top level and lets the parser produce a proper DoBlock node.
+    fn normalize_execute(sql: &str) -> String {
+        let mut out = String::with_capacity(sql.len());
+        for line in sql.split_inclusive('\n') {
+            let trimmed = line.trim_start();
+            if trimmed.len() > 9 && trimmed[..9].eq_ignore_ascii_case("EXECUTE '") {
+                let indent = &line[..line.len() - trimmed.len()];
+                out.push_str(indent);
+                out.push_str("DO '");
+                out.push_str(&trimmed[9..]);
+            } else if trimmed.len() > 10 && trimmed[..10].eq_ignore_ascii_case("EXECUTE $$") {
+                let indent = &line[..line.len() - trimmed.len()];
+                out.push_str(indent);
+                out.push_str("DO $$");
+                out.push_str(&trimmed[10..]);
+            } else {
+                out.push_str(line);
+            }
+        }
+        out
+    }
+
     fn parse_directives(
         text: &str,
         file_ignores: &mut HashSet<String>,
         stmt_ignores: &mut HashSet<String>,
     ) {
-        let mut search = text;
-        while let Some(idx) = search.find("safe-migrate: ignore-file(") {
-            let start = idx + "safe-migrate: ignore-file(".len();
-            if let Some(end) = search[start..].find(')') {
-                file_ignores.insert(search[start..start + end].trim().to_string());
-                search = &search[start + end + 1..];
-            } else {
-                break;
-            }
-        }
+        let marker = "safe-migrate:";
+        let mut pos = 0;
 
-        let mut search = text;
-        while let Some(idx) = search.find("safe-migrate: ignore(") {
-            let start = idx + "safe-migrate: ignore(".len();
-            if let Some(end) = search[start..].find(')') {
-                stmt_ignores.insert(search[start..start + end].trim().to_string());
-                search = &search[start + end + 1..];
-            } else {
-                break;
+        while let Some(start) = text[pos..].find(marker) {
+            let after = text[pos + start + marker.len()..].trim_start();
+
+            if let Some(rest) = after.strip_prefix("ignore-file") {
+                let rest = rest.trim_start();
+                if let Some(inner) = rest
+                    .strip_prefix('(')
+                    .and_then(|s| s.find(')').map(|e| &s[..e]))
+                {
+                    file_ignores.insert(inner.trim().to_string());
+                }
+            } else if let Some(rest) = after.strip_prefix("ignore") {
+                let rest = rest.trim_start();
+                if let Some(inner) = rest
+                    .strip_prefix('(')
+                    .and_then(|s| s.find(')').map(|e| &s[..e]))
+                {
+                    stmt_ignores.insert(inner.trim().to_string());
+                }
             }
+
+            pos = pos + start + marker.len();
         }
+    }
+
+    fn strip_sql_leading_comments(s: &str) -> String {
+        let mut pos = 0;
+        let bytes = s.as_bytes();
+        while pos < bytes.len() {
+            while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+                pos += 1;
+            }
+            if pos + 1 < bytes.len() && bytes[pos] == b'-' && bytes[pos + 1] == b'-' {
+                while pos < bytes.len() && bytes[pos] != b'\n' {
+                    pos += 1;
+                }
+                continue;
+            }
+            if pos + 1 < bytes.len() && bytes[pos] == b'/' && bytes[pos + 1] == b'*' {
+                pos += 2;
+                while pos + 1 < bytes.len() && !(bytes[pos] == b'*' && bytes[pos + 1] == b'/') {
+                    pos += 1;
+                }
+                if pos + 1 < bytes.len() {
+                    pos += 2;
+                }
+                continue;
+            }
+            break;
+        }
+        s[pos..].to_string()
     }
 }

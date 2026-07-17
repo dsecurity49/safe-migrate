@@ -582,7 +582,7 @@ mod rule_evaluation_tests {
             )
             .unwrap();
 
-        let func_id = ObjectId::new("public", "add(int,int)");
+        let func_id = ObjectId::new("public", "add(integer,integer)");
         assert!(state.local.functions.contains_key(&func_id));
 
         // Alter volatility

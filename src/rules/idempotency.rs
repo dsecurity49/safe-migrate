@@ -62,6 +62,22 @@ impl Rule for IdempotencyRule {
                     format!("CREATE TABLE {} without IF NOT EXISTS", c.id),
                 );
             }
+            Mutation::CreateView(c) if !c.or_replace => {
+                add_violation(
+                    OperationKind::CreateView,
+                    ObjectKind::View,
+                    c.id.to_string(),
+                    format!("CREATE VIEW {} without OR REPLACE", c.id),
+                );
+            }
+            Mutation::CreateSchema(c) if !c.if_not_exists => {
+                add_violation(
+                    OperationKind::CreateSchema,
+                    ObjectKind::Schema,
+                    c.name.clone(),
+                    format!("CREATE SCHEMA {} without IF NOT EXISTS", c.name),
+                );
+            }
             Mutation::CreateIndex(c) if !c.if_not_exists => {
                 add_violation(
                     OperationKind::CreateIndex,
@@ -72,7 +88,7 @@ impl Rule for IdempotencyRule {
             }
             Mutation::CreateSequence(c) if !c.if_not_exists => {
                 add_violation(
-                    OperationKind::Other("create_sequence".to_string()),
+                    OperationKind::CreateSequence,
                     ObjectKind::Sequence,
                     c.id.to_string(),
                     format!("CREATE SEQUENCE {} without IF NOT EXISTS", c.id),
@@ -87,6 +103,16 @@ impl Rule for IdempotencyRule {
                     d.id.to_string(),
                     format!("DROP TABLE {} without IF EXISTS", d.id),
                 );
+            }
+            Mutation::DropSchema(d) if !d.if_exists => {
+                for name in &d.names {
+                    add_violation(
+                        OperationKind::DropSchema,
+                        ObjectKind::Schema,
+                        name.clone(),
+                        format!("DROP SCHEMA {} without IF EXISTS", name),
+                    );
+                }
             }
             Mutation::DropIndex(d) if !d.if_exists => {
                 add_violation(
