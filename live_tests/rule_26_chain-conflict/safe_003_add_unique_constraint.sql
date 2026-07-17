@@ -1,0 +1,1 @@
+ALTER TABLE test_table ADD CONSTRAINT uq_id UNIQUE (id);

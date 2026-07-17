@@ -1,0 +1,1 @@
+ALTER TABLE list_parent ATTACH PARTITION range_child FOR VALUES FROM (1) TO (100);

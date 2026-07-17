@@ -1,0 +1,1 @@
+GRANT UPDATE ON test_table TO PUBLIC;

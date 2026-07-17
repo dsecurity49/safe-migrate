@@ -1,0 +1,1 @@
+SET CONSTRAINTS fk_constraint IMMEDIATE;

@@ -1,0 +1,3 @@
+BEGIN;
+ALTER TYPE my_enum ADD VALUE 'e' BEFORE 'd';
+COMMIT;

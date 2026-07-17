@@ -1,0 +1,1 @@
+VACUUM FULL VERBOSE test_table;

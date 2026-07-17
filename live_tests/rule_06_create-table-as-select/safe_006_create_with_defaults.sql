@@ -1,0 +1,1 @@
+CREATE TABLE t (id INT DEFAULT 1, name TEXT);

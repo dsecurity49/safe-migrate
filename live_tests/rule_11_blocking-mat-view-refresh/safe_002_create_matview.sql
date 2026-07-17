@@ -1,0 +1,1 @@
+CREATE MATERIALIZED VIEW mymatview AS SELECT * FROM test_table;

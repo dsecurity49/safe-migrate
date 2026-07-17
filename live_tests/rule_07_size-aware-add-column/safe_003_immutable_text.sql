@@ -1,0 +1,1 @@
+ALTER TABLE test_table ADD COLUMN c TEXT DEFAULT 'hello';

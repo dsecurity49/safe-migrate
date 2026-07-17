@@ -1,0 +1,1 @@
+CREATE POLICY p ON test_table FOR UPDATE TO PUBLIC USING (true);

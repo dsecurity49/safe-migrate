@@ -1,0 +1,1 @@
+ALTER TABLE hash_parent ATTACH PARTITION list_child FOR VALUES IN (10, 20, 30);

@@ -1,0 +1,1 @@
+CREATE INDEX i ON t(id);

@@ -1,0 +1,1 @@
+ALTER SCHEMA public RENAME TO pub;

@@ -1,0 +1,1 @@
+CREATE POLICY p ON test_table AS RESTRICTIVE FOR SELECT TO PUBLIC USING (tenant_id = current_setting('app.tenant'));

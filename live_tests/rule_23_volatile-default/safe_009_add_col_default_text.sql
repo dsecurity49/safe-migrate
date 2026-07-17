@@ -1,0 +1,1 @@
+ALTER TABLE test_table ADD COLUMN label TEXT DEFAULT 'N/A';

@@ -1,0 +1,1 @@
+CREATE POLICY p ON test_table AS RESTRICTIVE FOR INSERT TO PUBLIC WITH CHECK (id > 0 AND status = 'active');

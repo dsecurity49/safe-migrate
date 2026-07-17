@@ -1,0 +1,1 @@
+ALTER TABLE t_large ADD CONSTRAINT c CHECK (id > 0);

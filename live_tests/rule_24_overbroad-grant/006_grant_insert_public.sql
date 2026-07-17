@@ -1,0 +1,1 @@
+GRANT INSERT ON test_table TO PUBLIC;

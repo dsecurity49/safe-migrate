@@ -1,0 +1,1 @@
+VACUUM FULL VERBOSE ANALYZE test_table;
