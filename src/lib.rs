@@ -18,3 +18,4 @@ pub use db::cache::DbCache;
 pub use engine::config::Config;
 pub use engine::engine::SafeMigrateEngine;
 pub use report::reporter::Reporter;
+pub use report::interactive::run_interactive;

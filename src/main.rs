@@ -42,6 +42,10 @@ enum Commands {
         /// Output results in JSON format for CI/CD integration
         #[arg(long)]
         json: bool,
+
+        /// Launch an interactive terminal UI to browse violations
+        #[arg(short, long)]
+        interactive: bool,
     },
     /// Lint a chain of SQL migration files in order (state persists across files)
     LintChain {
@@ -61,6 +65,10 @@ enum Commands {
         /// Output results in JSON format for CI/CD integration
         #[arg(long)]
         json: bool,
+
+        /// Launch an interactive terminal UI to browse violations
+        #[arg(short, long)]
+        interactive: bool,
     },
     /// Sync database table statistics for accurate lock evaluation
     Sync {
@@ -87,6 +95,7 @@ fn main() -> Result<()> {
             cache,
             no_cache,
             json: _,
+            interactive: _,
         } => {
             let sql = fs::read_to_string(file)
                 .with_context(|| format!("Failed to read migration file: {}", file.display()))?;
@@ -165,6 +174,11 @@ fn main() -> Result<()> {
                         Reporter::print_json_report(&violations, &state.local.confidence);
                         return Ok(());
                     }
+                    
+                    if let Commands::Lint { interactive: true, .. } = &cli.command {
+                        safe_migrate::run_interactive(&violations, &state.local.confidence)?;
+                        return Ok(());
+                    }
 
                     let should_fail_ci =
                         Reporter::print_report(&violations, &state.local.confidence);
@@ -188,6 +202,7 @@ fn main() -> Result<()> {
             cache,
             no_cache,
             json: _,
+            interactive: _,
         } => {
             let mut files: Vec<_> = fs::read_dir(dir)
                 .with_context(|| format!("Failed to read directory: {}", dir.display()))?
@@ -259,6 +274,11 @@ fn main() -> Result<()> {
                 Ok(violations) => {
                     if let Commands::LintChain { json: true, .. } = &cli.command {
                         Reporter::print_json_report(&violations, &state.local.confidence);
+                        return Ok(());
+                    }
+                    
+                    if let Commands::LintChain { interactive: true, .. } = &cli.command {
+                        safe_migrate::run_interactive(&violations, &state.local.confidence)?;
                         return Ok(());
                     }
 
