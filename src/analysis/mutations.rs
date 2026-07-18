@@ -441,6 +441,7 @@ pub enum OpaqueMutation {
     PrepareTransaction,
     SetTransaction,
     SetConstraints,
+    StateCollision(String),
     UnresolvedReference {
         object_kind: crate::report::violations::ObjectKind,
         object_name: String,

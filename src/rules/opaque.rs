@@ -36,33 +36,56 @@ impl Rule for OpaqueDynamicSqlRule {
             ) {
                 return vec![];
             }
-            let block_type = match op {
-                crate::analysis::mutations::OpaqueMutation::DoBlock => "DO block",
-                crate::analysis::mutations::OpaqueMutation::Execute => "EXECUTE statement",
-                crate::analysis::mutations::OpaqueMutation::DynamicSql => "Dynamic SQL",
+            let (block_type, is_collision) = match &op {
+                crate::analysis::mutations::OpaqueMutation::DoBlock => ("DO block", false),
+                crate::analysis::mutations::OpaqueMutation::Execute => ("EXECUTE statement", false),
+                crate::analysis::mutations::OpaqueMutation::DynamicSql => ("Dynamic SQL", false),
                 crate::analysis::mutations::OpaqueMutation::PrepareTransaction => {
-                    "PREPARE TRANSACTION"
+                    ("PREPARE TRANSACTION", false)
                 }
-                crate::analysis::mutations::OpaqueMutation::SetTransaction => "SET TRANSACTION",
-                crate::analysis::mutations::OpaqueMutation::SetConstraints => "SET CONSTRAINTS",
+                crate::analysis::mutations::OpaqueMutation::SetTransaction => {
+                    ("SET TRANSACTION", false)
+                }
+                crate::analysis::mutations::OpaqueMutation::SetConstraints => {
+                    ("SET CONSTRAINTS", false)
+                }
+                crate::analysis::mutations::OpaqueMutation::StateCollision(msg) => {
+                    (msg.as_str(), true)
+                }
                 crate::analysis::mutations::OpaqueMutation::UnresolvedReference { .. } => {
                     unreachable!()
                 }
             };
 
-            violations.push(Violation {
-                source_range: None,
-                rule_id: self.id(),
-                operation_kind: OperationKind::OpaqueSql,
-                object_kind: ObjectKind::Opaque,
-                object_name: "<dynamic>".to_string(),
-                tier: self.default_tier(),
-                reason: format!("Encountered opaque {}", block_type),
-                recipe: self.recipe(),
-                dedup_key: None,
-                sql: None,
-                fk_dependency_related: false,
-            });
+            if is_collision {
+                violations.push(Violation {
+                    source_range: None,
+                    rule_id: "schema-drift",
+                    operation_kind: OperationKind::Conflict,
+                    object_kind: ObjectKind::Opaque,
+                    object_name: "<dynamic>".to_string(),
+                    tier: ViolationTier::Tier1,
+                    reason: format!("Migration state conflict: {}", block_type),
+                    recipe: "This migration attempts to create an object that already exists, or alter an object that does not. The simulated state has derailed.",
+                    dedup_key: None,
+                    sql: None,
+                    fk_dependency_related: false,
+                });
+            } else {
+                violations.push(Violation {
+                    source_range: None,
+                    rule_id: self.id(),
+                    operation_kind: OperationKind::OpaqueSql,
+                    object_kind: ObjectKind::Opaque,
+                    object_name: "<dynamic>".to_string(),
+                    tier: self.default_tier(),
+                    reason: format!("Encountered opaque {}", block_type),
+                    recipe: self.recipe(),
+                    dedup_key: None,
+                    sql: None,
+                    fk_dependency_related: false,
+                });
+            }
         }
 
         violations

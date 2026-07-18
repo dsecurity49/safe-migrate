@@ -764,8 +764,14 @@ impl TypeChangeRewriteRule {
         new_modifier: Option<i32>,
     ) -> bool {
         match (old_modifier, new_modifier) {
+            // In Postgres, -1 is unbounded. If we go from unbounded to anything bounded (>= 4), it's lossy.
+            (Some(-1), Some(new)) if new != -1 => true,
+            // If the new one is unbounded, it's never narrowing
+            (_, Some(-1)) => false,
+            // Both bounded: narrowing if new limit is smaller
             (Some(old), Some(new)) => new < old,
-            (None, Some(_)) => true,
+            // Going from no modifier (often implying unbounded or default) to a bounded modifier is lossy
+            (None, Some(new)) if new != -1 => true,
             _ => false,
         }
     }

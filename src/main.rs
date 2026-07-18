@@ -174,8 +174,11 @@ fn main() -> Result<()> {
                         Reporter::print_json_report(&violations, &state.local.confidence);
                         return Ok(());
                     }
-                    
-                    if let Commands::Lint { interactive: true, .. } = &cli.command {
+
+                    if let Commands::Lint {
+                        interactive: true, ..
+                    } = &cli.command
+                    {
                         safe_migrate::run_interactive(&violations, &state.local.confidence)?;
                         return Ok(());
                     }
@@ -276,8 +279,11 @@ fn main() -> Result<()> {
                         Reporter::print_json_report(&violations, &state.local.confidence);
                         return Ok(());
                     }
-                    
-                    if let Commands::LintChain { interactive: true, .. } = &cli.command {
+
+                    if let Commands::LintChain {
+                        interactive: true, ..
+                    } = &cli.command
+                    {
                         safe_migrate::run_interactive(&violations, &state.local.confidence)?;
                         return Ok(());
                     }

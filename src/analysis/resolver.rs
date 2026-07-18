@@ -161,7 +161,9 @@ impl Resolver {
                     new_id.inferred_schema = id.inferred_schema;
                     mutations.push(Mutation::Rename(Rename { old_id: id, new_id }));
                 } else {
-                    mutations.push(Mutation::Opaque(OpaqueMutation::DynamicSql));
+                    mutations.push(Mutation::Opaque(OpaqueMutation::StateCollision(
+                        "Schema structure collision".to_string(),
+                    )));
                 }
             }
             StatementFact::DropSchema {
@@ -200,7 +202,9 @@ impl Resolver {
                             Some(crate::model::sequence::SequenceOverlay::Present(_))
                         ))
                 {
-                    return vec![Mutation::Opaque(OpaqueMutation::DynamicSql)];
+                    return vec![Mutation::Opaque(OpaqueMutation::StateCollision(
+                        "Schema structure collision".to_string(),
+                    ))];
                 }
 
                 let resolved_persistence = match persistence {
@@ -224,7 +228,9 @@ impl Resolver {
                 for fk in foreign_keys {
                     let to_table = Self::resolve_lookup_name(&fk.references, state);
                     if !state.relation_is_present(&to_table) {
-                        return vec![Mutation::Opaque(OpaqueMutation::DynamicSql)];
+                        return vec![Mutation::Opaque(OpaqueMutation::StateCollision(
+                            "Schema structure collision".to_string(),
+                        ))];
                     }
                     fk_mutations.push(FkMutation {
                         constraint_name: fk.constraint_name.clone(),
@@ -241,7 +247,9 @@ impl Resolver {
                 if let Some(p_id) = &partition_of_id
                     && !state.relation_is_present(p_id)
                 {
-                    return vec![Mutation::Opaque(OpaqueMutation::DynamicSql)];
+                    return vec![Mutation::Opaque(OpaqueMutation::StateCollision(
+                        "Schema structure collision".to_string(),
+                    ))];
                 }
 
                 mutations.push(Mutation::CreateTable(CreateTable {
@@ -265,7 +273,9 @@ impl Resolver {
                 let id = Self::resolve_creation_name(name, state);
 
                 if !*or_replace && state.relation_is_present(&id) {
-                    return vec![Mutation::Opaque(OpaqueMutation::DynamicSql)];
+                    return vec![Mutation::Opaque(OpaqueMutation::StateCollision(
+                        "Schema structure collision".to_string(),
+                    ))];
                 }
 
                 let resolved_depends = depends_on
@@ -307,7 +317,9 @@ impl Resolver {
                 let id = Self::resolve_creation_name(name, state);
 
                 if state.relation_is_present(&id) {
-                    return vec![Mutation::Opaque(OpaqueMutation::DynamicSql)];
+                    return vec![Mutation::Opaque(OpaqueMutation::StateCollision(
+                        "Schema structure collision".to_string(),
+                    ))];
                 }
 
                 let resolved_depends = depends_on
@@ -348,7 +360,9 @@ impl Resolver {
                 let id = Self::resolve_creation_name(name, state);
 
                 if !*if_not_exists && state.local.graph.indexes.iter().any(|ix| ix.index_id == id) {
-                    return vec![Mutation::Opaque(OpaqueMutation::DynamicSql)];
+                    return vec![Mutation::Opaque(OpaqueMutation::StateCollision(
+                        "Schema structure collision".to_string(),
+                    ))];
                 }
 
                 mutations.push(Mutation::CreateIndex(CreateIndex {
@@ -438,7 +452,9 @@ impl Resolver {
                     Some(crate::model::types::TypeOverlay::Present(_))
                 ) || state.relation_is_present(&id)
                 {
-                    return vec![Mutation::Opaque(OpaqueMutation::DynamicSql)];
+                    return vec![Mutation::Opaque(OpaqueMutation::StateCollision(
+                        "Schema structure collision".to_string(),
+                    ))];
                 }
 
                 let mapped_kind = match create_type.kind {
@@ -476,7 +492,9 @@ impl Resolver {
                     Some(crate::model::types::TypeOverlay::Present(_))
                 ) || state.relation_is_present(&id)
                 {
-                    return vec![Mutation::Opaque(OpaqueMutation::DynamicSql)];
+                    return vec![Mutation::Opaque(OpaqueMutation::StateCollision(
+                        "Schema structure collision".to_string(),
+                    ))];
                 }
 
                 mutations.push(Mutation::CreateDomain(CreateDomainMutation {
@@ -518,7 +536,9 @@ impl Resolver {
                         Some(crate::model::sequence::SequenceOverlay::Present(_))
                     )
                 {
-                    return vec![Mutation::Opaque(OpaqueMutation::DynamicSql)];
+                    return vec![Mutation::Opaque(OpaqueMutation::StateCollision(
+                        "Schema structure collision".to_string(),
+                    ))];
                 }
 
                 let resolved_owned_by = owned_by.as_ref().map(|(table_name, col)| {
@@ -685,7 +705,9 @@ impl Resolver {
                         AlterTableActionFact::AttachPartition { child } => {
                             let child_id = Self::resolve_lookup_name(child, state);
                             if state.local.graph.check_partition_cycle(&id, &child_id) {
-                                return vec![Mutation::Opaque(OpaqueMutation::DynamicSql)];
+                                return vec![Mutation::Opaque(OpaqueMutation::StateCollision(
+                                    "Schema structure collision".to_string(),
+                                ))];
                             }
                             AlterTableActionMutation::AttachPartition { child: child_id }
                         }
@@ -810,7 +832,9 @@ impl Resolver {
             StatementFact::RollbackTransaction => mutations.push(Mutation::RollbackTransaction),
             StatementFact::RollbackToSavepoint { name } => {
                 if !state.local.transactions.iter().any(|t| t.name == *name) {
-                    return vec![Mutation::Opaque(OpaqueMutation::DynamicSql)];
+                    return vec![Mutation::Opaque(OpaqueMutation::StateCollision(
+                        "Schema structure collision".to_string(),
+                    ))];
                 }
                 mutations.push(Mutation::RollbackToSavepoint(RollbackToSavepointMutation {
                     name: name.clone(),
@@ -823,7 +847,9 @@ impl Resolver {
             }
             StatementFact::ReleaseSavepoint { name } => {
                 if !state.local.transactions.iter().any(|t| t.name == *name) {
-                    return vec![Mutation::Opaque(OpaqueMutation::DynamicSql)];
+                    return vec![Mutation::Opaque(OpaqueMutation::StateCollision(
+                        "Schema structure collision".to_string(),
+                    ))];
                 }
                 mutations.push(Mutation::ReleaseSavepoint(ReleaseSavepointMutation {
                     name: name.clone(),
