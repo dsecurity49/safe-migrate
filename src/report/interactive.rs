@@ -7,7 +7,7 @@ use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     execute, queue,
     style::{Color, Print, ResetColor, SetForegroundColor},
-    terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType},
+    terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use anyhow::Result;
 
@@ -19,7 +19,13 @@ pub fn run_interactive(violations: &[Violation], confidence: &Confidence) -> Res
 
     let mut stdout = stdout();
     enable_raw_mode()?;
-    execute!(stdout, cursor::Hide, Clear(ClearType::All), cursor::MoveTo(0, 0))?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        cursor::Hide,
+        Clear(ClearType::All),
+        cursor::MoveTo(0, 0)
+    )?;
 
     let mut selected = 0;
     
@@ -34,8 +40,9 @@ pub fn run_interactive(violations: &[Violation], confidence: &Confidence) -> Res
 
         // Calculate available height for the list dynamically
         let (_w, Height(h)) = terminal_size().unwrap_or((Width(80), Height(24)));
-        // Subtract lines for header (2), footer separator (2), detail text (~4), SQL (~4), and quit instructions (2)
-        let window_size = (h.saturating_sub(15) as usize).max(5);
+        // Subtract lines for header (2), footer separator (2), detail text (~5), SQL (~6), and quit instructions (2)
+        // We use 18 as a safe heuristic to prevent the text from wrapping and triggering a terminal scroll.
+        let window_size = (h.saturating_sub(18) as usize).max(3);
 
         // Render list (sliding window)
         let start = if selected >= window_size / 2 {
@@ -88,15 +95,27 @@ pub fn run_interactive(violations: &[Violation], confidence: &Confidence) -> Res
         )?;
         
         if let Some(sql) = &active.sql {
+            // Limit SQL context to max 5 lines to prevent pushing UI off-screen
+            let mut sql_lines: Vec<&str> = sql.lines().collect();
+            let mut truncated = false;
+            if sql_lines.len() > 5 {
+                sql_lines.truncate(5);
+                truncated = true;
+            }
+            
             queue!(
                 stdout,
                 SetForegroundColor(Color::White),
                 Print("\r\nSQL Context:\r\n"),
                 SetForegroundColor(Color::DarkGrey),
                 // Important: replace all \n inside the SQL with \r\n
-                Print(format!("{}\r\n", sql.replace('\n', "\r\n"))),
-                ResetColor,
+                Print(format!("{}\r\n", sql_lines.join("\r\n"))),
             )?;
+            
+            if truncated {
+                queue!(stdout, Print("... (truncated)\r\n"))?;
+            }
+            queue!(stdout, ResetColor)?;
         }
 
         queue!(
@@ -120,7 +139,13 @@ pub fn run_interactive(violations: &[Violation], confidence: &Confidence) -> Res
     }
 
     disable_raw_mode()?;
-    execute!(stdout, cursor::Show, Clear(ClearType::All), cursor::MoveTo(0, 0))?;
+    execute!(
+        stdout,
+        cursor::Show,
+        Clear(ClearType::All),
+        LeaveAlternateScreen,
+        cursor::MoveTo(0, 0)
+    )?;
     println!("Exited interactive mode.");
     
     Ok(())
