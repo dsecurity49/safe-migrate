@@ -73,9 +73,7 @@ mod tests {
             bincode::serde::decode_from_slice(&encoded, config)
                 .unwrap()
                 .0;
-        let deserialized = match decoded {
-            crate::db::cache::DbCacheVersioned::V1(c) => c,
-        };
+        let crate::db::cache::DbCacheVersioned::V1(deserialized) = decoded;
         assert_eq!(deserialized.pg_version_num, Some(160000));
         assert!(
             deserialized
@@ -126,9 +124,7 @@ mod tests {
             bincode::serde::decode_from_slice(&encoded, config)
                 .unwrap()
                 .0;
-        let deserialized = match decoded {
-            crate::db::cache::DbCacheVersioned::V1(c) => c,
-        };
+        let crate::db::cache::DbCacheVersioned::V1(deserialized) = decoded;
         let rel = deserialized.relations.get(&id).unwrap();
         assert_eq!(rel.columns[0].default_expr_text, Some("now()".into()));
         assert_eq!(rel.columns[0].type_modifier, Some(259));

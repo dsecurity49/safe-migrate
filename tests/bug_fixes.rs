@@ -984,9 +984,11 @@ mod phase10_bug_fixes_and_sorting_tests {
     // ─────────────────────────────────────────────
     #[test]
     fn test_bug012_partition_threshold_floor_at_one() {
-        let mut config = safe_migrate::engine::config::Config::default();
-        config.tier1_threshold_rows = 1;
-        config.tier2_threshold_rows = 1;
+        let config = safe_migrate::engine::config::Config {
+            tier1_threshold_rows: 1,
+            tier2_threshold_rows: 1,
+            ..Default::default()
+        };
         let engine = safe_migrate::engine::engine::SafeMigrateEngine::new(config);
         let mut cache = safe_migrate::db::cache::DbCache::new();
 
