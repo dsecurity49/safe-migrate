@@ -1,4 +1,4 @@
-# safe-migrate v0.4.0
+# safe-migrate v0.4.1
 
 A PostgreSQL migration linter that **executes a bi-directional state machine simulation** over your SQL, combining static typed AST analysis with live database statistics to prevent blocking locks before they reach production.
 
@@ -6,20 +6,20 @@ A PostgreSQL migration linter that **executes a bi-directional state machine sim
 
 ---
 
-## What's New in v0.4.0
+## What's New in v0.4.1
 
-v0.4.0 is a correctness and output release. v0.3.0 was the architectural rewrite; v0.4.0 fixes 14 confirmed bugs in the rule engine and state machine, expands rule coverage to the full PostgreSQL ecosystem, and redesigns the CLI output to be unambiguous. Earlier versions parsed migrations with regex and substring matching, which broke on quoted identifiers, schemas, and anything non-trivial. safe-migrate now walks a typed PostgreSQL AST and runs a full state machine simulation of the migration — including transaction rollbacks, cascading drops, and partition hierarchies — before evaluating any rule.
+v0.4.1 is a correctness and feature release. 5 state-machine bugs fixed, interactive TUI mode added, schema-scoped sync, binary+compressed cache, FK-dependency violation markers, and a typed `OperationKind`/`ObjectKind` taxonomy across all 26 rules. The 5055-line test monolith has been split into 13 focused integration test files.
 
 Highlights:
-- 14 bugs fixed across the rule engine, state machine, AST extraction, and output layer
-- `now()` correctly classified as STABLE — no longer produces false positive table-rewrite warnings
-- `BrokenComputeRule` now correctly fires when you drop a function that backs a trigger (was completely silent before due to function_id mismatch)
-- Confidence correctly restored after `ROLLBACK` — a rolled-back `DO` block no longer permanently taints confidence for the rest of the run
-- `DROP SCHEMA CASCADE` now correctly cleans trigger and publication graph edges (was leaving stale edges causing false positives)
-- New rules: `overbroad-grant`, `broken-compute`, `drop-database`, `schema-drift`, `irreversible-migration`, `chain-conflict`, `restrictive-policy`, `disable-trigger`
-- Multi-file chain execution (`lint-chain --dir`) with state persisting across files
-- Redesigned CLI output: structured header box, per-finding blocks with `object`/`reason`/`recipe`/`sql` fields, four-way verdict system (`HALT`/`CAUTIOUS`/`SAFE WITH RISK`/`SAFE`)
-- 235 passing tests (up from 185)
+- **Interactive TUI** (`-i`/`--interactive`): full-screen violation browser via `crossterm`, `EnterAlternateScreen`, RAII terminal guard
+- **Schema-scoped sync** (`--schemas`): restrict sync to named schemas; FK dependencies pulled cross-schema automatically and annotated in violations
+- **Binary cache**: on-disk cache is now `bincode` + `zstd` streaming (replaces JSON); atomic write via `encoder.finish()?`
+- `CreateType`/`CreateDomain` now correctly allow re-creation after a `DROP` (was blocked by stale `TypeOverlay::Dropped` entries)
+- Partition cycle detection wired: `ATTACH PARTITION` that would create a cycle now taints confidence instead of corrupting the graph
+- `is_lossy_varchar_narrowing` correctly handles Postgres unbounded `atttypmod = -1`
+- `DropType` tracked end-to-end through AST → facts → mutations → state → drift detection
+- `Violation.fk_dependency_related` field annotates violations touching FK-pulled baseline tables
+- 327 passing tests (up from 235)
 
 ### ✅ Live Database Statistics Integration
 
@@ -64,7 +64,7 @@ export DATABASE_URL="postgres://user:password@localhost:5432/mydb"
 safe-migrate sync
 ```
 
-Creates `.safe-migrate-stats.json` with table sizes, column info, constraints, and indexes. Safe to commit to source control — contains no secrets, only statistics.
+Creates `.safe-migrate.cache` with table sizes, column info, constraints, and indexes. Safe to commit to source control — contains no secrets, only statistics.
 
 **TLS warning:** When `DATABASE_URL` points to a non-localhost host, safe-migrate emits a warning that the connection is unencrypted. Use `sslmode=require` in your connection string or an SSH tunnel for production databases.
 
@@ -164,7 +164,7 @@ Example:
 
 ## Rules Reference
 
-All 25 rules with examples:
+All 26 rules with examples:
 
 ### 1. **blocking-constraint** (Tier 1)
 Adding a valid `CHECK` or `FOREIGN KEY` constraint scans the entire table with an `ACCESS EXCLUSIVE` lock.
@@ -351,7 +351,7 @@ toast_width_threshold_bytes = 2048
 default_rows = 10000
 
 # Cache freshness threshold in days (default: 7)
-# Warns if .safe-migrate-stats.json is older than this
+# Warns if .safe-migrate.cache is older than this
 stale_stats_days = 7
 ```
 
@@ -470,16 +470,20 @@ If the cache exists and is fresh:
 safe-migrate lint \
   --file migration.sql \
   --config safe-migrate.toml \
-  --cache .safe-migrate-stats.json \
-  --no-cache
+  --cache .safe-migrate.cache \
+  --no-cache \
+  --interactive \
+  --json
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-f, --file` | required | SQL migration file |
 | `--config` | `safe-migrate.toml` | Config overrides |
-| `--cache` | `.safe-migrate-stats.json` | Stats cache |
+| `--cache` | `.safe-migrate.cache` | Stats cache |
 | `--no-cache` | false | Use worst-case assumptions (offline mode) |
+| `-i, --interactive` | false | Launch full-screen TUI to browse violations |
+| `--json` | false | Output violations as JSON for CI/CD integration |
 
 ### `safe-migrate lint-chain`
 
@@ -489,26 +493,29 @@ Lint an ordered directory of migration files with state persisting across files.
 safe-migrate lint-chain \
   --dir migrations/ \
   --config safe-migrate.toml \
-  --cache .safe-migrate-stats.json
+  --cache .safe-migrate.cache
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--dir` | required | Directory of .sql files |
 | `--config` | `safe-migrate.toml` | Config overrides |
-| `--cache` | `.safe-migrate-stats.json` | Stats cache |
+| `--cache` | `.safe-migrate.cache` | Stats cache |
 | `--no-cache` | false | Use worst-case assumptions |
+| `-i, --interactive` | false | Launch full-screen TUI to browse violations |
+| `--json` | false | Output violations as JSON |
 
 ### `safe-migrate sync`
 
 ```bash
 export DATABASE_URL="postgres://user:pass@localhost/db"
-safe-migrate sync --out prod-stats.json
+safe-migrate sync --out prod-cache.json --schemas public,auth
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--out` | `.safe-migrate-stats.json` | Cache output path |
+| `--out` | `.safe-migrate.cache` | Cache output path |
+| `--schemas` | (all schemas) | Comma-separated list of schemas to sync; FK dependencies pulled cross-schema automatically |
 
 **Requires `DATABASE_URL` environment variable.**
 
@@ -572,6 +579,26 @@ lint-migrations:
   only:
     - merge_requests
 ```
+
+---
+
+## live_tests/ — End-to-End Integration Suite
+
+`live_tests/` is an exhaustive end-to-end suite that runs the compiled `safe-migrate` binary against 533 SQL migration fixtures across all 26 rule directories. It validates the AST parser, state machine, and rule evaluators in combination — not just unit logic.
+
+```bash
+cd live_tests
+
+./run.sh            # Full suite (silent summary per directory)
+./run.sh -v         # Verbose: pass/fail per file
+./run.sh -d rule_09_blocking-constraint   # Single rule directory
+./run.sh -t rule_01_irreversible-migration/001_drop_table.sql  # Single file
+./run.sh --offline  # No cache, worst-case assumptions
+```
+
+**Fixture naming:** `safe_*.sql` files must emit 0 violations for the target rule; `[0-9]*.sql` files must emit ≥ 1.
+
+The suite ships a frozen `.safe-migrate.cache` binary file so it runs in CI without a live PostgreSQL instance. `chain-conflict` directories are linted with `lint-chain -d`; all others use `lint -f` per file.
 
 ---
 

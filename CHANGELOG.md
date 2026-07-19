@@ -2,6 +2,42 @@
 
 All notable changes to safe-migrate are documented here.
 
+## v0.4.1
+
+Correctness and stability release. 5 bugs fixed across the state machine, cache layer, and test suite. Test suite expanded from 235 to 302 tests via a comprehensive integration test modularization (13 new test files under `tests/`). Adds interactive TUI mode, schema-scoped sync, typed operation taxonomy, binary+compressed cache, and FK-dependency violation markers.
+
+**Bug fixes:**
+
+- `CreateType` and `CreateDomain` in the state machine incorrectly used `contains_key` to detect conflicts. After a `DROP TYPE` or `DROP DOMAIN`, the entry remained as `TypeOverlay::Dropped` — `contains_key` still returned `true`, blocking valid re-creation of the same type name. Fixed by checking specifically for `TypeOverlay::Present`.
+- `AttachPartition` in the state machine did not call `check_partition_cycle`. Creating a partition cycle (table A is a partition of B, B is attached as a partition of A) would silently corrupt the partition graph instead of being detected. `check_partition_cycle` now runs before each edge is inserted; cycles taint confidence and skip the bad edge.
+- `drop(encoder)` in `sync.rs` silently swallowed I/O errors from `zstd::Encoder::auto_finish()` — a disk-full condition could leave a truncated cache file on disk while the atomic rename still succeeded. Replaced with `encoder.finish()?` to propagate write errors.
+- `is_lossy_varchar_narrowing` in `destructive.rs` did not handle Postgres's unbounded `atttypmod = -1`. Narrowing from an unbounded `varchar` to a bounded one was incorrectly skipped, missing a class of lossy type changes. Now correctly identifies `atttypmod = -1` as unbounded and fires the violation.
+- `fuzz_txn_010_multi_savepoint_chain` test had an incorrect assertion (`!v.is_empty()`) on SQL containing only transaction-control statements and no DDL. No rules fire on pure `BEGIN/SAVEPOINT/ROLLBACK TO/RELEASE/COMMIT` sequences. Corrected to `v.is_empty()` with an explanatory comment.
+
+**New capabilities:**
+
+- `--interactive` / `-i` flag: launches a full-screen TUI (via `crossterm` with `EnterAlternateScreen`/`LeaveAlternateScreen`) showing violations interactively. SQL previews are capped at 5 lines. `TerminalGuard` RAII drop guard ensures terminal state is always restored on early return or panic.
+- `--schemas` flag: restricts `safe-migrate sync` to a named set of schemas. Cross-schema FK dependencies are pulled automatically and marked `is_fk_dependency = true` so downstream rules can annotate findings with cross-team impact notes.
+- `Violation.fk_dependency_related: bool`: violations on FK-pulled baseline tables now carry this field. Reason strings include a cross-team impact annotation.
+- Binary+compressed cache: the on-disk cache is now a `bincode`-serialized `DbCacheVersioned::V1` payload compressed with `zstd` streaming. Replaced the previous JSON format. The JSON `vectorize` module has been removed.
+- `OperationKind` and `ObjectKind` enums now have fully typed variants replacing generic `Other`/`Unknown` arms. All 26 rules have been audited and updated to use the correct typed variants.
+- `DropType` pipeline: `DROP TYPE` is now fully tracked end-to-end through the AST visitor, fact extractor, mutation resolver, state machine, and drift detection rule.
+- `Rename` and `DropType` drift detection arms added to `DriftDetectionRule`.
+- `StateCollision(String)` variant in `OpaqueMutation` emits a `schema-drift` Tier 1 violation via the `OpaqueDynamicSqlRule` path when the state machine detects a creation conflict.
+
+**Test suite:**
+
+- 235 → 302 tests. The 5055-line `src/engine/tests.rs` monolith was split into 13 focused integration test files under `tests/` plus `tests/common/mod.rs` for shared helpers.
+- New test files: `tests/architectural_gaps.rs` (37 tests), `tests/bug_fixes.rs`, `tests/chain_execution.rs`, `tests/destructive_rules.rs`, `tests/exhaustive_fuzz.rs` (63 tests), and others.
+- `live_tests/` integration suite: 532 SQL fixtures with frozen `.safe-migrate.cache`; `run.sh` uses `lint-chain -d` for `chain-conflict` directories and `lint -f` per-file for all others.
+
+**Performance:**
+
+- Column sync loop in `sync.rs` now sorts by schema/table and reuses a cached `*mut RelationState` pointer across columns of the same table, eliminating per-column `ObjectId` heap allocations.
+- Violation deduplication in `reporter.rs` replaced an O(N²) nested-loop + string-comparison approach with a zero-copy `HashMap` grouping pass — O(N) with no extra allocations.
+
+
+
 ## v0.4.0
 
 Major correctness release. 16 bugs fixed across the rule engine, state machine, AST extraction, and output layer. Test suite expanded from 185 to 235 tests. Output format redesigned to be unambiguous and readable.

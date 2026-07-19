@@ -6,13 +6,13 @@ use crate::analysis::facts::{
     TypeCreationKind,
 };
 use crate::ast::identifiers::{Ident, QualifiedName};
-use squawk_syntax::ast::{ DropType,
+use squawk_syntax::ast::{
     AlterColumnOption, AlterConstraint, AlterDomain, AlterIndex, AlterSequence, AlterTable,
     AlterTableAction, AlterType, AstNode, AttachPartition, Column, ColumnConstraint, Constraint,
     CreateDatabase, CreateDomain, CreateIndex, CreateMaterializedView, CreatePolicy,
     CreateSequence, CreateTable, CreateTableAs, CreateTrigger, CreateType, CreateView,
     DetachPartition, DropDomain, DropIndex, DropMaterializedView, DropPolicy, DropSequence,
-    DropTable, DropTrigger, DropView, FieldExpr, Grant, Name, NameRef, Path, PathSegment,
+    DropTable, DropTrigger, DropType, DropView, FieldExpr, Grant, Name, NameRef, Path, PathSegment,
     ReleaseSavepoint, RenameTo, Revoke, RevokeCommand, Rollback, Savepoint, Set, Stmt, TableArg,
     TableConstraint,
 };

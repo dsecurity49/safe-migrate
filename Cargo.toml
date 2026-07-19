@@ -1,6 +1,6 @@
 [package]
 name = "safe-migrate"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 description = "Lint PostgreSQL migrations against live database statistics to prevent blocking locks"
 license = "MIT OR Apache-2.0"

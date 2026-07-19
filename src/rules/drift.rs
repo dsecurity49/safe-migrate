@@ -263,10 +263,11 @@ impl Rule for DriftDetectionRule {
                 }
             }
             Mutation::Rename(r) => {
-                if !pre_state.relations.contains_key(&r.old_id) 
-                    && !pre_state.types.contains_key(&r.old_id) 
+                if !pre_state.relations.contains_key(&r.old_id)
+                    && !pre_state.types.contains_key(&r.old_id)
                     && !pre_state.sequences.contains_key(&r.old_id)
-                    && !pre_state.indexes.iter().any(|idx| idx.index_id == r.old_id) {
+                    && !pre_state.indexes.iter().any(|idx| idx.index_id == r.old_id)
+                {
                     violations.push(Violation { source_range: None,
                         rule_id: self.id(),
                         operation_kind: OperationKind::Rename,

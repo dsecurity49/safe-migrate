@@ -688,7 +688,9 @@ impl AnalysisState {
                     return MutationResult::Skipped;
                 }
                 if !create.if_not_exists && self.relation_is_present(&create.id) {
-                    return MutationResult::Conflict { reason: format!("relation '{}' already exists", create.id) };
+                    return MutationResult::Conflict {
+                        reason: format!("relation '{}' already exists", create.id),
+                    };
                 }
 
                 self.snapshot_relation(&create.id);
@@ -788,7 +790,9 @@ impl AnalysisState {
             }
             Mutation::CreateView(create_view) => {
                 if !create_view.or_replace && self.relation_is_present(&create_view.id) {
-                    return MutationResult::Conflict { reason: format!("relation '{}' already exists", create_view.id) };
+                    return MutationResult::Conflict {
+                        reason: format!("relation '{}' already exists", create_view.id),
+                    };
                 }
                 self.snapshot_relation(&create_view.id);
                 self.snapshot_generation_counter();
@@ -818,7 +822,9 @@ impl AnalysisState {
             }
             Mutation::CreateMaterializedView(create_mv) => {
                 if self.relation_is_present(&create_mv.id) {
-                    return MutationResult::Conflict { reason: format!("relation '{}' already exists", create_mv.id) };
+                    return MutationResult::Conflict {
+                        reason: format!("relation '{}' already exists", create_mv.id),
+                    };
                 }
                 self.snapshot_relation(&create_mv.id);
                 self.snapshot_generation_counter();
@@ -848,12 +854,19 @@ impl AnalysisState {
             }
             Mutation::RefreshMaterializedView(_) => MutationResult::Applied,
             Mutation::CreateIndex(create_idx) => {
-                let exists = self.local.graph.indexes.iter().any(|ix| ix.index_id == create_idx.id);
+                let exists = self
+                    .local
+                    .graph
+                    .indexes
+                    .iter()
+                    .any(|ix| ix.index_id == create_idx.id);
                 if create_idx.if_not_exists && exists {
                     return MutationResult::Skipped;
                 }
                 if !create_idx.if_not_exists && exists {
-                    return MutationResult::Conflict { reason: format!("relation '{}' already exists", create_idx.id) };
+                    return MutationResult::Conflict {
+                        reason: format!("relation '{}' already exists", create_idx.id),
+                    };
                 }
                 self.snapshot_index_graph();
                 self.local.graph.indexes.push(IndexEdge {
@@ -1060,11 +1073,17 @@ impl AnalysisState {
                             });
                         }
                         AlterTableActionMutation::AttachPartition { child } => {
-                            self.snapshot_partition_graph();
-                            self.local.graph.partitions.push(PartitionEdge {
-                                parent: alter.id.clone(),
-                                child: child.clone(),
-                            });
+                            // BUG-012: Reject cycle topologies before inserting the edge.
+                            if self.local.graph.check_partition_cycle(&alter.id, child) {
+                                self.snapshot_confidence();
+                                self.local.confidence = Confidence::Tainted;
+                            } else {
+                                self.snapshot_partition_graph();
+                                self.local.graph.partitions.push(PartitionEdge {
+                                    parent: alter.id.clone(),
+                                    child: child.clone(),
+                                });
+                            }
                         }
                         AlterTableActionMutation::DetachPartition { child } => {
                             self.snapshot_partition_graph();
@@ -1079,8 +1098,13 @@ impl AnalysisState {
                 MutationResult::Applied
             }
             Mutation::CreateType(create_type) => {
-                if self.local.types.contains_key(&create_type.id) {
-                    return MutationResult::Conflict { reason: format!("type '{}' already exists", create_type.id) };
+                if matches!(
+                    self.local.types.get(&create_type.id),
+                    Some(TypeOverlay::Present(_))
+                ) {
+                    return MutationResult::Conflict {
+                        reason: format!("type '{}' already exists", create_type.id),
+                    };
                 }
                 self.snapshot_type(&create_type.id);
                 self.snapshot_generation_counter();
@@ -1111,8 +1135,13 @@ impl AnalysisState {
                 MutationResult::Applied
             }
             Mutation::CreateDomain(create_domain) => {
-                if self.local.types.contains_key(&create_domain.id) {
-                    return MutationResult::Conflict { reason: format!("type '{}' already exists", create_domain.id) };
+                if matches!(
+                    self.local.types.get(&create_domain.id),
+                    Some(TypeOverlay::Present(_))
+                ) {
+                    return MutationResult::Conflict {
+                        reason: format!("type '{}' already exists", create_domain.id),
+                    };
                 }
                 self.snapshot_type(&create_domain.id);
                 self.snapshot_generation_counter();
@@ -1151,7 +1180,9 @@ impl AnalysisState {
                     return MutationResult::Skipped;
                 }
                 if !create_seq.if_not_exists && self.local.sequences.contains_key(&create_seq.id) {
-                    return MutationResult::Conflict { reason: format!("relation '{}' already exists", create_seq.id) };
+                    return MutationResult::Conflict {
+                        reason: format!("relation '{}' already exists", create_seq.id),
+                    };
                 }
                 self.snapshot_sequence(&create_seq.id);
                 self.snapshot_generation_counter();

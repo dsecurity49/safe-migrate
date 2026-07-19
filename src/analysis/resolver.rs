@@ -10,13 +10,13 @@ use crate::analysis::mutations::{
     CreateIndex, CreateMaterializedView, CreatePolicyMutation, CreateProcedureMutation,
     CreatePublicationMutation, CreateRoleMutation, CreateSchemaMutation, CreateSequenceMutation,
     CreateSubscriptionMutation, CreateTable, CreateTriggerMutation, CreateTypeMutation, CreateView,
-    DropDatabaseMutation, DropDomainMutation, DropTypeMutation, DropFunctionMutation, DropIndex,
+    DropDatabaseMutation, DropDomainMutation, DropFunctionMutation, DropIndex,
     DropMaterializedViewMutation, DropPolicyMutation, DropProcedureMutation,
     DropPublicationMutation, DropRoleMutation, DropSchemaMutation, DropSequenceMutation,
-    DropSubscriptionMutation, DropTable, DropTriggerMutation, DropViewMutation, FkMutation,
-    GrantMutation, Mutation, OpaqueMutation, PersistenceMutation, RefreshMaterializedViewMutation,
-    ReleaseSavepointMutation, Rename, ResolvedGrantTarget, RevokeMutation,
-    RollbackToSavepointMutation, SavepointMutation, SearchPathChange,
+    DropSubscriptionMutation, DropTable, DropTriggerMutation, DropTypeMutation, DropViewMutation,
+    FkMutation, GrantMutation, Mutation, OpaqueMutation, PersistenceMutation,
+    RefreshMaterializedViewMutation, ReleaseSavepointMutation, Rename, ResolvedGrantTarget,
+    RevokeMutation, RollbackToSavepointMutation, SavepointMutation, SearchPathChange,
 };
 use crate::analysis::state::AnalysisState;
 use crate::ast::identifiers::{ObjectId, QualifiedName};
@@ -187,8 +187,6 @@ impl Resolver {
             } => {
                 let id = Self::resolve_creation_name(name, state);
 
-                
-
                 let resolved_persistence = match persistence {
                     PersistenceFact::Permanent => PersistenceMutation::Permanent,
                     PersistenceFact::Temporary => PersistenceMutation::Temporary,
@@ -209,7 +207,7 @@ impl Resolver {
                 let mut fk_mutations = Vec::new();
                 for fk in foreign_keys {
                     let to_table = Self::resolve_lookup_name(&fk.references, state);
-                    
+
                     fk_mutations.push(FkMutation {
                         constraint_name: fk.constraint_name.clone(),
                         to_table,
@@ -221,8 +219,6 @@ impl Resolver {
                 let partition_of_id = partition_of
                     .as_ref()
                     .map(|n| Self::resolve_lookup_name(n, state));
-
-                
 
                 mutations.push(Mutation::CreateTable(CreateTable {
                     id,
@@ -243,8 +239,6 @@ impl Resolver {
                 depends_on,
             } => {
                 let id = Self::resolve_creation_name(name, state);
-
-                
 
                 let resolved_depends = depends_on
                     .iter()
@@ -284,8 +278,6 @@ impl Resolver {
             StatementFact::CreateMaterializedView { name, depends_on } => {
                 let id = Self::resolve_creation_name(name, state);
 
-                
-
                 let resolved_depends = depends_on
                     .iter()
                     .map(|n| Self::resolve_lookup_name(n, state))
@@ -322,8 +314,6 @@ impl Resolver {
                 unique,
             } => {
                 let id = Self::resolve_creation_name(name, state);
-
-                
 
                 mutations.push(Mutation::CreateIndex(CreateIndex {
                     id,
@@ -407,8 +397,6 @@ impl Resolver {
             StatementFact::CreateType(create_type) => {
                 let id = Self::resolve_creation_name(&create_type.name, state);
 
-                
-
                 let mapped_kind = match create_type.kind {
                     TypeCreationKind::Enum => TypeKind::Enum { variants: vec![] },
                     TypeCreationKind::Range => TypeKind::Range,
@@ -439,8 +427,6 @@ impl Resolver {
             StatementFact::CreateDomain { name, base_type } => {
                 let id = Self::resolve_creation_name(name, state);
 
-                
-
                 mutations.push(Mutation::CreateDomain(CreateDomainMutation {
                     id,
                     base_type: base_type.clone(),
@@ -452,7 +438,7 @@ impl Resolver {
                     action: action.clone(),
                 }));
             }
-                        StatementFact::DropDomain {
+            StatementFact::DropDomain {
                 names,
                 if_exists,
                 cascade,
@@ -488,8 +474,6 @@ impl Resolver {
                 owned_by,
             } => {
                 let id = Self::resolve_creation_name(name, state);
-
-                
 
                 let resolved_owned_by = owned_by.as_ref().map(|(table_name, col)| {
                     (Self::resolve_lookup_name(table_name, state), col.clone())
@@ -654,7 +638,7 @@ impl Resolver {
                         }
                         AlterTableActionFact::AttachPartition { child } => {
                             let child_id = Self::resolve_lookup_name(child, state);
-                            
+
                             AlterTableActionMutation::AttachPartition { child: child_id }
                         }
                         AlterTableActionFact::DetachPartition { child } => {
@@ -715,7 +699,7 @@ impl Resolver {
                 cascade,
             } => {
                 let id = Self::resolve_lookup_name(name, state);
-                
+
                 // Still emit a DropTable mutation for rule evaluation (e.g. DriftDetectionRule)
                 // even when the table is not present locally. The state machine will handle
                 // tainting confidence in apply().
@@ -775,7 +759,6 @@ impl Resolver {
             StatementFact::CommitTransaction => mutations.push(Mutation::CommitTransaction),
             StatementFact::RollbackTransaction => mutations.push(Mutation::RollbackTransaction),
             StatementFact::RollbackToSavepoint { name } => {
-                
                 mutations.push(Mutation::RollbackToSavepoint(RollbackToSavepointMutation {
                     name: name.clone(),
                 }))
@@ -786,7 +769,6 @@ impl Resolver {
                 }))
             }
             StatementFact::ReleaseSavepoint { name } => {
-                
                 mutations.push(Mutation::ReleaseSavepoint(ReleaseSavepointMutation {
                     name: name.clone(),
                 }))
