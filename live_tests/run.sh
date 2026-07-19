@@ -89,32 +89,26 @@ for dir in $dirs; do
         files="$dir"/*.sql
     fi
 
-    # Build safe-migrate args
-    SM_ARGS=("lint")
-    if [ "$OFFLINE" -eq 1 ]; then
-        SM_ARGS+=("--no-cache")
-    else
-        SM_ARGS+=("--cache" "$CACHE_FILE")
-    fi
-    SM_ARGS+=("--json")
-
-    for file in $files; do
-        [ -f "$file" ] || continue
-        fname=$(basename "$file")
-
-        # Run safe-migrate lint, extract JSON (skip the "Analyzing migration:" line)
-        raw_output=$("$BIN" "${SM_ARGS[@]}" "-f" "$file" 2>&1)
-        json=$(echo "$raw_output" | sed -n '/^{/,$ p')
-        
-        if [ -z "$json" ]; then
-            [ "$VERBOSE" -eq 1 ] && echo "  [!] NO JSON: $fname | Output: $raw_output"
-            dir_fail=$((dir_fail + 1))
-            failures="$failures  [CRASH] $rule_dir/$fname\n"
-            continue
+    # Handle chain-conflict specially
+    if [[ "$rule_dir" == *"chain-conflict"* && -z "$TARGET_FILE" ]]; then
+        SM_ARGS=("lint-chain" "-d" "$dir")
+        if [ "$OFFLINE" -eq 1 ]; then
+            SM_ARGS+=("--no-cache")
+        else
+            SM_ARGS+=("--cache" "$CACHE_FILE")
         fi
+        SM_ARGS+=("--json")
 
-        # Extract the rule_ids from all violations
-        violation_rules=$(echo "$json" | python3 -c "
+        raw_output=$("$BIN" "${SM_ARGS[@]}" 2>&1)
+        json=$(echo "$raw_output" | sed -n '/^{/,$ p')
+
+        if [ -z "$json" ]; then
+            [ "$VERBOSE" -eq 1 ] && echo "  [!] NO JSON: $rule_dir | Output: $raw_output"
+            dir_fail=$((dir_fail + 1))
+            failures="$failures  [CRASH] $rule_dir\n"
+        else
+            # Extract the rule_ids from all violations in the chain
+            violation_rules=$(echo "$json" | python3 -c "
 import sys, json
 try:
     data = json.load(sys.stdin)
@@ -124,28 +118,77 @@ except:
     print('')
 " 2>/dev/null || echo "")
 
-        has_expected=$(echo "$violation_rules" | tr ',' '\n' | grep -x -c "$rule_id" || true)
+            has_expected=$(echo "$violation_rules" | tr ',' '\n' | grep -x -c "$rule_id" || true)
 
-        if [[ "$fname" == safe_* ]]; then
-            if [ "$has_expected" -eq 0 ]; then
-                [ "$VERBOSE" -eq 1 ] && echo "  [PASS] $rule_dir/$fname"
-                dir_pass=$((dir_pass + 1))
-            else
-                [ "$VERBOSE" -eq 1 ] && echo "  [FAIL] $rule_dir/$fname (expected 0 '$rule_id', got: $violation_rules)"
-                dir_fail=$((dir_fail + 1))
-                failures="$failures  [FAIL]  $rule_dir/$fname (safe but got $rule_id)\n"
-            fi
-        else
             if [ "$has_expected" -gt 0 ]; then
-                [ "$VERBOSE" -eq 1 ] && echo "  [PASS] $rule_dir/$fname"
+                [ "$VERBOSE" -eq 1 ] && echo "  [PASS] $rule_dir"
                 dir_pass=$((dir_pass + 1))
             else
-                [ "$VERBOSE" -eq 1 ] && echo "  [SKIP] $rule_dir/$fname (no '$rule_id', got: $violation_rules)"
+                [ "$VERBOSE" -eq 1 ] && echo "  [SKIP] $rule_dir (no '$rule_id', got: $violation_rules)"
                 dir_skip=$((dir_skip + 1))
-                failures="$failures  [SKIP]  $rule_dir/$fname (missed expected $rule_id)\n"
+                failures="$failures  [SKIP]  $rule_dir (missed expected $rule_id)\n"
             fi
         fi
-    done
+    else
+        # Standard linting per file
+        for file in $files; do
+            [ -f "$file" ] || continue
+            fname=$(basename "$file")
+
+            # Build safe-migrate args for single file
+            SM_ARGS=("lint")
+            if [ "$OFFLINE" -eq 1 ]; then
+                SM_ARGS+=("--no-cache")
+            else
+                SM_ARGS+=("--cache" "$CACHE_FILE")
+            fi
+            SM_ARGS+=("--json" "-f" "$file")
+
+            # Run safe-migrate lint, extract JSON (skip the "Analyzing migration:" line)
+            raw_output=$("$BIN" "${SM_ARGS[@]}" 2>&1)
+            json=$(echo "$raw_output" | sed -n '/^{/,$ p')
+            
+            if [ -z "$json" ]; then
+                [ "$VERBOSE" -eq 1 ] && echo "  [!] NO JSON: $fname | Output: $raw_output"
+                dir_fail=$((dir_fail + 1))
+                failures="$failures  [CRASH] $rule_dir/$fname\n"
+                continue
+            fi
+
+            # Extract the rule_ids from all violations
+            violation_rules=$(echo "$json" | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    rules = [v.get('rule_id','') for v in data.get('violations',[])]
+    print(','.join(rules))
+except:
+    print('')
+" 2>/dev/null || echo "")
+
+            has_expected=$(echo "$violation_rules" | tr ',' '\n' | grep -x -c "$rule_id" || true)
+
+            if [[ "$fname" == safe_* ]]; then
+                if [ "$has_expected" -eq 0 ]; then
+                    [ "$VERBOSE" -eq 1 ] && echo "  [PASS] $rule_dir/$fname"
+                    dir_pass=$((dir_pass + 1))
+                else
+                    [ "$VERBOSE" -eq 1 ] && echo "  [FAIL] $rule_dir/$fname (expected 0 '$rule_id', got: $violation_rules)"
+                    dir_fail=$((dir_fail + 1))
+                    failures="$failures  [FAIL]  $rule_dir/$fname (safe but got $rule_id)\n"
+                fi
+            else
+                if [ "$has_expected" -gt 0 ]; then
+                    [ "$VERBOSE" -eq 1 ] && echo "  [PASS] $rule_dir/$fname"
+                    dir_pass=$((dir_pass + 1))
+                else
+                    [ "$VERBOSE" -eq 1 ] && echo "  [SKIP] $rule_dir/$fname (no '$rule_id', got: $violation_rules)"
+                    dir_skip=$((dir_skip + 1))
+                    failures="$failures  [SKIP]  $rule_dir/$fname (missed expected $rule_id)\n"
+                fi
+            fi
+        done
+    fi
 
     total_pass=$((total_pass + dir_pass))
     total_fail=$((total_fail + dir_fail))
