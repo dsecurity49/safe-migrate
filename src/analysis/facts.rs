@@ -163,6 +163,11 @@ pub enum StatementFact {
         if_exists: bool,
         cascade: bool,
     },
+    DropType {
+        names: Vec<QualifiedName>,
+        if_exists: bool,
+        cascade: bool,
+    },
     CreateSequence {
         name: QualifiedName,
         if_not_exists: bool,

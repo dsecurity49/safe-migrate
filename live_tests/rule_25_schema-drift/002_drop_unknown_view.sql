@@ -1,1 +1,1 @@
-DROP VIEW unknown_view;
+DROP VIEW literally_unknown_view;

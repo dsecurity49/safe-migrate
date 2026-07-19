@@ -1,1 +1,1 @@
-CREATE VIEW v AS SELECT 1;
+CREATE VIEW completely_new_view AS SELECT 1;

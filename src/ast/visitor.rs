@@ -6,7 +6,7 @@ use crate::analysis::facts::{
     TypeCreationKind,
 };
 use crate::ast::identifiers::{Ident, QualifiedName};
-use squawk_syntax::ast::{
+use squawk_syntax::ast::{ DropType,
     AlterColumnOption, AlterConstraint, AlterDomain, AlterIndex, AlterSequence, AlterTable,
     AlterTableAction, AlterType, AstNode, AttachPartition, Column, ColumnConstraint, Constraint,
     CreateDatabase, CreateDomain, CreateIndex, CreateMaterializedView, CreatePolicy,
@@ -111,6 +111,9 @@ impl AstVisitor {
         }
         if let Some(node) = AlterDomain::cast(syntax.clone()) {
             return Self::extract_alter_domain(&node);
+        }
+        if let Some(node) = DropType::cast(syntax.clone()) {
+            return Self::extract_drop_type(&node);
         }
         if let Some(node) = DropDomain::cast(syntax.clone()) {
             return Self::extract_drop_domain(&node);
@@ -1492,6 +1495,19 @@ impl AstVisitor {
         })
     }
 
+    fn extract_drop_type(node: &DropType) -> Option<StatementFact> {
+        println!("EXTRACT DROP TYPE!");
+        let names: Vec<QualifiedName> = node
+            .paths()
+            .filter_map(|p| Self::path_to_qualified_name(&p))
+            .collect();
+
+        Some(StatementFact::DropType {
+            names,
+            if_exists: node.if_exists().is_some(),
+            cascade: node.cascade_token().is_some(),
+        })
+    }
     fn extract_drop_domain(node: &DropDomain) -> Option<StatementFact> {
         let names: Vec<QualifiedName> = node
             .paths()
