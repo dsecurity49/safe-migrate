@@ -1,0 +1,1 @@
+ALTER TABLE unknown_table ALTER COLUMN c SET DEFAULT 0;

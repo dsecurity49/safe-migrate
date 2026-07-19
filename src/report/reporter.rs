@@ -143,28 +143,24 @@ impl Reporter {
         // Group violations by sql key (same sql text + same object_name = same statement)
         // Each group is (primary_idx, Vec<secondary_idxs>)
         let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
-        let mut used = vec![false; violations.len()];
+        let mut sql_to_group_idx: std::collections::HashMap<(&str, &str), usize> =
+            std::collections::HashMap::new();
 
-        for i in 0..violations.len() {
-            if used[i] {
-                continue;
-            }
-            used[i] = true;
-            let mut secondaries = Vec::new();
-            // Find other violations with identical sql (if sql is Some)
-            if let Some(sql_i) = &violations[i].sql {
-                for j in (i + 1)..violations.len() {
-                    if !used[j]
-                        && let Some(sql_j) = &violations[j].sql
-                        && sql_i == sql_j
-                        && violations[j].object_name == violations[i].object_name
-                    {
-                        used[j] = true;
-                        secondaries.push(j);
-                    }
+        for (i, v) in violations.iter().enumerate() {
+            if let Some(sql) = &v.sql {
+                let key = (sql.as_str(), v.object_name.as_str());
+                if let Some(&gi) = sql_to_group_idx.get(&key) {
+                    groups[gi].1.push(i);
+                    continue;
                 }
+
+                let new_gi = groups.len();
+                groups.push((i, Vec::new()));
+                sql_to_group_idx.insert(key, new_gi);
+            } else {
+                // If sql is None, it never groups
+                groups.push((i, Vec::new()));
             }
-            groups.push((i, secondaries));
         }
 
         for (gi, (primary_idx, secondary_idxs)) in groups.iter().enumerate() {

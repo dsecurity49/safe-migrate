@@ -32,7 +32,7 @@ enum Commands {
         #[arg(long, default_value = "safe-migrate.toml")]
         config: PathBuf,
 
-        #[arg(long, default_value = ".safe-migrate-stats.json")]
+        #[arg(long, default_value = ".safe-migrate.cache")]
         cache: PathBuf,
 
         /// Bypass the local cache file and evaluate with default worst-case assumptions
@@ -42,6 +42,10 @@ enum Commands {
         /// Output results in JSON format for CI/CD integration
         #[arg(long)]
         json: bool,
+
+        /// Launch an interactive terminal UI to browse violations
+        #[arg(short, long)]
+        interactive: bool,
     },
     /// Lint a chain of SQL migration files in order (state persists across files)
     LintChain {
@@ -51,7 +55,7 @@ enum Commands {
         #[arg(long, default_value = "safe-migrate.toml")]
         config: PathBuf,
 
-        #[arg(long, default_value = ".safe-migrate-stats.json")]
+        #[arg(long, default_value = ".safe-migrate.cache")]
         cache: PathBuf,
 
         /// Bypass the local cache file and evaluate with default worst-case assumptions
@@ -61,11 +65,18 @@ enum Commands {
         /// Output results in JSON format for CI/CD integration
         #[arg(long)]
         json: bool,
+
+        /// Launch an interactive terminal UI to browse violations
+        #[arg(short, long)]
+        interactive: bool,
     },
     /// Sync database table statistics for accurate lock evaluation
     Sync {
-        #[arg(long, default_value = ".safe-migrate-stats.json")]
+        #[arg(long, default_value = ".safe-migrate.cache")]
         out: PathBuf,
+        /// Filter sync to specific schemas (comma-separated, e.g., --schemas public,auth)
+        #[arg(long, value_delimiter = ',')]
+        schemas: Option<Vec<String>>,
     },
 }
 
@@ -84,6 +95,7 @@ fn main() -> Result<()> {
             cache,
             no_cache,
             json: _,
+            interactive: _,
         } => {
             let sql = fs::read_to_string(file)
                 .with_context(|| format!("Failed to read migration file: {}", file.display()))?;
@@ -110,7 +122,7 @@ fn main() -> Result<()> {
                     .as_secs();
                 if now.saturating_sub(604_800) > file_time {
                     println!(
-                        "[ WARN ] Database stats cache (.safe-migrate-stats.json) is over 7 days old!"
+                        "[ WARN ] Database stats cache (.safe-migrate.cache) is over 7 days old!"
                     );
                     println!(
                         "         Run `safe-migrate sync` to ensure accurate lock evaluations.\n"
@@ -120,10 +132,23 @@ fn main() -> Result<()> {
 
             // 3. Safely Load Cache OR Fallback to Empty State
             let db_cache = if !*no_cache && cache.exists() {
-                let json = fs::read_to_string(cache).context("Failed to read cache file")?;
-                serde_json::from_str::<DbCache>(&json).map_err(|_| {
-                    anyhow!("Cache file '{}' is corrupted (Invalid JSON). Run `safe-migrate sync` to rebuild it.", cache.display())
-                })?
+                let file = std::fs::File::open(cache).context("Failed to open cache file")?;
+                let reader = std::io::BufReader::new(file);
+                let mut decoder = zstd::stream::Decoder::new(reader).map_err(|e| {
+                    anyhow!(
+                        "Cache file '{}' is corrupted (zstd init): {}",
+                        cache.display(),
+                        e
+                    )
+                })?;
+
+                let bincode_config = bincode::config::standard().with_variable_int_encoding();
+                let versioned: safe_migrate::db::cache::DbCacheVersioned = bincode::serde::decode_from_std_read(&mut decoder, bincode_config)
+                    .map_err(|e| anyhow!("Cache file '{}' is corrupted (bincode): {}. Run `safe-migrate sync` to rebuild it.", cache.display(), e))?;
+
+                match versioned {
+                    safe_migrate::db::cache::DbCacheVersioned::V1(c) => c,
+                }
             } else {
                 if *no_cache {
                     println!(
@@ -150,6 +175,14 @@ fn main() -> Result<()> {
                         return Ok(());
                     }
 
+                    if let Commands::Lint {
+                        interactive: true, ..
+                    } = &cli.command
+                    {
+                        safe_migrate::run_interactive(&violations, &state.local.confidence)?;
+                        return Ok(());
+                    }
+
                     let should_fail_ci =
                         Reporter::print_report(&violations, &state.local.confidence);
 
@@ -172,6 +205,7 @@ fn main() -> Result<()> {
             cache,
             no_cache,
             json: _,
+            interactive: _,
         } => {
             let mut files: Vec<_> = fs::read_dir(dir)
                 .with_context(|| format!("Failed to read directory: {}", dir.display()))?
@@ -206,10 +240,23 @@ fn main() -> Result<()> {
             });
 
             let db_cache = if !*no_cache && cache.exists() {
-                let json = fs::read_to_string(cache).context("Failed to read cache file")?;
-                serde_json::from_str::<DbCache>(&json).map_err(|_| {
-                    anyhow!("Cache file '{}' is corrupted (Invalid JSON). Run `safe-migrate sync` to rebuild it.", cache.display())
-                })?
+                let file = std::fs::File::open(cache).context("Failed to open cache file")?;
+                let reader = std::io::BufReader::new(file);
+                let mut decoder = zstd::stream::Decoder::new(reader).map_err(|e| {
+                    anyhow!(
+                        "Cache file '{}' is corrupted (zstd init): {}",
+                        cache.display(),
+                        e
+                    )
+                })?;
+
+                let bincode_config = bincode::config::standard().with_variable_int_encoding();
+                let versioned: safe_migrate::db::cache::DbCacheVersioned = bincode::serde::decode_from_std_read(&mut decoder, bincode_config)
+                    .map_err(|e| anyhow!("Cache file '{}' is corrupted (bincode): {}. Run `safe-migrate sync` to rebuild it.", cache.display(), e))?;
+
+                match versioned {
+                    safe_migrate::db::cache::DbCacheVersioned::V1(c) => c,
+                }
             } else {
                 if *no_cache {
                     println!(
@@ -233,6 +280,14 @@ fn main() -> Result<()> {
                         return Ok(());
                     }
 
+                    if let Commands::LintChain {
+                        interactive: true, ..
+                    } = &cli.command
+                    {
+                        safe_migrate::run_interactive(&violations, &state.local.confidence)?;
+                        return Ok(());
+                    }
+
                     let should_fail = Reporter::print_report(&violations, &state.local.confidence);
 
                     if should_fail {
@@ -250,13 +305,16 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Commands::Sync { out } => {
+        Commands::Sync { out, schemas } => {
             // DATABASE_URL is strictly isolated to the Sync command
             let _db_url = std::env::var("DATABASE_URL")
                 .context("DATABASE_URL environment variable must be set to run sync.")?;
 
             println!("Syncing database stats...");
-            sync::sync_cache(out)?; // sync_cache internally uses the env var
+            if let Some(s) = &schemas {
+                println!("Filtering to schemas: {}", s.join(", "));
+            }
+            sync::sync_cache(out, schemas.as_deref())?; // sync_cache internally uses the env var
             println!("[ SAFE ] Cache successfully written to {}", out.display());
         }
     }

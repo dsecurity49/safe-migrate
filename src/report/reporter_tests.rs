@@ -16,6 +16,7 @@ mod tests {
             recipe: "test recipe",
             dedup_key: None,
             sql: None,
+            fk_dependency_related: false,
         }
     }
 
@@ -75,6 +76,7 @@ mod tests {
             recipe: "ensure backups exist before deploying",
             dedup_key: None,
             sql: None,
+            fk_dependency_related: false,
         }];
         assert_eq!(compute_verdict(&violations), Verdict::SafeWithRisk);
     }
@@ -149,6 +151,7 @@ mod tests {
                 recipe: "recipe",
                 dedup_key: None,
                 sql: None,
+                fk_dependency_related: false,
             },
             Violation {
                 source_range: None,
@@ -161,6 +164,7 @@ mod tests {
                 recipe: "recipe",
                 dedup_key: None,
                 sql: None,
+                fk_dependency_related: false,
             },
         ];
         let confidence = Confidence::Exact;

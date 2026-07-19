@@ -30,6 +30,7 @@ pub enum Mutation {
     CreateDomain(CreateDomainMutation),
     AlterDomain(AlterDomainMutation),
     DropDomain(DropDomainMutation),
+    DropType(DropTypeMutation),
     CreateSequence(CreateSequenceMutation),
     AlterSequence(AlterSequenceMutation),
     DropSequence(DropSequenceMutation),
@@ -174,6 +175,13 @@ pub struct AlterDomainMutation {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct DropDomainMutation {
+    pub ids: Vec<ObjectId>,
+    pub if_exists: bool,
+    pub cascade: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DropTypeMutation {
     pub ids: Vec<ObjectId>,
     pub if_exists: bool,
     pub cascade: bool,
@@ -441,6 +449,7 @@ pub enum OpaqueMutation {
     PrepareTransaction,
     SetTransaction,
     SetConstraints,
+    StateCollision(String),
     UnresolvedReference {
         object_kind: crate::report::violations::ObjectKind,
         object_name: String,

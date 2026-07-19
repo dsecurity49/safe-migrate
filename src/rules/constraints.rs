@@ -97,9 +97,12 @@ impl Rule for BlockingConstraintRule {
                     false
                 };
 
-            // Partitioned tables escalate lock severity: use 50% of threshold
+            // Partitioned tables escalate lock severity: use 50% of threshold (floor at 1)
             let (adjusted_tier1, adjusted_tier2) = if is_partitioned {
-                (tier1_threshold / 2, tier2_threshold / 2)
+                (
+                    std::cmp::max(1, tier1_threshold / 2),
+                    std::cmp::max(1, tier2_threshold / 2),
+                )
             } else {
                 (tier1_threshold, tier2_threshold)
             };
@@ -125,6 +128,7 @@ impl Rule for BlockingConstraintRule {
                     recipe: "Run ANALYZE to ensure accurate row estimates before structural changes.",
                     dedup_key: Some(key),
                             sql: None,
+                            fk_dependency_related: false,
                 });
             }
 
@@ -158,6 +162,7 @@ impl Rule for BlockingConstraintRule {
                         recipe: self.recipe(),
                         dedup_key: None,
                         sql: None,
+                        fk_dependency_related: false,
                     });
                 }
                 AlterTableActionMutation::AddForeignKey {
@@ -190,6 +195,7 @@ impl Rule for BlockingConstraintRule {
                         recipe: self.recipe(),
                         dedup_key: None,
                         sql: None,
+                        fk_dependency_related: false,
                     });
                 }
                 AlterTableActionMutation::SetNotNull { column } => {
@@ -215,6 +221,7 @@ impl Rule for BlockingConstraintRule {
                             recipe: "Add CHECK constraint NOT VALID, then VALIDATE separately.",
                             dedup_key: None,
                             sql: None,
+                            fk_dependency_related: false,
                         });
                     }
                 }
@@ -236,6 +243,7 @@ impl Rule for BlockingConstraintRule {
                         recipe: "Build a UNIQUE index CONCURRENTLY first, then add the constraint USING INDEX.",
                         dedup_key: None,
                                     sql: None,
+                                    fk_dependency_related: false,
                     });
                 }
                 AlterTableActionMutation::SetStorage { column } => {
@@ -257,6 +265,7 @@ impl Rule for BlockingConstraintRule {
                         recipe: "Changing column storage requires an ACCESS EXCLUSIVE lock. Execute during a planned maintenance window.",
                         dedup_key: None,
                                     sql: None,
+                                    fk_dependency_related: false,
                     });
                 }
                 AlterTableActionMutation::SetAccessMethod => {
@@ -278,6 +287,7 @@ impl Rule for BlockingConstraintRule {
                         recipe: "Changing table access method requires an ACCESS EXCLUSIVE lock. Execute during a planned maintenance window.",
                         dedup_key: None,
                                     sql: None,
+                                    fk_dependency_related: false,
                     });
                 }
                 _ => {}

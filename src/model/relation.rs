@@ -13,6 +13,7 @@ pub enum Privilege {
     Truncate,
     References,
     Trigger,
+    All,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -28,16 +29,21 @@ impl PrivilegeMatrix {
 
     pub fn revoke(&mut self, role: &ObjectId, privileges: &HashSet<Privilege>) {
         if let Some(owned) = self.grants.get_mut(role) {
-            for p in privileges {
-                owned.remove(p);
+            if privileges.contains(&Privilege::All) {
+                owned.clear();
+            } else {
+                for p in privileges {
+                    owned.remove(p);
+                }
             }
         }
     }
 
     pub fn has_privilege(&self, role: &ObjectId, privilege: Privilege) -> bool {
-        self.grants
-            .get(role)
-            .is_some_and(|set| set.contains(&privilege))
+        self.grants.get(role).is_some_and(|set| {
+            set.contains(&privilege)
+                || (privilege != Privilege::All && set.contains(&Privilege::All))
+        })
     }
 }
 
@@ -73,6 +79,8 @@ pub struct RelationState {
     pub privileges: PrivilegeMatrix,
     pub partition_type: Option<String>, // e.g., "RANGE", "LIST", "HASH"
     pub partition_by: Option<String>,   // The partition key expression
+    #[serde(default)]
+    pub is_fk_dependency: bool,
 }
 
 impl Default for RelationState {
@@ -94,6 +102,7 @@ impl Default for RelationState {
             privileges: PrivilegeMatrix::default(),
             partition_type: None,
             partition_by: None,
+            is_fk_dependency: false,
         }
     }
 }
@@ -125,7 +134,12 @@ impl RelationState {
             privileges: PrivilegeMatrix::default(),
             partition_type: None,
             partition_by: None,
+            is_fk_dependency: false,
         }
+    }
+
+    pub fn mark_fk_dependency(&mut self) {
+        self.is_fk_dependency = true;
     }
 
     pub fn apply_column_action(&mut self, action: &ColumnAction) {
@@ -152,8 +166,10 @@ impl RelationState {
                 self.columns.retain(|c| c.name != *name);
             }
             ColumnAction::Rename { from, to } => {
-                if let Some(col) = self.columns.iter_mut().find(|c| c.name == *from) {
-                    col.name = to.clone();
+                if let Some(pos) = self.columns.iter().position(|c| c.name == *from)
+                    && !self.columns.iter().any(|c| c.name == *to)
+                {
+                    self.columns[pos].name = to.clone();
                 }
             }
             ColumnAction::SetNotNull { name } => {

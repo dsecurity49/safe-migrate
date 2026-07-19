@@ -1,0 +1,1 @@
+EXECUTE 'SELECT 1';

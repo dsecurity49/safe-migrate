@@ -1,0 +1,1 @@
+DROP POLICY p ON t;

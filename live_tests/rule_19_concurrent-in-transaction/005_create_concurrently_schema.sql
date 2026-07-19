@@ -1,0 +1,3 @@
+BEGIN;
+CREATE INDEX CONCURRENTLY i ON public.test_table(id);
+COMMIT;

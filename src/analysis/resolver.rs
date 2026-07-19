@@ -13,10 +13,10 @@ use crate::analysis::mutations::{
     DropDatabaseMutation, DropDomainMutation, DropFunctionMutation, DropIndex,
     DropMaterializedViewMutation, DropPolicyMutation, DropProcedureMutation,
     DropPublicationMutation, DropRoleMutation, DropSchemaMutation, DropSequenceMutation,
-    DropSubscriptionMutation, DropTable, DropTriggerMutation, DropViewMutation, FkMutation,
-    GrantMutation, Mutation, OpaqueMutation, PersistenceMutation, RefreshMaterializedViewMutation,
-    ReleaseSavepointMutation, Rename, ResolvedGrantTarget, RevokeMutation,
-    RollbackToSavepointMutation, SavepointMutation, SearchPathChange,
+    DropSubscriptionMutation, DropTable, DropTriggerMutation, DropTypeMutation, DropViewMutation,
+    FkMutation, GrantMutation, Mutation, OpaqueMutation, PersistenceMutation,
+    RefreshMaterializedViewMutation, ReleaseSavepointMutation, Rename, ResolvedGrantTarget,
+    RevokeMutation, RollbackToSavepointMutation, SavepointMutation, SearchPathChange,
 };
 use crate::analysis::state::AnalysisState;
 use crate::ast::identifiers::{ObjectId, QualifiedName};
@@ -93,7 +93,34 @@ impl Resolver {
     }
 
     fn resolve_function_id_by_sig(base_id: &ObjectId, sig: &str) -> ObjectId {
-        let mut id = ObjectId::new(base_id.schema.clone(), format!("{}({})", base_id.name, sig));
+        // Normalize types in signature to match pg_proc standard names
+        let normalized_sig = sig
+            .split(',')
+            .map(|s| {
+                let s = s.trim().to_lowercase();
+                match s.as_str() {
+                    "int" | "int4" => "integer".to_string(),
+                    "int8" => "bigint".to_string(),
+                    "int2" => "smallint".to_string(),
+                    "float8" => "double precision".to_string(),
+                    "float4" => "real".to_string(),
+                    "bool" => "boolean".to_string(),
+                    "varchar" => "character varying".to_string(),
+                    "char" => "character".to_string(),
+                    "time" => "time without time zone".to_string(),
+                    "timestamp" => "timestamp without time zone".to_string(),
+                    "timestamptz" => "timestamp with time zone".to_string(),
+                    "decimal" => "numeric".to_string(),
+                    _ => s,
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let mut id = ObjectId::new(
+            base_id.schema.clone(),
+            format!("{}({})", base_id.name, normalized_sig),
+        );
         id.inferred_schema = base_id.inferred_schema;
         id
     }
@@ -133,8 +160,6 @@ impl Resolver {
                     let mut new_id = ObjectId::new(id.schema.clone(), nn.resolve());
                     new_id.inferred_schema = id.inferred_schema;
                     mutations.push(Mutation::Rename(Rename { old_id: id, new_id }));
-                } else {
-                    mutations.push(Mutation::Opaque(OpaqueMutation::DynamicSql));
                 }
             }
             StatementFact::DropSchema {
@@ -162,20 +187,6 @@ impl Resolver {
             } => {
                 let id = Self::resolve_creation_name(name, state);
 
-                if !*if_not_exists
-                    && (state.relation_is_present(&id)
-                        || matches!(
-                            state.local.types.get(&id),
-                            Some(crate::model::types::TypeOverlay::Present(_))
-                        )
-                        || matches!(
-                            state.local.sequences.get(&id),
-                            Some(crate::model::sequence::SequenceOverlay::Present(_))
-                        ))
-                {
-                    return vec![Mutation::Opaque(OpaqueMutation::DynamicSql)];
-                }
-
                 let resolved_persistence = match persistence {
                     PersistenceFact::Permanent => PersistenceMutation::Permanent,
                     PersistenceFact::Temporary => PersistenceMutation::Temporary,
@@ -196,9 +207,7 @@ impl Resolver {
                 let mut fk_mutations = Vec::new();
                 for fk in foreign_keys {
                     let to_table = Self::resolve_lookup_name(&fk.references, state);
-                    if !state.relation_is_present(&to_table) {
-                        return vec![Mutation::Opaque(OpaqueMutation::DynamicSql)];
-                    }
+
                     fk_mutations.push(FkMutation {
                         constraint_name: fk.constraint_name.clone(),
                         to_table,
@@ -210,12 +219,6 @@ impl Resolver {
                 let partition_of_id = partition_of
                     .as_ref()
                     .map(|n| Self::resolve_lookup_name(n, state));
-
-                if let Some(p_id) = &partition_of_id
-                    && !state.relation_is_present(p_id)
-                {
-                    return vec![Mutation::Opaque(OpaqueMutation::DynamicSql)];
-                }
 
                 mutations.push(Mutation::CreateTable(CreateTable {
                     id,
@@ -236,10 +239,6 @@ impl Resolver {
                 depends_on,
             } => {
                 let id = Self::resolve_creation_name(name, state);
-
-                if !*or_replace && state.relation_is_present(&id) {
-                    return vec![Mutation::Opaque(OpaqueMutation::DynamicSql)];
-                }
 
                 let resolved_depends = depends_on
                     .iter()
@@ -279,10 +278,6 @@ impl Resolver {
             StatementFact::CreateMaterializedView { name, depends_on } => {
                 let id = Self::resolve_creation_name(name, state);
 
-                if state.relation_is_present(&id) {
-                    return vec![Mutation::Opaque(OpaqueMutation::DynamicSql)];
-                }
-
                 let resolved_depends = depends_on
                     .iter()
                     .map(|n| Self::resolve_lookup_name(n, state))
@@ -319,10 +314,6 @@ impl Resolver {
                 unique,
             } => {
                 let id = Self::resolve_creation_name(name, state);
-
-                if !*if_not_exists && state.local.graph.indexes.iter().any(|ix| ix.index_id == id) {
-                    return vec![Mutation::Opaque(OpaqueMutation::DynamicSql)];
-                }
 
                 mutations.push(Mutation::CreateIndex(CreateIndex {
                     id,
@@ -406,14 +397,6 @@ impl Resolver {
             StatementFact::CreateType(create_type) => {
                 let id = Self::resolve_creation_name(&create_type.name, state);
 
-                if matches!(
-                    state.local.types.get(&id),
-                    Some(crate::model::types::TypeOverlay::Present(_))
-                ) || state.relation_is_present(&id)
-                {
-                    return vec![Mutation::Opaque(OpaqueMutation::DynamicSql)];
-                }
-
                 let mapped_kind = match create_type.kind {
                     TypeCreationKind::Enum => TypeKind::Enum { variants: vec![] },
                     TypeCreationKind::Range => TypeKind::Range,
@@ -444,14 +427,6 @@ impl Resolver {
             StatementFact::CreateDomain { name, base_type } => {
                 let id = Self::resolve_creation_name(name, state);
 
-                if matches!(
-                    state.local.types.get(&id),
-                    Some(crate::model::types::TypeOverlay::Present(_))
-                ) || state.relation_is_present(&id)
-                {
-                    return vec![Mutation::Opaque(OpaqueMutation::DynamicSql)];
-                }
-
                 mutations.push(Mutation::CreateDomain(CreateDomainMutation {
                     id,
                     base_type: base_type.clone(),
@@ -478,21 +453,27 @@ impl Resolver {
                     cascade: *cascade,
                 }));
             }
+            StatementFact::DropType {
+                names,
+                if_exists,
+                cascade,
+            } => {
+                let ids = names
+                    .iter()
+                    .map(|n| Self::resolve_lookup_name(n, state))
+                    .collect();
+                mutations.push(Mutation::DropType(DropTypeMutation {
+                    ids,
+                    if_exists: *if_exists,
+                    cascade: *cascade,
+                }));
+            }
             StatementFact::CreateSequence {
                 name,
                 if_not_exists,
                 owned_by,
             } => {
                 let id = Self::resolve_creation_name(name, state);
-
-                if !*if_not_exists
-                    && matches!(
-                        state.local.sequences.get(&id),
-                        Some(crate::model::sequence::SequenceOverlay::Present(_))
-                    )
-                {
-                    return vec![Mutation::Opaque(OpaqueMutation::DynamicSql)];
-                }
 
                 let resolved_owned_by = owned_by.as_ref().map(|(table_name, col)| {
                     (Self::resolve_lookup_name(table_name, state), col.clone())
@@ -657,9 +638,7 @@ impl Resolver {
                         }
                         AlterTableActionFact::AttachPartition { child } => {
                             let child_id = Self::resolve_lookup_name(child, state);
-                            if state.local.graph.check_partition_cycle(&id, &child_id) {
-                                return vec![Mutation::Opaque(OpaqueMutation::DynamicSql)];
-                            }
+
                             AlterTableActionMutation::AttachPartition { child: child_id }
                         }
                         AlterTableActionFact::DetachPartition { child } => {
@@ -688,7 +667,23 @@ impl Resolver {
                         AlterTableActionFact::SetExpression { .. }
                         | AlterTableActionFact::SetOptions { .. }
                         | AlterTableActionFact::Inherit { .. }
-                        | AlterTableActionFact::NoInherit { .. } => {
+                        | AlterTableActionFact::NoInherit { .. }
+                        | AlterTableActionFact::ClusterOn { .. }
+                        | AlterTableActionFact::InheritTable { .. }
+                        | AlterTableActionFact::NoInheritTable { .. }
+                        | AlterTableActionFact::MergePartitions { .. }
+                        | AlterTableActionFact::SplitPartition
+                        | AlterTableActionFact::SetSchema { .. }
+                        | AlterTableActionFact::SetTablespace { .. }
+                        | AlterTableActionFact::SetLogged
+                        | AlterTableActionFact::SetUnlogged
+                        | AlterTableActionFact::OwnerTo { .. }
+                        | AlterTableActionFact::ReplicaIdentity { .. }
+                        | AlterTableActionFact::ForceRls
+                        | AlterTableActionFact::EnableRls
+                        | AlterTableActionFact::DisableRls
+                        | AlterTableActionFact::EnableAlwaysTrigger { .. }
+                        | AlterTableActionFact::EnableReplicaTrigger { .. } => {
                             AlterTableActionMutation::Opaque
                         }
                     };
@@ -704,9 +699,7 @@ impl Resolver {
                 cascade,
             } => {
                 let id = Self::resolve_lookup_name(name, state);
-                if !state.relation_is_present(&id) && *if_exists {
-                    return vec![];
-                }
+
                 // Still emit a DropTable mutation for rule evaluation (e.g. DriftDetectionRule)
                 // even when the table is not present locally. The state machine will handle
                 // tainting confidence in apply().
@@ -766,9 +759,6 @@ impl Resolver {
             StatementFact::CommitTransaction => mutations.push(Mutation::CommitTransaction),
             StatementFact::RollbackTransaction => mutations.push(Mutation::RollbackTransaction),
             StatementFact::RollbackToSavepoint { name } => {
-                if !state.local.transactions.iter().any(|t| t.name == *name) {
-                    return vec![Mutation::Opaque(OpaqueMutation::DynamicSql)];
-                }
                 mutations.push(Mutation::RollbackToSavepoint(RollbackToSavepointMutation {
                     name: name.clone(),
                 }))
@@ -779,9 +769,6 @@ impl Resolver {
                 }))
             }
             StatementFact::ReleaseSavepoint { name } => {
-                if !state.local.transactions.iter().any(|t| t.name == *name) {
-                    return vec![Mutation::Opaque(OpaqueMutation::DynamicSql)];
-                }
                 mutations.push(Mutation::ReleaseSavepoint(ReleaseSavepointMutation {
                     name: name.clone(),
                 }))
@@ -826,8 +813,35 @@ impl Resolver {
                 }));
             }
             StatementFact::DropFunction(f) => {
+                let mut signatures = Vec::new();
+                for sig in &f.signatures {
+                    let mut normalized_sig = sig.clone();
+                    normalized_sig.params = normalized_sig
+                        .params
+                        .into_iter()
+                        .map(|p| {
+                            let p = p.trim().to_lowercase();
+                            match p.as_str() {
+                                "int" | "int4" => "integer".to_string(),
+                                "int8" => "bigint".to_string(),
+                                "int2" => "smallint".to_string(),
+                                "float8" => "double precision".to_string(),
+                                "float4" => "real".to_string(),
+                                "bool" => "boolean".to_string(),
+                                "varchar" => "character varying".to_string(),
+                                "char" => "character".to_string(),
+                                "time" => "time without time zone".to_string(),
+                                "timestamp" => "timestamp without time zone".to_string(),
+                                "timestamptz" => "timestamp with time zone".to_string(),
+                                "decimal" => "numeric".to_string(),
+                                _ => p,
+                            }
+                        })
+                        .collect();
+                    signatures.push(normalized_sig);
+                }
                 mutations.push(Mutation::DropFunction(DropFunctionMutation {
-                    signatures: f.signatures.clone(),
+                    signatures,
                     if_exists: f.if_exists,
                     cascade: f.cascade,
                 }));

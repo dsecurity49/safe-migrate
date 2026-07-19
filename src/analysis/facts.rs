@@ -163,6 +163,11 @@ pub enum StatementFact {
         if_exists: bool,
         cascade: bool,
     },
+    DropType {
+        names: Vec<QualifiedName>,
+        if_exists: bool,
+        cascade: bool,
+    },
     CreateSequence {
         name: QualifiedName,
         if_not_exists: bool,
@@ -725,4 +730,40 @@ pub enum AlterTableActionFact {
         column: String,
     },
     SetAccessMethod,
+    ClusterOn {
+        index: String,
+    },
+    InheritTable {
+        parent: QualifiedName,
+    },
+    NoInheritTable {
+        parent: QualifiedName,
+    },
+    MergePartitions {
+        parent: QualifiedName,
+    },
+    SplitPartition,
+    SetSchema {
+        new_schema: String,
+    },
+    SetTablespace {
+        tablespace: String,
+    },
+    SetLogged,
+    SetUnlogged,
+    OwnerTo {
+        new_owner: String,
+    },
+    ReplicaIdentity {
+        option: String,
+    },
+    ForceRls,
+    EnableRls,
+    DisableRls,
+    EnableAlwaysTrigger {
+        trigger_name: Option<String>,
+    },
+    EnableReplicaTrigger {
+        trigger_name: Option<String>,
+    },
 }

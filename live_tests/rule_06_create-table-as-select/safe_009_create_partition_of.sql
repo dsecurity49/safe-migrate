@@ -1,0 +1,1 @@
+CREATE TABLE t PARTITION OF test_table FOR VALUES IN (1, 2, 3);

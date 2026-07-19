@@ -1,0 +1,1 @@
+ALTER TABLE parent ATTACH PARTITION region_na FOR VALUES IN ('NA', 'US', 'CA');

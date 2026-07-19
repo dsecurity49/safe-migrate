@@ -1,0 +1,1 @@
+CREATE POLICY p ON test_table FOR DELETE TO PUBLIC USING (true);

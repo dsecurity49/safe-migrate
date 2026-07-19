@@ -1,0 +1,2 @@
+CREATE TABLE t1 (id INT);
+CREATE TABLE t1 (id INT, val TEXT);

@@ -1,0 +1,1 @@
+CREATE POLICY p ON test_table AS RESTRICTIVE FOR SELECT TO role_admin USING (true);

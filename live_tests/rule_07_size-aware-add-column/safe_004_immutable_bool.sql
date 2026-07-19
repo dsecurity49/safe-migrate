@@ -1,0 +1,1 @@
+ALTER TABLE test_table ADD COLUMN c BOOLEAN DEFAULT true;

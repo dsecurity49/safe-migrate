@@ -1,0 +1,2 @@
+ALTER TABLE test_table ADD COLUMN c INT;
+ALTER TABLE test_table ADD COLUMN c TEXT;

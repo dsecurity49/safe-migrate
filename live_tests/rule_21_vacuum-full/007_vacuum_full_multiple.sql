@@ -1,0 +1,1 @@
+VACUUM FULL t1, t2;

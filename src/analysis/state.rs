@@ -72,6 +72,7 @@ pub struct AnalysisState {
     pub baseline_relations: HashSet<ObjectId>,
     pub baseline_indexes: HashSet<ObjectId>,
     pub baseline_foreign_keys: HashSet<(ObjectId, String)>,
+    pub baseline_fk_dependencies: HashSet<ObjectId>,
     pub local: LocalState,
 }
 
@@ -81,9 +82,13 @@ impl AnalysisState {
         let mut baseline_relations = HashSet::new();
         let mut baseline_indexes = HashSet::new();
         let mut baseline_foreign_keys = HashSet::new();
+        let mut baseline_fk_dependencies = HashSet::new();
         let mut graph = DependencyGraph::new();
 
         for (id, rel_state) in cache.baseline_relations() {
+            if rel_state.is_fk_dependency {
+                baseline_fk_dependencies.insert(id.clone());
+            }
             relations.insert(id.clone(), RelationOverlay::Present(rel_state.clone()));
             baseline_relations.insert(id.clone());
         }
@@ -113,15 +118,35 @@ impl AnalysisState {
             });
         }
 
+        for t in cache.triggers {
+            graph
+                .trigger_dependencies
+                .push(crate::analysis::graph::TriggerEdge {
+                    trigger_id: t.trigger_id,
+                    table_id: t.table_id,
+                    function_id: t.function_id,
+                });
+        }
+
+        let mut functions: HashMap<ObjectId, crate::model::function::FunctionOverlay> =
+            HashMap::new();
+        for (id, func_state) in &cache.functions {
+            functions.insert(
+                id.clone(),
+                crate::model::function::FunctionOverlay::Present(func_state.clone()),
+            );
+        }
+
         Self {
             pg_version_num: cache.pg_version_num,
             baseline_relations,
             baseline_indexes,
             baseline_foreign_keys,
+            baseline_fk_dependencies,
             local: LocalState {
                 relations,
                 types: HashMap::new(),
-                functions: HashMap::new(),
+                functions,
                 sequences: HashMap::new(),
                 publications: HashMap::new(),
                 subscriptions: HashMap::new(),
@@ -610,6 +635,12 @@ impl AnalysisState {
                         .graph
                         .views
                         .retain(|v| !closure.dropped_relations.contains(&resolve(&v.view_id)));
+
+                    self.snapshot_sequence_graph_full();
+                    self.local.graph.sequences.retain(|s| {
+                        let resolved_table = resolve(&s.table_id);
+                        !closure.dropped_relations.contains(&resolved_table)
+                    });
                 } else {
                     let has_view_deps = self
                         .local
@@ -637,6 +668,12 @@ impl AnalysisState {
                     self.local
                         .relations
                         .insert(drop_table.id.clone(), RelationOverlay::Dropped);
+
+                    self.snapshot_sequence_graph_full();
+                    self.local
+                        .graph
+                        .sequences
+                        .retain(|s| resolve(&s.table_id) != resolved_drop);
                 }
 
                 self.snapshot_partition_graph_full();
@@ -649,6 +686,11 @@ impl AnalysisState {
             Mutation::CreateTable(create) => {
                 if create.if_not_exists && self.relation_is_present(&create.id) {
                     return MutationResult::Skipped;
+                }
+                if !create.if_not_exists && self.relation_is_present(&create.id) {
+                    return MutationResult::Conflict {
+                        reason: format!("relation '{}' already exists", create.id),
+                    };
                 }
 
                 self.snapshot_relation(&create.id);
@@ -747,6 +789,11 @@ impl AnalysisState {
                 MutationResult::Applied
             }
             Mutation::CreateView(create_view) => {
+                if !create_view.or_replace && self.relation_is_present(&create_view.id) {
+                    return MutationResult::Conflict {
+                        reason: format!("relation '{}' already exists", create_view.id),
+                    };
+                }
                 self.snapshot_relation(&create_view.id);
                 self.snapshot_generation_counter();
                 self.local.generation_counter += 1;
@@ -774,6 +821,11 @@ impl AnalysisState {
                 MutationResult::Applied
             }
             Mutation::CreateMaterializedView(create_mv) => {
+                if self.relation_is_present(&create_mv.id) {
+                    return MutationResult::Conflict {
+                        reason: format!("relation '{}' already exists", create_mv.id),
+                    };
+                }
                 self.snapshot_relation(&create_mv.id);
                 self.snapshot_generation_counter();
                 self.local.generation_counter += 1;
@@ -802,15 +854,19 @@ impl AnalysisState {
             }
             Mutation::RefreshMaterializedView(_) => MutationResult::Applied,
             Mutation::CreateIndex(create_idx) => {
-                if create_idx.if_not_exists
-                    && self
-                        .local
-                        .graph
-                        .indexes
-                        .iter()
-                        .any(|ix| ix.index_id == create_idx.id)
-                {
+                let exists = self
+                    .local
+                    .graph
+                    .indexes
+                    .iter()
+                    .any(|ix| ix.index_id == create_idx.id);
+                if create_idx.if_not_exists && exists {
                     return MutationResult::Skipped;
+                }
+                if !create_idx.if_not_exists && exists {
+                    return MutationResult::Conflict {
+                        reason: format!("relation '{}' already exists", create_idx.id),
+                    };
                 }
                 self.snapshot_index_graph();
                 self.local.graph.indexes.push(IndexEdge {
@@ -975,12 +1031,18 @@ impl AnalysisState {
                             });
                         }
                         AlterTableActionMutation::SetType { column, ty, .. } => {
+                            if !rel.has_column(column) {
+                                self.local.confidence = Confidence::Tainted;
+                            }
                             rel.apply_column_action(&ColumnAction::SetType {
                                 name: column.clone(),
                                 data_type: ty.clone(),
                             });
                         }
                         AlterTableActionMutation::SetDefault { column, default } => {
+                            if !rel.has_column(column) {
+                                self.local.confidence = Confidence::Tainted;
+                            }
                             rel.apply_column_action(&ColumnAction::SetDefault {
                                 name: column.clone(),
                                 default: default.clone(),
@@ -1011,11 +1073,17 @@ impl AnalysisState {
                             });
                         }
                         AlterTableActionMutation::AttachPartition { child } => {
-                            self.snapshot_partition_graph();
-                            self.local.graph.partitions.push(PartitionEdge {
-                                parent: alter.id.clone(),
-                                child: child.clone(),
-                            });
+                            // BUG-012: Reject cycle topologies before inserting the edge.
+                            if self.local.graph.check_partition_cycle(&alter.id, child) {
+                                self.snapshot_confidence();
+                                self.local.confidence = Confidence::Tainted;
+                            } else {
+                                self.snapshot_partition_graph();
+                                self.local.graph.partitions.push(PartitionEdge {
+                                    parent: alter.id.clone(),
+                                    child: child.clone(),
+                                });
+                            }
                         }
                         AlterTableActionMutation::DetachPartition { child } => {
                             self.snapshot_partition_graph();
@@ -1030,6 +1098,14 @@ impl AnalysisState {
                 MutationResult::Applied
             }
             Mutation::CreateType(create_type) => {
+                if matches!(
+                    self.local.types.get(&create_type.id),
+                    Some(TypeOverlay::Present(_))
+                ) {
+                    return MutationResult::Conflict {
+                        reason: format!("type '{}' already exists", create_type.id),
+                    };
+                }
                 self.snapshot_type(&create_type.id);
                 self.snapshot_generation_counter();
                 self.local.generation_counter += 1;
@@ -1059,6 +1135,14 @@ impl AnalysisState {
                 MutationResult::Applied
             }
             Mutation::CreateDomain(create_domain) => {
+                if matches!(
+                    self.local.types.get(&create_domain.id),
+                    Some(TypeOverlay::Present(_))
+                ) {
+                    return MutationResult::Conflict {
+                        reason: format!("type '{}' already exists", create_domain.id),
+                    };
+                }
                 self.snapshot_type(&create_domain.id);
                 self.snapshot_generation_counter();
                 self.local.generation_counter += 1;
@@ -1084,9 +1168,21 @@ impl AnalysisState {
                 }
                 MutationResult::Applied
             }
+            Mutation::DropType(drop_type) => {
+                for id in &drop_type.ids {
+                    self.snapshot_type(id);
+                    self.local.types.insert(id.clone(), TypeOverlay::Dropped);
+                }
+                MutationResult::Applied
+            }
             Mutation::CreateSequence(create_seq) => {
                 if create_seq.if_not_exists && self.local.sequences.contains_key(&create_seq.id) {
                     return MutationResult::Skipped;
+                }
+                if !create_seq.if_not_exists && self.local.sequences.contains_key(&create_seq.id) {
+                    return MutationResult::Conflict {
+                        reason: format!("relation '{}' already exists", create_seq.id),
+                    };
                 }
                 self.snapshot_sequence(&create_seq.id);
                 self.snapshot_generation_counter();
@@ -1113,12 +1209,12 @@ impl AnalysisState {
             }
             Mutation::AlterSequence(alter_seq) => {
                 self.snapshot_sequence(&alter_seq.id);
+                self.snapshot_sequence_graph();
+                self.local
+                    .graph
+                    .sequences
+                    .retain(|s| s.sequence_id != alter_seq.id);
                 if let Some((table_id, col)) = &alter_seq.owned_by {
-                    self.snapshot_sequence_graph();
-                    self.local
-                        .graph
-                        .sequences
-                        .retain(|s| s.sequence_id != alter_seq.id);
                     self.local.graph.sequences.push(SequenceEdge {
                         sequence_id: alter_seq.id.clone(),
                         table_id: table_id.clone(),

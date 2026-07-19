@@ -1,0 +1,2 @@
+ALTER TABLE test_table RENAME COLUMN a TO b;
+ALTER TABLE test_table RENAME COLUMN b TO c;

@@ -1,0 +1,1 @@
+DROP SCHEMA a, b, c CASCADE;

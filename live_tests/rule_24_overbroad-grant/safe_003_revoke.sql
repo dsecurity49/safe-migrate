@@ -1,0 +1,1 @@
+REVOKE SELECT ON test_table FROM PUBLIC;

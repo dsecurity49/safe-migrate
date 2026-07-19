@@ -1,0 +1,3 @@
+BEGIN;
+CREATE INDEX CONCURRENTLY i ON test_table(id) INCLUDE (a, b);
+COMMIT;

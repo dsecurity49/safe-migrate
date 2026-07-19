@@ -65,6 +65,7 @@ impl Rule for MaterializedViewRefreshRule {
                         recipe: "Run ANALYZE to ensure accurate row estimates.",
                         dedup_key: Some(key),
                                     sql: None,
+                                    fk_dependency_related: false,
                     });
                 }
 
@@ -97,6 +98,7 @@ impl Rule for MaterializedViewRefreshRule {
                         recipe: self.recipe(),
                         dedup_key: None,
                         sql: None,
+                        fk_dependency_related: false,
                     });
                 }
             } else {
@@ -119,6 +121,7 @@ impl Rule for MaterializedViewRefreshRule {
                         recipe: "Create a unique index on the materialized view before attempting a concurrent refresh.",
                         dedup_key: None,
                                     sql: None,
+                                    fk_dependency_related: false,
                     });
                 }
             }

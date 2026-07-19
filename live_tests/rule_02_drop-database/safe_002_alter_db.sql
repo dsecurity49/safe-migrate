@@ -1,0 +1,1 @@
+ALTER DATABASE mydb RENAME TO mydb2;

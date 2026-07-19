@@ -1,0 +1,1 @@
+CREATE UNIQUE INDEX CONCURRENTLY idx ON t_large(id);

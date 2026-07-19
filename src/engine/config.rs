@@ -18,10 +18,11 @@ pub struct Config {
     pub tier2_threshold_rows: u64,
     pub stale_stats_days: u64,
     pub toast_width_threshold_bytes: i32,
-    pub default_rows: u64,           // Fallback for offline/unanalyzed tables
-    pub assume_pg_version: u32,      // Fallback for offline PG version
-    pub disabled_rules: Vec<String>, // Legacy global array
-    pub rules: HashMap<String, RuleConfig>, // NEW: Granular per-rule configs
+    pub default_rows: u64, // Fallback for offline/unanalyzed tables
+    pub rules: HashMap<String, RuleConfig>, // Per-rule configuration
+    pub assume_pg_version: u32,
+    pub disabled_rules: Vec<String>,
+    pub schemas: Option<Vec<String>>,
 }
 
 impl Default for Config {
@@ -35,6 +36,7 @@ impl Default for Config {
             assume_pg_version: 100000,
             disabled_rules: Vec::new(),
             rules: HashMap::new(),
+            schemas: None,
         }
     }
 }

@@ -1,0 +1,1 @@
+DROP FUNCTION f_safe(OUT INT);

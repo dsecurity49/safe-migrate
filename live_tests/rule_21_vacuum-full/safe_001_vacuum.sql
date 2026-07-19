@@ -1,0 +1,1 @@
+VACUUM test_table;

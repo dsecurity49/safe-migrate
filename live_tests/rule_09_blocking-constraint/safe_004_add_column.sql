@@ -1,0 +1,1 @@
+CREATE INDEX IF NOT EXISTS idx_t_id ON t(id);

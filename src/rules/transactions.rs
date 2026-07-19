@@ -45,6 +45,7 @@ impl Rule for ConcurrentInsideTransactionRule {
                         recipe: "Move CONCURRENTLY index creation outside of explicit transaction blocks.",
                         dedup_key: Some(format!("{}_{}", self.id(), c.id)),
                                     sql: None,
+                                    fk_dependency_related: false,
                     });
                 }
                 Mutation::DropIndex(d) if d.concurrently => {
@@ -62,6 +63,7 @@ impl Rule for ConcurrentInsideTransactionRule {
                         recipe: self.recipe(),
                         dedup_key: None,
                         sql: None,
+                        fk_dependency_related: false,
                     });
                 }
                 _ => {}
@@ -108,6 +110,7 @@ impl Rule for AlterTypeAddValueRule {
                 recipe: self.recipe(),
                 dedup_key: None,
                 sql: None,
+                fk_dependency_related: false,
             }];
         }
         vec![]
@@ -156,6 +159,7 @@ impl Rule for VacuumFullRule {
                 recipe: self.recipe(),
                 dedup_key: None,
                 sql: None,
+                fk_dependency_related: false,
             }];
         }
         vec![]

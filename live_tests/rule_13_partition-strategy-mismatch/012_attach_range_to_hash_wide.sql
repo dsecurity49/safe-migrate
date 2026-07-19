@@ -1,0 +1,1 @@
+ALTER TABLE hash_parent ATTACH PARTITION range_child FOR VALUES FROM (100) TO (200);

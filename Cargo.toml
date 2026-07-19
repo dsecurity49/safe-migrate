@@ -1,6 +1,6 @@
 [package]
 name = "safe-migrate"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 description = "Lint PostgreSQL migrations against live database statistics to prevent blocking locks"
 license = "MIT OR Apache-2.0"
@@ -25,6 +25,9 @@ rowan = "0.15.18"
 owo-colors = "4"
 terminal_size = "0.3"
 comfy-table = "7"
+bincode = { version = "2.0", features = ["serde"] }
+zstd = "0.13"
+crossterm = "0.27.0"
 
 [dev-dependencies]
 tempfile = "3.10"

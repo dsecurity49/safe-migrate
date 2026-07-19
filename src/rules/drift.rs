@@ -36,7 +36,7 @@ impl Rule for DriftDetectionRule {
             }) => {
                 violations.push(Violation { source_range: None,
                     rule_id: self.id(),
-                    operation_kind: OperationKind::Other("unresolved_reference".to_string()),
+                        operation_kind: OperationKind::UnresolvedReference,
                     object_kind: object_kind.clone(),
                     object_name: object_name.clone(),
                     tier: self.default_tier(),
@@ -48,6 +48,7 @@ impl Rule for DriftDetectionRule {
                     recipe: self.recipe(),
                     dedup_key: None,
                     sql: None,
+                    fk_dependency_related: false,
                 });
             }
             Mutation::DropTable(d) => {
@@ -65,6 +66,7 @@ impl Rule for DriftDetectionRule {
                         recipe: self.recipe(),
                         dedup_key: None,
                                     sql: None,
+                                    fk_dependency_related: false,
                     });
                 }
             }
@@ -83,6 +85,7 @@ impl Rule for DriftDetectionRule {
                         recipe: self.recipe(),
                         dedup_key: None,
                                     sql: None,
+                                    fk_dependency_related: false,
                     });
                 }
             }
@@ -102,6 +105,7 @@ impl Rule for DriftDetectionRule {
                             recipe: self.recipe(),
                             dedup_key: None,
                                             sql: None,
+                                            fk_dependency_related: false,
                         });
                     }
                 }
@@ -122,6 +126,7 @@ impl Rule for DriftDetectionRule {
                             recipe: self.recipe(),
                             dedup_key: None,
                                             sql: None,
+                                            fk_dependency_related: false,
                         });
                     }
                 }
@@ -142,6 +147,7 @@ impl Rule for DriftDetectionRule {
                             recipe: self.recipe(),
                             dedup_key: None,
                                             sql: None,
+                                            fk_dependency_related: false,
                         });
                     }
                 }
@@ -165,6 +171,7 @@ impl Rule for DriftDetectionRule {
                             recipe: self.recipe(),
                             dedup_key: None,
                                             sql: None,
+                                            fk_dependency_related: false,
                         });
                     }
                 }
@@ -188,6 +195,7 @@ impl Rule for DriftDetectionRule {
                             recipe: self.recipe(),
                             dedup_key: None,
                                             sql: None,
+                                            fk_dependency_related: false,
                         });
                     }
                 }
@@ -207,6 +215,7 @@ impl Rule for DriftDetectionRule {
                         recipe: self.recipe(),
                         dedup_key: None,
                                     sql: None,
+                                    fk_dependency_related: false,
                     });
                 }
             }
@@ -226,8 +235,54 @@ impl Rule for DriftDetectionRule {
                             recipe: self.recipe(),
                             dedup_key: None,
                                             sql: None,
+                                            fk_dependency_related: false,
                         });
                     }
+                }
+            }
+            Mutation::DropType(d) => {
+                println!("Evaluate DropType in drift rule: ids={:?}", d.ids);
+                for id in &d.ids {
+                    if !pre_state.types.contains_key(id) {
+                        violations.push(Violation { source_range: None,
+                            rule_id: self.id(),
+                            operation_kind: OperationKind::DropType,
+                            object_kind: ObjectKind::Type,
+                            object_name: id.to_string(),
+                            tier: self.default_tier(),
+                            reason: format!(
+                                "Migration DROPs type \"{}\" which does not exist in the production baseline",
+                                id
+                            ),
+                            recipe: self.recipe(),
+                            dedup_key: None,
+                            sql: None,
+                            fk_dependency_related: false,
+                        });
+                    }
+                }
+            }
+            Mutation::Rename(r) => {
+                if !pre_state.relations.contains_key(&r.old_id)
+                    && !pre_state.types.contains_key(&r.old_id)
+                    && !pre_state.sequences.contains_key(&r.old_id)
+                    && !pre_state.indexes.iter().any(|idx| idx.index_id == r.old_id)
+                {
+                    violations.push(Violation { source_range: None,
+                        rule_id: self.id(),
+                        operation_kind: OperationKind::Rename,
+                        object_kind: ObjectKind::Table, // Or general
+                        object_name: r.old_id.to_string(),
+                        tier: self.default_tier(),
+                        reason: format!(
+                            "Migration RENAMEs object \"{}\" which does not exist in the production baseline",
+                            r.old_id
+                        ),
+                        recipe: self.recipe(),
+                        dedup_key: None,
+                        sql: None,
+                        fk_dependency_related: false,
+                    });
                 }
             }
             Mutation::AlterType(a) if !pre_state.types.contains_key(&a.id) => {
@@ -244,6 +299,7 @@ impl Rule for DriftDetectionRule {
                     recipe: self.recipe(),
                     dedup_key: None,
                             sql: None,
+                            fk_dependency_related: false,
                 });
             }
             Mutation::AlterFunction(f) if !pre_state.functions.contains_key(&f.id) => {
@@ -260,6 +316,7 @@ impl Rule for DriftDetectionRule {
                     recipe: self.recipe(),
                     dedup_key: None,
                             sql: None,
+                            fk_dependency_related: false,
                 });
             }
             Mutation::AlterProcedure(p) if !pre_state.functions.contains_key(&p.id) => {
@@ -276,6 +333,7 @@ impl Rule for DriftDetectionRule {
                     recipe: self.recipe(),
                     dedup_key: None,
                             sql: None,
+                            fk_dependency_related: false,
                 });
             }
             Mutation::CreateTable(c) => {
@@ -296,6 +354,7 @@ impl Rule for DriftDetectionRule {
                         recipe: self.recipe(),
                         dedup_key: None,
                         sql: None,
+                        fk_dependency_related: false,
                     });
                 }
             }

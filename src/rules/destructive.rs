@@ -38,37 +38,57 @@ impl Rule for CascadingDropRule {
             && let Some(closure) = cascade_closure
         {
             let mut affects_baseline = false;
+            let mut has_fk_pulled = false;
 
             for rel_id in &closure.dropped_relations {
                 if rel_id != &drop.id && state.baseline_relations.contains(rel_id) {
                     affects_baseline = true;
-                    break;
+                    if state.baseline_fk_dependencies.contains(rel_id) {
+                        has_fk_pulled = true;
+                    }
                 }
             }
 
             if !affects_baseline {
-                for constraint in &closure.dropped_constraints {
-                    if state.baseline_foreign_keys.contains(constraint) {
+                for (from_table, cname) in &closure.dropped_constraints {
+                    if state
+                        .baseline_foreign_keys
+                        .contains(&(from_table.clone(), cname.clone()))
+                    {
                         affects_baseline = true;
                         break;
                     }
                 }
             }
 
+            for (from_table, _cname) in &closure.dropped_constraints {
+                if state.baseline_fk_dependencies.contains(from_table) {
+                    has_fk_pulled = true;
+                }
+            }
+
             if affects_baseline {
-                violations.push(Violation { source_range: None,
+                let mut reason = format!(
+                    "DROP TABLE {} CASCADE silently destroys pre-existing database dependencies",
+                    drop.id
+                );
+                if has_fk_pulled {
+                    reason.push_str(
+                        " (includes FK-pulled tables from other schemas — cross-team impact)",
+                    );
+                }
+                violations.push(Violation {
+                    source_range: None,
                     rule_id: self.id(),
                     operation_kind: OperationKind::DropTable,
                     object_kind: ObjectKind::Table,
                     object_name: drop.id.to_string(),
                     tier: self.default_tier(),
-                    reason: format!(
-                        "DROP TABLE {} CASCADE silently destroys pre-existing database dependencies",
-                        drop.id
-                    ),
+                    reason,
                     recipe: self.recipe(),
                     dedup_key: None,
-                            sql: None,
+                    sql: None,
+                    fk_dependency_related: has_fk_pulled,
                 });
             }
         }
@@ -149,6 +169,7 @@ impl Rule for SizeAwareAddColumnRule {
                         recipe: "Run ANALYZE to ensure accurate TOAST width and row estimates before structural changes.",
                         dedup_key: Some(key),
                                     sql: None,
+                                    fk_dependency_related: false,
                     });
                 }
 
@@ -193,6 +214,7 @@ impl Rule for SizeAwareAddColumnRule {
                     recipe: self.recipe(),
                     dedup_key: None,
                     sql: None,
+                    fk_dependency_related: false,
                 });
             }
         }
@@ -234,6 +256,7 @@ impl Rule for DropDatabaseRule {
                 recipe: self.recipe(),
                 dedup_key: None,
                 sql: None,
+                fk_dependency_related: false,
             }];
         }
         vec![]
@@ -278,6 +301,7 @@ impl Rule for DropSchemaCascadeRule {
                 recipe: self.recipe(),
                 dedup_key: None,
                 sql: None,
+                fk_dependency_related: false,
             });
         }
 
@@ -324,6 +348,7 @@ impl Rule for CreateTableAsSelectRule {
                 recipe: self.recipe(),
                 dedup_key: None,
                 sql: None,
+                fk_dependency_related: false,
             }];
         }
         vec![]
@@ -404,11 +429,17 @@ impl Rule for ReversibilityRule {
                     recipe: "This type change may be lossy. Verify data compatibility.",
                     dedup_key: None,
                     sql: None,
+                    fk_dependency_related: false,
                 });
             }
         }
 
         if let Reversibility::Irreversible = classify(mutation) {
+            // Guard: ReversibilityRule should not fire for DropDatabase,
+            // as DropDatabaseRule handles it specifically.
+            if matches!(mutation, Mutation::DropDatabase(_)) {
+                return violations; // Return early, let DropDatabaseRule handle it
+            }
             let mut rows = if let Mutation::AlterTable(a) = mutation {
                 pre_state
                     .relations
@@ -447,7 +478,7 @@ impl Rule for ReversibilityRule {
                         a.id.to_string(),
                     ),
                     _ => (
-                        OperationKind::Other("irreversible".to_string()),
+                        OperationKind::Irreversible,
                         ObjectKind::Table,
                         a.id.to_string(),
                     ),
@@ -463,8 +494,8 @@ impl Rule for ReversibilityRule {
                     d.id.to_string(),
                 ),
                 _ => (
-                    OperationKind::Other("irreversible".to_string()),
-                    ObjectKind::Unknown,
+                    OperationKind::Irreversible,
+                    ObjectKind::Table,
                     "unknown".to_string(),
                 ),
             };
@@ -480,6 +511,7 @@ impl Rule for ReversibilityRule {
                 recipe: self.recipe(),
                 dedup_key: None,
                 sql: None,
+                fk_dependency_related: false,
             });
         }
         violations
@@ -488,7 +520,7 @@ impl Rule for ReversibilityRule {
 
 /// Checks if a type change represents actual data loss (narrowing), not just a rewrite.
 /// This is used by ReversibilityRule to distinguish between "safe widening" (e.g., INT->BIGINT)
-/// and genuinely lossy changes (e.g., BIGINT->INT, VARCHAR(255)->VARCHAR(50)).
+/// and genuinely lossy changes (e.g., BIGINT->INT, VARCHAR(255)->VARCHAR(50), TEXT->VARCHAR(n)).
 fn is_type_change_lossy(old_type: &str, new_type: &str) -> bool {
     let old = old_type.to_lowercase().trim().to_string();
     let new = new_type.to_lowercase().trim().to_string();
@@ -508,6 +540,15 @@ fn is_type_change_lossy(old_type: &str, new_type: &str) -> bool {
     {
         // Both are varchar - check if narrowing
         return new_lim < old_lim;
+    }
+
+    // Check for TEXT -> VARCHAR(n) narrowing (text is unbounded, varchar(n) is bounded)
+    // Also handles character varying (unbounded) -> varchar(n)
+    let new_varchar_limit = extract_varchar_limit(&new);
+    if new_varchar_limit.is_some()
+        && (old_base == "text" || old_base == "varchar" || old_base == "character varying")
+    {
+        return true;
     }
 
     // Varchar to something smaller/narrower - check if target type can hold all values
@@ -651,6 +692,7 @@ impl Rule for GeneralCascadeRule {
                 recipe: self.recipe(),
                 dedup_key: None,
                 sql: None,
+                fk_dependency_related: false,
             }];
         }
         vec![]
@@ -687,9 +729,23 @@ impl TypeChangeRewriteRule {
         if pg_version >= 120000
             && (old_base == "numeric" || old_base == "decimal")
             && (new_base == "numeric" || new_base == "decimal")
-            && !new.contains('(')
         {
-            return true;
+            // Changing to unconstrained numeric is always safe (widest form).
+            if !new.contains('(') {
+                return true;
+            }
+            // Changing to a constrained numeric(p, s) is safe if the new
+            // precision is >= the old precision and the new scale is >= the
+            // old scale (i.e. the new type can represent every value the old
+            // type could). If the old type is unconstrained we cannot prove
+            // widening, so we fall through to false.
+            if let (Some((old_p, old_s)), Some((new_p, new_s))) =
+                (parse_numeric_params(&old), parse_numeric_params(&new))
+                && new_p >= old_p
+                && new_s >= old_s
+            {
+                return true;
+            }
         }
 
         false
@@ -708,11 +764,34 @@ impl TypeChangeRewriteRule {
         new_modifier: Option<i32>,
     ) -> bool {
         match (old_modifier, new_modifier) {
+            // In Postgres, -1 is unbounded. If we go from unbounded to anything bounded (>= 4), it's lossy.
+            (Some(-1), Some(new)) if new != -1 => true,
+            // If the new one is unbounded, it's never narrowing
+            (_, Some(-1)) => false,
+            // Both bounded: narrowing if new limit is smaller
             (Some(old), Some(new)) => new < old,
-            (None, Some(_)) => true,
+            // Going from no modifier (often implying unbounded or default) to a bounded modifier is lossy
+            (None, Some(new)) if new != -1 => true,
             _ => false,
         }
     }
+}
+
+/// Parses precision and scale from a numeric/decimal type string.
+/// Returns `Some((precision, scale))` for `numeric(p, s)` or `numeric(p)` (scale=0).
+/// Returns `None` if the type has no parameters.
+fn parse_numeric_params(ty: &str) -> Option<(i32, i32)> {
+    let lower = ty.to_lowercase();
+    let paren_start = lower.find('(')?;
+    let paren_end = lower.find(')')?;
+    let inner = &lower[paren_start + 1..paren_end];
+    let mut parts = inner.splitn(2, ',');
+    let precision: i32 = parts.next()?.trim().parse().ok()?;
+    let scale: i32 = parts
+        .next()
+        .map(|s| s.trim().parse().unwrap_or(0))
+        .unwrap_or(0);
+    Some((precision, scale))
 }
 
 /// Extracts a synthetic type_modifier-like value from a type string.
@@ -812,6 +891,7 @@ impl Rule for TypeChangeRewriteRule {
                         recipe: "Narrowing VARCHAR(n) precision may cause data truncation. Consider adding a new column, backfilling, and then dropping the old one.",
                         dedup_key: None,
                                     sql: None,
+                                    fk_dependency_related: false,
                     });
                 } else {
                     violations.push(Violation {
@@ -828,6 +908,7 @@ impl Rule for TypeChangeRewriteRule {
                         recipe: self.recipe(),
                         dedup_key: None,
                         sql: None,
+                        fk_dependency_related: false,
                     });
                 }
             }

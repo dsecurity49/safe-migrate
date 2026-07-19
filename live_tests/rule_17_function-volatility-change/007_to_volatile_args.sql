@@ -1,0 +1,1 @@
+ALTER FUNCTION f(integer) STABLE;

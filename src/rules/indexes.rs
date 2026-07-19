@@ -67,6 +67,7 @@ impl Rule for ConcurrentIndexRule {
                         recipe: "Run ANALYZE to ensure accurate row estimates before structural changes.",
                         dedup_key: Some(key),
                                     sql: None,
+                                    fk_dependency_related: false,
                     });
                 }
 
@@ -97,6 +98,7 @@ impl Rule for ConcurrentIndexRule {
                     recipe: self.recipe(),
                     dedup_key: None,
                     sql: None,
+                    fk_dependency_related: false,
                 });
             }
             Mutation::DropIndex(drop) if !drop.concurrently => {
@@ -128,6 +130,7 @@ impl Rule for ConcurrentIndexRule {
                         recipe: self.recipe(),
                         dedup_key: None,
                         sql: None,
+                        fk_dependency_related: false,
                     });
                 } else {
                     let mut target_relations = Vec::new();
@@ -160,6 +163,7 @@ impl Rule for ConcurrentIndexRule {
                             recipe: self.recipe(),
                             dedup_key: None,
                             sql: None,
+                            fk_dependency_related: false,
                         });
                     } else {
                         for rel in target_relations {
@@ -190,6 +194,7 @@ impl Rule for ConcurrentIndexRule {
                                 recipe: self.recipe(),
                                 dedup_key: None,
                                 sql: None,
+                                fk_dependency_related: false,
                             });
                         }
                     }

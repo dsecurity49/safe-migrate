@@ -4,9 +4,6 @@
 pub mod config;
 pub mod engine;
 
-#[cfg(test)]
-mod tests;
-
 use squawk_syntax::ast::SourceFile;
 use squawk_syntax::ast::Stmt;
 

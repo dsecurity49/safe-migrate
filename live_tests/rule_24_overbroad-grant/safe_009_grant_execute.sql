@@ -1,0 +1,1 @@
+GRANT EXECUTE ON FUNCTION my_func TO app_user;

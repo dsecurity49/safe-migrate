@@ -1,0 +1,1 @@
+ALTER TABLE test_table ADD COLUMN c INT DEFAULT random();

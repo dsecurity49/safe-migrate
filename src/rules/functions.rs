@@ -69,6 +69,7 @@ impl Rule for FunctionVolatilityRule {
                     recipe: self.recipe(),
                     dedup_key: None,
                     sql: None,
+                    fk_dependency_related: false,
                 });
             }
         }
@@ -109,6 +110,7 @@ impl Rule for BrokenComputeRule {
                 let schema = state.resolve_function_schema(&sig.name, &sig_str);
                 let function_id = crate::ast::identifiers::ObjectId::new(schema, sig_str);
 
+                println!("DEBUG BrokenComputeRule function_id: {:?}", function_id);
                 let affected = state.local.graph.triggers_for_function(&function_id);
 
                 if !affected.is_empty() {
@@ -131,6 +133,7 @@ impl Rule for BrokenComputeRule {
                         recipe: self.recipe(),
                         dedup_key: None,
                         sql: None,
+                        fk_dependency_related: false,
                     }];
                 }
             }

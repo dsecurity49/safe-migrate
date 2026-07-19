@@ -1,0 +1,1 @@
+ALTER TABLE list_parent ATTACH PARTITION list_child FOR VALUES IN (1);

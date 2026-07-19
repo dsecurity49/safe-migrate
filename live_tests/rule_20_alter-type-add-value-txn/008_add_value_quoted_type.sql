@@ -1,0 +1,3 @@
+BEGIN;
+ALTER TYPE "MyEnum" ADD VALUE 'new_val';
+COMMIT;

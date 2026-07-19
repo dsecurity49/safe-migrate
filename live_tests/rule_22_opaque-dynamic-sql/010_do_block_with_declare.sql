@@ -1,0 +1,1 @@
+DO $$ DECLARE x INT := 1; BEGIN PERFORM x; END $$;

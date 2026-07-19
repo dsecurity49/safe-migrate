@@ -27,7 +27,7 @@ safe-migrate/
 │   ├── engine/                   # Rule engine and configuration
 │   │   ├── engine.rs             # Main analysis pipeline, rule dispatch, violation ordering
 │   │   ├── config.rs             # safe-migrate.toml parsing
-│   │   ├── tests.rs              # 235-test suite (architectural_gap, rule_evaluation, state_mutation, chain_execution, reversibility, etc.)
+│   │   ├── [tests split into tests/ — see below]
 │   │   └── mod.rs
 │   │
 │   ├── model/                    # Data model for schema state
@@ -75,7 +75,29 @@ safe-migrate/
 │   └── main.rs                   # CLI entry point (lint, lint-chain, sync subcommands)
 │
 ├── tests/
-│   └── cli_tests.rs              # Integration tests for CLI exit codes and flags
+│   ├── architectural_gaps.rs      # 37 state machine & simulator tests
+│   ├── bug_fixes.rs               # Regression tests for confirmed bugs
+│   ├── chain_execution.rs         # Multi-file lint-chain tests
+│   ├── cli_tests.rs               # CLI exit codes and flag tests
+│   ├── destructive_rules.rs       # Destructive rule tests
+│   ├── exhaustive_fuzz.rs         # 63 fuzz-style transaction/confidence tests
+│   ├── expression_parsing.rs      # Expression visitor tests
+│   ├── reversibility.rs           # Reversibility classification tests
+│   ├── rule_evaluation.rs         # Rule engine evaluation tests
+│   ├── state_machine_guards.rs    # State machine guard tests
+│   ├── state_mutation.rs          # State mutation tests
+│   ├── transaction_lifecycle.rs   # Transaction lifecycle tests
+│   ├── alter_schema_visitor.rs    # Schema visitor tests
+│   ├── identifier_casing.rs       # Identifier normalization tests
+│   └── common/mod.rs             # Shared test helpers
+│
+├── live_tests/                      # End-to-end integration suite against the real binary
+│   ├── run.sh                        # Test runner: lint-chain for chain-conflict dirs, lint -f per-file elsewhere
+│   ├── .safe-migrate.cache           # Frozen binary cache; tests are written against this baseline schema
+│   ├── rule_01_irreversible-migration/  # 533 SQL fixtures across 26 rule directories
+│   ├── rule_02_drop-database/
+│   ├── ... (rules 03-25) ...
+│   └── rule_26_chain-conflict/
 │
 ├── docs/
 │   └── ast-reference/            # 22 PostgreSQL AST reference documents + index
@@ -107,7 +129,7 @@ safe-migrate/
 │   ├── ci.yml                    # Test on push/PR, cargo fmt/clippy checks
 │   └── release.yml               # Build & release multi-platform binaries on tag
 │
-├── Cargo.toml                    # v0.4.0, squawk-syntax = "=2.58.0"
+├── Cargo.toml                    # v0.4.1, squawk-syntax = "=2.58.0"
 ├── Cargo.lock
 ├── README.md
 ├── CHANGELOG.md
@@ -190,7 +212,7 @@ Read the `.rs` files in those directories directly when verifying or updating an
 
 4. **Write tests**
 
-   Add tests to `src/engine/tests.rs` covering:
+   Add tests to the appropriate file under `tests/` covering:
    - The rule fires on the mutation it's designed for
    - The rule does NOT fire when `MutationResult::Skipped` (e.g. `IF NOT EXISTS`/`IF EXISTS` on an object that already existed/didn't exist)
    - The rule respects configuration overrides
@@ -227,7 +249,7 @@ If you need to extract information from a new DDL statement:
 ## Running Tests
 
 ```bash
-cargo test                      # Full test suite (235 tests)
+cargo test                      # Full test suite (327 tests)
 cargo test rule_evaluation      # Just rule tests
 cargo test architectural_gap    # Just simulator/state machine tests
 cargo test chain_execution      # Just multi-file chain tests
@@ -243,6 +265,37 @@ export DATABASE_URL="postgres://..."
 cargo run -- sync                                   # Create cache
 cargo run -- lint --file test.sql                  # With cache
 ```
+
+### live_tests/ — end-to-end suite
+
+`live_tests/` runs the compiled binary against 533 SQL fixtures across all 26 rule directories. It does not use `cargo test` — it shells out to the binary directly and parses JSON output.
+
+```bash
+cd live_tests
+
+# Run the full suite (silent summary per directory)
+./run.sh
+
+# Verbose: print pass/fail for every .sql file
+./run.sh -v
+
+# Run a single rule directory
+./run.sh -d rule_25_schema-drift
+
+# Run a single file
+./run.sh -t rule_01_irreversible-migration/001_drop_table.sql
+
+# Offline mode (no cache, worst-case assumptions)
+./run.sh --offline
+```
+
+**Fixture naming convention:**
+- `safe_*.sql` — expected to emit 0 violations for the target rule
+- `[0-9]*.sql` — expected to emit ≥ 1 violation for the target rule
+
+**Cache:** `live_tests/.safe-migrate.cache` is a frozen binary cache committed to the repo. Tests are written against the baseline schema it contains. If you add fixtures that need new tables or constraints, deploy them to a local Postgres instance, run `safe-migrate sync`, and copy the resulting cache back into `live_tests/`.
+
+**`run.sh` dispatch:** `chain-conflict` directories are linted with `lint-chain -d`; all others use `lint -f` per file.
 
 ## Code Style
 

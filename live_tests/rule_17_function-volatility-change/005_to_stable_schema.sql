@@ -1,0 +1,1 @@
+ALTER FUNCTION public.f() STABLE;

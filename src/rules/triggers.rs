@@ -46,6 +46,7 @@ impl Rule for DisableTriggerRule {
                         recipe: self.recipe(),
                         dedup_key: None,
                         sql: None,
+                        fk_dependency_related: false,
                     });
                 }
                 AlterTableActionMutation::EnableTrigger { trigger_name } => {
@@ -60,6 +61,7 @@ impl Rule for DisableTriggerRule {
                         recipe: "Re-enabling triggers restores business logic. Ensure state consistency was maintained during the disabled window.",
                         dedup_key: None,
                                     sql: None,
+                                    fk_dependency_related: false,
                     });
                 }
                 _ => {}

@@ -13,6 +13,7 @@ pub enum OperationKind {
     DropDatabase,
     DropSequence,
     DropDomain,
+    DropType,
     DropPublication,
     DropTrigger,
     DropPolicy,
@@ -38,7 +39,17 @@ pub enum OperationKind {
     DisableTrigger,
     EnableTrigger,
     RenameTable,
+    RenameColumn,
+    Rename,
     OpaqueSql,
+    CreateSchema,
+    SetDefault,
+    CreateSequence,
+    CreateDomain,
+    AlterSchema,
+    Conflict,
+    Irreversible,
+    UnresolvedReference,
     Other(String),
 }
 
@@ -56,6 +67,7 @@ impl std::fmt::Display for OperationKind {
             OperationKind::DropDatabase => write!(f, "drop_database"),
             OperationKind::DropSequence => write!(f, "drop_sequence"),
             OperationKind::DropDomain => write!(f, "drop_domain"),
+            OperationKind::DropType => write!(f, "drop_type"),
             OperationKind::DropPublication => write!(f, "drop_publication"),
             OperationKind::DropTrigger => write!(f, "drop_trigger"),
             OperationKind::DropPolicy => write!(f, "drop_policy"),
@@ -81,7 +93,17 @@ impl std::fmt::Display for OperationKind {
             OperationKind::DisableTrigger => write!(f, "disable_trigger"),
             OperationKind::EnableTrigger => write!(f, "enable_trigger"),
             OperationKind::RenameTable => write!(f, "rename_table"),
+            OperationKind::RenameColumn => write!(f, "rename_column"),
+            OperationKind::Rename => write!(f, "rename"),
             OperationKind::OpaqueSql => write!(f, "opaque_sql"),
+            OperationKind::CreateSchema => write!(f, "create_schema"),
+            OperationKind::SetDefault => write!(f, "set_default"),
+            OperationKind::CreateSequence => write!(f, "create_sequence"),
+            OperationKind::CreateDomain => write!(f, "create_domain"),
+            OperationKind::AlterSchema => write!(f, "alter_schema"),
+            OperationKind::Conflict => write!(f, "conflict"),
+            OperationKind::Irreversible => write!(f, "irreversible"),
+            OperationKind::UnresolvedReference => write!(f, "unresolved_reference"),
             OperationKind::Other(s) => write!(f, "{}", s),
         }
     }
@@ -105,6 +127,7 @@ pub enum ObjectKind {
     Domain,
     Policy,
     Type,
+    Opaque,
     Unknown,
 }
 
@@ -127,6 +150,7 @@ impl std::fmt::Display for ObjectKind {
             ObjectKind::Domain => write!(f, "domain"),
             ObjectKind::Policy => write!(f, "policy"),
             ObjectKind::Type => write!(f, "type"),
+            ObjectKind::Opaque => write!(f, "opaque"),
             ObjectKind::Unknown => write!(f, "object"),
         }
     }
@@ -154,4 +178,6 @@ pub struct Violation {
     pub recipe: &'static str,
     pub dedup_key: Option<String>,
     pub sql: Option<String>,
+    #[serde(default)]
+    pub fk_dependency_related: bool,
 }

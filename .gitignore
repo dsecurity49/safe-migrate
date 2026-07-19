@@ -16,6 +16,11 @@
 *.clinerules
 .cline*
 roadmap.md
-
+graph.json
+AGENTS.md
 .git/
-roadmap.md
+*.json
+test_migrations/
+*.opencode/
+.safe-migrate.cache
+live_test/
