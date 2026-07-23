@@ -1,9 +1,6 @@
 // FILE: src/analysis/state.rs
 use crate::analysis::facts::{SearchPathTarget, TableConstraintFact};
-use crate::analysis::graph::{
-    DependencyGraph, FkEdge, IndexEdge, PartitionEdge, PublicationEdge, RenameEdge, SequenceEdge,
-    ViewEdge,
-};
+use crate::analysis::graph::{DependencyEdge, DependencyGraph, DependencyKind};
 use crate::analysis::mutations::{
     AlterTableActionMutation, AlterTypeActionMutation, Mutation, PersistenceMutation,
 };
@@ -64,7 +61,7 @@ pub struct PreState {
     pub subscriptions: HashMap<String, crate::model::replication::SubscriptionState>,
     pub sequences: HashMap<ObjectId, crate::model::sequence::SequenceState>,
     pub types: HashMap<ObjectId, crate::model::types::TypeState>,
-    pub indexes: Vec<crate::analysis::graph::IndexEdge>,
+    pub indexes: Vec<crate::analysis::graph::DependencyEdge>,
 }
 
 pub struct AnalysisState {
@@ -95,37 +92,42 @@ impl AnalysisState {
 
         for fk in cache.foreign_keys {
             baseline_foreign_keys.insert((fk.from_table.clone(), fk.constraint_name.clone()));
-            graph.foreign_keys.push(FkEdge {
-                constraint_name: Some(fk.constraint_name),
-                from_table: fk.from_table,
-                from_columns: Vec::new(),
-                to_table: fk.to_table,
-                to_columns: Vec::new(),
-                from_generation: 0,
-            });
+            graph.edges.push(DependencyEdge::new(
+                fk.from_table,
+                fk.to_table,
+                DependencyKind::ForeignKey {
+                    constraint_name: Some(fk.constraint_name),
+                    from_columns: Vec::new(),
+                    to_columns: Vec::new(),
+                    from_generation: 0,
+                },
+            ));
         }
 
         for idx in cache.indexes {
             // BUG-008: index ObjectIds go into baseline_indexes, not baseline_relations
             baseline_indexes.insert(idx.index_id.clone());
-            graph.indexes.push(IndexEdge {
-                index_id: idx.index_id,
-                relation_id: idx.table_id,
-                using_method: None,
-                has_predicate: false,
-                is_concurrent: false,
-                is_unique: false,
-            });
+            graph.edges.push(DependencyEdge::new(
+                idx.index_id,
+                idx.table_id,
+                DependencyKind::IndexOnRelation {
+                    using_method: None,
+                    has_predicate: false,
+                    is_concurrent: false,
+                    is_unique: false,
+                },
+            ));
         }
 
         for t in cache.triggers {
-            graph
-                .trigger_dependencies
-                .push(crate::analysis::graph::TriggerEdge {
+            graph.edges.push(DependencyEdge::new(
+                t.trigger_id.clone(),
+                t.table_id,
+                DependencyKind::TriggerOnTable {
                     trigger_id: t.trigger_id,
-                    table_id: t.table_id,
                     function_id: t.function_id,
-                });
+                },
+            ));
         }
 
         let mut functions: HashMap<ObjectId, crate::model::function::FunctionOverlay> =
@@ -294,7 +296,14 @@ impl AnalysisState {
             }
         }
 
-        let indexes = self.local.graph.indexes.clone();
+        let indexes = self
+            .local
+            .graph
+            .edges
+            .iter()
+            .filter(|e| matches!(e.kind, DependencyKind::IndexOnRelation { .. }))
+            .cloned()
+            .collect();
 
         PreState {
             relations,
@@ -329,51 +338,45 @@ impl AnalysisState {
 
         result.dropped_relations.insert(resolved_current.clone());
 
-        for view_edge in &self.local.graph.views {
-            if view_edge
-                .depends_on
-                .iter()
-                .any(|dep| self.local.graph.resolve_rename(dep) == &resolved_current)
-            {
-                let resolved_view_id = self.local.graph.resolve_rename(&view_edge.view_id).clone();
-                if !visited.contains(&resolved_view_id) {
-                    self.walk_cascade(&resolved_view_id, visited, result);
+        for edge in &self.local.graph.edges {
+            match &edge.kind {
+                DependencyKind::ViewDependency { .. } => {
+                    if self.local.graph.resolve_rename(&edge.referenced) == &resolved_current {
+                        let resolved_view_id =
+                            self.local.graph.resolve_rename(&edge.dependent).clone();
+                        if !visited.contains(&resolved_view_id) {
+                            self.walk_cascade(&resolved_view_id, visited, result);
+                        }
+                    }
                 }
-            }
-        }
-
-        for index_edge in &self.local.graph.indexes {
-            if self.local.graph.resolve_rename(&index_edge.relation_id) == &resolved_current {
-                result.dropped_indexes.insert(
-                    self.local
-                        .graph
-                        .resolve_rename(&index_edge.index_id)
-                        .clone(),
-                );
-            }
-        }
-
-        for fk_edge in &self.local.graph.foreign_keys {
-            if self.local.graph.resolve_rename(&fk_edge.to_table) == &resolved_current
-                && let Some(cname) = &fk_edge.constraint_name
-            {
-                result.dropped_constraints.insert((
-                    self.local.graph.resolve_rename(&fk_edge.from_table).clone(),
-                    cname.clone(),
-                ));
-            }
-        }
-
-        for partition_edge in &self.local.graph.partitions {
-            if self.local.graph.resolve_rename(&partition_edge.parent) == &resolved_current {
-                let resolved_child = self
-                    .local
-                    .graph
-                    .resolve_rename(&partition_edge.child)
-                    .clone();
-                if !visited.contains(&resolved_child) {
-                    self.walk_cascade(&resolved_child, visited, result);
+                DependencyKind::IndexOnRelation { .. } => {
+                    if self.local.graph.resolve_rename(&edge.referenced) == &resolved_current {
+                        result
+                            .dropped_indexes
+                            .insert(self.local.graph.resolve_rename(&edge.dependent).clone());
+                    }
                 }
+                DependencyKind::ForeignKey {
+                    constraint_name, ..
+                } => {
+                    if self.local.graph.resolve_rename(&edge.referenced) == &resolved_current
+                        && let Some(cname) = constraint_name
+                    {
+                        result.dropped_constraints.insert((
+                            self.local.graph.resolve_rename(&edge.dependent).clone(),
+                            cname.clone(),
+                        ));
+                    }
+                }
+                DependencyKind::PartitionOf
+                    if self.local.graph.resolve_rename(&edge.referenced) == &resolved_current =>
+                {
+                    let resolved_child = self.local.graph.resolve_rename(&edge.dependent).clone();
+                    if !visited.contains(&resolved_child) {
+                        self.walk_cascade(&resolved_child, visited, result);
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -499,41 +502,19 @@ impl AnalysisState {
                         self.local.sequences.insert(id, SequenceOverlay::Dropped);
                     }
 
-                    self.snapshot_fk_graph_full();
-                    self.snapshot_view_graph_full();
-                    self.snapshot_index_graph_full();
-                    self.snapshot_partition_graph_full();
-                    self.snapshot_sequence_graph_full();
-                    self.snapshot_rename_graph_full();
-                    self.snapshot_trigger_graph_full();
-                    self.snapshot_publication_graph_full();
+                    self.snapshot_graph_full();
 
                     let g = &mut self.local.graph;
-                    g.foreign_keys.retain(|fk| {
-                        !drop_schema.names.contains(&fk.from_table.schema)
-                            && !drop_schema.names.contains(&fk.to_table.schema)
+                    g.edges.retain(|e| {
+                        !drop_schema.names.contains(&e.dependent.schema)
+                            && !drop_schema.names.contains(&e.referenced.schema)
+                            && match &e.kind {
+                                DependencyKind::TriggerOnTable { function_id, .. } => {
+                                    !drop_schema.names.contains(&function_id.schema)
+                                }
+                                _ => true,
+                            }
                     });
-                    g.views
-                        .retain(|v| !drop_schema.names.contains(&v.view_id.schema));
-                    g.indexes
-                        .retain(|idx| !drop_schema.names.contains(&idx.index_id.schema));
-                    g.partitions.retain(|p| {
-                        !drop_schema.names.contains(&p.parent.schema)
-                            && !drop_schema.names.contains(&p.child.schema)
-                    });
-                    g.sequences
-                        .retain(|s| !drop_schema.names.contains(&s.sequence_id.schema));
-                    g.renames.retain(|r| {
-                        !drop_schema.names.contains(&r.from.schema)
-                            && !drop_schema.names.contains(&r.to.schema)
-                    });
-                    g.trigger_dependencies.retain(|t| {
-                        !drop_schema.names.contains(&t.trigger_id.schema)
-                            && !drop_schema.names.contains(&t.table_id.schema)
-                            && !drop_schema.names.contains(&t.function_id.schema)
-                    });
-                    g.publication_dependencies
-                        .retain(|p| !drop_schema.names.contains(&p.table_id.schema));
                 } else {
                     // Non-cascade: fail if any objects in the schema still exist
                     let has_relation = self.local.relations.iter().any(|(id, ov)| {
@@ -578,11 +559,11 @@ impl AnalysisState {
                 }
 
                 // Cleanup trigger dependencies
-                self.snapshot_trigger_graph_full();
-                self.local
-                    .graph
-                    .trigger_dependencies
-                    .retain(|t| t.table_id != drop_table.id);
+                self.snapshot_graph_full();
+                self.local.graph.edges.retain(|e| {
+                    !(matches!(e.kind, DependencyKind::TriggerOnTable { .. })
+                        && e.referenced == drop_table.id)
+                });
                 // Also remove the trigger states themselves if cascading (or simply leave them orphaned)
                 // For now, assume trigger state drops with the table in a cascade
                 if drop_table.cascade {
@@ -608,12 +589,19 @@ impl AnalysisState {
                     }
                 }
 
-                let renames = self.local.graph.renames.clone();
+                let renames: Vec<DependencyEdge> = self
+                    .local
+                    .graph
+                    .edges
+                    .iter()
+                    .filter(|e| matches!(e.kind, DependencyKind::RenameTo))
+                    .cloned()
+                    .collect();
                 let resolve = |id: &ObjectId| -> ObjectId {
                     let mut current = id;
                     loop {
-                        match renames.iter().find(|r| &r.from == current) {
-                            Some(edge) => current = &edge.to,
+                        match renames.iter().find(|r| &r.dependent == current) {
+                            Some(edge) => current = &edge.referenced,
                             None => return current.clone(),
                         }
                     }
@@ -638,56 +626,50 @@ impl AnalysisState {
                             .insert(dropped_rel_id.clone(), RelationOverlay::Dropped);
                     }
 
-                    self.snapshot_index_graph_full();
-                    self.local
-                        .graph
-                        .indexes
-                        .retain(|idx| !closure.dropped_indexes.contains(&resolve(&idx.index_id)));
-
-                    self.snapshot_fk_graph_full();
-                    self.local.graph.foreign_keys.retain(|fk| {
-                        let from_dropped =
-                            closure.dropped_relations.contains(&resolve(&fk.from_table));
-                        let to_dropped = closure.dropped_relations.contains(&resolve(&fk.to_table));
-                        let constraint_explicitly_dropped = if let Some(cname) = &fk.constraint_name
-                        {
-                            closure
-                                .dropped_constraints
-                                .contains(&(resolve(&fk.from_table), cname.clone()))
-                        } else {
-                            false
-                        };
-                        !(from_dropped || to_dropped || constraint_explicitly_dropped)
-                    });
-
-                    self.snapshot_view_graph_full();
-                    self.local
-                        .graph
-                        .views
-                        .retain(|v| !closure.dropped_relations.contains(&resolve(&v.view_id)));
-
-                    self.snapshot_sequence_graph_full();
-                    self.local.graph.sequences.retain(|s| {
-                        let resolved_table = resolve(&s.table_id);
-                        !closure.dropped_relations.contains(&resolved_table)
+                    self.snapshot_graph_full();
+                    self.local.graph.edges.retain(|e| match &e.kind {
+                        DependencyKind::IndexOnRelation { .. } => {
+                            !closure.dropped_indexes.contains(&resolve(&e.dependent))
+                        }
+                        DependencyKind::ForeignKey {
+                            constraint_name, ..
+                        } => {
+                            let from_dropped =
+                                closure.dropped_relations.contains(&resolve(&e.dependent));
+                            let to_dropped =
+                                closure.dropped_relations.contains(&resolve(&e.referenced));
+                            let constraint_explicitly_dropped = if let Some(cname) = constraint_name
+                            {
+                                closure
+                                    .dropped_constraints
+                                    .contains(&(resolve(&e.dependent), cname.clone()))
+                            } else {
+                                false
+                            };
+                            !(from_dropped || to_dropped || constraint_explicitly_dropped)
+                        }
+                        DependencyKind::ViewDependency { .. } => {
+                            !closure.dropped_relations.contains(&resolve(&e.dependent))
+                        }
+                        DependencyKind::SequenceOwnedBy { .. } => {
+                            !closure.dropped_relations.contains(&resolve(&e.referenced))
+                        }
+                        _ => true,
                     });
                 } else {
-                    let has_view_deps = self
-                        .local
-                        .graph
-                        .views
-                        .iter()
-                        .any(|v| v.depends_on.iter().any(|dep| resolve(dep) == resolved_drop));
-                    let has_fk_deps = self.local.graph.foreign_keys.iter().any(|fk| {
-                        resolve(&fk.to_table) == resolved_drop
-                            && resolve(&fk.from_table) != resolved_drop
+                    let has_view_deps = self.local.graph.edges.iter().any(|e| {
+                        matches!(e.kind, DependencyKind::ViewDependency { .. })
+                            && resolve(&e.referenced) == resolved_drop
                     });
-                    let has_partition_deps = self
-                        .local
-                        .graph
-                        .partitions
-                        .iter()
-                        .any(|p| resolve(&p.parent) == resolved_drop);
+                    let has_fk_deps = self.local.graph.edges.iter().any(|e| {
+                        matches!(e.kind, DependencyKind::ForeignKey { .. })
+                            && resolve(&e.referenced) == resolved_drop
+                            && resolve(&e.dependent) != resolved_drop
+                    });
+                    let has_partition_deps = self.local.graph.edges.iter().any(|e| {
+                        matches!(e.kind, DependencyKind::PartitionOf)
+                            && resolve(&e.referenced) == resolved_drop
+                    });
 
                     if has_view_deps || has_fk_deps || has_partition_deps {
                         self.local.confidence = Confidence::Tainted;
@@ -699,16 +681,21 @@ impl AnalysisState {
                         .relations
                         .insert(drop_table.id.clone(), RelationOverlay::Dropped);
 
-                    self.snapshot_sequence_graph_full();
-                    self.local
-                        .graph
-                        .sequences
-                        .retain(|s| resolve(&s.table_id) != resolved_drop);
+                    self.snapshot_graph_full();
+                    self.local.graph.edges.retain(|e| {
+                        !(matches!(e.kind, DependencyKind::SequenceOwnedBy { .. })
+                            && resolve(&e.referenced) == resolved_drop)
+                    });
                 }
 
-                self.snapshot_partition_graph_full();
-                self.local.graph.partitions.retain(|p| {
-                    resolve(&p.parent) != resolved_drop && resolve(&p.child) != resolved_drop
+                self.snapshot_graph_full();
+                self.local.graph.edges.retain(|e| {
+                    if let DependencyKind::PartitionOf = e.kind {
+                        resolve(&e.referenced) != resolved_drop
+                            && resolve(&e.dependent) != resolved_drop
+                    } else {
+                        true
+                    }
                 });
 
                 MutationResult::Applied
@@ -795,26 +782,29 @@ impl AnalysisState {
                     .insert(create.id.clone(), RelationOverlay::Present(rel_state));
 
                 if let Some(parent_id) = &create.partition_of {
-                    self.snapshot_partition_graph();
-                    self.local.graph.partitions.push(PartitionEdge {
-                        parent: parent_id.clone(),
-                        child: create.id.clone(),
-                    });
+                    self.snapshot_graph();
+                    self.local.graph.edges.push(DependencyEdge::new(
+                        create.id.clone(),
+                        parent_id.clone(),
+                        DependencyKind::PartitionOf,
+                    ));
                 }
 
                 if !create.foreign_keys.is_empty() {
-                    self.snapshot_fk_graph();
+                    self.snapshot_graph();
                 }
 
                 for fk in &create.foreign_keys {
-                    self.local.graph.foreign_keys.push(FkEdge {
-                        constraint_name: fk.constraint_name.clone(),
-                        from_table: create.id.clone(),
-                        from_columns: fk.from_columns.clone(),
-                        to_table: fk.to_table.clone(),
-                        to_columns: fk.to_columns.clone(),
-                        from_generation: generation,
-                    });
+                    self.local.graph.edges.push(DependencyEdge::new(
+                        create.id.clone(),
+                        fk.to_table.clone(),
+                        DependencyKind::ForeignKey {
+                            constraint_name: fk.constraint_name.clone(),
+                            from_columns: fk.from_columns.clone(),
+                            to_columns: fk.to_columns.clone(),
+                            from_generation: generation,
+                        },
+                    ));
                 }
                 MutationResult::Applied
             }
@@ -842,12 +832,16 @@ impl AnalysisState {
                     )),
                 );
 
-                self.snapshot_view_graph();
-                self.local.graph.views.push(ViewEdge {
-                    view_id: create_view.id.clone(),
-                    depends_on: create_view.depends_on.clone(),
-                    view_generation: generation,
-                });
+                self.snapshot_graph();
+                for dep in &create_view.depends_on {
+                    self.local.graph.edges.push(DependencyEdge::new(
+                        create_view.id.clone(),
+                        dep.clone(),
+                        DependencyKind::ViewDependency {
+                            view_generation: generation,
+                        },
+                    ));
+                }
                 MutationResult::Applied
             }
             Mutation::CreateMaterializedView(create_mv) => {
@@ -874,22 +868,24 @@ impl AnalysisState {
                     )),
                 );
 
-                self.snapshot_view_graph();
-                self.local.graph.views.push(ViewEdge {
-                    view_id: create_mv.id.clone(),
-                    depends_on: create_mv.depends_on.clone(),
-                    view_generation: generation,
-                });
+                self.snapshot_graph();
+                for dep in &create_mv.depends_on {
+                    self.local.graph.edges.push(DependencyEdge::new(
+                        create_mv.id.clone(),
+                        dep.clone(),
+                        DependencyKind::ViewDependency {
+                            view_generation: generation,
+                        },
+                    ));
+                }
                 MutationResult::Applied
             }
             Mutation::RefreshMaterializedView(_) => MutationResult::Applied,
             Mutation::CreateIndex(create_idx) => {
-                let exists = self
-                    .local
-                    .graph
-                    .indexes
-                    .iter()
-                    .any(|ix| ix.index_id == create_idx.id);
+                let exists = self.local.graph.edges.iter().any(|e| {
+                    matches!(e.kind, DependencyKind::IndexOnRelation { .. })
+                        && e.dependent == create_idx.id
+                });
                 if create_idx.if_not_exists && exists {
                     return MutationResult::Skipped;
                 }
@@ -898,15 +894,17 @@ impl AnalysisState {
                         reason: format!("relation '{}' already exists", create_idx.id),
                     };
                 }
-                self.snapshot_index_graph();
-                self.local.graph.indexes.push(IndexEdge {
-                    index_id: create_idx.id.clone(),
-                    relation_id: create_idx.table.clone(),
-                    using_method: create_idx.using_method.clone(),
-                    has_predicate: create_idx.has_predicate,
-                    is_concurrent: create_idx.concurrently,
-                    is_unique: create_idx.unique,
-                });
+                self.snapshot_graph();
+                self.local.graph.edges.push(DependencyEdge::new(
+                    create_idx.id.clone(),
+                    create_idx.table.clone(),
+                    DependencyKind::IndexOnRelation {
+                        using_method: create_idx.using_method.clone(),
+                        has_predicate: create_idx.has_predicate,
+                        is_concurrent: create_idx.concurrently,
+                        is_unique: create_idx.unique,
+                    },
+                ));
                 MutationResult::Applied
             }
             Mutation::CreatePolicy(create_policy) => {
@@ -949,15 +947,15 @@ impl AnalysisState {
                     rel.triggers.insert(create_trigger.name.clone());
                 }
 
-                self.snapshot_trigger_graph_full();
-                self.local
-                    .graph
-                    .trigger_dependencies
-                    .push(crate::analysis::graph::TriggerEdge {
-                        trigger_id,
-                        table_id: create_trigger.table.clone(),
+                self.snapshot_graph_full();
+                self.local.graph.edges.push(DependencyEdge::new(
+                    trigger_id.clone(),
+                    create_trigger.table.clone(),
+                    DependencyKind::TriggerOnTable {
+                        trigger_id: trigger_id.clone(),
                         function_id: create_trigger.function_id.clone(),
-                    });
+                    },
+                ));
 
                 MutationResult::Applied
             }
@@ -976,11 +974,11 @@ impl AnalysisState {
                     rel.triggers.remove(&drop_trigger.name);
                 }
 
-                self.snapshot_trigger_graph_full();
-                self.local
-                    .graph
-                    .trigger_dependencies
-                    .retain(|t| t.trigger_id != trigger_id);
+                self.snapshot_graph_full();
+                self.local.graph.edges.retain(|e| {
+                    !(matches!(e.kind, DependencyKind::TriggerOnTable { .. })
+                        && e.dependent == trigger_id)
+                });
 
                 MutationResult::Applied
             }
@@ -1020,15 +1018,15 @@ impl AnalysisState {
                                 });
 
                                 if let Some((source_table, source_col)) = depends_on {
-                                    self.snapshot_column_graph();
-                                    self.local.graph.column_dependencies.push(
-                                        crate::analysis::graph::ColumnDependencyEdge {
-                                            table_id: alter.id.clone(),
+                                    self.snapshot_graph();
+                                    self.local.graph.edges.push(DependencyEdge::new(
+                                        alter.id.clone(),
+                                        source_table.clone(),
+                                        DependencyKind::ColumnGeneratedFrom {
                                             column: name.clone(),
-                                            depends_on_table: source_table.clone(),
                                             depends_on_column: source_col.clone(),
                                         },
-                                    );
+                                    ));
                                 }
                             }
                         }
@@ -1085,21 +1083,30 @@ impl AnalysisState {
                             to_columns,
                             ..
                         } => {
-                            self.snapshot_fk_graph();
-                            self.local.graph.foreign_keys.push(FkEdge {
-                                constraint_name: constraint_name.clone(),
-                                from_table: alter.id.clone(),
-                                from_columns: from_columns.clone(),
-                                to_table: to_table.clone(),
-                                to_columns: to_columns.clone(),
-                                from_generation: generation,
-                            });
+                            self.snapshot_graph();
+                            self.local.graph.edges.push(DependencyEdge::new(
+                                alter.id.clone(),
+                                to_table.clone(),
+                                DependencyKind::ForeignKey {
+                                    constraint_name: constraint_name.clone(),
+                                    from_columns: from_columns.clone(),
+                                    to_columns: to_columns.clone(),
+                                    from_generation: generation,
+                                },
+                            ));
                         }
                         AlterTableActionMutation::DropConstraint { name } => {
-                            self.snapshot_fk_graph();
-                            self.local.graph.foreign_keys.retain(|fk| {
-                                !(fk.from_table == alter.id
-                                    && fk.constraint_name.as_ref() == Some(name))
+                            self.snapshot_graph();
+                            self.local.graph.edges.retain(|e| {
+                                if let DependencyKind::ForeignKey {
+                                    constraint_name, ..
+                                } = &e.kind
+                                {
+                                    !(e.dependent == alter.id
+                                        && constraint_name.as_ref() == Some(name))
+                                } else {
+                                    true
+                                }
                             });
                         }
                         AlterTableActionMutation::AttachPartition { child } => {
@@ -1108,19 +1115,21 @@ impl AnalysisState {
                                 self.snapshot_confidence();
                                 self.local.confidence = Confidence::Tainted;
                             } else {
-                                self.snapshot_partition_graph();
-                                self.local.graph.partitions.push(PartitionEdge {
-                                    parent: alter.id.clone(),
-                                    child: child.clone(),
-                                });
+                                self.snapshot_graph();
+                                self.local.graph.edges.push(DependencyEdge::new(
+                                    child.clone(),
+                                    alter.id.clone(),
+                                    DependencyKind::PartitionOf,
+                                ));
                             }
                         }
                         AlterTableActionMutation::DetachPartition { child } => {
-                            self.snapshot_partition_graph();
-                            self.local
-                                .graph
-                                .partitions
-                                .retain(|p| !(p.parent == alter.id && p.child == *child));
+                            self.snapshot_graph();
+                            self.local.graph.edges.retain(|e| {
+                                !(matches!(e.kind, DependencyKind::PartitionOf)
+                                    && e.dependent == *child
+                                    && e.referenced == alter.id)
+                            });
                         }
                         _ => {}
                     }
@@ -1228,28 +1237,32 @@ impl AnalysisState {
                 );
 
                 if let Some((table_id, col)) = &create_seq.owned_by {
-                    self.snapshot_sequence_graph();
-                    self.local.graph.sequences.push(SequenceEdge {
-                        sequence_id: create_seq.id.clone(),
-                        table_id: table_id.clone(),
-                        column: col.clone(),
-                    });
+                    self.snapshot_graph();
+                    self.local.graph.edges.push(DependencyEdge::new(
+                        create_seq.id.clone(),
+                        table_id.clone(),
+                        DependencyKind::SequenceOwnedBy {
+                            column: col.clone(),
+                        },
+                    ));
                 }
                 MutationResult::Applied
             }
             Mutation::AlterSequence(alter_seq) => {
                 self.snapshot_sequence(&alter_seq.id);
-                self.snapshot_sequence_graph();
-                self.local
-                    .graph
-                    .sequences
-                    .retain(|s| s.sequence_id != alter_seq.id);
+                self.snapshot_graph();
+                self.local.graph.edges.retain(|e| {
+                    !(matches!(e.kind, DependencyKind::SequenceOwnedBy { .. })
+                        && e.dependent == alter_seq.id)
+                });
                 if let Some((table_id, col)) = &alter_seq.owned_by {
-                    self.local.graph.sequences.push(SequenceEdge {
-                        sequence_id: alter_seq.id.clone(),
-                        table_id: table_id.clone(),
-                        column: col.clone(),
-                    });
+                    self.local.graph.edges.push(DependencyEdge::new(
+                        alter_seq.id.clone(),
+                        table_id.clone(),
+                        DependencyKind::SequenceOwnedBy {
+                            column: col.clone(),
+                        },
+                    ));
                 }
                 MutationResult::Applied
             }
@@ -1260,11 +1273,11 @@ impl AnalysisState {
                         .sequences
                         .insert(id.clone(), SequenceOverlay::Dropped);
                 }
-                self.snapshot_sequence_graph_full();
-                self.local
-                    .graph
-                    .sequences
-                    .retain(|s| !drop_seq.ids.contains(&s.sequence_id));
+                self.snapshot_graph_full();
+                self.local.graph.edges.retain(|e| {
+                    !(matches!(e.kind, DependencyKind::SequenceOwnedBy { .. })
+                        && drop_seq.ids.contains(&e.dependent))
+                });
                 MutationResult::Applied
             }
             Mutation::Rename(rename) => {
@@ -1278,21 +1291,15 @@ impl AnalysisState {
                         .relations
                         .insert(rename.new_id.clone(), RelationOverlay::Present(state));
                 }
-                self.snapshot_rename_graph();
-                self.local.graph.renames.push(RenameEdge {
-                    from: rename.old_id.clone(),
-                    to: rename.new_id.clone(),
-                });
+                self.snapshot_graph();
+                self.local.graph.edges.push(DependencyEdge::new(
+                    rename.old_id.clone(),
+                    rename.new_id.clone(),
+                    DependencyKind::RenameTo,
+                ));
 
                 // Snapshot all 8 affected graph edge lists before calling propagate_rename
-                self.snapshot_fk_graph_full();
-                self.snapshot_view_graph_full();
-                self.snapshot_index_graph_full();
-                self.snapshot_partition_graph_full();
-                self.snapshot_sequence_graph_full();
-                self.snapshot_column_graph_full();
-                self.snapshot_trigger_graph_full();
-                self.snapshot_publication_graph_full();
+                self.snapshot_graph_full();
 
                 self.local
                     .graph
@@ -1307,11 +1314,11 @@ impl AnalysisState {
                         .relations
                         .insert(id.clone(), RelationOverlay::Dropped);
                 }
-                self.snapshot_view_graph_full();
-                self.local
-                    .graph
-                    .views
-                    .retain(|v| !drop_view.ids.contains(&v.view_id));
+                self.snapshot_graph_full();
+                self.local.graph.edges.retain(|e| {
+                    !(matches!(e.kind, DependencyKind::ViewDependency { .. })
+                        && drop_view.ids.contains(&e.dependent))
+                });
                 MutationResult::Applied
             }
             Mutation::DropMaterializedView(drop_mv) => {
@@ -1321,19 +1328,19 @@ impl AnalysisState {
                         .relations
                         .insert(id.clone(), RelationOverlay::Dropped);
                 }
-                self.snapshot_view_graph_full();
-                self.local
-                    .graph
-                    .views
-                    .retain(|v| !drop_mv.ids.contains(&v.view_id));
+                self.snapshot_graph_full();
+                self.local.graph.edges.retain(|e| {
+                    !(matches!(e.kind, DependencyKind::ViewDependency { .. })
+                        && drop_mv.ids.contains(&e.dependent))
+                });
                 MutationResult::Applied
             }
             Mutation::DropIndex(drop_idx) => {
-                self.snapshot_index_graph();
-                self.local
-                    .graph
-                    .indexes
-                    .retain(|idx| idx.index_id != drop_idx.id);
+                self.snapshot_graph();
+                self.local.graph.edges.retain(|e| {
+                    !(matches!(e.kind, DependencyKind::IndexOnRelation { .. })
+                        && e.dependent == drop_idx.id)
+                });
                 MutationResult::Applied
             }
             Mutation::SearchPath(sp) => {
@@ -1597,20 +1604,20 @@ impl AnalysisState {
                 );
 
                 if let crate::analysis::facts::PublicationScope::Explicit(objects) = &p.scope {
-                    self.snapshot_publication_graph_full();
+                    self.snapshot_graph_full();
                     for obj in objects {
                         if let crate::analysis::facts::PublicationObjectFact::Table {
                             name, ..
                         } = obj
                         {
                             let table_id = self.resolve_relation_id(name);
-                            self.local
-                                .graph
-                                .publication_dependencies
-                                .push(PublicationEdge {
+                            self.local.graph.edges.push(DependencyEdge::new(
+                                table_id,
+                                ObjectId::new("public", &p.name),
+                                DependencyKind::PublicationIncludes {
                                     publication_name: p.name.clone(),
-                                    table_id,
-                                });
+                                },
+                            ));
                         }
                     }
                 }
@@ -1645,11 +1652,11 @@ impl AnalysisState {
                         crate::model::replication::PublicationOverlay::Dropped,
                     );
                 }
-                self.snapshot_publication_graph_full();
-                self.local
-                    .graph
-                    .publication_dependencies
-                    .retain(|edge| !p.names.contains(&edge.publication_name));
+                self.snapshot_graph_full();
+                self.local.graph.edges.retain(|e| {
+                    !(matches!(e.kind, DependencyKind::PublicationIncludes { .. })
+                        && p.names.contains(&e.referenced.name))
+                });
                 MutationResult::Applied
             }
             Mutation::CreateSubscription(s) => {
@@ -1899,22 +1906,6 @@ impl AnalysisState {
         }
     }
 
-    fn snapshot_trigger_graph_full(&mut self) {
-        if let Some(frame) = self.local.transactions.last_mut() {
-            frame.undo_log.push(StateChange::TriggerGraphSnapshot {
-                previous: self.local.graph.trigger_dependencies.clone(),
-            });
-        }
-    }
-
-    fn snapshot_publication_graph_full(&mut self) {
-        if let Some(frame) = self.local.transactions.last_mut() {
-            frame.undo_log.push(StateChange::PublicationGraphSnapshot {
-                previous: self.local.graph.publication_dependencies.clone(),
-            });
-        }
-    }
-
     #[allow(dead_code)]
     fn snapshot_current_role(&mut self) {
         if let Some(frame) = self.local.transactions.last_mut() {
@@ -1957,114 +1948,18 @@ impl AnalysisState {
         }
     }
 
-    fn snapshot_fk_graph(&mut self) {
+    fn snapshot_graph(&mut self) {
         if let Some(frame) = self.local.transactions.last_mut() {
-            frame.undo_log.push(StateChange::FkGraphLengthMarker {
-                len: self.local.graph.foreign_keys.len(),
+            frame.undo_log.push(StateChange::GraphLengthMarker {
+                len: self.local.graph.edges.len(),
             });
         }
     }
 
-    fn snapshot_fk_graph_full(&mut self) {
+    fn snapshot_graph_full(&mut self) {
         if let Some(frame) = self.local.transactions.last_mut() {
-            frame.undo_log.push(StateChange::FkGraphSnapshot {
-                previous: self.local.graph.foreign_keys.clone(),
-            });
-        }
-    }
-
-    fn snapshot_view_graph(&mut self) {
-        if let Some(frame) = self.local.transactions.last_mut() {
-            frame.undo_log.push(StateChange::ViewGraphLengthMarker {
-                len: self.local.graph.views.len(),
-            });
-        }
-    }
-
-    fn snapshot_view_graph_full(&mut self) {
-        if let Some(frame) = self.local.transactions.last_mut() {
-            frame.undo_log.push(StateChange::ViewGraphSnapshot {
-                previous: self.local.graph.views.clone(),
-            });
-        }
-    }
-
-    fn snapshot_index_graph(&mut self) {
-        if let Some(frame) = self.local.transactions.last_mut() {
-            frame.undo_log.push(StateChange::IndexGraphLengthMarker {
-                len: self.local.graph.indexes.len(),
-            });
-        }
-    }
-
-    fn snapshot_index_graph_full(&mut self) {
-        if let Some(frame) = self.local.transactions.last_mut() {
-            frame.undo_log.push(StateChange::IndexGraphSnapshot {
-                previous: self.local.graph.indexes.clone(),
-            });
-        }
-    }
-
-    fn snapshot_partition_graph(&mut self) {
-        if let Some(frame) = self.local.transactions.last_mut() {
-            frame.undo_log.push(StateChange::PartitionGraphMarker {
-                len: self.local.graph.partitions.len(),
-            });
-        }
-    }
-
-    fn snapshot_partition_graph_full(&mut self) {
-        if let Some(frame) = self.local.transactions.last_mut() {
-            frame.undo_log.push(StateChange::PartitionGraphSnapshot {
-                previous: self.local.graph.partitions.clone(),
-            });
-        }
-    }
-
-    fn snapshot_sequence_graph(&mut self) {
-        if let Some(frame) = self.local.transactions.last_mut() {
-            frame.undo_log.push(StateChange::SequenceGraphLengthMarker {
-                len: self.local.graph.sequences.len(),
-            });
-        }
-    }
-
-    fn snapshot_sequence_graph_full(&mut self) {
-        if let Some(frame) = self.local.transactions.last_mut() {
-            frame.undo_log.push(StateChange::SequenceGraphSnapshot {
-                previous: self.local.graph.sequences.clone(),
-            });
-        }
-    }
-
-    fn snapshot_column_graph(&mut self) {
-        if let Some(frame) = self.local.transactions.last_mut() {
-            frame.undo_log.push(StateChange::ColumnGraphLengthMarker {
-                len: self.local.graph.column_dependencies.len(),
-            });
-        }
-    }
-
-    fn snapshot_column_graph_full(&mut self) {
-        if let Some(frame) = self.local.transactions.last_mut() {
-            frame.undo_log.push(StateChange::ColumnGraphSnapshot {
-                previous: self.local.graph.column_dependencies.clone(),
-            });
-        }
-    }
-
-    fn snapshot_rename_graph(&mut self) {
-        if let Some(frame) = self.local.transactions.last_mut() {
-            frame.undo_log.push(StateChange::RenameGraphLengthMarker {
-                len: self.local.graph.renames.len(),
-            });
-        }
-    }
-
-    fn snapshot_rename_graph_full(&mut self) {
-        if let Some(frame) = self.local.transactions.last_mut() {
-            frame.undo_log.push(StateChange::RenameGraphSnapshot {
-                previous: self.local.graph.renames.clone(),
+            frame.undo_log.push(StateChange::GraphSnapshot {
+                previous: self.local.graph.edges.clone(),
             });
         }
     }
@@ -2128,11 +2023,11 @@ impl AnalysisState {
                         self.local.triggers.remove(&id);
                     }
                 }
-                StateChange::TriggerGraphSnapshot { previous } => {
-                    self.local.graph.trigger_dependencies = previous;
+                StateChange::GraphLengthMarker { len } => {
+                    self.local.graph.edges.truncate(len);
                 }
-                StateChange::PublicationGraphSnapshot { previous } => {
-                    self.local.graph.publication_dependencies = previous;
+                StateChange::GraphSnapshot { previous } => {
+                    self.local.graph.edges = previous;
                 }
                 StateChange::CurrentRoleSnapshot { previous } => {
                     self.local.current_role = previous;
@@ -2148,48 +2043,6 @@ impl AnalysisState {
                 }
                 StateChange::ConfidenceSnapshot { previous } => {
                     self.local.confidence = previous;
-                }
-                StateChange::FkGraphLengthMarker { len } => {
-                    self.local.graph.foreign_keys.truncate(len);
-                }
-                StateChange::FkGraphSnapshot { previous } => {
-                    self.local.graph.foreign_keys = previous;
-                }
-                StateChange::ViewGraphLengthMarker { len } => {
-                    self.local.graph.views.truncate(len);
-                }
-                StateChange::ViewGraphSnapshot { previous } => {
-                    self.local.graph.views = previous;
-                }
-                StateChange::IndexGraphLengthMarker { len } => {
-                    self.local.graph.indexes.truncate(len);
-                }
-                StateChange::IndexGraphSnapshot { previous } => {
-                    self.local.graph.indexes = previous;
-                }
-                StateChange::PartitionGraphMarker { len } => {
-                    self.local.graph.partitions.truncate(len);
-                }
-                StateChange::PartitionGraphSnapshot { previous } => {
-                    self.local.graph.partitions = previous;
-                }
-                StateChange::SequenceGraphLengthMarker { len } => {
-                    self.local.graph.sequences.truncate(len);
-                }
-                StateChange::SequenceGraphSnapshot { previous } => {
-                    self.local.graph.sequences = previous;
-                }
-                StateChange::RenameGraphLengthMarker { len } => {
-                    self.local.graph.renames.truncate(len);
-                }
-                StateChange::RenameGraphSnapshot { previous } => {
-                    self.local.graph.renames = previous;
-                }
-                StateChange::ColumnGraphLengthMarker { len } => {
-                    self.local.graph.column_dependencies.truncate(len);
-                }
-                StateChange::ColumnGraphSnapshot { previous } => {
-                    self.local.graph.column_dependencies = previous;
                 }
             }
         }

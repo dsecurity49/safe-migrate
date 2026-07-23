@@ -2,83 +2,60 @@
 use crate::ast::identifiers::ObjectId;
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct FkEdge {
-    pub constraint_name: Option<String>,
-    pub from_table: ObjectId,
-    pub from_columns: Vec<String>,
-    pub to_table: ObjectId,
-    pub to_columns: Vec<String>,
-    pub from_generation: u64,
+pub enum DependencyKind {
+    ForeignKey {
+        constraint_name: Option<String>,
+        from_columns: Vec<String>,
+        to_columns: Vec<String>,
+        from_generation: u64,
+    },
+    ViewDependency {
+        view_generation: u64,
+    },
+    IndexOnRelation {
+        using_method: Option<String>,
+        has_predicate: bool,
+        is_concurrent: bool,
+        is_unique: bool,
+    },
+    RenameTo,
+    PartitionOf,
+    SequenceOwnedBy {
+        column: String,
+    },
+    ColumnGeneratedFrom {
+        column: String,
+        depends_on_column: String,
+    },
+    TriggerOnTable {
+        trigger_id: ObjectId,
+        function_id: ObjectId,
+    },
+    PublicationIncludes {
+        publication_name: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct ViewEdge {
-    pub view_id: ObjectId,
-    pub depends_on: Vec<ObjectId>,
-    pub view_generation: u64,
+pub struct DependencyEdge {
+    pub dependent: ObjectId,
+    pub referenced: ObjectId,
+    pub kind: DependencyKind,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct ColumnDependencyEdge {
-    pub table_id: ObjectId,
-    pub column: String,
-    pub depends_on_table: ObjectId,
-    pub depends_on_column: String,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct IndexEdge {
-    pub index_id: ObjectId,
-    pub relation_id: ObjectId,
-    pub using_method: Option<String>,
-    pub has_predicate: bool,
-    pub is_concurrent: bool,
-    pub is_unique: bool,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct RenameEdge {
-    pub from: ObjectId,
-    pub to: ObjectId,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct PartitionEdge {
-    pub parent: ObjectId,
-    pub child: ObjectId,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct SequenceEdge {
-    pub sequence_id: ObjectId,
-    pub table_id: ObjectId,
-    pub column: String,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct TriggerEdge {
-    pub trigger_id: ObjectId,
-    pub table_id: ObjectId,
-    pub function_id: ObjectId,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct PublicationEdge {
-    pub publication_name: String,
-    pub table_id: ObjectId,
+impl DependencyEdge {
+    pub fn new(dependent: ObjectId, referenced: ObjectId, kind: DependencyKind) -> Self {
+        Self {
+            dependent,
+            referenced,
+            kind,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct DependencyGraph {
-    pub foreign_keys: Vec<FkEdge>,
-    pub views: Vec<ViewEdge>,
-    pub indexes: Vec<IndexEdge>,
-    pub renames: Vec<RenameEdge>,
-    pub partitions: Vec<PartitionEdge>,
-    pub sequences: Vec<SequenceEdge>,
-    pub column_dependencies: Vec<ColumnDependencyEdge>,
-    pub trigger_dependencies: Vec<TriggerEdge>,
-    pub publication_dependencies: Vec<PublicationEdge>,
+    pub edges: Vec<DependencyEdge>,
 }
 
 impl DependencyGraph {
@@ -89,49 +66,67 @@ impl DependencyGraph {
     // Phase 3 FIX (BUG-004): Traverse rename chains dynamically for accurate topology reads
     pub fn is_referenced_by_view(&self, id: &ObjectId) -> Vec<&ObjectId> {
         let target = self.resolve_rename(id);
-        self.views
+        self.edges
             .iter()
-            .filter(|v| {
-                v.depends_on
-                    .iter()
-                    .any(|dep| self.resolve_rename(dep) == target || dep == id)
+            .filter(|e| {
+                matches!(e.kind, DependencyKind::ViewDependency { .. })
+                    && (self.resolve_rename(&e.referenced) == target || &e.referenced == id)
             })
-            .map(|v| self.resolve_rename(&v.view_id))
+            .map(|e| self.resolve_rename(&e.dependent))
             .collect()
     }
 
     pub fn is_referenced_by_fk(&self, id: &ObjectId) -> Vec<(&ObjectId, u64)> {
         let target = self.resolve_rename(id);
-        self.foreign_keys
+        self.edges
             .iter()
-            .filter(|fk| self.resolve_rename(&fk.to_table) == target || &fk.to_table == id)
-            .map(|fk| (self.resolve_rename(&fk.from_table), fk.from_generation))
+            .filter_map(|e| {
+                if let DependencyKind::ForeignKey {
+                    from_generation, ..
+                } = &e.kind
+                    && (self.resolve_rename(&e.referenced) == target || &e.referenced == id)
+                {
+                    Some((self.resolve_rename(&e.dependent), *from_generation))
+                } else {
+                    None
+                }
+            })
             .collect()
     }
 
     pub fn is_referenced_by_index(&self, id: &ObjectId) -> Vec<&ObjectId> {
         let target = self.resolve_rename(id);
-        self.indexes
+        self.edges
             .iter()
-            .filter(|ix| self.resolve_rename(&ix.relation_id) == target || &ix.relation_id == id)
-            .map(|ix| self.resolve_rename(&ix.index_id))
+            .filter(|e| {
+                matches!(e.kind, DependencyKind::IndexOnRelation { .. })
+                    && (self.resolve_rename(&e.referenced) == target || &e.referenced == id)
+            })
+            .map(|e| self.resolve_rename(&e.dependent))
             .collect()
     }
 
     pub fn partitions_of(&self, id: &ObjectId) -> Vec<&ObjectId> {
         let target = self.resolve_rename(id);
-        self.partitions
+        self.edges
             .iter()
-            .filter(|p| self.resolve_rename(&p.parent) == target || &p.parent == id)
-            .map(|p| self.resolve_rename(&p.child))
+            .filter(|e| {
+                matches!(e.kind, DependencyKind::PartitionOf)
+                    && (self.resolve_rename(&e.referenced) == target || &e.referenced == id)
+            })
+            .map(|e| self.resolve_rename(&e.dependent))
             .collect()
     }
 
     pub fn resolve_rename<'a>(&'a self, id: &'a ObjectId) -> &'a ObjectId {
         let mut current = id;
         loop {
-            match self.renames.iter().find(|r| &r.from == current) {
-                Some(edge) => current = &edge.to,
+            match self
+                .edges
+                .iter()
+                .find(|e| matches!(e.kind, DependencyKind::RenameTo) && &e.dependent == current)
+            {
+                Some(edge) => current = &edge.referenced,
                 None => return current,
             }
         }
@@ -147,12 +142,12 @@ impl DependencyGraph {
 
         let mut current_parent = resolved_parent;
         loop {
-            let maybe_edge = self
-                .partitions
-                .iter()
-                .find(|p| self.resolve_rename(&p.child) == current_parent);
+            let maybe_edge = self.edges.iter().find(|e| {
+                matches!(e.kind, DependencyKind::PartitionOf)
+                    && self.resolve_rename(&e.dependent) == current_parent
+            });
             if let Some(edge) = maybe_edge {
-                let p = self.resolve_rename(&edge.parent);
+                let p = self.resolve_rename(&edge.referenced);
                 if p == resolved_child {
                     return true;
                 }
@@ -165,82 +160,41 @@ impl DependencyGraph {
     }
 
     pub fn propagate_rename(&mut self, old_id: &ObjectId, new_id: &ObjectId) {
-        for idx in &mut self.indexes {
-            if idx.index_id == *old_id {
-                idx.index_id = new_id.clone();
+        for edge in &mut self.edges {
+            if matches!(edge.kind, DependencyKind::RenameTo) {
+                continue;
             }
-            if idx.relation_id == *old_id {
-                idx.relation_id = new_id.clone();
+            if edge.dependent == *old_id {
+                edge.dependent = new_id.clone();
             }
-        }
-        for view in &mut self.views {
-            if view.view_id == *old_id {
-                view.view_id = new_id.clone();
+            if edge.referenced == *old_id {
+                edge.referenced = new_id.clone();
             }
-            view.depends_on.iter_mut().for_each(|dep| {
-                if *dep == *old_id {
-                    *dep = new_id.clone();
+            if let DependencyKind::TriggerOnTable {
+                trigger_id,
+                function_id,
+            } = &mut edge.kind
+            {
+                if *trigger_id == *old_id {
+                    *trigger_id = new_id.clone();
                 }
-            });
-        }
-        for fk in &mut self.foreign_keys {
-            if fk.from_table == *old_id {
-                fk.from_table = new_id.clone();
-            }
-            if fk.to_table == *old_id {
-                fk.to_table = new_id.clone();
-            }
-        }
-        for part in &mut self.partitions {
-            if part.parent == *old_id {
-                part.parent = new_id.clone();
-            }
-            if part.child == *old_id {
-                part.child = new_id.clone();
-            }
-        }
-        for seq in &mut self.sequences {
-            if seq.sequence_id == *old_id {
-                seq.sequence_id = new_id.clone();
-            }
-            if seq.table_id == *old_id {
-                seq.table_id = new_id.clone();
-            }
-        }
-        for col_dep in &mut self.column_dependencies {
-            if col_dep.table_id == *old_id {
-                col_dep.table_id = new_id.clone();
-            }
-            if col_dep.depends_on_table == *old_id {
-                col_dep.depends_on_table = new_id.clone();
-            }
-        }
-        for trg in &mut self.trigger_dependencies {
-            if trg.table_id == *old_id {
-                trg.table_id = new_id.clone();
-            }
-            if trg.trigger_id == *old_id {
-                trg.trigger_id = new_id.clone();
-            }
-            if trg.function_id == *old_id {
-                trg.function_id = new_id.clone();
-            }
-        }
-        for publ in &mut self.publication_dependencies {
-            if publ.table_id == *old_id {
-                publ.table_id = new_id.clone();
+                if *function_id == *old_id {
+                    *function_id = new_id.clone();
+                }
             }
         }
     }
 
-    pub fn triggers_on(&self, table_id: &ObjectId) -> Vec<&TriggerEdge> {
-        self.trigger_dependencies
+    pub fn triggers_on(&self, table_id: &ObjectId) -> Vec<&DependencyEdge> {
+        self.edges
             .iter()
-            .filter(|t| &t.table_id == table_id)
+            .filter(|e| {
+                matches!(e.kind, DependencyKind::TriggerOnTable { .. }) && &e.referenced == table_id
+            })
             .collect()
     }
 
-    pub fn triggers_for_function(&self, function_id: &ObjectId) -> Vec<&TriggerEdge> {
+    pub fn triggers_for_function(&self, function_id: &ObjectId) -> Vec<&DependencyEdge> {
         let normalize = |id: &ObjectId| -> ObjectId {
             let name = if let Some(idx) = id.name.find('(') {
                 format!("{}()", &id.name[..idx])
@@ -254,9 +208,18 @@ impl DependencyGraph {
             }
         };
         let target_id = normalize(function_id);
-        self.trigger_dependencies
+        self.edges
             .iter()
-            .filter(|t| normalize(&t.function_id) == target_id)
+            .filter(|e| {
+                if let DependencyKind::TriggerOnTable {
+                    function_id: fid, ..
+                } = &e.kind
+                {
+                    normalize(fid) == target_id
+                } else {
+                    false
+                }
+            })
             .collect()
     }
 }

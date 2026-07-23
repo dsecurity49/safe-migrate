@@ -2,6 +2,7 @@ mod common;
 
 mod state_mutation_tests {
     use crate::common::*;
+    use safe_migrate::analysis::graph::DependencyKind;
     use safe_migrate::analysis::state::Confidence;
     use safe_migrate::ast::identifiers::ObjectId;
     use safe_migrate::model::relation::RelationOverlay;
@@ -59,9 +60,14 @@ mod state_mutation_tests {
             state
                 .local
                 .graph
-                .renames
+                .edges
                 .iter()
-                .any(|e| e.from == object_id("public", "a") && e.to == object_id("public", "b"))
+                .filter(|e| matches!(
+                    e.kind,
+                    safe_migrate::analysis::graph::DependencyKind::RenameTo
+                ))
+                .any(|e| e.dependent == object_id("public", "a")
+                    && e.referenced == object_id("public", "b"))
         );
     }
 
@@ -81,17 +87,25 @@ mod state_mutation_tests {
             state
                 .local
                 .graph
-                .indexes
+                .edges
                 .iter()
-                .any(|i| i.index_id == object_id("public", "i2"))
+                .filter(|e| matches!(
+                    e.kind,
+                    safe_migrate::analysis::graph::DependencyKind::IndexOnRelation { .. }
+                ))
+                .any(|i| i.dependent == object_id("public", "i2"))
         );
         assert!(
             !state
                 .local
                 .graph
-                .indexes
+                .edges
                 .iter()
-                .any(|i| i.index_id == object_id("public", "i"))
+                .filter(|e| matches!(
+                    e.kind,
+                    safe_migrate::analysis::graph::DependencyKind::IndexOnRelation { .. }
+                ))
+                .any(|i| i.dependent == object_id("public", "i"))
         );
     }
 
@@ -111,16 +125,32 @@ mod state_mutation_tests {
             state
                 .local
                 .graph
-                .foreign_keys
+                .edges
                 .iter()
-                .any(|fk| fk.from_table == object_id("public", "c")
-                    && fk.to_table == object_id("public", "p"))
+                .filter(|e| matches!(
+                    e.kind,
+                    safe_migrate::analysis::graph::DependencyKind::ForeignKey { .. }
+                ))
+                .any(|fk| fk.dependent == object_id("public", "c")
+                    && fk.referenced == object_id("public", "p"))
         );
 
         engine
             .analyze("ALTER TABLE c DROP CONSTRAINT fk;", &mut state)
             .unwrap();
-        assert!(state.local.graph.foreign_keys.is_empty());
+        assert!(
+            state
+                .local
+                .graph
+                .edges
+                .iter()
+                .filter(|e| matches!(
+                    e.kind,
+                    safe_migrate::analysis::graph::DependencyKind::ForeignKey { .. }
+                ))
+                .count()
+                == 0
+        );
     }
 
     #[test]
@@ -139,14 +169,30 @@ mod state_mutation_tests {
             state
                 .local
                 .graph
-                .views
+                .edges
                 .iter()
-                .any(|v| v.view_id == object_id("public", "v")
-                    && v.depends_on.contains(&object_id("public", "t")))
+                .filter(|e| matches!(
+                    e.kind,
+                    safe_migrate::analysis::graph::DependencyKind::ViewDependency { .. }
+                ))
+                .any(|v| v.dependent == object_id("public", "v")
+                    && v.referenced == object_id("public", "t"))
         );
 
         engine.analyze("DROP VIEW v;", &mut state).unwrap();
-        assert!(state.local.graph.views.is_empty());
+        assert!(
+            state
+                .local
+                .graph
+                .edges
+                .iter()
+                .filter(|e| matches!(
+                    e.kind,
+                    safe_migrate::analysis::graph::DependencyKind::ViewDependency { .. }
+                ))
+                .count()
+                == 0
+        );
     }
 
     #[test]
@@ -165,10 +211,14 @@ mod state_mutation_tests {
             state
                 .local
                 .graph
-                .views
+                .edges
                 .iter()
-                .any(|v| v.view_id == object_id("public", "mv")
-                    && v.depends_on.contains(&object_id("public", "t")))
+                .filter(|e| matches!(
+                    e.kind,
+                    safe_migrate::analysis::graph::DependencyKind::ViewDependency { .. }
+                ))
+                .any(|v| v.dependent == object_id("public", "mv")
+                    && v.referenced == object_id("public", "t"))
         );
     }
 
@@ -188,10 +238,14 @@ mod state_mutation_tests {
             state
                 .local
                 .graph
-                .sequences
+                .edges
                 .iter()
-                .any(|s| s.sequence_id == object_id("public", "s")
-                    && s.table_id == object_id("public", "t"))
+                .filter(|e| matches!(
+                    e.kind,
+                    safe_migrate::analysis::graph::DependencyKind::SequenceOwnedBy { .. }
+                ))
+                .any(|s| s.dependent == object_id("public", "s")
+                    && s.referenced == object_id("public", "t"))
         );
 
         engine.analyze("DROP SEQUENCE s;", &mut state).unwrap();
@@ -199,7 +253,19 @@ mod state_mutation_tests {
             state.local.sequences.get(&object_id("public", "s")),
             Some(SequenceOverlay::Dropped)
         ));
-        assert!(state.local.graph.sequences.is_empty());
+        assert!(
+            state
+                .local
+                .graph
+                .edges
+                .iter()
+                .filter(|e| matches!(
+                    e.kind,
+                    safe_migrate::analysis::graph::DependencyKind::SequenceOwnedBy { .. }
+                ))
+                .count()
+                == 0
+        );
     }
 
     #[test]
@@ -297,15 +363,15 @@ mod state_mutation_tests {
             .unwrap();
         assert!(state.local.publications.contains_key("pub"));
 
-        let deps = &state.local.graph.publication_dependencies;
+        let deps = &state.local.graph.edges;
         assert_eq!(deps.len(), 2);
         assert!(
             deps.iter()
-                .any(|d| d.publication_name == "pub" && d.table_id == object_id("public", "t1"))
+                .any(|d| matches!(&d.kind, DependencyKind::PublicationIncludes { publication_name } if publication_name == "pub") && d.dependent == object_id("public", "t1"))
         );
         assert!(
             deps.iter()
-                .any(|d| d.publication_name == "pub" && d.table_id == object_id("public", "t2"))
+                .any(|d| matches!(&d.kind, DependencyKind::PublicationIncludes { publication_name } if publication_name == "pub") && d.dependent == object_id("public", "t2"))
         );
     }
 
@@ -497,9 +563,13 @@ mod state_mutation_tests {
             state
                 .local
                 .graph
-                .indexes
+                .edges
                 .iter()
-                .any(|i| i.relation_id == object_id("public", "mv"))
+                .filter(|e| matches!(
+                    e.kind,
+                    safe_migrate::analysis::graph::DependencyKind::IndexOnRelation { .. }
+                ))
+                .any(|i| i.referenced == object_id("public", "mv"))
         );
 
         engine

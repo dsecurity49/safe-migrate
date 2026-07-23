@@ -116,13 +116,35 @@ mod architectural_gap_tests {
                 &mut state,
             )
             .unwrap();
-        assert!(!state.local.graph.renames.is_empty());
+        assert!(
+            state
+                .local
+                .graph
+                .edges
+                .iter()
+                .filter(|e| matches!(
+                    e.kind,
+                    safe_migrate::analysis::graph::DependencyKind::RenameTo
+                ))
+                .count()
+                != 0
+        );
 
         engine
             .analyze("DROP SCHEMA s CASCADE;", &mut state)
             .unwrap();
         assert!(
-            state.local.graph.renames.is_empty(),
+            state
+                .local
+                .graph
+                .edges
+                .iter()
+                .filter(|e| matches!(
+                    e.kind,
+                    safe_migrate::analysis::graph::DependencyKind::RenameTo
+                ))
+                .count()
+                == 0,
             "Rename edges leaked after schema cascade"
         );
     }
@@ -205,15 +227,18 @@ mod architectural_gap_tests {
             )
             .unwrap();
 
-        let edge = state
-            .local
-            .graph
-            .views
-            .iter()
-            .find(|v| v.view_id == object_id("public", "v"))
-            .unwrap();
-        assert!(edge.depends_on.contains(&object_id("public", "base_table")));
-        assert!(!edge.depends_on.contains(&object_id("public", "my_cte")));
+        assert!(state.local.graph.edges.iter().any(|e| matches!(
+            e.kind,
+            safe_migrate::analysis::graph::DependencyKind::ViewDependency { .. }
+        ) && e.dependent
+            == object_id("public", "v")
+            && e.referenced == object_id("public", "base_table")));
+        assert!(!state.local.graph.edges.iter().any(|e| matches!(
+            e.kind,
+            safe_migrate::analysis::graph::DependencyKind::ViewDependency { .. }
+        ) && e.dependent
+            == object_id("public", "v")
+            && e.referenced == object_id("public", "my_cte")));
     }
 
     #[test]
@@ -227,17 +252,12 @@ mod architectural_gap_tests {
             .analyze("CREATE VIEW v AS SELECT * FROM app_sessions;", &mut state)
             .unwrap();
 
-        let edge = state
-            .local
-            .graph
-            .views
-            .iter()
-            .find(|v| v.view_id == object_id("public", "v"))
-            .unwrap();
-        assert!(
-            edge.depends_on
-                .contains(&object_id("public", "app_sessions"))
-        );
+        assert!(state.local.graph.edges.iter().any(|e| matches!(
+            e.kind,
+            safe_migrate::analysis::graph::DependencyKind::ViewDependency { .. }
+        ) && e.dependent
+            == object_id("public", "v")
+            && e.referenced == object_id("public", "app_sessions")));
     }
 
     #[test]
@@ -251,21 +271,21 @@ mod architectural_gap_tests {
             .analyze("CREATE VIEW v AS SELECT * FROM app.sessions;", &mut state)
             .unwrap();
 
-        let edge = state
-            .local
-            .graph
-            .views
-            .iter()
-            .find(|v| v.view_id == object_id("public", "v"))
-            .unwrap();
-
         assert!(
-            edge.depends_on.contains(&object_id("app", "sessions")),
+            state.local.graph.edges.iter().any(|e| matches!(
+                e.kind,
+                safe_migrate::analysis::graph::DependencyKind::ViewDependency { .. }
+            ) && e.dependent == object_id("public", "v")
+                && e.referenced == object_id("app", "sessions")),
             "Schema-qualified table should produce qualified depends_on entry"
         );
 
         assert!(
-            !edge.depends_on.contains(&object_id("public", "app")),
+            !state.local.graph.edges.iter().any(|e| matches!(
+                e.kind,
+                safe_migrate::analysis::graph::DependencyKind::ViewDependency { .. }
+            ) && e.dependent == object_id("public", "v")
+                && e.referenced == object_id("public", "app")),
             "Schema segment should not appear as a phantom dependency"
         );
     }
@@ -278,7 +298,17 @@ mod architectural_gap_tests {
         engine.analyze("CREATE TABLE p(id int) PARTITION BY RANGE(id); CREATE TABLE c PARTITION OF p FOR VALUES FROM (1) TO (10);", &mut state).unwrap();
         engine.analyze("DROP TABLE c;", &mut state).unwrap();
         assert!(
-            state.local.graph.partitions.is_empty(),
+            state
+                .local
+                .graph
+                .edges
+                .iter()
+                .filter(|e| matches!(
+                    e.kind,
+                    safe_migrate::analysis::graph::DependencyKind::PartitionOf
+                ))
+                .count()
+                == 0,
             "Partition edge leaked after child drop"
         );
     }
@@ -297,7 +327,19 @@ mod architectural_gap_tests {
                 &mut state,
             )
             .unwrap();
-        assert!(state.local.graph.indexes.is_empty());
+        assert!(
+            state
+                .local
+                .graph
+                .edges
+                .iter()
+                .filter(|e| matches!(
+                    e.kind,
+                    safe_migrate::analysis::graph::DependencyKind::IndexOnRelation { .. }
+                ))
+                .count()
+                == 0
+        );
     }
 
     // 11. Opaque confidence taint persistence
@@ -365,7 +407,16 @@ mod architectural_gap_tests {
             .analyze("DROP VIEW v; CREATE VIEW v AS SELECT * FROM t;", &mut state)
             .unwrap();
         assert_eq!(
-            state.local.graph.views.len(),
+            state
+                .local
+                .graph
+                .edges
+                .iter()
+                .filter(|e| matches!(
+                    e.kind,
+                    safe_migrate::analysis::graph::DependencyKind::ViewDependency { .. }
+                ))
+                .count(),
             1,
             "Duplicate view edge created"
         );

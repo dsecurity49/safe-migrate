@@ -135,8 +135,8 @@ impl Rule for ConcurrentIndexRule {
                 } else {
                     let mut target_relations = Vec::new();
                     for idx in &pre_state.indexes {
-                        if idx.index_id == drop.id
-                            && let Some(rel) = pre_state.relations.get(&idx.relation_id)
+                        if idx.dependent == drop.id
+                            && let Some(rel) = pre_state.relations.get(&idx.referenced)
                         {
                             target_relations.push(rel);
                         }

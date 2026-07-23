@@ -1,15 +1,10 @@
 // FILE: src/analysis/transaction.rs
 
+use crate::analysis::graph::DependencyEdge;
 use crate::ast::identifiers::ObjectId;
 use crate::model::relation::RelationOverlay;
 use crate::model::sequence::SequenceOverlay;
 use crate::model::types::TypeOverlay;
-// Added RenameEdge here to support the new RenameGraphSnapshot
-use crate::analysis::graph::{
-    ColumnDependencyEdge, FkEdge, IndexEdge, PartitionEdge, PublicationEdge, RenameEdge,
-    SequenceEdge, ViewEdge,
-};
-// Added HashSet to support the PendingValidationSnapshot
 use std::collections::HashSet;
 
 #[derive(Debug, Clone)]
@@ -29,59 +24,17 @@ pub enum StateChange {
     SearchPathSnapshot {
         previous: Vec<String>,
     },
-
-    // Phase 2 FIX (BUG-001, BUG-002): Transactional integrity for counters and validations
     GenerationCounterSnapshot {
         previous: u64,
     },
     PendingValidationSnapshot {
         previous: HashSet<(ObjectId, String)>,
     },
-
-    FkGraphLengthMarker {
+    GraphLengthMarker {
         len: usize,
     },
-    FkGraphSnapshot {
-        previous: Vec<FkEdge>,
-    },
-    ViewGraphLengthMarker {
-        len: usize,
-    },
-    ViewGraphSnapshot {
-        previous: Vec<ViewEdge>,
-    },
-    IndexGraphLengthMarker {
-        len: usize,
-    },
-    IndexGraphSnapshot {
-        previous: Vec<IndexEdge>,
-    },
-    RenameGraphLengthMarker {
-        len: usize,
-    },
-
-    // Phase 2 FIX (BUG-008): Missing snapshot for schema drops
-    RenameGraphSnapshot {
-        previous: Vec<RenameEdge>,
-    },
-
-    SequenceGraphLengthMarker {
-        len: usize,
-    },
-    SequenceGraphSnapshot {
-        previous: Vec<SequenceEdge>,
-    },
-    ColumnGraphLengthMarker {
-        len: usize,
-    },
-    ColumnGraphSnapshot {
-        previous: Vec<ColumnDependencyEdge>,
-    },
-    PartitionGraphMarker {
-        len: usize,
-    },
-    PartitionGraphSnapshot {
-        previous: Vec<PartitionEdge>,
+    GraphSnapshot {
+        previous: Vec<DependencyEdge>,
     },
     FunctionSnapshot {
         id: ObjectId,
@@ -102,12 +55,6 @@ pub enum StateChange {
     TriggerSnapshot {
         id: ObjectId,
         previous: Option<crate::model::trigger::TriggerOverlay>,
-    },
-    TriggerGraphSnapshot {
-        previous: Vec<crate::analysis::graph::TriggerEdge>,
-    },
-    PublicationGraphSnapshot {
-        previous: Vec<PublicationEdge>,
     },
     CurrentRoleSnapshot {
         previous: String,

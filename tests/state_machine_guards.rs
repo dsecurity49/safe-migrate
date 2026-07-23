@@ -133,12 +133,35 @@ mod state_machine_guards_tests {
             .analyze("CREATE INDEX idx ON t(id);", &mut state)
             .unwrap();
 
-        let edge_count = state.local.graph.indexes.len();
+        let edge_count = state
+            .local
+            .graph
+            .edges
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.kind,
+                    safe_migrate::analysis::graph::DependencyKind::IndexOnRelation { .. }
+                )
+            })
+            .count();
         engine
             .analyze("CREATE INDEX IF NOT EXISTS idx ON t(id);", &mut state)
             .unwrap();
 
-        assert_eq!(state.local.graph.indexes.len(), edge_count);
+        assert_eq!(
+            state
+                .local
+                .graph
+                .edges
+                .iter()
+                .filter(|e| matches!(
+                    e.kind,
+                    safe_migrate::analysis::graph::DependencyKind::IndexOnRelation { .. }
+                ))
+                .count(),
+            edge_count
+        );
     }
 
     #[test]
@@ -147,14 +170,37 @@ mod state_machine_guards_tests {
         let mut state = setup_state();
 
         engine.analyze("CREATE SEQUENCE s;", &mut state).unwrap();
-        let before = state.local.graph.sequences.len();
+        let before = state
+            .local
+            .graph
+            .edges
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.kind,
+                    safe_migrate::analysis::graph::DependencyKind::SequenceOwnedBy { .. }
+                )
+            })
+            .count();
         engine
             .analyze(
                 "CREATE SEQUENCE IF NOT EXISTS s OWNED BY foo.bar;",
                 &mut state,
             )
             .unwrap();
-        assert_eq!(state.local.graph.sequences.len(), before);
+        assert_eq!(
+            state
+                .local
+                .graph
+                .edges
+                .iter()
+                .filter(|e| matches!(
+                    e.kind,
+                    safe_migrate::analysis::graph::DependencyKind::SequenceOwnedBy { .. }
+                ))
+                .count(),
+            before
+        );
     }
 }
 

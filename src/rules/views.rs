@@ -103,12 +103,17 @@ impl Rule for MaterializedViewRefreshRule {
                 }
             } else {
                 // CONCURRENTLY refresh requires at least one unique index
-                let has_unique_index = state
-                    .local
-                    .graph
-                    .indexes
-                    .iter()
-                    .any(|idx| idx.relation_id == refresh.id && idx.is_unique);
+                let has_unique_index = state.local.graph.edges.iter().any(|e| {
+                    if let crate::analysis::graph::DependencyKind::IndexOnRelation {
+                        is_unique,
+                        ..
+                    } = &e.kind
+                    {
+                        e.referenced == refresh.id && *is_unique
+                    } else {
+                        false
+                    }
+                });
 
                 if !has_unique_index {
                     violations.push(Violation { source_range: None,

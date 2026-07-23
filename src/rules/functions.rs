@@ -116,7 +116,7 @@ impl Rule for BrokenComputeRule {
                 if !affected.is_empty() {
                     let triggers_info: Vec<String> = affected
                         .iter()
-                        .map(|t| format!("trigger {} on table {}", t.trigger_id, t.table_id))
+                        .map(|t| format!("trigger {} on table {}", t.dependent, t.referenced))
                         .collect();
 
                     return vec![Violation {

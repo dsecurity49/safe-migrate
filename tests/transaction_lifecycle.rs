@@ -99,15 +99,17 @@ mod transaction_lifecycle_tests {
         state
             .local
             .graph
-            .views
-            .push(safe_migrate::analysis::graph::ViewEdge {
-                view_id: v1_id.clone(),
-                depends_on: vec![t1_id.clone()],
-                view_generation: 0,
+            .edges
+            .push(safe_migrate::analysis::graph::DependencyEdge {
+                dependent: v1_id.clone(),
+                referenced: t1_id.clone(),
+                kind: safe_migrate::analysis::graph::DependencyKind::ViewDependency {
+                    view_generation: 0,
+                },
             });
 
         // Assert initial view dependency points to t1
-        assert_eq!(state.local.graph.views[0].depends_on[0], t1_id);
+        assert_eq!(state.local.graph.edges[0].referenced, t1_id);
 
         // Run rename under transaction and rollback
         engine
@@ -117,7 +119,7 @@ mod transaction_lifecycle_tests {
         // Check that table name is restored to t1, and the view dependency is restored to t1
         assert!(state.relation_is_present(&t1_id));
         assert!(!state.relation_is_present(&object_id("public", "t2")));
-        assert_eq!(state.local.graph.views[0].depends_on[0], t1_id);
+        assert_eq!(state.local.graph.edges[0].referenced, t1_id);
     }
 }
 

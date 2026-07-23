@@ -447,8 +447,32 @@ mod phase10_bug_fixes_and_sorting_tests {
             .unwrap();
 
         // Verify trigger and publication edges are present
-        assert!(!state.local.graph.trigger_dependencies.is_empty());
-        assert!(!state.local.graph.publication_dependencies.is_empty());
+        assert!(
+            state
+                .local
+                .graph
+                .edges
+                .iter()
+                .filter(|e| matches!(
+                    e.kind,
+                    safe_migrate::analysis::graph::DependencyKind::TriggerOnTable { .. }
+                ))
+                .count()
+                != 0
+        );
+        assert!(
+            state
+                .local
+                .graph
+                .edges
+                .iter()
+                .filter(|e| matches!(
+                    e.kind,
+                    safe_migrate::analysis::graph::DependencyKind::PublicationIncludes { .. }
+                ))
+                .count()
+                != 0
+        );
 
         // 2. Drop schema cascade
         engine
@@ -456,8 +480,32 @@ mod phase10_bug_fixes_and_sorting_tests {
             .unwrap();
 
         // Verify trigger and publication edges are cleaned up
-        assert!(state.local.graph.trigger_dependencies.is_empty());
-        assert!(state.local.graph.publication_dependencies.is_empty());
+        assert!(
+            state
+                .local
+                .graph
+                .edges
+                .iter()
+                .filter(|e| matches!(
+                    e.kind,
+                    safe_migrate::analysis::graph::DependencyKind::TriggerOnTable { .. }
+                ))
+                .count()
+                == 0
+        );
+        assert!(
+            state
+                .local
+                .graph
+                .edges
+                .iter()
+                .filter(|e| matches!(
+                    e.kind,
+                    safe_migrate::analysis::graph::DependencyKind::PublicationIncludes { .. }
+                ))
+                .count()
+                == 0
+        );
 
         // 3. Drop a completely unrelated function (say public.unrelated())
         engine
