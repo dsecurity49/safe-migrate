@@ -64,7 +64,7 @@ mod tests {
         });
 
         // Serialize to JSON
-        let versioned = crate::db::cache::DbCacheVersioned::V1(cache);
+        let versioned = crate::db::cache::DbCacheVersioned::V2(cache);
         let config = bincode::config::standard().with_variable_int_encoding();
         let encoded = bincode::serde::encode_to_vec(&versioned, config).unwrap();
 
@@ -73,7 +73,9 @@ mod tests {
             bincode::serde::decode_from_slice(&encoded, config)
                 .unwrap()
                 .0;
-        let crate::db::cache::DbCacheVersioned::V1(deserialized) = decoded;
+        let crate::db::cache::DbCacheVersioned::V2(deserialized) = decoded else {
+            panic!("Expected V2");
+        };
         assert_eq!(deserialized.pg_version_num, Some(160000));
         assert!(
             deserialized
@@ -117,14 +119,16 @@ mod tests {
         });
         cache.insert_baseline(id.clone(), rel);
 
-        let versioned = crate::db::cache::DbCacheVersioned::V1(cache);
+        let versioned = crate::db::cache::DbCacheVersioned::V2(cache);
         let config = bincode::config::standard().with_variable_int_encoding();
         let encoded = bincode::serde::encode_to_vec(&versioned, config).unwrap();
         let decoded: crate::db::cache::DbCacheVersioned =
             bincode::serde::decode_from_slice(&encoded, config)
                 .unwrap()
                 .0;
-        let crate::db::cache::DbCacheVersioned::V1(deserialized) = decoded;
+        let crate::db::cache::DbCacheVersioned::V2(deserialized) = decoded else {
+            panic!("Expected V2");
+        };
         let rel = deserialized.relations.get(&id).unwrap();
         assert_eq!(rel.columns[0].default_expr_text, Some("now()".into()));
         assert_eq!(rel.columns[0].type_modifier, Some(259));

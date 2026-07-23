@@ -478,6 +478,59 @@ pub fn sync_cache(out_path: &Path, schemas: Option<&[String]>) -> Result<()> {
         );
     }
 
+    // 7. Dependencies (pg_depend)
+    let depend_query = r#"
+        SELECT
+            d.classid, d.objid, d.objsubid,
+            d.refclassid, d.refobjid, d.refobjsubid,
+            d.deptype::text,
+            n1.nspname AS obj_schema, COALESCE(c1.relname, p1.proname, t1.typname) AS obj_name,
+            n2.nspname AS ref_schema, COALESCE(c2.relname, p2.proname, t2.typname) AS ref_name
+        FROM pg_depend d
+        LEFT JOIN pg_class c1 ON c1.oid = d.objid AND d.classid = 'pg_class'::regclass
+        LEFT JOIN pg_namespace n1 ON n1.oid = c1.relnamespace
+        LEFT JOIN pg_proc p1 ON p1.oid = d.objid AND d.classid = 'pg_proc'::regclass
+        LEFT JOIN pg_namespace n1p ON n1p.oid = p1.pronamespace
+        LEFT JOIN pg_type t1 ON t1.oid = d.objid AND d.classid = 'pg_type'::regclass
+        LEFT JOIN pg_namespace n1t ON n1t.oid = t1.typnamespace
+        LEFT JOIN pg_class c2 ON c2.oid = d.refobjid AND d.refclassid = 'pg_class'::regclass
+        LEFT JOIN pg_namespace n2 ON n2.oid = c2.relnamespace
+        LEFT JOIN pg_proc p2 ON p2.oid = d.refobjid AND d.refclassid = 'pg_proc'::regclass
+        LEFT JOIN pg_namespace n2p ON n2p.oid = p2.pronamespace
+        LEFT JOIN pg_type t2 ON t2.oid = d.refobjid AND d.refclassid = 'pg_type'::regclass
+        LEFT JOIN pg_namespace n2t ON n2t.oid = t2.typnamespace
+        WHERE d.deptype IN ('n', 'a', 'i')
+          AND (n1.nspname NOT IN ('pg_catalog', 'information_schema') OR n1.nspname IS NULL)
+    "#;
+
+    for row in client.query(depend_query, &[])? {
+        let classid: u32 = row.get(0);
+        let objid: u32 = row.get(1);
+        let objsubid: i32 = row.get(2);
+        let refclassid: u32 = row.get(3);
+        let refobjid: u32 = row.get(4);
+        let refobjsubid: i32 = row.get(5);
+        let deptype: String = row.get(6);
+        let obj_schema: Option<String> = row.get(7);
+        let obj_name: Option<String> = row.get(8);
+        let ref_schema: Option<String> = row.get(9);
+        let ref_name: Option<String> = row.get(10);
+
+        cache.dependencies.push(crate::db::cache::DependencyCache {
+            classid,
+            objid,
+            objsubid,
+            refclassid,
+            refobjid,
+            refobjsubid,
+            deptype,
+            obj_schema,
+            obj_name,
+            ref_schema,
+            ref_name,
+        });
+    }
+
     // Atomic write via temp file
     let tmp_path = out_path.with_extension("tmp");
     let file = std::fs::File::create(&tmp_path).context("Failed to create temporary cache file")?;
@@ -485,7 +538,7 @@ pub fn sync_cache(out_path: &Path, schemas: Option<&[String]>) -> Result<()> {
     let mut encoder =
         zstd::stream::Encoder::new(writer, 3).context("Failed to init zstd compression")?;
 
-    let versioned = crate::db::cache::DbCacheVersioned::V1(cache);
+    let versioned = crate::db::cache::DbCacheVersioned::V2(cache);
     let bincode_config = bincode::config::standard().with_variable_int_encoding();
 
     bincode::serde::encode_into_std_write(&versioned, &mut encoder, bincode_config)

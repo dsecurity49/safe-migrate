@@ -26,62 +26,78 @@ pub struct TriggerCache {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DbCache {
+pub struct DependencyCache {
+    pub classid: u32,
+    pub objid: u32,
+    pub objsubid: i32,
+    pub refclassid: u32,
+    pub refobjid: u32,
+    pub refobjsubid: i32,
+    pub deptype: String,
+    pub obj_schema: Option<String>,
+    pub obj_name: Option<String>,
+    pub ref_schema: Option<String>,
+    pub ref_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbCacheV1 {
     pub pg_version_num: Option<u32>,
-
     pub relations: HashMap<ObjectId, RelationState>,
-
     #[serde(default)]
     pub foreign_keys: Vec<ForeignKeyCache>,
-
     #[serde(default)]
     pub indexes: Vec<IndexCache>,
-
     #[serde(default)]
     pub triggers: Vec<TriggerCache>,
-
     #[serde(default)]
     pub functions: HashMap<ObjectId, FunctionState>,
 }
 
-pub const CACHE_FORMAT_VERSION: u32 = 1;
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbCache {
+    pub pg_version_num: Option<u32>,
+    pub relations: HashMap<ObjectId, RelationState>,
+    pub foreign_keys: Vec<ForeignKeyCache>,
+    pub indexes: Vec<IndexCache>,
+    pub triggers: Vec<TriggerCache>,
+    pub functions: HashMap<ObjectId, FunctionState>,
+    pub dependencies: Vec<DependencyCache>,
+}
 
-/// Compile-time guard: the version constant must equal the discriminant of the
-/// latest (highest-numbered) variant in `DbCacheVersioned`.  When a new variant
-/// `V2` is added, `CACHE_FORMAT_VERSION` must be bumped to `2`, and this
-/// assertion will catch any mismatch at compile time.
+pub const CACHE_FORMAT_VERSION: u32 = 2;
+
 const _: () = assert!(
-    CACHE_FORMAT_VERSION == 1,
+    CACHE_FORMAT_VERSION == 2,
     "CACHE_FORMAT_VERSION must be updated when new DbCacheVersioned variants are added",
 );
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DbCacheVersioned {
-    V1(DbCache),
+    V1(DbCacheV1),
+    V2(DbCache),
 }
 
 impl DbCacheVersioned {
-    /// Return the format-version number encoded in this variant.
     pub fn format_version(&self) -> u32 {
         match self {
             DbCacheVersioned::V1(_) => 1,
+            DbCacheVersioned::V2(_) => 2,
         }
     }
 
-    /// Unwrap into a `DbCache`, returning an error if the stored version does
-    /// not match `CACHE_FORMAT_VERSION`.  This catches the case where a cache
-    /// file was written by a newer binary and is then read by an older one that
-    /// only knows about lower-numbered variants.
     pub fn into_cache(self) -> Result<DbCache, String> {
-        let v = self.format_version();
-        if v != CACHE_FORMAT_VERSION {
-            return Err(format!(
-                "cache format version mismatch: file is v{v}, binary expects v{CACHE_FORMAT_VERSION}. \
-                 Run `safe-migrate sync` to rebuild the cache."
-            ));
-        }
         match self {
-            DbCacheVersioned::V1(c) => Ok(c),
+            DbCacheVersioned::V1(c) => Ok(DbCache {
+                pg_version_num: c.pg_version_num,
+                relations: c.relations,
+                foreign_keys: c.foreign_keys,
+                indexes: c.indexes,
+                triggers: c.triggers,
+                functions: c.functions,
+                dependencies: Vec::new(),
+            }),
+            DbCacheVersioned::V2(c) => Ok(c),
         }
     }
 }
@@ -101,6 +117,7 @@ impl DbCache {
             indexes: Vec::new(),
             triggers: Vec::new(),
             functions: HashMap::new(),
+            dependencies: Vec::new(),
         }
     }
 
@@ -120,9 +137,16 @@ mod tests {
     #[test]
     fn test_bug019_into_cache_succeeds_for_v1() {
         // 1d: into_cache() must succeed for the current format version (V1).
-        let cache = DbCache::new();
+        let cache = DbCacheV1 {
+            pg_version_num: None,
+            relations: HashMap::new(),
+            foreign_keys: Vec::new(),
+            indexes: Vec::new(),
+            triggers: Vec::new(),
+            functions: HashMap::new(),
+        };
         let versioned = DbCacheVersioned::V1(cache);
-        assert_eq!(versioned.format_version(), CACHE_FORMAT_VERSION);
+        assert_eq!(versioned.format_version(), 1);
         let result = versioned.into_cache();
         assert!(
             result.is_ok(),
@@ -134,11 +158,18 @@ mod tests {
     #[test]
     fn test_bug019_format_version_constant_matches_v1_variant() {
         // 1d: CACHE_FORMAT_VERSION must equal the discriminant reported by V1.
-        let versioned = DbCacheVersioned::V1(DbCache::new());
+        let versioned = DbCacheVersioned::V1(DbCacheV1 {
+            pg_version_num: None,
+            relations: HashMap::new(),
+            foreign_keys: Vec::new(),
+            indexes: Vec::new(),
+            triggers: Vec::new(),
+            functions: HashMap::new(),
+        });
         assert_eq!(
             versioned.format_version(),
-            CACHE_FORMAT_VERSION,
-            "format_version() for V1 must match CACHE_FORMAT_VERSION"
+            1,
+            "format_version() for V1 must match 1"
         );
     }
 }
