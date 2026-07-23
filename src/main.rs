@@ -146,9 +146,9 @@ fn main() -> Result<()> {
                 let versioned: safe_migrate::db::cache::DbCacheVersioned = bincode::serde::decode_from_std_read(&mut decoder, bincode_config)
                     .map_err(|e| anyhow!("Cache file '{}' is corrupted (bincode): {}. Run `safe-migrate sync` to rebuild it.", cache.display(), e))?;
 
-                match versioned {
-                    safe_migrate::db::cache::DbCacheVersioned::V1(c) => c,
-                }
+                versioned.into_cache().map_err(|e| {
+                    anyhow!("Cache file '{}' is incompatible: {}", cache.display(), e)
+                })?
             } else {
                 if *no_cache {
                     println!(
@@ -254,9 +254,9 @@ fn main() -> Result<()> {
                 let versioned: safe_migrate::db::cache::DbCacheVersioned = bincode::serde::decode_from_std_read(&mut decoder, bincode_config)
                     .map_err(|e| anyhow!("Cache file '{}' is corrupted (bincode): {}. Run `safe-migrate sync` to rebuild it.", cache.display(), e))?;
 
-                match versioned {
-                    safe_migrate::db::cache::DbCacheVersioned::V1(c) => c,
-                }
+                versioned.into_cache().map_err(|e| {
+                    anyhow!("Cache file '{}' is incompatible: {}", cache.display(), e)
+                })?
             } else {
                 if *no_cache {
                     println!(

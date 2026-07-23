@@ -1041,5 +1041,79 @@ mod phase10_bug_fixes_and_sorting_tests {
             tier1_violations
         );
     }
+
+    #[test]
+    fn test_bug018_drop_schema_no_cascade_conflicts_when_table_exists() {
+        // 1a: DROP SCHEMA without CASCADE must produce a chain-conflict violation
+        // when the schema still contains tables.
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE SCHEMA myschema; CREATE TABLE myschema.t1(id int);",
+                &mut state,
+            )
+            .unwrap();
+
+        let violations = engine.analyze("DROP SCHEMA myschema;", &mut state).unwrap();
+
+        let conflict = violations.iter().find(|v| v.rule_id == "chain-conflict");
+        assert!(
+            conflict.is_some(),
+            "Expected chain-conflict violation for DROP SCHEMA without CASCADE on non-empty schema, got: {:?}",
+            violations
+        );
+        assert!(
+            conflict.unwrap().reason.contains("CASCADE"),
+            "Conflict reason should mention CASCADE, got: {}",
+            conflict.unwrap().reason
+        );
+    }
+
+    #[test]
+    fn test_bug018_drop_schema_no_cascade_ok_when_empty() {
+        // 1a inverse: DROP SCHEMA without CASCADE must NOT conflict when schema is empty.
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze("CREATE SCHEMA myschema;", &mut state)
+            .unwrap();
+
+        let violations = engine.analyze("DROP SCHEMA myschema;", &mut state).unwrap();
+
+        let conflict = violations.iter().find(|v| v.rule_id == "chain-conflict");
+        assert!(
+            conflict.is_none(),
+            "Expected no chain-conflict for DROP SCHEMA on empty schema, got: {:?}",
+            violations
+        );
+    }
+
+    #[test]
+    fn test_bug018_drop_schema_cascade_still_applied_with_table() {
+        // 1a: DROP SCHEMA CASCADE must still succeed (no conflict) even with tables.
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE SCHEMA myschema; CREATE TABLE myschema.t1(id int);",
+                &mut state,
+            )
+            .unwrap();
+
+        let violations = engine
+            .analyze("DROP SCHEMA myschema CASCADE;", &mut state)
+            .unwrap();
+
+        let conflict = violations.iter().find(|v| v.rule_id == "chain-conflict");
+        assert!(
+            conflict.is_none(),
+            "Expected no chain-conflict for DROP SCHEMA CASCADE, got: {:?}",
+            violations
+        );
+    }
 }
 // ─────────────────────────────────────────────

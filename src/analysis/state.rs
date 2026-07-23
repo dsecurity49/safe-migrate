@@ -534,6 +534,36 @@ impl AnalysisState {
                     });
                     g.publication_dependencies
                         .retain(|p| !drop_schema.names.contains(&p.table_id.schema));
+                } else {
+                    // Non-cascade: fail if any objects in the schema still exist
+                    let has_relation = self.local.relations.iter().any(|(id, ov)| {
+                        drop_schema.names.contains(&id.schema)
+                            && !matches!(ov, RelationOverlay::Dropped)
+                    });
+                    let has_type = self.local.types.iter().any(|(id, ov)| {
+                        drop_schema.names.contains(&id.schema)
+                            && !matches!(ov, TypeOverlay::Dropped)
+                    });
+                    let has_sequence = self.local.sequences.iter().any(|(id, ov)| {
+                        drop_schema.names.contains(&id.schema)
+                            && !matches!(ov, SequenceOverlay::Dropped)
+                    });
+                    let has_function = self.local.functions.iter().any(|(id, ov)| {
+                        drop_schema.names.contains(&id.schema)
+                            && !matches!(ov, crate::model::function::FunctionOverlay::Dropped)
+                    });
+                    let has_trigger = self.local.triggers.iter().any(|(id, ov)| {
+                        drop_schema.names.contains(&id.schema)
+                            && !matches!(ov, TriggerOverlay::Dropped)
+                    });
+                    if has_relation || has_type || has_sequence || has_function || has_trigger {
+                        return MutationResult::Conflict {
+                            reason: format!(
+                                "schema(s) {:?} still contain objects; use CASCADE to drop them",
+                                drop_schema.names
+                            ),
+                        };
+                    }
                 }
                 MutationResult::Applied
             }

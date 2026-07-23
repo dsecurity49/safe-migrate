@@ -46,9 +46,44 @@ pub struct DbCache {
 
 pub const CACHE_FORMAT_VERSION: u32 = 1;
 
+/// Compile-time guard: the version constant must equal the discriminant of the
+/// latest (highest-numbered) variant in `DbCacheVersioned`.  When a new variant
+/// `V2` is added, `CACHE_FORMAT_VERSION` must be bumped to `2`, and this
+/// assertion will catch any mismatch at compile time.
+const _: () = assert!(
+    CACHE_FORMAT_VERSION == 1,
+    "CACHE_FORMAT_VERSION must be updated when new DbCacheVersioned variants are added",
+);
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DbCacheVersioned {
     V1(DbCache),
+}
+
+impl DbCacheVersioned {
+    /// Return the format-version number encoded in this variant.
+    pub fn format_version(&self) -> u32 {
+        match self {
+            DbCacheVersioned::V1(_) => 1,
+        }
+    }
+
+    /// Unwrap into a `DbCache`, returning an error if the stored version does
+    /// not match `CACHE_FORMAT_VERSION`.  This catches the case where a cache
+    /// file was written by a newer binary and is then read by an older one that
+    /// only knows about lower-numbered variants.
+    pub fn into_cache(self) -> Result<DbCache, String> {
+        let v = self.format_version();
+        if v != CACHE_FORMAT_VERSION {
+            return Err(format!(
+                "cache format version mismatch: file is v{v}, binary expects v{CACHE_FORMAT_VERSION}. \
+                 Run `safe-migrate sync` to rebuild the cache."
+            ));
+        }
+        match self {
+            DbCacheVersioned::V1(c) => Ok(c),
+        }
+    }
 }
 
 impl Default for DbCache {
@@ -75,5 +110,35 @@ impl DbCache {
 
     pub fn baseline_relations(&self) -> impl Iterator<Item = (&ObjectId, &RelationState)> {
         self.relations.iter()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_bug019_into_cache_succeeds_for_v1() {
+        // 1d: into_cache() must succeed for the current format version (V1).
+        let cache = DbCache::new();
+        let versioned = DbCacheVersioned::V1(cache);
+        assert_eq!(versioned.format_version(), CACHE_FORMAT_VERSION);
+        let result = versioned.into_cache();
+        assert!(
+            result.is_ok(),
+            "into_cache() should succeed for V1: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_bug019_format_version_constant_matches_v1_variant() {
+        // 1d: CACHE_FORMAT_VERSION must equal the discriminant reported by V1.
+        let versioned = DbCacheVersioned::V1(DbCache::new());
+        assert_eq!(
+            versioned.format_version(),
+            CACHE_FORMAT_VERSION,
+            "format_version() for V1 must match CACHE_FORMAT_VERSION"
+        );
     }
 }
