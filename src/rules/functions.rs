@@ -32,9 +32,7 @@ impl Rule for FunctionVolatilityRule {
             && let Some(old_func) = pre_state.functions.get(&alter.id)
             && let crate::analysis::facts::AlterFunctionAction::OptionsChange(new_opts) =
                 &alter.action
-        {
-            let ov = old_func.volatility.clone();
-            let new_vol = new_opts.iter().find_map(|opt| {
+            && let Some(nv) = new_opts.iter().find_map(|opt| {
                 if let crate::analysis::facts::FuncOptionFact::Volatility(v) = opt {
                     match v {
                         crate::analysis::facts::VolatilityKind::Volatile => {
@@ -50,11 +48,10 @@ impl Rule for FunctionVolatilityRule {
                 } else {
                     None
                 }
-            });
-
-            if let Some(nv) = new_vol
-                && ov != nv
-            {
+            })
+        {
+            let ov = old_func.volatility.clone();
+            if ov != nv {
                 violations.push(Violation {
                     source_range: None,
                     rule_id: self.id(),

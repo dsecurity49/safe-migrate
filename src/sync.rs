@@ -40,6 +40,31 @@ pub fn sync_cache(out_path: &Path, schemas: Option<&[String]>) -> Result<()> {
 
     let mut client = Client::connect(&db_url, NoTls).context("Failed to connect to PostgreSQL")?;
 
+    let cache = populate_cache(&mut client, schemas)?;
+
+    // Atomic write via temp file
+    let tmp_path = out_path.with_extension("tmp");
+    let file = std::fs::File::create(&tmp_path).context("Failed to create temporary cache file")?;
+    let writer = std::io::BufWriter::new(file);
+    let mut encoder =
+        zstd::stream::Encoder::new(writer, 3).context("Failed to init zstd compression")?;
+
+    let versioned = crate::db::cache::DbCacheVersioned::V2(cache);
+    let bincode_config = bincode::config::standard().with_variable_int_encoding();
+
+    bincode::serde::encode_into_std_write(&versioned, &mut encoder, bincode_config)
+        .context("Failed binary bincode 2.0 schema compilation and write")?;
+
+    encoder
+        .finish()
+        .context("Failed to flush final zstd stream to disk")?;
+
+    fs::rename(&tmp_path, out_path).context("Failed to atomically rename cache file")?;
+
+    Ok(())
+}
+
+pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result<DbCache> {
     let mut cache = DbCache::new();
 
     let schema_filter = if let Some(s) = schemas {
@@ -531,24 +556,5 @@ pub fn sync_cache(out_path: &Path, schemas: Option<&[String]>) -> Result<()> {
         });
     }
 
-    // Atomic write via temp file
-    let tmp_path = out_path.with_extension("tmp");
-    let file = std::fs::File::create(&tmp_path).context("Failed to create temporary cache file")?;
-    let writer = std::io::BufWriter::new(file);
-    let mut encoder =
-        zstd::stream::Encoder::new(writer, 3).context("Failed to init zstd compression")?;
-
-    let versioned = crate::db::cache::DbCacheVersioned::V2(cache);
-    let bincode_config = bincode::config::standard().with_variable_int_encoding();
-
-    bincode::serde::encode_into_std_write(&versioned, &mut encoder, bincode_config)
-        .context("Failed binary bincode 2.0 schema compilation and write")?;
-
-    encoder
-        .finish()
-        .context("Failed to flush final zstd stream to disk")?;
-
-    fs::rename(&tmp_path, out_path).context("Failed to atomically rename cache file")?;
-
-    Ok(())
+    Ok(cache)
 }
