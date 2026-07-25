@@ -637,9 +637,8 @@ impl AnalysisState {
                     .local
                     .constraints
                     .keys()
-                    .filter_map(|(table_id, name)| {
-                        (table_id == &drop_table.id).then(|| name.clone())
-                    })
+                    .filter(|(table_id, _)| table_id == &drop_table.id)
+                    .map(|(_, name)| name.clone())
                     .collect();
                 for name in constraints_to_drop {
                     self.snapshot_constraint(&drop_table.id, &name);
@@ -1521,9 +1520,8 @@ impl AnalysisState {
                     .local
                     .constraints
                     .iter()
-                    .filter_map(|((table_id, name), constraint)| {
-                        (table_id == &rename.old_id).then(|| (name.clone(), constraint.clone()))
-                    })
+                    .filter(|((table_id, _), _)| table_id == &rename.old_id)
+                    .map(|((_, name), constraint)| (name.clone(), constraint.clone()))
                     .collect();
                 for (name, mut constraint) in constraints_to_move {
                     self.snapshot_constraint(&rename.old_id, &name);
