@@ -124,9 +124,9 @@ except:
                 [ "$VERBOSE" -eq 1 ] && echo "  [PASS] $rule_dir"
                 dir_pass=$((dir_pass + 1))
             else
-                [ "$VERBOSE" -eq 1 ] && echo "  [SKIP] $rule_dir (no '$rule_id', got: $violation_rules)"
-                dir_skip=$((dir_skip + 1))
-                failures="$failures  [SKIP]  $rule_dir (missed expected $rule_id)\n"
+                [ "$VERBOSE" -eq 1 ] && echo "  [FAIL] $rule_dir (no '$rule_id', got: $violation_rules)"
+                dir_fail=$((dir_fail + 1))
+                failures="$failures  [FAIL]  $rule_dir (missed expected $rule_id)\n"
             fi
         fi
     else
@@ -182,9 +182,9 @@ except:
                     [ "$VERBOSE" -eq 1 ] && echo "  [PASS] $rule_dir/$fname"
                     dir_pass=$((dir_pass + 1))
                 else
-                    [ "$VERBOSE" -eq 1 ] && echo "  [SKIP] $rule_dir/$fname (no '$rule_id', got: $violation_rules)"
-                    dir_skip=$((dir_skip + 1))
-                    failures="$failures  [SKIP]  $rule_dir/$fname (missed expected $rule_id)\n"
+                    [ "$VERBOSE" -eq 1 ] && echo "  [FAIL] $rule_dir/$fname (no '$rule_id', got: $violation_rules)"
+                    dir_fail=$((dir_fail + 1))
+                    failures="$failures  [FAIL]  $rule_dir/$fname (missed expected $rule_id)\n"
                 fi
             fi
         done
