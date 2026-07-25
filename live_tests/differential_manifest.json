@@ -1,0 +1,2138 @@
+{
+  "rules": [
+    {
+      "rule_dir": "rule_03_drop-schema-cascade",
+      "enabled": true,
+      "fixtures": [
+        "001_cascade.sql",
+        "002_cascade_if_exists.sql",
+        "009_cascade_upper.sql"
+      ],
+      "excluded_fixtures": [
+        {
+          "fixture": "003_multi_cascade.sql",
+          "reason": "Requires a non-harness staging schema; dropping it adds no normalized state beyond the enabled public-schema case."
+        },
+        {
+          "fixture": "004_multi_cascade_if_exists.sql",
+          "reason": "Requires a non-harness staging schema; dropping it adds no normalized state beyond the enabled public-schema case."
+        },
+        {
+          "fixture": "005_cascade_quoted.sql",
+          "reason": "Requires a non-harness schema named My Schema and has no relation topology in the canonical baseline."
+        },
+        {
+          "fixture": "006_cascade_if_exists_quoted.sql",
+          "reason": "The absent quoted schema produces no normalized state change."
+        },
+        {
+          "fixture": "007_multi_three_cascade.sql",
+          "reason": "Requires three non-harness empty schemas whose existence is not represented in normalized simulator state."
+        },
+        {
+          "fixture": "008_cascade_long_name.sql",
+          "reason": "Requires a non-harness empty schema whose existence is not represented in normalized simulator state."
+        },
+        {
+          "fixture": "safe_001_no_cascade.sql",
+          "reason": "PostgreSQL correctly rejects dropping the populated public schema without CASCADE."
+        },
+        {
+          "fixture": "safe_002_restrict.sql",
+          "reason": "PostgreSQL correctly rejects dropping the populated public schema with RESTRICT."
+        },
+        {
+          "fixture": "safe_003_create.sql",
+          "reason": "Schema existence is not represented in normalized simulator state."
+        },
+        {
+          "fixture": "safe_004_rename.sql",
+          "reason": "Schema rename state is not yet represented separately from relation rename mutations."
+        },
+        {
+          "fixture": "safe_005_drop_if_exists_no_cascade.sql",
+          "reason": "PostgreSQL correctly rejects dropping the populated public schema without CASCADE."
+        },
+        {
+          "fixture": "safe_006_create_auth.sql",
+          "reason": "Schema ownership and existence are not represented in normalized simulator state."
+        },
+        {
+          "fixture": "safe_007_multi_no_cascade.sql",
+          "reason": "PostgreSQL correctly rejects dropping the populated public schema without CASCADE."
+        },
+        {
+          "fixture": "safe_008_multi_restrict.sql",
+          "reason": "PostgreSQL correctly rejects dropping the populated public schema with RESTRICT."
+        },
+        {
+          "fixture": "safe_009_drop_quoted_no_cascade.sql",
+          "reason": "Requires a non-harness quoted schema with no normalized topology."
+        }
+      ],
+      "schemas": [
+        "public",
+        "sm_identity",
+        "sm_core",
+        "sm_catalog",
+        "sm_billing",
+        "sm_fulfillment",
+        "sm_audit",
+        "sm_analytics"
+      ],
+      "scope": [
+        "relations",
+        "indexes",
+        "foreign_keys",
+        "partitions"
+      ],
+      "required_relations": [
+        "public.test_table",
+        "public.child_table",
+        "public.parent",
+        "public.child"
+      ],
+      "notes": "Seventh incremental slice. Validates public-schema CASCADE cleanup across relations, indexes, FK edges, triggers, and partition topology."
+    },
+    {
+      "rule_dir": "rule_01_irreversible-migration",
+      "enabled": true,
+      "fixtures": [
+        "001_drop_table.sql",
+        "002_drop_column.sql",
+        "004_drop_table_if_exists.sql",
+        "005_drop_cascade.sql",
+        "006_drop_column_if_exists.sql",
+        "safe_001_rename_col.sql",
+        "safe_002_add_col.sql",
+        "safe_003_widen_varchar.sql",
+        "safe_004_widen_int.sql",
+        "safe_006_set_default.sql",
+        "safe_007_add_not_null.sql",
+        "safe_008_rename_table.sql",
+        "safe_009_add_index.sql"
+      ],
+      "excluded_fixtures": [
+        {
+          "fixture": "safe_005_create_table.sql",
+          "reason": "The cumulative canonical baseline contains sm_core.t for rule_18 drop/idempotency cases, so PostgreSQL correctly rejects this unqualified duplicate CREATE TABLE."
+        },
+        {
+          "fixture": "safe_010_add_column_default.sql",
+          "reason": "The cumulative canonical baseline contains test_table.status for the rule_06 filtered CTAS fixture; added-column defaults remain covered by rules 07 and 23."
+        }
+      ],
+      "schemas": [
+        "public",
+        "sm_identity",
+        "sm_core",
+        "sm_catalog",
+        "sm_billing",
+        "sm_fulfillment",
+        "sm_audit",
+        "sm_analytics"
+      ],
+      "scope": [
+        "relations",
+        "columns",
+        "indexes",
+        "foreign_keys"
+      ],
+      "required_relations": [
+        "public.test_table",
+        "public.child_table"
+      ],
+      "notes": "Second incremental differential slice. Covers table and column drops, column/table renames, type widening, defaults, nullability, table creation, and index creation."
+    },
+    {
+      "rule_dir": "rule_04_destructive-general-cascade",
+      "enabled": true,
+      "fixtures": [
+        "001_drop_view_cascade.sql",
+        "002_drop_matview_cascade.sql",
+        "008_drop_view_if_exists_cascade.sql",
+        "009_drop_matview_if_exists_cascade.sql",
+        "safe_001_drop_view.sql",
+        "safe_002_drop_matview.sql",
+        "safe_008_drop_view_if_exists.sql",
+        "safe_009_drop_matview_if_exists.sql",
+        "safe_010_drop_view_restrict.sql"
+      ],
+      "excluded_fixtures": [
+        {
+          "fixture": "003_drop_seq_cascade.sql",
+          "reason": "Sequence state is not yet hydrated or normalized by the differential harness."
+        },
+        {
+          "fixture": "004_drop_domain_cascade.sql",
+          "reason": "Domain state is not yet hydrated from the live baseline into simulator type state."
+        },
+        {
+          "fixture": "005_drop_func_cascade.sql",
+          "reason": "Function existence is synchronized but not yet part of normalized differential state."
+        },
+        {
+          "fixture": "006_drop_proc_cascade.sql",
+          "reason": "Procedure existence is not yet part of normalized differential state."
+        },
+        {
+          "fixture": "007_drop_pub_cascade.sql",
+          "reason": "Publication state is not synchronized into the baseline cache."
+        },
+        {
+          "fixture": "010_drop_seq_if_exists_cascade.sql",
+          "reason": "Sequence state is not yet hydrated or normalized by the differential harness."
+        },
+        {
+          "fixture": "safe_003_drop_seq.sql",
+          "reason": "Sequence state is not yet hydrated or normalized by the differential harness."
+        },
+        {
+          "fixture": "safe_004_drop_func.sql",
+          "reason": "Function existence is synchronized but not yet part of normalized differential state."
+        },
+        {
+          "fixture": "safe_005_drop_proc.sql",
+          "reason": "Procedure existence is not yet part of normalized differential state."
+        },
+        {
+          "fixture": "safe_006_drop_pub.sql",
+          "reason": "Publication state is not synchronized into the baseline cache."
+        },
+        {
+          "fixture": "safe_007_drop_domain.sql",
+          "reason": "Domain state is not yet hydrated from the live baseline into simulator type state."
+        }
+      ],
+      "schemas": [
+        "public",
+        "sm_identity",
+        "sm_core",
+        "sm_catalog",
+        "sm_billing",
+        "sm_fulfillment",
+        "sm_audit",
+        "sm_analytics"
+      ],
+      "scope": [
+        "relations"
+      ],
+      "required_relations": [
+        "sm_core.myview",
+        "sm_core.mymat"
+      ],
+      "notes": "Eighth incremental slice. Validates CASCADE, RESTRICT, and IF EXISTS drop outcomes for views and materialized views."
+    },
+    {
+      "rule_dir": "rule_05_destructive-cascade",
+      "enabled": true,
+      "fixtures": [
+        "001_cascade.sql",
+        "007_cascade_schema_qualified.sql"
+      ],
+      "excluded_fixtures": [
+        {
+          "fixture": "002_cascade_if_exists.sql",
+          "reason": "Duplicates the participating unqualified CASCADE outcome with IF EXISTS."
+        },
+        {
+          "fixture": "003_cascade_quoted.sql",
+          "reason": "Quoted lowercase test_table resolves to the same object and outcome as the participating unqualified fixture."
+        },
+        {
+          "fixture": "004_cascade_multi.sql",
+          "reason": "Contains the same single DROP TABLE test_table CASCADE statement as the participating fixture."
+        },
+        {
+          "fixture": "005_cascade_again.sql",
+          "reason": "Contains the same single DROP TABLE test_table CASCADE statement as the participating fixture."
+        },
+        {
+          "fixture": "006_cascade_if_exists_multi.sql",
+          "reason": "Duplicates the participating unqualified CASCADE outcome with IF EXISTS."
+        },
+        {
+          "fixture": "008_cascade_upper.sql",
+          "reason": "Unquoted TEST_TABLE folds to test_table and duplicates the participating unqualified outcome."
+        },
+        {
+          "fixture": "009_cascade_temp.sql",
+          "reason": "Contains the same single DROP TABLE test_table CASCADE statement as the participating fixture."
+        },
+        {
+          "fixture": "010_cascade_long_name.sql",
+          "reason": "Contains the same single DROP TABLE test_table CASCADE statement as the participating fixture."
+        },
+        {
+          "fixture": "safe_001_no_cascade.sql",
+          "reason": "PostgreSQL rejects dropping public.test_table without CASCADE because the enterprise baseline has dependent foreign keys."
+        },
+        {
+          "fixture": "safe_002_restrict.sql",
+          "reason": "PostgreSQL rejects dropping public.test_table with RESTRICT because the enterprise baseline has dependent foreign keys."
+        },
+        {
+          "fixture": "safe_003_alter_table.sql",
+          "reason": "Add-column state is covered by dedicated participating rules and does not exercise cascade behavior."
+        },
+        {
+          "fixture": "safe_004_truncate.sql",
+          "reason": "TRUNCATE changes data rather than normalized schema topology."
+        },
+        {
+          "fixture": "safe_005_drop_if_exists_no_cascade.sql",
+          "reason": "PostgreSQL rejects dropping the existing public.test_table without CASCADE despite IF EXISTS."
+        },
+        {
+          "fixture": "safe_006_drop_quoted_no_cascade.sql",
+          "reason": "PostgreSQL rejects dropping quoted public.test_table without CASCADE because dependencies exist."
+        },
+        {
+          "fixture": "safe_007_drop_multi_no_cascade.sql",
+          "reason": "Requires absent baseline relations t1 and t2."
+        },
+        {
+          "fixture": "safe_009_insert.sql",
+          "reason": "PostgreSQL rejects one value for multi-column public.test_table, and data writes are outside normalized schema state."
+        },
+        {
+          "fixture": "safe_010_delete.sql",
+          "reason": "DELETE changes data rather than normalized schema topology."
+        }
+      ],
+      "schemas": [
+        "public",
+        "sm_identity",
+        "sm_core",
+        "sm_catalog",
+        "sm_billing",
+        "sm_fulfillment",
+        "sm_audit",
+        "sm_analytics"
+      ],
+      "scope": [
+        "relations",
+        "indexes",
+        "foreign_keys"
+      ],
+      "required_relations": [
+        "public.test_table",
+        "public.child_table"
+      ],
+      "notes": "Initial incremental live differential slice over the 65+ relation enterprise baseline. Confirms DROP TABLE ... CASCADE removes the target relation, its owned indexes, and same- and cross-schema FK edges without deleting unrelated tables."
+    },
+    {
+      "rule_dir": "rule_08_type-change-rewrite",
+      "enabled": true,
+      "fixtures": [
+        "001_lossy_varchar.sql",
+        "003_lossy_timestamp_to_date.sql",
+        "004_rewrite_numeric.sql",
+        "005_lossy_int_to_smallint.sql",
+        "006_rewrite_text_to_varchar.sql",
+        "007_lossy_numeric_to_int.sql",
+        "008_rewrite_bigint_to_int.sql",
+        "009_lossy_timestamptz_to_date.sql",
+        "010_rewrite_float_to_numeric.sql",
+        "011_lossy_numeric.sql",
+        "012_lossy_timestamptz_to_date.sql",
+        "013_lossy_varchar.sql",
+        "014_lossy_int_to_smallint.sql",
+        "safe_001_widen_varchar.sql",
+        "safe_002_widen_int.sql",
+        "safe_003_widen_varchar_limit.sql",
+        "safe_004_json_to_jsonb.sql",
+        "safe_005_varchar_to_text.sql",
+        "safe_006_widen_numeric.sql",
+        "safe_007_add_column.sql",
+        "safe_008_alter_default.sql",
+        "safe_009_drop_default.sql",
+        "safe_010_rename_column.sql"
+      ],
+      "excluded_fixtures": [
+        {
+          "fixture": "002_rewrite_int_to_text.sql",
+          "reason": "PostgreSQL rejects changing the referenced integer primary key to text while enterprise-baseline integer foreign keys depend on its equality operators."
+        }
+      ],
+      "schemas": [
+        "public",
+        "sm_identity",
+        "sm_core",
+        "sm_catalog",
+        "sm_billing",
+        "sm_fulfillment",
+        "sm_audit",
+        "sm_analytics"
+      ],
+      "scope": [
+        "relations",
+        "columns",
+        "foreign_keys"
+      ],
+      "required_relations": [
+        "public.test_table",
+        "public.child_table"
+      ],
+      "notes": "Fourth incremental slice. Compares PostgreSQL canonical column types after lossy and non-lossy conversions, plus rename/default mutations."
+    },
+    {
+      "rule_dir": "rule_07_size-aware-add-column",
+      "enabled": true,
+      "fixtures": [
+        "003_volatile_gen_random.sql",
+        "005_volatile_current_timestamp.sql",
+        "006_volatile_timeofday.sql",
+        "010_volatile_random_nested.sql",
+        "safe_001_no_default.sql",
+        "safe_002_immutable_int.sql",
+        "safe_003_immutable_text.sql",
+        "safe_004_immutable_bool.sql",
+        "safe_005_immutable_json.sql",
+        "safe_006_nullable.sql",
+        "safe_007_serial.sql",
+        "safe_008_immutable_numeric.sql",
+        "safe_009_immutable_timestamp.sql"
+      ],
+      "excluded_fixtures": [
+        {
+          "fixture": "001_volatile_random.sql",
+          "reason": "PostgreSQL cannot implicitly coerce random() double precision to integer."
+        },
+        {
+          "fixture": "002_volatile_now.sql",
+          "reason": "PostgreSQL cannot implicitly coerce random() double precision to integer."
+        },
+        {
+          "fixture": "004_volatile_clock.sql",
+          "reason": "PostgreSQL cannot coerce clock_timestamp() to integer."
+        },
+        {
+          "fixture": "007_volatile_transaction_timestamp.sql",
+          "reason": "PostgreSQL cannot implicitly coerce random() double precision to integer."
+        },
+        {
+          "fixture": "008_volatile_statement_timestamp.sql",
+          "reason": "PostgreSQL cannot implicitly coerce random() double precision to integer."
+        },
+        {
+          "fixture": "009_volatile_uuid_generate.sql",
+          "reason": "The local PostgreSQL server does not provide uuid_generate_v4(); enabling uuid-ossp would be an environment-specific side effect."
+        },
+        {
+          "fixture": "safe_010_alter_set_default.sql",
+          "reason": "Requires column c in the canonical baseline, which conflicts with enabled add-column fixtures."
+        }
+      ],
+      "schemas": [
+        "public",
+        "sm_identity",
+        "sm_core",
+        "sm_catalog",
+        "sm_billing",
+        "sm_fulfillment",
+        "sm_audit",
+        "sm_analytics"
+      ],
+      "scope": [
+        "relations",
+        "columns"
+      ],
+      "required_relations": [
+        "public.test_table"
+      ],
+      "notes": "Tenth incremental slice. Validates added-column type, nullability, and default presence across volatile, immutable, NULL, SERIAL, JSONB, numeric, and timestamp defaults."
+    },
+    {
+      "rule_dir": "rule_06_create-table-as-select",
+      "enabled": true,
+      "fixtures": [
+        "001_ctas.sql",
+        "002_ctas_with_columns.sql",
+        "004_ctas_no_data.sql",
+        "005_ctas_if_not_exists.sql",
+        "006_ctas_unlogged.sql",
+        "007_ctas_join.sql",
+        "008_ctas_group_by.sql",
+        "009_ctas_where.sql",
+        "010_ctas_subquery.sql"
+      ],
+      "excluded_fixtures": [
+        {
+          "fixture": "003_ctas_temp.sql",
+          "reason": "PostgreSQL creates unqualified temporary relations in a session pg_temp_* schema outside the current schema-scoped projection."
+        },
+        {
+          "fixture": "safe_001_create.sql",
+          "reason": "The cumulative canonical baseline contains sm_core.t for rule_18."
+        },
+        {
+          "fixture": "safe_002_create_if_not_exists.sql",
+          "reason": "Already represented by rule_18 and produces no CTAS-specific state."
+        },
+        {
+          "fixture": "safe_003_create_temp.sql",
+          "reason": "Temporary relations live in a session pg_temp_* schema outside the current projection."
+        },
+        {
+          "fixture": "safe_004_create_unlogged.sql",
+          "reason": "The cumulative canonical baseline contains sm_core.t for rule_18."
+        },
+        {
+          "fixture": "safe_005_select_into.sql",
+          "reason": "The cumulative canonical baseline contains sm_core.t for rule_18."
+        },
+        {
+          "fixture": "safe_006_create_with_defaults.sql",
+          "reason": "The cumulative canonical baseline contains sm_core.t for rule_18."
+        },
+        {
+          "fixture": "safe_007_create_like.sql",
+          "reason": "The cumulative canonical baseline contains sm_core.t for rule_18."
+        },
+        {
+          "fixture": "safe_008_create_inherits.sql",
+          "reason": "The cumulative canonical baseline contains sm_core.t and inheritance topology is outside this rule's CTAS scope."
+        },
+        {
+          "fixture": "safe_009_create_partition_of.sql",
+          "reason": "public.test_table is not partitioned and PostgreSQL correctly rejects this fixture."
+        },
+        {
+          "fixture": "safe_010_create_with_constraints.sql",
+          "reason": "The cumulative canonical baseline contains sm_core.t for rule_18."
+        }
+      ],
+      "schemas": [
+        "public",
+        "sm_identity",
+        "sm_core",
+        "sm_catalog",
+        "sm_billing",
+        "sm_fulfillment",
+        "sm_audit",
+        "sm_analytics"
+      ],
+      "scope": [
+        "relations"
+      ],
+      "required_relations": [
+        "public.test_table",
+        "sm_core.a",
+        "sm_core.b"
+      ],
+      "notes": "Eleventh incremental slice. Validates permanent and unlogged CTAS relation creation across projection, join, aggregate, filter, subquery, IF NOT EXISTS, and WITH NO DATA forms."
+    },
+    {
+      "rule_dir": "rule_12_blocking-partition-mutation",
+      "enabled": true,
+      "fixtures": [
+        "001_attach_partition.sql",
+        "003_attach_default.sql",
+        "007_attach_schema_qualified.sql"
+      ],
+      "excluded_fixtures": [
+        {
+          "fixture": "002_detach_partition.sql",
+          "reason": "Requires child to start attached, which conflicts with attach fixtures under the per-fixture canonical baseline."
+        },
+        {
+          "fixture": "004_detach_concurrently.sql",
+          "reason": "Requires child to start attached and PostgreSQL rejects DETACH CONCURRENTLY in transaction-like execution contexts."
+        },
+        {
+          "fixture": "005_attach_range.sql",
+          "reason": "Requires a RANGE parent and date-key-compatible child instead of the enabled LIST baseline."
+        },
+        {
+          "fixture": "006_attach_hash.sql",
+          "reason": "Requires a HASH parent and users_0 child instead of the enabled LIST baseline."
+        },
+        {
+          "fixture": "008_detach_finalize.sql",
+          "reason": "Requires a prior concurrent detach pending finalization."
+        },
+        {
+          "fixture": "009_attach_list_string.sql",
+          "reason": "Requires a text-key LIST parent and region_na child instead of the integer-key LIST baseline."
+        },
+        {
+          "fixture": "010_attach_range_int.sql",
+          "reason": "Requires a RANGE parent and logs_old child instead of the enabled LIST baseline."
+        },
+        {
+          "fixture": "011_detach_weekly.sql",
+          "reason": "Requires child to start attached, which conflicts with attach fixtures under the per-fixture canonical baseline."
+        },
+        {
+          "fixture": "012_attach_range_monthly.sql",
+          "reason": "Requires a RANGE parent and metrics_current child instead of the enabled LIST baseline."
+        },
+        {
+          "fixture": "safe_001_create_table.sql",
+          "reason": "The canonical enterprise baseline already contains sm_core.t on the active search path."
+        },
+        {
+          "fixture": "safe_002_add_column.sql",
+          "reason": "Add-column state is covered by dedicated participating rules and does not exercise partition topology."
+        },
+        {
+          "fixture": "safe_003_drop_column.sql",
+          "reason": "PostgreSQL rejects dropping absent baseline column public.test_table.c."
+        },
+        {
+          "fixture": "safe_004_rename_column.sql",
+          "reason": "Rename propagation is covered by dedicated participating rules and does not exercise partition topology."
+        },
+        {
+          "fixture": "safe_005_set_not_null.sql",
+          "reason": "Nullability state is covered by dedicated participating rules and does not exercise partition topology."
+        },
+        {
+          "fixture": "safe_006_create_index.sql",
+          "reason": "Index topology is covered by dedicated participating rules and does not exercise partition topology."
+        },
+        {
+          "fixture": "safe_007_truncate.sql",
+          "reason": "TRUNCATE changes data rather than normalized partition topology."
+        },
+        {
+          "fixture": "safe_008_insert.sql",
+          "reason": "PostgreSQL rejects one value for multi-column public.test_table, and data writes are outside normalized schema state."
+        }
+      ],
+      "schemas": [
+        "public",
+        "sm_identity",
+        "sm_core",
+        "sm_catalog",
+        "sm_billing",
+        "sm_fulfillment",
+        "sm_audit",
+        "sm_analytics"
+      ],
+      "scope": [
+        "relations",
+        "partitions"
+      ],
+      "required_relations": [
+        "public.parent",
+        "public.child"
+      ],
+      "notes": "Third incremental slice. Validates LIST/default partition attachment and schema-qualified partition topology."
+    },
+    {
+      "rule_dir": "rule_10_require-concurrent-index",
+      "enabled": true,
+      "transactional": false,
+      "fixtures": [
+        "001_create_index.sql",
+        "002_drop_index.sql",
+        "004_create_multi_col.sql",
+        "005_create_unique.sql",
+        "006_create_partial.sql",
+        "007_drop_index_if_exists.sql",
+        "008_create_index_include.sql",
+        "010_create_index_lower.sql",
+        "011_create_index_desc.sql",
+        "012_create_index_using_gin.sql",
+        "013_create_index_on_only.sql",
+        "014_create_index_where_multiple.sql",
+        "015_create_index_storage_param.sql",
+        "safe_001_create_concurrently.sql",
+        "safe_002_drop_concurrently.sql",
+        "safe_003_create_unique_concurrently.sql"
+      ],
+      "excluded_fixtures": [
+        {
+          "fixture": "009_create_index_tablespace.sql",
+          "reason": "Requires a server-local fastspace tablespace and filesystem location, making it an environment-specific fixture."
+        },
+        {
+          "fixture": "safe_004_alter_table.sql",
+          "reason": "Column state is outside this rule's index-focused comparison scope."
+        },
+        {
+          "fixture": "safe_005_create_table.sql",
+          "reason": "The cumulative canonical baseline contains sm_core.t for rule_18."
+        },
+        {
+          "fixture": "safe_006_drop_table.sql",
+          "reason": "PostgreSQL rejects dropping public.test_table without CASCADE because the enterprise baseline has dependent FKs and a trigger."
+        },
+        {
+          "fixture": "safe_007_select.sql",
+          "reason": "Data reads do not change normalized schema state."
+        },
+        {
+          "fixture": "safe_008_insert.sql",
+          "reason": "Data writes do not change normalized schema state."
+        }
+      ],
+      "schemas": [
+        "public",
+        "sm_identity",
+        "sm_core",
+        "sm_catalog",
+        "sm_billing",
+        "sm_fulfillment",
+        "sm_audit",
+        "sm_analytics"
+      ],
+      "scope": [
+        "relations",
+        "indexes"
+      ],
+      "required_relations": [
+        "sm_core.t_large",
+        "public.test_table"
+      ],
+      "notes": "Sixth incremental slice. Validates regular, unique, partial, expression, INCLUDE, GIN, ONLY, storage-parameter, and concurrent index outcomes."
+    },
+    {
+      "rule_dir": "rule_18_missing-idempotency",
+      "enabled": true,
+      "fixtures": [
+        "001_create_table.sql",
+        "002_drop_table.sql",
+        "003_create_index.sql",
+        "006_drop_view.sql",
+        "007_drop_matview.sql",
+        "014_create_view.sql",
+        "safe_001_create_if_not_exists.sql",
+        "safe_002_drop_if_exists.sql",
+        "safe_003_create_index_if_not_exists.sql",
+        "safe_006_drop_view_if_exists.sql",
+        "safe_007_drop_matview_if_exists.sql"
+      ],
+      "excluded_fixtures": [
+        {
+          "fixture": "004_drop_index.sql",
+          "reason": "Requires index i in the canonical baseline, which conflicts with enabled create-index fixtures."
+        },
+        {
+          "fixture": "005_drop_sequence.sql",
+          "reason": "Sequence state is not yet hydrated or normalized by the differential harness."
+        },
+        {
+          "fixture": "008_add_column.sql",
+          "reason": "Column-presence scope conflicts with create-view fixtures whose projected output columns are not modeled by the simulator."
+        },
+        {
+          "fixture": "009_drop_column.sql",
+          "reason": "Requires column c in the canonical baseline, which conflicts with add-column fixtures."
+        },
+        {
+          "fixture": "010_drop_policy.sql",
+          "reason": "Policy state is not yet normalized by the differential harness."
+        },
+        {
+          "fixture": "011_drop_trigger.sql",
+          "reason": "Trigger state is imported as dependency edges but is not yet normalized by this harness."
+        },
+        {
+          "fixture": "012_drop_domain.sql",
+          "reason": "Domain state is not yet hydrated from the live baseline into simulator type state."
+        },
+        {
+          "fixture": "013_create_sequence.sql",
+          "reason": "Sequence state is not yet hydrated or normalized by the differential harness."
+        },
+        {
+          "fixture": "016_create_schema.sql",
+          "reason": "Schema existence is not represented in normalized simulator state."
+        },
+        {
+          "fixture": "017_drop_schema.sql",
+          "reason": "Schema existence is not represented in normalized simulator state."
+        },
+        {
+          "fixture": "018_add_column_not_null.sql",
+          "reason": "Column-presence scope conflicts with create-view fixtures whose projected output columns are not modeled by the simulator."
+        },
+        {
+          "fixture": "safe_004_drop_index_if_exists.sql",
+          "reason": "Requires index i in the canonical baseline to produce a state change, which conflicts with enabled create-index fixtures."
+        },
+        {
+          "fixture": "safe_005_drop_sequence_if_exists.sql",
+          "reason": "Sequence state is not yet hydrated or normalized by the differential harness."
+        },
+        {
+          "fixture": "safe_008_add_column_if_not_exists.sql",
+          "reason": "Column-presence scope conflicts with create-view fixtures whose projected output columns are not modeled by the simulator."
+        },
+        {
+          "fixture": "safe_009_drop_column_if_exists.sql",
+          "reason": "Requires column c in the canonical baseline to produce a state change, which conflicts with add-column fixtures."
+        },
+        {
+          "fixture": "safe_010_drop_policy_if_exists.sql",
+          "reason": "Policy state is not yet normalized by the differential harness."
+        },
+        {
+          "fixture": "safe_011_create_schema_if_not_exists.sql",
+          "reason": "Schema existence is not represented in normalized simulator state."
+        }
+      ],
+      "schemas": [
+        "public",
+        "sm_identity",
+        "sm_core",
+        "sm_catalog",
+        "sm_billing",
+        "sm_fulfillment",
+        "sm_audit",
+        "sm_analytics"
+      ],
+      "scope": [
+        "relations",
+        "indexes"
+      ],
+      "required_relations": [
+        "sm_core.t",
+        "sm_core.v",
+        "sm_core.mv"
+      ],
+      "notes": "Fifth incremental slice. Validates idempotent and non-idempotent relation and index create/drop outcomes."
+    },
+    {
+      "rule_dir": "rule_14_restrictive-policy",
+      "enabled": true,
+      "fixtures": [
+        "001_restrictive_policy.sql",
+        "002_restrictive_all.sql",
+        "003_restrictive_insert.sql",
+        "004_restrictive_update.sql",
+        "005_restrictive_delete.sql",
+        "006_restrictive_select_where.sql",
+        "007_restrictive_update_check.sql",
+        "010_restrictive_select_expr.sql",
+        "011_restrictive_insert_check_expr.sql",
+        "safe_001_permissive.sql",
+        "safe_004_permissive_all.sql",
+        "safe_005_permissive_insert.sql",
+        "safe_006_permissive_update.sql",
+        "safe_007_permissive_delete.sql"
+      ],
+      "excluded_fixtures": [
+        {
+          "fixture": "008_restrictive_to_role.sql",
+          "reason": "Requires server role role_admin, which is absent from the local PostgreSQL environment."
+        },
+        {
+          "fixture": "009_restrictive_multiple_roles.sql",
+          "reason": "Requires server roles admin and manager, which are absent from the local PostgreSQL environment."
+        },
+        {
+          "fixture": "012_restrictive_select_tenant.sql",
+          "reason": "PostgreSQL rejects bigint tenant_id = text current_setting(...) without an explicit cast; changing the enterprise tenant key type would be incorrect."
+        },
+        {
+          "fixture": "safe_002_create_table.sql",
+          "reason": "The cumulative canonical baseline contains sm_core.t for rule_18."
+        },
+        {
+          "fixture": "safe_003_alter_table.sql",
+          "reason": "This is an unrelated column mutation already covered by rules 07, 08, 23, and 25."
+        },
+        {
+          "fixture": "safe_008_create_index.sql",
+          "reason": "This is an unrelated index mutation already covered by rules 01, 10, 18, and 25."
+        }
+      ],
+      "schemas": [
+        "public",
+        "sm_identity",
+        "sm_core",
+        "sm_catalog",
+        "sm_billing",
+        "sm_fulfillment",
+        "sm_audit",
+        "sm_analytics"
+      ],
+      "scope": [
+        "relations",
+        "policies"
+      ],
+      "required_relations": [
+        "public.test_table"
+      ],
+      "notes": "Thirteenth incremental slice. Compares policy ownership for restrictive and permissive SELECT, INSERT, UPDATE, DELETE, and ALL policies."
+    },
+    {
+      "rule_dir": "rule_23_volatile-default",
+      "enabled": true,
+      "fixtures": [
+        "004_create_table_volatile_gen_random_uuid.sql",
+        "005_add_col_volatile_timeofday.sql",
+        "007_create_table_volatile_clock_timestamp.sql",
+        "008_add_col_volatile_uuid.sql",
+        "009_set_default_volatile_clock.sql",
+        "safe_002_add_col_immutable.sql",
+        "safe_004_add_col_no_default.sql",
+        "safe_007_set_default_numeric.sql",
+        "safe_009_add_col_default_text.sql"
+      ],
+      "excluded_fixtures": [
+        {
+          "fixture": "001_create_table_volatile.sql",
+          "reason": "PostgreSQL cannot coerce random() double precision to a timestamp column default."
+        },
+        {
+          "fixture": "002_add_col_volatile.sql",
+          "reason": "PostgreSQL cannot implicitly coerce random() double precision to an integer column default."
+        },
+        {
+          "fixture": "003_set_default_volatile.sql",
+          "reason": "Requires column c in the canonical baseline, which conflicts with enabled add-column fixtures."
+        },
+        {
+          "fixture": "006_set_default_volatile_now.sql",
+          "reason": "PostgreSQL cannot coerce random() double precision to the baseline timestamptz column."
+        },
+        {
+          "fixture": "safe_001_create_table_immutable.sql",
+          "reason": "The cumulative canonical baseline contains sm_core.t for rule_18."
+        },
+        {
+          "fixture": "safe_003_set_default_immutable.sql",
+          "reason": "Requires column c in the canonical baseline, which conflicts with enabled add-column fixtures."
+        },
+        {
+          "fixture": "safe_005_create_table_immutable_bool.sql",
+          "reason": "The cumulative canonical baseline contains sm_core.t for rule_18."
+        },
+        {
+          "fixture": "safe_006_create_table_serial.sql",
+          "reason": "The cumulative canonical baseline contains sm_core.t for rule_18."
+        },
+        {
+          "fixture": "safe_008_create_table_default_null.sql",
+          "reason": "The cumulative canonical baseline contains sm_core.t for rule_18."
+        }
+      ],
+      "schemas": [
+        "public",
+        "sm_identity",
+        "sm_core",
+        "sm_catalog",
+        "sm_billing",
+        "sm_fulfillment",
+        "sm_audit",
+        "sm_analytics"
+      ],
+      "scope": [
+        "relations",
+        "columns"
+      ],
+      "required_relations": [
+        "public.test_table",
+        "sm_core.items"
+      ],
+      "notes": "Ninth incremental slice. Compares column type, nullability, and default presence for volatile and immutable default mutations."
+    },
+    {
+      "rule_dir": "rule_25_schema-drift",
+      "enabled": true,
+      "fixtures": [
+        "safe_002_create_table.sql",
+        "safe_003_alter_known_table.sql",
+        "safe_004_create_view.sql",
+        "safe_005_create_index.sql",
+        "safe_008_rename_known_table.sql"
+      ],
+      "excluded_fixtures": [
+        {
+          "fixture": "001_drop_unknown_table.sql",
+          "reason": "PostgreSQL rejects the unknown relation; this is a rule diagnostic case with no resulting live state."
+        },
+        {
+          "fixture": "002_drop_unknown_view.sql",
+          "reason": "PostgreSQL rejects the unknown view; this is a rule diagnostic case with no resulting live state."
+        },
+        {
+          "fixture": "003_drop_unknown_seq.sql",
+          "reason": "PostgreSQL rejects the unknown sequence and sequence state is not normalized."
+        },
+        {
+          "fixture": "004_alter_unknown_table.sql",
+          "reason": "PostgreSQL rejects the unknown relation; this is a rule diagnostic case with no resulting live state."
+        },
+        {
+          "fixture": "005_drop_unknown_func.sql",
+          "reason": "PostgreSQL rejects the unknown function and function state is not normalized."
+        },
+        {
+          "fixture": "006_drop_unknown_index.sql",
+          "reason": "PostgreSQL rejects the unknown index; this is a rule diagnostic case with no resulting live state."
+        },
+        {
+          "fixture": "007_drop_unknown_type.sql",
+          "reason": "PostgreSQL rejects the unknown type and type state is not hydrated."
+        },
+        {
+          "fixture": "008_rename_unknown_table.sql",
+          "reason": "PostgreSQL rejects the unknown relation; this is a rule diagnostic case with no resulting live state."
+        },
+        {
+          "fixture": "009_alter_unknown_table_set_default.sql",
+          "reason": "PostgreSQL rejects the unknown relation; this is a rule diagnostic case with no resulting live state."
+        },
+        {
+          "fixture": "safe_001_drop_known_table.sql",
+          "reason": "PostgreSQL rejects dropping public.test_table without CASCADE because enterprise baseline dependencies exist."
+        },
+        {
+          "fixture": "safe_006_select.sql",
+          "reason": "Data reads do not change normalized schema state."
+        },
+        {
+          "fixture": "safe_007_insert.sql",
+          "reason": "Data writes do not change normalized schema state."
+        },
+        {
+          "fixture": "safe_009_create_seq.sql",
+          "reason": "Sequence state is not yet hydrated or normalized by the differential harness."
+        }
+      ],
+      "schemas": [
+        "public",
+        "sm_identity",
+        "sm_core",
+        "sm_catalog",
+        "sm_billing",
+        "sm_fulfillment",
+        "sm_audit",
+        "sm_analytics"
+      ],
+      "scope": [
+        "relations",
+        "columns",
+        "indexes",
+        "foreign_keys"
+      ],
+      "fixture_scopes": {
+        "safe_004_create_view.sql": [
+          "relations"
+        ]
+      },
+      "required_relations": [
+        "public.test_table"
+      ],
+      "notes": "Twelfth incremental slice. Validates known-object creation, alteration, indexing, and rename propagation while classifying unknown-object fixtures as PostgreSQL rejection cases."
+    },
+    {
+      "rule_dir": "rule_15_disable-trigger",
+      "enabled": true,
+      "fixtures": [
+        "0005_disable_trigger.sql",
+        "0006_disable_trigger.sql",
+        "0007_disable_trigger.sql",
+        "0008_disable_trigger.sql",
+        "001_disable_all.sql",
+        "002_disable_specific.sql",
+        "003_enable_all.sql",
+        "004_enable_specific.sql",
+        "009_disable_trigger_user.sql",
+        "010_enable_trigger_audit.sql",
+        "safe_002_drop_trigger.sql",
+        "safe_003_add_column.sql",
+        "safe_005_create_table.sql",
+        "safe_009_create_index.sql",
+        "safe_010_rename_table.sql"
+      ],
+      "excluded_fixtures": [
+        {
+          "fixture": "safe_001_create_trigger.sql",
+          "reason": "The canonical baseline contains trigger t so drop and table-rename propagation can be validated."
+        },
+        {
+          "fixture": "safe_004_drop_column.sql",
+          "reason": "The canonical baseline intentionally omits column c so safe_003 can validate an independent ADD COLUMN."
+        },
+        {
+          "fixture": "safe_006_drop_table.sql",
+          "reason": "PostgreSQL correctly rejects DROP TABLE without CASCADE because public.child_table and sm_audit.change_requests depend on public.test_table."
+        },
+        {
+          "fixture": "safe_007_rename_trigger.sql",
+          "reason": "ALTER TRIGGER RENAME is not represented by the current AST mutation layer; deferred rather than treating an opaque statement as differential coverage."
+        },
+        {
+          "fixture": "safe_008_drop_constraint.sql",
+          "reason": "The canonical primary-key constraint is test_table_pkey, not the fixture-specific pk_id."
+        }
+      ],
+      "schemas": [
+        "public",
+        "sm_identity",
+        "sm_core",
+        "sm_catalog",
+        "sm_billing",
+        "sm_fulfillment",
+        "sm_audit",
+        "sm_analytics"
+      ],
+      "scope": [
+        "triggers"
+      ],
+      "required_relations": [
+        "public.test_table"
+      ],
+      "notes": "Thirteenth incremental slice. Compares PostgreSQL trigger identity, owning table, function, enabled mode, table-drop cleanup, and table-rename propagation."
+    },
+    {
+      "rule_dir": "rule_17_function-volatility-change",
+      "enabled": true,
+      "fixtures": [
+        "001_to_volatile.sql",
+        "002_to_stable.sql",
+        "003_to_immutable.sql",
+        "004_to_volatile_schema.sql",
+        "005_to_stable_schema.sql",
+        "006_to_immutable_schema.sql",
+        "007_to_volatile_args.sql",
+        "008_to_stable_args.sql",
+        "009_to_immutable_args.sql",
+        "010_to_volatile_more.sql",
+        "011_to_stable_restrict.sql",
+        "012_to_immutable_more.sql",
+        "013_to_volatile_public_args.sql",
+        "safe_003_rename_func.sql",
+        "safe_006_set_param.sql",
+        "safe_007_reset_param.sql",
+        "safe_009_create_index.sql",
+        "safe_010_drop_table.sql",
+        "safe_011_alter_func_rename_args.sql"
+      ],
+      "excluded_fixtures": [
+        {
+          "fixture": "safe_001_create_func.sql",
+          "reason": "The canonical baseline contains sm_core.f() to exercise volatility changes and trigger-function dependencies."
+        },
+        {
+          "fixture": "safe_002_create_table.sql",
+          "reason": "The cumulative canonical baseline contains sm_core.t for rule_18."
+        },
+        {
+          "fixture": "safe_004_set_schema.sql",
+          "reason": "PostgreSQL correctly rejects moving sm_core.f() to public because public.f() is required by the schema-qualified fixtures."
+        },
+        {
+          "fixture": "safe_005_owner_to.sql",
+          "reason": "The local PostgreSQL beta instance has no postgres role; role ownership is outside normalized function state."
+        },
+        {
+          "fixture": "safe_008_drop_func.sql",
+          "reason": "PostgreSQL correctly rejects dropping sm_core.f() because trigger public.t depends on it."
+        },
+        {
+          "fixture": "safe_012_alter_func_set_schema_args.sql",
+          "reason": "The fixture targets a non-harness schema named audit; the canonical owned schema is sm_audit."
+        }
+      ],
+      "schemas": [
+        "public",
+        "sm_identity",
+        "sm_core",
+        "sm_catalog",
+        "sm_billing",
+        "sm_fulfillment",
+        "sm_audit",
+        "sm_analytics"
+      ],
+      "scope": [
+        "functions"
+      ],
+      "required_relations": [
+        "public.test_table",
+        "sm_core.t"
+      ],
+      "notes": "Fourteenth incremental slice. Compares live pg_proc identity and volatility across overloads, schema qualification, option changes, and function renames."
+    },
+    {
+      "rule_dir": "rule_09_blocking-constraint",
+      "enabled": true,
+      "fixtures": [
+        "001_check_constraint.sql",
+        "002_foreign_key.sql",
+        "003_set_not_null.sql",
+        "004_unique_constraint.sql",
+        "005_primary_key.sql",
+        "008_exclude_constraint.sql",
+        "009_unique_multi_column.sql",
+        "010_primary_key_multi_column.sql",
+        "safe_004_add_column.sql",
+        "safe_007_create_index.sql",
+        "safe_009_alter_set_default.sql"
+      ],
+      "excluded_fixtures": [
+        {
+          "fixture": "006_set_storage.sql",
+          "reason": "Column storage strategy is not synchronized or normalized by the differential harness."
+        },
+        {
+          "fixture": "007_set_access_method.sql",
+          "reason": "Table access method identity is not synchronized or normalized by the differential harness."
+        },
+        {
+          "fixture": "safe_001_check_not_valid.sql",
+          "reason": "SELECT 1 has no resulting schema state."
+        },
+        {
+          "fixture": "safe_002_drop_not_null.sql",
+          "reason": "The cumulative canonical baseline already contains sm_core.t, so CREATE TABLE IF NOT EXISTS is a no-op."
+        },
+        {
+          "fixture": "safe_003_create_table.sql",
+          "reason": "PostgreSQL correctly rejects creating sm_core.t because the cumulative canonical baseline contains it."
+        },
+        {
+          "fixture": "safe_005_drop_column.sql",
+          "reason": "PostgreSQL correctly rejects dropping absent column public.test_table.c."
+        },
+        {
+          "fixture": "safe_006_rename_column.sql",
+          "reason": "Table comments are not synchronized or normalized by the differential harness."
+        },
+        {
+          "fixture": "safe_008_drop_constraint.sql",
+          "reason": "DROP INDEX IF EXISTS idx_t_id is a no-op against the canonical baseline."
+        },
+        {
+          "fixture": "safe_010_drop_index.sql",
+          "reason": "DROP INDEX IF EXISTS idx is a no-op against the canonical baseline."
+        }
+      ],
+      "schemas": [
+        "public",
+        "sm_identity",
+        "sm_core",
+        "sm_catalog",
+        "sm_billing",
+        "sm_fulfillment",
+        "sm_audit",
+        "sm_analytics"
+      ],
+      "scope": [
+        "constraints"
+      ],
+      "fixture_scopes": {
+        "002_foreign_key.sql": [
+          "constraints",
+          "foreign_keys"
+        ],
+        "003_set_not_null.sql": [
+          "relations",
+          "columns"
+        ],
+        "safe_004_add_column.sql": [
+          "indexes"
+        ],
+        "safe_007_create_index.sql": [
+          "indexes"
+        ],
+        "safe_009_alter_set_default.sql": [
+          "relations",
+          "constraints"
+        ]
+      },
+      "required_relations": [
+        "public.test_table",
+        "sm_core.t",
+        "sm_core.t_large"
+      ],
+      "notes": "Fifteenth incremental slice. Compares generic table-constraint identity, kind, validation state, unnamed FK naming/topology, nullability, and control index outcomes."
+    },
+    {
+      "rule_dir": "rule_16_broken-compute",
+      "enabled": true,
+      "fixtures": [
+        "003_drop_func_cascade.sql",
+        "005_drop_func_public.sql",
+        "safe_003_alter_table.sql",
+        "safe_005_drop_table.sql",
+        "safe_006_create_index.sql",
+        "safe_013_drop_func_args.sql",
+        "safe_014_drop_func_variadic.sql",
+        "safe_015_drop_func_out_param.sql",
+        "safe_016_drop_func_set_returning.sql",
+        "safe_017_drop_func_public_args.sql",
+        "safe_018_drop_func_default_args.sql"
+      ],
+      "excluded_fixtures": [
+        {
+          "fixture": "001_drop_func.sql",
+          "reason": "PostgreSQL correctly rejects dropping sm_core.f() because trigger public.t depends on it; the CASCADE outcome is covered by 003."
+        },
+        {
+          "fixture": "002_drop_func_if_exists.sql",
+          "reason": "The fixture does not contain IF EXISTS and PostgreSQL correctly rejects the dependent function drop without CASCADE."
+        },
+        {
+          "fixture": "004_drop_func_restrict.sql",
+          "reason": "The fixture does not contain RESTRICT and PostgreSQL correctly rejects the dependent function drop without CASCADE."
+        },
+        {
+          "fixture": "010_drop_func_simple.sql",
+          "reason": "PostgreSQL correctly rejects dropping sm_core.f() because trigger public.t depends on it."
+        },
+        {
+          "fixture": "011_drop_func_owner.sql",
+          "reason": "PostgreSQL correctly rejects dropping sm_core.f() because trigger public.t depends on it."
+        },
+        {
+          "fixture": "safe_001_create_func.sql",
+          "reason": "The canonical baseline contains sm_core.f() for trigger dependency and volatility coverage."
+        },
+        {
+          "fixture": "safe_002_create_table.sql",
+          "reason": "The cumulative canonical baseline contains sm_core.t."
+        },
+        {
+          "fixture": "safe_004_create_trigger.sql",
+          "reason": "The canonical baseline already contains trigger public.t using sm_core.f()."
+        },
+        {
+          "fixture": "safe_007_drop_index.sql",
+          "reason": "PostgreSQL rejects dropping absent index sm_core.i without IF EXISTS."
+        },
+        {
+          "fixture": "safe_008_select.sql",
+          "reason": "Data reads do not change normalized schema state."
+        },
+        {
+          "fixture": "safe_009_insert.sql",
+          "reason": "Data writes do not change normalized schema state."
+        },
+        {
+          "fixture": "safe_010_update.sql",
+          "reason": "Data writes do not change normalized schema state."
+        },
+        {
+          "fixture": "safe_011_delete.sql",
+          "reason": "Data writes do not change normalized schema state."
+        },
+        {
+          "fixture": "safe_012_create_sequence.sql",
+          "reason": "Sequence state is not synchronized or normalized by the differential harness."
+        }
+      ],
+      "schemas": [
+        "public",
+        "sm_identity",
+        "sm_core",
+        "sm_catalog",
+        "sm_billing",
+        "sm_fulfillment",
+        "sm_audit",
+        "sm_analytics"
+      ],
+      "scope": [
+        "functions"
+      ],
+      "fixture_scopes": {
+        "003_drop_func_cascade.sql": [
+          "functions",
+          "triggers"
+        ],
+        "safe_003_alter_table.sql": [
+          "relations",
+          "columns"
+        ],
+        "safe_005_drop_table.sql": [
+          "relations"
+        ],
+        "safe_006_create_index.sql": [
+          "indexes"
+        ]
+      },
+      "required_relations": [
+        "public.test_table",
+        "sm_core.t"
+      ],
+      "notes": "Sixteenth incremental slice. Validates function-drop cascade into dependent triggers and overload identity for regular, variadic, OUT-only, set-returning, and default-argument functions."
+    },
+    {
+      "rule_dir": "rule_20_alter-type-add-value-txn",
+      "enabled": true,
+      "fixtures": [
+        "001_add_value.sql",
+        "001_txn.sql",
+        "004_add_value_if_not_exists.sql",
+        "005_add_value_if_not_exists_before.sql",
+        "006_add_value_if_not_exists_after.sql",
+        "008_add_value_quoted_type.sql",
+        "009_add_value_status_type.sql",
+        "safe_004_alter_table.sql",
+        "safe_006_drop_type.sql",
+        "safe_008_create_index.sql"
+      ],
+      "excluded_fixtures": [
+        {
+          "fixture": "002_add_value_before.sql",
+          "reason": "Fixture assumes label d was committed by an earlier migration, but differential fixtures are intentionally rebuilt from baseline independently."
+        },
+        {
+          "fixture": "003_add_value_after.sql",
+          "reason": "Fixture assumes label e was committed by an earlier migration, but differential fixtures are intentionally rebuilt from baseline independently."
+        },
+        {
+          "fixture": "007_add_value_schema_qualified.sql",
+          "reason": "Fixture targets generic schema my_schema outside the harness-owned sm_* schema boundary."
+        },
+        {
+          "fixture": "safe_001_rename_type.sql",
+          "reason": "ALTER TYPE RENAME TO is not represented by the current parser/state mutation model; tracked as a future type-topology slice."
+        },
+        {
+          "fixture": "safe_002_rename_value.sql",
+          "reason": "ALTER TYPE RENAME VALUE is not represented by the current parser/state mutation model; tracked as a future enum-label mutation slice."
+        },
+        {
+          "fixture": "safe_003_create_table.sql",
+          "reason": "The cumulative canonical baseline already contains sm_core.t."
+        },
+        {
+          "fixture": "safe_005_create_type.sql",
+          "reason": "The canonical baseline contains sm_core.my_enum as the prerequisite for ALTER TYPE fixtures."
+        },
+        {
+          "fixture": "safe_007_select.sql",
+          "reason": "Data reads do not change normalized schema state."
+        },
+        {
+          "fixture": "safe_009_alter_schema.sql",
+          "reason": "Fixture targets generic schema my_schema outside the harness-owned sm_* schema boundary."
+        }
+      ],
+      "schemas": [
+        "public",
+        "sm_identity",
+        "sm_core",
+        "sm_catalog",
+        "sm_billing",
+        "sm_fulfillment",
+        "sm_audit",
+        "sm_analytics"
+      ],
+      "scope": [
+        "types"
+      ],
+      "fixture_scopes": {
+        "safe_004_alter_table.sql": [
+          "relations",
+          "columns"
+        ],
+        "safe_008_create_index.sql": [
+          "indexes"
+        ]
+      },
+      "required_relations": [
+        "public.test_table",
+        "sm_core.t"
+      ],
+      "notes": "Seventeenth incremental slice. Hydrates enterprise enum/domain state from PostgreSQL and compares enum existence, ordered labels, positional additions, quoted identity, and drops."
+    },
+    {
+      "rule_dir": "rule_13_partition-strategy-mismatch",
+      "enabled": true,
+      "fixtures": [
+        "safe_001_attach_list_to_list.sql",
+        "safe_003_attach_range_to_range.sql",
+        "safe_004_attach_hash_to_hash.sql",
+        "safe_005_add_column.sql",
+        "safe_006_create_index.sql",
+        "safe_007_rename_table.sql"
+      ],
+      "excluded_fixtures": [
+        {
+          "fixture": "001_attach_list_to_range.sql",
+          "reason": "The shared public.parent is the canonical LIST parent for rule 12; this fixture's filename assumes a conflicting RANGE baseline."
+        },
+        {
+          "fixture": "002_attach_range_to_list.sql",
+          "reason": "PostgreSQL rejects a FROM/TO partition bound for a LIST parent, so no resulting state exists to compare."
+        },
+        {
+          "fixture": "003_attach_hash_to_list.sql",
+          "reason": "The shared public.parent is the canonical LIST parent for rule 12 and PostgreSQL rejects a hash bound for it."
+        },
+        {
+          "fixture": "004_attach_range_to_hash.sql",
+          "reason": "PostgreSQL rejects a FROM/TO partition bound for a HASH parent, so no resulting state exists to compare."
+        },
+        {
+          "fixture": "005_attach_list_to_hash.sql",
+          "reason": "PostgreSQL rejects an IN partition bound for a HASH parent, so no resulting state exists to compare."
+        },
+        {
+          "fixture": "006_attach_hash_to_range.sql",
+          "reason": "PostgreSQL rejects a hash partition bound for a RANGE parent, so no resulting state exists to compare."
+        },
+        {
+          "fixture": "007_attach_list_string_to_range.sql",
+          "reason": "PostgreSQL rejects an IN partition bound for a RANGE parent, so no resulting state exists to compare."
+        },
+        {
+          "fixture": "008_attach_range_to_list_multi.sql",
+          "reason": "PostgreSQL rejects a FROM/TO partition bound for a LIST parent, so no resulting state exists to compare."
+        },
+        {
+          "fixture": "009_attach_hash_to_list_modulus.sql",
+          "reason": "PostgreSQL rejects a hash partition bound for a LIST parent, so no resulting state exists to compare."
+        },
+        {
+          "fixture": "010_attach_list_to_hash_multi.sql",
+          "reason": "PostgreSQL rejects an IN partition bound for a HASH parent, so no resulting state exists to compare."
+        },
+        {
+          "fixture": "011_attach_hash_to_range_modulus.sql",
+          "reason": "PostgreSQL rejects a hash partition bound for a RANGE parent, so no resulting state exists to compare."
+        },
+        {
+          "fixture": "012_attach_range_to_hash_wide.sql",
+          "reason": "PostgreSQL rejects a FROM/TO partition bound for a HASH parent, so no resulting state exists to compare."
+        },
+        {
+          "fixture": "safe_002_create_table.sql",
+          "reason": "The cumulative canonical baseline already contains sm_core.t."
+        },
+        {
+          "fixture": "safe_008_insert.sql",
+          "reason": "Data writes do not change normalized schema state."
+        }
+      ],
+      "schemas": [
+        "public",
+        "sm_identity",
+        "sm_core",
+        "sm_catalog",
+        "sm_billing",
+        "sm_fulfillment",
+        "sm_audit",
+        "sm_analytics"
+      ],
+      "scope": [
+        "relations",
+        "partitions"
+      ],
+      "fixture_scopes": {
+        "safe_005_add_column.sql": [
+          "relations",
+          "columns"
+        ],
+        "safe_006_create_index.sql": [
+          "indexes"
+        ],
+        "safe_007_rename_table.sql": [
+          "relations"
+        ]
+      },
+      "required_relations": [
+        "public.list_parent",
+        "public.list_child",
+        "public.range_parent",
+        "public.range_child",
+        "public.hash_parent",
+        "public.hash_child"
+      ],
+      "notes": "Eighteenth incremental slice. Compares PostgreSQL-hydrated LIST/RANGE/HASH parent strategies and valid attachment edges; invalid-bound fixtures are documented rather than treated as semantic state."
+    },
+    {
+      "rule_dir": "rule_24_overbroad-grant",
+      "enabled": true,
+      "fixtures": [
+        "001_grant_public.sql",
+        "002_grant_all.sql",
+        "004_grant_all_public.sql",
+        "005_grant_all_in_schema.sql",
+        "006_grant_insert_public.sql",
+        "007_grant_all_in_schema_public.sql",
+        "008_grant_update_public.sql",
+        "safe_001_grant_select.sql",
+        "safe_002_grant_insert.sql",
+        "safe_003_revoke.sql",
+        "safe_004_grant_update.sql",
+        "safe_005_grant_delete.sql"
+      ],
+      "excluded_fixtures": [
+        {
+          "fixture": "003_grant_with_option.sql",
+          "reason": "Grant-option identity is not yet represented in RelationState privilege entries."
+        },
+        {
+          "fixture": "009_grant_select_with_grant_option.sql",
+          "reason": "Grant-option identity is not yet represented in RelationState privilege entries."
+        },
+        {
+          "fixture": "safe_006_grant_select_columns.sql",
+          "reason": "Column-level ACLs live in pg_attribute.attacl and are intentionally distinct from relation ACL state."
+        },
+        {
+          "fixture": "safe_007_create_table.sql",
+          "reason": "The cumulative canonical baseline already contains sm_core.t."
+        },
+        {
+          "fixture": "safe_008_grant_usage.sql",
+          "reason": "Schema ACLs are outside the v1 relation-privilege comparison scope."
+        },
+        {
+          "fixture": "safe_009_grant_execute.sql",
+          "reason": "Function ACLs are outside the v1 relation-privilege comparison scope."
+        }
+      ],
+      "schemas": [
+        "public",
+        "sm_identity",
+        "sm_core",
+        "sm_catalog",
+        "sm_billing",
+        "sm_fulfillment",
+        "sm_audit",
+        "sm_analytics"
+      ],
+      "scope": [
+        "privileges"
+      ],
+      "required_relations": [
+        "public.test_table"
+      ],
+      "notes": "Nineteenth incremental slice. Synchronizes explicit non-owner PostgreSQL relation ACLs and compares grants/revokes for named roles and PUBLIC, including ALL TABLES IN SCHEMA expansion."
+    },
+    {
+      "rule_dir": "rule_11_blocking-mat-view-refresh",
+      "enabled": true,
+      "fixtures": [
+        "001_refresh.sql",
+        "002_refresh_with_data.sql",
+        "003_refresh_no_data.sql",
+        "004_refresh_analytics.sql",
+        "005_refresh_schema_qualified.sql",
+        "006_refresh_other_schema.sql",
+        "007_refresh_weekly_summary.sql",
+        "008_refresh_dashboard.sql",
+        "009_refresh_site_stats.sql",
+        "010_refresh_monthly.sql",
+        "011_refresh_user_report.sql",
+        "012_refresh_inventory.sql",
+        "safe_003_drop_matview.sql",
+        "safe_005_alter_table.sql",
+        "safe_007_create_index.sql"
+      ],
+      "excluded_fixtures": [
+        {
+          "fixture": "safe_001_refresh_concurrently.sql",
+          "reason": "Fixture contains SELECT 1 rather than a materialized-view refresh and changes no normalized state."
+        },
+        {
+          "fixture": "safe_002_create_matview.sql",
+          "reason": "The canonical baseline contains sm_core.mymatview with the unique index required by PostgreSQL for concurrent refresh."
+        },
+        {
+          "fixture": "safe_004_create_table.sql",
+          "reason": "The cumulative canonical baseline already contains sm_core.t."
+        },
+        {
+          "fixture": "safe_006_insert.sql",
+          "reason": "Data writes are outside the normalized schema-state comparison."
+        },
+        {
+          "fixture": "safe_008_select.sql",
+          "reason": "Data reads are outside the normalized schema-state comparison."
+        }
+      ],
+      "schemas": [
+        "public",
+        "sm_identity",
+        "sm_core",
+        "sm_catalog",
+        "sm_billing",
+        "sm_fulfillment",
+        "sm_audit",
+        "sm_analytics"
+      ],
+      "scope": [
+        "relations",
+        "indexes"
+      ],
+      "fixture_scopes": {
+        "safe_003_drop_matview.sql": [
+          "relations",
+          "indexes"
+        ],
+        "safe_005_alter_table.sql": [
+          "relations",
+          "columns"
+        ],
+        "safe_007_create_index.sql": [
+          "indexes"
+        ]
+      },
+      "required_relations": [
+        "sm_core.mymatview",
+        "public.test_table"
+      ],
+      "notes": "Twentieth incremental slice. Runs legal PostgreSQL concurrent refreshes against a populated materialized view with a qualifying unique index and verifies relation/index topology remains stable."
+    },
+    {
+      "rule_dir": "rule_26_chain-conflict",
+      "enabled": true,
+      "fixtures": [
+        "004_conflict.sql",
+        "010_conflict.sql",
+        "safe_001_chain.sql",
+        "safe_001_create_table.sql",
+        "safe_002_create_index.sql",
+        "safe_003_add_unique_constraint.sql",
+        "safe_004_add_not_null.sql",
+        "safe_005_create_view.sql",
+        "safe_007_grant_select.sql"
+      ],
+      "excluded_fixtures": [
+        {
+          "fixture": "001_chain.sql",
+          "reason": "PostgreSQL rejects the second incompatible duplicate column definition, leaving no committed resulting state."
+        },
+        {
+          "fixture": "001_conflict.sql",
+          "reason": "PostgreSQL rejects the second incompatible duplicate column definition, leaving no committed resulting state."
+        },
+        {
+          "fixture": "002_chain.sql",
+          "reason": "PostgreSQL rejects the second incompatible duplicate column definition, leaving no committed resulting state."
+        },
+        {
+          "fixture": "002_conflict.sql",
+          "reason": "PostgreSQL rejects the duplicate index name, leaving no committed resulting state."
+        },
+        {
+          "fixture": "003_chain.sql",
+          "reason": "PostgreSQL rejects the second incompatible duplicate column definition, leaving no committed resulting state."
+        },
+        {
+          "fixture": "003_conflict.sql",
+          "reason": "PostgreSQL rejects the duplicate table definition, leaving no committed resulting state."
+        },
+        {
+          "fixture": "005_conflict.sql",
+          "reason": "Fixture requires a baseline column a while column b must remain absent; that topology conflicts with the shared canonical table shape."
+        },
+        {
+          "fixture": "006_conflict.sql",
+          "reason": "Fixture requires baseline column c, while participating add-column chains require c to be absent."
+        },
+        {
+          "fixture": "007_conflict.sql",
+          "reason": "PostgreSQL rejects the second incompatible duplicate column definition, leaving no committed resulting state."
+        },
+        {
+          "fixture": "008_conflict.sql",
+          "reason": "PostgreSQL rejects the second incompatible duplicate column definition, leaving no committed resulting state."
+        },
+        {
+          "fixture": "009_conflict.sql",
+          "reason": "Fixture requires baseline column c, while participating add-column chains require c to be absent."
+        },
+        {
+          "fixture": "safe_006_create_seq.sql",
+          "reason": "Sequence state is not yet synchronized or normalized by the differential harness."
+        },
+        {
+          "fixture": "safe_008_insert.sql",
+          "reason": "Data writes are outside the normalized schema-state comparison."
+        },
+        {
+          "fixture": "safe_009_select.sql",
+          "reason": "Data reads are outside the normalized schema-state comparison."
+        }
+      ],
+      "schemas": [
+        "public",
+        "sm_identity",
+        "sm_core",
+        "sm_catalog",
+        "sm_billing",
+        "sm_fulfillment",
+        "sm_audit",
+        "sm_analytics"
+      ],
+      "scope": [
+        "relations",
+        "columns"
+      ],
+      "fixture_scopes": {
+        "004_conflict.sql": [
+          "relations",
+          "columns"
+        ],
+        "010_conflict.sql": [
+          "relations",
+          "columns"
+        ],
+        "safe_002_create_index.sql": [
+          "indexes"
+        ],
+        "safe_003_add_unique_constraint.sql": [
+          "constraints"
+        ],
+        "safe_005_create_view.sql": [
+          "relations",
+          "view_dependencies"
+        ],
+        "safe_007_grant_select.sql": [
+          "privileges"
+        ]
+      },
+      "required_relations": [
+        "public.test_table"
+      ],
+      "notes": "Twenty-first incremental slice. Compares valid multi-statement chain outcomes and state controls; PostgreSQL-rejected duplicate-definition chains are documented separately because the state harness compares successful resulting state."
+    },
+    {
+      "rule_dir": "rule_19_concurrent-in-transaction",
+      "enabled": true,
+      "transactional": false,
+      "fixtures": [
+        "safe_001_create_index.sql",
+        "safe_003_create_concurrently.sql",
+        "safe_005_create_unique_index.sql",
+        "safe_007_create_index_where.sql",
+        "safe_008_create_index_include.sql",
+        "safe_009_create_index_schema.sql"
+      ],
+      "excluded_fixtures": [
+        {
+          "fixture": "001_create_concurrently.sql",
+          "reason": "PostgreSQL rejects CREATE INDEX CONCURRENTLY inside the fixture's explicit transaction, leaving no successful resulting state."
+        },
+        {
+          "fixture": "001_txn.sql",
+          "reason": "PostgreSQL rejects CREATE INDEX CONCURRENTLY inside the fixture's explicit transaction, leaving no successful resulting state."
+        },
+        {
+          "fixture": "002_drop_concurrently.sql",
+          "reason": "PostgreSQL rejects DROP INDEX CONCURRENTLY inside the fixture's explicit transaction, leaving no successful resulting state."
+        },
+        {
+          "fixture": "003_create_concurrently_unique.sql",
+          "reason": "PostgreSQL rejects CREATE INDEX CONCURRENTLY inside the fixture's explicit transaction, leaving no successful resulting state."
+        },
+        {
+          "fixture": "004_drop_concurrently_exists.sql",
+          "reason": "PostgreSQL rejects DROP INDEX CONCURRENTLY inside the fixture's explicit transaction, leaving no successful resulting state."
+        },
+        {
+          "fixture": "005_create_concurrently_schema.sql",
+          "reason": "PostgreSQL rejects CREATE INDEX CONCURRENTLY inside the fixture's explicit transaction, leaving no successful resulting state."
+        },
+        {
+          "fixture": "006_drop_concurrently_schema.sql",
+          "reason": "PostgreSQL rejects DROP INDEX CONCURRENTLY inside the fixture's explicit transaction, leaving no successful resulting state."
+        },
+        {
+          "fixture": "007_create_concurrently_where.sql",
+          "reason": "PostgreSQL rejects CREATE INDEX CONCURRENTLY inside the fixture's explicit transaction, leaving no successful resulting state."
+        },
+        {
+          "fixture": "008_drop_concurrently_cascade.sql",
+          "reason": "PostgreSQL rejects DROP INDEX CONCURRENTLY inside the fixture's explicit transaction, leaving no successful resulting state."
+        },
+        {
+          "fixture": "009_create_concurrently_include.sql",
+          "reason": "PostgreSQL rejects CREATE INDEX CONCURRENTLY inside the fixture's explicit transaction, leaving no successful resulting state."
+        },
+        {
+          "fixture": "010_drop_concurrently_restrict.sql",
+          "reason": "PostgreSQL rejects DROP INDEX CONCURRENTLY inside the fixture's explicit transaction, leaving no successful resulting state."
+        },
+        {
+          "fixture": "011_create_concurrently_multi.sql",
+          "reason": "PostgreSQL rejects CREATE INDEX CONCURRENTLY inside the fixture's explicit transaction, leaving no successful resulting state."
+        },
+        {
+          "fixture": "012_drop_concurrently_public.sql",
+          "reason": "PostgreSQL rejects DROP INDEX CONCURRENTLY inside the fixture's explicit transaction, leaving no successful resulting state."
+        },
+        {
+          "fixture": "013_create_concurrently_covering.sql",
+          "reason": "PostgreSQL rejects CREATE INDEX CONCURRENTLY inside the fixture's explicit transaction, leaving no successful resulting state."
+        },
+        {
+          "fixture": "safe_002_drop_index.sql",
+          "reason": "Requires a baseline index named i, which conflicts with this rule's participating create-index fixtures."
+        },
+        {
+          "fixture": "safe_004_drop_concurrently.sql",
+          "reason": "The absent index makes this IF EXISTS statement a no-op with no differential state."
+        },
+        {
+          "fixture": "safe_006_drop_index_cascade.sql",
+          "reason": "Requires a baseline index named i, which conflicts with this rule's participating create-index fixtures."
+        },
+        {
+          "fixture": "safe_010_drop_index_schema.sql",
+          "reason": "Requires a baseline index named public.i, which conflicts with this rule's participating create-index fixtures."
+        },
+        {
+          "fixture": "safe_011_reindex.sql",
+          "reason": "Requires a baseline index named i, which conflicts with this rule's participating create-index fixtures."
+        },
+        {
+          "fixture": "safe_012_create_table.sql",
+          "reason": "The canonical enterprise baseline already contains public.test_table."
+        }
+      ],
+      "schemas": [
+        "public",
+        "sm_identity",
+        "sm_core",
+        "sm_catalog",
+        "sm_billing",
+        "sm_fulfillment",
+        "sm_audit",
+        "sm_analytics"
+      ],
+      "scope": [
+        "indexes"
+      ],
+      "required_relations": [
+        "public.test_table"
+      ],
+      "notes": "Twenty-second incremental slice. Compares successful index outcomes outside a harness transaction; explicit transaction-error fixtures are nondifferentiable in the successful-state harness and are documented individually."
+    },
+    {
+      "rule_dir": "rule_21_vacuum-full",
+      "enabled": true,
+      "transactional": false,
+      "fixtures": [
+        "001_vacuum_full.sql",
+        "002_vacuum_full_verbose.sql",
+        "003_vacuum_full_analyze.sql",
+        "004_vacuum_full_all.sql",
+        "006_vacuum_full_verbose_analyze.sql",
+        "008_vacuum_full_analyze_all.sql",
+        "009_vacuum_full_parenthesized.sql",
+        "safe_001_vacuum.sql",
+        "safe_002_analyze.sql",
+        "safe_003_vacuum_analyze.sql",
+        "safe_005_vacuum_verbose.sql",
+        "safe_006_analyze_all.sql",
+        "safe_007_vacuum_all.sql",
+        "safe_008_vacuum_analyze_all.sql"
+      ],
+      "excluded_fixtures": [
+        {
+          "fixture": "005_vacuum_full_schema.sql",
+          "reason": "Requires absent schema and relation my_schema.test_table; adding a duplicate enterprise table solely for maintenance syntax would not increase normalized state coverage."
+        },
+        {
+          "fixture": "007_vacuum_full_multiple.sql",
+          "reason": "Requires absent relations t1 and t2; equivalent single-table and whole-database maintenance outcomes are participating."
+        },
+        {
+          "fixture": "safe_004_create_table.sql",
+          "reason": "The canonical enterprise baseline already contains sm_core.t on the active search path."
+        },
+        {
+          "fixture": "safe_009_vacuum_schema.sql",
+          "reason": "Requires absent schema and relation my_schema.test_table; the public.test_table maintenance control is participating."
+        }
+      ],
+      "schemas": [
+        "public",
+        "sm_identity",
+        "sm_core",
+        "sm_catalog",
+        "sm_billing",
+        "sm_fulfillment",
+        "sm_audit",
+        "sm_analytics"
+      ],
+      "scope": [
+        "relations",
+        "columns",
+        "indexes",
+        "constraints",
+        "foreign_keys"
+      ],
+      "required_relations": [
+        "public.test_table"
+      ],
+      "notes": "Twenty-third incremental slice. Runs VACUUM, ANALYZE, and VACUUM FULL outside transactions and verifies that PostgreSQL maintenance preserves enterprise schema topology."
+    },
+    {
+      "rule_dir": "rule_22_opaque-dynamic-sql",
+      "enabled": true,
+      "fixtures": [
+        "001_do_block.sql",
+        "004_set_transaction.sql",
+        "005_set_constraints.sql",
+        "006_do_block_language.sql",
+        "008_set_transaction_read_only.sql",
+        "010_do_block_with_declare.sql",
+        "safe_001_create_table.sql",
+        "safe_002_alter_table.sql",
+        "safe_003_select.sql",
+        "safe_004_create_index.sql",
+        "safe_006_update.sql",
+        "safe_007_delete.sql"
+      ],
+      "excluded_fixtures": [
+        {
+          "fixture": "002_execute.sql",
+          "reason": "PostgreSQL has no top-level EXECUTE string statement; EXECUTE is valid only in procedural or prepared-statement contexts."
+        },
+        {
+          "fixture": "003_prepare_transaction.sql",
+          "reason": "Requires an active transaction and server-level prepared-transaction support, and intentionally leaves connection-level state rather than normalized schema state."
+        },
+        {
+          "fixture": "007_execute_format.sql",
+          "reason": "PostgreSQL rejects procedural EXECUTE and PL/pgSQL variables at top level."
+        },
+        {
+          "fixture": "009_set_constraints_named.sql",
+          "reason": "Requires a constraint named fk_constraint, which is absent from the canonical enterprise baseline."
+        },
+        {
+          "fixture": "safe_005_insert.sql",
+          "reason": "PostgreSQL rejects the single unqualified value because public.test_table has multiple non-generated columns."
+        },
+        {
+          "fixture": "safe_008_drop_table.sql",
+          "reason": "PostgreSQL rejects dropping public.test_table without CASCADE because the enterprise baseline has cross-table dependencies."
+        }
+      ],
+      "schemas": [
+        "public",
+        "sm_identity",
+        "sm_core",
+        "sm_catalog",
+        "sm_billing",
+        "sm_fulfillment",
+        "sm_audit",
+        "sm_analytics"
+      ],
+      "scope": [
+        "relations",
+        "columns",
+        "indexes",
+        "constraints",
+        "foreign_keys",
+        "view_dependencies"
+      ],
+      "fixture_scopes": {
+        "safe_001_create_table.sql": [
+          "relations",
+          "columns"
+        ],
+        "safe_002_alter_table.sql": [
+          "relations",
+          "columns"
+        ],
+        "safe_004_create_index.sql": [
+          "indexes"
+        ]
+      },
+      "required_relations": [
+        "public.test_table"
+      ],
+      "notes": "Twenty-fourth incremental slice. Executes valid opaque procedural and transaction-control statements against PostgreSQL, verifies their schema-state neutrality, and compares explicit DDL controls."
+    },
+    {
+      "rule_dir": "rule_02_drop-database",
+      "enabled": true,
+      "fixtures": [
+        "safe_004_drop_table.sql",
+        "safe_005_select.sql",
+        "safe_009_update.sql"
+      ],
+      "excluded_fixtures": [
+        {
+          "fixture": "001_drop_db.sql",
+          "reason": "Database mydb is not harness-owned, DROP DATABASE cannot be rollback-isolated, and database existence is outside normalized schema state."
+        },
+        {
+          "fixture": "002_drop_db_if_exists.sql",
+          "reason": "Database mydb is not harness-owned; IF EXISTS does not make destructive execution safe when a local database with that name may exist."
+        },
+        {
+          "fixture": "003_drop_db_force.sql",
+          "reason": "Database mydb is not harness-owned and FORCE may terminate unrelated local sessions; this connection-level behavior is intentionally nondifferentiable."
+        },
+        {
+          "fixture": "004_drop_db_force_if_exists.sql",
+          "reason": "Database mydb is not harness-owned and FORCE may terminate unrelated local sessions; IF EXISTS does not make execution safe."
+        },
+        {
+          "fixture": "005_drop_db_quoted.sql",
+          "reason": "Database My-DB is not harness-owned, DROP DATABASE cannot be rollback-isolated, and database existence is outside normalized schema state."
+        },
+        {
+          "fixture": "006_drop_db_quoted_force.sql",
+          "reason": "Database My-DB is not harness-owned and FORCE may terminate unrelated local sessions."
+        },
+        {
+          "fixture": "007_drop_db_multi_word.sql",
+          "reason": "Database my_database is not harness-owned, DROP DATABASE cannot be rollback-isolated, and database existence is outside normalized schema state."
+        },
+        {
+          "fixture": "008_drop_db_temp.sql",
+          "reason": "Database temp_db is not harness-owned, DROP DATABASE cannot be rollback-isolated, and database existence is outside normalized schema state."
+        },
+        {
+          "fixture": "009_drop_db_mixed_case.sql",
+          "reason": "PostgreSQL folds MyDataBase to mydatabase, which is not harness-owned; database existence is outside normalized schema state."
+        },
+        {
+          "fixture": "safe_001_create_db.sql",
+          "reason": "CREATE DATABASE cannot run inside rollback isolation and would create non-normalized connection-level state using a non-harness-owned name."
+        },
+        {
+          "fixture": "safe_002_alter_db.sql",
+          "reason": "Requires non-harness-owned database mydb and mutates connection-level state outside normalized schema comparison."
+        },
+        {
+          "fixture": "safe_003_create_table.sql",
+          "reason": "The canonical enterprise baseline already contains sm_core.t on the active search path."
+        },
+        {
+          "fixture": "safe_006_alter_db_owner.sql",
+          "reason": "Requires non-harness-owned database mydb and role postgres, which is not the local PostgreSQL role used by this beta environment."
+        },
+        {
+          "fixture": "safe_007_create_db_options.sql",
+          "reason": "CREATE DATABASE cannot be rollback-isolated, uses a non-harness-owned name, and requests an environment-specific locale."
+        },
+        {
+          "fixture": "safe_008_insert.sql",
+          "reason": "PostgreSQL rejects one value for baseline sm_core.t because it has two non-generated columns."
+        }
+      ],
+      "schemas": [
+        "public",
+        "sm_identity",
+        "sm_core",
+        "sm_catalog",
+        "sm_billing",
+        "sm_fulfillment",
+        "sm_audit",
+        "sm_analytics"
+      ],
+      "scope": [
+        "relations",
+        "columns",
+        "indexes",
+        "constraints",
+        "foreign_keys",
+        "view_dependencies"
+      ],
+      "required_relations": [
+        "sm_core.t"
+      ],
+      "notes": "Twenty-fifth incremental slice. Represents the connection-level rule with safe live controls only; fixed-name database creation, alteration, and deletion are explicitly classified as unsupported nondifferentiable behavior in the schema-state harness."
+    }
+  ]
+}

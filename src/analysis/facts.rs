@@ -269,7 +269,11 @@ pub struct AlterTypeFact {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum AlterTypeActionFact {
-    AddValue { new_value: String },
+    AddValue {
+        new_value: String,
+        neighbor: Option<String>,
+        before: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Default)]
@@ -677,7 +681,9 @@ pub enum AlterTableActionFact {
         constraint_name: Option<String>,
         not_valid: bool,
     },
-    AddUniqueConstraint,
+    AddUniqueConstraint {
+        constraint_name: Option<String>,
+    },
     AddPrimaryKeyConstraint,
     AddExcludeConstraint,
     SetNotNull {

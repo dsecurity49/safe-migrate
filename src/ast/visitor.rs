@@ -931,7 +931,13 @@ impl AstVisitor {
             .descendants()
             .any(|n| ast::UniqueConstraint::can_cast(n.kind()))
         {
-            return Some(AlterTableActionFact::AddUniqueConstraint);
+            let constraint_name = ac
+                .syntax()
+                .descendants()
+                .find_map(ast::ConstraintName::cast)
+                .and_then(|cn| cn.name())
+                .map(Self::resolve_name);
+            return Some(AlterTableActionFact::AddUniqueConstraint { constraint_name });
         }
 
         if ac
@@ -1496,7 +1502,6 @@ impl AstVisitor {
     }
 
     fn extract_drop_type(node: &DropType) -> Option<StatementFact> {
-        println!("EXTRACT DROP TYPE!");
         let names: Vec<QualifiedName> = node
             .paths()
             .filter_map(|p| Self::path_to_qualified_name(&p))
@@ -1546,13 +1551,30 @@ impl AstVisitor {
         if let Some(av) = node.add_value()
             && let Some(lit) = av.literal()
         {
+            let action_sql = av.syntax().text().to_string();
+            let action_lower = action_sql.to_ascii_lowercase();
+            let neighbor = av
+                .syntax()
+                .descendants()
+                .filter_map(ast::Literal::cast)
+                .map(|literal| {
+                    literal
+                        .syntax()
+                        .text()
+                        .to_string()
+                        .trim_matches('\'')
+                        .replace("''", "'")
+                })
+                .nth(1);
             actions.push(AlterTypeActionFact::AddValue {
                 new_value: lit
                     .syntax()
                     .text()
                     .to_string()
                     .trim_matches('\'')
-                    .to_string(),
+                    .replace("''", "'"),
+                neighbor,
+                before: action_lower.contains(" before "),
             });
         }
 
@@ -1873,10 +1895,16 @@ impl AstVisitor {
                                 .param_list()
                                 .map(|pl| {
                                     pl.params()
-                                        .map(|p| {
-                                            p.ty()
-                                                .map(|t| t.syntax().text().to_string())
-                                                .unwrap_or_else(|| "unknown".into())
+                                        .filter_map(|p| {
+                                            if matches!(p.mode(), Some(ast::ParamMode::ParamOut(_)))
+                                            {
+                                                return None;
+                                            }
+                                            Some(
+                                                p.ty()
+                                                    .map(|t| t.syntax().text().to_string())
+                                                    .unwrap_or_else(|| "unknown".into()),
+                                            )
                                         })
                                         .collect()
                                 })
@@ -2265,11 +2293,7 @@ impl AstVisitor {
     fn extract_privilege_from_revoke_command(
         cmd: &RevokeCommand,
     ) -> crate::analysis::facts::PrivilegeFact {
-        if let Some(role_ref) = cmd.role_ref() {
-            crate::analysis::facts::PrivilegeFact::RoleMembership(Self::resolve_name_ref(
-                &role_ref.name_ref().unwrap(),
-            ))
-        } else if cmd.select_token().is_some() {
+        if cmd.select_token().is_some() {
             crate::analysis::facts::PrivilegeFact::Select
         } else if cmd.insert_token().is_some() {
             crate::analysis::facts::PrivilegeFact::Insert
@@ -2293,6 +2317,19 @@ impl AstVisitor {
             crate::analysis::facts::PrivilegeFact::AlterSystem
         } else if cmd.all_token().is_some() {
             crate::analysis::facts::PrivilegeFact::All
+        } else if let Some(role_ref) = cmd.role_ref()
+            && let Some(name_ref) = role_ref.name_ref()
+        {
+            let name = Self::resolve_name_ref(&name_ref);
+            if !name_ref.is_quoted() {
+                match name.as_str() {
+                    "insert" => return crate::analysis::facts::PrivilegeFact::Insert,
+                    "update" => return crate::analysis::facts::PrivilegeFact::Update,
+                    "delete" => return crate::analysis::facts::PrivilegeFact::Delete,
+                    _ => {}
+                }
+            }
+            crate::analysis::facts::PrivilegeFact::RoleMembership(name)
         } else if let Some(ident) = cmd.syntax().descendants().find_map(ast::Name::cast) {
             crate::analysis::facts::PrivilegeFact::Named(ident.text().to_string())
         } else {
@@ -2550,11 +2587,7 @@ impl AstVisitor {
             .filter(|s| s.to_lowercase() != "default")
             .collect();
 
-        let is_default = node.config_value().is_some_and(|cv| {
-            matches!(&cv, ast::ConfigValue::NameRef(nr) if nr.text().to_uppercase() == "DEFAULT")
-        });
-
-        if is_default {
+        if node.default_token().is_some() {
             return Some(StatementFact::SetSearchPath {
                 target: SearchPathTarget::Default,
             });

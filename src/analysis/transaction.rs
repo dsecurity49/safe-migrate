@@ -56,6 +56,11 @@ pub enum StateChange {
         id: ObjectId,
         previous: Option<crate::model::trigger::TriggerOverlay>,
     },
+    ConstraintSnapshot {
+        table_id: ObjectId,
+        name: String,
+        previous: Option<crate::model::constraint::ConstraintState>,
+    },
     CurrentRoleSnapshot {
         previous: String,
     },

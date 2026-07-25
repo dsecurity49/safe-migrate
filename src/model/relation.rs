@@ -151,11 +151,38 @@ impl RelationState {
                 default,
             } => {
                 if !self.columns.iter().any(|c| c.name == *name) {
+                    let serial_type = data_type
+                        .as_deref()
+                        .map(str::trim)
+                        .map(str::to_ascii_lowercase)
+                        .and_then(|ty| match ty.as_str() {
+                            "smallserial" | "serial2" => Some("smallint"),
+                            "serial" | "serial4" => Some("integer"),
+                            "bigserial" | "serial8" => Some("bigint"),
+                            _ => None,
+                        });
+                    let is_serial = serial_type.is_some();
+                    let normalized_default = if is_serial {
+                        Some(crate::analysis::expr_ir::ExprIr::FunctionCall {
+                            name: "nextval".to_string(),
+                            args: Vec::new(),
+                        })
+                    } else if matches!(
+                        default,
+                        Some(crate::analysis::expr_ir::ExprIr::Literal(value))
+                            if value.trim().eq_ignore_ascii_case("null")
+                    ) {
+                        None
+                    } else {
+                        default.clone()
+                    };
                     self.columns.push(Column {
                         name: name.clone(),
-                        data_type: data_type.clone(),
-                        default: default.clone(),
-                        is_nullable: !not_null,
+                        data_type: serial_type
+                            .map(str::to_string)
+                            .or_else(|| data_type.clone()),
+                        default: normalized_default,
+                        is_nullable: !(*not_null || is_serial),
                         avg_width: None,
                         default_expr_text: None,
                         type_modifier: None,
@@ -189,7 +216,17 @@ impl RelationState {
             }
             ColumnAction::SetDefault { name, default } => {
                 if let Some(col) = self.columns.iter_mut().find(|c| c.name == *name) {
-                    col.default = default.clone();
+                    col.default = if matches!(
+                        default,
+                        Some(crate::analysis::expr_ir::ExprIr::Literal(value))
+                            if value.trim().eq_ignore_ascii_case("null")
+                    ) {
+                        None
+                    } else {
+                        default.clone()
+                    };
+                    // A migration mutation supersedes raw baseline catalog text.
+                    col.default_expr_text = None;
                 }
             }
         }

@@ -1,0 +1,54 @@
+#!/bin/sh
+set -eu
+
+verbosity=0
+rule_filter=
+
+usage() {
+    printf '%s\n' \
+        'Usage: scripts/live-differential [-v|-vv|-vvv] [--rule RULE_DIR]' \
+        '' \
+        '  -v     Show harness, rule, and fixture lifecycle.' \
+        '  -vv    Also show scopes, search paths, and state counts.' \
+        '  -vvv   Also dump complete normalized live and simulator states.' \
+        '  --rule Run one enabled manifest rule in isolation.' \
+        '' \
+        'DATABASE_URL must identify the PostgreSQL database to validate.'
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -v)
+            verbosity=1
+            ;;
+        -vv)
+            verbosity=2
+            ;;
+        -vvv)
+            verbosity=3
+            ;;
+        --rule)
+            if [ "$#" -lt 2 ]; then
+                usage >&2
+                exit 2
+            fi
+            rule_filter=$2
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            usage >&2
+            exit 2
+            ;;
+    esac
+    shift
+done
+
+export SAFE_MIGRATE_DIFF_VERBOSITY="$verbosity"
+if [ -n "$rule_filter" ]; then
+    export SAFE_MIGRATE_DIFF_RULE="$rule_filter"
+fi
+exec cargo test --test live_differential_harness -- --ignored --nocapture

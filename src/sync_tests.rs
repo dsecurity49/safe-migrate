@@ -27,6 +27,7 @@ mod tests {
     fn test_db_cache_serialization_roundtrip() {
         let mut cache = DbCache::new();
         cache.pg_version_num = Some(160000);
+        cache.search_path = vec!["app".into(), "public".into()];
 
         // Add a relation
         let id = ObjectId::new("public", "test_table");
@@ -62,9 +63,20 @@ mod tests {
             index_id: ObjectId::new("public", "idx_test"),
             table_id: ObjectId::new("public", "test_table"),
         });
+        let type_id = ObjectId::new("app", "status");
+        cache.types.insert(
+            type_id.clone(),
+            crate::model::types::TypeState {
+                id: type_id.clone(),
+                generation: 0,
+                kind: crate::model::types::TypeKind::Enum {
+                    variants: vec!["new".into(), "active".into()],
+                },
+            },
+        );
 
         // Serialize to JSON
-        let versioned = crate::db::cache::DbCacheVersioned::V2(cache);
+        let versioned = crate::db::cache::DbCacheVersioned::V5(cache);
         let config = bincode::config::standard().with_variable_int_encoding();
         let encoded = bincode::serde::encode_to_vec(&versioned, config).unwrap();
 
@@ -73,10 +85,11 @@ mod tests {
             bincode::serde::decode_from_slice(&encoded, config)
                 .unwrap()
                 .0;
-        let crate::db::cache::DbCacheVersioned::V2(deserialized) = decoded else {
-            panic!("Expected V2");
+        let crate::db::cache::DbCacheVersioned::V5(deserialized) = decoded else {
+            panic!("Expected V5");
         };
         assert_eq!(deserialized.pg_version_num, Some(160000));
+        assert_eq!(deserialized.search_path, ["app", "public"]);
         assert!(
             deserialized
                 .relations
@@ -84,6 +97,12 @@ mod tests {
         );
         assert_eq!(deserialized.foreign_keys.len(), 1);
         assert_eq!(deserialized.indexes.len(), 1);
+        assert_eq!(
+            deserialized.types.get(&type_id).map(|state| &state.kind),
+            Some(&crate::model::types::TypeKind::Enum {
+                variants: vec!["new".into(), "active".into()]
+            })
+        );
 
         // Verify relation stats survived
         let rel = deserialized
@@ -119,15 +138,15 @@ mod tests {
         });
         cache.insert_baseline(id.clone(), rel);
 
-        let versioned = crate::db::cache::DbCacheVersioned::V2(cache);
+        let versioned = crate::db::cache::DbCacheVersioned::V5(cache);
         let config = bincode::config::standard().with_variable_int_encoding();
         let encoded = bincode::serde::encode_to_vec(&versioned, config).unwrap();
         let decoded: crate::db::cache::DbCacheVersioned =
             bincode::serde::decode_from_slice(&encoded, config)
                 .unwrap()
                 .0;
-        let crate::db::cache::DbCacheVersioned::V2(deserialized) = decoded else {
-            panic!("Expected V2");
+        let crate::db::cache::DbCacheVersioned::V5(deserialized) = decoded else {
+            panic!("Expected V5");
         };
         let rel = deserialized.relations.get(&id).unwrap();
         assert_eq!(rel.columns[0].default_expr_text, Some("now()".into()));

@@ -1,0 +1,1572 @@
+use postgres::{Client, NoTls};
+use safe_migrate::analysis::graph::DependencyKind;
+use safe_migrate::analysis::state::AnalysisState;
+use safe_migrate::db::cache::DbCache;
+use safe_migrate::engine::config::Config;
+use safe_migrate::engine::engine::SafeMigrateEngine;
+use safe_migrate::model::constraint::ConstraintKind;
+use safe_migrate::model::function::{FunctionOverlay, Volatility};
+use safe_migrate::model::relation::{Privilege, RelationKind, RelationOverlay};
+use safe_migrate::model::trigger::TriggerOverlay;
+use safe_migrate::model::types::{TypeKind, TypeOverlay};
+use safe_migrate::sync::populate_cache;
+use serde::Deserialize;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+const VERBOSITY_ENV: &str = "SAFE_MIGRATE_DIFF_VERBOSITY";
+const RULE_FILTER_ENV: &str = "SAFE_MIGRATE_DIFF_RULE";
+
+#[derive(Debug, Deserialize)]
+struct DifferentialManifest {
+    rules: Vec<RuleManifest>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RuleManifest {
+    rule_dir: String,
+    enabled: bool,
+    fixtures: Vec<String>,
+    #[serde(default = "default_transactional")]
+    transactional: bool,
+    #[serde(default)]
+    excluded_fixtures: Vec<FixtureExclusion>,
+    schemas: Vec<String>,
+    scope: Vec<ComparisonScope>,
+    #[serde(default)]
+    fixture_scopes: BTreeMap<String, Vec<ComparisonScope>>,
+    #[serde(default)]
+    required_relations: Vec<String>,
+    #[serde(default)]
+    notes: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FixtureExclusion {
+    fixture: String,
+    reason: String,
+}
+
+fn default_transactional() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ComparisonScope {
+    Relations,
+    Columns,
+    Indexes,
+    Constraints,
+    ForeignKeys,
+    Functions,
+    Types,
+    Privileges,
+    Policies,
+    Triggers,
+    ViewDependencies,
+    Partitions,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct NormalizedState {
+    relations: BTreeMap<String, NormalizedRelation>,
+    indexes: BTreeSet<NormalizedIndex>,
+    foreign_keys: BTreeSet<NormalizedForeignKey>,
+    constraints: BTreeSet<NormalizedConstraint>,
+    functions: BTreeMap<String, String>,
+    types: BTreeMap<String, NormalizedType>,
+    privileges: BTreeSet<NormalizedPrivilege>,
+    policies: BTreeSet<NormalizedPolicy>,
+    triggers: BTreeMap<(String, String), NormalizedTrigger>,
+    partition_edges: BTreeSet<(String, String)>,
+    view_dependencies: BTreeSet<(String, String)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct NormalizedRelation {
+    kind: NormalizedRelationKind,
+    partition_strategy: Option<String>,
+    columns: BTreeMap<String, NormalizedColumn>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum NormalizedRelationKind {
+    Table,
+    View,
+    MaterializedView,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct NormalizedColumn {
+    data_type: String,
+    is_nullable: bool,
+    has_default: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct NormalizedIndex {
+    index: String,
+    table: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct NormalizedForeignKey {
+    from_table: String,
+    to_table: String,
+    constraint_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct NormalizedConstraint {
+    table: String,
+    name: String,
+    kind: String,
+    validated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct NormalizedPolicy {
+    table: String,
+    policy: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NormalizedTrigger {
+    function: String,
+    enabled_mode: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum NormalizedType {
+    Enum { variants: Vec<String> },
+    Domain { base_type: String },
+    Base,
+    Composite,
+    Range,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct NormalizedPrivilege {
+    table: String,
+    grantee: String,
+    privilege: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MismatchCategory {
+    MissingObjectInSimulator,
+    ExtraObjectInSimulator,
+    RelationKindMismatch,
+    PartitionStrategyMismatch,
+    ColumnMismatch,
+    MissingIndexInSimulator,
+    ExtraIndexInSimulator,
+    MissingForeignKeyInSimulator,
+    ExtraForeignKeyInSimulator,
+    MissingConstraintInSimulator,
+    ExtraConstraintInSimulator,
+    MissingFunctionInSimulator,
+    ExtraFunctionInSimulator,
+    FunctionVolatilityMismatch,
+    MissingTypeInSimulator,
+    ExtraTypeInSimulator,
+    TypeDefinitionMismatch,
+    MissingPrivilegeInSimulator,
+    ExtraPrivilegeInSimulator,
+    MissingPolicyInSimulator,
+    ExtraPolicyInSimulator,
+    MissingTriggerInSimulator,
+    ExtraTriggerInSimulator,
+    TriggerFunctionMismatch,
+    TriggerEnableModeMismatch,
+    MissingPartitionEdgeInSimulator,
+    ExtraPartitionEdgeInSimulator,
+    MissingViewDependencyInSimulator,
+    ExtraViewDependencyInSimulator,
+    BaselineObjectAbsent,
+    LiveExecutionFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RootCauseClassification {
+    SimulatorBug,
+    BaselineSetupGap,
+    EnvironmentIssue,
+    HarnessBug,
+    #[allow(dead_code)]
+    UnsupportedNondifferentiableBehavior,
+}
+
+#[derive(Debug, Clone)]
+struct Mismatch {
+    rule_dir: String,
+    fixture: String,
+    category: MismatchCategory,
+    root_cause: RootCauseClassification,
+    note: String,
+}
+
+#[test]
+#[ignore = "requires a live local PostgreSQL database via DATABASE_URL"]
+fn live_postgres_differential_harness() {
+    let verbosity = differential_verbosity();
+    let harness_started = Instant::now();
+    let database_url = match std::env::var("DATABASE_URL") {
+        Ok(value) => value,
+        Err(_) => {
+            eprintln!("skipping live differential harness: DATABASE_URL is not set");
+            return;
+        }
+    };
+
+    let mut client = match Client::connect(&database_url, NoTls) {
+        Ok(client) => client,
+        Err(error) => {
+            eprintln!("skipping live differential harness: PostgreSQL is unreachable: {error}");
+            return;
+        }
+    };
+    if verbosity >= 1 {
+        let row = client
+            .query_one(
+                "SELECT current_database(), current_user, current_setting('server_version'), current_schemas(false)",
+                &[],
+            )
+            .expect("failed to inspect connected PostgreSQL server");
+        let database: String = row.get(0);
+        let user: String = row.get(1);
+        let version: String = row.get(2);
+        let search_path: Vec<String> = row.get(3);
+        verbose(
+            verbosity,
+            1,
+            format!(
+                "connected database={database} user={user} PostgreSQL={version} search_path={search_path:?}"
+            ),
+        );
+    }
+
+    let manifest_path = repo_path("live_tests/differential_manifest.json");
+    let baseline_path = repo_path("live_tests/differential_baseline.sql");
+    let manifest = load_manifest(&manifest_path);
+    let baseline_sql = fs::read_to_string(&baseline_path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", baseline_path.display()));
+    let engine = SafeMigrateEngine::new(Config::default());
+    let mut mismatches = Vec::new();
+    let rule_filter = std::env::var(RULE_FILTER_ENV).ok();
+    let selected_rules = || {
+        manifest.rules.iter().filter(|rule| {
+            rule.enabled
+                && rule_filter
+                    .as_deref()
+                    .is_none_or(|selected| selected == rule.rule_dir)
+        })
+    };
+    let enabled_rules = selected_rules().count();
+    let enabled_fixtures = manifest
+        .rules
+        .iter()
+        .filter(|rule| {
+            rule.enabled
+                && rule_filter
+                    .as_deref()
+                    .is_none_or(|selected| selected == rule.rule_dir)
+        })
+        .map(|rule| rule.fixtures.len())
+        .sum::<usize>();
+    if enabled_rules == 0 {
+        panic!(
+            "no enabled differential rule matched {}={:?}",
+            RULE_FILTER_ENV, rule_filter
+        );
+    }
+    verbose(
+        verbosity,
+        1,
+        format!(
+            "loaded manifest={} enabled_rules={enabled_rules} enabled_fixtures={enabled_fixtures}",
+            manifest_path.display()
+        ),
+    );
+
+    for rule in selected_rules() {
+        verbose(
+            verbosity,
+            1,
+            format!(
+                "rule={} fixtures={} schemas={} transactional={}",
+                rule.rule_dir,
+                rule.fixtures.len(),
+                rule.schemas.len(),
+                rule.transactional
+            ),
+        );
+        verbose(
+            verbosity,
+            2,
+            format!(
+                "rule={} scope={:?} schemas={:?} notes={}",
+                rule.rule_dir,
+                rule.scope,
+                rule.schemas,
+                rule.notes.as_deref().unwrap_or("<none>")
+            ),
+        );
+        if verbosity >= 2 {
+            for exclusion in &rule.excluded_fixtures {
+                verbose(
+                    verbosity,
+                    2,
+                    format!(
+                        "rule={} excluded_fixture={} reason={}",
+                        rule.rule_dir, exclusion.fixture, exclusion.reason
+                    ),
+                );
+            }
+        }
+        for fixture in &rule.fixtures {
+            let scope = rule
+                .fixture_scopes
+                .get(fixture)
+                .map(Vec::as_slice)
+                .unwrap_or(&rule.scope);
+            let fixture_started = Instant::now();
+            let mismatches_before = mismatches.len();
+            let fixture_path = repo_path(&format!("live_tests/{}/{}", rule.rule_dir, fixture));
+            let sql = fs::read_to_string(&fixture_path).unwrap_or_else(|error| {
+                panic!("failed to read {}: {error}", fixture_path.display())
+            });
+            verbose(
+                verbosity,
+                1,
+                format!("case={}/{} phase=start", rule.rule_dir, fixture),
+            );
+            verbose(
+                verbosity,
+                2,
+                format!(
+                    "case={}/{} comparison_scope={scope:?}",
+                    rule.rule_dir, fixture
+                ),
+            );
+            verbose(
+                verbosity,
+                3,
+                format!(
+                    "case={}/{} migration_sql:\n{}",
+                    rule.rule_dir,
+                    fixture,
+                    sql.trim()
+                ),
+            );
+
+            if let Err(error) = client.batch_execute(&baseline_sql) {
+                mismatches.push(Mismatch {
+                    rule_dir: rule.rule_dir.clone(),
+                    fixture: fixture.clone(),
+                    category: MismatchCategory::LiveExecutionFailed,
+                    root_cause: classify_live_execution_error(&error),
+                    note: format!(
+                        "failed to rebuild baseline before fixture: {}",
+                        format_postgres_error(&error)
+                    ),
+                });
+                continue;
+            }
+            verbose(
+                verbosity,
+                2,
+                format!("case={}/{} phase=baseline-rebuilt", rule.rule_dir, fixture),
+            );
+
+            let baseline_cache = match populate_cache(&mut client, Some(&rule.schemas)) {
+                Ok(cache) => cache,
+                Err(error) => {
+                    mismatches.push(Mismatch {
+                        rule_dir: rule.rule_dir.clone(),
+                        fixture: fixture.clone(),
+                        category: MismatchCategory::LiveExecutionFailed,
+                        root_cause: RootCauseClassification::EnvironmentIssue,
+                        note: format!(
+                            "failed to sync baseline cache from live PostgreSQL: {error}"
+                        ),
+                    });
+                    continue;
+                }
+            };
+            verbose(
+                verbosity,
+                2,
+                format!(
+                    "case={}/{} baseline relations={} indexes={} constraints={} foreign_keys={} triggers={} functions={} dependencies={} search_path={:?}",
+                    rule.rule_dir,
+                    fixture,
+                    baseline_cache.relations.len(),
+                    baseline_cache.indexes.len(),
+                    baseline_cache.constraints.len(),
+                    baseline_cache.foreign_keys.len(),
+                    baseline_cache.triggers.len(),
+                    baseline_cache.functions.len(),
+                    baseline_cache.dependencies.len(),
+                    baseline_cache.search_path
+                ),
+            );
+
+            mismatches.extend(check_required_relations(rule, fixture, &baseline_cache));
+
+            let mut simulator_state = AnalysisState::new(baseline_cache);
+            if let Err(parse_errors) = engine.analyze(&sql, &mut simulator_state) {
+                mismatches.push(Mismatch {
+                    rule_dir: rule.rule_dir.clone(),
+                    fixture: fixture.clone(),
+                    category: MismatchCategory::LiveExecutionFailed,
+                    root_cause: RootCauseClassification::HarnessBug,
+                    note: format!(
+                        "fixture failed to parse in simulator: {}",
+                        parse_errors.join("; ")
+                    ),
+                });
+                continue;
+            }
+            verbose(
+                verbosity,
+                2,
+                format!("case={}/{} phase=simulated", rule.rule_dir, fixture),
+            );
+
+            if rule.transactional {
+                if let Err(error) = client.batch_execute("BEGIN") {
+                    mismatches.push(Mismatch {
+                        rule_dir: rule.rule_dir.clone(),
+                        fixture: fixture.clone(),
+                        category: MismatchCategory::LiveExecutionFailed,
+                        root_cause: RootCauseClassification::EnvironmentIssue,
+                        note: format!(
+                            "failed to begin rollback-isolated live fixture: {}",
+                            format_postgres_error(&error)
+                        ),
+                    });
+                    continue;
+                }
+                verbose(
+                    verbosity,
+                    2,
+                    format!(
+                        "case={}/{} phase=live-transaction-begun",
+                        rule.rule_dir, fixture
+                    ),
+                );
+            }
+
+            if let Err(error) = client.batch_execute(&sql) {
+                let root_cause = classify_live_execution_error(&error);
+                if rule.transactional {
+                    let _ = client.batch_execute("ROLLBACK");
+                }
+                mismatches.push(Mismatch {
+                    rule_dir: rule.rule_dir.clone(),
+                    fixture: fixture.clone(),
+                    category: MismatchCategory::LiveExecutionFailed,
+                    root_cause,
+                    note: format!(
+                        "live PostgreSQL rejected fixture: {}",
+                        format_postgres_error(&error)
+                    ),
+                });
+                continue;
+            }
+            verbose(
+                verbosity,
+                2,
+                format!("case={}/{} phase=postgres-applied", rule.rule_dir, fixture),
+            );
+
+            let live_state_result = snapshot_live_state(&mut client, &rule.schemas, scope);
+            if rule.transactional {
+                if let Err(error) = client.batch_execute("ROLLBACK") {
+                    mismatches.push(Mismatch {
+                        rule_dir: rule.rule_dir.clone(),
+                        fixture: fixture.clone(),
+                        category: MismatchCategory::LiveExecutionFailed,
+                        root_cause: RootCauseClassification::EnvironmentIssue,
+                        note: format!(
+                            "failed to roll back live fixture: {}",
+                            format_postgres_error(&error)
+                        ),
+                    });
+                    continue;
+                }
+                verbose(
+                    verbosity,
+                    2,
+                    format!(
+                        "case={}/{} phase=live-transaction-rolled-back",
+                        rule.rule_dir, fixture
+                    ),
+                );
+            }
+
+            let live_state = match live_state_result {
+                Ok(state) => state,
+                Err(error) => {
+                    mismatches.push(Mismatch {
+                        rule_dir: rule.rule_dir.clone(),
+                        fixture: fixture.clone(),
+                        category: MismatchCategory::LiveExecutionFailed,
+                        root_cause: RootCauseClassification::EnvironmentIssue,
+                        note: format!("failed to snapshot live PostgreSQL state: {error}"),
+                    });
+                    continue;
+                }
+            };
+
+            let simulator_projection = snapshot_simulator_state(&simulator_state, scope);
+            verbose(
+                verbosity,
+                2,
+                format!(
+                    "case={}/{} live={} simulator={}",
+                    rule.rule_dir,
+                    fixture,
+                    state_counts(&live_state),
+                    state_counts(&simulator_projection)
+                ),
+            );
+            verbose(
+                verbosity,
+                3,
+                format!(
+                    "case={}/{} live_state={live_state:#?}",
+                    rule.rule_dir, fixture
+                ),
+            );
+            verbose(
+                verbosity,
+                3,
+                format!(
+                    "case={}/{} simulator_state={simulator_projection:#?}",
+                    rule.rule_dir, fixture
+                ),
+            );
+            mismatches.extend(compare_states(
+                &rule.rule_dir,
+                fixture,
+                scope,
+                &live_state,
+                &simulator_projection,
+            ));
+            let case_mismatches = mismatches.len() - mismatches_before;
+            verbose(
+                verbosity,
+                1,
+                format!(
+                    "case={}/{} result={} mismatches={} elapsed={}",
+                    rule.rule_dir,
+                    fixture,
+                    if case_mismatches == 0 {
+                        "match"
+                    } else {
+                        "mismatch"
+                    },
+                    case_mismatches,
+                    format_duration(fixture_started.elapsed())
+                ),
+            );
+        }
+    }
+
+    if !mismatches.is_empty() {
+        panic!("{}", format_mismatch_report(&mismatches, &manifest_path));
+    }
+    verbose(
+        verbosity,
+        1,
+        format!(
+            "result=match fixtures={enabled_fixtures} elapsed={}",
+            format_duration(harness_started.elapsed())
+        ),
+    );
+}
+
+fn differential_verbosity() -> u8 {
+    std::env::var(VERBOSITY_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u8>().ok())
+        .unwrap_or(0)
+        .min(3)
+}
+
+fn verbose(verbosity: u8, level: u8, message: impl std::fmt::Display) {
+    if verbosity >= level {
+        eprintln!("[live-diff:v{level}] {message}");
+    }
+}
+
+fn state_counts(state: &NormalizedState) -> String {
+    format!(
+        "relations:{} indexes:{} constraints:{} foreign_keys:{} functions:{} types:{} privileges:{} policies:{} triggers:{} partitions:{} view_dependencies:{}",
+        state.relations.len(),
+        state.indexes.len(),
+        state.constraints.len(),
+        state.foreign_keys.len(),
+        state.functions.len(),
+        state.types.len(),
+        state.privileges.len(),
+        state.policies.len(),
+        state.triggers.len(),
+        state.partition_edges.len(),
+        state.view_dependencies.len()
+    )
+}
+
+fn format_duration(duration: Duration) -> String {
+    format!("{:.3}s", duration.as_secs_f64())
+}
+
+fn repo_path(relative: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join(relative)
+}
+
+fn load_manifest(path: &Path) -> DifferentialManifest {
+    let raw = fs::read_to_string(path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+    serde_json::from_str(&raw)
+        .unwrap_or_else(|error| panic!("failed to parse {}: {error}", path.display()))
+}
+
+fn check_required_relations(rule: &RuleManifest, fixture: &str, cache: &DbCache) -> Vec<Mismatch> {
+    let mut mismatches = Vec::new();
+    for relation in &rule.required_relations {
+        let (schema, name) = split_qualified_name(relation);
+        let object_id = safe_migrate::ast::identifiers::ObjectId::new(schema, name);
+        if !cache.relations.contains_key(&object_id) {
+            mismatches.push(Mismatch {
+                rule_dir: rule.rule_dir.clone(),
+                fixture: fixture.to_string(),
+                category: MismatchCategory::BaselineObjectAbsent,
+                root_cause: RootCauseClassification::BaselineSetupGap,
+                note: format!(
+                    "baseline is missing required relation {relation}; check live_tests/differential_baseline.sql"
+                ),
+            });
+        }
+    }
+    mismatches
+}
+
+fn classify_live_execution_error(error: &postgres::Error) -> RootCauseClassification {
+    if error
+        .code()
+        .is_some_and(|code| matches!(code.code(), "42710" | "42712" | "42723"))
+    {
+        return RootCauseClassification::BaselineSetupGap;
+    }
+    match error.code() {
+        Some(&postgres::error::SqlState::UNDEFINED_TABLE)
+        | Some(&postgres::error::SqlState::UNDEFINED_OBJECT)
+        | Some(&postgres::error::SqlState::UNDEFINED_COLUMN)
+        | Some(&postgres::error::SqlState::UNDEFINED_FUNCTION)
+        | Some(&postgres::error::SqlState::UNDEFINED_SCHEMA) => {
+            RootCauseClassification::BaselineSetupGap
+        }
+        _ => RootCauseClassification::EnvironmentIssue,
+    }
+}
+
+fn format_postgres_error(error: &postgres::Error) -> String {
+    let Some(db_error) = error.as_db_error() else {
+        return error.to_string();
+    };
+
+    let mut message = format!(
+        "{} (SQLSTATE {})",
+        db_error.message(),
+        db_error.code().code()
+    );
+    if let Some(detail) = db_error.detail() {
+        message.push_str(&format!(" detail={detail}"));
+    }
+    if let Some(hint) = db_error.hint() {
+        message.push_str(&format!(" hint={hint}"));
+    }
+    message
+}
+
+fn snapshot_live_state(
+    client: &mut Client,
+    schemas: &[String],
+    scope: &[ComparisonScope],
+) -> anyhow::Result<NormalizedState> {
+    let cache = populate_cache(client, Some(schemas))?;
+    let mut state = NormalizedState::default();
+
+    if scope.contains(&ComparisonScope::Policies) {
+        for (id, relation) in &cache.relations {
+            for policy in &relation.policies {
+                state.policies.insert(NormalizedPolicy {
+                    table: qualified_name(&id.schema, &id.name),
+                    policy: policy.clone(),
+                });
+            }
+        }
+    }
+
+    if scope.contains(&ComparisonScope::Functions) {
+        for (id, function) in &cache.functions {
+            state.functions.insert(
+                qualified_name(&id.schema, &id.name),
+                normalize_volatility(&function.volatility),
+            );
+        }
+    }
+
+    if scope.contains(&ComparisonScope::Types) {
+        for (id, type_state) in &cache.types {
+            state.types.insert(
+                qualified_name(&id.schema, &id.name),
+                normalize_type_kind(&type_state.kind),
+            );
+        }
+    }
+
+    if scope.contains(&ComparisonScope::Privileges) {
+        for (id, relation) in &cache.relations {
+            for (grantee, privileges) in &relation.privileges.grants {
+                for privilege in privileges {
+                    state.privileges.insert(NormalizedPrivilege {
+                        table: qualified_name(&id.schema, &id.name),
+                        grantee: grantee.name.clone(),
+                        privilege: normalize_privilege(*privilege),
+                    });
+                }
+            }
+        }
+    }
+
+    if scope.contains(&ComparisonScope::Constraints) {
+        for constraint in &cache.constraints {
+            state.constraints.insert(NormalizedConstraint {
+                table: qualified_name(&constraint.table_id.schema, &constraint.table_id.name),
+                name: constraint.name.clone(),
+                kind: normalize_constraint_kind(constraint.kind),
+                validated: constraint.validated,
+            });
+        }
+    }
+
+    if scope.contains(&ComparisonScope::Triggers) {
+        for trigger in &cache.triggers {
+            state.triggers.insert(
+                (
+                    qualified_name(&trigger.table_id.schema, &trigger.table_id.name),
+                    trigger.trigger_id.name.clone(),
+                ),
+                NormalizedTrigger {
+                    function: qualified_name(
+                        &trigger.function_id.schema,
+                        &trigger.function_id.name,
+                    ),
+                    enabled_mode: normalize_trigger_mode(trigger.enabled_mode),
+                },
+            );
+        }
+    }
+
+    if scope.contains(&ComparisonScope::Relations) || scope.contains(&ComparisonScope::Columns) {
+        for (id, relation) in cache.relations {
+            let mut normalized = NormalizedRelation {
+                kind: normalize_relation_kind(relation.kind),
+                partition_strategy: relation.partition_type,
+                columns: BTreeMap::new(),
+            };
+            if scope.contains(&ComparisonScope::Columns) {
+                for column in relation.columns {
+                    normalized.columns.insert(
+                        column.name,
+                        NormalizedColumn {
+                            data_type: normalize_data_type(
+                                &column.data_type.unwrap_or_else(|| "<unknown>".to_string()),
+                            ),
+                            is_nullable: column.is_nullable,
+                            has_default: column.default.is_some()
+                                || column.default_expr_text.is_some(),
+                        },
+                    );
+                }
+            }
+            state
+                .relations
+                .insert(qualified_name(&id.schema, &id.name), normalized);
+        }
+    }
+
+    if scope.contains(&ComparisonScope::Indexes) {
+        for index in cache.indexes {
+            state.indexes.insert(NormalizedIndex {
+                index: qualified_name(&index.index_id.schema, &index.index_id.name),
+                table: qualified_name(&index.table_id.schema, &index.table_id.name),
+            });
+        }
+    }
+
+    if scope.contains(&ComparisonScope::ForeignKeys) {
+        for fk in cache.foreign_keys {
+            state.foreign_keys.insert(NormalizedForeignKey {
+                from_table: qualified_name(&fk.from_table.schema, &fk.from_table.name),
+                to_table: qualified_name(&fk.to_table.schema, &fk.to_table.name),
+                constraint_name: fk.constraint_name,
+            });
+        }
+    }
+
+    if scope.contains(&ComparisonScope::Partitions) {
+        let schema_names = schemas.to_vec();
+        for row in client.query(
+            "
+            SELECT
+                pn.nspname AS parent_schema,
+                pc.relname AS parent_name,
+                cn.nspname AS child_schema,
+                cc.relname AS child_name
+            FROM pg_inherits i
+            JOIN pg_class pc ON pc.oid = i.inhparent
+            JOIN pg_namespace pn ON pn.oid = pc.relnamespace
+            JOIN pg_class cc ON cc.oid = i.inhrelid
+            JOIN pg_namespace cn ON cn.oid = cc.relnamespace
+            WHERE pn.nspname = ANY($1) AND cn.nspname = ANY($1)
+            ",
+            &[&schema_names],
+        )? {
+            let parent_schema: String = row.get("parent_schema");
+            let parent_name: String = row.get("parent_name");
+            let child_schema: String = row.get("child_schema");
+            let child_name: String = row.get("child_name");
+            state.partition_edges.insert((
+                qualified_name(&parent_schema, &parent_name),
+                qualified_name(&child_schema, &child_name),
+            ));
+        }
+    }
+
+    if scope.contains(&ComparisonScope::ViewDependencies) {
+        let schema_names = schemas.to_vec();
+        for row in client.query(
+            "
+            SELECT DISTINCT
+                vn.nspname AS view_schema,
+                vc.relname AS view_name,
+                tn.nspname AS table_schema,
+                tc.relname AS table_name
+            FROM pg_rewrite rw
+            JOIN pg_class vc ON vc.oid = rw.ev_class
+            JOIN pg_namespace vn ON vn.oid = vc.relnamespace
+            JOIN pg_depend d ON d.objid = rw.oid
+            JOIN pg_class tc ON tc.oid = d.refobjid
+            JOIN pg_namespace tn ON tn.oid = tc.relnamespace
+            WHERE vc.relkind IN ('v', 'm')
+              AND vn.nspname = ANY($1)
+              AND tn.nspname = ANY($1)
+              AND d.deptype = 'n'
+            ",
+            &[&schema_names],
+        )? {
+            let view_schema: String = row.get("view_schema");
+            let view_name: String = row.get("view_name");
+            let table_schema: String = row.get("table_schema");
+            let table_name: String = row.get("table_name");
+            state.view_dependencies.insert((
+                qualified_name(&view_schema, &view_name),
+                qualified_name(&table_schema, &table_name),
+            ));
+        }
+    }
+
+    Ok(state)
+}
+
+fn snapshot_simulator_state(state: &AnalysisState, scope: &[ComparisonScope]) -> NormalizedState {
+    let mut projection = NormalizedState::default();
+
+    if scope.contains(&ComparisonScope::Policies) {
+        for (id, overlay) in &state.local.relations {
+            let RelationOverlay::Present(relation) = overlay else {
+                continue;
+            };
+            for policy in &relation.policies {
+                projection.policies.insert(NormalizedPolicy {
+                    table: qualified_name(&id.schema, &id.name),
+                    policy: policy.clone(),
+                });
+            }
+        }
+    }
+
+    if scope.contains(&ComparisonScope::Functions) {
+        for (id, overlay) in &state.local.functions {
+            let FunctionOverlay::Present(function) = overlay else {
+                continue;
+            };
+            projection.functions.insert(
+                qualified_name(&id.schema, &id.name),
+                normalize_volatility(&function.volatility),
+            );
+        }
+    }
+
+    if scope.contains(&ComparisonScope::Types) {
+        for (id, overlay) in &state.local.types {
+            let TypeOverlay::Present(type_state) = overlay else {
+                continue;
+            };
+            projection.types.insert(
+                qualified_name(&id.schema, &id.name),
+                normalize_type_kind(&type_state.kind),
+            );
+        }
+    }
+
+    if scope.contains(&ComparisonScope::Privileges) {
+        for (id, overlay) in &state.local.relations {
+            let RelationOverlay::Present(relation) = overlay else {
+                continue;
+            };
+            for (grantee, privileges) in &relation.privileges.grants {
+                for privilege in privileges {
+                    projection.privileges.insert(NormalizedPrivilege {
+                        table: qualified_name(&id.schema, &id.name),
+                        grantee: grantee.name.clone(),
+                        privilege: normalize_privilege(*privilege),
+                    });
+                }
+            }
+        }
+    }
+
+    if scope.contains(&ComparisonScope::Constraints) {
+        for constraint in state.local.constraints.values() {
+            projection.constraints.insert(NormalizedConstraint {
+                table: qualified_name(&constraint.table_id.schema, &constraint.table_id.name),
+                name: constraint.name.clone(),
+                kind: normalize_constraint_kind(constraint.kind),
+                validated: constraint.validated,
+            });
+        }
+    }
+
+    if scope.contains(&ComparisonScope::Triggers) {
+        for edge in &state.local.graph.edges {
+            let DependencyKind::TriggerOnTable {
+                trigger_id,
+                function_id,
+            } = &edge.kind
+            else {
+                continue;
+            };
+            let Some(TriggerOverlay::Present(trigger)) = state.local.triggers.get(trigger_id)
+            else {
+                continue;
+            };
+            projection.triggers.insert(
+                (
+                    qualified_name(&edge.referenced.schema, &edge.referenced.name),
+                    trigger_id.name.clone(),
+                ),
+                NormalizedTrigger {
+                    function: qualified_name(&function_id.schema, &function_id.name),
+                    enabled_mode: normalize_trigger_mode(trigger.enabled_mode),
+                },
+            );
+        }
+    }
+
+    if scope.contains(&ComparisonScope::Relations) || scope.contains(&ComparisonScope::Columns) {
+        for (id, overlay) in &state.local.relations {
+            let RelationOverlay::Present(relation) = overlay else {
+                continue;
+            };
+            let mut normalized = NormalizedRelation {
+                kind: normalize_relation_kind(relation.kind.clone()),
+                partition_strategy: relation.partition_type.clone(),
+                columns: BTreeMap::new(),
+            };
+            if scope.contains(&ComparisonScope::Columns) {
+                for column in &relation.columns {
+                    normalized.columns.insert(
+                        column.name.clone(),
+                        NormalizedColumn {
+                            data_type: normalize_data_type(
+                                &column
+                                    .data_type
+                                    .clone()
+                                    .unwrap_or_else(|| "<unknown>".to_string()),
+                            ),
+                            is_nullable: column.is_nullable,
+                            has_default: column.default.is_some()
+                                || column.default_expr_text.is_some(),
+                        },
+                    );
+                }
+            }
+            projection
+                .relations
+                .insert(qualified_name(&id.schema, &id.name), normalized);
+        }
+    }
+
+    for edge in &state.local.graph.edges {
+        match &edge.kind {
+            DependencyKind::IndexOnRelation { .. } if scope.contains(&ComparisonScope::Indexes) => {
+                projection.indexes.insert(NormalizedIndex {
+                    index: qualified_name(&edge.dependent.schema, &edge.dependent.name),
+                    table: qualified_name(&edge.referenced.schema, &edge.referenced.name),
+                });
+            }
+            DependencyKind::ForeignKey {
+                constraint_name, ..
+            } if scope.contains(&ComparisonScope::ForeignKeys) => {
+                projection.foreign_keys.insert(NormalizedForeignKey {
+                    from_table: qualified_name(&edge.dependent.schema, &edge.dependent.name),
+                    to_table: qualified_name(&edge.referenced.schema, &edge.referenced.name),
+                    constraint_name: constraint_name
+                        .clone()
+                        .unwrap_or_else(|| "<unnamed>".to_string()),
+                });
+            }
+            DependencyKind::PartitionOf if scope.contains(&ComparisonScope::Partitions) => {
+                projection.partition_edges.insert((
+                    qualified_name(&edge.referenced.schema, &edge.referenced.name),
+                    qualified_name(&edge.dependent.schema, &edge.dependent.name),
+                ));
+            }
+            DependencyKind::ViewDependency { .. }
+                if scope.contains(&ComparisonScope::ViewDependencies) =>
+            {
+                projection.view_dependencies.insert((
+                    qualified_name(&edge.dependent.schema, &edge.dependent.name),
+                    qualified_name(&edge.referenced.schema, &edge.referenced.name),
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    projection
+}
+
+fn compare_states(
+    rule_dir: &str,
+    fixture: &str,
+    scope: &[ComparisonScope],
+    live: &NormalizedState,
+    simulator: &NormalizedState,
+) -> Vec<Mismatch> {
+    let mut mismatches = Vec::new();
+
+    if scope.contains(&ComparisonScope::Relations) {
+        for (name, live_relation) in &live.relations {
+            match simulator.relations.get(name) {
+                None => mismatches.push(Mismatch {
+                    rule_dir: rule_dir.to_string(),
+                    fixture: fixture.to_string(),
+                    category: MismatchCategory::MissingObjectInSimulator,
+                    root_cause: RootCauseClassification::SimulatorBug,
+                    note: format!("live PostgreSQL kept relation {name}, but simulator removed it"),
+                }),
+                Some(sim_relation) if sim_relation.kind != live_relation.kind => {
+                    mismatches.push(Mismatch {
+                        rule_dir: rule_dir.to_string(),
+                        fixture: fixture.to_string(),
+                        category: MismatchCategory::RelationKindMismatch,
+                        root_cause: RootCauseClassification::SimulatorBug,
+                        note: format!(
+                            "relation kind mismatch for {name}: live={:?}, simulator={:?}",
+                            live_relation.kind, sim_relation.kind
+                        ),
+                    });
+                }
+                Some(sim_relation)
+                    if sim_relation.partition_strategy != live_relation.partition_strategy =>
+                {
+                    mismatches.push(Mismatch {
+                        rule_dir: rule_dir.to_string(),
+                        fixture: fixture.to_string(),
+                        category: MismatchCategory::PartitionStrategyMismatch,
+                        root_cause: RootCauseClassification::SimulatorBug,
+                        note: format!(
+                            "partition strategy mismatch for {name}: live={:?}, simulator={:?}",
+                            live_relation.partition_strategy, sim_relation.partition_strategy
+                        ),
+                    });
+                }
+                Some(sim_relation)
+                    if scope.contains(&ComparisonScope::Columns)
+                        && sim_relation.columns != live_relation.columns =>
+                {
+                    mismatches.push(Mismatch {
+                        rule_dir: rule_dir.to_string(),
+                        fixture: fixture.to_string(),
+                        category: MismatchCategory::ColumnMismatch,
+                        root_cause: RootCauseClassification::SimulatorBug,
+                        note: format!(
+                            "column projection mismatch for {name}: live={:?}, simulator={:?}",
+                            live_relation.columns, sim_relation.columns
+                        ),
+                    });
+                }
+                Some(_) => {}
+            }
+        }
+
+        for name in simulator.relations.keys() {
+            if !live.relations.contains_key(name) {
+                mismatches.push(Mismatch {
+                    rule_dir: rule_dir.to_string(),
+                    fixture: fixture.to_string(),
+                    category: MismatchCategory::ExtraObjectInSimulator,
+                    root_cause: RootCauseClassification::SimulatorBug,
+                    note: format!("simulator kept relation {name}, but live PostgreSQL removed it"),
+                });
+            }
+        }
+    }
+
+    if scope.contains(&ComparisonScope::Indexes) {
+        for index in live.indexes.difference(&simulator.indexes) {
+            mismatches.push(Mismatch {
+                rule_dir: rule_dir.to_string(),
+                fixture: fixture.to_string(),
+                category: MismatchCategory::MissingIndexInSimulator,
+                root_cause: RootCauseClassification::SimulatorBug,
+                note: format!(
+                    "live PostgreSQL kept index {} on {}",
+                    index.index, index.table
+                ),
+            });
+        }
+        for index in simulator.indexes.difference(&live.indexes) {
+            mismatches.push(Mismatch {
+                rule_dir: rule_dir.to_string(),
+                fixture: fixture.to_string(),
+                category: MismatchCategory::ExtraIndexInSimulator,
+                root_cause: RootCauseClassification::SimulatorBug,
+                note: format!("simulator kept index {} on {}", index.index, index.table),
+            });
+        }
+    }
+
+    if scope.contains(&ComparisonScope::ForeignKeys) {
+        for fk in live.foreign_keys.difference(&simulator.foreign_keys) {
+            mismatches.push(Mismatch {
+                rule_dir: rule_dir.to_string(),
+                fixture: fixture.to_string(),
+                category: MismatchCategory::MissingForeignKeyInSimulator,
+                root_cause: RootCauseClassification::SimulatorBug,
+                note: format!(
+                    "live PostgreSQL kept FK {} ({} -> {})",
+                    fk.constraint_name, fk.from_table, fk.to_table
+                ),
+            });
+        }
+        for fk in simulator.foreign_keys.difference(&live.foreign_keys) {
+            mismatches.push(Mismatch {
+                rule_dir: rule_dir.to_string(),
+                fixture: fixture.to_string(),
+                category: MismatchCategory::ExtraForeignKeyInSimulator,
+                root_cause: RootCauseClassification::SimulatorBug,
+                note: format!(
+                    "simulator kept FK {} ({} -> {})",
+                    fk.constraint_name, fk.from_table, fk.to_table
+                ),
+            });
+        }
+    }
+
+    if scope.contains(&ComparisonScope::Constraints) {
+        for constraint in live.constraints.difference(&simulator.constraints) {
+            mismatches.push(Mismatch {
+                rule_dir: rule_dir.to_string(),
+                fixture: fixture.to_string(),
+                category: MismatchCategory::MissingConstraintInSimulator,
+                root_cause: RootCauseClassification::SimulatorBug,
+                note: format!(
+                    "live PostgreSQL kept {:?} constraint {} on {} (validated={})",
+                    constraint.kind, constraint.name, constraint.table, constraint.validated
+                ),
+            });
+        }
+        for constraint in simulator.constraints.difference(&live.constraints) {
+            mismatches.push(Mismatch {
+                rule_dir: rule_dir.to_string(),
+                fixture: fixture.to_string(),
+                category: MismatchCategory::ExtraConstraintInSimulator,
+                root_cause: RootCauseClassification::SimulatorBug,
+                note: format!(
+                    "simulator kept {:?} constraint {} on {} (validated={})",
+                    constraint.kind, constraint.name, constraint.table, constraint.validated
+                ),
+            });
+        }
+    }
+
+    if scope.contains(&ComparisonScope::Functions) {
+        for (name, live_volatility) in &live.functions {
+            match simulator.functions.get(name) {
+                None => mismatches.push(Mismatch {
+                    rule_dir: rule_dir.to_string(),
+                    fixture: fixture.to_string(),
+                    category: MismatchCategory::MissingFunctionInSimulator,
+                    root_cause: RootCauseClassification::SimulatorBug,
+                    note: format!("live PostgreSQL kept function {name}, but simulator removed it"),
+                }),
+                Some(simulator_volatility) if simulator_volatility != live_volatility => {
+                    mismatches.push(Mismatch {
+                        rule_dir: rule_dir.to_string(),
+                        fixture: fixture.to_string(),
+                        category: MismatchCategory::FunctionVolatilityMismatch,
+                        root_cause: RootCauseClassification::SimulatorBug,
+                        note: format!(
+                            "function {name} volatility mismatch: live={live_volatility}, simulator={simulator_volatility}"
+                        ),
+                    });
+                }
+                Some(_) => {}
+            }
+        }
+        for name in simulator.functions.keys() {
+            if !live.functions.contains_key(name) {
+                mismatches.push(Mismatch {
+                    rule_dir: rule_dir.to_string(),
+                    fixture: fixture.to_string(),
+                    category: MismatchCategory::ExtraFunctionInSimulator,
+                    root_cause: RootCauseClassification::SimulatorBug,
+                    note: format!("simulator kept function {name}, but live PostgreSQL removed it"),
+                });
+            }
+        }
+    }
+
+    if scope.contains(&ComparisonScope::Types) {
+        for (name, live_type) in &live.types {
+            match simulator.types.get(name) {
+                None => mismatches.push(Mismatch {
+                    rule_dir: rule_dir.to_string(),
+                    fixture: fixture.to_string(),
+                    category: MismatchCategory::MissingTypeInSimulator,
+                    root_cause: RootCauseClassification::SimulatorBug,
+                    note: format!("live PostgreSQL kept type {name}, but simulator removed it"),
+                }),
+                Some(simulator_type) if simulator_type != live_type => {
+                    mismatches.push(Mismatch {
+                        rule_dir: rule_dir.to_string(),
+                        fixture: fixture.to_string(),
+                        category: MismatchCategory::TypeDefinitionMismatch,
+                        root_cause: RootCauseClassification::SimulatorBug,
+                        note: format!(
+                            "type {name} definition mismatch: live={live_type:?}, simulator={simulator_type:?}"
+                        ),
+                    });
+                }
+                Some(_) => {}
+            }
+        }
+        for name in simulator.types.keys() {
+            if !live.types.contains_key(name) {
+                mismatches.push(Mismatch {
+                    rule_dir: rule_dir.to_string(),
+                    fixture: fixture.to_string(),
+                    category: MismatchCategory::ExtraTypeInSimulator,
+                    root_cause: RootCauseClassification::SimulatorBug,
+                    note: format!("simulator kept type {name}, but live PostgreSQL removed it"),
+                });
+            }
+        }
+    }
+
+    if scope.contains(&ComparisonScope::Privileges) {
+        for privilege in live.privileges.difference(&simulator.privileges) {
+            mismatches.push(Mismatch {
+                rule_dir: rule_dir.to_string(),
+                fixture: fixture.to_string(),
+                category: MismatchCategory::MissingPrivilegeInSimulator,
+                root_cause: RootCauseClassification::SimulatorBug,
+                note: format!(
+                    "live PostgreSQL kept {} on {} for {}",
+                    privilege.privilege, privilege.table, privilege.grantee
+                ),
+            });
+        }
+        for privilege in simulator.privileges.difference(&live.privileges) {
+            mismatches.push(Mismatch {
+                rule_dir: rule_dir.to_string(),
+                fixture: fixture.to_string(),
+                category: MismatchCategory::ExtraPrivilegeInSimulator,
+                root_cause: RootCauseClassification::SimulatorBug,
+                note: format!(
+                    "simulator kept {} on {} for {}",
+                    privilege.privilege, privilege.table, privilege.grantee
+                ),
+            });
+        }
+    }
+
+    if scope.contains(&ComparisonScope::Policies) {
+        for policy in live.policies.difference(&simulator.policies) {
+            mismatches.push(Mismatch {
+                rule_dir: rule_dir.to_string(),
+                fixture: fixture.to_string(),
+                category: MismatchCategory::MissingPolicyInSimulator,
+                root_cause: RootCauseClassification::SimulatorBug,
+                note: format!(
+                    "live PostgreSQL kept policy {} on {}",
+                    policy.policy, policy.table
+                ),
+            });
+        }
+        for policy in simulator.policies.difference(&live.policies) {
+            mismatches.push(Mismatch {
+                rule_dir: rule_dir.to_string(),
+                fixture: fixture.to_string(),
+                category: MismatchCategory::ExtraPolicyInSimulator,
+                root_cause: RootCauseClassification::SimulatorBug,
+                note: format!(
+                    "simulator kept policy {} on {}",
+                    policy.policy, policy.table
+                ),
+            });
+        }
+    }
+
+    if scope.contains(&ComparisonScope::Triggers) {
+        for (key, live_trigger) in &live.triggers {
+            match simulator.triggers.get(key) {
+                None => mismatches.push(Mismatch {
+                    rule_dir: rule_dir.to_string(),
+                    fixture: fixture.to_string(),
+                    category: MismatchCategory::MissingTriggerInSimulator,
+                    root_cause: RootCauseClassification::SimulatorBug,
+                    note: format!(
+                        "live PostgreSQL kept trigger {} on {}, but simulator removed it",
+                        key.1, key.0
+                    ),
+                }),
+                Some(simulator_trigger) if simulator_trigger.function != live_trigger.function => {
+                    mismatches.push(Mismatch {
+                        rule_dir: rule_dir.to_string(),
+                        fixture: fixture.to_string(),
+                        category: MismatchCategory::TriggerFunctionMismatch,
+                        root_cause: RootCauseClassification::SimulatorBug,
+                        note: format!(
+                            "trigger {} on {} function mismatch: live={}, simulator={}",
+                            key.1, key.0, live_trigger.function, simulator_trigger.function
+                        ),
+                    });
+                }
+                Some(simulator_trigger)
+                    if simulator_trigger.enabled_mode != live_trigger.enabled_mode =>
+                {
+                    mismatches.push(Mismatch {
+                        rule_dir: rule_dir.to_string(),
+                        fixture: fixture.to_string(),
+                        category: MismatchCategory::TriggerEnableModeMismatch,
+                        root_cause: RootCauseClassification::SimulatorBug,
+                        note: format!(
+                            "trigger {} on {} enabled-mode mismatch: live={}, simulator={}",
+                            key.1, key.0, live_trigger.enabled_mode, simulator_trigger.enabled_mode
+                        ),
+                    });
+                }
+                Some(_) => {}
+            }
+        }
+        for key in simulator.triggers.keys() {
+            if !live.triggers.contains_key(key) {
+                mismatches.push(Mismatch {
+                    rule_dir: rule_dir.to_string(),
+                    fixture: fixture.to_string(),
+                    category: MismatchCategory::ExtraTriggerInSimulator,
+                    root_cause: RootCauseClassification::SimulatorBug,
+                    note: format!(
+                        "simulator kept trigger {} on {}, but live PostgreSQL removed it",
+                        key.1, key.0
+                    ),
+                });
+            }
+        }
+    }
+
+    if scope.contains(&ComparisonScope::Partitions) {
+        for edge in live.partition_edges.difference(&simulator.partition_edges) {
+            mismatches.push(Mismatch {
+                rule_dir: rule_dir.to_string(),
+                fixture: fixture.to_string(),
+                category: MismatchCategory::MissingPartitionEdgeInSimulator,
+                root_cause: RootCauseClassification::SimulatorBug,
+                note: format!(
+                    "live PostgreSQL kept partition edge {} -> {}",
+                    edge.0, edge.1
+                ),
+            });
+        }
+        for edge in simulator.partition_edges.difference(&live.partition_edges) {
+            mismatches.push(Mismatch {
+                rule_dir: rule_dir.to_string(),
+                fixture: fixture.to_string(),
+                category: MismatchCategory::ExtraPartitionEdgeInSimulator,
+                root_cause: RootCauseClassification::SimulatorBug,
+                note: format!("simulator kept partition edge {} -> {}", edge.0, edge.1),
+            });
+        }
+    }
+
+    if scope.contains(&ComparisonScope::ViewDependencies) {
+        for edge in live
+            .view_dependencies
+            .difference(&simulator.view_dependencies)
+        {
+            mismatches.push(Mismatch {
+                rule_dir: rule_dir.to_string(),
+                fixture: fixture.to_string(),
+                category: MismatchCategory::MissingViewDependencyInSimulator,
+                root_cause: RootCauseClassification::SimulatorBug,
+                note: format!(
+                    "live PostgreSQL kept view dependency {} -> {}",
+                    edge.0, edge.1
+                ),
+            });
+        }
+        for edge in simulator
+            .view_dependencies
+            .difference(&live.view_dependencies)
+        {
+            mismatches.push(Mismatch {
+                rule_dir: rule_dir.to_string(),
+                fixture: fixture.to_string(),
+                category: MismatchCategory::ExtraViewDependencyInSimulator,
+                root_cause: RootCauseClassification::SimulatorBug,
+                note: format!("simulator kept view dependency {} -> {}", edge.0, edge.1),
+            });
+        }
+    }
+
+    mismatches
+}
+
+fn normalize_relation_kind(kind: RelationKind) -> NormalizedRelationKind {
+    match kind {
+        RelationKind::Table => NormalizedRelationKind::Table,
+        RelationKind::View => NormalizedRelationKind::View,
+        RelationKind::MaterializedView => NormalizedRelationKind::MaterializedView,
+    }
+}
+
+fn normalize_trigger_mode(mode: safe_migrate::model::trigger::TriggerEnableMode) -> String {
+    match mode {
+        safe_migrate::model::trigger::TriggerEnableMode::Disabled => "disabled",
+        safe_migrate::model::trigger::TriggerEnableMode::Origin => "origin",
+        safe_migrate::model::trigger::TriggerEnableMode::Replica => "replica",
+        safe_migrate::model::trigger::TriggerEnableMode::Always => "always",
+    }
+    .to_string()
+}
+
+fn normalize_volatility(volatility: &Volatility) -> String {
+    match volatility {
+        Volatility::Volatile => "volatile",
+        Volatility::Stable => "stable",
+        Volatility::Immutable => "immutable",
+    }
+    .to_string()
+}
+
+fn normalize_type_kind(kind: &TypeKind) -> NormalizedType {
+    match kind {
+        TypeKind::Enum { variants } => NormalizedType::Enum {
+            variants: variants.clone(),
+        },
+        TypeKind::Domain { base_type } => NormalizedType::Domain {
+            base_type: normalize_data_type(base_type),
+        },
+        TypeKind::Base => NormalizedType::Base,
+        TypeKind::Composite => NormalizedType::Composite,
+        TypeKind::Range => NormalizedType::Range,
+    }
+}
+
+fn normalize_privilege(privilege: Privilege) -> String {
+    match privilege {
+        Privilege::Select => "select",
+        Privilege::Insert => "insert",
+        Privilege::Update => "update",
+        Privilege::Delete => "delete",
+        Privilege::Truncate => "truncate",
+        Privilege::References => "references",
+        Privilege::Trigger => "trigger",
+        Privilege::All => "all",
+    }
+    .to_string()
+}
+
+fn normalize_constraint_kind(kind: ConstraintKind) -> String {
+    match kind {
+        ConstraintKind::Check => "check",
+        ConstraintKind::ForeignKey => "foreign_key",
+        ConstraintKind::PrimaryKey => "primary_key",
+        ConstraintKind::Unique => "unique",
+        ConstraintKind::Exclusion => "exclusion",
+    }
+    .to_string()
+}
+
+fn normalize_data_type(data_type: &str) -> String {
+    let normalized = data_type.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "int" | "int4" => "integer".to_string(),
+        "int2" => "smallint".to_string(),
+        "int8" => "bigint".to_string(),
+        "bool" => "boolean".to_string(),
+        "float4" => "real".to_string(),
+        "float8" => "double precision".to_string(),
+        "decimal" => "numeric".to_string(),
+        "varchar" => "character varying".to_string(),
+        "timestamp" => "timestamp without time zone".to_string(),
+        "timestamptz" => "timestamp with time zone".to_string(),
+        "time" => "time without time zone".to_string(),
+        "timetz" => "time with time zone".to_string(),
+        _ if normalized.starts_with("varchar(") => {
+            normalized.replacen("varchar(", "character varying(", 1)
+        }
+        _ => normalized,
+    }
+}
+
+fn qualified_name(schema: &str, name: &str) -> String {
+    format!("{schema}.{name}")
+}
+
+fn split_qualified_name(name: &str) -> (&str, &str) {
+    name.split_once('.')
+        .unwrap_or_else(|| panic!("qualified relation name must be schema.object, got {name}"))
+}
+
+fn format_mismatch_report(mismatches: &[Mismatch], manifest_path: &Path) -> String {
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "live differential harness found {} mismatch(es) using {}",
+        mismatches.len(),
+        manifest_path.display()
+    ));
+    for mismatch in mismatches {
+        lines.push(format!(
+            "[{} / {}] {:?} [{:?}] {}",
+            mismatch.rule_dir,
+            mismatch.fixture,
+            mismatch.category,
+            mismatch.root_cause,
+            mismatch.note
+        ));
+    }
+    lines.join("\n")
+}

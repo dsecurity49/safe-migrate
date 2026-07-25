@@ -49,7 +49,7 @@ pub fn sync_cache(out_path: &Path, schemas: Option<&[String]>) -> Result<()> {
     let mut encoder =
         zstd::stream::Encoder::new(writer, 3).context("Failed to init zstd compression")?;
 
-    let versioned = crate::db::cache::DbCacheVersioned::V2(cache);
+    let versioned = crate::db::cache::DbCacheVersioned::V5(cache);
     let bincode_config = bincode::config::standard().with_variable_int_encoding();
 
     bincode::serde::encode_into_std_write(&versioned, &mut encoder, bincode_config)
@@ -130,6 +130,11 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
     let version_row = client.query_one("SHOW server_version_num;", &[])?;
     let version_str: String = version_row.get(0);
     cache.pg_version_num = version_str.parse::<u32>().ok();
+
+    // Resolve role/database defaults and special entries such as "$user" exactly
+    // as PostgreSQL does, while excluding the implicit pg_catalog lookup.
+    let search_path_row = client.query_one("SELECT current_schemas(false);", &[])?;
+    cache.search_path = search_path_row.get(0);
 
     // Query 2: Relations + Staleness
     let table_query = format!(
@@ -316,6 +321,53 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
         }
     }
 
+    // Query 4.25: Explicit non-owner relation privileges.
+    let acl_query = format!(
+        "
+        SELECT
+            n.nspname AS schema_name,
+            c.relname AS relation_name,
+            CASE
+                WHEN acl.grantee = 0 THEN 'public'
+                ELSE pg_catalog.pg_get_userbyid(acl.grantee)
+            END AS grantee,
+            acl.privilege_type
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        CROSS JOIN LATERAL pg_catalog.aclexplode(c.relacl) acl
+        WHERE c.relkind IN ('r', 'p', 'v', 'm')
+          AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+          AND acl.grantee <> c.relowner
+          {schema_filter_with_fk};
+        "
+    );
+
+    for row in client.query(&acl_query, &[])? {
+        let schema_name: String = row.get("schema_name");
+        let relation_name: String = row.get("relation_name");
+        let grantee: String = row.get("grantee");
+        let privilege_type: String = row.get("privilege_type");
+        let privilege = match privilege_type.as_str() {
+            "SELECT" => crate::model::relation::Privilege::Select,
+            "INSERT" => crate::model::relation::Privilege::Insert,
+            "UPDATE" => crate::model::relation::Privilege::Update,
+            "DELETE" => crate::model::relation::Privilege::Delete,
+            "TRUNCATE" => crate::model::relation::Privilege::Truncate,
+            "REFERENCES" => crate::model::relation::Privilege::References,
+            "TRIGGER" => crate::model::relation::Privilege::Trigger,
+            _ => continue,
+        };
+        if let Some(relation) = cache
+            .relations
+            .get_mut(&ObjectId::new(&schema_name, &relation_name))
+        {
+            relation.privileges.grant(
+                ObjectId::new("", grantee),
+                [privilege].into_iter().collect(),
+            );
+        }
+    }
+
     // Query 4.5: Trigger Functions
     let trig_query = format!(
         "
@@ -323,6 +375,7 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
             n.nspname AS table_schema,
             c.relname AS table_name,
             t.tgname AS trigger_name,
+            t.tgenabled::text AS enabled_mode,
             fn.nspname AS function_schema,
             f.proname || '()' AS function_name
         FROM pg_trigger t
@@ -340,6 +393,7 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
         let table_schema: String = row.get("table_schema");
         let table_name: String = row.get("table_name");
         let trigger_name: String = row.get("trigger_name");
+        let enabled_mode: String = row.get("enabled_mode");
         let function_schema: String = row.get("function_schema");
         let function_name: String = row.get("function_name");
 
@@ -347,7 +401,53 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
             trigger_id: ObjectId::new(&table_schema, &trigger_name),
             table_id: ObjectId::new(&table_schema, &table_name),
             function_id: ObjectId::new(&function_schema, &function_name),
+            enabled_mode: crate::model::trigger::TriggerEnableMode::from_pg_code(&enabled_mode)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("unknown pg_trigger.tgenabled value {enabled_mode}")
+                })?,
         });
+    }
+
+    // Query 4.75: Table constraints
+    let constraint_query = format!(
+        "
+        SELECT
+            n.nspname AS table_schema,
+            c.relname AS table_name,
+            con.conname AS constraint_name,
+            con.contype::text AS constraint_type,
+            con.convalidated AS validated
+        FROM pg_constraint con
+        JOIN pg_class c ON c.oid = con.conrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE con.contype IN ('c', 'f', 'p', 'u', 'x')
+          AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+          {schema_filter};
+        "
+    );
+
+    for row in client.query(&constraint_query, &[])? {
+        let table_schema: String = row.get("table_schema");
+        let table_name: String = row.get("table_name");
+        let constraint_name: String = row.get("constraint_name");
+        let constraint_type: String = row.get("constraint_type");
+        let validated: bool = row.get("validated");
+        let kind = match constraint_type.as_str() {
+            "c" => crate::model::constraint::ConstraintKind::Check,
+            "f" => crate::model::constraint::ConstraintKind::ForeignKey,
+            "p" => crate::model::constraint::ConstraintKind::PrimaryKey,
+            "u" => crate::model::constraint::ConstraintKind::Unique,
+            "x" => crate::model::constraint::ConstraintKind::Exclusion,
+            _ => continue,
+        };
+        cache
+            .constraints
+            .push(crate::model::constraint::ConstraintState {
+                table_id: ObjectId::new(&table_schema, &table_name),
+                name: constraint_name,
+                kind,
+                validated,
+            });
     }
 
     // Query 5: Foreign Keys
@@ -503,14 +603,69 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
         );
     }
 
-    // 7. Dependencies (pg_depend)
+    // Query 8: User-defined types, including ordered enum labels and domains.
+    let type_query = format!(
+        "
+        SELECT
+            n.nspname AS schema_name,
+            t.typname AS type_name,
+            t.typtype::text AS type_kind,
+            CASE WHEN t.typtype = 'd'
+                THEN pg_catalog.format_type(t.typbasetype, t.typtypmod)
+                ELSE NULL
+            END AS domain_base_type,
+            COALESCE(
+                array_agg(e.enumlabel ORDER BY e.enumsortorder)
+                    FILTER (WHERE e.enumlabel IS NOT NULL),
+                ARRAY[]::text[]
+            ) AS enum_labels
+        FROM pg_type t
+        JOIN pg_namespace n ON n.oid = t.typnamespace
+        LEFT JOIN pg_enum e ON e.enumtypid = t.oid
+        WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
+          AND t.typtype IN ('e', 'd')
+          {schema_filter}
+        GROUP BY n.nspname, t.typname, t.typtype, t.typbasetype, t.typtypmod;
+        "
+    );
+
+    for row in client.query(&type_query, &[])? {
+        let schema_name: String = row.get("schema_name");
+        let type_name: String = row.get("type_name");
+        let type_kind: String = row.get("type_kind");
+        let domain_base_type: Option<String> = row.get("domain_base_type");
+        let enum_labels: Vec<String> = row.get("enum_labels");
+        let kind = match type_kind.as_str() {
+            "e" => crate::model::types::TypeKind::Enum {
+                variants: enum_labels,
+            },
+            "d" => crate::model::types::TypeKind::Domain {
+                base_type: domain_base_type.unwrap_or_default(),
+            },
+            _ => continue,
+        };
+        let id = ObjectId::new(&schema_name, &type_name);
+        cache.types.insert(
+            id.clone(),
+            crate::model::types::TypeState {
+                id,
+                generation: 0,
+                kind,
+            },
+        );
+    }
+
+    // Query 9: Dependencies (pg_depend)
+    let dependency_schemas = schemas.map(|items| items.to_vec());
     let depend_query = r#"
         SELECT
             d.classid, d.objid, d.objsubid,
             d.refclassid, d.refobjid, d.refobjsubid,
             d.deptype::text,
-            n1.nspname AS obj_schema, COALESCE(c1.relname, p1.proname, t1.typname) AS obj_name,
-            n2.nspname AS ref_schema, COALESCE(c2.relname, p2.proname, t2.typname) AS ref_name
+            COALESCE(n1.nspname, n1p.nspname, n1t.nspname) AS obj_schema,
+            COALESCE(c1.relname, p1.proname, t1.typname) AS obj_name,
+            COALESCE(n2.nspname, n2p.nspname, n2t.nspname) AS ref_schema,
+            COALESCE(c2.relname, p2.proname, t2.typname) AS ref_name
         FROM pg_depend d
         LEFT JOIN pg_class c1 ON c1.oid = d.objid AND d.classid = 'pg_class'::regclass
         LEFT JOIN pg_namespace n1 ON n1.oid = c1.relnamespace
@@ -525,10 +680,16 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
         LEFT JOIN pg_type t2 ON t2.oid = d.refobjid AND d.refclassid = 'pg_type'::regclass
         LEFT JOIN pg_namespace n2t ON n2t.oid = t2.typnamespace
         WHERE d.deptype IN ('n', 'a', 'i')
-          AND (n1.nspname NOT IN ('pg_catalog', 'information_schema') OR n1.nspname IS NULL)
+          AND COALESCE(n1.nspname, n1p.nspname, n1t.nspname) IS NOT NULL
+          AND COALESCE(n1.nspname, n1p.nspname, n1t.nspname)
+              NOT IN ('pg_catalog', 'information_schema')
+          AND (
+              $1::text[] IS NULL
+              OR COALESCE(n1.nspname, n1p.nspname, n1t.nspname) = ANY($1)
+          )
     "#;
 
-    for row in client.query(depend_query, &[])? {
+    for row in client.query(depend_query, &[&dependency_schemas])? {
         let classid: u32 = row.get(0);
         let objid: u32 = row.get(1);
         let objsubid: i32 = row.get(2);
@@ -553,6 +714,50 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
             obj_name,
             ref_schema,
             ref_name,
+        });
+    }
+
+    // View dependencies are owned by pg_rewrite entries, so the generic pg_depend
+    // query above cannot recover the dependent view's schema-qualified identity.
+    let view_depend_query = r#"
+        SELECT DISTINCT
+            'pg_class'::regclass::oid AS classid,
+            vc.oid AS objid,
+            0 AS objsubid,
+            'pg_class'::regclass::oid AS refclassid,
+            tc.oid AS refobjid,
+            0 AS refobjsubid,
+            vn.nspname AS obj_schema,
+            vc.relname AS obj_name,
+            tn.nspname AS ref_schema,
+            tc.relname AS ref_name
+        FROM pg_rewrite rw
+        JOIN pg_class vc ON vc.oid = rw.ev_class
+        JOIN pg_namespace vn ON vn.oid = vc.relnamespace
+        JOIN pg_depend d ON d.objid = rw.oid
+        JOIN pg_class tc ON tc.oid = d.refobjid
+        JOIN pg_namespace tn ON tn.oid = tc.relnamespace
+        WHERE vc.relkind IN ('v', 'm')
+          AND d.deptype = 'n'
+          AND (
+              $1::text[] IS NULL
+              OR (vn.nspname = ANY($1) AND tn.nspname = ANY($1))
+          )
+    "#;
+
+    for row in client.query(view_depend_query, &[&dependency_schemas])? {
+        cache.dependencies.push(crate::db::cache::DependencyCache {
+            classid: row.get(0),
+            objid: row.get(1),
+            objsubid: row.get(2),
+            refclassid: row.get(3),
+            refobjid: row.get(4),
+            refobjsubid: row.get(5),
+            deptype: "view".to_string(),
+            obj_schema: Some(row.get(6)),
+            obj_name: Some(row.get(7)),
+            ref_schema: Some(row.get(8)),
+            ref_name: Some(row.get(9)),
         });
     }
 

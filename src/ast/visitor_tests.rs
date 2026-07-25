@@ -31,6 +31,27 @@ mod tests {
     }
 
     #[test]
+    fn test_grant_extracts_individual_table_privileges() {
+        let fact = parse_and_extract_statement(
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON test_table TO app_user;",
+        )
+        .expect("grant fact");
+
+        let StatementFact::Grant(grant) = fact else {
+            panic!("expected grant fact");
+        };
+        assert_eq!(
+            grant.privileges,
+            crate::analysis::facts::PrivilegeSpec::List(vec![
+                crate::analysis::facts::PrivilegeFact::Select,
+                crate::analysis::facts::PrivilegeFact::Insert,
+                crate::analysis::facts::PrivilegeFact::Update,
+                crate::analysis::facts::PrivilegeFact::Delete,
+            ])
+        );
+    }
+
+    #[test]
     fn test_create_table_with_columns() {
         let sql = "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255) NOT NULL);";
         let facts = parse_and_extract_statement(sql);
@@ -463,7 +484,9 @@ mod tests {
         let facts = parse_and_extract_statement(sql);
         assert!(facts.is_some());
         match facts.unwrap() {
-            StatementFact::SetSearchPath { .. } => {}
+            StatementFact::SetSearchPath {
+                target: crate::analysis::facts::SearchPathTarget::Default,
+            } => {}
             _ => panic!("Expected SetSearchPath fact"),
         }
     }

@@ -1,7 +1,10 @@
 // FILE: src/db/cache.rs
 use crate::ast::identifiers::ObjectId;
+use crate::model::constraint::ConstraintState;
 use crate::model::function::FunctionState;
 use crate::model::relation::RelationState;
+use crate::model::trigger::TriggerEnableMode;
+use crate::model::types::TypeState;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -20,6 +23,14 @@ pub struct IndexCache {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TriggerCache {
+    pub trigger_id: ObjectId,
+    pub table_id: ObjectId,
+    pub function_id: ObjectId,
+    pub enabled_mode: TriggerEnableMode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LegacyTriggerCache {
     pub trigger_id: ObjectId,
     pub table_id: ObjectId,
     pub function_id: ObjectId,
@@ -49,33 +60,75 @@ pub struct DbCacheV1 {
     #[serde(default)]
     pub indexes: Vec<IndexCache>,
     #[serde(default)]
-    pub triggers: Vec<TriggerCache>,
+    pub triggers: Vec<LegacyTriggerCache>,
     #[serde(default)]
     pub functions: HashMap<ObjectId, FunctionState>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DbCache {
+pub struct DbCacheV2 {
     pub pg_version_num: Option<u32>,
     pub relations: HashMap<ObjectId, RelationState>,
     pub foreign_keys: Vec<ForeignKeyCache>,
     pub indexes: Vec<IndexCache>,
+    pub triggers: Vec<LegacyTriggerCache>,
+    pub functions: HashMap<ObjectId, FunctionState>,
+    pub dependencies: Vec<DependencyCache>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbCache {
+    pub pg_version_num: Option<u32>,
+    pub search_path: Vec<String>,
+    pub relations: HashMap<ObjectId, RelationState>,
+    pub foreign_keys: Vec<ForeignKeyCache>,
+    pub indexes: Vec<IndexCache>,
+    pub constraints: Vec<ConstraintState>,
+    pub triggers: Vec<TriggerCache>,
+    pub functions: HashMap<ObjectId, FunctionState>,
+    pub types: HashMap<ObjectId, TypeState>,
+    pub dependencies: Vec<DependencyCache>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbCacheV3 {
+    pub pg_version_num: Option<u32>,
+    pub search_path: Vec<String>,
+    pub relations: HashMap<ObjectId, RelationState>,
+    pub foreign_keys: Vec<ForeignKeyCache>,
+    pub indexes: Vec<IndexCache>,
+    pub triggers: Vec<LegacyTriggerCache>,
+    pub functions: HashMap<ObjectId, FunctionState>,
+    pub dependencies: Vec<DependencyCache>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbCacheV4 {
+    pub pg_version_num: Option<u32>,
+    pub search_path: Vec<String>,
+    pub relations: HashMap<ObjectId, RelationState>,
+    pub foreign_keys: Vec<ForeignKeyCache>,
+    pub indexes: Vec<IndexCache>,
+    pub constraints: Vec<ConstraintState>,
     pub triggers: Vec<TriggerCache>,
     pub functions: HashMap<ObjectId, FunctionState>,
     pub dependencies: Vec<DependencyCache>,
 }
 
-pub const CACHE_FORMAT_VERSION: u32 = 2;
+pub const CACHE_FORMAT_VERSION: u32 = 5;
 
 const _: () = assert!(
-    CACHE_FORMAT_VERSION == 2,
+    CACHE_FORMAT_VERSION == 5,
     "CACHE_FORMAT_VERSION must be updated when new DbCacheVersioned variants are added",
 );
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DbCacheVersioned {
     V1(DbCacheV1),
-    V2(DbCache),
+    V2(DbCacheV2),
+    V3(DbCacheV3),
+    V4(DbCacheV4),
+    V5(DbCache),
 }
 
 impl DbCacheVersioned {
@@ -83,6 +136,9 @@ impl DbCacheVersioned {
         match self {
             DbCacheVersioned::V1(_) => 1,
             DbCacheVersioned::V2(_) => 2,
+            DbCacheVersioned::V3(_) => 3,
+            DbCacheVersioned::V4(_) => 4,
+            DbCacheVersioned::V5(_) => 5,
         }
     }
 
@@ -93,13 +149,64 @@ impl DbCacheVersioned {
                 relations: c.relations,
                 foreign_keys: c.foreign_keys,
                 indexes: c.indexes,
+                constraints: Vec::new(),
+                triggers: upgrade_legacy_triggers(c.triggers),
+                functions: c.functions,
+                types: HashMap::new(),
+                dependencies: Vec::new(),
+                search_path: vec!["public".to_string()],
+            }),
+            DbCacheVersioned::V2(c) => Ok(DbCache {
+                pg_version_num: c.pg_version_num,
+                search_path: vec!["public".to_string()],
+                relations: c.relations,
+                foreign_keys: c.foreign_keys,
+                indexes: c.indexes,
+                constraints: Vec::new(),
+                triggers: upgrade_legacy_triggers(c.triggers),
+                functions: c.functions,
+                types: HashMap::new(),
+                dependencies: c.dependencies,
+            }),
+            DbCacheVersioned::V3(c) => Ok(DbCache {
+                pg_version_num: c.pg_version_num,
+                search_path: c.search_path,
+                relations: c.relations,
+                foreign_keys: c.foreign_keys,
+                indexes: c.indexes,
+                constraints: Vec::new(),
+                triggers: upgrade_legacy_triggers(c.triggers),
+                functions: c.functions,
+                types: HashMap::new(),
+                dependencies: c.dependencies,
+            }),
+            DbCacheVersioned::V4(c) => Ok(DbCache {
+                pg_version_num: c.pg_version_num,
+                search_path: c.search_path,
+                relations: c.relations,
+                foreign_keys: c.foreign_keys,
+                indexes: c.indexes,
+                constraints: c.constraints,
                 triggers: c.triggers,
                 functions: c.functions,
-                dependencies: Vec::new(),
+                types: HashMap::new(),
+                dependencies: c.dependencies,
             }),
-            DbCacheVersioned::V2(c) => Ok(c),
+            DbCacheVersioned::V5(c) => Ok(c),
         }
     }
+}
+
+fn upgrade_legacy_triggers(triggers: Vec<LegacyTriggerCache>) -> Vec<TriggerCache> {
+    triggers
+        .into_iter()
+        .map(|trigger| TriggerCache {
+            trigger_id: trigger.trigger_id,
+            table_id: trigger.table_id,
+            function_id: trigger.function_id,
+            enabled_mode: TriggerEnableMode::Origin,
+        })
+        .collect()
 }
 
 impl Default for DbCache {
@@ -112,11 +219,14 @@ impl DbCache {
     pub fn new() -> Self {
         Self {
             pg_version_num: None,
+            search_path: vec!["public".to_string()],
             relations: HashMap::new(),
             foreign_keys: Vec::new(),
             indexes: Vec::new(),
+            constraints: Vec::new(),
             triggers: Vec::new(),
             functions: HashMap::new(),
+            types: HashMap::new(),
             dependencies: Vec::new(),
         }
     }

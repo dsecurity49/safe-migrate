@@ -7,6 +7,7 @@ use crate::analysis::mutations::{
 use crate::analysis::transaction::{StateChange, TransactionFrame};
 use crate::ast::identifiers::ObjectId;
 use crate::db::cache::DbCache;
+use crate::model::constraint::{ConstraintKind, ConstraintState};
 pub use crate::model::relation::RelationOverlay;
 use crate::model::relation::{ColumnAction, Persistence, Privilege, RelationKind, RelationState};
 use crate::model::sequence::{SequenceOverlay, SequenceState};
@@ -43,8 +44,10 @@ pub struct LocalState {
     pub subscriptions: HashMap<String, crate::model::replication::SubscriptionOverlay>,
     pub roles: HashMap<ObjectId, crate::model::role::RoleOverlay>,
     pub triggers: HashMap<ObjectId, TriggerOverlay>,
+    pub constraints: HashMap<(ObjectId, String), ConstraintState>,
     pub graph: DependencyGraph,
     pub search_path: Vec<String>,
+    pub default_search_path: Vec<String>,
     pub current_role: String,
     pub confidence: Confidence,
     pub transactions: Vec<TransactionFrame>,
@@ -75,11 +78,15 @@ pub struct AnalysisState {
 
 impl AnalysisState {
     pub fn new(cache: DbCache) -> Self {
+        let default_search_path = cache.search_path.clone();
         let mut relations: HashMap<ObjectId, RelationOverlay> = HashMap::new();
         let mut baseline_relations = HashSet::new();
         let mut baseline_indexes = HashSet::new();
         let mut baseline_foreign_keys = HashSet::new();
         let mut baseline_fk_dependencies = HashSet::new();
+        let mut triggers = HashMap::new();
+        let mut constraints = HashMap::new();
+        let mut types = HashMap::new();
         let mut graph = DependencyGraph::new();
 
         for (id, rel_state) in cache.baseline_relations() {
@@ -88,6 +95,10 @@ impl AnalysisState {
             }
             relations.insert(id.clone(), RelationOverlay::Present(rel_state.clone()));
             baseline_relations.insert(id.clone());
+        }
+
+        for (id, type_state) in &cache.types {
+            types.insert(id.clone(), TypeOverlay::Present(type_state.clone()));
         }
 
         for fk in cache.foreign_keys {
@@ -119,7 +130,57 @@ impl AnalysisState {
             ));
         }
 
+        for dependency in cache.dependencies {
+            if dependency.deptype != "view" {
+                continue;
+            }
+            let (Some(obj_schema), Some(obj_name), Some(ref_schema), Some(ref_name)) = (
+                dependency.obj_schema,
+                dependency.obj_name,
+                dependency.ref_schema,
+                dependency.ref_name,
+            ) else {
+                continue;
+            };
+            let dependent = ObjectId::new(obj_schema, obj_name);
+            let referenced = ObjectId::new(ref_schema, ref_name);
+            let is_view = relations.get(&dependent).is_some_and(|relation| {
+                matches!(
+                    relation,
+                    RelationOverlay::Present(state)
+                        if matches!(
+                            state.kind,
+                            crate::model::relation::RelationKind::View
+                                | crate::model::relation::RelationKind::MaterializedView
+                        )
+                )
+            });
+            if is_view && relations.contains_key(&referenced) {
+                graph.edges.push(DependencyEdge::new(
+                    dependent,
+                    referenced,
+                    DependencyKind::ViewDependency { view_generation: 0 },
+                ));
+            }
+        }
+
+        for constraint in cache.constraints {
+            constraints.insert(
+                (constraint.table_id.clone(), constraint.name.clone()),
+                constraint,
+            );
+        }
+
         for t in cache.triggers {
+            triggers.insert(
+                t.trigger_id.clone(),
+                TriggerOverlay::Present(crate::model::trigger::TriggerState {
+                    id: t.trigger_id.clone(),
+                    table_id: t.table_id.clone(),
+                    enabled_mode: t.enabled_mode,
+                    generation: 0,
+                }),
+            );
             graph.edges.push(DependencyEdge::new(
                 t.trigger_id.clone(),
                 t.table_id,
@@ -147,15 +208,17 @@ impl AnalysisState {
             baseline_fk_dependencies,
             local: LocalState {
                 relations,
-                types: HashMap::new(),
+                types,
                 functions,
                 sequences: HashMap::new(),
                 publications: HashMap::new(),
                 subscriptions: HashMap::new(),
                 roles: HashMap::new(),
-                triggers: HashMap::new(),
+                triggers,
+                constraints,
                 graph,
-                search_path: vec!["public".to_string()],
+                search_path: default_search_path.clone(),
+                default_search_path,
                 current_role: "postgres".to_string(),
                 confidence: Confidence::Exact,
                 transactions: Vec::new(),
@@ -480,6 +543,18 @@ impl AnalysisState {
                         self.local.relations.insert(id, RelationOverlay::Dropped);
                     }
 
+                    let constraints_to_drop: Vec<(ObjectId, String)> = self
+                        .local
+                        .constraints
+                        .keys()
+                        .filter(|(table_id, _)| drop_schema.names.contains(&table_id.schema))
+                        .cloned()
+                        .collect();
+                    for (table_id, name) in constraints_to_drop {
+                        self.snapshot_constraint(&table_id, &name);
+                        self.local.constraints.remove(&(table_id, name));
+                    }
+
                     let mut types_to_drop = Vec::new();
                     for id in self.local.types.keys() {
                         if drop_schema.names.contains(&id.schema) {
@@ -558,36 +633,50 @@ impl AnalysisState {
                     }
                 }
 
-                // Cleanup trigger dependencies
+                let constraints_to_drop: Vec<String> = self
+                    .local
+                    .constraints
+                    .keys()
+                    .filter_map(|(table_id, name)| {
+                        (table_id == &drop_table.id).then(|| name.clone())
+                    })
+                    .collect();
+                for name in constraints_to_drop {
+                    self.snapshot_constraint(&drop_table.id, &name);
+                    self.local
+                        .constraints
+                        .remove(&(drop_table.id.clone(), name));
+                }
+
+                let triggers_to_drop: Vec<ObjectId> = self
+                    .local
+                    .triggers
+                    .iter()
+                    .filter_map(|(id, overlay)| {
+                        let TriggerOverlay::Present(trigger) = overlay else {
+                            return None;
+                        };
+                        let graph_matches = self.local.graph.edges.iter().any(|edge| {
+                            matches!(edge.kind, DependencyKind::TriggerOnTable { .. })
+                                && edge.dependent == *id
+                                && edge.referenced == drop_table.id
+                        });
+                        (trigger.table_id == drop_table.id || graph_matches).then(|| id.clone())
+                    })
+                    .collect();
+                for trigger_id in triggers_to_drop {
+                    self.snapshot_trigger(&trigger_id);
+                    self.local
+                        .triggers
+                        .insert(trigger_id, TriggerOverlay::Dropped);
+                }
+
+                // PostgreSQL always drops triggers owned by a dropped table.
                 self.snapshot_graph_full();
                 self.local.graph.edges.retain(|e| {
                     !(matches!(e.kind, DependencyKind::TriggerOnTable { .. })
                         && e.referenced == drop_table.id)
                 });
-                // Also remove the trigger states themselves if cascading (or simply leave them orphaned)
-                // For now, assume trigger state drops with the table in a cascade
-                if drop_table.cascade {
-                    let triggers_to_drop: Vec<ObjectId> = self
-                        .local
-                        .triggers
-                        .iter()
-                        .filter_map(|(id, overlay)| {
-                            if let TriggerOverlay::Present(t) = overlay {
-                                if t.table_id == drop_table.id {
-                                    Some(id.clone())
-                                } else {
-                                    None
-                                }
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-                    for tid in triggers_to_drop {
-                        self.snapshot_trigger(&tid);
-                        self.local.triggers.insert(tid, TriggerOverlay::Dropped);
-                    }
-                }
 
                 let renames: Vec<DependencyEdge> = self
                     .local
@@ -936,6 +1025,7 @@ impl AnalysisState {
                     TriggerOverlay::Present(crate::model::trigger::TriggerState {
                         id: trigger_id.clone(),
                         table_id: create_trigger.table.clone(),
+                        enabled_mode: crate::model::trigger::TriggerEnableMode::Origin,
                         generation: self.local.generation_counter,
                     }),
                 );
@@ -983,6 +1073,43 @@ impl AnalysisState {
                 MutationResult::Applied
             }
             Mutation::AlterTable(alter) => {
+                let trigger_mode = match &alter.action {
+                    AlterTableActionMutation::DisableTrigger { trigger_name } => Some((
+                        trigger_name.as_deref(),
+                        crate::model::trigger::TriggerEnableMode::Disabled,
+                    )),
+                    AlterTableActionMutation::EnableTrigger { trigger_name } => Some((
+                        trigger_name.as_deref(),
+                        crate::model::trigger::TriggerEnableMode::Origin,
+                    )),
+                    _ => None,
+                };
+                if let Some((trigger_name, enabled_mode)) = trigger_mode {
+                    let all = trigger_name.is_none_or(|name| name.eq_ignore_ascii_case("all"));
+                    let trigger_ids: Vec<ObjectId> = self
+                        .local
+                        .triggers
+                        .iter()
+                        .filter_map(|(id, overlay)| {
+                            let TriggerOverlay::Present(trigger) = overlay else {
+                                return None;
+                            };
+                            (trigger.table_id == alter.id
+                                && (all || trigger_name == Some(id.name.as_str())))
+                            .then(|| id.clone())
+                        })
+                        .collect();
+                    for trigger_id in trigger_ids {
+                        self.snapshot_trigger(&trigger_id);
+                        if let Some(TriggerOverlay::Present(trigger)) =
+                            self.local.triggers.get_mut(&trigger_id)
+                        {
+                            trigger.enabled_mode = enabled_mode;
+                        }
+                    }
+                    return MutationResult::Applied;
+                }
+
                 self.snapshot_relation(&alter.id);
                 let rel_overlay = self.local.relations.get_mut(&alter.id);
                 if let Some(RelationOverlay::Present(rel)) = rel_overlay {
@@ -1083,12 +1210,25 @@ impl AnalysisState {
                             to_columns,
                             ..
                         } => {
+                            let constraint_name = constraint_name.clone().unwrap_or_else(|| {
+                                format!("{}_{}_fkey", alter.id.name, from_columns.join("_"))
+                            });
+                            self.snapshot_constraint(&alter.id, &constraint_name);
+                            self.local.constraints.insert(
+                                (alter.id.clone(), constraint_name.clone()),
+                                ConstraintState {
+                                    table_id: alter.id.clone(),
+                                    name: constraint_name.clone(),
+                                    kind: ConstraintKind::ForeignKey,
+                                    validated: true,
+                                },
+                            );
                             self.snapshot_graph();
                             self.local.graph.edges.push(DependencyEdge::new(
                                 alter.id.clone(),
                                 to_table.clone(),
                                 DependencyKind::ForeignKey {
-                                    constraint_name: constraint_name.clone(),
+                                    constraint_name: Some(constraint_name),
                                     from_columns: from_columns.clone(),
                                     to_columns: to_columns.clone(),
                                     from_generation: generation,
@@ -1096,6 +1236,10 @@ impl AnalysisState {
                             ));
                         }
                         AlterTableActionMutation::DropConstraint { name } => {
+                            self.snapshot_constraint(&alter.id, name);
+                            self.local
+                                .constraints
+                                .remove(&(alter.id.clone(), name.clone()));
                             self.snapshot_graph();
                             self.local.graph.edges.retain(|e| {
                                 if let DependencyKind::ForeignKey {
@@ -1108,6 +1252,74 @@ impl AnalysisState {
                                     true
                                 }
                             });
+                        }
+                        AlterTableActionMutation::RenameConstraint { old_name, new_name } => {
+                            self.snapshot_constraint(&alter.id, old_name);
+                            self.snapshot_constraint(&alter.id, new_name);
+                            if let Some(mut constraint) = self
+                                .local
+                                .constraints
+                                .remove(&(alter.id.clone(), old_name.clone()))
+                            {
+                                constraint.name = new_name.clone();
+                                self.local
+                                    .constraints
+                                    .insert((alter.id.clone(), new_name.clone()), constraint);
+                            }
+                            self.snapshot_graph_full();
+                            for edge in &mut self.local.graph.edges {
+                                if edge.dependent == alter.id
+                                    && let DependencyKind::ForeignKey {
+                                        constraint_name, ..
+                                    } = &mut edge.kind
+                                    && constraint_name.as_deref() == Some(old_name)
+                                {
+                                    *constraint_name = Some(new_name.clone());
+                                }
+                            }
+                        }
+                        AlterTableActionMutation::AddCheckConstraint {
+                            constraint_name,
+                            not_valid,
+                        } => {
+                            let constraint_name = constraint_name
+                                .clone()
+                                .unwrap_or_else(|| format!("{}_check", alter.id.name));
+                            self.snapshot_constraint(&alter.id, &constraint_name);
+                            self.local.constraints.insert(
+                                (alter.id.clone(), constraint_name.clone()),
+                                ConstraintState {
+                                    table_id: alter.id.clone(),
+                                    name: constraint_name,
+                                    kind: ConstraintKind::Check,
+                                    validated: !not_valid,
+                                },
+                            );
+                        }
+                        AlterTableActionMutation::AddUniqueConstraint { constraint_name } => {
+                            let constraint_name = constraint_name
+                                .clone()
+                                .unwrap_or_else(|| format!("{}_key", alter.id.name));
+                            self.snapshot_constraint(&alter.id, &constraint_name);
+                            self.local.constraints.insert(
+                                (alter.id.clone(), constraint_name.clone()),
+                                ConstraintState {
+                                    table_id: alter.id.clone(),
+                                    name: constraint_name,
+                                    kind: ConstraintKind::Unique,
+                                    validated: true,
+                                },
+                            );
+                        }
+                        AlterTableActionMutation::ValidateConstraint { constraint_name } => {
+                            self.snapshot_constraint(&alter.id, constraint_name);
+                            if let Some(constraint) = self
+                                .local
+                                .constraints
+                                .get_mut(&(alter.id.clone(), constraint_name.clone()))
+                            {
+                                constraint.validated = true;
+                            }
                         }
                         AlterTableActionMutation::AttachPartition { child } => {
                             // BUG-012: Reject cycle topologies before inserting the edge.
@@ -1164,9 +1376,23 @@ impl AnalysisState {
                 self.snapshot_type(&alter_type.id);
                 if let Some(TypeOverlay::Present(t)) = self.local.types.get_mut(&alter_type.id) {
                     match &alter_type.action {
-                        AlterTypeActionMutation::AddValue { new_value } => {
+                        AlterTypeActionMutation::AddValue {
+                            new_value,
+                            neighbor,
+                            before,
+                        } => {
                             if let TypeKind::Enum { variants } = &mut t.kind {
-                                variants.push(new_value.clone());
+                                if variants.contains(new_value) {
+                                    return MutationResult::Skipped;
+                                }
+                                let insertion_index = neighbor
+                                    .as_ref()
+                                    .and_then(|neighbor| {
+                                        variants.iter().position(|value| value == neighbor)
+                                    })
+                                    .map(|index| if *before { index } else { index + 1 })
+                                    .unwrap_or(variants.len());
+                                variants.insert(insertion_index, new_value.clone());
                             }
                         }
                     }
@@ -1291,6 +1517,25 @@ impl AnalysisState {
                         .relations
                         .insert(rename.new_id.clone(), RelationOverlay::Present(state));
                 }
+                let constraints_to_move: Vec<(String, ConstraintState)> = self
+                    .local
+                    .constraints
+                    .iter()
+                    .filter_map(|((table_id, name), constraint)| {
+                        (table_id == &rename.old_id).then(|| (name.clone(), constraint.clone()))
+                    })
+                    .collect();
+                for (name, mut constraint) in constraints_to_move {
+                    self.snapshot_constraint(&rename.old_id, &name);
+                    self.snapshot_constraint(&rename.new_id, &name);
+                    self.local
+                        .constraints
+                        .remove(&(rename.old_id.clone(), name.clone()));
+                    constraint.table_id = rename.new_id.clone();
+                    self.local
+                        .constraints
+                        .insert((rename.new_id.clone(), name), constraint);
+                }
                 self.snapshot_graph();
                 self.local.graph.edges.push(DependencyEdge::new(
                     rename.old_id.clone(),
@@ -1330,8 +1575,10 @@ impl AnalysisState {
                 }
                 self.snapshot_graph_full();
                 self.local.graph.edges.retain(|e| {
-                    !(matches!(e.kind, DependencyKind::ViewDependency { .. })
+                    !((matches!(e.kind, DependencyKind::ViewDependency { .. })
                         && drop_mv.ids.contains(&e.dependent))
+                        || (matches!(e.kind, DependencyKind::IndexOnRelation { .. })
+                            && drop_mv.ids.contains(&e.referenced)))
                 });
                 MutationResult::Applied
             }
@@ -1347,7 +1594,7 @@ impl AnalysisState {
                 self.snapshot_search_path();
                 match &sp.target {
                     SearchPathTarget::Default => {
-                        self.local.search_path = vec!["public".to_string()];
+                        self.local.search_path = self.local.default_search_path.clone();
                     }
                     SearchPathTarget::Schemas(schemas) => {
                         self.local.search_path = schemas.clone();
@@ -1499,8 +1746,67 @@ impl AnalysisState {
                 MutationResult::Applied
             }
             Mutation::AlterFunction(f) => {
-                self.snapshot_function(&f.id);
-                // Function generation tracking removed to match model definition
+                use crate::analysis::facts::{AlterFunctionAction, FuncOptionFact};
+                use crate::model::function::{FunctionOverlay, SecurityMode, Volatility};
+
+                match &f.action {
+                    AlterFunctionAction::OptionsChange(options) => {
+                        self.snapshot_function(&f.id);
+                        if let Some(FunctionOverlay::Present(function)) =
+                            self.local.functions.get_mut(&f.id)
+                        {
+                            for option in options {
+                                match option {
+                                    FuncOptionFact::Volatility(volatility) => {
+                                        function.volatility = match volatility {
+                                            crate::analysis::facts::VolatilityKind::Volatile => {
+                                                Volatility::Volatile
+                                            }
+                                            crate::analysis::facts::VolatilityKind::Stable => {
+                                                Volatility::Stable
+                                            }
+                                            crate::analysis::facts::VolatilityKind::Immutable => {
+                                                Volatility::Immutable
+                                            }
+                                        };
+                                    }
+                                    FuncOptionFact::Security(security) => {
+                                        function.security = match security {
+                                            crate::analysis::facts::SecurityKind::Invoker => {
+                                                SecurityMode::Invoker
+                                            }
+                                            crate::analysis::facts::SecurityKind::Definer => {
+                                                SecurityMode::Definer
+                                            }
+                                        };
+                                    }
+                                    FuncOptionFact::Language(language) => {
+                                        function.language = language.clone();
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    AlterFunctionAction::Rename { to, .. } => {
+                        let signature =
+                            f.id.name
+                                .find('(')
+                                .map(|index| &f.id.name[index..])
+                                .unwrap_or("");
+                        let new_id = ObjectId::new(f.id.schema.clone(), format!("{to}{signature}"));
+                        self.move_function(&f.id, &new_id);
+                    }
+                    AlterFunctionAction::SchemaChange { new_schema } => {
+                        let new_id = ObjectId::new(new_schema.clone(), f.id.name.clone());
+                        self.move_function(&f.id, &new_id);
+                    }
+                    AlterFunctionAction::OwnerChange(_)
+                    | AlterFunctionAction::DependsOnExtension { .. }
+                    | AlterFunctionAction::NoDependsOnExtension { .. } => {
+                        self.snapshot_function(&f.id);
+                    }
+                }
                 MutationResult::Applied
             }
             Mutation::DropFunction(f) => {
@@ -1518,11 +1824,57 @@ impl AnalysisState {
                             return MutationResult::Skipped;
                         }
                     } else {
+                        let dependent_triggers: Vec<(ObjectId, ObjectId)> = self
+                            .local
+                            .graph
+                            .edges
+                            .iter()
+                            .filter_map(|edge| {
+                                let DependencyKind::TriggerOnTable { function_id, .. } = &edge.kind
+                                else {
+                                    return None;
+                                };
+                                (function_id == &id)
+                                    .then(|| (edge.dependent.clone(), edge.referenced.clone()))
+                            })
+                            .collect();
+                        if !dependent_triggers.is_empty() && !f.cascade {
+                            return MutationResult::Conflict {
+                                reason: format!(
+                                    "function '{}' still has dependent triggers; use CASCADE",
+                                    id
+                                ),
+                            };
+                        }
+
                         any_applied = true;
                         self.snapshot_function(&id);
                         self.local
                             .functions
-                            .insert(id, crate::model::function::FunctionOverlay::Dropped);
+                            .insert(id.clone(), crate::model::function::FunctionOverlay::Dropped);
+
+                        if f.cascade {
+                            for (trigger_id, table_id) in &dependent_triggers {
+                                self.snapshot_trigger(trigger_id);
+                                self.local
+                                    .triggers
+                                    .insert(trigger_id.clone(), TriggerOverlay::Dropped);
+                                self.snapshot_relation(table_id);
+                                if let Some(RelationOverlay::Present(relation)) =
+                                    self.local.relations.get_mut(table_id)
+                                {
+                                    relation.triggers.remove(&trigger_id.name);
+                                }
+                            }
+                            if !dependent_triggers.is_empty() {
+                                self.snapshot_graph_full();
+                                self.local.graph.edges.retain(|edge| {
+                                    !dependent_triggers
+                                        .iter()
+                                        .any(|(trigger_id, _)| edge.dependent == *trigger_id)
+                                });
+                            }
+                        }
                     }
                 }
                 if any_applied {
@@ -1856,6 +2208,28 @@ impl AnalysisState {
         }
     }
 
+    fn move_function(&mut self, old_id: &ObjectId, new_id: &ObjectId) {
+        self.snapshot_function(old_id);
+        self.snapshot_function(new_id);
+        if let Some(crate::model::function::FunctionOverlay::Present(mut function)) =
+            self.local.functions.remove(old_id)
+        {
+            function.id = new_id.clone();
+            self.local.functions.insert(
+                new_id.clone(),
+                crate::model::function::FunctionOverlay::Present(function),
+            );
+        }
+
+        self.snapshot_graph_full();
+        self.local.graph.propagate_rename(old_id, new_id);
+        self.local.graph.edges.push(DependencyEdge::new(
+            old_id.clone(),
+            new_id.clone(),
+            DependencyKind::RenameTo,
+        ));
+    }
+
     fn snapshot_function(&mut self, id: &ObjectId) {
         if let Some(frame) = self.local.transactions.last_mut() {
             let previous = self.local.functions.get(id).cloned();
@@ -1901,6 +2275,18 @@ impl AnalysisState {
             let previous = self.local.triggers.get(id).cloned();
             frame.undo_log.push(StateChange::TriggerSnapshot {
                 id: id.clone(),
+                previous,
+            });
+        }
+    }
+
+    fn snapshot_constraint(&mut self, table_id: &ObjectId, name: &str) {
+        if let Some(frame) = self.local.transactions.last_mut() {
+            let key = (table_id.clone(), name.to_string());
+            let previous = self.local.constraints.get(&key).cloned();
+            frame.undo_log.push(StateChange::ConstraintSnapshot {
+                table_id: table_id.clone(),
+                name: name.to_string(),
                 previous,
             });
         }
@@ -2021,6 +2407,18 @@ impl AnalysisState {
                         self.local.triggers.insert(id, prev);
                     } else {
                         self.local.triggers.remove(&id);
+                    }
+                }
+                StateChange::ConstraintSnapshot {
+                    table_id,
+                    name,
+                    previous,
+                } => {
+                    let key = (table_id, name);
+                    if let Some(previous) = previous {
+                        self.local.constraints.insert(key, previous);
+                    } else {
+                        self.local.constraints.remove(&key);
                     }
                 }
                 StateChange::GraphLengthMarker { len } => {

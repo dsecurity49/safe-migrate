@@ -241,7 +241,6 @@ impl Rule for DriftDetectionRule {
                 }
             }
             Mutation::DropType(d) => {
-                println!("Evaluate DropType in drift rule: ids={:?}", d.ids);
                 for id in &d.ids {
                     if !pre_state.types.contains_key(id) {
                         violations.push(Violation { source_range: None,

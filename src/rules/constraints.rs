@@ -225,7 +225,7 @@ impl Rule for BlockingConstraintRule {
                         });
                     }
                 }
-                AlterTableActionMutation::AddUniqueConstraint
+                AlterTableActionMutation::AddUniqueConstraint { .. }
                 | AlterTableActionMutation::AddPrimaryKeyConstraint => {
                     let mut reason =
                         format!("Adding a UNIQUE or PRIMARY KEY constraint to {}", alter.id);

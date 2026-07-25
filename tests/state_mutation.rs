@@ -7,7 +7,7 @@ mod state_mutation_tests {
     use safe_migrate::ast::identifiers::ObjectId;
     use safe_migrate::model::relation::RelationOverlay;
     use safe_migrate::model::sequence::SequenceOverlay;
-    use safe_migrate::model::types::{TypeKind, TypeOverlay};
+    use safe_migrate::model::types::{TypeKind, TypeOverlay, TypeState};
 
     #[test]
     fn test_topology_table_basic() {
@@ -298,6 +298,46 @@ mod state_mutation_tests {
     }
 
     #[test]
+    fn test_enum_add_value_preserves_postgres_ordering() {
+        let engine = setup_engine();
+        let mut cache = safe_migrate::db::cache::DbCache::new();
+        let id = object_id("public", "e");
+        cache.types.insert(
+            id.clone(),
+            TypeState {
+                id: id.clone(),
+                generation: 0,
+                kind: TypeKind::Enum {
+                    variants: vec!["first".into(), "last".into()],
+                },
+            },
+        );
+        let mut state = safe_migrate::AnalysisState::new(cache);
+
+        engine
+            .analyze(
+                "ALTER TYPE e ADD VALUE 'middle' BEFORE 'last'; ALTER TYPE e ADD VALUE 'tail' AFTER 'last';",
+                &mut state,
+            )
+            .unwrap();
+
+        let Some(TypeOverlay::Present(type_state)) = state.local.types.get(&id) else {
+            panic!("enum e missing");
+        };
+        assert_eq!(
+            type_state.kind,
+            TypeKind::Enum {
+                variants: vec![
+                    "first".into(),
+                    "middle".into(),
+                    "last".into(),
+                    "tail".into()
+                ]
+            }
+        );
+    }
+
+    #[test]
     fn test_topology_replication_graph() {
         let engine = setup_engine();
         let mut state = setup_state();
@@ -467,6 +507,77 @@ mod state_mutation_tests {
     }
 
     #[test]
+    fn test_synced_search_path_is_initial_and_default_path() {
+        let engine = setup_engine();
+        let mut cache = safe_migrate::db::cache::DbCache::new();
+        cache.search_path = vec!["tenant_app".to_string(), "shared".to_string()];
+        let mut state = safe_migrate::AnalysisState::new(cache);
+
+        engine
+            .analyze("CREATE TABLE first(id int);", &mut state)
+            .unwrap();
+        engine
+            .analyze(
+                "SET search_path TO temporary_path; SET search_path TO DEFAULT; CREATE TABLE second(id int);",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(state.relation_is_present(&object_id("tenant_app", "first")));
+        assert!(state.relation_is_present(&object_id("tenant_app", "second")));
+        assert_eq!(state.local.search_path, ["tenant_app", "shared"]);
+    }
+
+    #[test]
+    fn test_unqualified_index_uses_table_schema() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE TABLE public.indexed_table(id int); SET search_path TO other_schema, public; CREATE INDEX indexed_table_id_idx ON public.indexed_table(id);",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(state.local.graph.edges.iter().any(|edge| {
+            edge.dependent == object_id("public", "indexed_table_id_idx")
+                && edge.referenced == object_id("public", "indexed_table")
+                && matches!(
+                    edge.kind,
+                    safe_migrate::analysis::graph::DependencyKind::IndexOnRelation { .. }
+                )
+        }));
+    }
+
+    #[test]
+    fn test_serial_and_default_null_follow_postgres_column_state() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE TABLE serial_test (id SERIAL, optional INT DEFAULT NULL);",
+                &mut state,
+            )
+            .unwrap();
+
+        let Some(RelationOverlay::Present(relation)) =
+            state.get_relation(&object_id("public", "serial_test"))
+        else {
+            panic!("serial_test should be present");
+        };
+        let id = relation.get_column("id").unwrap();
+        assert_eq!(id.data_type.as_deref(), Some("integer"));
+        assert!(!id.is_nullable);
+        assert!(id.default.is_some());
+
+        let optional = relation.get_column("optional").unwrap();
+        assert!(optional.is_nullable);
+        assert!(optional.default.is_none());
+    }
+
+    #[test]
     fn test_state_alter_column_types() {
         let engine = setup_engine();
         let mut state = setup_state();
@@ -580,6 +691,24 @@ mod state_mutation_tests {
     }
 
     #[test]
+    fn test_drop_materialized_view_removes_its_indexes() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE MATERIALIZED VIEW mv AS SELECT 1 AS id; CREATE UNIQUE INDEX mv_id_idx ON mv(id); DROP MATERIALIZED VIEW mv;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(!state.local.graph.edges.iter().any(|edge| {
+            matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
+                && edge.referenced == object_id("public", "mv")
+        }));
+    }
+
+    #[test]
     fn test_state_drop_function_if_exists() {
         let engine = setup_engine();
         let mut state = setup_state();
@@ -647,6 +776,191 @@ mod state_mutation_tests {
             .analyze("REVOKE SELECT ON t FROM public;", &mut state)
             .unwrap();
         assert!(state.relation_is_present(&object_id("public", "t")));
+    }
+
+    #[test]
+    fn test_state_hydrates_and_disables_trigger() {
+        use safe_migrate::db::cache::TriggerCache;
+        use safe_migrate::model::trigger::{TriggerEnableMode, TriggerOverlay};
+
+        let engine = setup_engine();
+        let mut cache = cache_with_table("public", "test_table", None);
+        cache.triggers.push(TriggerCache {
+            trigger_id: object_id("public", "check_trigger"),
+            table_id: object_id("public", "test_table"),
+            function_id: object_id("public", "check_row()"),
+            enabled_mode: TriggerEnableMode::Origin,
+        });
+        let mut state = safe_migrate::AnalysisState::new(cache);
+
+        engine
+            .analyze(
+                "ALTER TABLE test_table DISABLE TRIGGER check_trigger;",
+                &mut state,
+            )
+            .unwrap();
+
+        let Some(TriggerOverlay::Present(trigger)) = state
+            .local
+            .triggers
+            .get(&object_id("public", "check_trigger"))
+        else {
+            panic!("baseline trigger should be hydrated");
+        };
+        assert_eq!(trigger.enabled_mode, TriggerEnableMode::Disabled);
+    }
+
+    #[test]
+    fn test_state_alter_function_updates_volatility_and_identity() {
+        use safe_migrate::model::function::{FunctionOverlay, Volatility};
+
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT 1';",
+                &mut state,
+            )
+            .unwrap();
+        engine
+            .analyze("ALTER FUNCTION f() IMMUTABLE;", &mut state)
+            .unwrap();
+
+        let Some(FunctionOverlay::Present(function)) =
+            state.local.functions.get(&object_id("public", "f()"))
+        else {
+            panic!("function should remain present after volatility change");
+        };
+        assert_eq!(function.volatility, Volatility::Immutable);
+
+        engine
+            .analyze("ALTER FUNCTION f() RENAME TO g;", &mut state)
+            .unwrap();
+        assert!(
+            !state
+                .local
+                .functions
+                .contains_key(&object_id("public", "f()"))
+        );
+        assert!(matches!(
+            state.local.functions.get(&object_id("public", "g()")),
+            Some(FunctionOverlay::Present(_))
+        ));
+    }
+
+    #[test]
+    fn test_state_adds_named_check_constraint() {
+        use safe_migrate::model::constraint::ConstraintKind;
+
+        let engine = setup_engine();
+        let mut state =
+            safe_migrate::AnalysisState::new(cache_with_table("public", "t_large", None));
+        engine
+            .analyze(
+                "ALTER TABLE t_large ADD CONSTRAINT positive_id CHECK (id > 0);",
+                &mut state,
+            )
+            .unwrap();
+
+        let constraint = state
+            .local
+            .constraints
+            .get(&(object_id("public", "t_large"), "positive_id".to_string()))
+            .expect("check constraint should be represented");
+        assert_eq!(constraint.kind, ConstraintKind::Check);
+        assert!(constraint.validated);
+    }
+
+    #[test]
+    fn test_state_adds_named_unique_constraint() {
+        use safe_migrate::model::constraint::ConstraintKind;
+
+        let engine = setup_engine();
+        let mut state =
+            safe_migrate::AnalysisState::new(cache_with_table("public", "t_large", None));
+        engine
+            .analyze(
+                "ALTER TABLE t_large ADD CONSTRAINT unique_id UNIQUE (id);",
+                &mut state,
+            )
+            .unwrap();
+
+        let constraint = state
+            .local
+            .constraints
+            .get(&(object_id("public", "t_large"), "unique_id".to_string()))
+            .expect("unique constraint should be represented");
+        assert_eq!(constraint.kind, ConstraintKind::Unique);
+        assert!(constraint.validated);
+    }
+
+    #[test]
+    fn test_drop_function_cascade_removes_dependent_trigger() {
+        use safe_migrate::model::function::FunctionOverlay;
+        use safe_migrate::model::trigger::TriggerOverlay;
+
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "
+                CREATE TABLE target (id integer);
+                CREATE FUNCTION compute_trigger() RETURNS trigger
+                    LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';
+                CREATE TRIGGER compute_row AFTER INSERT ON target
+                    EXECUTE FUNCTION compute_trigger();
+                DROP FUNCTION compute_trigger() CASCADE;
+                ",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            state
+                .local
+                .functions
+                .get(&object_id("public", "compute_trigger()")),
+            Some(FunctionOverlay::Dropped)
+        ));
+        assert!(matches!(
+            state
+                .local
+                .triggers
+                .get(&object_id("public", "compute_row")),
+            Some(TriggerOverlay::Dropped)
+        ));
+    }
+
+    #[test]
+    fn test_variadic_function_drop_normalizes_array_alias() {
+        use safe_migrate::db::cache::DbCache;
+        use safe_migrate::model::function::{
+            FunctionOverlay, FunctionState, SecurityMode, Volatility,
+        };
+
+        let engine = setup_engine();
+        let function_id = object_id("public", "f_safe(integer[])");
+        let mut cache = DbCache::new();
+        cache.functions.insert(
+            function_id.clone(),
+            FunctionState {
+                id: function_id.clone(),
+                arg_types: vec!["integer[]".to_string()],
+                return_type: "integer".to_string(),
+                volatility: Volatility::Volatile,
+                language: "sql".to_string(),
+                security: SecurityMode::Invoker,
+            },
+        );
+        let mut state = safe_migrate::AnalysisState::new(cache);
+        engine
+            .analyze("DROP FUNCTION f_safe(VARIADIC INT[]);", &mut state)
+            .unwrap();
+
+        assert!(matches!(
+            state.local.functions.get(&function_id),
+            Some(FunctionOverlay::Dropped)
+        ));
     }
 }
 

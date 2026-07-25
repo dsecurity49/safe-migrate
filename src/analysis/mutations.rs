@@ -201,7 +201,11 @@ pub struct AlterTypeMutation {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum AlterTypeActionMutation {
-    AddValue { new_value: String },
+    AddValue {
+        new_value: String,
+        neighbor: Option<String>,
+        before: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -496,7 +500,9 @@ pub enum AlterTableActionMutation {
         constraint_name: Option<String>,
         not_valid: bool,
     },
-    AddUniqueConstraint,
+    AddUniqueConstraint {
+        constraint_name: Option<String>,
+    },
     AddPrimaryKeyConstraint,
     AddExcludeConstraint,
     SetNotNull {

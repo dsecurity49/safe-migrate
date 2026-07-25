@@ -20,6 +20,8 @@ graph.json
 AGENTS.md
 .git/
 *.json
+!live_tests/differential_baseline.sql
+!live_tests/differential_manifest.json
 test_migrations/
 *.opencode/
 .safe-migrate.cache

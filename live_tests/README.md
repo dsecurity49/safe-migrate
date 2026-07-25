@@ -12,6 +12,28 @@ The suite is organized into subdirectories for each implemented rule. Inside eac
 
 The test runner (`run.sh`) is a fast bash script that executes the local `safe-migrate` binary against the `.sql` fixtures and parses the output JSON to verify the correct rules fired.
 
+### Live Differential Harness
+
+The ignored live differential harness rebuilds `differential_baseline.sql` before
+each enabled fixture and compares normalized simulator state with PostgreSQL:
+
+```bash
+DATABASE_URL='host=/path/to/socket dbname=postgres user=my_user' \
+    scripts/live-differential -vv
+```
+
+Verbosity is cumulative: `-v` reports lifecycle and fixture outcomes, `-vv`
+adds cache and normalized-state counts, and `-vvv` dumps complete normalized
+live and simulator projections. CI may set `SAFE_MIGRATE_DIFF_VERBOSITY=1..3`
+and invoke the ignored Cargo test directly with `--nocapture`.
+
+Run a newly enabled rule by itself before the cumulative manifest:
+
+```bash
+scripts/live-differential -vv --rule rule_01_irreversible-migration
+scripts/live-differential -v
+```
+
 ### Basic Usage
 ```bash
 ./run.sh

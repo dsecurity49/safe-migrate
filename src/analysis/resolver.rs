@@ -96,24 +96,7 @@ impl Resolver {
         // Normalize types in signature to match pg_proc standard names
         let normalized_sig = sig
             .split(',')
-            .map(|s| {
-                let s = s.trim().to_lowercase();
-                match s.as_str() {
-                    "int" | "int4" => "integer".to_string(),
-                    "int8" => "bigint".to_string(),
-                    "int2" => "smallint".to_string(),
-                    "float8" => "double precision".to_string(),
-                    "float4" => "real".to_string(),
-                    "bool" => "boolean".to_string(),
-                    "varchar" => "character varying".to_string(),
-                    "char" => "character".to_string(),
-                    "time" => "time without time zone".to_string(),
-                    "timestamp" => "timestamp without time zone".to_string(),
-                    "timestamptz" => "timestamp with time zone".to_string(),
-                    "decimal" => "numeric".to_string(),
-                    _ => s,
-                }
-            })
+            .map(Self::normalize_function_arg_type)
             .collect::<Vec<_>>()
             .join(",");
 
@@ -123,6 +106,28 @@ impl Resolver {
         );
         id.inferred_schema = base_id.inferred_schema;
         id
+    }
+
+    fn normalize_function_arg_type(raw: &str) -> String {
+        let normalized = raw.trim().to_lowercase();
+        if let Some(element_type) = normalized.strip_suffix("[]") {
+            return format!("{}[]", Self::normalize_function_arg_type(element_type));
+        }
+        match normalized.as_str() {
+            "int" | "int4" => "integer".to_string(),
+            "int8" => "bigint".to_string(),
+            "int2" => "smallint".to_string(),
+            "float8" => "double precision".to_string(),
+            "float4" => "real".to_string(),
+            "bool" => "boolean".to_string(),
+            "varchar" => "character varying".to_string(),
+            "char" => "character".to_string(),
+            "time" => "time without time zone".to_string(),
+            "timestamp" => "timestamp without time zone".to_string(),
+            "timestamptz" => "timestamp with time zone".to_string(),
+            "decimal" => "numeric".to_string(),
+            _ => normalized,
+        }
     }
 
     fn resolve_grant_target(
@@ -313,11 +318,18 @@ impl Resolver {
                 has_predicate,
                 unique,
             } => {
-                let id = Self::resolve_creation_name(name, state);
+                let table = Self::resolve_lookup_name(relation, state);
+                // PostgreSQL places an unqualified index in the indexed
+                // relation's schema, not the first schema in search_path.
+                let id = if name.schema.is_some() {
+                    Self::resolve_creation_name(name, state)
+                } else {
+                    ObjectId::new(table.schema.clone(), name.name.resolve())
+                };
 
                 mutations.push(Mutation::CreateIndex(CreateIndex {
                     id,
-                    table: Self::resolve_lookup_name(relation, state),
+                    table,
                     if_not_exists: *if_not_exists,
                     concurrently: *concurrently,
                     using_method: using_method.clone(),
@@ -413,11 +425,17 @@ impl Resolver {
                 let id = Self::resolve_lookup_name(&alter_type.name, state);
                 for action_fact in &alter_type.actions {
                     match action_fact {
-                        crate::analysis::facts::AlterTypeActionFact::AddValue { new_value } => {
+                        crate::analysis::facts::AlterTypeActionFact::AddValue {
+                            new_value,
+                            neighbor,
+                            before,
+                        } => {
                             mutations.push(Mutation::AlterType(AlterTypeMutation {
                                 id: id.clone(),
                                 action: AlterTypeActionMutation::AddValue {
                                     new_value: new_value.clone(),
+                                    neighbor: neighbor.clone(),
+                                    before: *before,
                                 },
                             }));
                         }
@@ -597,8 +615,10 @@ impl Resolver {
                             constraint_name: constraint_name.clone(),
                             not_valid: *not_valid,
                         },
-                        AlterTableActionFact::AddUniqueConstraint => {
-                            AlterTableActionMutation::AddUniqueConstraint
+                        AlterTableActionFact::AddUniqueConstraint { constraint_name } => {
+                            AlterTableActionMutation::AddUniqueConstraint {
+                                constraint_name: constraint_name.clone(),
+                            }
                         }
                         AlterTableActionFact::AddPrimaryKeyConstraint => {
                             AlterTableActionMutation::AddPrimaryKeyConstraint
@@ -819,24 +839,7 @@ impl Resolver {
                     normalized_sig.params = normalized_sig
                         .params
                         .into_iter()
-                        .map(|p| {
-                            let p = p.trim().to_lowercase();
-                            match p.as_str() {
-                                "int" | "int4" => "integer".to_string(),
-                                "int8" => "bigint".to_string(),
-                                "int2" => "smallint".to_string(),
-                                "float8" => "double precision".to_string(),
-                                "float4" => "real".to_string(),
-                                "bool" => "boolean".to_string(),
-                                "varchar" => "character varying".to_string(),
-                                "char" => "character".to_string(),
-                                "time" => "time without time zone".to_string(),
-                                "timestamp" => "timestamp without time zone".to_string(),
-                                "timestamptz" => "timestamp with time zone".to_string(),
-                                "decimal" => "numeric".to_string(),
-                                _ => p,
-                            }
-                        })
+                        .map(|p| Self::normalize_function_arg_type(&p))
                         .collect();
                     signatures.push(normalized_sig);
                 }
