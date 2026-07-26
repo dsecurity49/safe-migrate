@@ -2471,19 +2471,45 @@ impl AstVisitor {
 
     fn extract_role(role_ref: &squawk_syntax::ast::RoleRef) -> crate::analysis::facts::RoleFact {
         if let Some(token) = role_ref.ident_token() {
-            crate::analysis::facts::RoleFact::Named {
-                name: token.text().to_string(),
+            let raw = token.text().to_string();
+            let name = if !raw.starts_with('"') {
+                raw.to_lowercase()
+            } else {
+                raw.trim_matches('"').to_string()
+            };
+            return crate::analysis::facts::RoleFact::Named {
+                name,
                 via_legacy_group_syntax: role_ref.group_token().is_some(),
-            }
-        } else if role_ref.current_role_token().is_some() {
-            crate::analysis::facts::RoleFact::CurrentRole
-        } else if role_ref.current_user_token().is_some() {
-            crate::analysis::facts::RoleFact::CurrentUser
-        } else if role_ref.session_user_token().is_some() {
-            crate::analysis::facts::RoleFact::SessionUser
-        } else {
-            crate::analysis::facts::RoleFact::Unknown
+            };
         }
+        if role_ref.current_role_token().is_some() {
+            return crate::analysis::facts::RoleFact::CurrentRole;
+        }
+        if role_ref.current_user_token().is_some() {
+            return crate::analysis::facts::RoleFact::CurrentUser;
+        }
+        if role_ref.session_user_token().is_some() {
+            return crate::analysis::facts::RoleFact::SessionUser;
+        }
+        let via_group = role_ref.group_token().is_some();
+        if let Some(token) = role_ref
+            .syntax()
+            .descendants_with_tokens()
+            .filter_map(|x| x.into_token())
+            .find(|t| t.kind() != SyntaxKind::WHITESPACE && t.kind() != SyntaxKind::COMMENT)
+        {
+            let raw = token.text().to_string();
+            let name = if !raw.starts_with('"') {
+                raw.to_lowercase()
+            } else {
+                raw.trim_matches('"').to_string()
+            };
+            return crate::analysis::facts::RoleFact::Named {
+                name,
+                via_legacy_group_syntax: via_group,
+            };
+        }
+        crate::analysis::facts::RoleFact::Unknown
     }
 
     fn extract_create_role(node: &squawk_syntax::ast::CreateRole) -> Option<StatementFact> {

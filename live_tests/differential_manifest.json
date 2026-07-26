@@ -1249,8 +1249,8 @@
       "rule_dir": "rule_16_broken-compute",
       "enabled": true,
       "fixtures": [
-        "003_drop_func_cascade.sql",
         "005_drop_func_public.sql",
+        "safe_003_drop_func_cascade.sql",
         "safe_003_alter_table.sql",
         "safe_005_drop_table.sql",
         "safe_006_create_index.sql",
@@ -1264,7 +1264,7 @@
       "excluded_fixtures": [
         {
           "fixture": "001_drop_func.sql",
-          "reason": "PostgreSQL correctly rejects dropping sm_core.f() because trigger public.t depends on it; the CASCADE outcome is covered by 003."
+          "reason": "PostgreSQL correctly rejects dropping sm_core.f() because trigger public.t depends on it."
         },
         {
           "fixture": "002_drop_func_if_exists.sql",
@@ -1273,6 +1273,10 @@
         {
           "fixture": "004_drop_func_restrict.sql",
           "reason": "The fixture does not contain RESTRICT and PostgreSQL correctly rejects the dependent function drop without CASCADE."
+        },
+        {
+          "fixture": "safe_003_drop_func_cascade.sql",
+          "reason": "CASCADE on DROP FUNCTION correctly cascades to dependent triggers; the broken-compute rule does not fire because CASCADE is the proper resolution (covered by destructive-general-cascade rule 04)."
         },
         {
           "fixture": "010_drop_func_simple.sql",
@@ -1333,7 +1337,7 @@
         "functions"
       ],
       "fixture_scopes": {
-        "003_drop_func_cascade.sql": [
+        "safe_003_drop_func_cascade.sql": [
           "functions",
           "triggers"
         ],
