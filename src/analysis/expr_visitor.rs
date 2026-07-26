@@ -27,6 +27,21 @@ impl ExprVisitor {
             Expr::SliceExpr(se) => Self::convert_slice_expr(se),
             Expr::FieldExpr(fe) => Self::convert_field_expr(fe),
             Expr::PostfixExpr(pe) => Self::convert_postfix_expr(pe),
+            Expr::Collate(ce) => {
+                let left = ce
+                    .expr()
+                    .map(Self::convert)
+                    .unwrap_or(ExprIr::Literal("<lhs>".into()));
+                let right = ce
+                    .collation_ref()
+                    .map(|c| c.syntax().text().to_string())
+                    .unwrap_or_else(|| "<collation>".into());
+                ExprIr::BinaryOp {
+                    left: Box::new(left),
+                    op: "COLLATE".to_string(),
+                    right: Box::new(ExprIr::Literal(right)),
+                }
+            }
             _ => ExprIr::Literal("<complex>".into()),
         }
     }
@@ -79,7 +94,6 @@ impl ExprVisitor {
             .map(|o| match o {
                 BinOp::And(t) => t.text().to_string(),
                 BinOp::Caret(t) => t.text().to_string(),
-                BinOp::Collate(t) => t.text().to_string(),
                 BinOp::ColonEq(t) => t.text().to_string(),
                 BinOp::Eq(t) => t.text().to_string(),
                 BinOp::FatArrow(t) => t.text().to_string(),

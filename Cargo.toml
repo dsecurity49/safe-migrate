@@ -10,10 +10,9 @@ keywords = ["postgres", "migration", "linter", "ast", "database"]
 categories = ["command-line-utilities", "database"]
 
 [dependencies]
-squawk-syntax = "=2.58.0"
-squawk-linter = "=2.58.0"
-squawk-lexer  = "=2.58.0"
-squawk-parser = "=2.58.0"
+squawk-syntax = "=2.61.0"
+squawk-lexer  = "=2.61.0"
+squawk-parser = "=2.61.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.8"
