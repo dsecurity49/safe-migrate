@@ -135,65 +135,47 @@ fn replace_cache(temp_file: NamedTempFile, out_path: &Path) -> Result<()> {
 
 pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result<DbCache> {
     let mut cache = DbCache::new();
+    let schema_values = schemas.map(|items| items.to_vec());
 
-    let schema_filter = if let Some(s) = schemas {
-        format!("AND n.nspname = ANY(ARRAY['{}'])", s.join("','"))
-    } else {
-        "".to_string()
-    };
-
-    let schema_filter_with_fk = if let Some(s) = schemas {
-        let arr = format!("ARRAY['{}']", s.join("','"));
-        format!(
-            "AND (
-            n.nspname = ANY({arr})
+    let schema_filter = "AND ($1::text[] IS NULL OR n.nspname = ANY($1))";
+    let schema_filter_with_fk = r#"
+        AND (
+            $1::text[] IS NULL
+            OR n.nspname = ANY($1)
             OR c.oid IN (
                 SELECT conrelid FROM pg_constraint cst
                 JOIN pg_class c2 ON c2.oid = cst.confrelid
                 JOIN pg_namespace n2 ON n2.oid = c2.relnamespace
-                WHERE n2.nspname = ANY({arr})
+                WHERE n2.nspname = ANY($1)
             )
             OR c.oid IN (
                 SELECT confrelid FROM pg_constraint cst
                 JOIN pg_class c2 ON c2.oid = cst.conrelid
                 JOIN pg_namespace n2 ON n2.oid = c2.relnamespace
-                WHERE n2.nspname = ANY({arr})
+                WHERE n2.nspname = ANY($1)
             )
-        )"
         )
-    } else {
-        "".to_string()
-    };
-
-    let schema_filter_n1_or_n2 = if let Some(s) = schemas {
-        let arr = format!("ARRAY['{}']", s.join("','"));
-        format!("AND (n1.nspname = ANY({arr}) OR n2.nspname = ANY({arr}))")
-    } else {
-        "".to_string()
-    };
-
-    let schema_filter_nt = if let Some(s) = schemas {
-        let arr = format!("ARRAY['{}']", s.join("','"));
-        format!(
-            "AND (
-            n_t.nspname = ANY({arr})
+    "#;
+    let schema_filter_n1_or_n2 =
+        "AND ($1::text[] IS NULL OR n1.nspname = ANY($1) OR n2.nspname = ANY($1))";
+    let schema_filter_nt = r#"
+        AND (
+            $1::text[] IS NULL
+            OR n_t.nspname = ANY($1)
             OR t.oid IN (
                 SELECT conrelid FROM pg_constraint cst
                 JOIN pg_class c2 ON c2.oid = cst.confrelid
                 JOIN pg_namespace n2 ON n2.oid = c2.relnamespace
-                WHERE n2.nspname = ANY({arr})
+                WHERE n2.nspname = ANY($1)
             )
             OR t.oid IN (
                 SELECT confrelid FROM pg_constraint cst
                 JOIN pg_class c2 ON c2.oid = cst.conrelid
                 JOIN pg_namespace n2 ON n2.oid = c2.relnamespace
-                WHERE n2.nspname = ANY({arr})
+                WHERE n2.nspname = ANY($1)
             )
-        )"
         )
-    } else {
-        "".to_string()
-    };
+    "#;
 
     // Query 1: Server Version
     let version_row = client.query_one("SHOW server_version_num;", &[])?;
@@ -228,7 +210,7 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
     "
     );
 
-    for row in client.query(&table_query, &[])? {
+    for row in client.query(&table_query, &[&schema_values])? {
         let schema_name: String = row.get("schema_name");
         let relation_name: String = row.get("relation_name");
         let relkind: i8 = row.get("relation_kind");
@@ -317,7 +299,7 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
     let mut current_object_id: Option<ObjectId> = None;
     let mut current_rel: Option<*mut crate::model::relation::RelationState> = None;
 
-    for row in client.query(&col_query, &[])? {
+    for row in client.query(&col_query, &[&schema_values])? {
         let schema_name: String = row.get("schema_name");
         let relation_name: String = row.get("relation_name");
         let column_name: String = row.get("column_name");
@@ -376,7 +358,7 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
         GROUP BY n.nspname, c.relname;
     ");
 
-    for row in client.query(&tp_query, &[])? {
+    for row in client.query(&tp_query, &[&schema_values])? {
         let schema_name: String = row.get("schema_name");
         let relation_name: String = row.get("relation_name");
         let triggers: Vec<String> = row.get("triggers");
@@ -411,7 +393,7 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
         "
     );
 
-    for row in client.query(&acl_query, &[])? {
+    for row in client.query(&acl_query, &[&schema_values])? {
         let schema_name: String = row.get("schema_name");
         let relation_name: String = row.get("relation_name");
         let grantee: String = row.get("grantee");
@@ -458,7 +440,7 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
     "
     );
 
-    for row in client.query(&trig_query, &[])? {
+    for row in client.query(&trig_query, &[&schema_values])? {
         let table_schema: String = row.get("table_schema");
         let table_name: String = row.get("table_name");
         let trigger_name: String = row.get("trigger_name");
@@ -495,7 +477,7 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
         "
     );
 
-    for row in client.query(&constraint_query, &[])? {
+    for row in client.query(&constraint_query, &[&schema_values])? {
         let table_schema: String = row.get("table_schema");
         let table_name: String = row.get("table_name");
         let constraint_name: String = row.get("constraint_name");
@@ -536,7 +518,7 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
     "
     );
 
-    for row in client.query(&fk_query, &[])? {
+    for row in client.query(&fk_query, &[&schema_values])? {
         let constraint_name: String = row.get("constraint_name");
         let from_schema: String = row.get("from_schema");
         let from_table: String = row.get("from_table");
@@ -586,7 +568,7 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
     "
     );
 
-    for row in client.query(&idx_query, &[])? {
+    for row in client.query(&idx_query, &[&schema_values])? {
         let index_schema: String = row.get("index_schema");
         let index_name: String = row.get("index_name");
         let table_schema: String = row.get("table_schema");
@@ -622,7 +604,7 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
     "
     );
 
-    for row in client.query(&func_query, &[])? {
+    for row in client.query(&func_query, &[&schema_values])? {
         let schema_name: String = row.get("schema_name");
         let func_name: String = row.get("func_name");
         let arg_types_str: String = row.get("arg_types");
@@ -698,7 +680,7 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
         "
     );
 
-    for row in client.query(&type_query, &[])? {
+    for row in client.query(&type_query, &[&schema_values])? {
         let schema_name: String = row.get("schema_name");
         let type_name: String = row.get("type_name");
         let type_kind: String = row.get("type_kind");
@@ -725,7 +707,6 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
     }
 
     // Query 9: Dependencies (pg_depend)
-    let dependency_schemas = schemas.map(|items| items.to_vec());
     let depend_query = r#"
         SELECT
             d.classid, d.objid, d.objsubid,
@@ -758,7 +739,7 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
           )
     "#;
 
-    for row in client.query(depend_query, &[&dependency_schemas])? {
+    for row in client.query(depend_query, &[&schema_values])? {
         let classid: u32 = row.get(0);
         let objid: u32 = row.get(1);
         let objsubid: i32 = row.get(2);
@@ -814,7 +795,7 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
           )
     "#;
 
-    for row in client.query(view_depend_query, &[&dependency_schemas])? {
+    for row in client.query(view_depend_query, &[&schema_values])? {
         cache.dependencies.push(crate::db::cache::DependencyCache {
             classid: row.get(0),
             objid: row.get(1),
