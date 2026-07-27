@@ -9,7 +9,7 @@ safe-migrate/
 ├── src/
 │   ├── analysis/                 # State machine simulator
 │   │   ├── expr_ir.rs            # Expression intermediate representation
-│   │   ├── expr_visitor.rs       # Expression AST visitor (squawk_syntax 2.58.0)
+│   │   ├── expr_visitor.rs       # Expression AST visitor (squawk_syntax 2.61.0)
 │   │   ├── facts.rs              # Fact extraction results
 │   │   ├── graph.rs              # Dependency graphs (FK, indexes, partitions, views, triggers, publications)
 │   │   ├── mutations.rs          # Mutation types and resolution
@@ -129,7 +129,7 @@ safe-migrate/
 │   ├── ci.yml                    # Test on push/PR, cargo fmt/clippy checks
 │   └── release.yml               # Build & release multi-platform binaries on tag
 │
-├── Cargo.toml                    # v0.4.1, squawk-syntax = "=2.58.0"
+├── Cargo.toml                    # v0.4.2, squawk-syntax = "=2.61.0"
 ├── Cargo.lock
 ├── README.md
 ├── CHANGELOG.md
@@ -145,9 +145,9 @@ safe-migrate/
 `docs/ast-reference/` is verified directly against the actual squawk source in Cargo's registry cache — no intermediate dump file is kept or committed. To locate the source for a given version:
 
 ```bash
-find ~/.cargo/registry/src -type d -name "squawk-syntax-2.58.0"
-find ~/.cargo/registry/src -type d -name "squawk-lexer-2.58.0"
-find ~/.cargo/registry/src -type d -name "squawk-parser-2.58.0"
+find ~/.cargo/registry/src -type d -name "squawk-syntax-2.61.0"
+find ~/.cargo/registry/src -type d -name "squawk-lexer-2.61.0"
+find ~/.cargo/registry/src -type d -name "squawk-parser-2.61.0"
 ```
 
 Read the `.rs` files in those directories directly when verifying or updating an AST reference doc. Do not guess accessor names from memory — confirm against the actual source before documenting or relying on a method signature.
@@ -249,7 +249,7 @@ If you need to extract information from a new DDL statement:
 ## Running Tests
 
 ```bash
-cargo test                      # Full test suite (327 tests)
+cargo test                      # Full test suite (344 tests)
 cargo test rule_evaluation      # Just rule tests
 cargo test architectural_gap    # Just simulator/state machine tests
 cargo test chain_execution      # Just multi-file chain tests
@@ -268,7 +268,7 @@ cargo run -- lint --file test.sql                  # With cache
 
 ### live_tests/ — end-to-end suite
 
-`live_tests/` runs the compiled binary against 533 SQL fixtures across all 26 rule directories. It does not use `cargo test` — it shells out to the binary directly and parses JSON output.
+`live_tests/` runs the compiled binary against 510 SQL fixtures across all 26 rule directories. It does not use `cargo test` — it shells out to the binary directly and parses JSON output.
 
 ```bash
 cd live_tests

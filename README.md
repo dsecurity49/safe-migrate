@@ -1,4 +1,4 @@
-# safe-migrate v0.4.1
+# safe-migrate v0.4.2
 
 A PostgreSQL migration linter that **executes a bi-directional state machine simulation** over your SQL, combining static typed AST analysis with live database statistics to prevent blocking locks before they reach production.
 
@@ -6,20 +6,16 @@ A PostgreSQL migration linter that **executes a bi-directional state machine sim
 
 ---
 
-## What's New in v0.4.1
+## What's New in v0.4.2
 
-v0.4.1 is a correctness and feature release. 5 state-machine bugs fixed, interactive TUI mode added, schema-scoped sync, binary+compressed cache, FK-dependency violation markers, and a typed `OperationKind`/`ObjectKind` taxonomy across all 26 rules. The 5055-line test monolith has been split into 13 focused integration test files.
+v0.4.2 upgrades the squawk parser to 2.61.0, adds `pg_depend`-based dependency tracking, and introduces a differential test harness that compares the simulator against real PostgreSQL dry-runs across all 26 rules.
 
 Highlights:
-- **Interactive TUI** (`-i`/`--interactive`): full-screen violation browser via `crossterm`, `EnterAlternateScreen`, RAII terminal guard
-- **Schema-scoped sync** (`--schemas`): restrict sync to named schemas; FK dependencies pulled cross-schema automatically and annotated in violations
-- **Binary cache**: on-disk cache is now `bincode` + `zstd` streaming (replaces JSON); atomic write via `encoder.finish()?`
-- `CreateType`/`CreateDomain` now correctly allow re-creation after a `DROP` (was blocked by stale `TypeOverlay::Dropped` entries)
-- Partition cycle detection wired: `ATTACH PARTITION` that would create a cycle now taints confidence instead of corrupting the graph
-- `is_lossy_varchar_narrowing` correctly handles Postgres unbounded `atttypmod = -1`
-- `DropType` tracked end-to-end through AST → facts → mutations → state → drift detection
-- `Violation.fk_dependency_related` field annotates violations touching FK-pulled baseline tables
-- 327 passing tests (up from 235)
+- **Parser upgrade**: squawk-{syntax,lexer,parser} 2.58.0 → 2.61.0; full AST extraction migration to `PathRef`/`NameRef`/`descendants_with_tokens()` API
+- **Dependency tracking**: `safe-migrate sync` queries `pg_depend` and builds a `DependencyCache`; 9 graph edge types consolidated into unified `DependencyEdge`/`DependencyKind`
+- **Differential harness**: `tests/live_differential_harness.rs` + `live_tests/` manifest and baseline — 0 mismatches across all 26 rules
+- **Bug fixes**: `DropSchema` without `CASCADE` correctly returns conflict; cache format version validated at decode; role name extraction handles keyword tokens (`PUBLIC_KW`, `GROUP_KW`) with PostgreSQL case-folding
+- 344 passing unit tests; 510 live_tests fixtures pass
 
 ### ✅ Live Database Statistics Integration
 
@@ -584,7 +580,7 @@ lint-migrations:
 
 ## live_tests/ — End-to-End Integration Suite
 
-`live_tests/` is an exhaustive end-to-end suite that runs the compiled `safe-migrate` binary against 533 SQL migration fixtures across all 26 rule directories. It validates the AST parser, state machine, and rule evaluators in combination — not just unit logic.
+`live_tests/` is an exhaustive end-to-end suite that runs the compiled `safe-migrate` binary against 510 SQL migration fixtures across all 26 rule directories. It validates the AST parser, state machine, and rule evaluators in combination — not just unit logic.
 
 ```bash
 cd live_tests

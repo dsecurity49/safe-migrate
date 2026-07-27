@@ -2,6 +2,38 @@
 
 All notable changes to safe-migrate are documented here.
 
+## v0.4.2
+
+Internal correctness and infrastructure release. Upgraded squawk-parser 2.58.0 → 2.61.0, added `pg_depend`-based dependency tracking, and built a differential test harness that compares simulator output against real PostgreSQL dry-runs across all 26 rules.
+
+**Parser upgrade:**
+
+- squawk-{syntax,lexer,parser} pinned to 2.61.0; squawk-linter removed from dependencies
+- Full AST extraction migration to new API: `PathRef`/`NameRef`/`descendants_with_tokens()` replacing direct `Path`/`Name` casts
+- `Collate` expression moved from `BinOp::Collate` to `Expr::Collate` variant
+
+**Dependency tracking:**
+
+- `safe-migrate sync` now queries `pg_depend` and builds a `DependencyCache` in the model
+- Consolidated 9 ad-hoc graph edge types into unified `DependencyEdge`/`DependencyKind`
+
+**Differential test harness:**
+
+- `tests/live_differential_harness.rs`: compares simulator `MutationResult` against PostgreSQL's actual dry-run outcome
+- `live_tests/` expanded with `differential_manifest.json`, `differential_baseline.sql`, and `scripts/live-differential` runner
+- Covers all 26 rules with per-rule scope/schema configuration; 0 mismatches in cached mode
+
+**Bug fixes:**
+
+- `DropSchema` without `CASCADE` now returns `MutationResult::Conflict` when the schema still contains relations, types, sequences, functions, or triggers — matching PostgreSQL runtime behavior
+- Cache format version (`CACHE_FORMAT_VERSION`) now validated at decode time instead of being a dead constant
+- Grant/Revoke role extraction: keyword tokens (`PUBLIC_KW`, `GROUP_KW`) handled via `descendants_with_tokens()` fallback with proper PostgreSQL case-folding (unquoted → lowercase, quoted → preserve case)
+- Orphaned `003_drop_func_cascade.sql` fixture removed; restored as `safe_` pattern since `CASCADE` correctly resolves trigger dependencies
+
+**Test suite:**
+
+- 344 unit tests (up from 302); 510 live_tests SQL fixtures pass across all 26 rule directories
+
 ## v0.4.1
 
 Correctness and stability release. 5 bugs fixed across the state machine, cache layer, and test suite. Test suite expanded from 235 to 302 tests via a comprehensive integration test modularization (13 new test files under `tests/`). Adds interactive TUI mode, schema-scoped sync, typed operation taxonomy, binary+compressed cache, and FK-dependency violation markers.
