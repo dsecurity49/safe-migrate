@@ -64,6 +64,7 @@ fn test_cli_json_is_machine_clean_and_marks_missing_baseline_tainted() {
 
     assert_eq!(report["schema_version"], 1);
     assert_eq!(report["confidence"], "Tainted");
+    assert_eq!(report["baseline"]["status"], "unavailable");
     assert!(report["violations"].is_array());
     assert!(!String::from_utf8_lossy(&output.stdout).contains("[ INFO ]"));
     assert!(String::from_utf8_lossy(&output.stderr).contains("--no-cache passed"));
@@ -146,6 +147,8 @@ fn test_cli_auto_sync_failure_continues_without_a_cache() {
     let output = assert.get_output();
     let report = parse_json_stdout(output);
     assert_eq!(report["confidence"], "Tainted");
+    assert_eq!(report["baseline"]["status"], "unavailable");
+    assert_eq!(report["baseline"]["auto_sync"], "failed");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("Automatic cache sync failed"));
     assert!(stderr.contains("No usable cache is available"));
@@ -175,7 +178,10 @@ fn test_cli_auto_sync_failure_uses_the_previous_cache() {
         .success();
 
     let output = assert.get_output();
-    assert_eq!(parse_json_stdout(output)["confidence"], "Exact");
+    let report = parse_json_stdout(output);
+    assert_eq!(report["confidence"], "Tainted");
+    assert_eq!(report["baseline"]["status"], "stale");
+    assert_eq!(report["baseline"]["auto_sync"], "failed");
     assert!(String::from_utf8_lossy(&output.stderr).contains("Continuing with the previous cache"));
 }
 

@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use safe_migrate::analysis::state::Confidence;
+use safe_migrate::db::cache::CacheMetadata;
 use safe_migrate::db::cache_file::unprotect_cache_bytes;
 use safe_migrate::report::violations::Violation;
 use safe_migrate::sync;
@@ -9,7 +10,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const CACHE_STALE_AFTER_SECS: u64 = 7 * 24 * 60 * 60;
 const EXIT_BLOCKING_FINDINGS: i32 = 2;
 
 #[derive(Parser, Debug)]
@@ -92,6 +92,33 @@ enum OutputMode {
     Interactive,
 }
 
+#[derive(Clone, Copy)]
+enum AutoSyncOutcome {
+    NotRequested,
+    Refreshed,
+    Failed,
+    Bypassed,
+}
+
+impl AutoSyncOutcome {
+    fn label(self) -> &'static str {
+        match self {
+            Self::NotRequested => "not_requested",
+            Self::Refreshed => "refreshed",
+            Self::Failed => "failed",
+            Self::Bypassed => "bypassed",
+        }
+    }
+}
+
+struct PreparedCache {
+    cache: DbCache,
+    baseline_unknown: bool,
+    baseline_stale: bool,
+    auto_sync: AutoSyncOutcome,
+    metadata: CacheMetadata,
+}
+
 impl OutputMode {
     fn from_flags(json: bool, interactive: bool) -> Self {
         if json {
@@ -159,7 +186,13 @@ fn run_lint(
     let sql = fs::read_to_string(file)
         .with_context(|| format!("Failed to read migration file: {}", file.display()))?;
     let config = load_config(config_path)?;
-    let (db_cache, baseline_unknown) = prepare_cache(&config, cache, no_cache)?;
+    let PreparedCache {
+        cache: db_cache,
+        baseline_unknown,
+        baseline_stale,
+        auto_sync,
+        metadata,
+    } = prepare_cache(&config, cache, no_cache)?;
 
     eprintln!("Analyzing migration: {}", file.display());
 
@@ -167,7 +200,15 @@ fn run_lint(
     let mut state = AnalysisState::with_baseline(db_cache, !baseline_unknown);
     let violations = engine.analyze(&sql, &mut state).map_err(analysis_error)?;
 
-    finish_analysis(violations, &mut state, baseline_unknown, output_mode)
+    finish_analysis(
+        violations,
+        &mut state,
+        baseline_unknown,
+        baseline_stale,
+        auto_sync,
+        metadata,
+        output_mode,
+    )
 }
 
 fn run_lint_chain(
@@ -203,7 +244,13 @@ fn run_lint_chain(
     }
 
     let config = load_config(config_path)?;
-    let (db_cache, baseline_unknown) = prepare_cache(&config, cache, no_cache)?;
+    let PreparedCache {
+        cache: db_cache,
+        baseline_unknown,
+        baseline_stale,
+        auto_sync,
+        metadata,
+    } = prepare_cache(&config, cache, no_cache)?;
 
     eprintln!("Analyzing migration chain in: {}", dir.display());
 
@@ -213,7 +260,15 @@ fn run_lint_chain(
         .analyze_chain(&migrations, &mut state)
         .map_err(analysis_error)?;
 
-    finish_analysis(violations, &mut state, baseline_unknown, output_mode)
+    finish_analysis(
+        violations,
+        &mut state,
+        baseline_unknown,
+        baseline_stale,
+        auto_sync,
+        metadata,
+        output_mode,
+    )
 }
 
 fn run_sync(out: &Path, config_path: &Path, schemas: Option<&[String]>) -> Result<()> {
@@ -235,63 +290,77 @@ fn load_config(path: &Path) -> Result<Config> {
         .with_context(|| format!("Failed to load configuration: {}", path.display()))
 }
 
-fn prepare_cache(config: &Config, cache: &Path, no_cache: bool) -> Result<(DbCache, bool)> {
-    maybe_auto_sync(config, cache, no_cache);
-    warn_if_stale_cache(cache, no_cache);
-    load_cache(cache, no_cache, config.cache_encryption)
+fn prepare_cache(config: &Config, cache: &Path, no_cache: bool) -> Result<PreparedCache> {
+    let auto_sync = maybe_auto_sync(config, cache, no_cache);
+    let (cache, baseline_unknown) = load_cache(cache, no_cache, config.cache_encryption)?;
+    let baseline_stale =
+        warn_if_stale_cache(&cache.metadata, baseline_unknown, config.stale_stats_days);
+    let metadata = cache.metadata.clone();
+    Ok(PreparedCache {
+        cache,
+        baseline_unknown,
+        baseline_stale,
+        auto_sync,
+        metadata,
+    })
 }
 
-fn maybe_auto_sync(config: &Config, cache: &Path, no_cache: bool) {
+fn maybe_auto_sync(config: &Config, cache: &Path, no_cache: bool) -> AutoSyncOutcome {
     if !config.auto_sync {
-        return;
+        return AutoSyncOutcome::NotRequested;
     }
 
     if no_cache {
         eprintln!("[ INFO ] --no-cache bypasses configured automatic cache sync.");
-        return;
+        return AutoSyncOutcome::Bypassed;
     }
 
     eprintln!(
         "[ INFO ] Automatic cache sync enabled. Refreshing {}.",
         cache.display()
     );
-    if let Err(error) = sync::sync_cache(cache, config.schemas.as_deref(), config.cache_encryption)
-    {
-        eprintln!("[ WARN ] Automatic cache sync failed: {error}");
-        if cache.exists() {
-            eprintln!("         Continuing with the previous cache.");
-        } else {
-            eprintln!("         No usable cache is available; continuing with uncertain analysis.");
+    match sync::sync_cache(cache, config.schemas.as_deref(), config.cache_encryption) {
+        Ok(()) => AutoSyncOutcome::Refreshed,
+        Err(error) => {
+            eprintln!("[ WARN ] Automatic cache sync failed: {error}");
+            if cache.exists() {
+                eprintln!("         Continuing with the previous cache.");
+            } else {
+                eprintln!(
+                    "         No usable cache is available; continuing with uncertain analysis."
+                );
+            }
+            AutoSyncOutcome::Failed
         }
     }
 }
 
-fn warn_if_stale_cache(cache: &Path, no_cache: bool) {
-    if no_cache || !cache.exists() {
-        return;
+fn warn_if_stale_cache(metadata: &CacheMetadata, baseline_unknown: bool, stale_days: u64) -> bool {
+    if baseline_unknown {
+        return false;
     }
 
-    let Ok(metadata) = fs::metadata(cache) else {
-        return;
-    };
-    let Ok(modified) = metadata.modified() else {
-        return;
+    let Some(created_at) = metadata.created_at_unix_secs else {
+        eprintln!(
+            "[ WARN ] Cache has no creation timestamp. Refresh it before relying on baseline-aware results."
+        );
+        return true;
     };
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let modified = modified
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    if now.saturating_sub(modified) > CACHE_STALE_AFTER_SECS {
+    let age = now.saturating_sub(created_at);
+    if age > stale_days.saturating_mul(24 * 60 * 60) {
         eprintln!(
-            "[ WARN ] Database stats cache ({}) is over 7 days old.",
-            cache.display()
+            "[ WARN ] Database cache is {} days old (configured limit: {} days).",
+            age / (24 * 60 * 60),
+            stale_days
         );
         eprintln!("         Run `safe-migrate sync` to refresh lock evaluations.");
+        true
+    } else {
+        false
     }
 }
 
@@ -346,11 +415,14 @@ fn finish_analysis(
     violations: Vec<Violation>,
     state: &mut AnalysisState,
     baseline_unknown: bool,
+    baseline_stale: bool,
+    auto_sync: AutoSyncOutcome,
+    metadata: CacheMetadata,
     output_mode: OutputMode,
 ) -> Result<()> {
     // Preserve worst-case rule evaluation for an empty baseline, then disclose
     // that the final report has no verified database baseline.
-    if baseline_unknown {
+    if baseline_unknown || baseline_stale || matches!(auto_sync, AutoSyncOutcome::Failed) {
         state.local.confidence = Confidence::Tainted;
     }
 
@@ -360,7 +432,14 @@ fn finish_analysis(
             Reporter::print_report(&violations, &state.local.confidence);
         }
         OutputMode::Json => {
-            let report = Reporter::json_report(&violations, &state.local.confidence);
+            let mut report = Reporter::json_report(&violations, &state.local.confidence);
+            report["baseline"] = serde_json::json!({
+                "status": if baseline_unknown { "unavailable" } else if baseline_stale { "stale" } else { "available" },
+                "created_at_unix_secs": metadata.created_at_unix_secs,
+                "source_database": metadata.source_database,
+                "schemas": metadata.schemas,
+                "auto_sync": auto_sync.label(),
+            });
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         OutputMode::Interactive => {

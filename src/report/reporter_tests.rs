@@ -101,6 +101,14 @@ mod tests {
     }
 
     #[test]
+    fn test_tainted_safe_verdict_requires_review() {
+        assert_eq!(
+            Verdict::Safe.recommendation(&Confidence::Tainted),
+            "no blocking finding, but baseline evidence is uncertain — review before deploying"
+        );
+    }
+
+    #[test]
     fn test_no_color_toggling() {
         unsafe {
             std::env::set_var("NO_COLOR", "1");

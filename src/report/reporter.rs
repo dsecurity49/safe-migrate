@@ -23,7 +23,10 @@ impl Verdict {
         }
     }
 
-    pub fn recommendation(&self) -> &'static str {
+    pub fn recommendation(&self, confidence: &Confidence) -> &'static str {
+        if confidence == &Confidence::Tainted && !matches!(self, Verdict::Halt) {
+            return "no blocking finding, but baseline evidence is uncertain — review before deploying";
+        }
         match self {
             Verdict::Halt => "do not deploy",
             Verdict::Cautious => "review warnings before deploy",
@@ -246,7 +249,7 @@ impl Reporter {
         summary_table.add_row(vec!["Verdict", &format!(": {}", verdict.label())]);
         summary_table.add_row(vec![
             "Recommendation",
-            &format!(": {}", verdict.recommendation()),
+            &format!(": {}", verdict.recommendation(confidence)),
         ]);
         summary_table.add_row(vec!["HALT (Tier 1)", &format!(": {}", tier1)]);
         summary_table.add_row(vec!["WARN (Tier 2)", &format!(": {}", tier2)]);
