@@ -1,649 +1,207 @@
 # safe-migrate v0.4.3
 
-A PostgreSQL migration linter that **executes a bi-directional state machine simulation** over your SQL, combining static typed AST analysis with live database statistics to prevent blocking locks before they reach production.
+safe-migrate lint-checks PostgreSQL migrations by simulating their schema
+changes. A synced local cache supplies production schema metadata and row-count
+estimates for checks whose severity depends on the current database.
 
-**The Problem:** `ALTER TABLE users ADD COLUMN status TEXT` is safe on 500 rows. On 50M rows, it acquires an `ACCESS EXCLUSIVE` lock that takes down your app. Standard linters only look at the SQL. **safe-migrate looks at the SQL AND the size of the tables it affects.**
+It is a safety aid, not a substitute for testing a migration on a representative
+database or for planning application-level rollout and backfill work.
 
----
-
-## What's New in v0.4.3
-
-v0.4.3 makes safe-migrate easier to use safely in CI and scripts. JSON reports
-are now machine-clean and versioned, blocking findings have a dedicated exit
-status, and offline analysis is explicitly labelled as uncertain.
-
-Highlights:
-- **Stable JSON v1**: `lint --json` and `lint-chain --json` write exactly one
-  JSON document to standard output, with `schema_version: 1`.
-- **CI exit status**: completed analysis with a Tier 1 finding exits with
-  status `2`; operational failures remain status `1`.
-- **Clear confidence**: runs without a cache are reported as `Tainted` while
-  retaining conservative worst-case rule evaluation.
-- **Contributor docs**: the stale Squawk 2.58 AST snapshot was replaced with
-  source-first AST development and architecture guides.
-
-### ✅ Live Database Statistics Integration
-
-The `sync` command reads from PostgreSQL's catalog:
-- `pg_class.reltuples` — estimated row counts
-- `pg_class.relpages` — page estimates for TOAST threshold crossing
-- `pg_stat_user_tables.last_analyze` — staleness detection
-- `pg_attribute.avg_width` — column width for compression decisions
-- Foreign key graph, index mappings, partition hierarchies
-
-**No application credentials needed** — `sync` only requires `SELECT` on catalog tables.
-
----
-
-## Installation
-
-### From Binary (Recommended)
+## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/dsecurity49/safe-migrate/main/install.sh | bash
+cargo install safe-migrate --locked
 ```
 
-Supports:
-- Linux (x86_64, ARM64, musl)
-- macOS (Intel, Apple Silicon)
-- Windows (x86_64)
+Or build this checkout with `cargo build --locked`.
 
-### From Cargo
+## Quick start
 
-```bash
-cargo install safe-migrate
-```
-
----
-
-## Quick Start
-
-### Step 1: Sync Database Statistics
+Sync a local baseline before linting migrations that touch existing objects:
 
 ```bash
-export DATABASE_URL="postgres://user:password@localhost:5432/mydb"
+export DATABASE_URL='postgres://readonly_user:password@localhost:5432/app'
 safe-migrate sync
+safe-migrate lint --file migrations/20260727_add_status.sql
 ```
 
-Creates `.safe-migrate.cache` with table sizes, object names, column metadata,
-constraints, dependencies, and indexes. The cache contains no database
-credentials by design, but it is schema metadata: review it before committing
-or sharing it outside the team.
+`sync` writes `.safe-migrate.cache` by default. It reads PostgreSQL catalog
+metadata and needs a database role able to read those catalogs; do not put
+`DATABASE_URL` or its credentials in `safe-migrate.toml`.
 
-**TLS warning:** When `DATABASE_URL` points to a non-localhost host, safe-migrate emits a warning that the connection is unencrypted. Use `sslmode=require` in your connection string or an SSH tunnel for production databases.
+Remote `DATABASE_URL` values must include `sslmode=require`; safe-migrate uses
+the system TLS trust store and refuses an unencrypted remote connection. Local
+TCP and Unix-socket connections remain supported.
 
-**Cache freshness:** Warnings if older than 7 days (configurable). Stale stats are flagged in the report.
+`lint` and `lint-chain` are offline commands. They never need to connect to
+PostgreSQL unless `auto_sync = true` is configured.
 
-### Step 2: Lint Your Migration
+## Confidence and exit status
 
-```bash
-safe-migrate lint --file migration.sql
-```
+Reports carry a confidence value:
 
-Output:
+| Confidence | Meaning |
+|---|---|
+| `Exact` | The simulator remained consistent with the available baseline and SQL. |
+| `Tainted` | The cache/baseline is unavailable or stale, automatic refresh failed, or analysis encountered an uncertain transition. Review before deployment. |
 
-```
-┌────────────────────────────────────────────────────────────────┐
-│ safe-migrate lint                                              │
-╞════════════════════════════════════════════════════════════════╡
-│ Verdict: HALT       Confidence: Exact                          │
-│ HALT: 1   WARN: 1   SAFE: 0                                    │
-└────────────────────────────────────────────────────────────────┘
+Without a cache, safe-migrate still evaluates visible DDL using conservative
+defaults. It does not invent baseline-comparison findings such as
+`schema-drift` when no baseline exists.
 
- [HALT] blocking-constraint
-   object : table public.orders
-   reason : synchronous FOREIGN KEY constraint addition locks public.orders and public.auth_users
-   recipe : Add it as NOT VALID first, then VALIDATE in a separate transaction.
-   sql    : ALTER TABLE orders ADD CONSTRAINT fk_user FOREIGN KEY (user_id) REFERENCES auth_users(id);
+- Exit `0`: analysis completed with no Tier 1 finding.
+- Exit `1`: invocation, configuration, cache, parser, or internal failure.
+- Exit `2`: analysis completed and found one or more Tier 1 findings.
 
- ──────────────────────────────────────────────────
-
- [WARN] require-concurrent-index
-   object : index public.idx_orders_user
-   reason : synchronous index creation on public.orders can block writes
-   recipe : Add the CONCURRENTLY keyword.
-   sql    : CREATE INDEX idx_orders_user ON orders(user_id);
-
-┌────────────────────────────────────────────────────────────────┐
-│ SUMMARY                                                        │
-╞════════════════════════════════════════════════════════════════╡
-│ Verdict                 : HALT                                 │
-│ Recommendation          : do not deploy                        │
-│ HALT (Tier 1)           : 1                                    │
-│ WARN (Tier 2)           : 1                                    │
-│ SAFE (Tier 3)           : 0                                    │
-└────────────────────────────────────────────────────────────────┘
-```
-
-Exit code: **2** (Tier 1 violation) → CI build fails. Exit code **1** means an
-operational failure such as invalid input, configuration, or cache data.
-
----
-
-## The Trust Model
-
-### Confidence Levels
-
-| Level | Meaning | When It Happens |
-|-------|---------|-----------------|
-| **Exact** | The simulator remained consistent with the supplied SQL and baseline | No opaque or unresolved transitions |
-| **Tainted** | The baseline or one or more transitions is uncertain | Missing cache, `DO` blocks, `EXECUTE`, dynamic SQL |
-
-When confidence is `Tainted`, safe-migrate still evaluates all visible DDL and
-reports the uncertainty. A missing cache uses conservative worst-case
-assumptions; taint from opaque or unresolved SQL can downgrade findings whose
-severity relies on an unknown state transition.
-
-### Version-Gating
-
-safe-migrate detects your PostgreSQL version from the cache and applies version-specific rules:
-
-**Example: Constant DEFAULT on ADD COLUMN**
-
-```sql
-ALTER TABLE orders ADD COLUMN status VARCHAR(20) DEFAULT 'pending';
-```
-
-- **PG 11+**: Metadata-only, no rewrite → ✅ Safe (Tier 3)
-- **PG <11**: Table rewrite → ⚠️ Warning (Tier 2 for small tables, Tier 1 for large)
-
-The rule reads `pg_version_num` from the cache and applies the correct threshold.
-
-### Cache Staleness
-
-Tables without recent `ANALYZE`:
-- Flagged as `[WARNING: Based on stale statistics]`
-- Treated conservatively (assume Tier 2+ severity)
-- Still evaluated (not suppressed)
-
-Example:
-
-```
-[WARN] [TIER 2 - WARNING] Table statistics are stale. Lock evaluations may be 
-                          inaccurate.
-                          Rule:   blocking-constraint
-                          Recipe: Run ANALYZE to ensure accurate row estimates.
-```
-
----
-
-## Rules Reference
-
-All 26 rules with examples:
-
-### 1. **blocking-constraint** (Tier 1)
-Adding a valid `CHECK` or `FOREIGN KEY` constraint scans the entire table with an `ACCESS EXCLUSIVE` lock.
-
-```sql
-ALTER TABLE orders ADD CONSTRAINT fk_user 
-  FOREIGN KEY (user_id) REFERENCES users(id);
-```
-
-**Safe alternative:**
-```sql
-ALTER TABLE orders ADD CONSTRAINT fk_user 
-  FOREIGN KEY (user_id) REFERENCES users(id) NOT VALID;
--- Later, in a separate migration:
-ALTER TABLE orders VALIDATE CONSTRAINT fk_user;
-```
-
-### 2. **size-aware-add-column** (Tier 1)
-Adding a column with a volatile `DEFAULT` requires a table rewrite, even on PG11+.
-
-```sql
-ALTER TABLE orders ADD COLUMN created_at TIMESTAMP DEFAULT NOW();  -- REWRITE
-ALTER TABLE orders ADD COLUMN id UUID DEFAULT gen_random_uuid();   -- REWRITE
-```
-
-**Safe alternative (PG11+):**
-```sql
-ALTER TABLE orders ADD COLUMN status VARCHAR(20) DEFAULT 'pending';  -- METADATA ONLY
-```
-
-### 3. **type-change-rewrite** (Tier 1)
-Changing a column type usually requires a full table rewrite with `ACCESS EXCLUSIVE` lock.
-
-```sql
-ALTER TABLE users ALTER COLUMN id TYPE BIGINT;  -- REWRITE
-```
-
-**Safe alternatives:**
-- Widen `varchar(10)` → `varchar(100)` (no rewrite)
-- Widen `numeric(10,2)` → `numeric(20,2)` on PG12+ (no rewrite)
-
-### 4. **concurrent-index** (Tier 2)
-Synchronous index creation blocks writes. Use `CONCURRENTLY`.
-
-```sql
-CREATE INDEX CONCURRENTLY idx_users_email ON users(email);
-DROP INDEX CONCURRENTLY idx_users_email;
-```
-
-### 5. **concurrent-in-transaction** (Tier 1)
-PostgreSQL does not allow `CREATE/DROP INDEX CONCURRENTLY` inside an explicit transaction block.
-
-```sql
-BEGIN;
-CREATE INDEX CONCURRENTLY idx ON users(id);  -- ❌ ERROR
-COMMIT;
-```
-
-### 6. **cascading-drop** (Tier 1)
-`DROP TABLE ... CASCADE` silently destroys views, indexes, constraints without warning.
-
-```sql
-DROP TABLE users CASCADE;  -- ❌ May drop dependent views
-```
-
-**Safe alternative:**
-```sql
-DROP VIEW dependent_view;
-DROP TABLE users;
-```
-
-### 7. **blocking-mat-view-refresh** (Tier 2)
-`REFRESH MATERIALIZED VIEW` (without `CONCURRENTLY`) blocks all reads during refresh.
-
-```sql
-REFRESH MATERIALIZED VIEW mv_order_totals;
-```
-
-**Safe alternative:**
-```sql
-REFRESH MATERIALIZED VIEW CONCURRENTLY mv_order_totals;
-```
-
-### 8. **partition-lock** (Tier 1/2)
-Partition operations (attaching/detaching) that affect large parent tables. HASH partitioned tables escalate locking severity (the tier thresholds are halved) due to more aggressive locking.
-
-### 9. **opaque-dynamic-sql** (Tier 2)
-`DO` blocks and `EXECUTE` statements hide mutations. Analysis confidence degrades.
-
-```sql
-DO $$
-BEGIN
-  EXECUTE 'ALTER TABLE ' || table_name || ' ADD COLUMN id int';
-END $$;
-```
-
-**Recommendation:** Avoid dynamic DDL in migrations. Use explicit SQL.
-
-### 10. **volatile-default** (Tier 3)
-Using volatile functions like `random()` or `now()` as defaults can cause unexpected behavior in logical replication.
-
-### 11. **vacuum-full** (Tier 1)
-`VACUUM FULL` requires an `ACCESS EXCLUSIVE` lock and rewrites the entire table. Never in migrations.
-
-### 12. **idempotency** (Tier 3, disabled by default)
-Recommend `CREATE TABLE IF NOT EXISTS` and `CREATE INDEX IF NOT EXISTS` for safer re-runs.
-
-### 13. **overbroad-grant** (Tier 1/2)
-Flags grants that apply too broadly — `GRANT ... TO PUBLIC` (Tier 1, applies to every role) or `GRANT ALL PRIVILEGES` to a non-owner role (Tier 2).
-
-```sql
-GRANT ALL PRIVILEGES ON orders TO PUBLIC;  -- ❌ Tier 1: PUBLIC is every role
-GRANT SELECT ON orders TO app_user;        -- ✅ Safe
-```
-
-### 14. **broken-compute** (Tier 1)
-Flags dropping a function that is used by one or more triggers. The trigger would be left pointing at a non-existent function.
-
-```sql
-CREATE TRIGGER audit BEFORE INSERT ON orders EXECUTE FUNCTION audit_fn();
-DROP FUNCTION audit_fn();  -- ❌ breaks the trigger
-```
-
-### 15. **drop-database** (Tier 1)
-`DROP DATABASE` is an irreversible, high-blast-radius operation that destroys the entire database. Should never appear in a migration file.
-
-### 16. **schema-drift** (Tier 1)
-Flags migrations that reference tables or objects not present in the synced production baseline. If `DROP TABLE orders` is in the migration but `orders` is not in the cache, the migration would fail at runtime. Also flags when creating a partitioned table (`CREATE TABLE ... PARTITION OF parent`) where the parent table does not exist in the production baseline.
-
-**Requires `safe-migrate sync` to be meaningful.** Without a cache, this rule has no baseline to compare against.
-
-### 17. **irreversible-migration** (Tier 1/3)
-Classifies `DROP COLUMN`, `DROP TABLE`, and lossy type changes (`VARCHAR(255) → VARCHAR(50)`) as irreversible. Tier is gated on row count — empty tables get Tier 3 (low risk), populated tables get Tier 1.
-
-```sql
-ALTER TABLE orders DROP COLUMN legacy_code;  -- Tier 1 if rows > 0, Tier 3 if empty
-```
-
-### 18. **restrictive-policy** (Tier 2)
-Flags RLS policies with `AS RESTRICTIVE` that could unexpectedly restrict access beyond what was intended.
-
-### 19. **disable-trigger** (Tier 2)
-Flags `ALTER TABLE ... DISABLE TRIGGER ALL` in migration files. Disabling triggers in a migration means constraints and audit trails are bypassed for the duration of the migration.
-
-### 20. **chain-conflict** (Tier 1)
-When using `lint-chain`, flags migrations in the same chain that add the same column with different types to the same table. Only applies to multi-file chain execution.
-
-### 21. **partition-strategy-mismatch** (Tier 1)
-Flags `ATTACH PARTITION` operations where the partition being attached does not match the parent table's partition strategy (RANGE/LIST/HASH). Mismatched strategies will cause the operation to fail at runtime.
-
-```sql
--- If parent table is defined as PARTITION BY RANGE:
-ALTER TABLE parent_table ATTACH PARTITION child_table FOR VALUES IN ('2023-01-01'); -- ❌ if child_table is HASH partitioned or has no partition strategy
-```
-
----
+`--json` emits exactly one JSON document on standard output. Diagnostics go to
+standard error. The JSON report includes a `baseline` object with baseline
+status, cache provenance, and automatic-sync outcome.
 
 ## Configuration
 
-Create `safe-migrate.toml` in your repo root to customize rule behavior and thresholds. All settings are optional — safe-migrate ships with sensible defaults. Invalid or unparseable config files cause safe-migrate to exit with an error (no silent fallback).
-
-### Global Settings
+All settings are optional. `safe-migrate.toml` is loaded from the current
+directory unless `--config` specifies another path.
 
 ```toml
-# Row count threshold for Tier 1 (default: 100,000)
-# Tables with >= this many rows trigger Tier 1 for dangerous operations
+# Size thresholds used by lock-sensitive rules.
 tier1_threshold_rows = 100000
-
-# Row count threshold for Tier 2 (default: 10,000)
-# Tables with >= this many rows trigger Tier 2 for dangerous operations
 tier2_threshold_rows = 10000
-
-# PostgreSQL version to assume when database is offline (default: 100000)
-# Format: XXYYZZ (e.g., 100000 = PG 10.0, 110000 = PG 11.0, 170010 = PG 17.0.10)
-# Used for version-gated rules like constant DEFAULT on ADD COLUMN (safe on PG11+)
-assume_pg_version = 100000
-
-# TOAST column width threshold in bytes (default: 2048)
-# Columns wider than this are flagged for TOAST overflow risk
-toast_width_threshold_bytes = 2048
-
-# Default row count for unanalyzed tables (default: 10,000)
-# Tables with unknown size are treated as having this many rows
 default_rows = 10000
 
-# Cache freshness threshold in days (default: 7)
-# Warns if .safe-migrate.cache is older than this
+# Version assumed only when no cache is available.
+assume_pg_version = 100000
+
+# Treat a cache older than this as an uncertain baseline.
 stale_stats_days = 7
-```
 
-### Per-Rule Configuration
+# Restrict sync (and configured automatic sync) to these schemas.
+schemas = ["public", "auth"]
 
-Override any rule's tier or thresholds:
+# Disabled by default. Before lint/lint-chain, refresh the configured cache.
+# A failed refresh prints its cause and continues with the previous cache; if
+# none exists, analysis continues with an uncertain baseline.
+auto_sync = false
 
-```toml
+# Disabled by default. When true, sync encrypts new cache files. Supply a
+# 32-byte key as 64 hexadecimal characters only through the environment.
+cache_encryption = false
+
 [rules.blocking-constraint]
-# Stricter thresholds for foreign key constraints specifically
 tier1_threshold_rows = 5000
 tier2_threshold_rows = 1000
 
-[rules.size-aware-add-column]
-# Escalate all table rewrites to Tier 1 regardless of size
-tier1_threshold_rows = 0
-
 [rules.missing-idempotency]
-# Disable the idempotency rule (don't warn about missing IF NOT EXISTS)
 disabled = true
 ```
 
-### Complete Example
+Rule entries support `disabled`, `tier1_threshold_rows`, and
+`tier2_threshold_rows`. Global `disabled_rules = ["rule-id"]` is also
+supported. A rule’s documented primary ID is the ID used for disabling it;
+some rules emit more specific finding IDs as noted in the rule catalog.
 
-```toml
-# Global defaults for the whole team
-tier1_threshold_rows = 100000
-tier2_threshold_rows = 10000
-assume_pg_version = 170000   # Assume PG 17 for new staging envs
-toast_width_threshold_bytes = 2048
-default_rows = 10000
-stale_stats_days = 7
+### Automatic sync
 
-# Stricter rules for high-traffic tables
-[rules.blocking-constraint]
-tier1_threshold_rows = 1000    # Flag FKs on tables >1K rows
-tier2_threshold_rows = 100
+Automatic sync is configuration-only—there is no CLI flag. It runs for `lint`
+and `lint-chain`, before analysis, when `auto_sync = true`. `--no-cache`
+always bypasses it. Sync failure never deletes a prior cache and never turns a
+successful lint invocation into a crash: the error is printed, then the old
+cache is used if readable. The resulting report is `Tainted`.
 
-[rules.concurrent-index]
-tier1_threshold_rows = 50000   # Flag non-concurrent indexes on tables >50K rows
+### Encrypted caches
 
-# Relax some rules for safer operations
-[rules.blocking-mat-view-refresh]
-tier1_threshold_rows = 500000  # Only flag materialized view refresh on huge tables
-
-# Disable rules that don't apply to your workflow
-[rules.vacuum-full]
-disabled = true
-```
-
-### Rule Reference
-
-| Rule ID | What It Does | Default Tier |
-|---------|------------|--------------|
-| `destructive-cascade` | Flags DROP TABLE ... CASCADE operations that affect baseline schema | Tier 1 |
-| `size-aware-add-column` | Flags table rewrites for ADD COLUMN with volatile defaults or PG<11 constant defaults | Tier 1 |
-| `type-change-rewrite` | Flags type changes that force ACCESS EXCLUSIVE table rewrites | Tier 1 |
-| `blocking-constraint` | Flags synchronous CHECK or FOREIGN KEY constraint additions | Tier 1 |
-| `blocking-index-constraint` | Flags synchronous PRIMARY KEY or UNIQUE constraint additions via index | Tier 1 |
-| `require-concurrent-index` | Flags synchronous index creation | Tier 2 |
-| `require-concurrent-drop-index` | Flags synchronous index dropping | Tier 2 |
-| `blocking-mat-view-refresh` | Flags synchronous REFRESH MATERIALIZED VIEW (without CONCURRENTLY) | Tier 2 |
-| `partition-lock` | Flags partition attach/detach operations on large tables | Tier 1/2 |
-| `concurrent-in-transaction` | Blocks CONCURRENTLY index operations inside explicit transaction blocks | Tier 1 |
-| `vacuum-full` | Flags VACUUM FULL usage (requires ACCESS EXCLUSIVE lock) | Tier 1 |
-| `opaque-dynamic-sql` | Detects dynamic SQL (DO blocks, EXECUTE) that hides mutations | Tier 2 |
-| `volatile-default` | Notes volatile functions like `clock_timestamp()` or `random()` in defaults | Tier 3 |
-| `missing-idempotency` | Recommends IF NOT EXISTS on CREATE statements (disabled by default) | Tier 3 |
-| `table-rewrite-storage` | Flags table rewrites caused by column storage parameter changes | Tier 1 |
-| `table-rewrite-access-method` | Flags table rewrites caused by access method changes | Tier 1 |
-| `overbroad-grant` | Flags GRANT ... TO PUBLIC or GRANT ALL PRIVILEGES to non-owner roles | Tier 1/2 |
-| `broken-compute` | Flags dropping a function that backs a trigger | Tier 1 |
-| `drop-database` | Flags DROP DATABASE in migration files | Tier 1 |
-| `schema-drift` | Flags references to tables absent from the production baseline | Tier 1 |
-| `irreversible-migration` | Flags DROP COLUMN, DROP TABLE, lossy type changes as irreversible | Tier 1/3 |
-| `restrictive-policy` | Flags RESTRICTIVE RLS policies that could unexpectedly restrict access | Tier 2 |
-| `disable-trigger` | Flags ALTER TABLE ... DISABLE TRIGGER ALL in migrations | Tier 2 |
-| `chain-conflict` | Flags same-chain migrations adding the same column with different types | Tier 1 |
-| `partition-strategy-mismatch` | Flags partition attachment where strategies mismatch | Tier 1 |
-
-### Version-Gating Examples
-
-The engine reads `assume_pg_version` and applies version-specific rules:
-
-**PG 11+: Constant defaults are safe**
-```sql
--- With assume_pg_version >= 110000, this is metadata-only (safe):
-ALTER TABLE orders ADD COLUMN status VARCHAR(20) DEFAULT 'pending';
-```
-
-**PG <11: Constant defaults require rewrite**
-```sql
--- With assume_pg_version < 110000, same SQL flags as Tier 1:
-ALTER TABLE orders ADD COLUMN status VARCHAR(20) DEFAULT 'pending';
-```
-
-### Cache Behavior
-
-If `safe-migrate sync` hasn't been run or the cache is missing:
-- Uses `assume_pg_version` for version-gated rules
-- Uses `default_rows` for all unanalyzed tables
-- Sets confidence to `Tainted` (since actual row counts are unknown)
-
-If the cache exists and is fresh:
-- Uses actual `pg_version_num` from PostgreSQL
-- Uses actual table row counts from `pg_class.reltuples`
-- Sets confidence to `Exact` (unless dynamic SQL is detected)
-
----
-
-## CLI Reference
-
-### `safe-migrate lint`
+With `cache_encryption = true`, set this environment variable before `sync`,
+`lint`, or `lint-chain`:
 
 ```bash
-safe-migrate lint \
-  --file migration.sql \
-  --config safe-migrate.toml \
-  --cache .safe-migrate.cache \
-  --no-cache \
-  --interactive \
-  --json
+export SAFE_MIGRATE_CACHE_KEY='64 hexadecimal characters (32 bytes)'
 ```
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `-f, --file` | required | SQL migration file |
-| `--config` | `safe-migrate.toml` | Config overrides |
-| `--cache` | `.safe-migrate.cache` | Stats cache |
-| `--no-cache` | false | Use worst-case assumptions (offline mode) |
-| `-i, --interactive` | false | Launch full-screen TUI to browse violations |
-| `--json` | false | Write one versioned JSON report to stdout; incompatible with `--interactive` |
+safe-migrate uses authenticated XChaCha20-Poly1305 encryption with a fresh
+random nonce for each cache write. The key is deliberately not accepted in
+TOML, command-line flags, or cache metadata. Keep it in your secret manager.
+An encrypted cache without the setting and key fails closed; regenerate a cache
+after enabling encryption rather than committing a key or decrypted cache.
 
-### `safe-migrate lint-chain`
-
-Lint an ordered directory of migration files with state persisting across files. Files are processed in lexicographic order (V1__, V2__, etc.).
+## Commands
 
 ```bash
-safe-migrate lint-chain \
-  --dir migrations/ \
-  --config safe-migrate.toml \
-  --cache .safe-migrate.cache
+# One migration
+safe-migrate lint --file migration.sql [--cache path] [--config path] [--no-cache] [--json]
+
+# Ordered .sql files, retaining simulated state across the chain
+safe-migrate lint-chain --dir migrations/ [--cache path] [--config path] [--no-cache] [--json]
+
+# Refresh the local cache; --config is used for cache_encryption
+safe-migrate sync [--out .safe-migrate.cache] [--config safe-migrate.toml] [--schemas public,auth]
 ```
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--dir` | required | Directory of .sql files |
-| `--config` | `safe-migrate.toml` | Config overrides |
-| `--cache` | `.safe-migrate.cache` | Stats cache |
-| `--no-cache` | false | Use worst-case assumptions |
-| `-i, --interactive` | false | Launch full-screen TUI to browse violations |
-| `--json` | false | Write one versioned JSON report to stdout; incompatible with `--interactive` |
+`--interactive` is available for human exploration and cannot be combined with
+`--json`.
 
-### `safe-migrate sync`
+## Rule catalog
 
-```bash
-export DATABASE_URL="postgres://user:pass@localhost/db"
-safe-migrate sync --out prod-cache.safe-migrate.cache --schemas public,auth
-```
+The engine currently evaluates these 26 primary rules:
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--out` | `.safe-migrate.cache` | Cache output path |
-| `--schemas` | (all schemas) | Comma-separated list of schemas to sync; FK dependencies pulled cross-schema automatically |
+| ID | Checks |
+|---|---|
+| `irreversible-migration` | Irreversible table/column changes and lossy type changes. |
+| `drop-database` | `DROP DATABASE`. |
+| `drop-schema-cascade` | `DROP SCHEMA ... CASCADE`. |
+| `destructive-general-cascade` | Cascading drops of non-table objects. |
+| `destructive-cascade` | `DROP TABLE ... CASCADE` and dependent objects. |
+| `create-table-as-select` | `CREATE TABLE ... AS SELECT` on an existing populated baseline. |
+| `size-aware-add-column` | Add-column operations that can rewrite large tables. |
+| `type-change-rewrite` | Type changes requiring a table rewrite. |
+| `blocking-constraint` | Synchronous CHECK and foreign-key validation. |
+| `require-concurrent-index` | Synchronous index creation or removal. |
+| `blocking-mat-view-refresh` | Non-concurrent materialized-view refresh. |
+| `blocking-partition-mutation` | Partition attach/detach locking. |
+| `partition-strategy-mismatch` | Incompatible partition strategies. |
+| `restrictive-policy` | Restrictive RLS policies. |
+| `disable-trigger` | Disabling all triggers. |
+| `broken-compute` | Dropping a function still referenced by a trigger. |
+| `function-volatility-change` | Changing a function’s volatility classification. |
+| `missing-idempotency` | Missing safe re-run guards where supported. |
+| `concurrent-in-transaction` | Concurrent index operations inside a transaction. |
+| `alter-type-add-value-txn` | `ALTER TYPE ... ADD VALUE` transaction constraints. |
+| `vacuum-full` | `VACUUM FULL`. |
+| `opaque-dynamic-sql` | Dynamic/opaque SQL that cannot be fully simulated. |
+| `volatile-default` | Volatile column defaults. |
+| `overbroad-grant` | Broad grants such as `PUBLIC` or `ALL PRIVILEGES`. |
+| `schema-drift` | References inconsistent with a supplied database baseline. |
+| `chain-conflict` | Conflicting state changes across `lint-chain` files. |
 
-**Requires `DATABASE_URL` environment variable.**
+The `blocking-constraint` rule can emit `blocking-index-constraint`, and
+`require-concurrent-index` can emit `require-concurrent-drop-index`. Rewrite
+paths can also emit `table-rewrite-storage` or `table-rewrite-access-method`.
+Those are finding IDs, not independently configurable primary rules.
 
----
+## CI
 
-## CI/CD Integration
-
-### GitHub Actions
+Check in a reviewed cache only when it is acceptable for your team to store
+schema metadata in the repository. Otherwise sync in CI from a protected
+database secret and lint the migrations. Preserve exit status `2` as a blocked
+migration, and treat `1` as an infrastructure/configuration failure.
 
 ```yaml
-name: Safe Migrate
-
-on:
-  pull_request:
-    branches: [main]
-
-jobs:
-  lint-migrations:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Install safe-migrate
-        run: |
-          curl -fsSL https://raw.githubusercontent.com/dsecurity49/safe-migrate/main/install.sh | bash
-
-      - name: Sync database stats
-        env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: safe-migrate sync --out prod-cache.safe-migrate.cache
-
-      - name: Lint changed migrations
-        run: |
-          FILES=$(git diff --name-only origin/main...HEAD -- '*.sql')
-          
-          if [ -z "$FILES" ]; then
-            echo "No migrations changed."
-            exit 0
-          fi
-          
-          for f in $FILES; do
-            echo "Linting $f..."
-            safe-migrate lint --file "$f" --cache prod-cache.safe-migrate.cache
-          done
+- name: Build and lint migrations
+  run: |
+    cargo build --locked --release
+    ./target/release/safe-migrate lint-chain --dir migrations --json > safe-migrate-report.json
 ```
 
-### GitLab CI
+For database-backed CI, add `DATABASE_URL` as a protected secret and run
+`safe-migrate sync` in a controlled network environment before the lint step.
+Never echo the URL or write it to the cache/configuration file.
 
-```yaml
-lint-migrations:
-  image: ubuntu:latest
-  script:
-    - curl -fsSL https://raw.githubusercontent.com/dsecurity49/safe-migrate/main/install.sh | bash
-    - safe-migrate sync --out prod-cache.safe-migrate.cache
-    - |
-      git diff --name-only origin/main...HEAD -- '*.sql' | while read f; do
-        safe-migrate lint --file "$f" --cache prod-cache.safe-migrate.cache
-      done
-  only:
-    - merge_requests
-```
-
----
-
-## live_tests/ — End-to-End Integration Suite
-
-`live_tests/` is an exhaustive end-to-end suite that runs the compiled `safe-migrate` binary against 510 SQL migration fixtures across all 26 rule directories. It validates the AST parser, state machine, and rule evaluators in combination — not just unit logic.
+## Development
 
 ```bash
-cd live_tests
-
-./run.sh            # Full suite (silent summary per directory)
-./run.sh -v         # Verbose: pass/fail per file
-./run.sh -d rule_09_blocking-constraint   # Single rule directory
-./run.sh -t rule_01_irreversible-migration/001_drop_table.sql  # Single file
-./run.sh --offline  # No cache, worst-case assumptions
+cargo fmt -- --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --locked
+cd live_tests && ./run.sh
 ```
 
-**Fixture naming:** `safe_*.sql` files must emit 0 violations for the target rule; `[0-9]*.sql` files must emit ≥ 1.
-
-The suite ships a frozen `.safe-migrate.cache` binary file so it runs in CI without a live PostgreSQL instance. `chain-conflict` directories are linted with `lint-chain -d`; all others use `lint -f` per file.
-
----
-
-## Architecture
-
-safe-migrate parses your migration into a typed AST, then simulates it statement-by-statement against an in-memory model of your schema (tables, columns, indexes, foreign keys, views, partitions, functions, triggers, roles, policies, publications, subscriptions). That model starts from your synced database statistics and is updated as each statement is applied — so by the time a rule runs, it's checking against the schema as it would actually look at that point in the migration, not just the raw SQL text.
-
-This is what allows things like:
-- Correctly evaluating a `DROP TABLE ... CASCADE` against everything that actually depends on it
-- Knowing a table was renamed earlier in the same file when checking a later `ALTER TABLE`
-- Treating `BEGIN ... ROLLBACK` as a no-op on the schema, rather than analyzing the in-transaction state as if it persisted (confidence correctly restored after rollback)
-- Detecting that dropping a function would break a trigger that depends on it
-- Flagging migrations that reference tables absent from the production baseline
-
-DML statements (`INSERT`, `UPDATE`, `DELETE`, `SELECT`) are ignored. Dynamic SQL (`DO` blocks, `EXECUTE`) is detected and flagged, since it can hide schema changes the simulator can't see. When confidence is `Tainted` due to opaque SQL, Tier 1 violations are downgraded to Tier 2 — unless the opaque SQL was inside a transaction that was subsequently rolled back, in which case confidence is fully restored.
-
----
-
-## Why This Matters
-
-PostgreSQL lock behavior is invisible in the SQL itself. The same `ALTER TABLE` statement is a no-op on one table and an outage on another, depending entirely on size, version, and what else depends on it. safe-migrate makes that visible before you deploy, not after.
-
----
-
-## License
-
-Dual-licensed under [MIT](LICENSE-MIT) or [Apache 2.0](LICENSE-APACHE).
-
----
-
-## Documentation and Contributing
-
-- [Documentation index](docs/README.md)
-- [CLI and report contract](docs/CONTRACT.md)
-- [Contributor guide](CONTRIBUTING.md)
-- [Maintainer architecture notes](docs/internal/ARCHITECTURE.md)
-- [AST development workflow](docs/internal/AST_DEVELOPMENT.md)
-
----
-
-## Changelog
-
-See [CHANGELOG.md](CHANGELOG.md) for full release history.
+See [the user-visible CLI/report contract](docs/CONTRACT.md),
+[contributing guide](CONTRIBUTING.md), and [maintainer documentation](docs/README.md).

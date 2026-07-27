@@ -5,7 +5,7 @@ use crate::model::relation::{Persistence, RelationKind, RelationState};
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sync::sync_cache;
+    use crate::sync::{is_local_host, sync_cache};
     use std::io::Write;
     use tempfile::NamedTempFile;
 
@@ -35,6 +35,15 @@ mod tests {
 
         assert!(sync_cache(tmp.path(), None, false).is_err());
         assert_eq!(std::fs::read(tmp.path()).unwrap(), b"known-good-cache");
+    }
+
+    #[test]
+    fn test_remote_host_detection_requires_tls_but_keeps_local_connections_supported() {
+        assert!(is_local_host("localhost"));
+        assert!(is_local_host("127.0.0.1"));
+        assert!(is_local_host("::1"));
+        assert!(is_local_host("/var/run/postgresql"));
+        assert!(!is_local_host("db.internal.example"));
     }
 
     #[test]

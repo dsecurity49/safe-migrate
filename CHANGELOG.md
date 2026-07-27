@@ -15,6 +15,19 @@ All notable changes to safe-migrate are documented here.
 - `--json` and `--interactive` are now rejected when supplied together.
 - Runs without a cache now report `Tainted` confidence while preserving
   conservative worst-case rule evaluation.
+- `auto_sync = true` refreshes the cache before `lint` and `lint-chain`.
+  Refresh failures now report their cause, retain the prior cache, and continue
+  with a `Tainted` report instead of crashing or deleting the baseline.
+- Cache replacement is atomic: a failed sync leaves the previous cache intact.
+- Cache provenance (creation time, source database, and selected schemas) is
+  stored in new cache files and exposed in the additive JSON `baseline` object.
+  `stale_stats_days` now evaluates that recorded creation time.
+- `cache_encryption = true` encrypts newly synced cache files using
+  XChaCha20-Poly1305 and the environment-only `SAFE_MIGRATE_CACHE_KEY`.
+- Schema filters for `sync --schemas` are bound query parameters rather than
+  interpolated SQL.
+- Remote sync now uses native TLS and requires `sslmode=require`; local TCP and
+  Unix-socket connections remain supported.
 
 **Documentation:**
 

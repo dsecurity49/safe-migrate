@@ -5,7 +5,10 @@ use crate::db::cache::{DbCache, ForeignKeyCache, IndexCache};
 use crate::db::cache_file::protect_cache_bytes;
 use crate::model::relation::{Persistence, RelationKind, RelationState};
 use anyhow::{Context, Result};
-use postgres::{Client, NoTls};
+use native_tls::TlsConnector;
+use postgres::config::{Host, SslMode};
+use postgres::{Client, Config as PostgresConfig};
+use postgres_native_tls::MakeTlsConnector;
 use std::io::Write;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -23,31 +26,42 @@ pub fn sync_cache(
     let db_url = std::env::var("DATABASE_URL")
         .context("DATABASE_URL environment variable is required to sync database stats. Do not pass credentials via CLI flags or config files.")?;
 
-    // Warn if connecting to a non-local host without TLS
-    let host = db_url
-        .split('@')
-        .nth(1)
-        .and_then(|h| h.split('/').next())
-        .unwrap_or("localhost");
-    if !host.starts_with("localhost")
-        && !host.starts_with("127.")
-        && !host.starts_with("/")
-        && host != "::1"
-    {
-        eprintln!(
-            "[WARN] Connecting to PostgreSQL at {} without TLS encryption.\n\
-             The database password will be sent in cleartext over the network.\n\
-             Use an SSH tunnel or a local connection for sensitive databases,\n\
-             or add native-tls support (see https://github.com/dsecurity49/safe-migrate).",
-            host
-        );
-    }
-
-    let mut client = Client::connect(&db_url, NoTls).context("Failed to connect to PostgreSQL")?;
+    let mut client = connect_database(&db_url)?;
 
     let cache = populate_cache(&mut client, schemas)?;
 
     write_cache(out_path, cache, cache_encryption)
+}
+
+fn connect_database(db_url: &str) -> Result<Client> {
+    let config: PostgresConfig = db_url
+        .parse()
+        .context("DATABASE_URL is not a valid PostgreSQL connection string")?;
+
+    if config
+        .get_hosts()
+        .iter()
+        .any(|host| matches!(host, Host::Tcp(name) if !is_local_host(name)))
+        && config.get_ssl_mode() != SslMode::Require
+    {
+        anyhow::bail!(
+            "Remote DATABASE_URL connections require sslmode=require. Use a trusted TLS endpoint or an SSH tunnel."
+        );
+    }
+
+    let connector = TlsConnector::builder()
+        .build()
+        .context("Failed to configure native TLS for PostgreSQL")?;
+    config
+        .connect(MakeTlsConnector::new(connector))
+        .context("Failed to connect to PostgreSQL")
+}
+
+pub(crate) fn is_local_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host == "::1"
+        || host.starts_with("127.")
+        || host.starts_with('/')
 }
 
 fn write_cache(out_path: &Path, cache: DbCache, cache_encryption: bool) -> Result<()> {

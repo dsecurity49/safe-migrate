@@ -10,10 +10,11 @@ enforces it.
 - `safe-migrate lint-chain --dir <path>` analyzes `.sql` files in filename
   order while preserving state across files.
 - `safe-migrate sync` reads PostgreSQL catalog metadata and writes a local
-  cache. It is the only command that requires `DATABASE_URL`.
+  cache. It requires `DATABASE_URL`.
 
-`lint` and `lint-chain` must not connect to PostgreSQL. They may use an explicit
-cache, the default cache path, or `--no-cache`.
+`lint` and `lint-chain` use an explicit cache, the default cache path, or
+`--no-cache`. When `auto_sync = true` is set in configuration, they may refresh
+the cache before analysis. `--no-cache` always bypasses automatic sync.
 
 ## Output channels
 
@@ -57,6 +58,11 @@ Each violation includes:
 - `sql`
 - `fk_dependency_related`
 
+The additive `baseline` object records cache/baseline status, cache provenance,
+and automatic-sync outcome. Its status is `available`, `stale`, or
+`unavailable`; its automatic-sync outcome is `not_requested`, `refreshed`,
+`failed`, or `bypassed`.
+
 Fields may be added compatibly. Removing a field, renaming a field, changing its
 type, or changing the meaning of an existing enum value is a report-contract
 change and must be documented in `CHANGELOG.md`.
@@ -97,8 +103,10 @@ Analysis without a database cache is reported as `Tainted`, because existing
 production schema and dependency state are unknown. Rule evaluation retains
 its default worst-case assumptions; an absent cache does not downgrade a
 finding solely because the baseline is unavailable. A stale-cache warning does
-not silently change findings, but it must be visible on standard error and the
-report must not describe the result as a production guarantee.
+not silently change individual findings, but it taints confidence, must be
+visible on standard error, and must not be described as a production guarantee.
+The configured `stale_stats_days` limit is evaluated from provenance recorded
+inside a successful cache, not from file modification time.
 
 ## Failure behavior
 
@@ -110,6 +118,14 @@ The following conditions must never produce a successful clean report:
 - corrupt or incompatible cache;
 - unsupported command-line combinations;
 - internal serialization or analysis failure.
+
+Automatic cache refresh failure is different: it prints the underlying error
+and analysis continues with the old readable cache, or with an unavailable
+baseline if none exists. That successful analysis is reported as `Tainted`.
+Sync writes replace an existing cache only after the new payload has been fully
+produced. Encrypted caches require `cache_encryption = true` and a valid
+`SAFE_MIGRATE_CACHE_KEY`; missing or invalid key material is an operational
+failure and is never accepted from TOML or command-line arguments.
 
 Errors must identify the failed input or subsystem without printing
 `DATABASE_URL`, credentials, or migration contents not already requested in the
