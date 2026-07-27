@@ -5,18 +5,16 @@ use crate::db::cache::{DbCache, ForeignKeyCache, IndexCache};
 use crate::model::relation::{Persistence, RelationKind, RelationState};
 use anyhow::{Context, Result};
 use postgres::{Client, NoTls};
-use std::fs;
 use std::path::Path;
+use tempfile::NamedTempFile;
+
+#[cfg(windows)]
+use std::fs;
 
 pub fn sync_cache(out_path: &Path, schemas: Option<&[String]>) -> Result<()> {
     // Strict env-only credential enforcement
     let db_url = std::env::var("DATABASE_URL")
         .context("DATABASE_URL environment variable is required to sync database stats. Do not pass credentials via CLI flags or config files.")?;
-
-    // Destructive cache removal prevents corrupted reads on failures
-    if out_path.exists() {
-        fs::remove_file(out_path).context("Failed to remove old cache file before sync")?;
-    }
 
     // Warn if connecting to a non-local host without TLS
     let host = db_url
@@ -42,9 +40,20 @@ pub fn sync_cache(out_path: &Path, schemas: Option<&[String]>) -> Result<()> {
 
     let cache = populate_cache(&mut client, schemas)?;
 
-    // Atomic write via temp file
-    let tmp_path = out_path.with_extension("tmp");
-    let file = std::fs::File::create(&tmp_path).context("Failed to create temporary cache file")?;
+    write_cache(out_path, cache)
+}
+
+fn write_cache(out_path: &Path, cache: DbCache) -> Result<()> {
+    let parent = out_path.parent().unwrap_or_else(|| Path::new("."));
+    let temp_file = NamedTempFile::new_in(parent).with_context(|| {
+        format!(
+            "Failed to create temporary cache file beside {}",
+            out_path.display()
+        )
+    })?;
+    let file = temp_file
+        .reopen()
+        .context("Failed to reopen temporary cache file for writing")?;
     let writer = std::io::BufWriter::new(file);
     let mut encoder =
         zstd::stream::Encoder::new(writer, 3).context("Failed to init zstd compression")?;
@@ -59,9 +68,69 @@ pub fn sync_cache(out_path: &Path, schemas: Option<&[String]>) -> Result<()> {
         .finish()
         .context("Failed to flush final zstd stream to disk")?;
 
-    fs::rename(&tmp_path, out_path).context("Failed to atomically rename cache file")?;
+    replace_cache(temp_file, out_path)?;
 
     Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_cache(temp_file: NamedTempFile, out_path: &Path) -> Result<()> {
+    temp_file
+        .persist(out_path)
+        .map_err(|error| error.error)
+        .with_context(|| {
+            format!(
+                "Failed to atomically replace cache file: {}",
+                out_path.display()
+            )
+        })?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn replace_cache(temp_file: NamedTempFile, out_path: &Path) -> Result<()> {
+    if !out_path.exists() {
+        temp_file
+            .persist(out_path)
+            .map_err(|error| error.error)
+            .with_context(|| format!("Failed to install cache file: {}", out_path.display()))?;
+        return Ok(());
+    }
+
+    let backup = out_path.with_extension("safe-migrate.backup");
+    fs::rename(out_path, &backup).with_context(|| {
+        format!(
+            "Failed to stage existing cache for replacement: {}",
+            out_path.display()
+        )
+    })?;
+
+    match temp_file.persist(out_path) {
+        Ok(_) => {
+            fs::remove_file(&backup).with_context(|| {
+                format!(
+                    "Installed new cache but failed to remove backup: {}",
+                    backup.display()
+                )
+            })?;
+            Ok(())
+        }
+        Err(error) => {
+            let restore_result = fs::rename(&backup, out_path);
+            let message = if let Err(restore_error) = restore_result {
+                format!(
+                    "Failed to install new cache: {}. The old cache could not be restored: {}",
+                    error.error, restore_error
+                )
+            } else {
+                format!(
+                    "Failed to install new cache; restored the previous cache: {}",
+                    error.error
+                )
+            };
+            Err(anyhow::anyhow!(message))
+        }
+    }
 }
 
 pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result<DbCache> {

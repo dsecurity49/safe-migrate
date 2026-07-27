@@ -24,6 +24,20 @@ mod tests {
     }
 
     #[test]
+    fn test_sync_failure_preserves_existing_cache() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(b"known-good-cache").unwrap();
+        tmp.flush().unwrap();
+
+        unsafe {
+            std::env::remove_var("DATABASE_URL");
+        }
+
+        assert!(sync_cache(tmp.path(), None).is_err());
+        assert_eq!(std::fs::read(tmp.path()).unwrap(), b"known-good-cache");
+    }
+
+    #[test]
     fn test_db_cache_serialization_roundtrip() {
         let mut cache = DbCache::new();
         cache.pg_version_num = Some(160000);
