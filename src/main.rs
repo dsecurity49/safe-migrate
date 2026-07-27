@@ -275,6 +275,7 @@ fn run_sync(out: &Path, config_path: &Path, schemas: Option<&[String]>) -> Resul
     std::env::var("DATABASE_URL")
         .context("DATABASE_URL environment variable must be set to run sync.")?;
     let config = load_config(config_path)?;
+    let schemas = config.sync_schemas(schemas);
 
     println!("Syncing database stats...");
     if let Some(schemas) = schemas {

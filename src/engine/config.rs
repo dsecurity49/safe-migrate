@@ -89,6 +89,12 @@ impl Config {
             .and_then(|r| r.tier2_threshold_rows)
             .unwrap_or(self.tier2_threshold_rows)
     }
+
+    /// Returns the schema filter for a direct sync. An explicit CLI value wins
+    /// over the team-wide configuration default.
+    pub fn sync_schemas<'a>(&'a self, cli_schemas: Option<&'a [String]>) -> Option<&'a [String]> {
+        cli_schemas.or(self.schemas.as_deref())
+    }
 }
 
 #[cfg(test)]
@@ -128,5 +134,23 @@ mod tests {
         // Assert Rule Disabling
         assert!(config.is_rule_disabled("missing-idempotency"));
         assert!(!config.is_rule_disabled("blocking-constraint"));
+    }
+
+    #[test]
+    fn test_direct_sync_prefers_cli_schema_filter_over_configured_default() {
+        let config = Config {
+            schemas: Some(vec!["public".to_string()]),
+            ..Config::default()
+        };
+        let cli_schemas = vec!["auth".to_string()];
+
+        assert_eq!(
+            config.sync_schemas(None),
+            Some(["public".to_string()].as_slice())
+        );
+        assert_eq!(
+            config.sync_schemas(Some(&cli_schemas)),
+            Some(["auth".to_string()].as_slice())
+        );
     }
 }
