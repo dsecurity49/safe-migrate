@@ -70,6 +70,32 @@ fn test_cli_json_is_machine_clean_and_marks_missing_baseline_tainted() {
 }
 
 #[test]
+fn test_cli_no_cache_does_not_invent_schema_drift() {
+    let mut sql_file = tempfile::NamedTempFile::new().unwrap();
+    writeln!(sql_file, "ALTER TABLE widgets ADD COLUMN status text;").unwrap();
+
+    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let assert = cmd
+        .arg("lint")
+        .arg("--file")
+        .arg(sql_file.path())
+        .arg("--no-cache")
+        .arg("--json")
+        .assert()
+        .success();
+    let report = parse_json_stdout(assert.get_output());
+
+    assert_eq!(report["confidence"], "Tainted");
+    assert!(
+        report["violations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|violation| violation["rule_id"] != "schema-drift")
+    );
+}
+
+#[test]
 fn test_cli_json_halt_is_json_and_uses_blocking_exit_status() {
     let mut sql_file = tempfile::NamedTempFile::new().unwrap();
     writeln!(sql_file, "DROP DATABASE production;").unwrap();

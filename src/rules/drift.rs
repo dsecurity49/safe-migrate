@@ -27,6 +27,13 @@ impl Rule for DriftDetectionRule {
         _config: &Config,
         _cascade_closure: Option<&CascadeResult>,
     ) -> Vec<Violation> {
+        // A missing cache is not proof that production lacks an object. Keep
+        // the stateful analyzer useful offline without turning every ALTER or
+        // DROP into a false blocking baseline-drift finding.
+        if !state.baseline_available {
+            return Vec::new();
+        }
+
         let mut violations = Vec::new();
 
         match mutation {

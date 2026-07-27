@@ -158,7 +158,7 @@ fn run_lint(
     eprintln!("Analyzing migration: {}", file.display());
 
     let engine = SafeMigrateEngine::new(config);
-    let mut state = AnalysisState::new(db_cache);
+    let mut state = AnalysisState::with_baseline(db_cache, !baseline_unknown);
     let violations = engine.analyze(&sql, &mut state).map_err(analysis_error)?;
 
     finish_analysis(violations, &mut state, baseline_unknown, output_mode)
@@ -203,7 +203,7 @@ fn run_lint_chain(
     eprintln!("Analyzing migration chain in: {}", dir.display());
 
     let engine = SafeMigrateEngine::new(config);
-    let mut state = AnalysisState::new(db_cache);
+    let mut state = AnalysisState::with_baseline(db_cache, !baseline_unknown);
     let violations = engine
         .analyze_chain(&migrations, &mut state)
         .map_err(analysis_error)?;

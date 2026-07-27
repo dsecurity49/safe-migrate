@@ -69,6 +69,10 @@ pub struct PreState {
 
 pub struct AnalysisState {
     pub pg_version_num: Option<u32>,
+    /// Whether the initial cache was loaded from a real cache file. An empty
+    /// cache can be a valid baseline for an empty database, so availability
+    /// must not be inferred from the number of modeled objects.
+    pub baseline_available: bool,
     pub baseline_relations: HashSet<ObjectId>,
     pub baseline_indexes: HashSet<ObjectId>,
     pub baseline_foreign_keys: HashSet<(ObjectId, String)>,
@@ -78,6 +82,10 @@ pub struct AnalysisState {
 
 impl AnalysisState {
     pub fn new(cache: DbCache) -> Self {
+        Self::with_baseline(cache, true)
+    }
+
+    pub fn with_baseline(cache: DbCache, baseline_available: bool) -> Self {
         let default_search_path = cache.search_path.clone();
         let mut relations: HashMap<ObjectId, RelationOverlay> = HashMap::new();
         let mut baseline_relations = HashSet::new();
@@ -202,6 +210,7 @@ impl AnalysisState {
 
         Self {
             pg_version_num: cache.pg_version_num,
+            baseline_available,
             baseline_relations,
             baseline_indexes,
             baseline_foreign_keys,
