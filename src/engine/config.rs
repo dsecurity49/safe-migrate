@@ -19,6 +19,7 @@ pub struct Config {
     pub stale_stats_days: u64,
     pub toast_width_threshold_bytes: i32,
     pub default_rows: u64, // Fallback for offline/unanalyzed tables
+    pub auto_sync: bool,
     pub rules: HashMap<String, RuleConfig>, // Per-rule configuration
     pub assume_pg_version: u32,
     pub disabled_rules: Vec<String>,
@@ -33,6 +34,7 @@ impl Default for Config {
             stale_stats_days: 7,
             toast_width_threshold_bytes: 2048,
             default_rows: 10_000,
+            auto_sync: false,
             assume_pg_version: 100000,
             disabled_rules: Vec::new(),
             rules: HashMap::new(),
@@ -118,6 +120,7 @@ mod tests {
         // Assert Granular Fallbacks
         assert_eq!(config.rule_tier1_threshold("blocking-constraint"), 5000);
         assert_eq!(config.rule_tier1_threshold("unspecified-rule"), 500_000);
+        assert!(!config.auto_sync);
 
         // Assert Rule Disabling
         assert!(config.is_rule_disabled("missing-idempotency"));

@@ -152,8 +152,7 @@ fn run_lint(
     let sql = fs::read_to_string(file)
         .with_context(|| format!("Failed to read migration file: {}", file.display()))?;
     let config = load_config(config_path)?;
-    warn_if_stale_cache(cache, no_cache);
-    let (db_cache, baseline_unknown) = load_cache(cache, no_cache)?;
+    let (db_cache, baseline_unknown) = prepare_cache(&config, cache, no_cache)?;
 
     eprintln!("Analyzing migration: {}", file.display());
 
@@ -197,8 +196,7 @@ fn run_lint_chain(
     }
 
     let config = load_config(config_path)?;
-    warn_if_stale_cache(cache, no_cache);
-    let (db_cache, baseline_unknown) = load_cache(cache, no_cache)?;
+    let (db_cache, baseline_unknown) = prepare_cache(&config, cache, no_cache)?;
 
     eprintln!("Analyzing migration chain in: {}", dir.display());
 
@@ -227,6 +225,36 @@ fn run_sync(out: &Path, schemas: Option<&[String]>) -> Result<()> {
 fn load_config(path: &Path) -> Result<Config> {
     Config::load_from_file(path)
         .with_context(|| format!("Failed to load configuration: {}", path.display()))
+}
+
+fn prepare_cache(config: &Config, cache: &Path, no_cache: bool) -> Result<(DbCache, bool)> {
+    maybe_auto_sync(config, cache, no_cache);
+    warn_if_stale_cache(cache, no_cache);
+    load_cache(cache, no_cache)
+}
+
+fn maybe_auto_sync(config: &Config, cache: &Path, no_cache: bool) {
+    if !config.auto_sync {
+        return;
+    }
+
+    if no_cache {
+        eprintln!("[ INFO ] --no-cache bypasses configured automatic cache sync.");
+        return;
+    }
+
+    eprintln!(
+        "[ INFO ] Automatic cache sync enabled. Refreshing {}.",
+        cache.display()
+    );
+    if let Err(error) = sync::sync_cache(cache, config.schemas.as_deref()) {
+        eprintln!("[ WARN ] Automatic cache sync failed: {error}");
+        if cache.exists() {
+            eprintln!("         Continuing with the previous cache.");
+        } else {
+            eprintln!("         No usable cache is available; continuing with uncertain analysis.");
+        }
+    }
 }
 
 fn warn_if_stale_cache(cache: &Path, no_cache: bool) {
