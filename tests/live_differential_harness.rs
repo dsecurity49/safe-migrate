@@ -595,9 +595,12 @@ fn live_postgres_differential_harness() {
 }
 
 fn fixture_is_selected(filter: &Option<String>, rule_dir: &str, fixture: &str) -> bool {
-    filter
-        .as_deref()
-        .is_none_or(|selected| selected == format!("{rule_dir}/{fixture}"))
+    filter.as_deref().is_none_or(|selected| {
+        selected
+            .split(',')
+            .map(str::trim)
+            .any(|candidate| candidate == format!("{rule_dir}/{fixture}"))
+    })
 }
 
 fn differential_verbosity() -> u8 {

@@ -6,7 +6,7 @@ rule_filter=""
 fixture_filter=""
 
 usage() {
-    printf '%s\n' "Usage: scripts/live-differential [-v|-vv|-vvv] [--rule RULE_DIRECTORY] [--fixture RULE_DIRECTORY/FILE.sql]"
+    printf '%s\n' "Usage: scripts/live-differential [-v|-vv|-vvv] [--rule RULE_DIRECTORY] [--fixture RULE_DIRECTORY/FILE.sql[,RULE_DIRECTORY/FILE.sql...]]"
     printf '%s\n' "Requires DATABASE_URL for a disposable PostgreSQL database."
 }
 

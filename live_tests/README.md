@@ -42,6 +42,8 @@ Run one qualified fixture while debugging a mismatch:
 scripts/live-differential --fixture rule_01_irreversible-migration/001_drop_table.sql
 ```
 
+Pass a comma-separated list of qualified fixtures to run a small shard.
+
 ### Basic Usage
 ```bash
 ./run.sh
