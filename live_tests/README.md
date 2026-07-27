@@ -24,8 +24,10 @@ DATABASE_URL='host=/path/to/socket dbname=postgres user=my_user' \
 
 Verbosity is cumulative: `-v` reports lifecycle and fixture outcomes, `-vv`
 adds cache and normalized-state counts, and `-vvv` dumps complete normalized
-live and simulator projections. CI may set `SAFE_MIGRATE_DIFF_VERBOSITY=1..3`
-and invoke the ignored Cargo test directly with `--nocapture`.
+live and simulator projections. CI runs this harness against an isolated
+PostgreSQL 16 service. Locally, use a disposable database: the harness rebuilds
+its canonical baseline before every fixture and executes the fixtures. It does
+not use the frozen cache.
 
 Run a newly enabled rule by itself before the cumulative manifest:
 

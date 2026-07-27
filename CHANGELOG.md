@@ -28,6 +28,8 @@ All notable changes to safe-migrate are documented here.
   interpolated SQL.
 - Remote sync now uses native TLS and requires `sslmode=require`; local TCP and
   Unix-socket connections remain supported.
+- Added `scripts/live-differential` and a PostgreSQL 16 CI job that executes
+  the previously ignored simulator-vs-PostgreSQL differential harness.
 
 **Documentation:**
 
