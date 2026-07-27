@@ -2,6 +2,29 @@
 
 All notable changes to safe-migrate are documented here.
 
+## Unreleased
+
+**CLI contract:**
+
+- `lint --json` and `lint-chain --json` now emit exactly one versioned JSON
+  report on standard output (`schema_version: 1`); diagnostics are written to
+  standard error.
+- A completed analysis with one or more Tier 1 findings now exits with status
+  `2`. Operational, parser, cache, and configuration failures continue to use
+  status `1`.
+- `--json` and `--interactive` are now rejected when supplied together.
+- Runs without a cache now report `Tainted` confidence while preserving
+  conservative worst-case rule evaluation.
+
+**Documentation:**
+
+- Removed the stale Squawk 2.58.0 AST reference snapshot. AST contributors now
+  verify behavior against the exact pinned Squawk source and executable tests.
+- Added a documentation index, a v0.4.3 CLI/report contract, and focused
+  maintainer guides for architecture invariants and AST development.
+- Reworked `CONTRIBUTING.md` to avoid copied file counts, rule inventories, and
+  dependency accessor catalogs that become stale.
+
 ## v0.4.2
 
 Internal correctness and infrastructure release. Upgraded squawk-parser 2.58.0 → 2.61.0, added `pg_depend`-based dependency tracking, and built a differential test harness that compares simulator output against real PostgreSQL dry-runs across all 26 rules.

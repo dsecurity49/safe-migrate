@@ -1,337 +1,196 @@
 # Contributing to safe-migrate
 
-Thanks for your interest in contributing! This guide explains the project structure and how to add new rules or extend the AST extraction logic.
+Thanks for contributing. safe-migrate is a Rust PostgreSQL migration analyzer
+with typed AST extraction, stateful schema simulation, and safety rules.
 
-## Project Structure
+## Start here
 
-```
-safe-migrate/
-├── src/
-│   ├── analysis/                 # State machine simulator
-│   │   ├── expr_ir.rs            # Expression intermediate representation
-│   │   ├── expr_visitor.rs       # Expression AST visitor (squawk_syntax 2.61.0)
-│   │   ├── facts.rs              # Fact extraction results
-│   │   ├── graph.rs              # Dependency graphs (FK, indexes, partitions, views, triggers, publications)
-│   │   ├── mutations.rs          # Mutation types and resolution
-│   │   ├── resolver.rs           # Schema resolution with search_path
-│   │   ├── state.rs              # AnalysisState, LocalState, mutation application, undo-log
-│   │   ├── transaction.rs        # Transaction frame management, StateChange variants
-│   │   └── mod.rs
-│   │
-│   ├── ast/                      # AST visitor pattern, extraction from squawk_syntax
-│   │   ├── visitor.rs            # Fact extraction from typed AST nodes
-│   │   ├── visitor_tests.rs      # AST extraction unit tests
-│   │   ├── identifiers.rs        # ObjectId, Path resolution, schema walking
-│   │   └── mod.rs
-│   │
-│   ├── engine/                   # Rule engine and configuration
-│   │   ├── engine.rs             # Main analysis pipeline, rule dispatch, violation ordering
-│   │   ├── config.rs             # safe-migrate.toml parsing
-│   │   ├── [tests split into tests/ — see below]
-│   │   └── mod.rs
-│   │
-│   ├── model/                    # Data model for schema state
-│   │   ├── relation.rs           # RelationState (tables/views/sequences/materialized views)
-│   │   ├── column.rs             # Column metadata, width, nullability, default expression
-│   │   ├── function.rs           # FunctionState, Volatility, SecurityMode
-│   │   ├── role.rs               # RoleState, PrivilegeGrant
-│   │   ├── trigger.rs            # TriggerState
-│   │   ├── replication.rs        # PublicationState, SubscriptionState
-│   │   ├── sequence.rs           # Sequence state, OWNED BY tracking
-│   │   ├── types.rs              # Type definitions (enums, domains)
-│   │   └── mod.rs
-│   │
-│   ├── rules/                    # Rule implementations (26 rule IDs)
-│   │   ├── destructive.rs        # destructive-cascade, size-aware-add-column, type-change-rewrite, drop-database, create-table-as-select
-│   │   ├── constraints.rs        # blocking-constraint, blocking-index-constraint
-│   │   ├── indexes.rs            # require-concurrent-index, require-concurrent-drop-index
-│   │   ├── views.rs              # blocking-mat-view-refresh
-│   │   ├── partitions.rs         # partition-lock
-│   │   ├── idempotency.rs        # missing-idempotency
-│   │   ├── transactions.rs       # concurrent-in-transaction, vacuum-full
-│   │   ├── opaque.rs             # opaque-dynamic-sql
-│   │   ├── expressions.rs        # volatile-default
-│   │   ├── functions.rs          # broken-compute, function-volatility-change, function-schema-change
-│   │   ├── security.rs           # overbroad-grant
-│   │   ├── policies.rs           # restrictive-policy
-│   │   ├── triggers.rs           # disable-trigger
-│   │   ├── drift.rs              # schema-drift, irreversible-migration
-│   │   ├── conflict.rs           # chain-conflict (MutationResult::Conflict surfacing)
-│   │   └── mod.rs                # Rule trait definition, module exports
-│   │
-│   ├── report/                   # Violation reporting
-│   │   ├── violations.rs         # Violation struct, ViolationTier, OperationKind, ObjectKind, Verdict
-│   │   ├── reporter.rs           # CLI output formatting (header box, per-finding blocks, summary box)
-│   │   ├── reporter_tests.rs     # Reporter unit tests
-│   │   └── mod.rs
-│   │
-│   ├── db/                       # Database integration
-│   │   ├── cache.rs              # DbCache serialization, ForeignKeyCache, IndexCache
-│   │   └── mod.rs
-│   │
-│   ├── sync.rs                   # Database stats sync (6 queries to pg_class, pg_attribute, pg_stat_user_tables, etc.)
-│   ├── sync_tests.rs             # Sync and cache unit tests
-│   ├── lib.rs                    # Library root, public API exports
-│   └── main.rs                   # CLI entry point (lint, lint-chain, sync subcommands)
-│
-├── tests/
-│   ├── architectural_gaps.rs      # 37 state machine & simulator tests
-│   ├── bug_fixes.rs               # Regression tests for confirmed bugs
-│   ├── chain_execution.rs         # Multi-file lint-chain tests
-│   ├── cli_tests.rs               # CLI exit codes and flag tests
-│   ├── destructive_rules.rs       # Destructive rule tests
-│   ├── exhaustive_fuzz.rs         # 63 fuzz-style transaction/confidence tests
-│   ├── expression_parsing.rs      # Expression visitor tests
-│   ├── reversibility.rs           # Reversibility classification tests
-│   ├── rule_evaluation.rs         # Rule engine evaluation tests
-│   ├── state_machine_guards.rs    # State machine guard tests
-│   ├── state_mutation.rs          # State mutation tests
-│   ├── transaction_lifecycle.rs   # Transaction lifecycle tests
-│   ├── alter_schema_visitor.rs    # Schema visitor tests
-│   ├── identifier_casing.rs       # Identifier normalization tests
-│   └── common/mod.rs             # Shared test helpers
-│
-├── live_tests/                      # End-to-end integration suite against the real binary
-│   ├── run.sh                        # Test runner: lint-chain for chain-conflict dirs, lint -f per-file elsewhere
-│   ├── .safe-migrate.cache           # Frozen binary cache; tests are written against this baseline schema
-│   ├── rule_01_irreversible-migration/  # 533 SQL fixtures across 26 rule directories
-│   ├── rule_02_drop-database/
-│   ├── ... (rules 03-25) ...
-│   └── rule_26_chain-conflict/
-│
-├── docs/
-│   └── ast-reference/            # 22 PostgreSQL AST reference documents + index
-│       ├── README.md             # Index, guide, and navigation
-│       ├── columns.md            # Column lifecycle, TableArg dispatch
-│       ├── constraints.md        # FK, CHECK, UNIQUE, PK, exclusion
-│       ├── indexes.md            # Index creation/drop/alter, PartitionItem limitations
-│       ├── partitions.md         # Partition hierarchies, reverse-graph walk
-│       ├── sequences.md          # SequenceOption polymorphic dispatch, OWNED BY
-│       ├── schemas.md            # Schema creation, NameRef.text() normalization
-│       ├── views.md              # View/MV creation, DropView accessor
-│       ├── materialized_views.md # Reference to views.md with storage emphasis
-│       ├── functions.md          # Function creation, volatility detection
-│       ├── triggers.md           # Trigger creation, event detection
-│       ├── transactions.md       # BEGIN/COMMIT/ROLLBACK polymorphic forms, savepoints
-│       ├── search_path.md        # Set node dispatch, schema resolution
-│       ├── database.md           # CREATE/ALTER/DROP DATABASE
-│       ├── roles.md              # Role/User/Group aliases, privilege management
-│       ├── grant_revoke.md       # Grant/Revoke, PrivilegeTarget enum
-│       ├── enums.md              # CreateType polymorphic forms (enum/range/composite/shell)
-│       ├── domains.md            # CreateDomain, AlterDomainAction
-│       ├── policies.md           # RLS policy creation, two-layer model
-│       ├── publications.md       # Logical replication publication
-│       ├── subscriptions.md      # Logical replication subscription
-│       ├── security_model.md     # Two-axis risk model (structural vs access-control)
-│       └── non_schema_effects.md # [SYNTHESIS] Session context, replication, config side effects
-│
-├── .github/workflows/
-│   ├── ci.yml                    # Test on push/PR, cargo fmt/clippy checks
-│   └── release.yml               # Build & release multi-platform binaries on tag
-│
-├── Cargo.toml                    # v0.4.2, squawk-syntax = "=2.61.0"
-├── Cargo.lock
-├── README.md
-├── CHANGELOG.md
-├── CONTRIBUTING.md
-├── install.sh
-├── LICENSE-MIT
-├── LICENSE-APACHE
-└── .gitignore
+- [Documentation index](docs/README.md)
+- [Architecture and invariants](docs/internal/ARCHITECTURE.md)
+- [AST development](docs/internal/AST_DEVELOPMENT.md)
+- [CLI and report contract](docs/CONTRACT.md)
+
+## Project structure
+
+```text
+src/analysis/   facts, resolution, mutations, dependency graph, state, transactions
+src/ast/        extraction from the pinned Squawk typed AST
+src/db/         versioned database cache
+src/engine/     configuration, orchestration, and rule dispatch
+src/model/      modeled PostgreSQL objects
+src/report/     human, JSON, and interactive reporting
+src/rules/      safety rule implementations
+tests/          integration, state-machine, rule, CLI, and regression tests
+live_tests/     end-to-end SQL fixtures and frozen database cache
+docs/           product contracts and maintainer documentation
 ```
 
-## Verifying against squawk_syntax source
+Prefer this stable directory-level map over a copied inventory of every source
+file or rule. Use `rg --files src tests live_tests` when you need the current
+layout.
 
-`docs/ast-reference/` is verified directly against the actual squawk source in Cargo's registry cache — no intermediate dump file is kept or committed. To locate the source for a given version:
+## Development commands
+
+Use locked dependencies:
 
 ```bash
-find ~/.cargo/registry/src -type d -name "squawk-syntax-2.61.0"
-find ~/.cargo/registry/src -type d -name "squawk-lexer-2.61.0"
-find ~/.cargo/registry/src -type d -name "squawk-parser-2.61.0"
+cargo build --locked
+cargo test --locked
+cargo fmt -- --check
+cargo clippy --all-targets --locked -- -D warnings
 ```
 
-Read the `.rs` files in those directories directly when verifying or updating an AST reference doc. Do not guess accessor names from memory — confirm against the actual source before documenting or relying on a method signature.
-
-## Adding a New Rule
-
-1. **Create the rule struct and impl Rule**
-
-   ```rust
-   pub struct MyNewRule;
-   
-   impl Rule for MyNewRule {
-       fn id(&self) -> &'static str { "my-rule-id" }
-       fn default_tier(&self) -> ViolationTier { ViolationTier::Tier2 }
-       fn recipe(&self) -> &'static str { "How to fix this violation." }
-       
-       fn evaluate(
-           &self,
-           mutation: &Mutation,
-           result: &MutationResult,
-           pre_relations: &HashMap<ObjectId, RelationState>,
-           state: &AnalysisState,
-           config: &Config,
-           cascade_closure: Option<&CascadeResult>,
-       ) -> Vec<Violation> {
-           // Always guard on Skipped first — every rule must do this
-           if *result == MutationResult::Skipped {
-               return vec![];
-           }
-
-           // Match on mutation type and create violations.
-           // operation_kind and object_kind should be inferred from the
-           // Mutation variant, not left as a default/unknown value.
-           vec![]
-       }
-   }
-   ```
-
-2. **Register the rule in `src/engine/engine.rs`**
-
-   ```rust
-   pub fn new(config: Config) -> Self {
-       Self {
-           config,
-           rules: vec![
-               // ... existing rules ...
-               Box::new(MyNewRule),
-           ],
-       }
-   }
-   ```
-
-3. **Add configuration support (optional)**
-
-   In `src/engine/config.rs`, add a field if your rule needs thresholds or toggles:
-
-   ```toml
-   [rules.my-rule-id]
-   disabled = false
-   my_threshold = 1000
-   ```
-
-4. **Write tests**
-
-   Add tests to the appropriate file under `tests/` covering:
-   - The rule fires on the mutation it's designed for
-   - The rule does NOT fire when `MutationResult::Skipped` (e.g. `IF NOT EXISTS`/`IF EXISTS` on an object that already existed/didn't exist)
-   - The rule respects configuration overrides
-   - Edge cases specific to the rule (empty tables for row-count-gated rules, only if the rule actually uses row counts — a lock-behavior-only rule like index concurrency should not reference row counts or staleness at all)
-
-## Extending AST Extraction
-
-If you need to extract information from a new DDL statement:
-
-1. **Check the AST reference docs first** — `docs/ast-reference/README.md` has an index of all 22 documents.
-
-2. **Find your statement in the appropriate document**
-   - Example: Adding FK constraint extraction? See `docs/ast-reference/constraints.md`
-   - Need partition handling? See `docs/ast-reference/partitions.md`
-
-3. **Review the accessor methods** in that document
-   - Check if the data you need is extractable or if there's a grammar gap
-   - Look for handwritten extensions that might help
-   - Note any polymorphic nodes that need token dispatch
-
-4. **Implement the extraction in `src/ast/visitor.rs`**
-
-   ```rust
-   fn extract_create_table(node: &CreateTable) -> Option<Fact> {
-       let name = node.name()?.text();
-       // ... use accessor methods documented in columns.md, constraints.md, etc.
-   }
-   ```
-
-5. **Check against grammar limitations**
-   - If you hit a limitation listed in `docs/ast-reference/`, add a test that documents it
-   - Update the limitation in the appropriate AST doc if you work around it
-
-## Running Tests
+Focused examples:
 
 ```bash
-cargo test                      # Full test suite (344 tests)
-cargo test rule_evaluation      # Just rule tests
-cargo test architectural_gap    # Just simulator/state machine tests
-cargo test chain_execution      # Just multi-file chain tests
-cargo test reversibility        # Just reversibility classification tests
-cargo test --doc               # Doc tests (if any)
+cargo test rule_evaluation
+cargo test architectural_gap
+cargo test expression_parsing
 ```
 
-For integration testing:
-
-```bash
-cargo run -- lint --file test.sql --no-cache       # Offline mode
-export DATABASE_URL="postgres://..."
-cargo run -- sync                                   # Create cache
-cargo run -- lint --file test.sql                  # With cache
-```
-
-### live_tests/ — end-to-end suite
-
-`live_tests/` runs the compiled binary against 510 SQL fixtures across all 26 rule directories. It does not use `cargo test` — it shells out to the binary directly and parses JSON output.
+End-to-end fixtures:
 
 ```bash
 cd live_tests
-
-# Run the full suite (silent summary per directory)
 ./run.sh
-
-# Verbose: print pass/fail for every .sql file
-./run.sh -v
-
-# Run a single rule directory
 ./run.sh -d rule_25_schema-drift
-
-# Run a single file
-./run.sh -t rule_01_irreversible-migration/001_drop_table.sql
-
-# Offline mode (no cache, worst-case assumptions)
-./run.sh --offline
 ```
 
-**Fixture naming convention:**
-- `safe_*.sql` — expected to emit 0 violations for the target rule
-- `[0-9]*.sql` — expected to emit ≥ 1 violation for the target rule
+The fixture runner invokes the compiled binary. Most rule directories lint each
+file independently; chain-conflict fixtures use `lint-chain`.
 
-**Cache:** `live_tests/.safe-migrate.cache` is a frozen binary cache committed to the repo. Tests are written against the baseline schema it contains. If you add fixtures that need new tables or constraints, deploy them to a local Postgres instance, run `safe-migrate sync`, and copy the resulting cache back into `live_tests/`.
+## Adding or changing a rule
 
-**`run.sh` dispatch:** `chain-conflict` directories are linted with `lint-chain -d`; all others use `lint -f` per file.
+1. Implement one safety concept under `src/rules/`.
+2. Register the rule in the engine's canonical rule list.
+3. Add configuration only when the rule needs a user-controlled policy.
+4. Add focused regression tests.
+5. Add or update end-to-end fixtures.
+6. Update the canonical user-facing rule documentation.
+7. Add a `CHANGELOG.md` entry for user-visible behavior.
 
-## Code Style
+Rules must:
 
-- Run `cargo fmt` before committing
-- Run `cargo clippy -- -D warnings` to catch lints
-- Keep rule implementations self-contained (one rule per concept)
-- Document non-obvious state machine logic inline
+- handle `MutationResult::Skipped` deliberately;
+- distinguish conflicts from applied mutations;
+- infer operation and object kinds from the mutation;
+- avoid mutating analysis state;
+- explain the mechanism and a safer next step;
+- document PostgreSQL-version assumptions;
+- avoid using row count for lock behavior unless table size actually changes
+  the rule's conclusion.
 
-## Reporting Bugs
+## Extending AST extraction
 
-Found a bug in the simulator or a rule? Check if it's:
+Do not use an old AST reference or guess accessors from memory. Follow the
+[source-first AST workflow](docs/internal/AST_DEVELOPMENT.md):
 
-1. **AST extraction issue** — The parser isn't giving us the right data → check `docs/ast-reference/` for grammar gaps, update the doc, add a test
-2. **State machine issue** — Mutations aren't applied correctly → check `src/analysis/state.rs`, ensure undo-log captures the right state changes
-3. **Rule issue** — False positive or false negative → check the rule's logic, check thresholds in `src/engine/config.rs`
+1. confirm the exact Squawk versions in `Cargo.toml` and `Cargo.lock`;
+2. inspect the resolved dependency source and grammar;
+3. add an exact fact assertion in `src/ast/visitor_tests.rs`;
+4. implement extraction in `src/ast/visitor.rs` or expression conversion in
+   `src/analysis/expr_visitor.rs`;
+5. test resolver, state, and rule effects when behavior crosses layers;
+6. represent unsupported parser behavior explicitly.
+
+A Squawk version upgrade is an AST migration. Update all three pinned Squawk
+crates together and validate the full extraction surface through compilation and
+tests.
+
+## State-machine changes
+
+When adding modeled state:
+
+1. define the state or overlay in the appropriate model module;
+2. add explicit mutations and resolution;
+3. preserve baseline-versus-local identity;
+4. add transaction undo state for every mutable component;
+5. test apply, skip, conflict, rollback, rename, drop, and recreate behavior;
+6. update dependency edges and generation metadata where applicable.
+
+See [Architecture and invariants](docs/internal/ARCHITECTURE.md).
+
+## CLI and report changes
+
+User-visible output is an interface. Changes to JSON fields, confidence meaning,
+verdicts, exit statuses, output channels, or ordering must:
+
+1. follow [the CLI and report contract](docs/CONTRACT.md);
+2. include integration or golden tests;
+3. preserve machine-only JSON standard output;
+4. update `CHANGELOG.md`;
+5. include a migration note when scripts may break.
+
+## Testing expectations
+
+Add regression coverage with every behavior change:
+
+- AST changes: assert exact extracted facts.
+- Resolver/state changes: assert the resulting state and undo behavior.
+- Rule changes: assert rule ID, tier, object, reason, and relevant recipe.
+- Reporter changes: assert structured output and deterministic ordering.
+- CLI changes: assert standard output, standard error, and exit status.
+- Database metadata changes: use existing cache and live-test helpers.
+
+`safe_*.sql` fixtures are expected not to emit the target rule. Numbered
+fixtures are expected to emit the target rule. A fixture count is not a
+correctness claim by itself; prefer precise assertions in Rust tests for
+object, tier, reason, and source behavior.
+
+## Database synchronization
+
+Only `safe-migrate sync` reads `DATABASE_URL`. Do not commit credentials,
+connection strings, or private database dumps. Use a least-privilege PostgreSQL
+role and treat cache changes as reviewable schema-state changes.
+
+The frozen cache under `live_tests/` belongs to the test corpus. Update it only
+when a fixture requires a changed baseline, and explain the assumption in the
+pull request.
+
+## Code style
+
+- Format with `rustfmt`.
+- Treat Clippy warnings as errors.
+- Use idiomatic Rust naming and four-space indentation.
+- Keep one rule concept per file or focused module.
+- Document non-obvious undo-log and dependency-graph behavior inline.
+
+## Reporting bugs
 
 Include:
-- Minimal SQL that reproduces the issue
-- Expected vs actual output
-- Your PG version (or use `assume_pg_version` in test)
 
-## Versioning & Releases
+- minimal SQL;
+- expected and actual output;
+- safe-migrate version;
+- PostgreSQL version or assumed version;
+- whether a cache was used;
+- relevant configuration.
+
+Classify the likely layer:
+
+- AST extraction: add an exact visitor regression and inspect the pinned Squawk
+  source.
+- Resolution/state: test mutations, overlays, dependencies, and rollback.
+- Rule: test false-positive/false-negative behavior and severity.
+- CLI/report: test output channels, JSON, and exit status.
+
+## Versioning and releases
 
 safe-migrate uses semantic versioning:
-- **Major:** API/rule changes, SQL parsing overhauls
-- **Minor:** New rules, new config options, internal improvements
-- **Patch:** Bug fixes
 
-Before releasing:
-1. Update version in `Cargo.toml`
-2. Update `CHANGELOG.md`
-3. Run full test suite: `cargo test`
-4. Tag with `git tag vX.Y.Z` and push
-5. GitHub Actions will build and release binaries automatically
+- major: incompatible public API or product-contract changes;
+- minor: backward-compatible features, rules, or configuration;
+- patch: backward-compatible fixes.
 
-## Questions?
+Before release:
 
-Open an issue on [GitHub](https://github.com/dsecurity49/safe-migrate) or check the AST reference docs for extraction-related questions.
+1. update `Cargo.toml` and `CHANGELOG.md`;
+2. run formatting, locked tests, Clippy, and the live fixture suite;
+3. verify CLI/report contracts and release artifacts;
+4. tag only after the release commit is validated.
+
+## Questions
+
+Open an issue at <https://github.com/dsecurity49/safe-migrate> with a minimal
+reproduction and the affected layer.
 

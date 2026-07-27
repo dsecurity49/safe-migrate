@@ -44,8 +44,11 @@ mod tests {
         let has_failures = Reporter::print_report(&violations, &confidence);
         assert!(has_failures);
 
-        // Also call the JSON output function to cover that branch
-        Reporter::print_json_report(&violations, &confidence);
+        let report = Reporter::json_report(&violations, &confidence);
+        assert_eq!(report["schema_version"], Reporter::JSON_SCHEMA_VERSION);
+        assert_eq!(report["confidence"], "Tainted");
+        assert_eq!(report["verdict"], "HALT");
+        assert_eq!(report["violations"].as_array().unwrap().len(), 3);
     }
 
     #[test]

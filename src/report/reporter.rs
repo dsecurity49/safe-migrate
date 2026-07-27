@@ -79,17 +79,23 @@ fn terminal_width() -> usize {
 pub struct Reporter;
 
 impl Reporter {
-    pub fn print_json_report(violations: &[Violation], confidence: &Confidence) {
+    pub const JSON_SCHEMA_VERSION: u32 = 1;
+
+    pub fn json_report(violations: &[Violation], confidence: &Confidence) -> serde_json::Value {
         let verdict = compute_verdict(violations);
-        let output = serde_json::json!({
+        serde_json::json!({
+            "schema_version": Self::JSON_SCHEMA_VERSION,
             "confidence": match confidence {
                 Confidence::Exact => "Exact",
                 Confidence::Tainted => "Tainted",
             },
             "verdict": verdict.label(),
             "violations": violations,
-        });
-        println!("{}", serde_json::to_string_pretty(&output).unwrap());
+        })
+    }
+
+    pub fn should_halt(violations: &[Violation]) -> bool {
+        compute_verdict(violations) == Verdict::Halt
     }
 
     pub fn print_report(violations: &[Violation], confidence: &Confidence) -> bool {
@@ -247,6 +253,6 @@ impl Reporter {
         summary_table.add_row(vec!["SAFE (Tier 3)", &format!(": {}", tier3)]);
         println!("{}", summary_table);
 
-        verdict == Verdict::Halt
+        Self::should_halt(violations)
     }
 }

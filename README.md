@@ -1,4 +1,4 @@
-# safe-migrate v0.4.2
+# safe-migrate v0.4.3
 
 A PostgreSQL migration linter that **executes a bi-directional state machine simulation** over your SQL, combining static typed AST analysis with live database statistics to prevent blocking locks before they reach production.
 
@@ -6,16 +6,21 @@ A PostgreSQL migration linter that **executes a bi-directional state machine sim
 
 ---
 
-## What's New in v0.4.2
+## What's New in v0.4.3
 
-v0.4.2 upgrades the squawk parser to 2.61.0, adds `pg_depend`-based dependency tracking, and introduces a differential test harness that compares the simulator against real PostgreSQL dry-runs across all 26 rules.
+v0.4.3 makes safe-migrate easier to use safely in CI and scripts. JSON reports
+are now machine-clean and versioned, blocking findings have a dedicated exit
+status, and offline analysis is explicitly labelled as uncertain.
 
 Highlights:
-- **Parser upgrade**: squawk-{syntax,lexer,parser} 2.58.0 → 2.61.0; full AST extraction migration to `PathRef`/`NameRef`/`descendants_with_tokens()` API
-- **Dependency tracking**: `safe-migrate sync` queries `pg_depend` and builds a `DependencyCache`; 9 graph edge types consolidated into unified `DependencyEdge`/`DependencyKind`
-- **Differential harness**: `tests/live_differential_harness.rs` + `live_tests/` manifest and baseline — 0 mismatches across all 26 rules
-- **Bug fixes**: `DropSchema` without `CASCADE` correctly returns conflict; cache format version validated at decode; role name extraction handles keyword tokens (`PUBLIC_KW`, `GROUP_KW`) with PostgreSQL case-folding
-- 344 passing unit tests; 510 live_tests fixtures pass
+- **Stable JSON v1**: `lint --json` and `lint-chain --json` write exactly one
+  JSON document to standard output, with `schema_version: 1`.
+- **CI exit status**: completed analysis with a Tier 1 finding exits with
+  status `2`; operational failures remain status `1`.
+- **Clear confidence**: runs without a cache are reported as `Tainted` while
+  retaining conservative worst-case rule evaluation.
+- **Contributor docs**: the stale Squawk 2.58 AST snapshot was replaced with
+  source-first AST development and architecture guides.
 
 ### ✅ Live Database Statistics Integration
 
@@ -60,7 +65,10 @@ export DATABASE_URL="postgres://user:password@localhost:5432/mydb"
 safe-migrate sync
 ```
 
-Creates `.safe-migrate.cache` with table sizes, column info, constraints, and indexes. Safe to commit to source control — contains no secrets, only statistics.
+Creates `.safe-migrate.cache` with table sizes, object names, column metadata,
+constraints, dependencies, and indexes. The cache contains no database
+credentials by design, but it is schema metadata: review it before committing
+or sharing it outside the team.
 
 **TLS warning:** When `DATABASE_URL` points to a non-localhost host, safe-migrate emits a warning that the connection is unencrypted. Use `sslmode=require` in your connection string or an SSH tunnel for production databases.
 
@@ -107,7 +115,8 @@ Output:
 └────────────────────────────────────────────────────────────────┘
 ```
 
-Exit code: **1** (Tier 1 violation) → CI build fails
+Exit code: **2** (Tier 1 violation) → CI build fails. Exit code **1** means an
+operational failure such as invalid input, configuration, or cache data.
 
 ---
 
@@ -117,13 +126,13 @@ Exit code: **1** (Tier 1 violation) → CI build fails
 
 | Level | Meaning | When It Happens |
 |-------|---------|-----------------|
-| **Exact** | Analysis is mathematically sound | Pure DDL, no opaque SQL |
-| **Tainted** | Some DDL is hidden in opaque statements | `DO` blocks, `EXECUTE` statements, dynamic SQL |
+| **Exact** | The simulator remained consistent with the supplied SQL and baseline | No opaque or unresolved transitions |
+| **Tainted** | The baseline or one or more transitions is uncertain | Missing cache, `DO` blocks, `EXECUTE`, dynamic SQL |
 
-When confidence is `Tainted`, the engine:
-- Still evaluates all visible DDL
-- Warns that hidden mutations may exist
-- Does **not** suppress violations (conservative)
+When confidence is `Tainted`, safe-migrate still evaluates all visible DDL and
+reports the uncertainty. A missing cache uses conservative worst-case
+assumptions; taint from opaque or unresolved SQL can downgrade findings whose
+severity relies on an unknown state transition.
 
 ### Version-Gating
 
@@ -479,7 +488,7 @@ safe-migrate lint \
 | `--cache` | `.safe-migrate.cache` | Stats cache |
 | `--no-cache` | false | Use worst-case assumptions (offline mode) |
 | `-i, --interactive` | false | Launch full-screen TUI to browse violations |
-| `--json` | false | Output violations as JSON for CI/CD integration |
+| `--json` | false | Write one versioned JSON report to stdout; incompatible with `--interactive` |
 
 ### `safe-migrate lint-chain`
 
@@ -499,13 +508,13 @@ safe-migrate lint-chain \
 | `--cache` | `.safe-migrate.cache` | Stats cache |
 | `--no-cache` | false | Use worst-case assumptions |
 | `-i, --interactive` | false | Launch full-screen TUI to browse violations |
-| `--json` | false | Output violations as JSON |
+| `--json` | false | Write one versioned JSON report to stdout; incompatible with `--interactive` |
 
 ### `safe-migrate sync`
 
 ```bash
 export DATABASE_URL="postgres://user:pass@localhost/db"
-safe-migrate sync --out prod-cache.json --schemas public,auth
+safe-migrate sync --out prod-cache.safe-migrate.cache --schemas public,auth
 ```
 
 | Flag | Default | Description |
@@ -543,7 +552,7 @@ jobs:
       - name: Sync database stats
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: safe-migrate sync --out prod-cache.json
+        run: safe-migrate sync --out prod-cache.safe-migrate.cache
 
       - name: Lint changed migrations
         run: |
@@ -556,7 +565,7 @@ jobs:
           
           for f in $FILES; do
             echo "Linting $f..."
-            safe-migrate lint --file "$f" --cache prod-cache.json
+            safe-migrate lint --file "$f" --cache prod-cache.safe-migrate.cache
           done
 ```
 
@@ -567,10 +576,10 @@ lint-migrations:
   image: ubuntu:latest
   script:
     - curl -fsSL https://raw.githubusercontent.com/dsecurity49/safe-migrate/main/install.sh | bash
-    - safe-migrate sync --out prod-cache.json
+    - safe-migrate sync --out prod-cache.safe-migrate.cache
     - |
       git diff --name-only origin/main...HEAD -- '*.sql' | while read f; do
-        safe-migrate lint --file "$f" --cache prod-cache.json
+        safe-migrate lint --file "$f" --cache prod-cache.safe-migrate.cache
       done
   only:
     - merge_requests
@@ -622,6 +631,16 @@ PostgreSQL lock behavior is invisible in the SQL itself. The same `ALTER TABLE` 
 ## License
 
 Dual-licensed under [MIT](LICENSE-MIT) or [Apache 2.0](LICENSE-APACHE).
+
+---
+
+## Documentation and Contributing
+
+- [Documentation index](docs/README.md)
+- [CLI and report contract](docs/CONTRACT.md)
+- [Contributor guide](CONTRIBUTING.md)
+- [Maintainer architecture notes](docs/internal/ARCHITECTURE.md)
+- [AST development workflow](docs/internal/AST_DEVELOPMENT.md)
 
 ---
 
