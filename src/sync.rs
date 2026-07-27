@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use postgres::{Client, NoTls};
 use std::io::Write;
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::NamedTempFile;
 
 #[cfg(windows)]
@@ -61,7 +62,7 @@ fn write_cache(out_path: &Path, cache: DbCache, cache_encryption: bool) -> Resul
     let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3)
         .context("Failed to init zstd compression")?;
 
-    let versioned = crate::db::cache::DbCacheVersioned::V5(cache);
+    let versioned = crate::db::cache::DbCacheVersioned::V6(cache);
     let bincode_config = bincode::config::standard().with_variable_int_encoding();
 
     bincode::serde::encode_into_std_write(&versioned, &mut encoder, bincode_config)
@@ -145,6 +146,13 @@ fn replace_cache(temp_file: NamedTempFile, out_path: &Path) -> Result<()> {
 pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result<DbCache> {
     let mut cache = DbCache::new();
     let schema_values = schemas.map(|items| items.to_vec());
+    cache.metadata.created_at_unix_secs = Some(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    );
+    cache.metadata.schemas = schema_values.clone();
 
     let schema_filter = "AND ($1::text[] IS NULL OR n.nspname = ANY($1))";
     let schema_filter_with_fk = r#"
@@ -190,6 +198,9 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
     let version_row = client.query_one("SHOW server_version_num;", &[])?;
     let version_str: String = version_row.get(0);
     cache.pg_version_num = version_str.parse::<u32>().ok();
+
+    let database_row = client.query_one("SELECT current_database();", &[])?;
+    cache.metadata.source_database = Some(database_row.get(0));
 
     // Resolve role/database defaults and special entries such as "$user" exactly
     // as PostgreSQL does, while excluding the implicit pg_catalog lookup.

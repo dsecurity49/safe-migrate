@@ -41,6 +41,9 @@ mod tests {
     fn test_db_cache_serialization_roundtrip() {
         let mut cache = DbCache::new();
         cache.pg_version_num = Some(160000);
+        cache.metadata.created_at_unix_secs = Some(1_700_000_000);
+        cache.metadata.source_database = Some("app".into());
+        cache.metadata.schemas = Some(vec!["app".into(), "public".into()]);
         cache.search_path = vec!["app".into(), "public".into()];
 
         // Add a relation
@@ -90,7 +93,7 @@ mod tests {
         );
 
         // Serialize to JSON
-        let versioned = crate::db::cache::DbCacheVersioned::V5(cache);
+        let versioned = crate::db::cache::DbCacheVersioned::V6(cache);
         let config = bincode::config::standard().with_variable_int_encoding();
         let encoded = bincode::serde::encode_to_vec(&versioned, config).unwrap();
 
@@ -99,10 +102,22 @@ mod tests {
             bincode::serde::decode_from_slice(&encoded, config)
                 .unwrap()
                 .0;
-        let crate::db::cache::DbCacheVersioned::V5(deserialized) = decoded else {
-            panic!("Expected V5");
+        let crate::db::cache::DbCacheVersioned::V6(deserialized) = decoded else {
+            panic!("Expected V6");
         };
         assert_eq!(deserialized.pg_version_num, Some(160000));
+        assert_eq!(
+            deserialized.metadata.created_at_unix_secs,
+            Some(1_700_000_000)
+        );
+        assert_eq!(
+            deserialized.metadata.source_database.as_deref(),
+            Some("app")
+        );
+        assert_eq!(
+            deserialized.metadata.schemas.as_deref(),
+            Some(["app".to_string(), "public".to_string()].as_slice())
+        );
         assert_eq!(deserialized.search_path, ["app", "public"]);
         assert!(
             deserialized
@@ -152,15 +167,15 @@ mod tests {
         });
         cache.insert_baseline(id.clone(), rel);
 
-        let versioned = crate::db::cache::DbCacheVersioned::V5(cache);
+        let versioned = crate::db::cache::DbCacheVersioned::V6(cache);
         let config = bincode::config::standard().with_variable_int_encoding();
         let encoded = bincode::serde::encode_to_vec(&versioned, config).unwrap();
         let decoded: crate::db::cache::DbCacheVersioned =
             bincode::serde::decode_from_slice(&encoded, config)
                 .unwrap()
                 .0;
-        let crate::db::cache::DbCacheVersioned::V5(deserialized) = decoded else {
-            panic!("Expected V5");
+        let crate::db::cache::DbCacheVersioned::V6(deserialized) = decoded else {
+            panic!("Expected V6");
         };
         let rel = deserialized.relations.get(&id).unwrap();
         assert_eq!(rel.columns[0].default_expr_text, Some("now()".into()));
@@ -178,6 +193,29 @@ mod tests {
         assert!(deserialized.relations.is_empty());
         assert!(deserialized.foreign_keys.is_empty());
         assert!(deserialized.indexes.is_empty());
+    }
+
+    #[test]
+    fn test_legacy_v5_cache_reads_without_provenance() {
+        let legacy = crate::db::cache::DbCacheV5 {
+            pg_version_num: Some(160000),
+            search_path: vec!["public".into()],
+            relations: Default::default(),
+            foreign_keys: Vec::new(),
+            indexes: Vec::new(),
+            constraints: Vec::new(),
+            triggers: Vec::new(),
+            functions: Default::default(),
+            types: Default::default(),
+            dependencies: Vec::new(),
+        };
+
+        let cache = crate::db::cache::DbCacheVersioned::V5(legacy)
+            .into_cache()
+            .unwrap();
+        assert_eq!(cache.pg_version_num, Some(160000));
+        assert!(cache.metadata.created_at_unix_secs.is_none());
+        assert!(cache.metadata.source_database.is_none());
     }
 
     #[test]

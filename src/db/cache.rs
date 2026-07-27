@@ -51,6 +51,19 @@ pub struct DependencyCache {
     pub ref_name: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CacheMetadata {
+    /// Seconds since the Unix epoch when `safe-migrate sync` assembled this
+    /// baseline. `None` represents a cache written before provenance support.
+    pub created_at_unix_secs: Option<u64>,
+    /// PostgreSQL database name only; connection credentials and host details
+    /// are deliberately never stored in a cache.
+    pub source_database: Option<String>,
+    /// Explicit schema scope passed to sync. `None` means all non-system
+    /// schemas were requested.
+    pub schemas: Option<Vec<String>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DbCacheV1 {
     pub pg_version_num: Option<u32>,
@@ -78,6 +91,21 @@ pub struct DbCacheV2 {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DbCache {
+    pub pg_version_num: Option<u32>,
+    pub metadata: CacheMetadata,
+    pub search_path: Vec<String>,
+    pub relations: HashMap<ObjectId, RelationState>,
+    pub foreign_keys: Vec<ForeignKeyCache>,
+    pub indexes: Vec<IndexCache>,
+    pub constraints: Vec<ConstraintState>,
+    pub triggers: Vec<TriggerCache>,
+    pub functions: HashMap<ObjectId, FunctionState>,
+    pub types: HashMap<ObjectId, TypeState>,
+    pub dependencies: Vec<DependencyCache>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbCacheV5 {
     pub pg_version_num: Option<u32>,
     pub search_path: Vec<String>,
     pub relations: HashMap<ObjectId, RelationState>,
@@ -115,10 +143,10 @@ pub struct DbCacheV4 {
     pub dependencies: Vec<DependencyCache>,
 }
 
-pub const CACHE_FORMAT_VERSION: u32 = 5;
+pub const CACHE_FORMAT_VERSION: u32 = 6;
 
 const _: () = assert!(
-    CACHE_FORMAT_VERSION == 5,
+    CACHE_FORMAT_VERSION == 6,
     "CACHE_FORMAT_VERSION must be updated when new DbCacheVersioned variants are added",
 );
 
@@ -128,7 +156,8 @@ pub enum DbCacheVersioned {
     V2(DbCacheV2),
     V3(DbCacheV3),
     V4(DbCacheV4),
-    V5(DbCache),
+    V5(DbCacheV5),
+    V6(DbCache),
 }
 
 impl DbCacheVersioned {
@@ -139,6 +168,7 @@ impl DbCacheVersioned {
             DbCacheVersioned::V3(_) => 3,
             DbCacheVersioned::V4(_) => 4,
             DbCacheVersioned::V5(_) => 5,
+            DbCacheVersioned::V6(_) => 6,
         }
     }
 
@@ -146,6 +176,7 @@ impl DbCacheVersioned {
         match self {
             DbCacheVersioned::V1(c) => Ok(DbCache {
                 pg_version_num: c.pg_version_num,
+                metadata: CacheMetadata::default(),
                 relations: c.relations,
                 foreign_keys: c.foreign_keys,
                 indexes: c.indexes,
@@ -158,6 +189,7 @@ impl DbCacheVersioned {
             }),
             DbCacheVersioned::V2(c) => Ok(DbCache {
                 pg_version_num: c.pg_version_num,
+                metadata: CacheMetadata::default(),
                 search_path: vec!["public".to_string()],
                 relations: c.relations,
                 foreign_keys: c.foreign_keys,
@@ -170,6 +202,7 @@ impl DbCacheVersioned {
             }),
             DbCacheVersioned::V3(c) => Ok(DbCache {
                 pg_version_num: c.pg_version_num,
+                metadata: CacheMetadata::default(),
                 search_path: c.search_path,
                 relations: c.relations,
                 foreign_keys: c.foreign_keys,
@@ -182,6 +215,7 @@ impl DbCacheVersioned {
             }),
             DbCacheVersioned::V4(c) => Ok(DbCache {
                 pg_version_num: c.pg_version_num,
+                metadata: CacheMetadata::default(),
                 search_path: c.search_path,
                 relations: c.relations,
                 foreign_keys: c.foreign_keys,
@@ -192,7 +226,20 @@ impl DbCacheVersioned {
                 types: HashMap::new(),
                 dependencies: c.dependencies,
             }),
-            DbCacheVersioned::V5(c) => Ok(c),
+            DbCacheVersioned::V5(c) => Ok(DbCache {
+                pg_version_num: c.pg_version_num,
+                metadata: CacheMetadata::default(),
+                search_path: c.search_path,
+                relations: c.relations,
+                foreign_keys: c.foreign_keys,
+                indexes: c.indexes,
+                constraints: c.constraints,
+                triggers: c.triggers,
+                functions: c.functions,
+                types: c.types,
+                dependencies: c.dependencies,
+            }),
+            DbCacheVersioned::V6(c) => Ok(c),
         }
     }
 }
@@ -219,6 +266,7 @@ impl DbCache {
     pub fn new() -> Self {
         Self {
             pg_version_num: None,
+            metadata: CacheMetadata::default(),
             search_path: vec!["public".to_string()],
             relations: HashMap::new(),
             foreign_keys: Vec::new(),
