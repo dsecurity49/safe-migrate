@@ -36,6 +36,12 @@ scripts/live-differential -vv --rule rule_01_irreversible-migration
 scripts/live-differential -v
 ```
 
+Run one qualified fixture while debugging a mismatch:
+
+```bash
+scripts/live-differential --fixture rule_01_irreversible-migration/001_drop_table.sql
+```
+
 ### Basic Usage
 ```bash
 ./run.sh

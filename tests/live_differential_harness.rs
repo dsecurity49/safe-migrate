@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 
 const VERBOSITY_ENV: &str = "SAFE_MIGRATE_DIFF_VERBOSITY";
 const RULE_FILTER_ENV: &str = "SAFE_MIGRATE_DIFF_RULE";
+const FIXTURE_FILTER_ENV: &str = "SAFE_MIGRATE_DIFF_FIXTURE";
 
 #[derive(Debug, Deserialize)]
 struct DifferentialManifest {
@@ -257,6 +258,7 @@ fn live_postgres_differential_harness() {
     let engine = SafeMigrateEngine::new(Config::default());
     let mut mismatches = Vec::new();
     let rule_filter = std::env::var(RULE_FILTER_ENV).ok();
+    let fixture_filter = std::env::var(FIXTURE_FILTER_ENV).ok();
     let selected_rules = || {
         manifest.rules.iter().filter(|rule| {
             rule.enabled
@@ -266,21 +268,18 @@ fn live_postgres_differential_harness() {
         })
     };
     let enabled_rules = selected_rules().count();
-    let enabled_fixtures = manifest
-        .rules
-        .iter()
-        .filter(|rule| {
-            rule.enabled
-                && rule_filter
-                    .as_deref()
-                    .is_none_or(|selected| selected == rule.rule_dir)
+    let enabled_fixtures = selected_rules()
+        .map(|rule| {
+            rule.fixtures
+                .iter()
+                .filter(|fixture| fixture_is_selected(&fixture_filter, &rule.rule_dir, fixture))
+                .count()
         })
-        .map(|rule| rule.fixtures.len())
         .sum::<usize>();
-    if enabled_rules == 0 {
+    if enabled_rules == 0 || enabled_fixtures == 0 {
         panic!(
-            "no enabled differential rule matched {}={:?}",
-            RULE_FILTER_ENV, rule_filter
+            "no enabled differential fixture matched {}={:?}, {}={:?}",
+            RULE_FILTER_ENV, rule_filter, FIXTURE_FILTER_ENV, fixture_filter
         );
     }
     verbose(
@@ -327,7 +326,11 @@ fn live_postgres_differential_harness() {
                 );
             }
         }
-        for fixture in &rule.fixtures {
+        for fixture in rule
+            .fixtures
+            .iter()
+            .filter(|fixture| fixture_is_selected(&fixture_filter, &rule.rule_dir, fixture))
+        {
             let scope = rule
                 .fixture_scopes
                 .get(fixture)
@@ -589,6 +592,12 @@ fn live_postgres_differential_harness() {
             format_duration(harness_started.elapsed())
         ),
     );
+}
+
+fn fixture_is_selected(filter: &Option<String>, rule_dir: &str, fixture: &str) -> bool {
+    filter
+        .as_deref()
+        .is_none_or(|selected| selected == format!("{rule_dir}/{fixture}"))
 }
 
 fn differential_verbosity() -> u8 {

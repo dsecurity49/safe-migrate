@@ -3,9 +3,10 @@ set -eu
 
 verbosity=0
 rule_filter=""
+fixture_filter=""
 
 usage() {
-    printf '%s\n' "Usage: scripts/live-differential [-v|-vv|-vvv] [--rule RULE_DIRECTORY]"
+    printf '%s\n' "Usage: scripts/live-differential [-v|-vv|-vvv] [--rule RULE_DIRECTORY] [--fixture RULE_DIRECTORY/FILE.sql]"
     printf '%s\n' "Requires DATABASE_URL for a disposable PostgreSQL database."
 }
 
@@ -28,6 +29,14 @@ while [ "$#" -gt 0 ]; do
             fi
             rule_filter=$1
             ;;
+        --fixture)
+            shift
+            if [ "$#" -eq 0 ]; then
+                usage >&2
+                exit 2
+            fi
+            fixture_filter=$1
+            ;;
         -h|--help)
             usage
             exit 0
@@ -48,6 +57,9 @@ fi
 export SAFE_MIGRATE_DIFF_VERBOSITY=$verbosity
 if [ -n "$rule_filter" ]; then
     export SAFE_MIGRATE_DIFF_RULE=$rule_filter
+fi
+if [ -n "$fixture_filter" ]; then
+    export SAFE_MIGRATE_DIFF_FIXTURE=$fixture_filter
 fi
 
 cargo test --locked --test live_differential_harness \
