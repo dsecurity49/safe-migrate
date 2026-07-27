@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use safe_migrate::analysis::state::Confidence;
+use safe_migrate::db::cache_file::unprotect_cache_bytes;
 use safe_migrate::report::violations::Violation;
 use safe_migrate::sync;
 use safe_migrate::{AnalysisState, Config, DbCache, Reporter, SafeMigrateEngine};
@@ -76,6 +77,8 @@ enum Commands {
     Sync {
         #[arg(long, default_value = ".safe-migrate.cache")]
         out: PathBuf,
+        #[arg(long, default_value = "safe-migrate.toml")]
+        config: PathBuf,
         /// Filter sync to specific schemas (comma-separated, e.g., --schemas public,auth)
         #[arg(long, value_delimiter = ',')]
         schemas: Option<Vec<String>>,
@@ -138,7 +141,11 @@ fn main() -> Result<()> {
             no_cache,
             OutputMode::from_flags(json, interactive),
         ),
-        Commands::Sync { out, schemas } => run_sync(&out, schemas.as_deref()),
+        Commands::Sync {
+            out,
+            config,
+            schemas,
+        } => run_sync(&out, &config, schemas.as_deref()),
     }
 }
 
@@ -209,15 +216,16 @@ fn run_lint_chain(
     finish_analysis(violations, &mut state, baseline_unknown, output_mode)
 }
 
-fn run_sync(out: &Path, schemas: Option<&[String]>) -> Result<()> {
+fn run_sync(out: &Path, config_path: &Path, schemas: Option<&[String]>) -> Result<()> {
     std::env::var("DATABASE_URL")
         .context("DATABASE_URL environment variable must be set to run sync.")?;
+    let config = load_config(config_path)?;
 
     println!("Syncing database stats...");
     if let Some(schemas) = schemas {
         println!("Filtering to schemas: {}", schemas.join(", "));
     }
-    sync::sync_cache(out, schemas)?;
+    sync::sync_cache(out, schemas, config.cache_encryption)?;
     println!("[ SAFE ] Cache successfully written to {}", out.display());
     Ok(())
 }
@@ -230,7 +238,7 @@ fn load_config(path: &Path) -> Result<Config> {
 fn prepare_cache(config: &Config, cache: &Path, no_cache: bool) -> Result<(DbCache, bool)> {
     maybe_auto_sync(config, cache, no_cache);
     warn_if_stale_cache(cache, no_cache);
-    load_cache(cache, no_cache)
+    load_cache(cache, no_cache, config.cache_encryption)
 }
 
 fn maybe_auto_sync(config: &Config, cache: &Path, no_cache: bool) {
@@ -247,7 +255,8 @@ fn maybe_auto_sync(config: &Config, cache: &Path, no_cache: bool) {
         "[ INFO ] Automatic cache sync enabled. Refreshing {}.",
         cache.display()
     );
-    if let Err(error) = sync::sync_cache(cache, config.schemas.as_deref()) {
+    if let Err(error) = sync::sync_cache(cache, config.schemas.as_deref(), config.cache_encryption)
+    {
         eprintln!("[ WARN ] Automatic cache sync failed: {error}");
         if cache.exists() {
             eprintln!("         Continuing with the previous cache.");
@@ -286,11 +295,12 @@ fn warn_if_stale_cache(cache: &Path, no_cache: bool) {
     }
 }
 
-fn load_cache(cache: &Path, no_cache: bool) -> Result<(DbCache, bool)> {
+fn load_cache(cache: &Path, no_cache: bool, cache_encryption: bool) -> Result<(DbCache, bool)> {
     if !no_cache && cache.exists() {
-        let file = fs::File::open(cache)
-            .with_context(|| format!("Failed to open cache file: {}", cache.display()))?;
-        let reader = std::io::BufReader::new(file);
+        let encoded = fs::read(cache)
+            .with_context(|| format!("Failed to read cache file: {}", cache.display()))?;
+        let decrypted = unprotect_cache_bytes(encoded, cache_encryption)?;
+        let reader = std::io::Cursor::new(decrypted);
         let mut decoder = zstd::stream::Decoder::new(reader).map_err(|error| {
             anyhow!(
                 "Cache file '{}' is corrupted (zstd init): {}",

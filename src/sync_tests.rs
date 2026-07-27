@@ -19,7 +19,7 @@ mod tests {
             std::env::remove_var("DATABASE_URL");
         }
 
-        let result = sync_cache(path, None);
+        let result = sync_cache(path, None, false);
         assert!(result.is_err());
     }
 
@@ -33,7 +33,7 @@ mod tests {
             std::env::remove_var("DATABASE_URL");
         }
 
-        assert!(sync_cache(tmp.path(), None).is_err());
+        assert!(sync_cache(tmp.path(), None, false).is_err());
         assert_eq!(std::fs::read(tmp.path()).unwrap(), b"known-good-cache");
     }
 

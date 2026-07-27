@@ -2,16 +2,22 @@
 
 use crate::ast::identifiers::ObjectId;
 use crate::db::cache::{DbCache, ForeignKeyCache, IndexCache};
+use crate::db::cache_file::protect_cache_bytes;
 use crate::model::relation::{Persistence, RelationKind, RelationState};
 use anyhow::{Context, Result};
 use postgres::{Client, NoTls};
+use std::io::Write;
 use std::path::Path;
 use tempfile::NamedTempFile;
 
 #[cfg(windows)]
 use std::fs;
 
-pub fn sync_cache(out_path: &Path, schemas: Option<&[String]>) -> Result<()> {
+pub fn sync_cache(
+    out_path: &Path,
+    schemas: Option<&[String]>,
+    cache_encryption: bool,
+) -> Result<()> {
     // Strict env-only credential enforcement
     let db_url = std::env::var("DATABASE_URL")
         .context("DATABASE_URL environment variable is required to sync database stats. Do not pass credentials via CLI flags or config files.")?;
@@ -40,23 +46,20 @@ pub fn sync_cache(out_path: &Path, schemas: Option<&[String]>) -> Result<()> {
 
     let cache = populate_cache(&mut client, schemas)?;
 
-    write_cache(out_path, cache)
+    write_cache(out_path, cache, cache_encryption)
 }
 
-fn write_cache(out_path: &Path, cache: DbCache) -> Result<()> {
+fn write_cache(out_path: &Path, cache: DbCache, cache_encryption: bool) -> Result<()> {
     let parent = out_path.parent().unwrap_or_else(|| Path::new("."));
-    let temp_file = NamedTempFile::new_in(parent).with_context(|| {
+    let mut temp_file = NamedTempFile::new_in(parent).with_context(|| {
         format!(
             "Failed to create temporary cache file beside {}",
             out_path.display()
         )
     })?;
-    let file = temp_file
-        .reopen()
-        .context("Failed to reopen temporary cache file for writing")?;
-    let writer = std::io::BufWriter::new(file);
-    let mut encoder =
-        zstd::stream::Encoder::new(writer, 3).context("Failed to init zstd compression")?;
+    let mut compressed = Vec::new();
+    let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3)
+        .context("Failed to init zstd compression")?;
 
     let versioned = crate::db::cache::DbCacheVersioned::V5(cache);
     let bincode_config = bincode::config::standard().with_variable_int_encoding();
@@ -67,6 +70,12 @@ fn write_cache(out_path: &Path, cache: DbCache) -> Result<()> {
     encoder
         .finish()
         .context("Failed to flush final zstd stream to disk")?;
+
+    let cache_bytes = protect_cache_bytes(compressed, cache_encryption)?;
+    temp_file
+        .write_all(&cache_bytes)
+        .context("Failed to write cache payload")?;
+    temp_file.flush().context("Failed to flush cache payload")?;
 
     replace_cache(temp_file, out_path)?;
 
