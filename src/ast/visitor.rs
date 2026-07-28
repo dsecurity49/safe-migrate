@@ -49,7 +49,15 @@ impl AstVisitor {
             Stmt::Grant(node) => return Self::extract_grant(node),
             Stmt::Revoke(node) => return Self::extract_revoke(node),
             Stmt::Begin(_) => return Some(StatementFact::BeginTransaction),
-            Stmt::Commit(_) => return Some(StatementFact::CommitTransaction),
+            Stmt::Commit(node) => {
+                return Some(
+                    if node.chain_token().is_some() && node.no_token().is_none() {
+                        StatementFact::CommitAndChain
+                    } else {
+                        StatementFact::CommitTransaction
+                    },
+                );
+            }
             Stmt::Rollback(node) => return Self::extract_rollback(node),
             Stmt::SavepointCreate(node) => return Some(Self::extract_savepoint(node)),
             Stmt::ReleaseSavepoint(node) => return Some(Self::extract_release_savepoint(node)),

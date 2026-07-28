@@ -42,6 +42,7 @@ pub enum Mutation {
     SearchPath(SearchPathChange),
     BeginTransaction,
     CommitTransaction,
+    CommitAndChain,
     RollbackTransaction,
     RollbackToSavepoint(RollbackToSavepointMutation),
     Savepoint(SavepointMutation),

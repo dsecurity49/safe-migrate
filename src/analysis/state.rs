@@ -547,7 +547,9 @@ impl AnalysisState {
         if self.local.transaction_aborted
             && !matches!(
                 mutation,
-                Mutation::CommitTransaction | Mutation::RollbackTransaction
+                Mutation::CommitTransaction
+                    | Mutation::CommitAndChain
+                    | Mutation::RollbackTransaction
             )
         {
             return MutationResult::NotExecuted;
@@ -1644,6 +1646,20 @@ impl AnalysisState {
                     while self.local.transactions.pop().is_some() {}
                 }
                 self.local.transaction_aborted = false;
+                MutationResult::Applied
+            }
+            Mutation::CommitAndChain => {
+                if self.local.transaction_aborted {
+                    while let Some(frame) = self.local.transactions.pop() {
+                        self.rollback_frame(frame);
+                    }
+                } else {
+                    while self.local.transactions.pop().is_some() {}
+                }
+                self.local.transaction_aborted = false;
+                self.local
+                    .transactions
+                    .push(TransactionFrame::new("transaction"));
                 MutationResult::Applied
             }
             Mutation::RollbackTransaction => {

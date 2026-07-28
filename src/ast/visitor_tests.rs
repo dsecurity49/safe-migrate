@@ -453,6 +453,15 @@ mod tests {
     }
 
     #[test]
+    fn test_commit_and_chain() {
+        let facts = parse_and_extract_statement("COMMIT AND CHAIN;");
+        assert!(matches!(facts, Some(StatementFact::CommitAndChain)));
+
+        let facts = parse_and_extract_statement("COMMIT AND NO CHAIN;");
+        assert!(matches!(facts, Some(StatementFact::CommitTransaction)));
+    }
+
+    #[test]
     fn test_savepoint() {
         let sql = "SAVEPOINT sp1;";
         let facts = parse_and_extract_statement(sql);
