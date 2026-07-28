@@ -5,7 +5,7 @@ use crate::model::relation::{Persistence, RelationKind, RelationState};
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sync::{is_local_host, sync_cache};
+    use crate::sync::{cache_search_path, is_local_host, sync_cache};
     use std::io::Write;
     use tempfile::NamedTempFile;
 
@@ -44,6 +44,27 @@ mod tests {
         assert!(is_local_host("::1"));
         assert!(is_local_host("/var/run/postgresql"));
         assert!(!is_local_host("db.internal.example"));
+    }
+
+    #[test]
+    fn test_scoped_sync_uses_the_explicit_scope_as_search_path() {
+        let database_search_path = vec!["tenant".into(), "public".into()];
+        let schemas = vec!["public".into(), "auth".into()];
+
+        assert_eq!(
+            cache_search_path(database_search_path, Some(&schemas)),
+            ["public", "auth"]
+        );
+    }
+
+    #[test]
+    fn test_unscoped_sync_preserves_the_database_search_path() {
+        let database_search_path = vec!["tenant".into(), "public".into()];
+
+        assert_eq!(
+            cache_search_path(database_search_path.clone(), None),
+            database_search_path
+        );
     }
 
     #[test]

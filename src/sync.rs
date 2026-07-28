@@ -58,6 +58,15 @@ pub(crate) fn is_local_host(host: &str) -> bool {
         || host.starts_with('/')
 }
 
+pub(crate) fn cache_search_path(
+    database_search_path: Vec<String>,
+    schemas: Option<&[String]>,
+) -> Vec<String> {
+    schemas
+        .map(<[String]>::to_vec)
+        .unwrap_or(database_search_path)
+}
+
 fn write_cache(out_path: &Path, cache: DbCache, cache_encryption: bool) -> Result<()> {
     let parent = out_path.parent().unwrap_or_else(|| Path::new("."));
     let mut temp_file = NamedTempFile::new_in(parent).with_context(|| {
@@ -211,9 +220,12 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
     cache.metadata.source_database = Some(database_row.get(0));
 
     // Resolve role/database defaults and special entries such as "$user" exactly
-    // as PostgreSQL does, while excluding the implicit pg_catalog lookup.
+    // as PostgreSQL does, while excluding the implicit pg_catalog lookup. An
+    // explicit schema scope is also the intended resolution scope: schemas
+    // pulled only as cross-schema FK dependencies must not become implicit
+    // lookup targets.
     let search_path_row = client.query_one("SELECT current_schemas(false);", &[])?;
-    cache.search_path = search_path_row.get(0);
+    cache.search_path = cache_search_path(search_path_row.get(0), schemas);
 
     // Query 2: Relations + Staleness
     let table_query = format!(
