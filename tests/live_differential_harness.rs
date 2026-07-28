@@ -655,11 +655,170 @@ fn repo_path(relative: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(relative)
 }
 
+#[test]
+fn differential_manifest_accounts_for_every_sql_fixture() {
+    load_manifest(&repo_path("live_tests/differential_manifest.json"));
+}
+
 fn load_manifest(path: &Path) -> DifferentialManifest {
     let raw = fs::read_to_string(path)
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
-    serde_json::from_str(&raw)
-        .unwrap_or_else(|error| panic!("failed to parse {}: {error}", path.display()))
+    let manifest = serde_json::from_str(&raw)
+        .unwrap_or_else(|error| panic!("failed to parse {}: {error}", path.display()));
+    validate_manifest(&manifest, path);
+    manifest
+}
+
+fn validate_manifest(manifest: &DifferentialManifest, path: &Path) {
+    let live_tests_dir = path
+        .parent()
+        .unwrap_or_else(|| panic!("manifest has no parent directory: {}", path.display()));
+    let actual_rule_dirs = directory_names(live_tests_dir);
+    let mut manifest_rule_dirs = BTreeSet::new();
+
+    for rule in &manifest.rules {
+        assert!(
+            manifest_rule_dirs.insert(rule.rule_dir.clone()),
+            "duplicate differential manifest rule directory: {}",
+            rule.rule_dir
+        );
+
+        let included = unique_fixture_names(
+            &rule.rule_dir,
+            "fixtures",
+            rule.fixtures.iter().map(String::as_str),
+        );
+        let excluded = unique_fixture_names(
+            &rule.rule_dir,
+            "excluded_fixtures",
+            rule.excluded_fixtures
+                .iter()
+                .map(|exclusion| exclusion.fixture.as_str()),
+        );
+        for exclusion in &rule.excluded_fixtures {
+            assert!(
+                !exclusion.reason.trim().is_empty(),
+                "excluded fixture {}/{} has no reason",
+                rule.rule_dir,
+                exclusion.fixture
+            );
+        }
+
+        let overlap = included
+            .intersection(&excluded)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(
+            overlap.is_empty(),
+            "differential fixtures cannot be both included and excluded for {}: {overlap:?}",
+            rule.rule_dir
+        );
+
+        for fixture in rule.fixture_scopes.keys() {
+            assert!(
+                included.contains(fixture),
+                "fixture scope references a non-included fixture: {}/{}",
+                rule.rule_dir,
+                fixture
+            );
+        }
+
+        let rule_dir = live_tests_dir.join(&rule.rule_dir);
+        let actual_fixtures = sql_fixture_names(&rule_dir);
+        let accounted_for = included.union(&excluded).cloned().collect::<BTreeSet<_>>();
+        let unlisted = actual_fixtures
+            .difference(&accounted_for)
+            .cloned()
+            .collect::<Vec<_>>();
+        let missing = accounted_for
+            .difference(&actual_fixtures)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(
+            unlisted.is_empty() && missing.is_empty(),
+            "differential manifest mismatch for {}: unlisted={unlisted:?}, missing={missing:?}",
+            rule.rule_dir
+        );
+    }
+
+    assert_eq!(
+        manifest_rule_dirs, actual_rule_dirs,
+        "differential manifest rule directories do not match live_tests"
+    );
+}
+
+fn unique_fixture_names<'a>(
+    rule_dir: &str,
+    field: &str,
+    fixtures: impl Iterator<Item = &'a str>,
+) -> BTreeSet<String> {
+    let mut unique = BTreeSet::new();
+    for fixture in fixtures {
+        assert!(
+            unique.insert(fixture.to_string()),
+            "duplicate fixture in {rule_dir}.{field}: {fixture}"
+        );
+    }
+    unique
+}
+
+fn directory_names(path: &Path) -> BTreeSet<String> {
+    fs::read_dir(path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
+        .map(|entry| {
+            entry.unwrap_or_else(|error| {
+                panic!(
+                    "failed to read directory entry in {}: {error}",
+                    path.display()
+                )
+            })
+        })
+        .filter(|entry| {
+            entry
+                .file_type()
+                .unwrap_or_else(|error| {
+                    panic!("failed to inspect {}: {error}", entry.path().display())
+                })
+                .is_dir()
+        })
+        .map(|entry| {
+            entry.file_name().into_string().unwrap_or_else(|name| {
+                panic!("non-UTF-8 directory name in {}: {name:?}", path.display())
+            })
+        })
+        .filter(|name| name.starts_with("rule_"))
+        .collect()
+}
+
+fn sql_fixture_names(path: &Path) -> BTreeSet<String> {
+    fs::read_dir(path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
+        .map(|entry| {
+            entry.unwrap_or_else(|error| {
+                panic!(
+                    "failed to read directory entry in {}: {error}",
+                    path.display()
+                )
+            })
+        })
+        .filter(|entry| {
+            entry
+                .file_type()
+                .unwrap_or_else(|error| {
+                    panic!("failed to inspect {}: {error}", entry.path().display())
+                })
+                .is_file()
+                && entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "sql")
+        })
+        .map(|entry| {
+            entry.file_name().into_string().unwrap_or_else(|name| {
+                panic!("non-UTF-8 fixture name in {}: {name:?}", path.display())
+            })
+        })
+        .collect()
 }
 
 fn check_required_relations(rule: &RuleManifest, fixture: &str, cache: &DbCache) -> Vec<Mismatch> {
