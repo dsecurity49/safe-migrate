@@ -5,7 +5,9 @@ use crate::model::relation::{Persistence, RelationKind, RelationState};
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sync::{cache_search_path, is_local_host, relation_owner_id, sync_cache};
+    use crate::sync::{
+        cache_search_path, is_local_host, is_system_schema, relation_owner_id, sync_cache,
+    };
     use std::io::Write;
     use tempfile::NamedTempFile;
 
@@ -73,6 +75,15 @@ mod tests {
             relation_owner_id("app_owner"),
             ObjectId::new("", "app_owner")
         );
+    }
+
+    #[test]
+    fn test_system_schema_detection_covers_catalog_and_toast() {
+        assert!(is_system_schema("pg_catalog"));
+        assert!(is_system_schema("pg_toast"));
+        assert!(is_system_schema("information_schema"));
+        assert!(!is_system_schema("public"));
+        assert!(!is_system_schema("app"));
     }
 
     #[test]

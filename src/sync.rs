@@ -71,6 +71,10 @@ pub(crate) fn relation_owner_id(owner_name: impl Into<String>) -> ObjectId {
     ObjectId::new("", owner_name)
 }
 
+pub(crate) fn is_system_schema(schema: &str) -> bool {
+    schema == "information_schema" || schema.starts_with("pg_")
+}
+
 fn write_cache(out_path: &Path, cache: DbCache, cache_encryption: bool) -> Result<()> {
     let parent = out_path.parent().unwrap_or_else(|| Path::new("."));
     let mut temp_file = NamedTempFile::new_in(parent).with_context(|| {
@@ -610,6 +614,10 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
         JOIN pg_class t ON t.oid = x.indrelid
         JOIN pg_namespace n_t ON n_t.oid = t.relnamespace
         WHERE x.indisvalid = true
+          AND n_i.nspname !~ '^pg_'
+          AND n_i.nspname <> 'information_schema'
+          AND n_t.nspname !~ '^pg_'
+          AND n_t.nspname <> 'information_schema'
         {schema_filter_nt};
     "
     );
@@ -619,6 +627,10 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
         let index_name: String = row.get("index_name");
         let table_schema: String = row.get("table_schema");
         let table_name: String = row.get("table_name");
+
+        if is_system_schema(&index_schema) || is_system_schema(&table_schema) {
+            continue;
+        }
 
         cache.indexes.push(IndexCache {
             index_id: ObjectId::new(&index_schema, &index_name),
