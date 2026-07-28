@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use safe_migrate::analysis::state::Confidence;
 use safe_migrate::db::cache::CacheMetadata;
 use safe_migrate::db::cache_file::unprotect_cache_bytes;
-use safe_migrate::report::violations::Violation;
+use safe_migrate::report::violations::{ReportFinding, Violation};
 use safe_migrate::sync;
 use safe_migrate::{AnalysisState, Config, DbCache, Reporter, SafeMigrateEngine};
 use std::fs;
@@ -43,11 +43,15 @@ enum Commands {
         no_cache: bool,
 
         /// Output results in JSON format for CI/CD integration
-        #[arg(long, conflicts_with = "interactive")]
+        #[arg(long, conflicts_with_all = ["interactive", "markdown"])]
         json: bool,
 
+        /// Output a deterministic Markdown report for pull-request artifacts
+        #[arg(long, conflicts_with_all = ["interactive", "json"])]
+        markdown: bool,
+
         /// Launch an interactive terminal UI to browse violations
-        #[arg(short, long, conflicts_with = "json")]
+        #[arg(short, long, conflicts_with_all = ["json", "markdown"])]
         interactive: bool,
     },
     /// Lint a chain of SQL migration files in order (state persists across files)
@@ -66,11 +70,15 @@ enum Commands {
         no_cache: bool,
 
         /// Output results in JSON format for CI/CD integration
-        #[arg(long, conflicts_with = "interactive")]
+        #[arg(long, conflicts_with_all = ["interactive", "markdown"])]
         json: bool,
 
+        /// Output a deterministic Markdown report for pull-request artifacts
+        #[arg(long, conflicts_with_all = ["interactive", "json"])]
+        markdown: bool,
+
         /// Launch an interactive terminal UI to browse violations
-        #[arg(short, long, conflicts_with = "json")]
+        #[arg(short, long, conflicts_with_all = ["json", "markdown"])]
         interactive: bool,
     },
     /// Sync database table statistics for accurate lock evaluation
@@ -89,6 +97,7 @@ enum Commands {
 enum OutputMode {
     Human,
     Json,
+    Markdown,
     Interactive,
 }
 
@@ -120,9 +129,11 @@ struct PreparedCache {
 }
 
 impl OutputMode {
-    fn from_flags(json: bool, interactive: bool) -> Self {
+    fn from_flags(json: bool, markdown: bool, interactive: bool) -> Self {
         if json {
             Self::Json
+        } else if markdown {
+            Self::Markdown
         } else if interactive {
             Self::Interactive
         } else {
@@ -146,13 +157,14 @@ fn main() -> Result<()> {
             cache,
             no_cache,
             json,
+            markdown,
             interactive,
         } => run_lint(
             &file,
             &config,
             &cache,
             no_cache,
-            OutputMode::from_flags(json, interactive),
+            OutputMode::from_flags(json, markdown, interactive),
         ),
         Commands::LintChain {
             dir,
@@ -160,13 +172,14 @@ fn main() -> Result<()> {
             cache,
             no_cache,
             json,
+            markdown,
             interactive,
         } => run_lint_chain(
             &dir,
             &config,
             &cache,
             no_cache,
-            OutputMode::from_flags(json, interactive),
+            OutputMode::from_flags(json, markdown, interactive),
         ),
         Commands::Sync {
             out,
@@ -198,10 +211,12 @@ fn run_lint(
 
     let engine = SafeMigrateEngine::new(config);
     let mut state = AnalysisState::with_baseline(db_cache, !baseline_unknown);
-    let violations = engine.analyze(&sql, &mut state).map_err(analysis_error)?;
+    let findings = engine
+        .analyze_with_locations(file.display().to_string(), sql, &mut state)
+        .map_err(analysis_error)?;
 
     finish_analysis(
-        violations,
+        findings,
         &mut state,
         baseline_unknown,
         baseline_stale,
@@ -233,11 +248,7 @@ fn run_lint_chain(
     let mut migrations = Vec::new();
     for entry in files {
         let path = entry.path();
-        let filename = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("unknown")
-            .to_owned();
+        let filename = path.display().to_string();
         let sql = fs::read_to_string(&path)
             .with_context(|| format!("Failed to read migration file: {}", path.display()))?;
         migrations.push((filename, sql));
@@ -256,12 +267,12 @@ fn run_lint_chain(
 
     let engine = SafeMigrateEngine::new(config);
     let mut state = AnalysisState::with_baseline(db_cache, !baseline_unknown);
-    let violations = engine
-        .analyze_chain(&migrations, &mut state)
+    let findings = engine
+        .analyze_chain_with_locations(&migrations, &mut state)
         .map_err(analysis_error)?;
 
     finish_analysis(
-        violations,
+        findings,
         &mut state,
         baseline_unknown,
         baseline_stale,
@@ -413,7 +424,7 @@ fn analysis_error(errors: Vec<String>) -> anyhow::Error {
 }
 
 fn finish_analysis(
-    violations: Vec<Violation>,
+    findings: Vec<ReportFinding>,
     state: &mut AnalysisState,
     baseline_unknown: bool,
     baseline_stale: bool,
@@ -429,21 +440,48 @@ fn finish_analysis(
         state.local.confidence = Confidence::Tainted;
     }
 
+    let violations: Vec<Violation> = findings
+        .iter()
+        .map(|finding| finding.violation.clone())
+        .collect();
     let should_halt = Reporter::should_halt(&violations);
+    let baseline = serde_json::json!({
+        "status": if baseline_unknown { "unavailable" } else if baseline_stale { "stale" } else { "available" },
+        "created_at_unix_secs": metadata.created_at_unix_secs,
+        "source_database": metadata.source_database,
+        "schemas": metadata.schemas,
+        "auto_sync": auto_sync.label(),
+    });
     match output_mode {
         OutputMode::Human => {
             Reporter::print_report(&violations, &state.local.confidence);
         }
         OutputMode::Json => {
-            let mut report = Reporter::json_report(&violations, &state.local.confidence);
-            report["baseline"] = serde_json::json!({
-                "status": if baseline_unknown { "unavailable" } else if baseline_stale { "stale" } else { "available" },
-                "created_at_unix_secs": metadata.created_at_unix_secs,
-                "source_database": metadata.source_database,
-                "schemas": metadata.schemas,
-                "auto_sync": auto_sync.label(),
-            });
+            let mut report =
+                Reporter::json_report_with_locations(&findings, &state.local.confidence);
+            report["baseline"] = baseline.clone();
             println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        OutputMode::Markdown => {
+            let mut report = Reporter::markdown_report(&findings, &state.local.confidence);
+            report.push_str("\n## Baseline\n\n");
+            report.push_str(&format!(
+                "- **Status:** `{}`\n- **Automatic sync:** `{}`\n",
+                baseline["status"].as_str().unwrap_or("unknown"),
+                baseline["auto_sync"].as_str().unwrap_or("unknown")
+            ));
+            if let Some(source_database) = baseline["source_database"].as_str() {
+                report.push_str(&format!("- **Source database:** `{source_database}`\n"));
+            }
+            if let Some(schemas) = baseline["schemas"].as_array() {
+                let schemas = schemas
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                report.push_str(&format!("- **Schemas:** `{schemas}`\n"));
+            }
+            println!("{report}");
         }
         OutputMode::Interactive => {
             safe_migrate::run_interactive(&violations, &state.local.confidence)?;

@@ -1,6 +1,6 @@
 // FILE: src/report/reporter.rs
 use crate::analysis::state::Confidence;
-use crate::report::violations::{Violation, ViolationTier};
+use crate::report::violations::{ReportFinding, Violation, ViolationTier};
 use comfy_table::Table;
 use owo_colors::{OwoColorize, Style};
 
@@ -95,6 +95,101 @@ impl Reporter {
             "verdict": verdict.label(),
             "violations": violations,
         })
+    }
+
+    /// Additive JSON rendering that includes file/line locations when analysis
+    /// was invoked with source-aware reporting.
+    pub fn json_report_with_locations(
+        findings: &[ReportFinding],
+        confidence: &Confidence,
+    ) -> serde_json::Value {
+        let violations: Vec<_> = findings
+            .iter()
+            .map(|finding| finding.violation.clone())
+            .collect();
+        let mut report = Self::json_report(&violations, confidence);
+        report["violations"] =
+            serde_json::to_value(findings).expect("Report findings must always serialize to JSON");
+        report
+    }
+
+    /// Deterministic Markdown rendering for pull-request artifacts. It uses
+    /// the same verdict, confidence, tier, and finding data as JSON output.
+    pub fn markdown_report(findings: &[ReportFinding], confidence: &Confidence) -> String {
+        let violations: Vec<_> = findings
+            .iter()
+            .map(|finding| finding.violation.clone())
+            .collect();
+        let verdict = compute_verdict(&violations);
+        let confidence = match confidence {
+            Confidence::Exact => "Exact",
+            Confidence::Tainted => "Tainted",
+        };
+        let tier1 = violations
+            .iter()
+            .filter(|violation| violation.tier == ViolationTier::Tier1)
+            .count();
+        let tier2 = violations
+            .iter()
+            .filter(|violation| violation.tier == ViolationTier::Tier2)
+            .count();
+        let tier3 = violations
+            .iter()
+            .filter(|violation| violation.tier == ViolationTier::Tier3)
+            .count();
+
+        let mut output = format!(
+            "# safe-migrate report\n\n**Verdict:** {}  \n**Confidence:** {}\n\n| Severity | Findings |\n| --- | ---: |\n| HALT (Tier 1) | {} |\n| WARN (Tier 2) | {} |\n| SAFE (Tier 3) | {} |\n",
+            verdict.label(),
+            confidence,
+            tier1,
+            tier2,
+            tier3
+        );
+
+        if findings.is_empty() {
+            output.push_str("\nNo findings detected.\n");
+            return output;
+        }
+
+        output.push_str("\n## Findings\n");
+        for finding in findings {
+            let violation = &finding.violation;
+            output.push_str(&format!(
+                "\n### {} — `{}`\n\n",
+                markdown_tier_label(&violation.tier),
+                markdown_code(violation.rule_id)
+            ));
+            if let Some(location) = &finding.location {
+                output.push_str(&format!(
+                    "**Location:** `{}:{}:{}`  \n",
+                    markdown_code(&location.file),
+                    location.line,
+                    location.column
+                ));
+            }
+            output.push_str(&format!(
+                "**Object:** {} {}  \n**Reason:** {}  \n**Recommendation:** {}\n",
+                violation.object_kind,
+                markdown_escape(&violation.object_name),
+                markdown_escape(&violation.reason),
+                markdown_escape(
+                    &violation
+                        .recipe
+                        .lines()
+                        .map(str::trim)
+                        .filter(|line| !line.is_empty())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                )
+            ));
+            if let Some(sql) = &violation.sql
+                && !sql.trim().is_empty()
+            {
+                output.push_str(&format!("\n```sql\n{}\n```\n", sql.trim()));
+            }
+        }
+        output
     }
 
     pub fn should_halt(violations: &[Violation]) -> bool {
@@ -258,4 +353,20 @@ impl Reporter {
 
         Self::should_halt(violations)
     }
+}
+
+fn markdown_tier_label(tier: &ViolationTier) -> &'static str {
+    match tier {
+        ViolationTier::Tier1 => "HALT",
+        ViolationTier::Tier2 => "WARN",
+        ViolationTier::Tier3 => "SAFE",
+    }
+}
+
+fn markdown_escape(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('|', "\\|")
+}
+
+fn markdown_code(value: &str) -> String {
+    value.replace('`', "'")
 }

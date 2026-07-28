@@ -260,15 +260,111 @@ fn test_cli_json_halt_is_json_and_uses_blocking_exit_status() {
 
     assert_eq!(report["verdict"], "HALT");
     assert_eq!(report["confidence"], "Tainted");
-    assert!(
-        report["violations"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(
-                |violation| violation["rule_id"] == "drop-database" && violation["tier"] == "Tier1"
-            )
+    let finding = report["violations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|violation| violation["rule_id"] == "drop-database" && violation["tier"] == "Tier1")
+        .expect("drop-database finding");
+    assert_eq!(
+        finding["location"]["file"],
+        sql_file.path().display().to_string()
     );
+    assert_eq!(finding["location"]["line"], 1);
+    assert_eq!(finding["location"]["column"], 1);
+}
+
+#[test]
+fn test_cli_markdown_report_is_machine_clean_and_includes_location() {
+    let mut sql_file = tempfile::NamedTempFile::new().unwrap();
+    writeln!(sql_file, "DROP DATABASE production;").unwrap();
+
+    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let assert = cmd
+        .arg("lint")
+        .arg("--file")
+        .arg(sql_file.path())
+        .arg("--no-cache")
+        .arg("--markdown")
+        .assert()
+        .code(2);
+    let output = assert.get_output();
+    let markdown = String::from_utf8_lossy(&output.stdout);
+
+    assert!(markdown.starts_with("# safe-migrate report\n"));
+    assert!(markdown.contains("### HALT — `drop-database`"));
+    assert!(markdown.contains(&format!("`{}:1:1`", sql_file.path().display())));
+    assert!(markdown.contains("## Baseline"));
+    assert!(!markdown.contains("Analyzing migration"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Analyzing migration"));
+}
+
+#[test]
+fn test_cli_chain_json_reports_the_source_file_for_findings() {
+    let dir = tempfile::tempdir().unwrap();
+    let migration = dir.path().join("002_drop_database.sql");
+    fs::write(&migration, "DROP DATABASE production;").unwrap();
+
+    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let assert = cmd
+        .arg("lint-chain")
+        .arg("--dir")
+        .arg(dir.path())
+        .arg("--no-cache")
+        .arg("--json")
+        .assert()
+        .code(2);
+    let report = parse_json_stdout(assert.get_output());
+    let finding = report["violations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|violation| violation["rule_id"] == "drop-database")
+        .expect("drop-database finding");
+    assert_eq!(finding["location"]["file"], migration.display().to_string());
+    assert_eq!(finding["location"]["line"], 1);
+}
+
+#[test]
+fn test_cli_json_locations_preserve_offsets_through_execute_normalization() {
+    let mut sql_file = tempfile::NamedTempFile::new().unwrap();
+    writeln!(sql_file, "-- generated migration").unwrap();
+    writeln!(sql_file, "EXECUTE 'DROP DATABASE production';").unwrap();
+
+    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let assert = cmd
+        .arg("lint")
+        .arg("--file")
+        .arg(sql_file.path())
+        .arg("--no-cache")
+        .arg("--json")
+        .assert()
+        .success();
+    let report = parse_json_stdout(assert.get_output());
+    let finding = report["violations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|violation| violation["rule_id"] == "opaque-dynamic-sql")
+        .expect("opaque dynamic SQL finding");
+
+    assert_eq!(finding["location"]["line"], 2);
+    assert_eq!(finding["location"]["column"], 1);
+}
+
+#[test]
+fn test_cli_rejects_json_and_markdown_together() {
+    let mut sql_file = tempfile::NamedTempFile::new().unwrap();
+    writeln!(sql_file, "CREATE TABLE widgets (id bigint PRIMARY KEY);").unwrap();
+
+    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    cmd.arg("lint")
+        .arg("--file")
+        .arg(sql_file.path())
+        .arg("--json")
+        .arg("--markdown")
+        .assert()
+        .failure();
 }
 
 #[test]

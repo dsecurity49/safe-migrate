@@ -2,7 +2,9 @@
 mod tests {
     use crate::analysis::state::Confidence;
     use crate::report::reporter::{Reporter, Verdict, compute_verdict};
-    use crate::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
+    use crate::report::violations::{
+        ObjectKind, OperationKind, ReportFinding, SourceLocation, Violation, ViolationTier,
+    };
 
     fn make_violation(rule_id: &'static str, tier: ViolationTier, reason: &str) -> Violation {
         Violation {
@@ -49,6 +51,25 @@ mod tests {
         assert_eq!(report["confidence"], "Tainted");
         assert_eq!(report["verdict"], "HALT");
         assert_eq!(report["violations"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn test_markdown_report_includes_the_same_finding_and_location_data() {
+        let finding = ReportFinding {
+            violation: make_violation("test-rule", ViolationTier::Tier2, "needs review"),
+            location: Some(SourceLocation {
+                file: "migrations/001.sql".to_string(),
+                line: 3,
+                column: 5,
+            }),
+        };
+
+        let markdown = Reporter::markdown_report(&[finding], &Confidence::Exact);
+        assert!(markdown.starts_with("# safe-migrate report\n"));
+        assert!(markdown.contains("**Verdict:** CAUTIOUS"));
+        assert!(markdown.contains("### WARN — `test-rule`"));
+        assert!(markdown.contains("`migrations/001.sql:3:5`"));
+        assert!(markdown.contains("needs review"));
     }
 
     #[test]

@@ -229,17 +229,18 @@ after enabling encryption rather than committing a key or decrypted cache.
 
 ```bash
 # One migration
-safe-migrate lint --file migration.sql [--cache path] [--config path] [--no-cache] [--json]
+safe-migrate lint --file migration.sql [--cache path] [--config path] [--no-cache] [--json | --markdown]
 
 # Ordered .sql files, retaining simulated state across the chain
-safe-migrate lint-chain --dir migrations/ [--cache path] [--config path] [--no-cache] [--json]
+safe-migrate lint-chain --dir migrations/ [--cache path] [--config path] [--no-cache] [--json | --markdown]
 
 # Refresh the local cache; --config is used for cache_encryption
 safe-migrate sync [--out .safe-migrate.cache] [--config safe-migrate.toml] [--schemas public,auth]
 ```
 
 `--interactive` is available for human exploration and cannot be combined with
-`--json`. `sync --schemas` overrides the configured `schemas` list for that
+`--json` or `--markdown`. `--markdown` produces a deterministic review report
+with file/line/column locations. `sync --schemas` overrides the configured `schemas` list for that
 one refresh. Cache paths are local files; do not commit an unreviewed cache or
 an encrypted cache key.
 
@@ -316,6 +317,33 @@ For database-backed CI, add `DATABASE_URL` as a protected secret and run
 Never echo the URL or write it to the cache/configuration file. If CI cannot
 reach PostgreSQL, use a deliberately reviewed cache or run with `--no-cache`
 and treat the resulting `Tainted` confidence as a review requirement.
+
+### Reusable GitHub Action
+
+The pinned Action produces deterministic JSON and Markdown artifacts for one
+migration or an ordered migration directory. It does not synchronize a database
+or use `DATABASE_URL`; prepare a reviewed cache in a separate, explicit step if
+your workflow needs database-aware findings.
+
+```yaml
+- id: safe_migrate
+  uses: dsecurity49/safe-migrate@v0.4.3
+  with:
+    mode: lint-chain
+    path: migrations
+    cache: .safe-migrate.cache
+    output-dir: safe-migrate-artifacts
+
+- uses: actions/upload-artifact@v4
+  if: always()
+  with:
+    name: safe-migrate-report
+    path: safe-migrate-artifacts/
+```
+
+The Action exposes `json-report`, `markdown-report`, and `exit-code` outputs.
+It preserves exit code `2` for blocking findings, so use `if: always()` for
+artifact upload and let the job fail when the migration must be blocked.
 
 ## Development
 

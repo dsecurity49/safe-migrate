@@ -91,3 +91,26 @@ jobs:
           name: live-differential-postgres-${{ matrix.postgres }}
           path: live-differential-postgres-${{ matrix.postgres }}.log
           if-no-files-found: error
+
+  action-smoke:
+    name: Reusable Action smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Generate review artifacts with the local Action
+        id: safe_migrate
+        uses: ./
+        with:
+          mode: lint
+          path: live_tests/rule_01_irreversible-migration/safe_002_add_col.sql
+          no-cache: "true"
+          output-dir: action-smoke-artifacts
+
+      - name: Verify generated artifacts
+        shell: bash
+        run: |
+          test -s "${{ steps.safe_migrate.outputs.json-report }}"
+          test -s "${{ steps.safe_migrate.outputs.markdown-report }}"
+          test "${{ steps.safe_migrate.outputs.exit-code }}" = "0"

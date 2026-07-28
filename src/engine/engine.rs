@@ -4,7 +4,7 @@ use crate::analysis::resolver::Resolver;
 use crate::analysis::state::AnalysisState;
 use crate::ast::visitor::AstVisitor;
 use crate::engine::config::Config;
-use crate::report::violations::Violation;
+use crate::report::violations::{ReportFinding, SourceLocation, Violation};
 use crate::rules::Rule;
 use crate::rules::conflict::ConflictRule;
 use crate::rules::constraints::BlockingConstraintRule;
@@ -112,14 +112,81 @@ impl SafeMigrateEngine {
         self.analyze_chain(&[("<inline>".to_string(), sql.to_string())], state)
     }
 
+    /// Analyze ordered files and retain reportable source locations for every
+    /// finding. The original `analyze_chain` API remains available to callers
+    /// that only need violations.
+    pub fn analyze_chain_with_locations(
+        &self,
+        files: &[(String, String)],
+        state: &mut AnalysisState,
+    ) -> Result<Vec<ReportFinding>, Vec<String>> {
+        let mut findings = Vec::new();
+
+        for (file_index, (filename, sql)) in files.iter().enumerate() {
+            let normalized_sql = Self::normalize_execute(sql);
+            let violations = self.analyze_normalized_file(filename, &normalized_sql, state)?;
+            findings.extend(
+                violations
+                    .into_iter()
+                    .map(|violation| ReportFinding {
+                        location: Self::source_location(
+                            filename,
+                            &normalized_sql,
+                            violation.source_range,
+                        ),
+                        violation,
+                    })
+                    .map(|finding| (file_index, finding)),
+            );
+        }
+
+        findings.sort_by(|(a_index, a), (b_index, b)| {
+            a.violation
+                .tier
+                .cmp(&b.violation.tier)
+                .then_with(|| a_index.cmp(b_index))
+                .then_with(|| match (&a.location, &b.location) {
+                    (Some(a_location), Some(b_location)) => a_location
+                        .line
+                        .cmp(&b_location.line)
+                        .then_with(|| a_location.column.cmp(&b_location.column)),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                })
+                .then_with(|| a.violation.object_name.cmp(&b.violation.object_name))
+                .then_with(|| a.violation.rule_id.cmp(b.violation.rule_id))
+        });
+
+        Ok(findings.into_iter().map(|(_, finding)| finding).collect())
+    }
+
+    pub fn analyze_with_locations(
+        &self,
+        filename: String,
+        sql: String,
+        state: &mut AnalysisState,
+    ) -> Result<Vec<ReportFinding>, Vec<String>> {
+        self.analyze_chain_with_locations(&[(filename, sql)], state)
+    }
+
     fn analyze_single_file(
+        &self,
+        filename: &str,
+        sql: &str,
+        state: &mut AnalysisState,
+    ) -> Result<Vec<Violation>, Vec<String>> {
+        let sql = Self::normalize_execute(sql);
+        self.analyze_normalized_file(filename, &sql, state)
+    }
+
+    fn analyze_normalized_file(
         &self,
         _filename: &str,
         sql: &str,
         state: &mut AnalysisState,
     ) -> Result<Vec<Violation>, Vec<String>> {
-        let sql = Self::normalize_execute(sql);
-        let parsed = SourceFile::parse(&sql);
+        let parsed = SourceFile::parse(sql);
         let errors: Vec<String> = parsed.errors().iter().map(|e| e.to_string()).collect();
         if !errors.is_empty() {
             return Err(errors);
@@ -250,10 +317,36 @@ impl SafeMigrateEngine {
         Ok(all_violations)
     }
 
+    fn source_location(
+        filename: &str,
+        sql: &str,
+        source_range: Option<rowan::TextRange>,
+    ) -> Option<SourceLocation> {
+        let start = usize::from(source_range?.start());
+        if start > sql.len() || !sql.is_char_boundary(start) {
+            return None;
+        }
+
+        let before = &sql[..start];
+        let line = before.bytes().filter(|byte| *byte == b'\n').count() + 1;
+        let column = before
+            .rsplit_once('\n')
+            .map_or(before, |(_, final_line)| final_line)
+            .chars()
+            .count()
+            + 1;
+        Some(SourceLocation {
+            file: filename.to_string(),
+            line,
+            column,
+        })
+    }
+
     /// Pre-process SQL to handle EXECUTE '...' which Squawk's parser does not
     /// recognize (top-level EXECUTE expects a prepared-statement name, not a
-    /// string literal).  Rewriting to DO '...' is semantically equivalent at
-    /// the top level and lets the parser produce a proper DoBlock node.
+    /// string literal). Rewriting to DO lets the parser produce a proper
+    /// DoBlock node. Keep the replacement byte-for-byte the same length so
+    /// source ranges still point into the original migration text.
     fn normalize_execute(sql: &str) -> String {
         let mut out = String::with_capacity(sql.len());
         for line in sql.split_inclusive('\n') {
@@ -261,12 +354,12 @@ impl SafeMigrateEngine {
             if trimmed.len() > 9 && trimmed[..9].eq_ignore_ascii_case("EXECUTE '") {
                 let indent = &line[..line.len() - trimmed.len()];
                 out.push_str(indent);
-                out.push_str("DO '");
+                out.push_str("DO      '");
                 out.push_str(&trimmed[9..]);
             } else if trimmed.len() > 10 && trimmed[..10].eq_ignore_ascii_case("EXECUTE $$") {
                 let indent = &line[..line.len() - trimmed.len()];
                 out.push_str(indent);
-                out.push_str("DO $$");
+                out.push_str("DO      $$");
                 out.push_str(&trimmed[10..]);
             } else {
                 out.push_str(line);

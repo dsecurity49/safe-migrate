@@ -30,6 +30,11 @@ All notable changes to safe-migrate are documented here.
 - Remote sync is rejected by this build; use an SSH tunnel and a localhost or
   Unix-socket `DATABASE_URL`. This avoids unsafe transport and keeps the CLI
   portable on Android/Termux.
+- `lint` and `lint-chain` support `--markdown` for deterministic pull-request
+  artifacts. JSON now includes additive file/line/column finding locations.
+- Added the pinned reusable GitHub Action, which writes JSON and Markdown
+  artifacts from an explicit file or ordered directory without synchronizing a
+  database by default.
 - Added `scripts/live-differential` and a PostgreSQL 16 CI job that executes
   the previously ignored simulator-vs-PostgreSQL differential harness. CI now
   runs the enabled differential manifest on PostgreSQL 14, 15, and 16 and

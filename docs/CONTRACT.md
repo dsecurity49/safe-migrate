@@ -31,8 +31,16 @@ When `--json` is selected:
 - diagnostics remain on standard error;
 - the JSON report is produced for both `lint` and `lint-chain`.
 
-Interactive output and `--json` are mutually exclusive. The CLI must reject the
-combination rather than silently choosing one.
+When `--markdown` is selected:
+
+- standard output contains one deterministic Markdown report;
+- diagnostics remain on standard error;
+- findings include file, line, and column when the parser produced a source
+  range;
+- JSON and Markdown modes are mutually exclusive.
+
+Interactive output is mutually exclusive with `--json` and `--markdown`. The
+CLI must reject conflicting output selections rather than silently choosing one.
 
 ## JSON report
 
@@ -78,6 +86,12 @@ and automatic-sync outcome:
 `null` when no cache is available, and older compatible cache versions can lack
 provenance, which makes the baseline stale.
 
+Each JSON violation may include this additive location object:
+
+```json
+"location": { "file": "migrations/001_add_status.sql", "line": 12, "column": 1 }
+```
+
 Fields may be added compatibly. Removing a field, renaming a field, changing its
 type, or changing the meaning of an existing enum value is a report-contract
 change and must be documented in `CHANGELOG.md`.
@@ -101,7 +115,7 @@ The v0.4.3 exit-status contract is:
 - `1`: invocation, configuration, I/O, cache, parser, or internal failure;
 - `2`: analysis completed and found at least one Tier 1 finding.
 
-Human and JSON modes must use the same exit-status policy.
+Human, JSON, and Markdown modes must use the same exit-status policy.
 
 ## Confidence
 
