@@ -2910,11 +2910,6 @@ impl AstVisitor {
                     })
                 }
             }
-            SetTarget::SetTimeZone(stz) if stz.default_token().is_some() => {
-                Some(StatementFact::SetSearchPath {
-                    target: SearchPathTarget::Default,
-                })
-            }
             _ => None,
         }
     }

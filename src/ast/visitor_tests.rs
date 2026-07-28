@@ -516,6 +516,11 @@ mod tests {
     }
 
     #[test]
+    fn test_set_time_zone_does_not_produce_a_search_path_fact() {
+        assert!(parse_and_extract_statement("SET TIME ZONE DEFAULT;").is_none());
+    }
+
+    #[test]
     fn test_create_schema() {
         let sql = "CREATE SCHEMA my_schema;";
         let facts = parse_and_extract_statement(sql);

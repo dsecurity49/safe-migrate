@@ -546,6 +546,22 @@ mod state_mutation_tests {
     }
 
     #[test]
+    fn set_time_zone_does_not_reset_search_path() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "SET search_path TO tenant, public; SET TIME ZONE DEFAULT; CREATE TABLE t(id int);",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(state.relation_is_present(&object_id("tenant", "t")));
+        assert_eq!(state.local.search_path, ["tenant", "public"]);
+    }
+
+    #[test]
     fn test_synced_search_path_is_initial_and_default_path() {
         let engine = setup_engine();
         let mut cache = safe_migrate::db::cache::DbCache::new();
