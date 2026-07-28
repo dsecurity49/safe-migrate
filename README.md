@@ -10,7 +10,21 @@ database or for planning application-level rollout and backfill work.
 
 ## Install
 
-### Download a release binary
+### With Cargo
+
+If you already use Rust, install the latest crates.io release with locked
+dependencies:
+
+```bash
+cargo install safe-migrate --locked
+safe-migrate --version
+```
+
+Use `cargo install safe-migrate --locked --version 0.4.2` to reproduce a
+specific published crate release. Cargo installs the binary into its configured
+binary directory (normally `~/.cargo/bin`), which must be on `PATH`.
+
+### Without Rust: download a release binary
 
 The recommended installation path is the repository installer. It detects the
 supported Linux, macOS, and Termux target, downloads the matching GitHub Release
@@ -30,20 +44,6 @@ safe-migrate --version
 Use `sh install.sh --help` to choose `--install-dir`, force a `--target`, or
 replace an existing binary with `--force`. Running the current installer
 without `--version` selects the latest published release.
-
-### Install with Cargo
-
-If you already use Rust, install the latest crates.io release with locked
-dependencies:
-
-```bash
-cargo install safe-migrate --locked
-safe-migrate --version
-```
-
-Use `cargo install safe-migrate --locked --version 0.4.2` to reproduce a
-specific published crate release. Cargo installs the binary into its configured
-binary directory (normally `~/.cargo/bin`), which must be on `PATH`.
 
 ### Manual release download
 
