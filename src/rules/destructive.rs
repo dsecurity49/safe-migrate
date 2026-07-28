@@ -398,7 +398,7 @@ impl Rule for ReversibilityRule {
         config: &Config,
         _cascade_closure: Option<&CascadeResult>,
     ) -> Vec<Violation> {
-        if *result == MutationResult::Skipped {
+        if *result != MutationResult::Applied {
             return vec![];
         }
 

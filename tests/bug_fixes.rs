@@ -761,6 +761,12 @@ mod phase10_bug_fixes_and_sorting_tests {
                     .reason
                     .contains("column 'nonexistent_col' does not exist")
         }));
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.rule_id == "irreversible-migration"),
+            "A failed DROP COLUMN did not perform an irreversible operation"
+        );
         assert_eq!(
             state.local.confidence,
             safe_migrate::analysis::state::Confidence::Exact,
