@@ -38,7 +38,7 @@ mod tests {
     }
 
     #[test]
-    fn test_remote_host_detection_requires_tls_but_keeps_local_connections_supported() {
+    fn test_remote_host_detection_keeps_local_connections_supported() {
         assert!(is_local_host("localhost"));
         assert!(is_local_host("127.0.0.1"));
         assert!(is_local_host("::1"));

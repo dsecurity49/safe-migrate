@@ -5,10 +5,8 @@ use crate::db::cache::{DbCache, ForeignKeyCache, IndexCache};
 use crate::db::cache_file::protect_cache_bytes;
 use crate::model::relation::{Persistence, RelationKind, RelationState};
 use anyhow::{Context, Result};
-use native_tls::TlsConnector;
-use postgres::config::{Host, SslMode};
-use postgres::{Client, Config as PostgresConfig};
-use postgres_native_tls::MakeTlsConnector;
+use postgres::config::Host;
+use postgres::{Client, Config as PostgresConfig, NoTls};
 use std::io::Write;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -42,18 +40,14 @@ fn connect_database(db_url: &str) -> Result<Client> {
         .get_hosts()
         .iter()
         .any(|host| matches!(host, Host::Tcp(name) if !is_local_host(name)))
-        && config.get_ssl_mode() != SslMode::Require
     {
         anyhow::bail!(
-            "Remote DATABASE_URL connections require sslmode=require. Use a trusted TLS endpoint or an SSH tunnel."
+            "Remote DATABASE_URL connections are not supported by this build. Use an SSH tunnel and connect through localhost or a Unix socket."
         );
     }
 
-    let connector = TlsConnector::builder()
-        .build()
-        .context("Failed to configure native TLS for PostgreSQL")?;
     config
-        .connect(MakeTlsConnector::new(connector))
+        .connect(NoTls)
         .context("Failed to connect to PostgreSQL")
 }
 
