@@ -117,3 +117,26 @@ jobs:
           test -s "${{ steps.safe_migrate.outputs.json-report }}"
           test -s "${{ steps.safe_migrate.outputs.markdown-report }}"
           test "${{ steps.safe_migrate.outputs.exit-code }}" = "0"
+
+      - name: Plant untrusted workspace configuration
+        shell: bash
+        run: |
+          printf '%s\n' '[rules.drop-database]' 'disabled = true' > safe-migrate.toml
+
+      - name: Verify Action defaults ignore workspace configuration
+        id: untrusted_config
+        continue-on-error: true
+        uses: ./
+        with:
+          mode: lint
+          path: live_tests/rule_02_drop-database/001_drop_db.sql
+          no-cache: "true"
+          output-dir: action-untrusted-config-artifacts
+
+      - name: Assert security rule remained enabled
+        shell: bash
+        run: |
+          test "${{ steps.untrusted_config.outcome }}" = "failure"
+          test "${{ steps.untrusted_config.outputs.exit-code }}" = "2"
+          grep -q '"rule_id": "drop-database"' \
+            "${{ steps.untrusted_config.outputs.json-report }}"

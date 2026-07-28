@@ -15,9 +15,9 @@ inputs:
     required: false
     default: .safe-migrate.cache
   config:
-    description: Optional safe-migrate TOML configuration path.
+    description: Explicitly trusted safe-migrate TOML path. Empty uses built-in defaults and never reads workspace configuration.
     required: false
-    default: safe-migrate.toml
+    default: ""
   no-cache:
     description: Run with an unavailable baseline instead of reading the cache.
     required: false
@@ -70,7 +70,13 @@ runs:
             ;;
         esac
 
-        command+=(--cache "$INPUT_CACHE" --config "$INPUT_CONFIG")
+        command+=(--cache "$INPUT_CACHE")
+        if [ -n "$INPUT_CONFIG" ]; then
+          command+=(--config "$INPUT_CONFIG")
+        else
+          default_config="$(mktemp "${RUNNER_TEMP}/safe-migrate-default.XXXXXX.toml")"
+          command+=(--config "$default_config")
+        fi
         if [ "$INPUT_NO_CACHE" = "true" ]; then
           command+=(--no-cache)
         fi
