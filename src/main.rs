@@ -2,12 +2,15 @@ use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use safe_migrate::analysis::state::Confidence;
 use safe_migrate::db::cache::{CacheMetadata, DbCacheVersioned};
-use safe_migrate::db::cache_file::{is_encrypted_cache_bytes, unprotect_cache_bytes};
+use safe_migrate::db::cache_file::{
+    MAX_CACHE_DECODE_BYTES, is_encrypted_cache_bytes, read_cache_bytes, unprotect_cache_bytes,
+};
 use safe_migrate::model::relation::RelationKind;
 use safe_migrate::report::violations::{ReportFinding, Violation};
 use safe_migrate::sync;
 use safe_migrate::{AnalysisState, Config, DbCache, Reporter, SafeMigrateEngine};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -572,21 +575,30 @@ fn load_cache(cache: &Path, no_cache: bool, cache_encryption: bool) -> Result<(D
 }
 
 fn decode_cache(cache_path: &Path, cache_encryption: bool) -> Result<(DbCache, u32, bool)> {
-    let encoded = fs::read(cache_path)
-        .with_context(|| format!("Failed to read cache file: {}", cache_path.display()))?;
+    let encoded = read_cache_bytes(cache_path)?;
     let encrypted = is_encrypted_cache_bytes(&encoded);
     let decrypted = unprotect_cache_bytes(encoded, cache_encryption)?;
     let reader = std::io::Cursor::new(decrypted);
-    let mut decoder = zstd::stream::Decoder::new(reader).map_err(|error| {
+    let decoder = zstd::stream::Decoder::new(reader).map_err(|error| {
         anyhow!(
             "Cache file '{}' is corrupted (zstd init): {}",
             cache_path.display(),
             error
         )
     })?;
-    let config = bincode::config::standard().with_variable_int_encoding();
+    let mut decoder = decoder.take(MAX_CACHE_DECODE_BYTES as u64);
+    let config = bincode::config::standard()
+        .with_variable_int_encoding()
+        .with_limit::<MAX_CACHE_DECODE_BYTES>();
     let versioned: DbCacheVersioned =
         bincode::serde::decode_from_std_read(&mut decoder, config).map_err(|error| {
+            if matches!(&error, bincode::error::DecodeError::LimitExceeded) {
+                return anyhow!(
+                    "Cache file '{}' exceeds the {} MiB decoded-size limit",
+                    cache_path.display(),
+                    MAX_CACHE_DECODE_BYTES / (1024 * 1024)
+                );
+            }
             anyhow!(
                 "Cache file '{}' is corrupted (bincode): {}. Run `safe-migrate sync` to rebuild it.",
                 cache_path.display(),

@@ -2,7 +2,7 @@ use std::fs;
 use std::io::Write;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use safe_migrate::db::cache::DbCacheVersioned;
+use safe_migrate::db::cache::{DbCache, DbCacheVersioned};
 
 fn parse_json_stdout(output: &std::process::Output) -> serde_json::Value {
     serde_json::from_slice(&output.stdout).expect("stdout must contain exactly one JSON document")
@@ -60,6 +60,40 @@ fn test_cli_lint_invalid_cache() {
         .arg("--cache")
         .arg(corrupted_cache.path());
     cmd.assert().failure();
+}
+
+#[test]
+fn test_cli_rejects_cache_with_oversized_decoded_container() {
+    let config = bincode::config::standard().with_variable_int_encoding();
+    let encoded =
+        bincode::serde::encode_to_vec(DbCacheVersioned::V6(DbCache::new()), config).unwrap();
+    assert_eq!(&encoded[..4], &[5, 0, 0, 0]);
+
+    let mut malicious = encoded[..3].to_vec();
+    malicious.push(1);
+    malicious.push(252);
+    malicious.extend_from_slice(&300_000_000u32.to_le_bytes());
+
+    let mut compressed = Vec::new();
+    let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3).unwrap();
+    encoder.write_all(&malicious).unwrap();
+    encoder.finish().unwrap();
+
+    let mut cache = tempfile::NamedTempFile::new().unwrap();
+    cache.write_all(&compressed).unwrap();
+
+    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    cmd.arg("cache")
+        .arg("inspect")
+        .arg("--cache")
+        .arg(cache.path());
+    let output = cmd.output().unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("exceeds the 256 MiB decoded-size limit"),
+        "unexpected stderr: {stderr}"
+    );
 }
 
 #[test]

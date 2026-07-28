@@ -3,10 +3,38 @@ use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
     aead::{Aead, Generate, KeyInit},
 };
+use std::fs::File;
+use std::io::Read;
+use std::path::Path;
 
 pub const CACHE_KEY_ENV: &str = "SAFE_MIGRATE_CACHE_KEY";
+pub const MAX_CACHE_FILE_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_CACHE_DECODE_BYTES: usize = 256 * 1024 * 1024;
 const ENCRYPTED_CACHE_MAGIC: &[u8] = b"SMENC001";
 const NONCE_LENGTH: usize = 24;
+
+pub fn read_cache_bytes(cache_path: &Path) -> Result<Vec<u8>> {
+    read_cache_bytes_with_limit(cache_path, MAX_CACHE_FILE_BYTES)
+}
+
+fn read_cache_bytes_with_limit(cache_path: &Path, max_bytes: u64) -> Result<Vec<u8>> {
+    let file = File::open(cache_path)
+        .with_context(|| format!("Failed to read cache file: {}", cache_path.display()))?;
+    let initial_size = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+    let initial_capacity = initial_size.min(max_bytes) as usize;
+    let mut bytes = Vec::with_capacity(initial_capacity);
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("Failed to read cache file: {}", cache_path.display()))?;
+    if bytes.len() as u64 > max_bytes {
+        bail!(
+            "Cache file '{}' exceeds the {} MiB encoded-size limit",
+            cache_path.display(),
+            max_bytes / (1024 * 1024)
+        );
+    }
+    Ok(bytes)
+}
 
 /// Identifies the safe-migrate encryption envelope without attempting to
 /// decrypt it. This supports safe metadata inspection without exposing key
@@ -107,7 +135,9 @@ fn hex_nibble(byte: u8) -> Result<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     use std::sync::Mutex;
+    use tempfile::NamedTempFile;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -132,6 +162,15 @@ mod tests {
         assert!(decode_hex_key(&"a1".repeat(32)).is_ok());
         assert!(decode_hex_key("not-a-key").is_err());
         assert!(decode_hex_key(&"zz".repeat(32)).is_err());
+    }
+
+    #[test]
+    fn cache_file_reader_rejects_data_beyond_its_limit() {
+        let mut cache = NamedTempFile::new().unwrap();
+        cache.write_all(b"12345").unwrap();
+
+        let error = read_cache_bytes_with_limit(cache.path(), 4).unwrap_err();
+        assert!(error.to_string().contains("encoded-size limit"));
     }
 
     #[test]
