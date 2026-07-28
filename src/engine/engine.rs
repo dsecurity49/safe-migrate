@@ -26,7 +26,10 @@ use crate::rules::transactions::{
 };
 use crate::rules::triggers::DisableTriggerRule;
 use crate::rules::views::MaterializedViewRefreshRule;
-use squawk_syntax::ast::{AstNode, SourceFile};
+use squawk_syntax::{
+    SyntaxKind,
+    ast::{AstNode, SourceFile},
+};
 use std::collections::HashSet;
 
 pub struct SafeMigrateEngine {
@@ -201,6 +204,7 @@ impl SafeMigrateEngine {
             .syntax()
             .descendants_with_tokens()
             .filter_map(|it| it.into_token())
+            .filter(|token| token.kind() == SyntaxKind::COMMENT)
         {
             let mut dummy = HashSet::new();
             Self::parse_directives(token.text(), &mut file_ignores, &mut dummy);
@@ -215,8 +219,10 @@ impl SafeMigrateEngine {
                     break;
                 }
                 if let Some(token) = element.as_token() {
-                    let mut dummy = HashSet::new();
-                    Self::parse_directives(token.text(), &mut dummy, &mut stmt_ignores);
+                    if token.kind() == SyntaxKind::COMMENT {
+                        let mut dummy = HashSet::new();
+                        Self::parse_directives(token.text(), &mut dummy, &mut stmt_ignores);
+                    }
                 }
                 prev = element.prev_sibling_or_token();
             }
@@ -225,6 +231,7 @@ impl SafeMigrateEngine {
                 .syntax()
                 .descendants_with_tokens()
                 .filter_map(|it| it.into_token())
+                .filter(|token| token.kind() == SyntaxKind::COMMENT)
             {
                 let mut dummy = HashSet::new();
                 Self::parse_directives(token.text(), &mut dummy, &mut stmt_ignores);

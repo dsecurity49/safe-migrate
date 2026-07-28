@@ -982,6 +982,20 @@ mod phase10_bug_fixes_and_sorting_tests {
         );
     }
 
+    #[test]
+    fn directives_in_sql_literals_do_not_suppress_rules() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let sql = "SELECT 'safe-migrate: ignore-file(drop-database)'; DROP DATABASE my_db;";
+        let violations = engine.analyze(sql, &mut state).unwrap();
+
+        assert!(
+            violations.iter().any(|v| v.rule_id == "drop-database"),
+            "directive-like text in a SQL literal must not suppress a rule"
+        );
+    }
+
     // ─────────────────────────────────────────────
     // Bug 15 — stmt_text strips leading comments
     // ─────────────────────────────────────────────
