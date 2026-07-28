@@ -422,8 +422,10 @@ fn finish_analysis(
     output_mode: OutputMode,
 ) -> Result<()> {
     // Preserve worst-case rule evaluation for an empty baseline, then disclose
-    // that the final report has no verified database baseline.
-    if baseline_unknown || baseline_stale || matches!(auto_sync, AutoSyncOutcome::Failed) {
+    // that the final report has no verified database baseline. A failed
+    // automatic refresh does not invalidate an otherwise fresh cache; its
+    // outcome remains visible in the report's baseline metadata.
+    if baseline_unknown || baseline_stale {
         state.local.confidence = Confidence::Tainted;
     }
 

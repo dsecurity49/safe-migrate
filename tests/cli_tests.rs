@@ -1,8 +1,34 @@
 use std::fs;
 use std::io::Write;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use safe_migrate::db::cache::DbCacheVersioned;
 
 fn parse_json_stdout(output: &std::process::Output) -> serde_json::Value {
     serde_json::from_slice(&output.stdout).expect("stdout must contain exactly one JSON document")
+}
+
+fn write_fresh_cache(path: &std::path::Path) {
+    let encoded = fs::read("live_tests/.safe-migrate.cache").unwrap();
+    let reader = std::io::Cursor::new(encoded);
+    let mut decoder = zstd::stream::Decoder::new(reader).unwrap();
+    let config = bincode::config::standard().with_variable_int_encoding();
+    let versioned: DbCacheVersioned =
+        bincode::serde::decode_from_std_read(&mut decoder, config).unwrap();
+    let mut cache = versioned.into_cache().unwrap();
+    cache.metadata.created_at_unix_secs = Some(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    );
+    let mut compressed = Vec::new();
+    let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3).unwrap();
+    let config = bincode::config::standard().with_variable_int_encoding();
+    bincode::serde::encode_into_std_write(DbCacheVersioned::V6(cache), &mut encoder, config)
+        .unwrap();
+    encoder.finish().unwrap();
+    fs::write(path, compressed).unwrap();
 }
 
 #[test]
@@ -181,6 +207,37 @@ fn test_cli_auto_sync_failure_uses_the_previous_cache() {
     let report = parse_json_stdout(output);
     assert_eq!(report["confidence"], "Tainted");
     assert_eq!(report["baseline"]["status"], "stale");
+    assert_eq!(report["baseline"]["auto_sync"], "failed");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Continuing with the previous cache"));
+}
+
+#[test]
+fn test_cli_auto_sync_failure_keeps_fresh_cache_confidence_exact() {
+    let cache_dir = tempfile::tempdir().unwrap();
+    let cache_path = cache_dir.path().join("fresh-baseline.cache");
+    write_fresh_cache(&cache_path);
+
+    let mut config_file = tempfile::NamedTempFile::new().unwrap();
+    writeln!(config_file, "auto_sync = true").unwrap();
+
+    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let assert = cmd
+        .arg("lint")
+        .arg("--file")
+        .arg("live_tests/rule_01_irreversible-migration/safe_002_add_col.sql")
+        .arg("--config")
+        .arg(config_file.path())
+        .arg("--cache")
+        .arg(&cache_path)
+        .arg("--json")
+        .env("DATABASE_URL", "postgres://127.0.0.1:1/safe_migrate")
+        .assert()
+        .success();
+
+    let output = assert.get_output();
+    let report = parse_json_stdout(output);
+    assert_eq!(report["confidence"], "Exact");
+    assert_eq!(report["baseline"]["status"], "available");
     assert_eq!(report["baseline"]["auto_sync"], "failed");
     assert!(String::from_utf8_lossy(&output.stderr).contains("Continuing with the previous cache"));
 }

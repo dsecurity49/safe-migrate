@@ -17,7 +17,8 @@ All notable changes to safe-migrate are documented here.
   conservative worst-case rule evaluation.
 - `auto_sync = true` refreshes the cache before `lint` and `lint-chain`.
   Refresh failures now report their cause, retain the prior cache, and continue
-  with a `Tainted` report instead of crashing or deleting the baseline.
+  without crashing or deleting the baseline. A retained fresh cache keeps its
+  confidence while the JSON baseline records the failed refresh.
 - Cache replacement is atomic: a failed sync leaves the previous cache intact.
 - Cache provenance (creation time, source database, and selected schemas) is
   stored in new cache files and exposed in the additive JSON `baseline` object.
@@ -26,8 +27,9 @@ All notable changes to safe-migrate are documented here.
   XChaCha20-Poly1305 and the environment-only `SAFE_MIGRATE_CACHE_KEY`.
 - Schema filters for `sync --schemas` are bound query parameters rather than
   interpolated SQL.
-- Remote sync now uses native TLS and requires `sslmode=require`; local TCP and
-  Unix-socket connections remain supported.
+- Remote sync is rejected by this build; use an SSH tunnel and a localhost or
+  Unix-socket `DATABASE_URL`. This avoids unsafe transport and keeps the CLI
+  portable on Android/Termux.
 - Added `scripts/live-differential` and a PostgreSQL 16 CI job that executes
   the previously ignored simulator-vs-PostgreSQL differential harness.
 

@@ -29,9 +29,8 @@ safe-migrate lint --file migrations/20260727_add_status.sql
 metadata and needs a database role able to read those catalogs; do not put
 `DATABASE_URL` or its credentials in `safe-migrate.toml`.
 
-Remote `DATABASE_URL` values must include `sslmode=require`; safe-migrate uses
-the system TLS trust store and refuses an unencrypted remote connection. Local
-TCP and Unix-socket connections remain supported.
+For safety, this build only syncs through localhost or a Unix socket. Use an
+SSH tunnel for a remote database, then point `DATABASE_URL` at the local tunnel.
 
 `lint` and `lint-chain` are offline commands. They never need to connect to
 PostgreSQL unless `auto_sync = true` is configured.
@@ -105,7 +104,8 @@ Automatic sync is configuration-only—there is no CLI flag. It runs for `lint`
 and `lint-chain`, before analysis, when `auto_sync = true`. `--no-cache`
 always bypasses it. Sync failure never deletes a prior cache and never turns a
 successful lint invocation into a crash: the error is printed, then the old
-cache is used if readable. The resulting report is `Tainted`.
+cache is used if readable. A cache still within `stale_stats_days` keeps its
+existing confidence; the JSON baseline still records `auto_sync: "failed"`.
 
 ### Encrypted caches
 

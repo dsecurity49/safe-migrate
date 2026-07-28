@@ -121,7 +121,10 @@ The following conditions must never produce a successful clean report:
 
 Automatic cache refresh failure is different: it prints the underlying error
 and analysis continues with the old readable cache, or with an unavailable
-baseline if none exists. That successful analysis is reported as `Tainted`.
+baseline if none exists. A retained cache that is still within
+`stale_stats_days` keeps its existing confidence; an unavailable or stale
+baseline is reported as `Tainted`. The JSON baseline records the failed refresh
+in either case.
 Sync writes replace an existing cache only after the new payload has been fully
 produced. Encrypted caches require `cache_encryption = true` and a valid
 `SAFE_MIGRATE_CACHE_KEY`; missing or invalid key material is an operational
