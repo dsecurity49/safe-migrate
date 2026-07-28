@@ -31,7 +31,9 @@ All notable changes to safe-migrate are documented here.
   Unix-socket `DATABASE_URL`. This avoids unsafe transport and keeps the CLI
   portable on Android/Termux.
 - Added `scripts/live-differential` and a PostgreSQL 16 CI job that executes
-  the previously ignored simulator-vs-PostgreSQL differential harness.
+  the previously ignored simulator-vs-PostgreSQL differential harness. CI now
+  runs the enabled differential manifest on PostgreSQL 14, 15, and 16 and
+  uploads a verbose per-version log artifact.
 
 **Documentation:**
 

@@ -24,10 +24,13 @@ DATABASE_URL='host=/path/to/socket dbname=postgres user=my_user' \
 
 Verbosity is cumulative: `-v` reports lifecycle and fixture outcomes, `-vv`
 adds cache and normalized-state counts, and `-vvv` dumps complete normalized
-live and simulator projections. CI runs this harness against an isolated
-PostgreSQL 16 service. Locally, use a disposable database: the harness rebuilds
-its canonical baseline before every fixture and executes the fixtures. It does
-not use the frozen cache.
+live and simulator projections. CI runs this harness against isolated
+PostgreSQL 14, 15, and 16 services and uploads one verbose log artifact per
+version. This is the currently supported live-differential matrix; it covers
+the enabled fixtures in `differential_manifest.json`, not every PostgreSQL DDL
+construct. Locally, use a disposable database: the harness rebuilds its
+canonical baseline before every fixture and executes the fixtures. It does not
+use the frozen cache.
 
 Run a newly enabled rule by itself before the cumulative manifest:
 

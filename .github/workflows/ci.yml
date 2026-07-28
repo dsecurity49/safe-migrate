@@ -44,11 +44,15 @@ jobs:
           cargo audit
 
   live-differential:
-    name: PostgreSQL differential harness
+    name: PostgreSQL ${{ matrix.postgres }} differential harness
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: ["14", "15", "16"]
     services:
       postgres:
-        image: postgres:16
+        image: postgres:${{ matrix.postgres }}
         env:
           POSTGRES_DB: safe_migrate
           POSTGRES_USER: safe_migrate
@@ -62,7 +66,7 @@ jobs:
           - 5432:5432
     env:
       DATABASE_URL: postgres://safe_migrate:safe_migrate@localhost:5432/safe_migrate
-      SAFE_MIGRATE_DIFF_VERBOSITY: 1
+      SAFE_MIGRATE_DIFF_VERBOSITY: 2
 
     steps:
       - name: Checkout repository
@@ -75,4 +79,15 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Compare simulator state with PostgreSQL
-        run: scripts/live-differential
+        shell: bash
+        run: |
+          set -o pipefail
+          scripts/live-differential 2>&1 | tee "live-differential-postgres-${{ matrix.postgres }}.log"
+
+      - name: Upload differential log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-differential-postgres-${{ matrix.postgres }}
+          path: live-differential-postgres-${{ matrix.postgres }}.log
+          if-no-files-found: error
