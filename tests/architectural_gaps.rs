@@ -675,7 +675,7 @@ mod architectural_gap_tests {
 
     // 23. Drop without cascade validates dependents (BUG-006)
     #[test]
-    fn test_drop_without_cascade_validates_dependents() {
+    fn drop_without_cascade_reports_conflict_and_preserves_dependents() {
         let engine = setup_engine();
         let mut state = setup_state();
 
@@ -690,14 +690,17 @@ mod architectural_gap_tests {
             )
             .unwrap();
 
-        // Drop without cascade
-        let _ = engine.analyze("DROP TABLE a;", &mut state);
+        let violations = engine.analyze("DROP TABLE a;", &mut state).unwrap();
 
-        // It should taint confidence and skip the drop
+        assert!(violations.iter().any(|violation| {
+            violation.rule_id == "chain-conflict"
+                && violation.tier == ViolationTier::Tier1
+                && violation.reason.contains("still has dependent objects")
+        }));
         assert_eq!(
             state.local.confidence,
-            safe_migrate::analysis::state::Confidence::Tainted,
-            "Engine should taint on unsafe drop"
+            Confidence::Exact,
+            "A known PostgreSQL dependency conflict does not make simulation uncertain"
         );
         assert!(
             state.relation_is_present(&object_id("public", "a")),
