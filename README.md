@@ -42,7 +42,7 @@ Reports carry a confidence value:
 | Confidence | Meaning |
 |---|---|
 | `Exact` | The simulator remained consistent with the available baseline and SQL. |
-| `Tainted` | The cache/baseline is unavailable or stale, automatic refresh failed, or analysis encountered an uncertain transition. Review before deployment. |
+| `Tainted` | The cache/baseline is unavailable or stale, or analysis encountered an uncertain transition. A failed automatic refresh is recorded in the baseline metadata; a retained fresh cache keeps its existing confidence. Review before deployment. |
 
 Without a cache, safe-migrate still evaluates visible DDL using conservative
 defaults. It does not invent baseline-comparison findings such as
