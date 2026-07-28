@@ -69,6 +69,12 @@ impl SafeMigrateEngine {
         }
     }
 
+    /// Returns the canonical primary rule IDs in evaluation order. This is the
+    /// source of truth for configuration and user-facing rule documentation.
+    pub fn primary_rule_ids(&self) -> Vec<&'static str> {
+        self.rules.iter().map(|rule| rule.id()).collect()
+    }
+
     pub fn analyze_chain(
         &self,
         files: &[(String, String)],
