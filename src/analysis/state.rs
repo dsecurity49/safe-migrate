@@ -25,7 +25,12 @@ pub enum Confidence {
 pub enum MutationResult {
     Applied,
     Skipped,
-    Conflict { reason: String },
+    /// PostgreSQL did not execute this statement because an earlier statement
+    /// aborted the active transaction.
+    NotExecuted,
+    Conflict {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Default, Clone)]
@@ -51,6 +56,7 @@ pub struct LocalState {
     pub current_role: String,
     pub confidence: Confidence,
     pub transactions: Vec<TransactionFrame>,
+    pub transaction_aborted: bool,
     pub pending_validation: HashSet<(ObjectId, String)>,
     pub generation_counter: u64,
 }
@@ -231,6 +237,7 @@ impl AnalysisState {
                 current_role: "postgres".to_string(),
                 confidence: Confidence::Exact,
                 transactions: Vec::new(),
+                transaction_aborted: false,
                 pending_validation: HashSet::new(),
                 generation_counter: 0,
             },
@@ -537,6 +544,15 @@ impl AnalysisState {
         mutation: &Mutation,
         precomputed_cascade: Option<&CascadeResult>,
     ) -> MutationResult {
+        if self.local.transaction_aborted
+            && !matches!(
+                mutation,
+                Mutation::CommitTransaction | Mutation::RollbackTransaction
+            )
+        {
+            return MutationResult::NotExecuted;
+        }
+
         match mutation {
             Mutation::CreateSchema(_) => MutationResult::Applied,
             Mutation::DropSchema(drop_schema) => {
@@ -1620,16 +1636,36 @@ impl AnalysisState {
                 MutationResult::Applied
             }
             Mutation::CommitTransaction => {
-                while self.local.transactions.pop().is_some() {}
+                if self.local.transaction_aborted {
+                    while let Some(frame) = self.local.transactions.pop() {
+                        self.rollback_frame(frame);
+                    }
+                } else {
+                    while self.local.transactions.pop().is_some() {}
+                }
+                self.local.transaction_aborted = false;
                 MutationResult::Applied
             }
             Mutation::RollbackTransaction => {
                 while let Some(frame) = self.local.transactions.pop() {
                     self.rollback_frame(frame);
                 }
+                self.local.transaction_aborted = false;
                 MutationResult::Applied
             }
             Mutation::RollbackToSavepoint(rts) => {
+                if !self
+                    .local
+                    .transactions
+                    .iter()
+                    .any(|frame| frame.name == rts.name)
+                {
+                    self.local.confidence = Confidence::Tainted;
+                    self.local.transaction_aborted = true;
+                    return MutationResult::Conflict {
+                        reason: format!("savepoint '{}' does not exist", rts.name),
+                    };
+                }
                 let mut rolled_back = Vec::new();
                 while let Some(frame) = self.local.transactions.last() {
                     if frame.name == rts.name {

@@ -31,6 +31,24 @@ mod transaction_lifecycle_tests {
     }
 
     #[test]
+    fn missing_savepoint_aborts_the_transaction_and_skips_later_statements() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let violations = engine
+            .analyze(
+                "BEGIN; CREATE TABLE t(id int); ROLLBACK TO SAVEPOINT missing; DROP DATABASE should_not_run; ROLLBACK;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(violations.iter().any(|v| v.rule_id == "chain-conflict"));
+        assert!(!violations.iter().any(|v| v.rule_id == "drop-database"));
+        assert!(!state.relation_is_present(&object_id("public", "t")));
+        assert!(!state.local.transaction_aborted);
+    }
+
+    #[test]
     fn test_savepoint_flow() {
         let engine = setup_engine();
         let mut state = setup_state();

@@ -254,6 +254,10 @@ impl SafeMigrateEngine {
                     let pre_state = state.capture_pre_state();
                     let result = state.apply(&mutation, pre_cascade.as_ref());
 
+                    if result == crate::analysis::state::MutationResult::NotExecuted {
+                        continue;
+                    }
+
                     for rule in &self.rules {
                         if file_ignores.contains(rule.id())
                             || stmt_ignores.contains(rule.id())
