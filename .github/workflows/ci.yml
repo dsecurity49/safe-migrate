@@ -94,6 +94,9 @@ jobs:
           test "$status" -ne 0
           grep -q 'requires reachable PostgreSQL' <<< "$output"
 
+      - name: Verify successful automatic synchronization
+        run: scripts/live-auto-sync
+
       - name: Compare simulator state with PostgreSQL
         shell: bash
         run: |

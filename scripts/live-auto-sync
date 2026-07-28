@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+
+if [ -z "${DATABASE_URL:-}" ]; then
+    printf '%s\n' "DATABASE_URL is required for the live auto-sync contract." >&2
+    exit 2
+fi
+
+cargo test --locked --test live_auto_sync \
+    live_auto_sync_refreshes_lint_and_lint_chain -- --ignored --nocapture
