@@ -44,6 +44,7 @@ pub enum Mutation {
     CommitTransaction,
     CommitAndChain,
     RollbackTransaction,
+    RollbackAndChain,
     RollbackToSavepoint(RollbackToSavepointMutation),
     Savepoint(SavepointMutation),
     ReleaseSavepoint(ReleaseSavepointMutation),

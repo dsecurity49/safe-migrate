@@ -552,6 +552,7 @@ impl AnalysisState {
                 Mutation::CommitTransaction
                     | Mutation::CommitAndChain
                     | Mutation::RollbackTransaction
+                    | Mutation::RollbackAndChain
             )
         {
             return MutationResult::NotExecuted;
@@ -1676,6 +1677,16 @@ impl AnalysisState {
                     self.rollback_frame(frame);
                 }
                 self.local.transaction_aborted = false;
+                MutationResult::Applied
+            }
+            Mutation::RollbackAndChain => {
+                while let Some(frame) = self.local.transactions.pop() {
+                    self.rollback_frame(frame);
+                }
+                self.local.transaction_aborted = false;
+                self.local
+                    .transactions
+                    .push(TransactionFrame::new("transaction"));
                 MutationResult::Applied
             }
             Mutation::RollbackToSavepoint(rts) => {

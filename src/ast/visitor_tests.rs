@@ -462,6 +462,15 @@ mod tests {
     }
 
     #[test]
+    fn test_rollback_and_chain() {
+        let facts = parse_and_extract_statement("ROLLBACK AND CHAIN;");
+        assert!(matches!(facts, Some(StatementFact::RollbackAndChain)));
+
+        let facts = parse_and_extract_statement("ROLLBACK AND NO CHAIN;");
+        assert!(matches!(facts, Some(StatementFact::RollbackTransaction)));
+    }
+
+    #[test]
     fn test_savepoint() {
         let sql = "SAVEPOINT sp1;";
         let facts = parse_and_extract_statement(sql);

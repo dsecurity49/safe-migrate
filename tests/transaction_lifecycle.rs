@@ -38,6 +38,26 @@ mod transaction_lifecycle_tests {
     }
 
     #[test]
+    fn rollback_and_chain_starts_a_new_transaction() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let violations = engine
+            .analyze(
+                "BEGIN; ROLLBACK AND CHAIN; CREATE INDEX CONCURRENTLY idx ON users (id); ROLLBACK;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.rule_id == "concurrent-in-transaction")
+        );
+        assert!(state.local.transactions.is_empty());
+    }
+
+    #[test]
     fn test_txn_rollback() {
         let engine = setup_engine();
         let mut state = setup_state();

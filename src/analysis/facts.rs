@@ -209,6 +209,7 @@ pub enum StatementFact {
     CommitTransaction,
     CommitAndChain,
     RollbackTransaction,
+    RollbackAndChain,
     RollbackToSavepoint {
         name: String,
     },

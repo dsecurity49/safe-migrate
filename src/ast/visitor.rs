@@ -2925,6 +2925,9 @@ impl AstVisitor {
             .map(|t| Self::resolve_identifier_token(t.text()))
         {
             Some(name) => Some(StatementFact::RollbackToSavepoint { name }),
+            None if node.chain_token().is_some() && node.no_token().is_none() => {
+                Some(StatementFact::RollbackAndChain)
+            }
             None => Some(StatementFact::RollbackTransaction),
         }
     }
