@@ -5,7 +5,7 @@ use crate::model::relation::{Persistence, RelationKind, RelationState};
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sync::{cache_search_path, is_local_host, sync_cache};
+    use crate::sync::{cache_search_path, is_local_host, relation_owner_id, sync_cache};
     use std::io::Write;
     use tempfile::NamedTempFile;
 
@@ -64,6 +64,14 @@ mod tests {
         assert_eq!(
             cache_search_path(database_search_path.clone(), None),
             database_search_path
+        );
+    }
+
+    #[test]
+    fn test_synced_relation_owner_uses_role_identity() {
+        assert_eq!(
+            relation_owner_id("app_owner"),
+            ObjectId::new("", "app_owner")
         );
     }
 

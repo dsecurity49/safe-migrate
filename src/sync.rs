@@ -67,6 +67,10 @@ pub(crate) fn cache_search_path(
         .unwrap_or(database_search_path)
 }
 
+pub(crate) fn relation_owner_id(owner_name: impl Into<String>) -> ObjectId {
+    ObjectId::new("", owner_name)
+}
+
 fn write_cache(out_path: &Path, cache: DbCache, cache_encryption: bool) -> Result<()> {
     let parent = out_path.parent().unwrap_or_else(|| Path::new("."));
     let mut temp_file = NamedTempFile::new_in(parent).with_context(|| {
@@ -235,6 +239,7 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
             c.relname AS relation_name,
             c.relkind AS relation_kind,
             c.relpersistence AS persistence,
+            pg_catalog.pg_get_userbyid(c.relowner) AS owner_name,
             CASE WHEN c.reltuples < 0 THEN -1 ELSE c.reltuples::bigint END AS estimated_rows,
             c.relpages::bigint AS relpages,
             to_char(s.last_analyze, 'YYYY-MM-DD HH24:MI:SS') AS last_analyze,
@@ -255,6 +260,7 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
         let relation_name: String = row.get("relation_name");
         let relkind: i8 = row.get("relation_kind");
         let persistence_char: i8 = row.get("persistence");
+        let owner_name: String = row.get("owner_name");
         let raw_rows: i64 = row.get("estimated_rows");
         let relpages: i64 = row.get("relpages");
 
@@ -283,7 +289,7 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
 
         let mut state = RelationState::new(
             object_id.clone(),
-            ObjectId::new("public", "postgres"),
+            relation_owner_id(owner_name),
             0,
             estimated_rows,
             kind,
