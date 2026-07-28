@@ -277,32 +277,4 @@ mod tests {
         assert!(cache.metadata.created_at_unix_secs.is_none());
         assert!(cache.metadata.source_database.is_none());
     }
-
-    #[test]
-    fn test_db_cache_atomic_write_pattern() {
-        // This test validates that the temp->rename atomic write pattern used
-        // in sync_cache works correctly by manually simulating it.
-        let tmp_file = NamedTempFile::new().unwrap();
-        let final_path = tmp_file.path().to_path_buf();
-        let tmp_path = final_path.with_extension("tmp");
-
-        // Write to temp
-        let cache = DbCache::new();
-        let json = serde_json::to_string_pretty(&cache).unwrap();
-        let mut tmp = std::fs::File::create(&tmp_path).unwrap();
-        tmp.write_all(json.as_bytes()).unwrap();
-        drop(tmp);
-
-        // Atomically rename
-        std::fs::rename(&tmp_path, &final_path).unwrap();
-
-        // Verify temp is gone and final exists
-        assert!(!tmp_path.exists());
-        assert!(final_path.exists());
-
-        // Read back
-        let content = std::fs::read_to_string(&final_path).unwrap();
-        let deserialized: DbCache = serde_json::from_str(&content).unwrap();
-        assert!(deserialized.pg_version_num.is_none());
-    }
 }

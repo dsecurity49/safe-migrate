@@ -88,6 +88,16 @@ pub(crate) fn is_system_schema(schema: &str) -> bool {
 }
 
 fn write_cache(out_path: &Path, cache: DbCache, cache_encryption: bool) -> Result<()> {
+    write_cache_with_protection(out_path, cache, |compressed| {
+        protect_cache_bytes(compressed, cache_encryption)
+    })
+}
+
+fn write_cache_with_protection(
+    out_path: &Path,
+    cache: DbCache,
+    protect: impl FnOnce(Vec<u8>) -> Result<Vec<u8>>,
+) -> Result<()> {
     let parent = out_path.parent().unwrap_or_else(|| Path::new("."));
     let mut temp_file = NamedTempFile::new_in(parent).with_context(|| {
         format!(
@@ -109,7 +119,7 @@ fn write_cache(out_path: &Path, cache: DbCache, cache_encryption: bool) -> Resul
         .finish()
         .context("Failed to flush final zstd stream to disk")?;
 
-    let cache_bytes = protect_cache_bytes(compressed, cache_encryption)?;
+    let cache_bytes = protect(compressed)?;
     temp_file
         .write_all(&cache_bytes)
         .context("Failed to write cache payload")?;
@@ -118,6 +128,54 @@ fn write_cache(out_path: &Path, cache: DbCache, cache_encryption: bool) -> Resul
     replace_cache(temp_file, out_path)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod atomic_write_tests {
+    use super::*;
+    use crate::db::cache::DbCacheVersioned;
+    use std::fs;
+
+    #[test]
+    fn production_cache_writer_atomically_replaces_and_decodes() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cache_path = temp_dir.path().join("baseline.cache");
+        fs::write(&cache_path, b"old-cache").unwrap();
+
+        let mut cache = DbCache::new();
+        cache.pg_version_num = Some(180002);
+        write_cache(&cache_path, cache, false).unwrap();
+
+        let encoded = fs::read(&cache_path).unwrap();
+        assert_ne!(encoded, b"old-cache");
+        let reader = std::io::Cursor::new(encoded);
+        let mut decoder = zstd::stream::Decoder::new(reader).unwrap();
+        let config = bincode::config::standard().with_variable_int_encoding();
+        let versioned: DbCacheVersioned =
+            bincode::serde::decode_from_std_read(&mut decoder, config).unwrap();
+        assert_eq!(versioned.into_cache().unwrap().pg_version_num, Some(180002));
+        assert_eq!(fs::read_dir(temp_dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn production_cache_writer_preserves_old_bytes_after_pre_install_failure() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cache_path = temp_dir.path().join("baseline.cache");
+        fs::write(&cache_path, b"known-good-cache").unwrap();
+
+        let error = write_cache_with_protection(&cache_path, DbCache::new(), |_| {
+            Err(anyhow::anyhow!("injected payload-protection failure"))
+        })
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("injected payload-protection failure")
+        );
+        assert_eq!(fs::read(&cache_path).unwrap(), b"known-good-cache");
+        assert_eq!(fs::read_dir(temp_dir.path()).unwrap().count(), 1);
+    }
 }
 
 #[cfg(not(windows))]
