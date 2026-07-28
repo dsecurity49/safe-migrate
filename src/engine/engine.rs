@@ -266,7 +266,11 @@ impl SafeMigrateEngine {
                             crate::analysis::state::MutationResult::Conflict { .. }
                         );
                     if statement_failed && let Some(checkpoint) = &statement_checkpoint {
+                        let transaction_aborted = state.local.transaction_aborted;
                         *state = checkpoint.clone();
+                        if transaction_aborted && !state.local.transactions.is_empty() {
+                            state.local.transaction_aborted = true;
+                        }
                     }
 
                     if result == crate::analysis::state::MutationResult::NotExecuted {

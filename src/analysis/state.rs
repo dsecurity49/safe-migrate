@@ -558,6 +558,19 @@ impl AnalysisState {
             return MutationResult::NotExecuted;
         }
 
+        let result = self.apply_inner(mutation, precomputed_cascade);
+        if matches!(result, MutationResult::Conflict { .. }) && !self.local.transactions.is_empty()
+        {
+            self.local.transaction_aborted = true;
+        }
+        result
+    }
+
+    fn apply_inner(
+        &mut self,
+        mutation: &Mutation,
+        precomputed_cascade: Option<&CascadeResult>,
+    ) -> MutationResult {
         match mutation {
             Mutation::CreateSchema(_) => MutationResult::Applied,
             Mutation::DropSchema(drop_schema) => {

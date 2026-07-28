@@ -235,6 +235,63 @@ mod transaction_lifecycle_tests {
     }
 
     #[test]
+    fn mutation_conflict_aborts_the_transaction_and_skips_later_statements() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let violations = engine
+            .analyze(
+                "BEGIN;
+                 CREATE TABLE conflict_t(id integer);
+                 CREATE TABLE conflict_t(id integer);
+                 DROP DATABASE production;
+                 ROLLBACK;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(violations.iter().any(|violation| {
+            violation.rule_id == "chain-conflict"
+                && violation.reason.contains("relation 'public.conflict_t'")
+        }));
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.rule_id == "drop-database")
+        );
+        assert!(!state.relation_is_present(&object_id("public", "conflict_t")));
+        assert!(state.local.transactions.is_empty());
+        assert!(!state.local.transaction_aborted);
+    }
+
+    #[test]
+    fn idempotent_skip_does_not_abort_the_transaction() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let violations = engine
+            .analyze(
+                "BEGIN;
+                 CREATE TABLE kept_t(id integer);
+                 CREATE TABLE IF NOT EXISTS kept_t(id integer);
+                 CREATE TABLE following_t(id integer);
+                 COMMIT;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict")
+        );
+        assert!(state.relation_is_present(&object_id("public", "kept_t")));
+        assert!(state.relation_is_present(&object_id("public", "following_t")));
+        assert!(state.local.transactions.is_empty());
+        assert!(!state.local.transaction_aborted);
+    }
+
+    #[test]
     fn multi_action_alter_table_restores_state_after_a_failed_action() {
         let engine = setup_engine();
         let mut state = setup_state();
