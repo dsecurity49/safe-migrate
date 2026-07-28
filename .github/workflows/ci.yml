@@ -97,6 +97,9 @@ jobs:
       - name: Verify successful automatic synchronization
         run: scripts/live-auto-sync
 
+      - name: Verify encrypted cache CLI contract
+        run: scripts/live-cache-encryption
+
       - name: Compare simulator state with PostgreSQL
         shell: bash
         run: |
