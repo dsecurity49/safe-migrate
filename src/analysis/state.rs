@@ -662,50 +662,6 @@ impl AnalysisState {
                     }
                 }
 
-                let constraints_to_drop: Vec<String> = self
-                    .local
-                    .constraints
-                    .keys()
-                    .filter(|(table_id, _)| table_id == &drop_table.id)
-                    .map(|(_, name)| name.clone())
-                    .collect();
-                for name in constraints_to_drop {
-                    self.snapshot_constraint(&drop_table.id, &name);
-                    self.local
-                        .constraints
-                        .remove(&(drop_table.id.clone(), name));
-                }
-
-                let triggers_to_drop: Vec<ObjectId> = self
-                    .local
-                    .triggers
-                    .iter()
-                    .filter_map(|(id, overlay)| {
-                        let TriggerOverlay::Present(trigger) = overlay else {
-                            return None;
-                        };
-                        let graph_matches = self.local.graph.edges.iter().any(|edge| {
-                            matches!(edge.kind, DependencyKind::TriggerOnTable { .. })
-                                && edge.dependent == *id
-                                && edge.referenced == drop_table.id
-                        });
-                        (trigger.table_id == drop_table.id || graph_matches).then(|| id.clone())
-                    })
-                    .collect();
-                for trigger_id in triggers_to_drop {
-                    self.snapshot_trigger(&trigger_id);
-                    self.local
-                        .triggers
-                        .insert(trigger_id, TriggerOverlay::Dropped);
-                }
-
-                // PostgreSQL always drops triggers owned by a dropped table.
-                self.snapshot_graph_full();
-                self.local.graph.edges.retain(|e| {
-                    !(matches!(e.kind, DependencyKind::TriggerOnTable { .. })
-                        && e.referenced == drop_table.id)
-                });
-
                 let renames: Vec<DependencyEdge> = self
                     .local
                     .graph
@@ -793,8 +749,12 @@ impl AnalysisState {
                     });
 
                     if has_view_deps || has_fk_deps || has_partition_deps {
-                        self.local.confidence = Confidence::Tainted;
-                        return MutationResult::Skipped;
+                        return MutationResult::Conflict {
+                            reason: format!(
+                                "relation '{}' still has dependent objects; use CASCADE",
+                                drop_table.id
+                            ),
+                        };
                     }
 
                     self.snapshot_relation(&drop_table.id);
@@ -808,6 +768,50 @@ impl AnalysisState {
                             && resolve(&e.referenced) == resolved_drop)
                     });
                 }
+
+                let constraints_to_drop: Vec<String> = self
+                    .local
+                    .constraints
+                    .keys()
+                    .filter(|(table_id, _)| table_id == &drop_table.id)
+                    .map(|(_, name)| name.clone())
+                    .collect();
+                for name in constraints_to_drop {
+                    self.snapshot_constraint(&drop_table.id, &name);
+                    self.local
+                        .constraints
+                        .remove(&(drop_table.id.clone(), name));
+                }
+
+                let triggers_to_drop: Vec<ObjectId> = self
+                    .local
+                    .triggers
+                    .iter()
+                    .filter_map(|(id, overlay)| {
+                        let TriggerOverlay::Present(trigger) = overlay else {
+                            return None;
+                        };
+                        let graph_matches = self.local.graph.edges.iter().any(|edge| {
+                            matches!(edge.kind, DependencyKind::TriggerOnTable { .. })
+                                && edge.dependent == *id
+                                && edge.referenced == drop_table.id
+                        });
+                        (trigger.table_id == drop_table.id || graph_matches).then(|| id.clone())
+                    })
+                    .collect();
+                for trigger_id in triggers_to_drop {
+                    self.snapshot_trigger(&trigger_id);
+                    self.local
+                        .triggers
+                        .insert(trigger_id, TriggerOverlay::Dropped);
+                }
+
+                // PostgreSQL drops triggers only after the table drop succeeds.
+                self.snapshot_graph_full();
+                self.local.graph.edges.retain(|e| {
+                    !(matches!(e.kind, DependencyKind::TriggerOnTable { .. })
+                        && e.referenced == drop_table.id)
+                });
 
                 self.snapshot_graph_full();
                 self.local.graph.edges.retain(|e| {

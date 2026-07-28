@@ -43,6 +43,30 @@ mod state_mutation_tests {
     }
 
     #[test]
+    fn failed_drop_table_keeps_owned_triggers_for_later_dependency_checks() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let violations = engine
+            .analyze(
+                "CREATE TABLE t(id int); CREATE FUNCTION f() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END; $$; CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION f(); CREATE VIEW v AS SELECT * FROM t; DROP TABLE t; DROP FUNCTION f();",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(violations.iter().any(|violation| {
+            violation.reason.contains("relation 'public.t")
+                && violation.reason.contains("still has dependent objects")
+        }));
+        assert!(violations.iter().any(|violation| {
+            violation
+                .reason
+                .contains("function 'public.f()' still has dependent triggers")
+        }));
+        assert!(state.relation_is_present(&object_id("public", "t")));
+    }
+
+    #[test]
     fn test_topology_rename_table() {
         let engine = setup_engine();
         let mut state = setup_state();
