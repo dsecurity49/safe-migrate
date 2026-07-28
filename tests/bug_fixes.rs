@@ -742,7 +742,7 @@ mod phase10_bug_fixes_and_sorting_tests {
     }
 
     #[test]
-    fn test_finding8_drop_column_no_if_exists_on_nonexistent() {
+    fn drop_nonexistent_column_without_if_exists_reports_exact_conflict() {
         let engine = setup_engine();
         let mut state = setup_state();
 
@@ -750,15 +750,21 @@ mod phase10_bug_fixes_and_sorting_tests {
             .analyze("CREATE TABLE t(id int);", &mut state)
             .unwrap();
 
-        let _v = engine
+        let violations = engine
             .analyze("ALTER TABLE t DROP COLUMN nonexistent_col;", &mut state)
             .unwrap();
 
-        // Without IF EXISTS, confidence should be tainted (table in unknown state)
+        assert!(violations.iter().any(|violation| {
+            violation.rule_id == "chain-conflict"
+                && violation.tier == ViolationTier::Tier1
+                && violation
+                    .reason
+                    .contains("column 'nonexistent_col' does not exist")
+        }));
         assert_eq!(
             state.local.confidence,
-            safe_migrate::analysis::state::Confidence::Tainted,
-            "Confidence should be Tainted when dropping a nonexistent column without IF EXISTS"
+            safe_migrate::analysis::state::Confidence::Exact,
+            "A known PostgreSQL column conflict does not make simulation uncertain"
         );
     }
 
