@@ -31,6 +31,20 @@ Use `sh install.sh --help` to choose `--install-dir`, force a `--target`, or
 replace an existing binary with `--force`. Running the current installer
 without `--version` selects the latest published release.
 
+### Install with Cargo
+
+If you already use Rust, install the latest crates.io release with locked
+dependencies:
+
+```bash
+cargo install safe-migrate --locked
+safe-migrate --version
+```
+
+Use `cargo install safe-migrate --locked --version 0.4.2` to reproduce a
+specific published crate release. Cargo installs the binary into its configured
+binary directory (normally `~/.cargo/bin`), which must be on `PATH`.
+
 ### Manual release download
 
 Release archives and SHA-256 checksum files are published on the
