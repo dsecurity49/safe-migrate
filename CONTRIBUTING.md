@@ -139,9 +139,10 @@ object, tier, reason, and source behavior.
 
 ## Database synchronization
 
-Only `safe-migrate sync` reads `DATABASE_URL`. Do not commit credentials,
-connection strings, or private database dumps. Use a least-privilege PostgreSQL
-role and treat cache changes as reviewable schema-state changes.
+`safe-migrate sync`, and `lint` or `lint-chain` only when configured with
+`auto_sync = true`, read `DATABASE_URL`. Do not commit credentials, connection
+strings, or private database dumps. Use a least-privilege PostgreSQL role and
+treat cache changes as reviewable schema-state changes.
 
 The frozen cache under `live_tests/` belongs to the test corpus. Update it only
 when a fixture requires a changed baseline, and explain the assumption in the
@@ -174,23 +175,7 @@ Classify the likely layer:
 - Rule: test false-positive/false-negative behavior and severity.
 - CLI/report: test output channels, JSON, and exit status.
 
-## Versioning and releases
-
-safe-migrate uses semantic versioning:
-
-- major: incompatible public API or product-contract changes;
-- minor: backward-compatible features, rules, or configuration;
-- patch: backward-compatible fixes.
-
-Before release:
-
-1. update `Cargo.toml` and `CHANGELOG.md`;
-2. run formatting, locked tests, Clippy, and the live fixture suite;
-3. verify CLI/report contracts and release artifacts;
-4. tag only after the release commit is validated.
-
 ## Questions
 
 Open an issue at <https://github.com/dsecurity49/safe-migrate> with a minimal
 reproduction and the affected layer.
-

@@ -35,6 +35,9 @@ All notable changes to safe-migrate are documented here.
 
 **Documentation:**
 
+- Expanded installation, configuration, cache, CI, contract, and maintainer
+  documentation. Release-binary instructions now include platform asset names
+  and checksum verification.
 - Removed the stale Squawk 2.58.0 AST reference snapshot. AST contributors now
   verify behavior against the exact pinned Squawk source and executable tests.
 - Added a documentation index, a v0.4.3 CLI/report contract, and focused

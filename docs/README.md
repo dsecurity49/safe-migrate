@@ -13,8 +13,12 @@ The repository keeps two kinds of documentation:
 
 - [Architecture and invariants](internal/ARCHITECTURE.md) — boundaries between
   parsing, resolution, state mutation, rules, reporting, and database sync.
+- [Cache and synchronization](internal/CACHE.md) — versioning, provenance,
+  freshness, atomic replacement, encryption, and connection boundaries.
 - [AST development](internal/AST_DEVELOPMENT.md) — the source-first workflow for
   working with the pinned Squawk parser.
+- [Testing](internal/TESTING.md) — focused, full-suite, fixture, and live
+  PostgreSQL validation.
 - [Contributing](../CONTRIBUTING.md) — development workflow and test commands.
 
 ## Documentation policy

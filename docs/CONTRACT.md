@@ -10,7 +10,9 @@ enforces it.
 - `safe-migrate lint-chain --dir <path>` analyzes `.sql` files in filename
   order while preserving state across files.
 - `safe-migrate sync` reads PostgreSQL catalog metadata and writes a local
-  cache. It requires `DATABASE_URL`.
+  cache. It requires `DATABASE_URL` and accepts only localhost or Unix-socket
+  connections in this build; remote databases must be reached through an SSH
+  tunnel.
 
 `lint` and `lint-chain` use an explicit cache, the default cache path, or
 `--no-cache`. When `auto_sync = true` is set in configuration, they may refresh
@@ -59,9 +61,22 @@ Each violation includes:
 - `fk_dependency_related`
 
 The additive `baseline` object records cache/baseline status, cache provenance,
-and automatic-sync outcome. Its status is `available`, `stale`, or
-`unavailable`; its automatic-sync outcome is `not_requested`, `refreshed`,
-`failed`, or `bypassed`.
+and automatic-sync outcome:
+
+```json
+{
+  "status": "available",
+  "created_at_unix_secs": 0,
+  "source_database": "app",
+  "schemas": ["public"],
+  "auto_sync": "not_requested"
+}
+```
+
+`status` is `available`, `stale`, or `unavailable`; `auto_sync` is
+`not_requested`, `refreshed`, `failed`, or `bypassed`. Provenance values are
+`null` when no cache is available, and older compatible cache versions can lack
+provenance, which makes the baseline stale.
 
 Fields may be added compatibly. Removing a field, renaming a field, changing its
 type, or changing the meaning of an existing enum value is a report-contract

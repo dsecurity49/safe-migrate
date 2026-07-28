@@ -1,36 +1,89 @@
 # safe-migrate v0.4.3
 
-safe-migrate lint-checks PostgreSQL migrations by simulating their schema
-changes. A synced local cache supplies production schema metadata and row-count
-estimates for checks whose severity depends on the current database.
+safe-migrate checks PostgreSQL migrations by simulating schema changes before
+they reach production. A synced local cache supplies production schema metadata
+and row-count estimates for checks whose severity depends on the current
+database.
 
 It is a safety aid, not a substitute for testing a migration on a representative
 database or for planning application-level rollout and backfill work.
 
 ## Install
 
+### Download a release binary
+
+Release archives and SHA-256 checksum files are published on the
+[GitHub Releases page](https://github.com/dsecurity49/safe-migrate/releases).
+Choose the archive matching your platform:
+
+| Platform | Archive |
+|---|---|
+| Linux x86_64 (glibc) | `safe-migrate-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux x86_64 (musl/Alpine) | `safe-migrate-x86_64-unknown-linux-musl.tar.gz` |
+| Linux ARM64 (glibc) | `safe-migrate-aarch64-unknown-linux-gnu.tar.gz` |
+| Linux ARM64 (musl/Alpine) | `safe-migrate-aarch64-unknown-linux-musl.tar.gz` |
+| macOS Intel | `safe-migrate-x86_64-apple-darwin.tar.gz` |
+| macOS Apple Silicon | `safe-migrate-aarch64-apple-darwin.tar.gz` |
+| Windows x86_64 | `safe-migrate-x86_64-pc-windows-msvc.zip` |
+
+For example, install a published Linux x86_64 musl release and verify it. Set
+`version` to the tag you want from the Releases page:
+
 ```bash
-cargo install safe-migrate --locked
+version=v0.4.2
+asset=safe-migrate-x86_64-unknown-linux-musl
+base="https://github.com/dsecurity49/safe-migrate/releases/download/$version/$asset"
+
+curl -fLO "$base.tar.gz"
+curl -fLO "$base.sha256"
+sha256sum -c "$asset.sha256"
+tar -xzf "$asset.tar.gz"
+install -m 755 safe-migrate "$HOME/.local/bin/safe-migrate"
+safe-migrate --version
 ```
 
-Or build this checkout with `cargo build --locked`.
+Add `~/.local/bin` to `PATH` if needed. On macOS, use `shasum -a 256 -c` for
+checksum verification. Windows users can extract the ZIP and verify the
+adjacent `.sha256` file with `Get-FileHash` before adding the executable to
+`PATH`. Android/Termux is not a published release target; build from source
+there.
+
+### Build from source
+
+Install the Rust toolchain, clone this repository, then build with the locked
+dependency set:
+
+```bash
+git clone https://github.com/dsecurity49/safe-migrate.git
+cd safe-migrate
+cargo build --locked --release
+install -m 755 target/release/safe-migrate "$HOME/.local/bin/safe-migrate"
+```
+
+Run `cargo test --locked` before relying on a locally built development binary.
 
 ## Quick start
 
 Sync a local baseline before linting migrations that touch existing objects:
 
 ```bash
+# Use a role that can read PostgreSQL catalogs. Keep this outside TOML and Git.
 export DATABASE_URL='postgres://readonly_user:password@localhost:5432/app'
+
+# Create the local baseline cache, then check one migration.
 safe-migrate sync
 safe-migrate lint --file migrations/20260727_add_status.sql
 ```
 
 `sync` writes `.safe-migrate.cache` by default. It reads PostgreSQL catalog
-metadata and needs a database role able to read those catalogs; do not put
-`DATABASE_URL` or its credentials in `safe-migrate.toml`.
+metadata and needs a database role able to read those catalogs; use a
+least-privilege role and do not put `DATABASE_URL` or its credentials in
+`safe-migrate.toml`.
 
-For safety, this build only syncs through localhost or a Unix socket. Use an
-SSH tunnel for a remote database, then point `DATABASE_URL` at the local tunnel.
+For safety, this build only syncs through localhost or a Unix socket. For a
+remote database, create an SSH tunnel and point `DATABASE_URL` at the local
+end, for example `ssh -N -L 5433:db.internal:5432 bastion` followed by
+`postgres://readonly_user@localhost:5433/app`.
 
 `lint` and `lint-chain` are offline commands. They never need to connect to
 PostgreSQL unless `auto_sync = true` is configured.
@@ -98,6 +151,21 @@ Rule entries support `disabled`, `tier1_threshold_rows`, and
 supported. A rule’s documented primary ID is the ID used for disabling it;
 some rules emit more specific finding IDs as noted in the rule catalog.
 
+### Configuration reference
+
+| Setting | Default | Effect |
+|---|---:|---|
+| `tier1_threshold_rows` | `100000` | Default table-size threshold for Tier 1 lock-sensitive findings. |
+| `tier2_threshold_rows` | `10000` | Default table-size threshold for Tier 2 lock-sensitive findings. |
+| `default_rows` | `10000` | Conservative row estimate when no usable statistics are available. |
+| `stale_stats_days` | `7` | Maximum cache age before the baseline becomes `stale` and confidence becomes `Tainted`. |
+| `toast_width_threshold_bytes` | `2048` | Width threshold used by storage/rewrite analysis. |
+| `assume_pg_version` | `100000` | PostgreSQL version assumed only when no cache supplies one. |
+| `schemas` | unset | Schemas included by `sync` and configured automatic sync. Explicit `sync --schemas` takes precedence. |
+| `auto_sync` | `false` | Refreshes the cache before `lint` and `lint-chain`. It has no command-line flag. |
+| `cache_encryption` | `false` | Encrypts new cache files and requires `SAFE_MIGRATE_CACHE_KEY` to read them. |
+| `disabled_rules` | `[]` | Primary rule IDs disabled globally. |
+
 ### Automatic sync
 
 Automatic sync is configuration-only—there is no CLI flag. It runs for `lint`
@@ -136,7 +204,21 @@ safe-migrate sync [--out .safe-migrate.cache] [--config safe-migrate.toml] [--sc
 ```
 
 `--interactive` is available for human exploration and cannot be combined with
-`--json`.
+`--json`. `sync --schemas` overrides the configured `schemas` list for that
+one refresh. Cache paths are local files; do not commit an unreviewed cache or
+an encrypted cache key.
+
+### Cache lifecycle
+
+`sync` writes cache replacements atomically: a failed refresh leaves the prior
+cache untouched. New cache files record their creation timestamp, source
+database name, and selected schemas. `lint --json` and `lint-chain --json`
+expose that information in the additive `baseline` object.
+
+Refresh a cache after significant production schema changes, after changing
+the selected schemas, or when the report marks it `stale`. A cache is not a
+database backup and should not contain credentials; cache encryption protects
+the local payload but does not make it safe to share indiscriminately.
 
 ## Rule catalog
 
@@ -181,18 +263,24 @@ Those are finding IDs, not independently configurable primary rules.
 Check in a reviewed cache only when it is acceptable for your team to store
 schema metadata in the repository. Otherwise sync in CI from a protected
 database secret and lint the migrations. Preserve exit status `2` as a blocked
-migration, and treat `1` as an infrastructure/configuration failure.
+migration, and treat `1` as an infrastructure/configuration failure. Do not
+enable `auto_sync` implicitly in CI: make the sync step visible in the job.
 
 ```yaml
-- name: Build and lint migrations
+- name: Build, sync, and lint migrations
+  env:
+    DATABASE_URL: ${{ secrets.SAFE_MIGRATE_DATABASE_URL }}
   run: |
     cargo build --locked --release
+    ./target/release/safe-migrate sync --out .safe-migrate.cache
     ./target/release/safe-migrate lint-chain --dir migrations --json > safe-migrate-report.json
 ```
 
 For database-backed CI, add `DATABASE_URL` as a protected secret and run
 `safe-migrate sync` in a controlled network environment before the lint step.
-Never echo the URL or write it to the cache/configuration file.
+Never echo the URL or write it to the cache/configuration file. If CI cannot
+reach PostgreSQL, use a deliberately reviewed cache or run with `--no-cache`
+and treat the resulting `Tainted` confidence as a review requirement.
 
 ## Development
 

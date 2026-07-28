@@ -23,8 +23,10 @@ PostgreSQL catalogs and statistics
   -> baseline AnalysisState
 ```
 
-Only `sync` connects to PostgreSQL. Linting operates on SQL plus a local cache
-or an empty conservative baseline.
+`sync` connects to PostgreSQL. `lint` and `lint-chain` ordinarily operate on
+SQL plus a local cache or an empty conservative baseline; they connect only
+when configuration explicitly enables `auto_sync = true` and `--no-cache` is
+not supplied.
 
 ## Layer responsibilities
 
@@ -71,7 +73,9 @@ and deterministic ordering follow [the contract](../CONTRACT.md).
 - Dependency internals are verified from the pinned source, not copied docs.
 - The visitor extracts facts; the resolver resolves names; state applies
   effects; rules assess safety.
-- Linting never requires or initiates a database connection.
+- Linting is offline by default. Automatic synchronization is an explicit
+  configuration opt-in, must run before analysis, and must preserve a readable
+  previous cache when refresh fails.
 - Ordered chain analysis reuses one state across files in deterministic
   filename order.
 - Baseline state and migration-created state remain distinguishable.
