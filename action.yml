@@ -35,7 +35,7 @@ outputs:
     description: Path to the generated Markdown report.
     value: ${{ steps.report.outputs.markdown-report }}
   exit-code:
-    description: Analyzer exit status: 0 completed, 1 operational failure, 2 blocking findings.
+    description: "Analyzer exit status: 0 completed, 1 operational failure, 2 blocking findings."
     value: ${{ steps.report.outputs.exit-code }}
   diagnostic-log:
     description: Path to analyzer diagnostics, including the reason for operational failures.
