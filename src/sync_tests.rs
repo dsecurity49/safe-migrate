@@ -60,6 +60,17 @@ mod tests {
     }
 
     #[test]
+    fn test_scoped_sync_preserves_live_priority_within_the_scope() {
+        let database_search_path = vec!["tenant".into(), "public".into()];
+        let schemas = vec!["public".into(), "tenant".into(), "auth".into()];
+
+        assert_eq!(
+            cache_search_path(database_search_path, Some(&schemas)),
+            ["tenant", "public", "auth"]
+        );
+    }
+
+    #[test]
     fn test_unscoped_sync_preserves_the_database_search_path() {
         let database_search_path = vec!["tenant".into(), "public".into()];
 

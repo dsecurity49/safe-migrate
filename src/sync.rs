@@ -62,9 +62,21 @@ pub(crate) fn cache_search_path(
     database_search_path: Vec<String>,
     schemas: Option<&[String]>,
 ) -> Vec<String> {
-    schemas
-        .map(<[String]>::to_vec)
-        .unwrap_or(database_search_path)
+    let Some(schemas) = schemas else {
+        return database_search_path;
+    };
+
+    let mut scoped_search_path = Vec::new();
+    for schema in database_search_path
+        .into_iter()
+        .filter(|schema| schemas.contains(schema))
+        .chain(schemas.iter().cloned())
+    {
+        if !scoped_search_path.contains(&schema) {
+            scoped_search_path.push(schema);
+        }
+    }
+    scoped_search_path
 }
 
 pub(crate) fn relation_owner_id(owner_name: impl Into<String>) -> ObjectId {
@@ -229,9 +241,8 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
 
     // Resolve role/database defaults and special entries such as "$user" exactly
     // as PostgreSQL does, while excluding the implicit pg_catalog lookup. An
-    // explicit schema scope is also the intended resolution scope: schemas
-    // pulled only as cross-schema FK dependencies must not become implicit
-    // lookup targets.
+    // explicit schema scope remains the resolution boundary, but selected
+    // schemas retain their live PostgreSQL priority.
     let search_path_row = client.query_one("SELECT current_schemas(false);", &[])?;
     cache.search_path = cache_search_path(search_path_row.get(0), schemas);
 

@@ -1250,6 +1250,7 @@
       "enabled": true,
       "fixtures": [
         "005_drop_func_public.sql",
+        "safe_003_drop_func_cascade.sql",
         "safe_003_alter_table.sql",
         "safe_005_drop_table.sql",
         "safe_006_create_index.sql",
@@ -1272,10 +1273,6 @@
         {
           "fixture": "004_drop_func_restrict.sql",
           "reason": "The fixture does not contain RESTRICT and PostgreSQL correctly rejects the dependent function drop without CASCADE."
-        },
-        {
-          "fixture": "safe_003_drop_func_cascade.sql",
-          "reason": "Temporarily excluded because scoped cache hydration does not preserve the live session search path for unqualified function resolution."
         },
         {
           "fixture": "010_drop_func_simple.sql",
@@ -1336,6 +1333,10 @@
         "functions"
       ],
       "fixture_scopes": {
+        "safe_003_drop_func_cascade.sql": [
+          "functions",
+          "triggers"
+        ],
         "safe_003_alter_table.sql": [
           "relations",
           "columns"
@@ -1351,7 +1352,7 @@
         "public.test_table",
         "sm_core.t"
       ],
-      "notes": "Sixteenth incremental slice. Validates function overload identity for regular, variadic, OUT-only, set-returning, and default-argument functions."
+      "notes": "Sixteenth incremental slice. Validates function-drop cascade into dependent triggers and overload identity for regular, variadic, OUT-only, set-returning, and default-argument functions."
     },
     {
       "rule_dir": "rule_20_alter-type-add-value-txn",
