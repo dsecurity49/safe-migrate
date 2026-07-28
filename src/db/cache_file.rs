@@ -8,6 +8,13 @@ pub const CACHE_KEY_ENV: &str = "SAFE_MIGRATE_CACHE_KEY";
 const ENCRYPTED_CACHE_MAGIC: &[u8] = b"SMENC001";
 const NONCE_LENGTH: usize = 24;
 
+/// Identifies the safe-migrate encryption envelope without attempting to
+/// decrypt it. This supports safe metadata inspection without exposing key
+/// material or payload contents.
+pub fn is_encrypted_cache_bytes(cache_bytes: &[u8]) -> bool {
+    cache_bytes.starts_with(ENCRYPTED_CACHE_MAGIC)
+}
+
 /// Encrypts an encoded cache when cache encryption is enabled. The on-disk
 /// envelope includes only a format marker and random nonce; the authenticated
 /// ciphertext contains all cache metadata.
@@ -34,7 +41,7 @@ pub fn protect_cache_bytes(cache_bytes: Vec<u8>, encryption_enabled: bool) -> Re
 /// enabled configuration and the environment-only key; authentication failures
 /// intentionally do not distinguish a wrong key from modified ciphertext.
 pub fn unprotect_cache_bytes(cache_bytes: Vec<u8>, encryption_enabled: bool) -> Result<Vec<u8>> {
-    if !cache_bytes.starts_with(ENCRYPTED_CACHE_MAGIC) {
+    if !is_encrypted_cache_bytes(&cache_bytes) {
         return Ok(cache_bytes);
     }
 

@@ -35,6 +35,10 @@ All notable changes to safe-migrate are documented here.
 - Added the pinned reusable GitHub Action, which writes JSON and Markdown
   artifacts from an explicit file or ordered directory without synchronizing a
   database by default.
+- Added `cache inspect`, which reports cache provenance and redacted contents
+  counts without opening a database connection. Cache documentation now covers
+  sensitive metadata, scoped least-privilege access, and re-sync/key-rotation
+  redaction workflows.
 - Added `scripts/live-differential` and a PostgreSQL 16 CI job that executes
   the previously ignored simulator-vs-PostgreSQL differential harness. CI now
   runs the enabled differential manifest on PostgreSQL 14, 15, and 16 and

@@ -10,6 +10,10 @@ the baseline used by analysis to distinguish existing production objects from
 objects created inside a migration. It is not a database dump and must never
 contain connection credentials.
 
+It does contain sensitive metadata: schema, relation, column, constraint,
+index, trigger, function, type, role-grant, dependency, and statistics data.
+Treat the file like a schema inventory, not a safe-to-share build artifact.
+
 New cache files store provenance:
 
 - creation time as Unix seconds;
@@ -30,6 +34,45 @@ line options, TOML, diagnostics, or cache metadata.
 `lint` and `lint-chain` are offline by default. `auto_sync = true` is the sole
 opt-in that refreshes before analysis. `--no-cache` bypasses both cache loading
 and automatic synchronization.
+
+## Inspection and redaction
+
+`safe-migrate cache inspect --cache <path>` reads a cache locally and prints
+format/provenance plus counts. `--json` makes that summary scriptable. It never
+prints object, column, role, or dependency names and never reads `DATABASE_URL`.
+It can inspect an encrypted cache only when encryption is configured and the
+environment key is available; neither the key nor credentials are emitted.
+
+There is intentionally no in-place cache redactor. Removing names or edges
+from a serialized baseline can make later analysis misleading. To produce a
+lower-sensitivity cache, re-sync from a sanitized database or an explicit,
+approved schema scope, inspect the new cache, and dispose of the original using
+your normal artifact-retention procedure. For encrypted cache-key rotation,
+write a fresh cache with a new `SAFE_MIGRATE_CACHE_KEY`, update the secret
+store, then remove the old cache and key according to local policy.
+
+Keep caches out of Git and logs. Use owner-only filesystem permissions where
+available, short CI artifact retention, and access controls appropriate for a
+schema/dependency snapshot.
+
+## Least-privilege sync role
+
+`sync` only issues read-only `SHOW`, `SELECT`, and catalog/view-function calls.
+It queries server/version and search-path values plus `pg_class`,
+`pg_namespace`, `pg_attribute`, `pg_attrdef`, `pg_constraint`, `pg_depend`,
+`pg_index`, `pg_proc`, `pg_type`, `pg_trigger`, `pg_policy`, `pg_rewrite`,
+`pg_stats`, and `pg_stat_user_tables`.
+
+Start with a dedicated `LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION`
+role, `CONNECT` on the target database, and `USAGE` only on schemas included in
+the sync scope. Do not grant write privileges, database ownership,
+`pg_read_all_data`, `pg_monitor`, server-file roles, or broad table `SELECT`
+by default. PostgreSQL limits `pg_stats` to readable tables, so this minimal
+role can yield unknown column widths; that is safer than granting raw data
+access solely to improve a heuristic. If a team requires richer widths, grant
+`SELECT` only to reviewed relations/columns and record that exception. The
+optional `pg_read_all_stats` role reveals broader server statistics and must be
+approved separately.
 
 ## Write and failure semantics
 

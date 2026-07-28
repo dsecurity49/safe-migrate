@@ -236,6 +236,10 @@ safe-migrate lint-chain --dir migrations/ [--cache path] [--config path] [--no-c
 
 # Refresh the local cache; --config is used for cache_encryption
 safe-migrate sync [--out .safe-migrate.cache] [--config safe-migrate.toml] [--schemas public,auth]
+
+# Inspect cache provenance and a redacted contents summary without connecting
+# to PostgreSQL.
+safe-migrate cache inspect [--cache .safe-migrate.cache] [--json]
 ```
 
 `--interactive` is available for human exploration and cannot be combined with
@@ -253,8 +257,41 @@ expose that information in the additive `baseline` object.
 
 Refresh a cache after significant production schema changes, after changing
 the selected schemas, or when the report marks it `stale`. A cache is not a
-database backup and should not contain credentials; cache encryption protects
-the local payload but does not make it safe to share indiscriminately.
+database backup and never stores connection credentials. It does contain schema,
+object, column, function, role-grant, dependency, and statistical metadata, so
+treat it as sensitive. `safe-migrate cache inspect` shows provenance and counts
+only; it deliberately omits object and dependency names. Cache encryption
+protects the local payload but does not make it safe to share indiscriminately.
+
+### Sync access and cache handling
+
+`sync` is read-only: it runs `SHOW`, `SELECT`, and catalog/view functions over
+PostgreSQL metadata. Use a dedicated login role with no write, ownership,
+replication, role-administration, or server-file privileges. Start with the
+schemas that need migration review:
+
+```sql
+CREATE ROLE safe_migrate_sync LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+GRANT CONNECT ON DATABASE app TO safe_migrate_sync;
+GRANT USAGE ON SCHEMA public, auth TO safe_migrate_sync;
+```
+
+Do not grant `pg_read_all_data`, `pg_monitor`, or broad table `SELECT` merely
+to run safe-migrate. The catalog snapshot will work with reduced detail; in
+particular, PostgreSQL exposes `pg_stats` rows only for tables a role can read,
+so `avg_width` can be unavailable. If fuller width estimates are worth the data
+access, grant `SELECT` only on explicitly approved tables (or columns) after a
+security review. `pg_read_all_stats` is also optional and exposes wider server
+statistics; do not treat it as a default least-privilege grant.
+
+For a shareable or lower-sensitivity baseline, create a new cache from an
+approved schema scope or sanitized database—do not try to edit a cache in
+place, because object names and dependencies must remain consistent. Store
+caches outside Git and CI logs, restrict local permissions (for example,
+`chmod 600 .safe-migrate.cache`), and use short artifact retention. To rotate
+an encrypted cache, generate a new `SAFE_MIGRATE_CACHE_KEY`, run `sync` to a
+new cache, update the secret store, then remove the old cache/artifact through
+your platform’s approved retention process.
 
 ## Rule catalog
 

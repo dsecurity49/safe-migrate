@@ -72,6 +72,52 @@ fn test_cli_sync_no_db_url() {
 }
 
 #[test]
+fn test_cache_inspect_outputs_a_redacted_json_summary() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let cache_path = temp_dir.path().join("baseline.cache");
+    write_fresh_cache(&cache_path);
+
+    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let assert = cmd
+        .arg("cache")
+        .arg("inspect")
+        .arg("--cache")
+        .arg(&cache_path)
+        .arg("--json")
+        .assert()
+        .success();
+    let report = parse_json_stdout(assert.get_output());
+
+    assert_eq!(report["path"], cache_path.display().to_string());
+    assert_eq!(report["format_version"], 6);
+    assert_eq!(report["encrypted"], false);
+    assert!(report["contents"]["relations"].is_number());
+    assert!(report["contents"]["columns"].is_number());
+    assert!(report.get("relation_names").is_none());
+    assert!(report.get("database_url").is_none());
+}
+
+#[test]
+fn test_cache_inspect_human_summary_discloses_redaction() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let cache_path = temp_dir.path().join("baseline.cache");
+    write_fresh_cache(&cache_path);
+
+    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let assert = cmd
+        .arg("cache")
+        .arg("inspect")
+        .arg("--cache")
+        .arg(&cache_path)
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
+
+    assert!(stdout.contains("Contents (counts only):"));
+    assert!(stdout.contains("Redaction: this summary intentionally omits"));
+}
+
+#[test]
 fn test_cli_json_is_machine_clean_and_marks_missing_baseline_tainted() {
     let mut sql_file = tempfile::NamedTempFile::new().unwrap();
     writeln!(sql_file, "CREATE TABLE widgets (id bigint PRIMARY KEY);").unwrap();

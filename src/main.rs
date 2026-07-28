@@ -1,8 +1,9 @@
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use safe_migrate::analysis::state::Confidence;
-use safe_migrate::db::cache::CacheMetadata;
-use safe_migrate::db::cache_file::unprotect_cache_bytes;
+use safe_migrate::db::cache::{CacheMetadata, DbCacheVersioned};
+use safe_migrate::db::cache_file::{is_encrypted_cache_bytes, unprotect_cache_bytes};
+use safe_migrate::model::relation::RelationKind;
 use safe_migrate::report::violations::{ReportFinding, Violation};
 use safe_migrate::sync;
 use safe_migrate::{AnalysisState, Config, DbCache, Reporter, SafeMigrateEngine};
@@ -91,6 +92,25 @@ enum Commands {
         #[arg(long, value_delimiter = ',')]
         schemas: Option<Vec<String>>,
     },
+    /// Inspect a local cache without connecting to PostgreSQL
+    Cache {
+        #[command(subcommand)]
+        command: CacheCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum CacheCommands {
+    /// Print cache provenance and a redacted contents summary
+    Inspect {
+        #[arg(long, default_value = ".safe-migrate.cache")]
+        cache: PathBuf,
+        #[arg(long, default_value = "safe-migrate.toml")]
+        config: PathBuf,
+        /// Output the redacted summary as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -126,6 +146,36 @@ struct PreparedCache {
     baseline_stale: bool,
     auto_sync: AutoSyncOutcome,
     metadata: CacheMetadata,
+}
+
+#[derive(serde::Serialize)]
+struct CacheInspection {
+    path: String,
+    format_version: u32,
+    encrypted: bool,
+    created_at_unix_secs: Option<u64>,
+    age_seconds: Option<u64>,
+    source_database: Option<String>,
+    schemas: Option<Vec<String>>,
+    search_path: Vec<String>,
+    postgresql_version_num: Option<u32>,
+    contents: CacheContentsSummary,
+}
+
+#[derive(serde::Serialize)]
+struct CacheContentsSummary {
+    relations: usize,
+    tables: usize,
+    views: usize,
+    materialized_views: usize,
+    columns: usize,
+    indexes: usize,
+    foreign_keys: usize,
+    constraints: usize,
+    triggers: usize,
+    functions: usize,
+    types: usize,
+    dependencies: usize,
 }
 
 impl OutputMode {
@@ -186,6 +236,13 @@ fn main() -> Result<()> {
             config,
             schemas,
         } => run_sync(&out, &config, schemas.as_deref()),
+        Commands::Cache { command } => match command {
+            CacheCommands::Inspect {
+                cache,
+                config,
+                json,
+            } => run_cache_inspect(&cache, &config, json),
+        },
     }
 }
 
@@ -297,6 +354,130 @@ fn run_sync(out: &Path, config_path: &Path, schemas: Option<&[String]>) -> Resul
     Ok(())
 }
 
+fn run_cache_inspect(cache_path: &Path, config_path: &Path, json: bool) -> Result<()> {
+    let config = load_config(config_path)?;
+    let (cache, format_version, encrypted) = decode_cache(cache_path, config.cache_encryption)?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let inspection = CacheInspection {
+        path: cache_path.display().to_string(),
+        format_version,
+        encrypted,
+        created_at_unix_secs: cache.metadata.created_at_unix_secs,
+        age_seconds: cache
+            .metadata
+            .created_at_unix_secs
+            .map(|created_at| now.saturating_sub(created_at)),
+        source_database: cache.metadata.source_database.clone(),
+        schemas: cache.metadata.schemas.clone(),
+        search_path: cache.search_path.clone(),
+        postgresql_version_num: cache.pg_version_num,
+        contents: summarize_cache(&cache),
+    };
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&inspection)?);
+    } else {
+        print_cache_inspection(&inspection);
+    }
+    Ok(())
+}
+
+fn summarize_cache(cache: &DbCache) -> CacheContentsSummary {
+    let mut tables = 0;
+    let mut views = 0;
+    let mut materialized_views = 0;
+    let mut columns = 0;
+    for relation in cache.relations.values() {
+        columns += relation.columns.len();
+        match &relation.kind {
+            RelationKind::Table => tables += 1,
+            RelationKind::View => views += 1,
+            RelationKind::MaterializedView => materialized_views += 1,
+        }
+    }
+    CacheContentsSummary {
+        relations: cache.relations.len(),
+        tables,
+        views,
+        materialized_views,
+        columns,
+        indexes: cache.indexes.len(),
+        foreign_keys: cache.foreign_keys.len(),
+        constraints: cache.constraints.len(),
+        triggers: cache.triggers.len(),
+        functions: cache.functions.len(),
+        types: cache.types.len(),
+        dependencies: cache.dependencies.len(),
+    }
+}
+
+fn print_cache_inspection(inspection: &CacheInspection) {
+    println!("Cache: {}", inspection.path);
+    println!("Format version: {}", inspection.format_version);
+    println!(
+        "Encryption: {}",
+        if inspection.encrypted {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    println!(
+        "Created at (Unix seconds): {}",
+        inspection
+            .created_at_unix_secs
+            .map_or_else(|| "unknown".to_string(), |value| value.to_string())
+    );
+    println!(
+        "Age: {}",
+        inspection.age_seconds.map_or_else(
+            || "unknown".to_string(),
+            |seconds| format!("{} seconds", seconds)
+        )
+    );
+    println!(
+        "Source database: {}",
+        inspection.source_database.as_deref().unwrap_or("unknown")
+    );
+    println!(
+        "Schema scope: {}",
+        inspection
+            .schemas
+            .as_deref()
+            .map(|schemas| schemas.join(", "))
+            .unwrap_or_else(|| "all non-system schemas".to_string())
+    );
+    println!("Search path: {}", inspection.search_path.join(", "));
+    println!(
+        "PostgreSQL version: {}",
+        inspection
+            .postgresql_version_num
+            .map_or_else(|| "unknown".to_string(), |value| value.to_string())
+    );
+    let contents = &inspection.contents;
+    println!(
+        "Contents (counts only): {} relations ({} tables, {} views, {} materialized views), {} columns, {} indexes, {} foreign keys, {} constraints, {} triggers, {} functions, {} types, {} dependencies",
+        contents.relations,
+        contents.tables,
+        contents.views,
+        contents.materialized_views,
+        contents.columns,
+        contents.indexes,
+        contents.foreign_keys,
+        contents.constraints,
+        contents.triggers,
+        contents.functions,
+        contents.types,
+        contents.dependencies,
+    );
+    println!(
+        "Redaction: this summary intentionally omits object, column, role, and dependency names; cache files still contain that metadata and must be handled as sensitive."
+    );
+}
+
 fn load_config(path: &Path) -> Result<Config> {
     Config::load_from_file(path)
         .with_context(|| format!("Failed to load configuration: {}", path.display()))
@@ -378,33 +559,7 @@ fn warn_if_stale_cache(metadata: &CacheMetadata, baseline_unknown: bool, stale_d
 
 fn load_cache(cache: &Path, no_cache: bool, cache_encryption: bool) -> Result<(DbCache, bool)> {
     if !no_cache && cache.exists() {
-        let encoded = fs::read(cache)
-            .with_context(|| format!("Failed to read cache file: {}", cache.display()))?;
-        let decrypted = unprotect_cache_bytes(encoded, cache_encryption)?;
-        let reader = std::io::Cursor::new(decrypted);
-        let mut decoder = zstd::stream::Decoder::new(reader).map_err(|error| {
-            anyhow!(
-                "Cache file '{}' is corrupted (zstd init): {}",
-                cache.display(),
-                error
-            )
-        })?;
-        let config = bincode::config::standard().with_variable_int_encoding();
-        let versioned: safe_migrate::db::cache::DbCacheVersioned =
-            bincode::serde::decode_from_std_read(&mut decoder, config).map_err(|error| {
-                anyhow!(
-                    "Cache file '{}' is corrupted (bincode): {}. Run `safe-migrate sync` to rebuild it.",
-                    cache.display(),
-                    error
-                )
-            })?;
-        let cache = versioned.into_cache().map_err(|error| {
-            anyhow!(
-                "Cache file '{}' is incompatible: {}",
-                cache.display(),
-                error
-            )
-        })?;
+        let (cache, _, _) = decode_cache(cache, cache_encryption)?;
         Ok((cache, false))
     } else {
         if no_cache {
@@ -414,6 +569,39 @@ fn load_cache(cache: &Path, no_cache: bool, cache_encryption: bool) -> Result<(D
         }
         Ok((DbCache::new(), true))
     }
+}
+
+fn decode_cache(cache_path: &Path, cache_encryption: bool) -> Result<(DbCache, u32, bool)> {
+    let encoded = fs::read(cache_path)
+        .with_context(|| format!("Failed to read cache file: {}", cache_path.display()))?;
+    let encrypted = is_encrypted_cache_bytes(&encoded);
+    let decrypted = unprotect_cache_bytes(encoded, cache_encryption)?;
+    let reader = std::io::Cursor::new(decrypted);
+    let mut decoder = zstd::stream::Decoder::new(reader).map_err(|error| {
+        anyhow!(
+            "Cache file '{}' is corrupted (zstd init): {}",
+            cache_path.display(),
+            error
+        )
+    })?;
+    let config = bincode::config::standard().with_variable_int_encoding();
+    let versioned: DbCacheVersioned =
+        bincode::serde::decode_from_std_read(&mut decoder, config).map_err(|error| {
+            anyhow!(
+                "Cache file '{}' is corrupted (bincode): {}. Run `safe-migrate sync` to rebuild it.",
+                cache_path.display(),
+                error
+            )
+        })?;
+    let format_version = versioned.format_version();
+    let cache = versioned.into_cache().map_err(|error| {
+        anyhow!(
+            "Cache file '{}' is incompatible: {}",
+            cache_path.display(),
+            error
+        )
+    })?;
+    Ok((cache, format_version, encrypted))
 }
 
 fn analysis_error(errors: Vec<String>) -> anyhow::Error {

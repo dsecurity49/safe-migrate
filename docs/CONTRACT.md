@@ -13,10 +13,17 @@ enforces it.
   cache. It requires `DATABASE_URL` and accepts only localhost or Unix-socket
   connections in this build; remote databases must be reached through an SSH
   tunnel.
+- `safe-migrate cache inspect` reads a local cache without connecting to
+  PostgreSQL and prints provenance plus a redacted contents summary. `--json`
+  emits that same summary as one JSON document.
 
 `lint` and `lint-chain` use an explicit cache, the default cache path, or
 `--no-cache`. When `auto_sync = true` is set in configuration, they may refresh
 the cache before analysis. `--no-cache` always bypasses automatic sync.
+
+`cache inspect` never lists object, column, role, or dependency names. Its
+source database, schema scope, versions, and counts still describe sensitive
+infrastructure and must not be published automatically.
 
 ## Output channels
 
