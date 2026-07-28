@@ -218,11 +218,11 @@ impl SafeMigrateEngine {
                 if element.as_node().is_some() {
                     break;
                 }
-                if let Some(token) = element.as_token() {
-                    if token.kind() == SyntaxKind::COMMENT {
-                        let mut dummy = HashSet::new();
-                        Self::parse_directives(token.text(), &mut dummy, &mut stmt_ignores);
-                    }
+                if let Some(token) = element.as_token()
+                    && token.kind() == SyntaxKind::COMMENT
+                {
+                    let mut dummy = HashSet::new();
+                    Self::parse_directives(token.text(), &mut dummy, &mut stmt_ignores);
                 }
                 prev = element.prev_sibling_or_token();
             }

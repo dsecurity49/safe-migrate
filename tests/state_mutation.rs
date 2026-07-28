@@ -72,6 +72,21 @@ mod state_mutation_tests {
     }
 
     #[test]
+    fn rename_back_to_original_name_does_not_loop_during_drop() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE TABLE a(id int); ALTER TABLE a RENAME TO b; ALTER TABLE b RENAME TO a; DROP TABLE a;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(!state.relation_is_present(&object_id("public", "a")));
+    }
+
+    #[test]
     fn test_topology_rename_index() {
         let engine = setup_engine();
         let mut state = setup_state();

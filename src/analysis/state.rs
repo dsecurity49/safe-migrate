@@ -696,7 +696,11 @@ impl AnalysisState {
                     .collect();
                 let resolve = |id: &ObjectId| -> ObjectId {
                     let mut current = id;
+                    let mut visited = HashSet::new();
                     loop {
+                        if !visited.insert(current.clone()) {
+                            return id.clone();
+                        }
                         match renames.iter().find(|r| &r.dependent == current) {
                             Some(edge) => current = &edge.referenced,
                             None => return current.clone(),
