@@ -151,6 +151,45 @@ mod transaction_lifecycle_tests {
     }
 
     #[test]
+    fn multi_action_alter_table_restores_state_after_a_failed_action() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let violations = engine
+            .analyze(
+                "CREATE TABLE t(id int); ALTER TABLE t ADD COLUMN b integer, DROP COLUMN missing; ALTER TABLE t ADD COLUMN b text;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(
+            violations
+                .iter()
+                .any(|violation| { violation.reason.contains("column 'missing' does not exist") })
+        );
+        assert!(!violations.iter().any(|violation| {
+            violation
+                .reason
+                .contains("column 'b' already added with type integer")
+        }));
+        let relation = state
+            .local
+            .relations
+            .get(&object_id("public", "t"))
+            .and_then(|overlay| match overlay {
+                safe_migrate::analysis::state::RelationOverlay::Present(relation) => Some(relation),
+                safe_migrate::analysis::state::RelationOverlay::Dropped => None,
+            })
+            .expect("table should remain present");
+        let column = relation
+            .columns
+            .iter()
+            .find(|column| column.name == "b")
+            .expect("following statement should add column b");
+        assert_eq!(column.data_type.as_deref(), Some("text"));
+    }
+
+    #[test]
     fn test_rename_propagation_rollback() {
         let engine = setup_engine();
         let mut cache = safe_migrate::db::cache::DbCache::new();

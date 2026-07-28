@@ -40,6 +40,7 @@ pub struct CascadeResult {
     pub dropped_constraints: HashSet<(ObjectId, String)>,
 }
 
+#[derive(Clone)]
 pub struct LocalState {
     pub relations: HashMap<ObjectId, RelationOverlay>,
     pub types: HashMap<ObjectId, TypeOverlay>,
@@ -73,6 +74,7 @@ pub struct PreState {
     pub indexes: Vec<crate::analysis::graph::DependencyEdge>,
 }
 
+#[derive(Clone)]
 pub struct AnalysisState {
     pub pg_version_num: Option<u32>,
     /// Whether the initial cache was loaded from a real cache file. An empty
@@ -1193,9 +1195,12 @@ impl AnalysisState {
                                     // Column doesn't exist and IF EXISTS was specified: no-op
                                     return MutationResult::Skipped;
                                 }
-                                // Column doesn't exist and IF EXISTS not specified: PG runtime error
-                                self.local.confidence = Confidence::Tainted;
-                                return MutationResult::Skipped;
+                                return MutationResult::Conflict {
+                                    reason: format!(
+                                        "column '{}' does not exist on relation '{}'",
+                                        name, alter.id
+                                    ),
+                                };
                             }
                             rel.apply_column_action(&ColumnAction::Drop { name: name.clone() });
                         }

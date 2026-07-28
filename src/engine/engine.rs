@@ -241,6 +241,12 @@ impl SafeMigrateEngine {
             let stmt_text = Self::strip_sql_leading_comments(&stmt.syntax().text().to_string());
 
             if let Some(fact) = AstVisitor::extract(&stmt) {
+                let atomic_alter = matches!(
+                    &fact,
+                    crate::analysis::facts::StatementFact::AlterTable { actions, .. }
+                        if actions.len() > 1
+                );
+                let statement_checkpoint = atomic_alter.then(|| state.clone());
                 let mutations = Resolver::resolve(&fact, state);
 
                 for mutation in mutations {
@@ -253,6 +259,15 @@ impl SafeMigrateEngine {
 
                     let pre_state = state.capture_pre_state();
                     let result = state.apply(&mutation, pre_cascade.as_ref());
+
+                    let statement_failed = atomic_alter
+                        && matches!(
+                            result,
+                            crate::analysis::state::MutationResult::Conflict { .. }
+                        );
+                    if statement_failed && let Some(checkpoint) = &statement_checkpoint {
+                        *state = checkpoint.clone();
+                    }
 
                     if result == crate::analysis::state::MutationResult::NotExecuted {
                         continue;
@@ -320,6 +335,10 @@ impl SafeMigrateEngine {
                             }
                             all_violations.push(v);
                         }
+                    }
+
+                    if statement_failed {
+                        break;
                     }
                 }
             }
