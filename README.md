@@ -45,6 +45,11 @@ Use `sh install.sh --help` to choose `--install-dir`, force a `--target`, or
 replace an existing binary with `--force`. Running the current installer
 without `--version` selects the latest published release.
 
+Use `sh install.sh --dry-run --version v0.4.2` to inspect the selected target,
+release URL, and destination without downloading or changing files. A dry run
+with no version intentionally reports that a real install would first resolve
+the latest release; it never makes that network request itself.
+
 ### Manual release download
 
 Release archives and SHA-256 checksum files are published on the

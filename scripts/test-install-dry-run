@@ -1,0 +1,31 @@
+#!/bin/sh
+set -eu
+
+repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+test_tmp=$(mktemp -d)
+trap 'rm -rf "$test_tmp"' EXIT HUP INT TERM
+
+install_dir="$test_tmp/install"
+output="$test_tmp/output"
+command_dir="$test_tmp/commands"
+mkdir "$command_dir"
+ln -s "$(command -v uname)" "$command_dir/uname"
+
+# The restricted PATH contains only uname and deliberately omits curl. A
+# successful dry run proves it neither requires nor invokes network tooling.
+PATH="$command_dir" \
+  /bin/sh "$repo_root/install.sh" \
+  --dry-run \
+  --version v0.4.2 \
+  --target x86_64-unknown-linux-musl \
+  --install-dir "$install_dir" \
+  >"$output" 2>&1
+
+grep -F '[dry-run] No network requests or filesystem changes will be made.' "$output" >/dev/null
+grep -F 'safe-migrate-x86_64-unknown-linux-musl.tar.gz' "$output" >/dev/null
+grep -F "atomically install ${install_dir}/safe-migrate" "$output" >/dev/null
+
+if [ -e "$install_dir" ]; then
+  printf '%s\n' 'dry run unexpectedly created the requested install directory' >&2
+  exit 1
+fi

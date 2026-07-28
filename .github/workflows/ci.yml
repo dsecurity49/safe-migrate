@@ -29,6 +29,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt -- --check
 
+      - name: Verify installer dry run
+        run: sh scripts/test-install-dry-run
+
       - name: Build (locked)
         run: cargo build --locked --verbose
 

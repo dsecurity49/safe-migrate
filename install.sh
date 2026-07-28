@@ -273,9 +273,46 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+need uname
+
+REQUESTED_VERSION="$(normalize_version "$REQUESTED_VERSION")"
+
+log "Detecting operating system and architecture..."
+
+OS="$(uname -s)"
+ARCH="$(uname -m)"
+
+CANDIDATES="$(candidate_targets "$OS" "$ARCH")"
+INSTALL_DIR="$(pick_install_dir)"
+DEST="${INSTALL_DIR}/${BIN_NAME}"
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  log "[dry-run] No network requests or filesystem changes will be made."
+  if [ "$REQUESTED_VERSION" = "latest" ]; then
+    log "[dry-run] Would query GitHub Releases for the latest version."
+    VERSION_LABEL="<latest release>"
+  else
+    VERSION_LABEL="$REQUESTED_VERSION"
+  fi
+
+  log "[dry-run] Version: ${VERSION_LABEL}"
+  log "[dry-run] Candidate targets: $(printf '%s ' $CANDIDATES)"
+  for candidate in $CANDIDATES; do
+    if [ "$REQUESTED_VERSION" = "latest" ]; then
+      log "[dry-run] Would download and verify ${BIN_NAME}-${candidate}.tar.gz after resolving the release version."
+    else
+      log "[dry-run] Would download and verify $(build_url "$REQUESTED_VERSION" "$candidate")"
+    fi
+  done
+  log "[dry-run] Would extract the selected archive and atomically install ${DEST}"
+  if [ -e "$DEST" ] && [ "$FORCE" -ne 1 ]; then
+    warn "${DEST} already exists; a real install would require --force."
+  fi
+  exit 0
+fi
+
 need curl
 need tar
-need uname
 need sed
 need head
 need grep
@@ -285,13 +322,6 @@ need chmod
 need mkdir
 need mv
 need rm
-
-REQUESTED_VERSION="$(normalize_version "$REQUESTED_VERSION")"
-
-log "Detecting operating system and architecture..."
-
-OS="$(uname -s)"
-ARCH="$(uname -m)"
 
 if [ "$REQUESTED_VERSION" = "latest" ]; then
   log "Fetching latest release version..."
@@ -305,8 +335,6 @@ log "Using version: ${RESOLVED_VERSION}"
 
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT HUP INT TERM
-
-CANDIDATES="$(candidate_targets "$OS" "$ARCH")"
 
 TAR_FILE=""
 SELECTED_TARGET=""
@@ -350,9 +378,6 @@ if [ ! -f "$BIN_PATH" ]; then
   BIN_PATH="$(find "$TMP_DIR" -type f -name "$BIN_NAME" | head -n 1 || true)"
 fi
 [ -n "$BIN_PATH" ] || die "Binary not found inside archive"
-
-INSTALL_DIR="$(pick_install_dir)"
-DEST="${INSTALL_DIR}/${BIN_NAME}"
 
 if [ -e "$DEST" ] && [ "$FORCE" -ne 1 ]; then
   die "${DEST} already exists. Use --force to overwrite."

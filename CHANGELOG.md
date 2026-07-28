@@ -39,6 +39,8 @@ All notable changes to safe-migrate are documented here.
   counts without opening a database connection. Cache documentation now covers
   sensitive metadata, scoped least-privilege access, and re-sync/key-rotation
   redaction workflows.
+- Fixed `install.sh --dry-run` to be a real no-network, no-write plan. CI now
+  verifies it without `curl` being available.
 - Added `scripts/live-differential` and a PostgreSQL 16 CI job that executes
   the previously ignored simulator-vs-PostgreSQL differential harness. CI now
   runs the enabled differential manifest on PostgreSQL 14, 15, and 16 and
