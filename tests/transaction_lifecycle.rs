@@ -171,6 +171,70 @@ mod transaction_lifecycle_tests {
     }
 
     #[test]
+    fn release_outer_savepoint_removes_nested_savepoints_and_preserves_undo() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let violations = engine
+            .analyze(
+                "BEGIN;
+                 SAVEPOINT outer_sp;
+                 CREATE TABLE release_a(id integer);
+                 SAVEPOINT inner_sp;
+                 CREATE TABLE release_b(id integer);
+                 RELEASE SAVEPOINT outer_sp;
+                 ROLLBACK TO SAVEPOINT inner_sp;
+                 DROP DATABASE production;
+                 ROLLBACK;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(violations.iter().any(|violation| {
+            violation.rule_id == "chain-conflict"
+                && violation
+                    .reason
+                    .contains("savepoint 'inner_sp' does not exist")
+        }));
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.rule_id == "drop-database")
+        );
+        assert!(!state.relation_is_present(&object_id("public", "release_a")));
+        assert!(!state.relation_is_present(&object_id("public", "release_b")));
+        assert!(state.local.transactions.is_empty());
+        assert!(!state.local.transaction_aborted);
+    }
+
+    #[test]
+    fn missing_release_savepoint_aborts_the_active_transaction() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let violations = engine
+            .analyze(
+                "BEGIN; RELEASE SAVEPOINT missing; DROP DATABASE production; ROLLBACK;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(violations.iter().any(|violation| {
+            violation.rule_id == "chain-conflict"
+                && violation
+                    .reason
+                    .contains("savepoint 'missing' does not exist")
+        }));
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.rule_id == "drop-database")
+        );
+        assert!(state.local.transactions.is_empty());
+        assert!(!state.local.transaction_aborted);
+    }
+
+    #[test]
     fn multi_action_alter_table_restores_state_after_a_failed_action() {
         let engine = setup_engine();
         let mut state = setup_state();

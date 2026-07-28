@@ -1731,20 +1731,35 @@ impl AnalysisState {
                 MutationResult::Applied
             }
             Mutation::ReleaseSavepoint(rsp) => {
-                let mut rolled_back = Vec::new();
-                while let Some(frame) = self.local.transactions.last() {
-                    if frame.name == rsp.name {
-                        break;
+                let Some(position) = self
+                    .local
+                    .transactions
+                    .iter()
+                    .rposition(|frame| frame.name == rsp.name)
+                else {
+                    self.local.confidence = Confidence::Tainted;
+                    if !self.local.transactions.is_empty() {
+                        self.local.transaction_aborted = true;
                     }
-                    rolled_back.push(self.local.transactions.pop().unwrap());
+                    return MutationResult::Conflict {
+                        reason: format!("savepoint '{}' does not exist", rsp.name),
+                    };
+                };
+                if position == 0 {
+                    self.local.confidence = Confidence::Tainted;
+                    return MutationResult::Conflict {
+                        reason: format!("savepoint '{}' is not inside a transaction", rsp.name),
+                    };
                 }
-                if let Some(frame) = self.local.transactions.pop()
-                    && let Some(outer) = self.local.transactions.last_mut()
-                {
+
+                let released = self.local.transactions.split_off(position);
+                let outer = self
+                    .local
+                    .transactions
+                    .last_mut()
+                    .expect("a released savepoint always has an outer transaction frame");
+                for frame in released {
                     outer.undo_log.extend(frame.undo_log);
-                }
-                for frame in rolled_back.into_iter().rev() {
-                    self.local.transactions.push(frame);
                 }
                 MutationResult::Applied
             }
