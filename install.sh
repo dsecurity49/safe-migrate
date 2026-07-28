@@ -70,6 +70,22 @@ build_url() {
     "$REPO" "$version" "$BIN_NAME" "$target"
 }
 
+sha256_digest() {
+  file="$1"
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$file" | cut -d' ' -f1
+    return
+  fi
+
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$file" | cut -d' ' -f1
+    return
+  fi
+
+  die "sha256sum or shasum is required to verify release checksums"
+}
+
 candidate_targets() {
   os="$1"
   arch="$2"
@@ -151,7 +167,7 @@ download_asset() {
   if curl -fsSL -o "$sha_file" "$sha_url" 2>/dev/null; then
     expected=$(cut -d' ' -f1 < "$sha_file" 2>/dev/null || true)
     if [ -n "$expected" ]; then
-      actual=$(sha256sum "$part" 2>/dev/null | cut -d' ' -f1 || true)
+      actual=$(sha256_digest "$part" 2>/dev/null || true)
       if [ "$actual" != "$expected" ]; then
         rm -f "$part" "$sha_file"
         log "Checksum mismatch for ${target}. Expected ${expected}, got ${actual}."

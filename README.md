@@ -12,6 +12,27 @@ database or for planning application-level rollout and backfill work.
 
 ### Download a release binary
 
+The recommended installation path is the repository installer. It detects the
+supported Linux, macOS, and Termux target, downloads the matching GitHub Release
+archive, verifies its published SHA-256 checksum, and installs `safe-migrate`
+to a writable binary directory.
+
+To install a specific release, download the installer from that same tag and
+run it locally:
+
+```bash
+version=v0.4.2
+curl -fLO "https://raw.githubusercontent.com/dsecurity49/safe-migrate/$version/install.sh"
+sh install.sh --version "$version"
+safe-migrate --version
+```
+
+Use `sh install.sh --help` to choose `--install-dir`, force a `--target`, or
+replace an existing binary with `--force`. Running the current installer
+without `--version` selects the latest published release.
+
+### Manual release download
+
 Release archives and SHA-256 checksum files are published on the
 [GitHub Releases page](https://github.com/dsecurity49/safe-migrate/releases).
 Choose the archive matching your platform:
@@ -45,8 +66,8 @@ safe-migrate --version
 Add `~/.local/bin` to `PATH` if needed. On macOS, use `shasum -a 256 -c` for
 checksum verification. Windows users can extract the ZIP and verify the
 adjacent `.sha256` file with `Get-FileHash` before adding the executable to
-`PATH`. Android/Termux is not a published release target; build from source
-there.
+`PATH`. The installer is the preferred path on Termux because it selects the
+appropriate install directory automatically.
 
 ### Build from source
 
