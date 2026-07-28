@@ -347,6 +347,39 @@ mod transaction_lifecycle_tests {
     }
 
     #[test]
+    fn chain_without_active_transaction_does_not_start_a_transaction() {
+        let engine = setup_engine();
+
+        for (statement, expected_reason, index_name) in [
+            (
+                "COMMIT AND CHAIN",
+                "COMMIT AND CHAIN can only be used in transaction blocks",
+                "commit_outside_idx",
+            ),
+            (
+                "ROLLBACK AND CHAIN",
+                "ROLLBACK AND CHAIN can only be used in transaction blocks",
+                "rollback_outside_idx",
+            ),
+        ] {
+            let mut state = setup_state();
+            let sql = format!("{statement}; CREATE INDEX CONCURRENTLY {index_name} ON users(id);");
+            let violations = engine.analyze(&sql, &mut state).unwrap();
+
+            assert!(violations.iter().any(|violation| {
+                violation.rule_id == "chain-conflict" && violation.reason.contains(expected_reason)
+            }));
+            assert!(
+                !violations
+                    .iter()
+                    .any(|violation| violation.rule_id == "concurrent-in-transaction")
+            );
+            assert!(state.local.transactions.is_empty());
+            assert!(!state.local.transaction_aborted);
+        }
+    }
+
+    #[test]
     fn multi_action_alter_table_restores_state_after_a_failed_action() {
         let engine = setup_engine();
         let mut state = setup_state();

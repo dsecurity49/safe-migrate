@@ -1672,6 +1672,13 @@ impl AnalysisState {
                 MutationResult::Applied
             }
             Mutation::CommitAndChain => {
+                if self.local.transactions.is_empty() {
+                    self.local.confidence = Confidence::Tainted;
+                    return MutationResult::Conflict {
+                        reason: "COMMIT AND CHAIN can only be used in transaction blocks"
+                            .to_string(),
+                    };
+                }
                 if self.local.transaction_aborted {
                     while let Some(frame) = self.local.transactions.pop() {
                         self.rollback_frame(frame);
@@ -1693,6 +1700,13 @@ impl AnalysisState {
                 MutationResult::Applied
             }
             Mutation::RollbackAndChain => {
+                if self.local.transactions.is_empty() {
+                    self.local.confidence = Confidence::Tainted;
+                    return MutationResult::Conflict {
+                        reason: "ROLLBACK AND CHAIN can only be used in transaction blocks"
+                            .to_string(),
+                    };
+                }
                 while let Some(frame) = self.local.transactions.pop() {
                     self.rollback_frame(frame);
                 }
