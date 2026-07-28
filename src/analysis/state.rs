@@ -1673,15 +1673,18 @@ impl AnalysisState {
                     }
                     rolled_back.push(self.local.transactions.pop().unwrap());
                 }
+                // Frames are popped newest-first. Restore them in that same
+                // order before restoring changes made after the target
+                // savepoint itself; undo logs are chronological.
+                for frame in rolled_back {
+                    self.rollback_frame(frame);
+                }
                 if let Some(frame) = self.local.transactions.last_mut() {
                     let mut temp_frame = TransactionFrame::new(&frame.name);
                     while let Some(change) = frame.undo_log.pop() {
                         temp_frame.undo_log.push(change);
                     }
                     self.rollback_frame(temp_frame);
-                }
-                for frame in rolled_back.into_iter().rev() {
-                    self.rollback_frame(frame);
                 }
                 MutationResult::Applied
             }

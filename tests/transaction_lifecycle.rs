@@ -100,6 +100,37 @@ mod transaction_lifecycle_tests {
     }
 
     #[test]
+    fn rollback_to_outer_savepoint_undoes_nested_changes_in_reverse_order() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let violations = engine
+            .analyze(
+                "CREATE TABLE t(id int); BEGIN; SAVEPOINT a; ALTER TABLE t ADD COLUMN a integer; SAVEPOINT b; ALTER TABLE t ADD COLUMN b integer; ROLLBACK TO SAVEPOINT a; ALTER TABLE t ADD COLUMN a text; COMMIT;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(!violations.iter().any(|v| v.rule_id == "chain-conflict"));
+        let relation = state
+            .local
+            .relations
+            .get(&object_id("public", "t"))
+            .and_then(|overlay| match overlay {
+                safe_migrate::analysis::state::RelationOverlay::Present(relation) => Some(relation),
+                safe_migrate::analysis::state::RelationOverlay::Dropped => None,
+            })
+            .expect("table should remain present");
+        let column = relation
+            .columns
+            .iter()
+            .find(|column| column.name == "a")
+            .expect("replacement column should be present");
+        assert_eq!(column.data_type.as_deref(), Some("text"));
+        assert!(!relation.columns.iter().any(|column| column.name == "b"));
+    }
+
+    #[test]
     fn test_rename_propagation_rollback() {
         let engine = setup_engine();
         let mut cache = safe_migrate::db::cache::DbCache::new();
