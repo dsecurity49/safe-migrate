@@ -1,10 +1,18 @@
 #!/bin/bash
-# Generate 500+ SQL migration files for comprehensive fuzz testing
-set -e
+# Generate a deterministic 400+ SQL migration corpus.
+set -eu
 
-DIR="tests/fuzz_migrations/sql"
-rm -rf "$DIR"
+if [ "$#" -ne 1 ]; then
+    echo "Usage: tests/fuzz_migrations/generate.sh OUTPUT_DIRECTORY" >&2
+    exit 2
+fi
+
+DIR=$1
 mkdir -p "$DIR"
+if find "$DIR" -mindepth 1 -print -quit | grep -q .; then
+    echo "Output directory must be empty: $DIR" >&2
+    exit 2
+fi
 
 N=1
 write() {
@@ -413,4 +421,4 @@ for i in $(seq 1 20); do
 done
 
 echo "Generated $((N-1)) SQL migration files in $DIR/"
-ls "$DIR/" | wc -l
+find "$DIR" -maxdepth 1 -type f -name '*.sql' | wc -l

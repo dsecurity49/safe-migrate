@@ -38,6 +38,9 @@ jobs:
       - name: Run tests (locked)
         run: cargo test --locked --verbose
 
+      - name: Run generated migration fuzz corpus
+        run: scripts/fuzz
+
       - name: Run Clippy (Linter)
         run: cargo clippy --all-targets --locked -- -D warnings
 
