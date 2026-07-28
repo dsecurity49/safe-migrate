@@ -81,6 +81,19 @@ jobs:
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
 
+      - name: Reject an unreachable live database
+        shell: bash
+        env:
+          DATABASE_URL: postgres://127.0.0.1:1/postgres?connect_timeout=1
+        run: |
+          set +e
+          output="$(scripts/live-differential --rule rule_02_drop-database 2>&1)"
+          status=$?
+          set -e
+          printf '%s\n' "$output"
+          test "$status" -ne 0
+          grep -q 'requires reachable PostgreSQL' <<< "$output"
+
       - name: Compare simulator state with PostgreSQL
         shell: bash
         run: |

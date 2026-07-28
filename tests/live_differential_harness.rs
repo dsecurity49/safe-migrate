@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 const VERBOSITY_ENV: &str = "SAFE_MIGRATE_DIFF_VERBOSITY";
 const RULE_FILTER_ENV: &str = "SAFE_MIGRATE_DIFF_RULE";
 const FIXTURE_FILTER_ENV: &str = "SAFE_MIGRATE_DIFF_FIXTURE";
+const REQUIRE_LIVE_ENV: &str = "SAFE_MIGRATE_REQUIRE_LIVE";
 
 #[derive(Debug, Deserialize)]
 struct DifferentialManifest {
@@ -218,6 +219,10 @@ fn live_postgres_differential_harness() {
     let database_url = match std::env::var("DATABASE_URL") {
         Ok(value) => value,
         Err(_) => {
+            assert!(
+                !live_database_is_required(),
+                "live differential harness requires DATABASE_URL"
+            );
             eprintln!("skipping live differential harness: DATABASE_URL is not set");
             return;
         }
@@ -226,6 +231,10 @@ fn live_postgres_differential_harness() {
     let mut client = match Client::connect(&database_url, NoTls) {
         Ok(client) => client,
         Err(error) => {
+            assert!(
+                !live_database_is_required(),
+                "live differential harness requires reachable PostgreSQL: {error}"
+            );
             eprintln!("skipping live differential harness: PostgreSQL is unreachable: {error}");
             return;
         }
@@ -609,6 +618,10 @@ fn differential_verbosity() -> u8 {
         .and_then(|value| value.parse::<u8>().ok())
         .unwrap_or(0)
         .min(3)
+}
+
+fn live_database_is_required() -> bool {
+    std::env::var_os(REQUIRE_LIVE_ENV).is_some()
 }
 
 fn verbose(verbosity: u8, level: u8, message: impl std::fmt::Display) {
