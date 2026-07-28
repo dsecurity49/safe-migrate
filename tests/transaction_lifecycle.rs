@@ -292,6 +292,61 @@ mod transaction_lifecycle_tests {
     }
 
     #[test]
+    fn savepoint_outside_transaction_does_not_create_a_transaction_frame() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let violations = engine
+            .analyze(
+                "SAVEPOINT outside_sp;
+                 CREATE INDEX CONCURRENTLY outside_idx ON users(id);",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(violations.iter().any(|violation| {
+            violation.rule_id == "chain-conflict"
+                && violation
+                    .reason
+                    .contains("SAVEPOINT can only be used in transaction blocks")
+        }));
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.rule_id == "concurrent-in-transaction")
+        );
+        assert!(state.local.transactions.is_empty());
+        assert!(!state.local.transaction_aborted);
+    }
+
+    #[test]
+    fn rollback_to_savepoint_outside_transaction_does_not_abort_later_analysis() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let violations = engine
+            .analyze(
+                "ROLLBACK TO SAVEPOINT outside_sp; DROP DATABASE production;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(violations.iter().any(|violation| {
+            violation.rule_id == "chain-conflict"
+                && violation
+                    .reason
+                    .contains("savepoint 'outside_sp' does not exist")
+        }));
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.rule_id == "drop-database")
+        );
+        assert!(state.local.transactions.is_empty());
+        assert!(!state.local.transaction_aborted);
+    }
+
+    #[test]
     fn multi_action_alter_table_restores_state_after_a_failed_action() {
         let engine = setup_engine();
         let mut state = setup_state();

@@ -1710,7 +1710,9 @@ impl AnalysisState {
                     .any(|frame| frame.name == rts.name)
                 {
                     self.local.confidence = Confidence::Tainted;
-                    self.local.transaction_aborted = true;
+                    if !self.local.transactions.is_empty() {
+                        self.local.transaction_aborted = true;
+                    }
                     return MutationResult::Conflict {
                         reason: format!("savepoint '{}' does not exist", rts.name),
                     };
@@ -1738,6 +1740,12 @@ impl AnalysisState {
                 MutationResult::Applied
             }
             Mutation::Savepoint(sp) => {
+                if self.local.transactions.is_empty() {
+                    self.local.confidence = Confidence::Tainted;
+                    return MutationResult::Conflict {
+                        reason: "SAVEPOINT can only be used in transaction blocks".to_string(),
+                    };
+                }
                 self.local
                     .transactions
                     .push(TransactionFrame::new(sp.name.clone()));
