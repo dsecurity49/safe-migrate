@@ -474,23 +474,25 @@ mod exhaustive_fuzz_tests {
     }
 
     #[test]
-    fn fuzz_txn_010_multi_savepoint_chain() {
+    fn rollback_to_savepoint_discards_later_savepoints() {
         let engine = setup_engine();
         let mut state = setup_state();
-        // Pure transaction-control only: no DDL means no violations.
-        // The test verifies that the engine does not panic on a
-        // ROLLBACK-TO followed by RELEASE of the rolled-back savepoint.
-        let v = engine
+        let violations = engine
             .analyze(
                 "BEGIN; SAVEPOINT s1; SAVEPOINT s2; SAVEPOINT s3; ROLLBACK TO s2; RELEASE SAVEPOINT s3; COMMIT;",
                 &mut state,
             )
             .unwrap();
+
         assert!(
-            v.is_empty(),
-            "Expected no violations for pure transaction-control SQL, got: {:?}",
-            v
+            violations.iter().any(|violation| {
+                violation.rule_id == "chain-conflict"
+                    && violation.reason.contains("savepoint 's3' does not exist")
+            }),
+            "Releasing a savepoint discarded by ROLLBACK TO must be reported"
         );
+        assert!(state.local.transactions.is_empty());
+        assert!(!state.local.transaction_aborted);
     }
 
     // --- Fuzz Group 3: Confidence taint + tier downgrade (30 cases) ---
