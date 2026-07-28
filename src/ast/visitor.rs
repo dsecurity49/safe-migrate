@@ -2919,7 +2919,7 @@ impl AstVisitor {
         match node
             .savepoint_ref()
             .and_then(|s| s.ident_token())
-            .map(|t| t.text().to_string())
+            .map(|t| Self::resolve_identifier_token(t.text()))
         {
             Some(name) => Some(StatementFact::RollbackToSavepoint { name }),
             None => Some(StatementFact::RollbackTransaction),
@@ -2931,7 +2931,7 @@ impl AstVisitor {
             name: node
                 .savepoint()
                 .and_then(|s| s.ident_token())
-                .map(|n| n.text().to_string())
+                .map(|n| Self::resolve_identifier_token(n.text()))
                 .unwrap_or_default(),
         }
     }
@@ -2941,9 +2941,14 @@ impl AstVisitor {
             name: node
                 .savepoint_ref()
                 .and_then(|s| s.ident_token())
-                .map(|t| t.text().to_string())
+                .map(|t| Self::resolve_identifier_token(t.text()))
                 .unwrap_or_default(),
         }
+    }
+
+    fn resolve_identifier_token(text: &str) -> String {
+        let quoted = text.starts_with('"');
+        Ident::new(text.trim_matches('"').to_string(), quoted).resolve()
     }
 
     fn segment_ident(segment: PathSegment) -> Option<Ident> {

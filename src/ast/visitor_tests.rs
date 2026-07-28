@@ -466,6 +466,21 @@ mod tests {
     }
 
     #[test]
+    fn test_savepoint_identifier_casing_matches_postgres() {
+        let unquoted = parse_and_extract_statement("SAVEPOINT MixedCase;").unwrap();
+        assert!(matches!(
+            unquoted,
+            StatementFact::Savepoint { name } if name == "mixedcase"
+        ));
+
+        let quoted = parse_and_extract_statement("SAVEPOINT \"MixedCase\";").unwrap();
+        assert!(matches!(
+            quoted,
+            StatementFact::Savepoint { name } if name == "MixedCase"
+        ));
+    }
+
+    #[test]
     fn test_release_savepoint() {
         let sql = "RELEASE SAVEPOINT sp1;";
         let facts = parse_and_extract_statement(sql);

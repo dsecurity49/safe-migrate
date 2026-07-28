@@ -64,6 +64,26 @@ mod transaction_lifecycle_tests {
     }
 
     #[test]
+    fn unquoted_savepoint_names_are_case_insensitive() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let violations = engine
+            .analyze(
+                "BEGIN; SAVEPOINT MixedCase; ROLLBACK TO SAVEPOINT mixedcase; CREATE INDEX CONCURRENTLY idx ON users (id); ROLLBACK;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.rule_id == "concurrent-in-transaction")
+        );
+        assert!(!violations.iter().any(|v| v.rule_id == "chain-conflict"));
+    }
+
+    #[test]
     fn test_rollback_to_savepoint_keeps_outer_txn() {
         let engine = setup_engine();
         let mut state = setup_state();
