@@ -140,3 +140,27 @@ jobs:
           test "${{ steps.untrusted_config.outputs.exit-code }}" = "2"
           grep -q '"rule_id": "drop-database"' \
             "${{ steps.untrusted_config.outputs.json-report }}"
+
+      - name: Verify operational failures produce diagnostic artifacts
+        id: operational_error
+        continue-on-error: true
+        uses: ./
+        with:
+          mode: lint
+          path: missing-migration.sql
+          no-cache: "true"
+          output-dir: action-operational-error-artifacts
+
+      - name: Assert operational error artifact contract
+        shell: bash
+        run: |
+          test "${{ steps.operational_error.outcome }}" = "failure"
+          test "${{ steps.operational_error.outputs.exit-code }}" = "1"
+          test -s "${{ steps.operational_error.outputs.json-report }}"
+          test -s "${{ steps.operational_error.outputs.markdown-report }}"
+          test -s "${{ steps.operational_error.outputs.diagnostic-log }}"
+          jq -e \
+            '.status == "operational_error" and .exit_code == 1' \
+            "${{ steps.operational_error.outputs.json-report }}"
+          grep -q 'missing-migration.sql' \
+            "${{ steps.operational_error.outputs.diagnostic-log }}"

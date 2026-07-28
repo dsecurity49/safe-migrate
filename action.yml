@@ -37,6 +37,9 @@ outputs:
   exit-code:
     description: Analyzer exit status: 0 completed, 1 operational failure, 2 blocking findings.
     value: ${{ steps.report.outputs.exit-code }}
+  diagnostic-log:
+    description: Path to analyzer diagnostics, including the reason for operational failures.
+    value: ${{ steps.report.outputs.diagnostic-log }}
 
 runs:
   using: composite
@@ -87,22 +90,48 @@ runs:
         binary="${install_root}/bin/safe-migrate"
         json_report="${INPUT_OUTPUT_DIR}/safe-migrate-report.json"
         markdown_report="${INPUT_OUTPUT_DIR}/safe-migrate-report.md"
+        diagnostic_log="${INPUT_OUTPUT_DIR}/safe-migrate-diagnostics.log"
+        : > "$diagnostic_log"
 
         # Database synchronization is intentionally outside the Action's
         # default path. A separate workflow step can prepare a reviewed cache.
         set +e
-        env -u DATABASE_URL "$binary" "${command[@]}" --json > "$json_report"
+        env -u DATABASE_URL "$binary" "${command[@]}" --json \
+          > "$json_report" 2> >(tee -a "$diagnostic_log" >&2)
         json_status=$?
-        env -u DATABASE_URL "$binary" "${command[@]}" --markdown > "$markdown_report"
+        env -u DATABASE_URL "$binary" "${command[@]}" --markdown \
+          > "$markdown_report" 2> >(tee -a "$diagnostic_log" >&2)
         markdown_status=$?
         set -e
 
+        final_status="$json_status"
         if [ "$json_status" -ne "$markdown_status" ]; then
-          echo "JSON and Markdown runs returned different statuses: ${json_status} and ${markdown_status}" >&2
-          exit 1
+          final_status=1
+          echo "JSON and Markdown runs returned different statuses: ${json_status} and ${markdown_status}" \
+            | tee -a "$diagnostic_log" >&2
+        fi
+
+        if [ "$final_status" -eq 1 ]; then
+          if [ ! -s "$diagnostic_log" ]; then
+            echo "safe-migrate failed without emitting a diagnostic" \
+              | tee -a "$diagnostic_log" >&2
+          fi
+          printf '%s\n' \
+            '{' \
+            '  "artifact_schema_version": 1,' \
+            '  "status": "operational_error",' \
+            '  "exit_code": 1,' \
+            '  "message": "safe-migrate did not produce an analysis report; see safe-migrate-diagnostics.log"' \
+            '}' > "$json_report"
+          printf '%s\n' \
+            '# safe-migrate operational error' \
+            '' \
+            'Analysis did not complete. See `safe-migrate-diagnostics.log` for the underlying error.' \
+            > "$markdown_report"
         fi
 
         echo "json-report=${json_report}" >> "$GITHUB_OUTPUT"
         echo "markdown-report=${markdown_report}" >> "$GITHUB_OUTPUT"
-        echo "exit-code=${json_status}" >> "$GITHUB_OUTPUT"
-        exit "$json_status"
+        echo "diagnostic-log=${diagnostic_log}" >> "$GITHUB_OUTPUT"
+        echo "exit-code=${final_status}" >> "$GITHUB_OUTPUT"
+        exit "$final_status"
