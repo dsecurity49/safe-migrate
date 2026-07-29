@@ -2,7 +2,7 @@ mod common;
 
 mod state_mutation_tests {
     use crate::common::*;
-    use safe_migrate::analysis::graph::DependencyKind;
+    use safe_migrate::analysis::graph::{DependencyEdge, DependencyGraph, DependencyKind};
     use safe_migrate::analysis::state::Confidence;
     use safe_migrate::ast::identifiers::ObjectId;
     use safe_migrate::model::relation::RelationOverlay;
@@ -108,6 +108,26 @@ mod state_mutation_tests {
             .unwrap();
 
         assert!(!state.relation_is_present(&object_id("public", "a")));
+    }
+
+    #[test]
+    fn malformed_partition_ancestry_is_rejected_without_looping() {
+        let a = object_id("public", "a");
+        let b = object_id("public", "b");
+        let child = object_id("public", "new_child");
+        let mut graph = DependencyGraph::new();
+        graph.edges.push(DependencyEdge::new(
+            a.clone(),
+            b.clone(),
+            DependencyKind::PartitionOf,
+        ));
+        graph.edges.push(DependencyEdge::new(
+            b,
+            a.clone(),
+            DependencyKind::PartitionOf,
+        ));
+
+        assert!(graph.check_partition_cycle(&a, &child));
     }
 
     #[test]

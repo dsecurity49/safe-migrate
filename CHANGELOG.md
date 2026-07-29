@@ -51,6 +51,8 @@ All notable changes to safe-migrate are documented here.
 - `chain-conflict` findings now use a statement-agnostic remediation and
   migration-state object label instead of incorrectly describing every
   conflict as a duplicate-column problem.
+- Partition ancestry validation now terminates and rejects new attachments
+  when it encounters an already-cyclic internal dependency graph.
 
 **Documentation:**
 

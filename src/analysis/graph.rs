@@ -150,7 +150,13 @@ impl DependencyGraph {
         }
 
         let mut current_parent = resolved_parent;
+        let mut visited = HashSet::new();
         loop {
+            if !visited.insert(current_parent.clone()) {
+                // The existing ancestry is already malformed. Reject another
+                // attachment instead of looping or extending the cycle.
+                return true;
+            }
             let maybe_edge = self.edges.iter().find(|e| {
                 matches!(e.kind, DependencyKind::PartitionOf)
                     && self.resolve_rename(&e.dependent) == current_parent
