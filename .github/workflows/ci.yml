@@ -29,7 +29,7 @@ jobs:
       - name: Check formatting
         run: cargo fmt -- --check
 
-      - name: Verify installer dry run
+      - name: Verify installer contract
         run: sh scripts/test-install-dry-run
 
       - name: Build (locked)

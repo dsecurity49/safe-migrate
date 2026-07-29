@@ -51,6 +51,10 @@ All notable changes to safe-migrate are documented here.
   redaction workflows.
 - Fixed `install.sh --dry-run` to be a real no-network, no-write plan. CI now
   verifies it without `curl` being available.
+- `install.sh` now requests the published `safe-migrate-<target>.sha256` asset
+  and fails closed when a checksum is unavailable, malformed, or mismatched.
+  The offline installer harness also proves a valid checksum still installs
+  successfully.
 - Added `scripts/live-differential` and a PostgreSQL 16 CI job that executes
   the previously ignored simulator-vs-PostgreSQL differential harness. CI now
   runs the enabled differential manifest on PostgreSQL 14, 15, and 16 and

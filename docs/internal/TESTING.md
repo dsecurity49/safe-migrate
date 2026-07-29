@@ -31,7 +31,9 @@ scripts/fuzz
 ```
 
 The installer test proves a pinned dry run does not need network tooling or
-write its requested destination. The fuzz script generates at least 400 SQL
+write its requested destination. Its offline download mocks also require
+missing, malformed, and mismatched checksums to fail closed while a valid
+checksum installs successfully. The fuzz script generates at least 400 SQL
 migrations, requires every accepted case to produce valid JSON with a matching
 exit status, permits only its named parser rejection, and fails on operational
 errors, crashes, or timeouts.

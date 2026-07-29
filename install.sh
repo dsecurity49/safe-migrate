@@ -161,26 +161,37 @@ download_asset() {
     return 2
   fi
 
-  # Verify checksum if available
-  sha_url="${url}.sha256"
+  # Every published archive must have an adjacent checksum. Never install an
+  # archive whose checksum is unavailable, malformed, or mismatched.
+  sha_url="${url%.tar.gz}.sha256"
   sha_file="${part}.sha256"
-  if curl -fsSL -o "$sha_file" "$sha_url" 2>/dev/null; then
-    expected=$(cut -d' ' -f1 < "$sha_file" 2>/dev/null || true)
-    if [ -n "$expected" ]; then
-      actual=$(sha256_digest "$part" 2>/dev/null || true)
-      if [ "$actual" != "$expected" ]; then
-        rm -f "$part" "$sha_file"
-        log "Checksum mismatch for ${target}. Expected ${expected}, got ${actual}."
-        return 1
-      fi
-      [ "$VERBOSE" -eq 1 ] && log "Checksum verified for ${target}"
-    fi
-    rm -f "$sha_file"
+  if ! curl -fsSL -o "$sha_file" "$sha_url" 2>/dev/null; then
+    rm -f "$part" "$sha_file"
+    printf '%s\n' "integrity-error:${target}:checksum file is unavailable" >&2
+    return 3
   fi
+
+  expected=$(cut -d' ' -f1 < "$sha_file" 2>/dev/null || true)
+  if ! printf '%s\n' "$expected" | grep -Eq '^[[:xdigit:]]{64}$'; then
+    rm -f "$sha_file"
+    rm -f "$part"
+    printf '%s\n' "integrity-error:${target}:checksum file is malformed" >&2
+    return 3
+  fi
+
+  actual=$(sha256_digest "$part")
+  if [ "$actual" != "$expected" ]; then
+    rm -f "$part" "$sha_file"
+    printf '%s\n' "integrity-error:${target}:checksum mismatch" >&2
+    return 3
+  fi
+  rm -f "$sha_file"
+  [ "$VERBOSE" -eq 1 ] && log "Checksum verified for ${target}"
 
   tar -tzf "$part" >/dev/null 2>&1 || {
     rm -f "$part"
-    return 1
+    printf '%s\n' "integrity-error:${target}:archive is invalid" >&2
+    return 3
   }
 
   mv "$part" "$out"
@@ -339,6 +350,7 @@ trap 'rm -rf "$TMP_DIR"' EXIT HUP INT TERM
 TAR_FILE=""
 SELECTED_TARGET=""
 NETWORK_ERROR=""
+INTEGRITY_ERROR=""
 
 for candidate in $CANDIDATES; do
   rc=0
@@ -348,11 +360,20 @@ for candidate in $CANDIDATES; do
     break
   elif [ "$rc" -eq 2 ]; then
     NETWORK_ERROR="$(cat "${TMP_DIR}/dl_err" 2>/dev/null || true)"
+  elif [ "$rc" -eq 3 ]; then
+    INTEGRITY_ERROR="$(cat "${TMP_DIR}/dl_err" 2>/dev/null || true)"
+    break
   fi
 done
 
 if [ -z "$TAR_FILE" ]; then
-  if [ -n "$NETWORK_ERROR" ]; then
+  if [ -n "$INTEGRITY_ERROR" ]; then
+    printf 'Error: release integrity verification failed for %s\n' "$RESOLVED_VERSION" >&2
+    if echo "$INTEGRITY_ERROR" | grep -q '^integrity-error:'; then
+      printf '  Target : %s\n' "$(echo "$INTEGRITY_ERROR" | cut -d: -f2)" >&2
+      printf '  Reason : %s\n' "$(echo "$INTEGRITY_ERROR" | cut -d: -f3-)" >&2
+    fi
+  elif [ -n "$NETWORK_ERROR" ]; then
     printf 'Error: network failure downloading %s\n' "$RESOLVED_VERSION" >&2
     if echo "$NETWORK_ERROR" | grep -q '^network-error:'; then
       printf '  Target : %s\n' "$(echo "$NETWORK_ERROR" | cut -d: -f2)" >&2

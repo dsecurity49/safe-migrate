@@ -29,3 +29,95 @@ if [ -e "$install_dir" ]; then
   printf '%s\n' 'dry run unexpectedly created the requested install directory' >&2
   exit 1
 fi
+
+# Exercise real installer integrity handling without network access.
+archive_root="$test_tmp/archive"
+archive="$test_tmp/safe-migrate-x86_64-unknown-linux-musl.tar.gz"
+mkdir "$archive_root"
+printf '%s\n' '#!/bin/sh' 'printf "mock safe-migrate\n"' > "$archive_root/safe-migrate"
+chmod +x "$archive_root/safe-migrate"
+tar -czf "$archive" -C "$archive_root" safe-migrate
+
+mock_dir="$test_tmp/mock-commands"
+mkdir "$mock_dir"
+for command_name in \
+  uname tar gzip sed head grep mktemp cp chmod mkdir mv rm cut cat find sha256sum
+do
+  ln -s "$(command -v "$command_name")" "$mock_dir/$command_name"
+done
+
+mock_curl="$mock_dir/curl"
+printf '%s\n' \
+  '#!/bin/sh' \
+  'set -eu' \
+  'output=""' \
+  'url=""' \
+  'while [ "$#" -gt 0 ]; do' \
+  '  case "$1" in' \
+  '    -o) output="$2"; shift 2 ;;' \
+  '    -*) shift ;;' \
+  '    *) url="$1"; shift ;;' \
+  '  esac' \
+  'done' \
+  'case "$url" in' \
+  '  *.tar.gz.sha256) exit 22 ;;' \
+  '  *.sha256)' \
+  '    case "$MOCK_CHECKSUM_MODE" in' \
+  '      missing) exit 22 ;;' \
+  '      malformed) printf "not-a-checksum  archive.tar.gz\n" > "$output" ;;' \
+  '      mismatch) printf "%064d  archive.tar.gz\n" 0 > "$output" ;;' \
+  '      valid)' \
+  '        digest=$(sha256sum "$MOCK_ARCHIVE" | cut -d" " -f1)' \
+  '        printf "%s  archive.tar.gz\n" "$digest" > "$output"' \
+  '        ;;' \
+  '      *) exit 2 ;;' \
+  '    esac' \
+  '    ;;' \
+  '  *.tar.gz) cp "$MOCK_ARCHIVE" "$output" ;;' \
+  '  *) exit 22 ;;' \
+  'esac' \
+  > "$mock_curl"
+chmod +x "$mock_curl"
+
+run_mock_install() {
+  checksum_mode="$1"
+  expected_status="$2"
+  case_dir="$test_tmp/$checksum_mode"
+  case_output="$case_dir/output"
+  case_install="$case_dir/install"
+  mkdir "$case_dir"
+
+  set +e
+  PATH="$mock_dir" \
+    MOCK_ARCHIVE="$archive" \
+    MOCK_CHECKSUM_MODE="$checksum_mode" \
+    /bin/sh "$repo_root/install.sh" \
+      --version v0.4.2 \
+      --target x86_64-unknown-linux-musl \
+      --install-dir "$case_install" \
+      >"$case_output" 2>&1
+  status=$?
+  set -e
+
+  if [ "$status" -ne "$expected_status" ]; then
+    printf 'installer case %s returned %s, expected %s\n' \
+      "$checksum_mode" "$status" "$expected_status" >&2
+    sed -n '1,80p' "$case_output" >&2
+    exit 1
+  fi
+
+  case "$checksum_mode" in
+    valid)
+      test -x "$case_install/safe-migrate"
+      ;;
+    *)
+      grep -F 'release integrity verification failed' "$case_output" >/dev/null
+      test ! -e "$case_install/safe-migrate"
+      ;;
+  esac
+}
+
+run_mock_install missing 1
+run_mock_install malformed 1
+run_mock_install mismatch 1
+run_mock_install valid 0
