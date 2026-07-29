@@ -46,7 +46,8 @@ jobs:
 
       - name: Install and run cargo-audit
         run: |
-          cargo install cargo-audit --locked
+          cargo install cargo-audit --version 0.22.2 --locked
+          test "$(cargo-audit --version)" = "cargo-audit 0.22.2"
           cargo audit
 
   live-differential:
