@@ -1,6 +1,10 @@
 # Safe-Migrate Live Tests
 
-This directory contains the exhaustive end-to-end integration test suite for the `safe-migrate` engine. It validates the exact behavior of the AST parser, state machine, and rule evaluators against realistic PostgreSQL migration scripts.
+This directory contains the end-to-end SQL fixture suite for the
+`safe-migrate` engine. The cached fixture runner checks whether each target rule
+is present or absent as expected; it does not execute SQL in PostgreSQL. The
+separate live differential harness compares modeled state with a real
+PostgreSQL database for the fixtures enabled in its manifest.
 
 ## Structure
 
@@ -69,7 +73,7 @@ You can target specific tests or increase verbosity using the following flags:
 
 ## Rules Tested
 
-The suite currently runs exhaustive coverage against all 26 core rules:
+The cached suite has fixture coverage for all 26 primary rule directories:
 
 1. `irreversible-migration`
 2. `drop-database`
