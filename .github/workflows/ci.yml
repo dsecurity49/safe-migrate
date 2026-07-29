@@ -56,10 +56,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        postgres: ["14", "15", "16"]
+        include:
+          - postgres: "14"
+            image: postgres:14@sha256:caf49e3b10d377aa2cfee478591d623808527beb27125d38797b418013f72d81
+          - postgres: "15"
+            image: postgres:15@sha256:74e110c41804365e3915fcc09d5e7a1eff50161aaa94d5da0e58e0cd75ae509c
+          - postgres: "16"
+            image: postgres:16@sha256:33f923b05f64ca54ac4401c01126a6b92afe839a0aa0a52bc5aeb5cc958e5f20
     services:
       postgres:
-        image: postgres:${{ matrix.postgres }}
+        image: ${{ matrix.image }}
         env:
           POSTGRES_DB: safe_migrate
           POSTGRES_USER: safe_migrate
