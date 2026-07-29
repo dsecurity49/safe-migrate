@@ -4,6 +4,7 @@ mod exhaustive_fuzz_tests {
     use crate::common::*;
     use safe_migrate::analysis::state::AnalysisState;
     use safe_migrate::db::cache::DbCache;
+    use safe_migrate::report::violations::ObjectKind;
 
     /// Helper: create a DbCache with a table in the baseline
     fn cache_with_table(schema: &str, name: &str, rows: Option<u64>) -> DbCache {
@@ -484,13 +485,17 @@ mod exhaustive_fuzz_tests {
             )
             .unwrap();
 
-        assert!(
-            violations.iter().any(|violation| {
+        let conflict = violations
+            .iter()
+            .find(|violation| {
                 violation.rule_id == "chain-conflict"
                     && violation.reason.contains("savepoint 's3' does not exist")
-            }),
-            "Releasing a savepoint discarded by ROLLBACK TO must be reported"
-        );
+            })
+            .expect("releasing a savepoint discarded by ROLLBACK TO must be reported");
+        assert_eq!(conflict.object_kind, ObjectKind::Unknown);
+        assert_eq!(conflict.object_name, "<migration-state>");
+        assert!(conflict.recipe.contains("schema state"));
+        assert!(!conflict.recipe.contains("each column"));
         assert!(state.local.transactions.is_empty());
         assert!(!state.local.transaction_aborted);
     }

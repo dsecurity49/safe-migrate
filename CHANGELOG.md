@@ -48,6 +48,9 @@ All notable changes to safe-migrate are documented here.
 - Failed mutations no longer emit `irreversible-migration` findings for
   operations PostgreSQL would not execute, while their Tier 1 conflict finding
   remains visible.
+- `chain-conflict` findings now use a statement-agnostic remediation and
+  migration-state object label instead of incorrectly describing every
+  conflict as a duplicate-column problem.
 
 **Documentation:**
 

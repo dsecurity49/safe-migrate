@@ -329,7 +329,7 @@ The engine currently evaluates these 26 primary rules:
 | `volatile-default` | Volatile column defaults. |
 | `overbroad-grant` | Broad grants such as `PUBLIC` or `ALL PRIVILEGES`. |
 | `schema-drift` | References inconsistent with a supplied database baseline. |
-| `chain-conflict` | Conflicting state changes across `lint-chain` files. |
+| `chain-conflict` | Statements that cannot execute against the simulated state, including conflicts across `lint-chain` files. |
 
 The `blocking-constraint` rule can emit `blocking-index-constraint`, and
 `require-concurrent-index` can emit `require-concurrent-drop-index`. Rewrite
