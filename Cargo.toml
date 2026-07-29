@@ -2,7 +2,7 @@
 name = "safe-migrate"
 version = "0.4.3"
 edition = "2024"
-description = "Lint PostgreSQL migrations against live database statistics to prevent blocking locks"
+description = "Analyze PostgreSQL migrations for schema and locking risks"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/dsecurity49/safe-migrate"
 readme = "README.md"

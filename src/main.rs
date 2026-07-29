@@ -19,7 +19,10 @@ const EXIT_BLOCKING_FINDINGS: i32 = 2;
 #[derive(Parser, Debug)]
 #[command(name = "safe-migrate")]
 #[command(version)]
-#[command(about = "Lint PostgreSQL migrations to prevent blocking locks", long_about = None)]
+#[command(
+    about = "Analyze PostgreSQL migrations for schema and locking risks",
+    long_about = None
+)]
 struct Cli {
     /// Disable colored output
     #[arg(long, global = true)]

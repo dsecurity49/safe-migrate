@@ -27,6 +27,8 @@ All notable changes to safe-migrate are documented here.
   XChaCha20-Poly1305 and the environment-only `SAFE_MIGRATE_CACHE_KEY`.
 - `sync --help` now describes the full schema-metadata and statistics cache
   instead of implying that synchronization stores only table statistics.
+- Package metadata and top-level help now describe schema and locking risk
+  analysis without claiming that the analyzer prevents blocking locks.
 - Schema filters for `sync --schemas` are bound query parameters rather than
   interpolated SQL.
 - Remote sync is rejected by this build; use an SSH tunnel and a localhost or
