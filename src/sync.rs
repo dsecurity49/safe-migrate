@@ -130,54 +130,6 @@ fn write_cache_with_protection(
     Ok(())
 }
 
-#[cfg(test)]
-mod atomic_write_tests {
-    use super::*;
-    use crate::db::cache::DbCacheVersioned;
-    use std::fs;
-
-    #[test]
-    fn production_cache_writer_atomically_replaces_and_decodes() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let cache_path = temp_dir.path().join("baseline.cache");
-        fs::write(&cache_path, b"old-cache").unwrap();
-
-        let mut cache = DbCache::new();
-        cache.pg_version_num = Some(180002);
-        write_cache(&cache_path, cache, false).unwrap();
-
-        let encoded = fs::read(&cache_path).unwrap();
-        assert_ne!(encoded, b"old-cache");
-        let reader = std::io::Cursor::new(encoded);
-        let mut decoder = zstd::stream::Decoder::new(reader).unwrap();
-        let config = bincode::config::standard().with_variable_int_encoding();
-        let versioned: DbCacheVersioned =
-            bincode::serde::decode_from_std_read(&mut decoder, config).unwrap();
-        assert_eq!(versioned.into_cache().unwrap().pg_version_num, Some(180002));
-        assert_eq!(fs::read_dir(temp_dir.path()).unwrap().count(), 1);
-    }
-
-    #[test]
-    fn production_cache_writer_preserves_old_bytes_after_pre_install_failure() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let cache_path = temp_dir.path().join("baseline.cache");
-        fs::write(&cache_path, b"known-good-cache").unwrap();
-
-        let error = write_cache_with_protection(&cache_path, DbCache::new(), |_| {
-            Err(anyhow::anyhow!("injected payload-protection failure"))
-        })
-        .unwrap_err();
-
-        assert!(
-            error
-                .to_string()
-                .contains("injected payload-protection failure")
-        );
-        assert_eq!(fs::read(&cache_path).unwrap(), b"known-good-cache");
-        assert_eq!(fs::read_dir(temp_dir.path()).unwrap().count(), 1);
-    }
-}
-
 #[cfg(not(windows))]
 fn replace_cache(temp_file: NamedTempFile, out_path: &Path) -> Result<()> {
     temp_file
@@ -939,4 +891,52 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
     }
 
     Ok(cache)
+}
+
+#[cfg(test)]
+mod atomic_write_tests {
+    use super::*;
+    use crate::db::cache::DbCacheVersioned;
+    use std::fs;
+
+    #[test]
+    fn production_cache_writer_atomically_replaces_and_decodes() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cache_path = temp_dir.path().join("baseline.cache");
+        fs::write(&cache_path, b"old-cache").unwrap();
+
+        let mut cache = DbCache::new();
+        cache.pg_version_num = Some(180002);
+        write_cache(&cache_path, cache, false).unwrap();
+
+        let encoded = fs::read(&cache_path).unwrap();
+        assert_ne!(encoded, b"old-cache");
+        let reader = std::io::Cursor::new(encoded);
+        let mut decoder = zstd::stream::Decoder::new(reader).unwrap();
+        let config = bincode::config::standard().with_variable_int_encoding();
+        let versioned: DbCacheVersioned =
+            bincode::serde::decode_from_std_read(&mut decoder, config).unwrap();
+        assert_eq!(versioned.into_cache().unwrap().pg_version_num, Some(180002));
+        assert_eq!(fs::read_dir(temp_dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn production_cache_writer_preserves_old_bytes_after_pre_install_failure() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cache_path = temp_dir.path().join("baseline.cache");
+        fs::write(&cache_path, b"known-good-cache").unwrap();
+
+        let error = write_cache_with_protection(&cache_path, DbCache::new(), |_| {
+            Err(anyhow::anyhow!("injected payload-protection failure"))
+        })
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("injected payload-protection failure")
+        );
+        assert_eq!(fs::read(&cache_path).unwrap(), b"known-good-cache");
+        assert_eq!(fs::read_dir(temp_dir.path()).unwrap().count(), 1);
+    }
 }
