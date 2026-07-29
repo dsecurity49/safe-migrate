@@ -485,8 +485,13 @@ fn print_cache_inspection(inspection: &CacheInspection) {
 }
 
 fn load_config(path: &Path) -> Result<Config> {
-    Config::load_from_file(path)
-        .with_context(|| format!("Failed to load configuration: {}", path.display()))
+    let config = Config::load_from_file(path)
+        .with_context(|| format!("Failed to load configuration: {}", path.display()))?;
+    let engine = SafeMigrateEngine::new(config.clone());
+    config
+        .validate_rule_ids(engine.primary_rule_ids())
+        .with_context(|| format!("Failed to validate configuration: {}", path.display()))?;
+    Ok(config)
 }
 
 fn prepare_cache(config: &Config, cache: &Path, no_cache: bool) -> Result<PreparedCache> {

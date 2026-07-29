@@ -1,6 +1,6 @@
 // FILE: src/engine/config.rs
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::Path;
 
@@ -95,6 +95,33 @@ impl Config {
     pub fn sync_schemas<'a>(&'a self, cli_schemas: Option<&'a [String]>) -> Option<&'a [String]> {
         cli_schemas.or(self.schemas.as_deref())
     }
+
+    /// Reject misspelled primary rule IDs instead of silently accepting no-op
+    /// configuration. The engine supplies its canonical IDs so this module
+    /// does not maintain a second rule catalog.
+    pub fn validate_rule_ids<'a>(
+        &self,
+        primary_rule_ids: impl IntoIterator<Item = &'a str>,
+    ) -> Result<(), anyhow::Error> {
+        let valid: BTreeSet<String> = primary_rule_ids.into_iter().map(str::to_owned).collect();
+        let unknown: BTreeSet<&str> = self
+            .rules
+            .keys()
+            .map(String::as_str)
+            .chain(self.disabled_rules.iter().map(String::as_str))
+            .filter(|rule_id| !valid.contains(*rule_id))
+            .collect();
+
+        if unknown.is_empty() {
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!(
+            "Unknown primary rule ID(s): {}. Valid primary rule IDs: {}",
+            unknown.into_iter().collect::<Vec<_>>().join(", "),
+            valid.into_iter().collect::<Vec<_>>().join(", ")
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -152,5 +179,35 @@ mod tests {
             config.sync_schemas(Some(&cli_schemas)),
             Some(["auth".to_string()].as_slice())
         );
+    }
+
+    #[test]
+    fn rule_id_validation_rejects_unknown_rule_keys_and_disabled_ids() {
+        let mut config = Config::default();
+        config
+            .rules
+            .insert("typo-rule".to_string(), RuleConfig::default());
+        config.disabled_rules = vec!["known-rule".to_string(), "other-typo".to_string()];
+
+        let error = config
+            .validate_rule_ids(["known-rule"])
+            .expect_err("unknown rule IDs must fail validation")
+            .to_string();
+
+        assert!(error.contains("other-typo, typo-rule"));
+        assert!(error.contains("Valid primary rule IDs: known-rule"));
+    }
+
+    #[test]
+    fn rule_id_validation_accepts_known_rule_keys_and_disabled_ids() {
+        let mut config = Config::default();
+        config
+            .rules
+            .insert("known-rule".to_string(), RuleConfig::default());
+        config.disabled_rules = vec!["known-rule".to_string()];
+
+        config
+            .validate_rule_ids(["known-rule"])
+            .expect("known rule IDs must pass validation");
     }
 }

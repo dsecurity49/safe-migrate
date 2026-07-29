@@ -45,6 +45,28 @@ fn test_cli_help() {
 }
 
 #[test]
+fn test_cli_rejects_unknown_configured_rule_id() {
+    let mut sql_file = tempfile::NamedTempFile::new().unwrap();
+    writeln!(sql_file, "SELECT 1;").unwrap();
+    let mut config_file = tempfile::NamedTempFile::new().unwrap();
+    writeln!(config_file, "[rules.concurent-index]\ndisabled = true").unwrap();
+
+    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let assert = cmd
+        .arg("lint")
+        .arg("--file")
+        .arg(sql_file.path())
+        .arg("--config")
+        .arg(config_file.path())
+        .arg("--no-cache")
+        .assert()
+        .code(1);
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(stderr.contains("Unknown primary rule ID(s): concurent-index"));
+    assert!(stderr.contains("require-concurrent-index"));
+}
+
+#[test]
 fn test_cli_lint_nonexistent_file() {
     let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
     cmd.arg("lint").arg("--file").arg("nonexistent_file.sql");
