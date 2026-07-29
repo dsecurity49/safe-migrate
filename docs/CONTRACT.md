@@ -130,10 +130,17 @@ Human, JSON, and Markdown modes must use the same exit-status policy.
 evidence available to it. They are not guarantees about production runtime,
 lock wait duration, application compatibility, or data backfills.
 
-- `Exact`: no unsupported, unresolved, or contradictory state transition was
-  encountered relative to the supplied baseline.
+- `Exact`: every state transition was either applied, skipped, or rejected with
+  a deterministic outcome relative to the supplied baseline.
 - `Tainted`: at least one transition or reference could not be resolved
   confidently.
+
+An execution conflict that PostgreSQL would deterministically reject—such as
+dropping a missing column or dropping a referenced table without `CASCADE`—is
+reported as a Tier 1 `chain-conflict`, leaves simulated state unchanged, and
+does not taint confidence by itself. This applies to both `lint` and
+`lint-chain`; “chain” describes retained migration state, not a restriction to
+the multi-file command.
 
 Analysis without a database cache is reported as `Tainted`, because existing
 production schema and dependency state are unknown. Rule evaluation retains
