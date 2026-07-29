@@ -43,7 +43,7 @@ Use the script's selectors when diagnosing one case:
 
 ```bash
 scripts/live-differential --rule rule_25_schema-drift
-scripts/live-differential --fixture rule_25_schema-drift/001_drop_missing_table.sql
+scripts/live-differential --fixture rule_25_schema-drift/safe_002_create_table.sql
 ```
 
 The harness resets only its `sm_*` schemas and named fixture objects, but it
