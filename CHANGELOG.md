@@ -106,7 +106,9 @@ Internal correctness and infrastructure release. Upgraded squawk-parser 2.58.0 â
 
 - `tests/live_differential_harness.rs`: compares simulator `MutationResult` against PostgreSQL's actual dry-run outcome
 - `live_tests/` expanded with `differential_manifest.json`, `differential_baseline.sql`, and `scripts/live-differential` runner
-- Covers all 26 rules with per-rule scope/schema configuration; 0 mismatches in cached mode
+- Defines per-rule scope/schema configuration for all 26 rule directories. The
+  PostgreSQL comparison remains an opt-in live test that requires
+  `DATABASE_URL`; cached fixture success is not live-equivalence evidence.
 
 **Bug fixes:**
 
