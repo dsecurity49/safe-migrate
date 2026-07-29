@@ -25,6 +25,8 @@ All notable changes to safe-migrate are documented here.
   `stale_stats_days` now evaluates that recorded creation time.
 - `cache_encryption = true` encrypts newly synced cache files using
   XChaCha20-Poly1305 and the environment-only `SAFE_MIGRATE_CACHE_KEY`.
+- `sync --help` now describes the full schema-metadata and statistics cache
+  instead of implying that synchronization stores only table statistics.
 - Schema filters for `sync --schemas` are bound query parameters rather than
   interpolated SQL.
 - Remote sync is rejected by this build; use an SSH tunnel and a localhost or

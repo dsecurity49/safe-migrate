@@ -85,7 +85,7 @@ enum Commands {
         #[arg(short, long, conflicts_with_all = ["json", "markdown"])]
         interactive: bool,
     },
-    /// Sync database table statistics for accurate lock evaluation
+    /// Sync PostgreSQL schema metadata and statistics into a local cache
     Sync {
         #[arg(long, default_value = ".safe-migrate.cache")]
         out: PathBuf,
