@@ -29,8 +29,9 @@ All notable changes to safe-migrate are documented here.
   instead of implying that synchronization stores only table statistics.
 - Package metadata and top-level help now describe schema and locking risk
   analysis without claiming that the analyzer prevents blocking locks.
-- Unknown primary rule IDs in `[rules.*]` or `disabled_rules` now fail
-  configuration validation instead of silently becoming no-op settings.
+- Unknown top-level/per-rule setting names and unknown primary rule IDs in
+  `[rules.*]` or `disabled_rules` now fail configuration validation instead of
+  silently becoming no-op settings.
 - Schema filters for `sync --schemas` are bound query parameters rather than
   interpolated SQL.
 - Remote sync is rejected by this build; use an SSH tunnel and a localhost or

@@ -5,6 +5,7 @@ use std::fs;
 use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct RuleConfig {
     pub disabled: Option<bool>,
     pub tier1_threshold_rows: Option<u64>,
@@ -12,7 +13,7 @@ pub struct RuleConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)] // Allows missing keys in TOML to fall back to Default::default()
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub tier1_threshold_rows: u64,
     pub tier2_threshold_rows: u64,
@@ -209,5 +210,26 @@ mod tests {
         config
             .validate_rule_ids(["known-rule"])
             .expect("known rule IDs must pass validation");
+    }
+
+    #[test]
+    fn config_rejects_unknown_top_level_setting() {
+        let error = toml::from_str::<Config>("auto_syn = true")
+            .expect_err("unknown top-level settings must fail")
+            .to_string();
+
+        assert!(error.contains("unknown field `auto_syn`"));
+        assert!(error.contains("auto_sync"));
+    }
+
+    #[test]
+    fn config_rejects_unknown_per_rule_setting() {
+        let error =
+            toml::from_str::<Config>("[rules.blocking-constraint]\ntier1_threshold_row = 1")
+                .expect_err("unknown per-rule settings must fail")
+                .to_string();
+
+        assert!(error.contains("unknown field `tier1_threshold_row`"));
+        assert!(error.contains("tier1_threshold_rows"));
     }
 }

@@ -67,6 +67,28 @@ fn test_cli_rejects_unknown_configured_rule_id() {
 }
 
 #[test]
+fn test_cli_rejects_unknown_configuration_setting() {
+    let mut sql_file = tempfile::NamedTempFile::new().unwrap();
+    writeln!(sql_file, "SELECT 1;").unwrap();
+    let mut config_file = tempfile::NamedTempFile::new().unwrap();
+    writeln!(config_file, "auto_syn = true").unwrap();
+
+    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let assert = cmd
+        .arg("lint")
+        .arg("--file")
+        .arg(sql_file.path())
+        .arg("--config")
+        .arg(config_file.path())
+        .arg("--no-cache")
+        .assert()
+        .code(1);
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(stderr.contains("unknown field `auto_syn`"));
+    assert!(stderr.contains("auto_sync"));
+}
+
+#[test]
 fn test_cli_lint_nonexistent_file() {
     let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
     cmd.arg("lint").arg("--file").arg("nonexistent_file.sql");

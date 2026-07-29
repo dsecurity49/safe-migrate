@@ -190,8 +190,8 @@ Rule entries support `disabled`, `tier1_threshold_rows`, and
 `tier2_threshold_rows`. Global `disabled_rules = ["rule-id"]` is also
 supported. A rule’s documented primary ID is the ID used for disabling it;
 some rules emit more specific finding IDs as noted in the rule catalog.
-Unknown primary rule IDs in either configuration form are rejected instead of
-being silently ignored.
+Unknown primary rule IDs and unknown top-level or per-rule setting names are
+rejected instead of being silently ignored.
 
 ### Configuration reference
 
