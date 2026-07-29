@@ -184,7 +184,10 @@ Major correctness release. 16 bugs fixed across the rule engine, state machine, 
 - `install.sh`: Added SHA256 checksum download and verification step for release artifacts.
 - Release workflow: Added `checksum: sha256` to release artifact generation. Removed `aarch64-pc-windows-msvc` target (no native GitHub Actions runner available).
 - CI workflow: Added `--locked` to all `cargo` commands. Added `cargo audit` step for dependency vulnerability scanning.
-- `safe-migrate sync`: Added runtime warning when `DATABASE_URL` points to a non-localhost host — the connection is unencrypted by default. Use `sslmode=require` or SSH tunnel for production databases.
+- `safe-migrate sync`: Added a runtime warning for non-localhost targets. The
+  original `sslmode=require` advice was not enforceable by the `NoTls` client;
+  v0.4.3 supersedes it by rejecting direct remote targets and requiring a local
+  Unix socket or SSH tunnel.
 - Consolidated duplicate `rowan` dependency: direct dependency downgraded from `0.16.1` to `0.15.18` to match squawk's transitive version.
 
 **Output redesign:**
