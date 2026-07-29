@@ -244,7 +244,7 @@ safe-migrate sync [--out .safe-migrate.cache] [--config safe-migrate.toml] [--sc
 
 # Inspect cache provenance and a redacted contents summary without connecting
 # to PostgreSQL.
-safe-migrate cache inspect [--cache .safe-migrate.cache] [--json]
+safe-migrate cache inspect [--cache .safe-migrate.cache] [--config safe-migrate.toml] [--json]
 ```
 
 `--interactive` is available for human exploration and cannot be combined with
