@@ -63,8 +63,9 @@ All notable changes to safe-migrate are documented here.
 
 - Expanded installation, configuration, cache, CI, contract, and maintainer
   documentation. Release-binary instructions now include platform asset names
-  and checksum verification. The documented installer is now the primary path;
-  it also falls back to macOS `shasum` when `sha256sum` is unavailable.
+  and checksum verification. Cargo is the primary path for Rust users; the
+  installer is the primary no-Rust path and falls back to macOS `shasum` when
+  `sha256sum` is unavailable.
 - Removed the stale Squawk 2.58.0 AST reference snapshot. AST contributors now
   verify behavior against the exact pinned Squawk source and executable tests.
 - Added a documentation index, a v0.4.3 CLI/report contract, and focused
