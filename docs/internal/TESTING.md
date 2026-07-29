@@ -20,6 +20,22 @@ cargo test expression_parsing
 cargo test --test cli_tests
 ```
 
+## Repository script gates
+
+Run the installer contract and generated migration corpus from the repository
+root:
+
+```bash
+sh scripts/test-install-dry-run
+scripts/fuzz
+```
+
+The installer test proves a pinned dry run does not need network tooling or
+write its requested destination. The fuzz script generates at least 400 SQL
+migrations, requires every accepted case to produce valid JSON with a matching
+exit status, permits only its named parser rejection, and fails on operational
+errors, crashes, or timeouts.
+
 ## Fixture suites
 
 `live_tests/run.sh` checks SQL fixtures through the compiled CLI. Run one rule
@@ -38,6 +54,22 @@ needs a disposable local database exposed through `DATABASE_URL`:
 DATABASE_URL='postgres://safe_migrate:safe_migrate@localhost:5432/safe_migrate' \
   scripts/live-differential
 ```
+
+The same disposable database is required by the dedicated automatic-sync and
+encrypted-cache contracts:
+
+```bash
+DATABASE_URL='postgres://safe_migrate:safe_migrate@localhost:5432/safe_migrate' \
+  scripts/live-auto-sync
+DATABASE_URL='postgres://safe_migrate:safe_migrate@localhost:5432/safe_migrate' \
+  scripts/live-cache-encryption
+```
+
+`scripts/live-auto-sync` exercises successful refresh, cache creation, and an
+`Exact` available baseline for both `lint` and `lint-chain`.
+`scripts/live-cache-encryption` exercises encrypted sync, inspect, `lint`,
+configured automatic sync, and `lint-chain`, plus rejection when encryption is
+disabled or the key is missing or incorrect.
 
 Use the script's selectors when diagnosing one case:
 
