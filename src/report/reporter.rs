@@ -31,7 +31,7 @@ impl Verdict {
             Verdict::Halt => "do not deploy",
             Verdict::Cautious => "review warnings before deploy",
             Verdict::SafeWithRisk => "irreversible operations present — ensure backups exist",
-            Verdict::Safe => "safe to deploy",
+            Verdict::Safe => "no modeled blocking findings",
         }
     }
 }

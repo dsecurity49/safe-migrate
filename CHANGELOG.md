@@ -30,6 +30,8 @@ All notable changes to safe-migrate are documented here.
   table statistics.
 - Package metadata and top-level help now describe schema and locking risk
   analysis without claiming that the analyzer prevents blocking locks.
+- A clean `Exact` report now recommends “no modeled blocking findings” rather
+  than claiming the migration is “safe to deploy.”
 - Unknown top-level/per-rule setting names and unknown primary rule IDs in
   `[rules.*]` or `disabled_rules` now fail configuration validation instead of
   silently becoming no-op settings.

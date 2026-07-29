@@ -130,6 +130,13 @@ mod tests {
     }
 
     #[test]
+    fn test_exact_safe_verdict_does_not_guarantee_deployment() {
+        let recommendation = Verdict::Safe.recommendation(&Confidence::Exact);
+        assert_eq!(recommendation, "no modeled blocking findings");
+        assert!(!recommendation.contains("safe to deploy"));
+    }
+
+    #[test]
     fn test_no_color_toggling() {
         unsafe {
             std::env::set_var("NO_COLOR", "1");
