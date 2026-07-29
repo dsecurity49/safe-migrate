@@ -25,8 +25,9 @@ All notable changes to safe-migrate are documented here.
   `stale_stats_days` now evaluates that recorded creation time.
 - `cache_encryption = true` encrypts newly synced cache files using
   XChaCha20-Poly1305 and the environment-only `SAFE_MIGRATE_CACHE_KEY`.
-- `sync --help` now describes the full schema-metadata and statistics cache
-  instead of implying that synchronization stores only table statistics.
+- `sync` help, progress, and error text now describe the full schema-metadata
+  and statistics cache instead of implying that synchronization stores only
+  table statistics.
 - Package metadata and top-level help now describe schema and locking risk
   analysis without claiming that the analyzer prevents blocking locks.
 - Unknown top-level/per-rule setting names and unknown primary rule IDs in

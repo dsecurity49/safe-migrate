@@ -43,6 +43,10 @@ fn live_encrypted_cache_round_trip_and_rejection_contract() {
         .output()
         .expect("run encrypted sync");
     assert_success(&sync_output, "encrypted sync");
+    assert!(
+        String::from_utf8_lossy(&sync_output.stdout)
+            .contains("Syncing PostgreSQL schema metadata and statistics")
+    );
     assert!(!String::from_utf8_lossy(&sync_output.stdout).contains(TEST_KEY));
     assert!(!String::from_utf8_lossy(&sync_output.stderr).contains(TEST_KEY));
 

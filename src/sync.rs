@@ -22,7 +22,7 @@ pub fn sync_cache(
 ) -> Result<()> {
     // Strict env-only credential enforcement
     let db_url = std::env::var("DATABASE_URL")
-        .context("DATABASE_URL environment variable is required to sync database stats. Do not pass credentials via CLI flags or config files.")?;
+        .context("DATABASE_URL environment variable is required to sync PostgreSQL schema metadata and statistics. Do not pass credentials via CLI flags or config files.")?;
 
     let mut client = connect_database(&db_url)?;
 

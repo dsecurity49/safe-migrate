@@ -351,7 +351,7 @@ fn run_sync(out: &Path, config_path: &Path, schemas: Option<&[String]>) -> Resul
     let config = load_config(config_path)?;
     let schemas = config.sync_schemas(schemas);
 
-    println!("Syncing database stats...");
+    println!("Syncing PostgreSQL schema metadata and statistics...");
     if let Some(schemas) = schemas {
         println!("Filtering to schemas: {}", schemas.join(", "));
     }

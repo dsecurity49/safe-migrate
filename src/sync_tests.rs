@@ -22,7 +22,12 @@ mod tests {
         }
 
         let result = sync_cache(path, None, false);
-        assert!(result.is_err());
+        let error = result.expect_err("sync without DATABASE_URL must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("sync PostgreSQL schema metadata and statistics")
+        );
     }
 
     #[test]
