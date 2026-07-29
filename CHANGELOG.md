@@ -54,6 +54,11 @@ All notable changes to safe-migrate are documented here.
 - Partition ancestry validation now terminates and rejects new attachments
   when it encounters an already-cyclic internal dependency graph.
 
+**Maintenance:**
+
+- Replaced the unmaintained `bincode` crate with the wire-compatible
+  `bincode-next` 2.1 line. Existing versioned cache payloads remain readable.
+
 **Documentation:**
 
 - Expanded installation, configuration, cache, CI, contract, and maintainer
