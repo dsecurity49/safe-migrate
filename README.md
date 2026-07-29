@@ -362,14 +362,15 @@ and treat the resulting `Tainted` confidence as a review requirement.
 
 ### Reusable GitHub Action
 
-The pinned Action produces deterministic JSON and Markdown artifacts for one
-migration or an ordered migration directory. It does not synchronize a database
-or use `DATABASE_URL`; prepare a reviewed cache in a separate, explicit step if
-your workflow needs database-aware findings.
+Starting with v0.4.3, the pinned Action produces deterministic JSON and Markdown
+artifacts for one migration or an ordered migration directory. It is not
+available in v0.4.2. The Action does not synchronize a database or use
+`DATABASE_URL`; prepare a reviewed cache in a separate, explicit step if your
+workflow needs database-aware findings.
 
 ```yaml
 - id: safe_migrate
-  uses: dsecurity49/safe-migrate@v0.4.2
+  uses: dsecurity49/safe-migrate@v0.4.3
   with:
     mode: lint-chain
     path: migrations
