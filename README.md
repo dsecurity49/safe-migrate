@@ -384,9 +384,10 @@ workflow needs database-aware findings.
     path: safe-migrate-artifacts/
 ```
 
-The Action exposes `json-report`, `markdown-report`, and `exit-code` outputs.
-It preserves exit code `2` for blocking findings, so use `if: always()` for
-artifact upload and let the job fail when the migration must be blocked.
+The Action exposes `json-report`, `markdown-report`, `diagnostic-log`, and
+`exit-code` outputs. It preserves exit code `2` for blocking findings, so use
+`if: always()` for artifact upload and let the job fail when the migration must
+be blocked. On exit `1`, inspect `diagnostic-log` for the operational failure.
 
 ## Development
 
