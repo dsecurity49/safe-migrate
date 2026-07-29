@@ -369,7 +369,7 @@ your workflow needs database-aware findings.
 
 ```yaml
 - id: safe_migrate
-  uses: dsecurity49/safe-migrate@v0.4.3
+  uses: dsecurity49/safe-migrate@v0.4.2
   with:
     mode: lint-chain
     path: migrations
