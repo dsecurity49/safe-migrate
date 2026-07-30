@@ -1054,6 +1054,10 @@ fn snapshot_live_state(
               AND vn.nspname = ANY($1)
               AND tn.nspname = ANY($1)
               AND d.deptype = 'n'
+              -- PostgreSQL 14/15 expose an internal rewrite-rule self-edge
+              -- here. It is not a view-to-relation dependency that the
+              -- simulator should model.
+              AND tc.oid <> vc.oid
             ",
             &[&schema_names],
         )? {
