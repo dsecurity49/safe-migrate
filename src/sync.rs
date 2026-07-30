@@ -1,7 +1,7 @@
 // FILE: src/sync.rs
 
 use crate::ast::identifiers::ObjectId;
-use crate::db::cache::{DbCache, ForeignKeyCache, IndexCache};
+use crate::db::cache::{CACHE_V3_MAGIC, DbCache, DbCacheVersioned, ForeignKeyCache, IndexCache};
 use crate::db::cache_file::protect_cache_bytes;
 use crate::model::relation::{Persistence, RelationKind, RelationState};
 use anyhow::{Context, Result};
@@ -109,11 +109,15 @@ fn write_cache_with_protection(
     let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3)
         .context("Failed to init zstd compression")?;
 
-    let versioned = crate::db::cache::DbCacheVersioned::V6(cache);
+    encoder
+        .write_all(CACHE_V3_MAGIC)
+        .context("Failed to write cache V3 payload header")?;
+
+    let versioned = DbCacheVersioned::V3(cache);
     let bincode_config = bincode::config::standard().with_variable_int_encoding();
 
     bincode::serde::encode_into_std_write(&versioned, &mut encoder, bincode_config)
-        .context("Failed binary bincode 2.0 schema compilation and write")?;
+        .context("Failed bincode schema compilation and write")?;
 
     encoder
         .finish()
@@ -898,6 +902,7 @@ mod atomic_write_tests {
     use super::*;
     use crate::db::cache::DbCacheVersioned;
     use std::fs;
+    use std::io::Read;
 
     #[test]
     fn production_cache_writer_atomically_replaces_and_decodes() {
@@ -913,9 +918,15 @@ mod atomic_write_tests {
         assert_ne!(encoded, b"old-cache");
         let reader = std::io::Cursor::new(encoded);
         let mut decoder = zstd::stream::Decoder::new(reader).unwrap();
+        let mut payload = Vec::new();
+        decoder.read_to_end(&mut payload).unwrap();
+        let payload = payload
+            .strip_prefix(CACHE_V3_MAGIC)
+            .expect("writer must prefix V3 cache payloads");
         let config = bincode::config::standard().with_variable_int_encoding();
-        let versioned: DbCacheVersioned =
-            bincode::serde::decode_from_std_read(&mut decoder, config).unwrap();
+        let versioned: DbCacheVersioned = bincode::serde::decode_from_slice(payload, config)
+            .unwrap()
+            .0;
         assert_eq!(versioned.into_cache().unwrap().pg_version_num, Some(180002));
         assert_eq!(fs::read_dir(temp_dir.path()).unwrap().count(), 1);
     }

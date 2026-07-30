@@ -2,30 +2,42 @@ use std::fs;
 use std::io::Write;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use safe_migrate::db::cache::{DbCache, DbCacheVersioned};
+use safe_migrate::db::cache::{CACHE_V3_MAGIC, DbCache, DbCacheV2, DbCacheVersioned};
+use std::io::Read;
 
 fn parse_json_stdout(output: &std::process::Output) -> serde_json::Value {
     serde_json::from_slice(&output.stdout).expect("stdout must contain exactly one JSON document")
 }
 
 fn write_fresh_cache(path: &std::path::Path) {
-    let encoded = fs::read("live_tests/.safe-migrate.cache").unwrap();
-    let reader = std::io::Cursor::new(encoded);
-    let mut decoder = zstd::stream::Decoder::new(reader).unwrap();
-    let config = bincode::config::standard().with_variable_int_encoding();
-    let versioned: DbCacheVersioned =
-        bincode::serde::decode_from_std_read(&mut decoder, config).unwrap();
-    let mut cache = versioned.into_cache().unwrap();
-    cache.metadata.created_at_unix_secs = Some(
+    write_cache_with_timestamp(
+        path,
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs(),
     );
+}
+
+fn write_cache_with_timestamp(path: &std::path::Path, created_at_unix_secs: u64) {
+    let encoded = fs::read("live_tests/.safe-migrate.cache").unwrap();
+    let reader = std::io::Cursor::new(encoded);
+    let mut decoder = zstd::stream::Decoder::new(reader).unwrap();
+    let mut payload = Vec::new();
+    decoder.read_to_end(&mut payload).unwrap();
+
+    let config = bincode::config::standard().with_variable_int_encoding();
+    let cache_payload = payload.strip_prefix(CACHE_V3_MAGIC).unwrap_or(&payload);
+    let versioned: DbCacheVersioned = bincode::serde::decode_from_slice(cache_payload, config)
+        .unwrap()
+        .0;
+    let mut cache = versioned.into_cache().unwrap();
+    cache.metadata.created_at_unix_secs = Some(created_at_unix_secs);
     let mut compressed = Vec::new();
     let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3).unwrap();
     let config = bincode::config::standard().with_variable_int_encoding();
-    bincode::serde::encode_into_std_write(DbCacheVersioned::V6(cache), &mut encoder, config)
+    encoder.write_all(CACHE_V3_MAGIC).unwrap();
+    bincode::serde::encode_into_std_write(DbCacheVersioned::V3(cache), &mut encoder, config)
         .unwrap();
     encoder.finish().unwrap();
     fs::write(path, compressed).unwrap();
@@ -116,8 +128,8 @@ fn test_cli_lint_invalid_cache() {
 fn test_cli_rejects_cache_with_oversized_decoded_container() {
     let config = bincode::config::standard().with_variable_int_encoding();
     let encoded =
-        bincode::serde::encode_to_vec(DbCacheVersioned::V6(DbCache::new()), config).unwrap();
-    assert_eq!(&encoded[..4], &[5, 0, 0, 0]);
+        bincode::serde::encode_to_vec(DbCacheVersioned::V3(DbCache::new()), config).unwrap();
+    assert_eq!(&encoded[..4], &[2, 0, 0, 0]);
 
     let mut malicious = encoded[..3].to_vec();
     malicious.push(1);
@@ -126,6 +138,7 @@ fn test_cli_rejects_cache_with_oversized_decoded_container() {
 
     let mut compressed = Vec::new();
     let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3).unwrap();
+    encoder.write_all(CACHE_V3_MAGIC).unwrap();
     encoder.write_all(&malicious).unwrap();
     encoder.finish().unwrap();
 
@@ -144,6 +157,78 @@ fn test_cli_rejects_cache_with_oversized_decoded_container() {
         stderr.contains("exceeds the 256 MiB decoded-size limit"),
         "unexpected stderr: {stderr}"
     );
+}
+
+#[test]
+fn test_cache_inspect_reads_legacy_v2_cache() {
+    let legacy = DbCacheV2 {
+        pg_version_num: Some(160000),
+        relations: Default::default(),
+        foreign_keys: Vec::new(),
+        indexes: Vec::new(),
+        triggers: Vec::new(),
+        functions: Default::default(),
+        dependencies: Vec::new(),
+    };
+    let config = bincode::config::standard().with_variable_int_encoding();
+    let payload = bincode::serde::encode_to_vec(DbCacheVersioned::V2(legacy), config).unwrap();
+    let mut compressed = Vec::new();
+    let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3).unwrap();
+    encoder.write_all(&payload).unwrap();
+    encoder.finish().unwrap();
+
+    let cache = tempfile::NamedTempFile::new().unwrap();
+    fs::write(cache.path(), compressed).unwrap();
+
+    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let assert = cmd
+        .arg("cache")
+        .arg("inspect")
+        .arg("--cache")
+        .arg(cache.path())
+        .arg("--json")
+        .assert()
+        .success();
+    assert_eq!(parse_json_stdout(assert.get_output())["format_version"], 2);
+}
+
+#[test]
+fn test_cache_inspect_reads_frozen_legacy_v1_cache() {
+    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let assert = cmd
+        .arg("cache")
+        .arg("inspect")
+        .arg("--cache")
+        .arg("live_tests/.safe-migrate.cache")
+        .arg("--json")
+        .assert()
+        .success();
+    assert_eq!(parse_json_stdout(assert.get_output())["format_version"], 1);
+}
+
+#[test]
+fn test_cache_inspect_rejects_released_v5_cache_and_requires_sync() {
+    // V5 was historical enum tag 4 under the variable-integer bincode
+    // configuration. The reader must reject it before deserializing it.
+    let mut compressed = Vec::new();
+    let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3).unwrap();
+    encoder.write_all(&[4, 0, 0, 0]).unwrap();
+    encoder.finish().unwrap();
+
+    let cache = tempfile::NamedTempFile::new().unwrap();
+    fs::write(cache.path(), compressed).unwrap();
+
+    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let assert = cmd
+        .arg("cache")
+        .arg("inspect")
+        .arg("--cache")
+        .arg(cache.path())
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(stderr.contains("unsupported legacy format V5"));
+    assert!(stderr.contains("safe-migrate sync"));
 }
 
 #[test]
@@ -173,7 +258,7 @@ fn test_cache_inspect_outputs_a_redacted_json_summary() {
     let report = parse_json_stdout(assert.get_output());
 
     assert_eq!(report["path"], cache_path.display().to_string());
-    assert_eq!(report["format_version"], 6);
+    assert_eq!(report["format_version"], 3);
     assert_eq!(report["encrypted"], false);
     assert!(report["contents"]["relations"].is_number());
     assert!(report["contents"]["columns"].is_number());
@@ -314,7 +399,7 @@ fn test_cli_auto_sync_failure_continues_without_a_cache() {
 fn test_cli_auto_sync_failure_uses_the_previous_cache() {
     let cache_dir = tempfile::tempdir().unwrap();
     let cache_path = cache_dir.path().join("baseline.cache");
-    fs::copy("live_tests/.safe-migrate.cache", &cache_path).unwrap();
+    write_cache_with_timestamp(&cache_path, 0);
 
     let mut config_file = tempfile::NamedTempFile::new().unwrap();
     writeln!(config_file, "auto_sync = true").unwrap();

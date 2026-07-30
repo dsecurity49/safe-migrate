@@ -23,8 +23,19 @@ All notable changes to safe-migrate are documented here.
 - Cache provenance (creation time, source database, and selected schemas) is
   stored in new cache files and exposed in the additive JSON `baseline` object.
   `stale_stats_days` now evaluates that recorded creation time.
+- Cache storage has been reset to an explicitly headered V3 format. Legacy V1
+  and V2 caches remain readable; unheadered V3–V6 caches, including v0.4.2's
+  V5 cache, now fail closed and require `safe-migrate sync`.
 - `cache_encryption = true` encrypts newly synced cache files using
   XChaCha20-Poly1305 and the environment-only `SAFE_MIGRATE_CACHE_KEY`.
+- Encryption-enabled runs now reject plaintext cache files rather than silently
+  accepting a protection downgrade.
+- A schema-scoped cache now reports references outside its scope as Tier 2
+  coverage uncertainty instead of asserting Tier 1 production drift.
+- Parsed SQL without a typed extractor now produces an opaque Tier 2 finding
+  and taints later confidence; it is no longer silently ignored.
+- The reusable Action now defaults to `no-cache: "true"`; callers must
+  explicitly opt in to reading a reviewed cache.
 - `sync` help, progress, and error text now describe the full schema-metadata
   and statistics cache instead of implying that synchronization stores only
   table statistics.

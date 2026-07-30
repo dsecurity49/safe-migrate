@@ -186,7 +186,7 @@ impl Reporter {
             if let Some(sql) = &violation.sql
                 && !sql.trim().is_empty()
             {
-                output.push_str(&format!("\n```sql\n{}\n```\n", sql.trim()));
+                output.push_str(&markdown_sql_block(sql.trim()));
             }
         }
         output
@@ -369,4 +369,14 @@ fn markdown_escape(value: &str) -> String {
 
 fn markdown_code(value: &str) -> String {
     value.replace('`', "'")
+}
+
+fn markdown_sql_block(sql: &str) -> String {
+    let longest_backtick_run = sql
+        .split(|character| character != '`')
+        .map(str::len)
+        .max()
+        .unwrap_or(0);
+    let fence = "`".repeat(longest_backtick_run.max(2) + 1);
+    format!("\n{fence}sql\n{sql}\n{fence}\n")
 }

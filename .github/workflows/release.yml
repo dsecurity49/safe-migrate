@@ -50,6 +50,13 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Verify release tag matches Cargo package version
+        shell: bash
+        run: |
+          package_version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          test -n "$package_version"
+          test "$GITHUB_REF_NAME" = "v$package_version"
+
       - name: Build and package binary
         id: package
         uses: taiki-e/upload-rust-binary-action@f0d45ae91ee7b8ee928de7a9d04d893a08bcbec6 # v1.30.2

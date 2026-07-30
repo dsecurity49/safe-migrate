@@ -81,6 +81,10 @@ pub struct AnalysisState {
     /// cache can be a valid baseline for an empty database, so availability
     /// must not be inferred from the number of modeled objects.
     pub baseline_available: bool,
+    /// `None` means the cache covered all non-system schemas. A populated set
+    /// records an explicitly scoped sync, for which objects outside the set
+    /// are unknown rather than known absent.
+    pub baseline_schemas: Option<HashSet<String>>,
     pub baseline_relations: HashSet<ObjectId>,
     pub baseline_indexes: HashSet<ObjectId>,
     pub baseline_foreign_keys: HashSet<(ObjectId, String)>,
@@ -89,12 +93,24 @@ pub struct AnalysisState {
 }
 
 impl AnalysisState {
+    fn trigger_key(table_id: &ObjectId, name: &str) -> ObjectId {
+        // PostgreSQL identifiers cannot contain NUL, so this is an unambiguous
+        // internal composite key while keeping the public cache representation
+        // as the trigger's actual name.
+        ObjectId::new(&table_id.schema, format!("{}\0{name}", table_id.name))
+    }
+
     pub fn new(cache: DbCache) -> Self {
         Self::with_baseline(cache, true)
     }
 
     pub fn with_baseline(cache: DbCache, baseline_available: bool) -> Self {
         let default_search_path = cache.search_path.clone();
+        let baseline_schemas = cache
+            .metadata
+            .schemas
+            .as_ref()
+            .map(|schemas| schemas.iter().cloned().collect());
         let mut relations: HashMap<ObjectId, RelationOverlay> = HashMap::new();
         let mut baseline_relations = HashSet::new();
         let mut baseline_indexes = HashSet::new();
@@ -188,20 +204,22 @@ impl AnalysisState {
         }
 
         for t in cache.triggers {
+            let trigger_key = Self::trigger_key(&t.table_id, &t.trigger_id.name);
             triggers.insert(
-                t.trigger_id.clone(),
+                trigger_key.clone(),
                 TriggerOverlay::Present(crate::model::trigger::TriggerState {
-                    id: t.trigger_id.clone(),
+                    name: t.trigger_id.name.clone(),
+                    id: trigger_key.clone(),
                     table_id: t.table_id.clone(),
                     enabled_mode: t.enabled_mode,
                     generation: 0,
                 }),
             );
             graph.edges.push(DependencyEdge::new(
-                t.trigger_id.clone(),
+                trigger_key.clone(),
                 t.table_id,
                 DependencyKind::TriggerOnTable {
-                    trigger_id: t.trigger_id,
+                    trigger_id: trigger_key,
                     function_id: t.function_id,
                 },
             ));
@@ -219,6 +237,7 @@ impl AnalysisState {
         Self {
             pg_version_num: cache.pg_version_num,
             baseline_available,
+            baseline_schemas,
             baseline_relations,
             baseline_indexes,
             baseline_foreign_keys,
@@ -299,6 +318,48 @@ impl AnalysisState {
             self.local.relations.get(id),
             Some(RelationOverlay::Present(_))
         )
+    }
+
+    /// Returns whether a cache-backed absence is authoritative for an object.
+    /// A scoped cache only establishes absence in the schemas it actually
+    /// synchronized.
+    pub fn baseline_covers_object(&self, id: &ObjectId) -> bool {
+        self.baseline_schemas
+            .as_ref()
+            .is_none_or(|schemas| schemas.contains(&id.schema))
+    }
+
+    pub fn baseline_scope_omits_displayed_object<'a>(
+        &self,
+        object_name: &'a str,
+    ) -> Option<&'a str> {
+        let schemas = self.baseline_schemas.as_ref()?;
+        let (schema, _) = object_name.split_once('.')?;
+        (!schemas.contains(schema)).then_some(schema)
+    }
+
+    fn sequence_is_present(&self, id: &ObjectId) -> bool {
+        matches!(
+            self.local.sequences.get(id),
+            Some(SequenceOverlay::Present(_))
+        )
+    }
+
+    fn type_is_present(&self, id: &ObjectId) -> bool {
+        matches!(self.local.types.get(id), Some(TypeOverlay::Present(_)))
+    }
+
+    fn index_is_present(&self, id: &ObjectId) -> bool {
+        self.local.graph.edges.iter().any(|edge| {
+            matches!(edge.kind, DependencyKind::IndexOnRelation { .. }) && edge.dependent == *id
+        })
+    }
+
+    fn relation_namespace_is_taken(&self, id: &ObjectId) -> bool {
+        self.relation_is_present(id)
+            || self.sequence_is_present(id)
+            || self.index_is_present(id)
+            || self.type_is_present(id)
     }
 
     pub fn column_was_added_in_transaction(&self, table_id: &ObjectId, column: &str) -> bool {
@@ -553,6 +614,7 @@ impl AnalysisState {
                     | Mutation::CommitAndChain
                     | Mutation::RollbackTransaction
                     | Mutation::RollbackAndChain
+                    | Mutation::RollbackToSavepoint(_)
             )
         {
             return MutationResult::NotExecuted;
@@ -843,7 +905,7 @@ impl AnalysisState {
                 if create.if_not_exists && self.relation_is_present(&create.id) {
                     return MutationResult::Skipped;
                 }
-                if !create.if_not_exists && self.relation_is_present(&create.id) {
+                if self.relation_namespace_is_taken(&create.id) {
                     return MutationResult::Conflict {
                         reason: format!("relation '{}' already exists", create.id),
                     };
@@ -948,10 +1010,17 @@ impl AnalysisState {
                 MutationResult::Applied
             }
             Mutation::CreateView(create_view) => {
-                if !create_view.or_replace && self.relation_is_present(&create_view.id) {
-                    return MutationResult::Conflict {
-                        reason: format!("relation '{}' already exists", create_view.id),
-                    };
+                if self.relation_namespace_is_taken(&create_view.id) {
+                    let is_replaceable_view = matches!(
+                        self.local.relations.get(&create_view.id),
+                        Some(RelationOverlay::Present(relation))
+                            if relation.kind == RelationKind::View
+                    );
+                    if !create_view.or_replace || !is_replaceable_view {
+                        return MutationResult::Conflict {
+                            reason: format!("relation '{}' already exists", create_view.id),
+                        };
+                    }
                 }
                 self.snapshot_relation(&create_view.id);
                 self.snapshot_generation_counter();
@@ -984,7 +1053,7 @@ impl AnalysisState {
                 MutationResult::Applied
             }
             Mutation::CreateMaterializedView(create_mv) => {
-                if self.relation_is_present(&create_mv.id) {
+                if self.relation_namespace_is_taken(&create_mv.id) {
                     return MutationResult::Conflict {
                         reason: format!("relation '{}' already exists", create_mv.id),
                     };
@@ -1021,14 +1090,11 @@ impl AnalysisState {
             }
             Mutation::RefreshMaterializedView(_) => MutationResult::Applied,
             Mutation::CreateIndex(create_idx) => {
-                let exists = self.local.graph.edges.iter().any(|e| {
-                    matches!(e.kind, DependencyKind::IndexOnRelation { .. })
-                        && e.dependent == create_idx.id
-                });
+                let exists = self.index_is_present(&create_idx.id);
                 if create_idx.if_not_exists && exists {
                     return MutationResult::Skipped;
                 }
-                if !create_idx.if_not_exists && exists {
+                if self.relation_namespace_is_taken(&create_idx.id) {
                     return MutationResult::Conflict {
                         reason: format!("relation '{}' already exists", create_idx.id),
                     };
@@ -1051,7 +1117,19 @@ impl AnalysisState {
                 if let Some(RelationOverlay::Present(rel)) =
                     self.local.relations.get_mut(&create_policy.table)
                 {
+                    if rel.policies.contains(&create_policy.name) {
+                        return MutationResult::Conflict {
+                            reason: format!(
+                                "policy '{}' already exists on relation '{}'",
+                                create_policy.name, create_policy.table
+                            ),
+                        };
+                    }
                     rel.policies.insert(create_policy.name.clone());
+                } else {
+                    return MutationResult::Conflict {
+                        reason: format!("relation '{}' does not exist", create_policy.table),
+                    };
                 }
                 MutationResult::Applied
             }
@@ -1060,19 +1138,44 @@ impl AnalysisState {
                 if let Some(RelationOverlay::Present(rel)) =
                     self.local.relations.get_mut(&drop_policy.table)
                 {
+                    if !rel.policies.contains(&drop_policy.name) {
+                        return if drop_policy.if_exists {
+                            MutationResult::Skipped
+                        } else {
+                            MutationResult::Conflict {
+                                reason: format!(
+                                    "policy '{}' does not exist on relation '{}'",
+                                    drop_policy.name, drop_policy.table
+                                ),
+                            }
+                        };
+                    }
                     rel.policies.remove(&drop_policy.name);
+                } else {
+                    return MutationResult::Conflict {
+                        reason: format!("relation '{}' does not exist", drop_policy.table),
+                    };
                 }
                 MutationResult::Applied
             }
             Mutation::CreateTrigger(create_trigger) => {
-                let trigger_id = ObjectId::new(
-                    create_trigger.table.schema.clone(),
-                    create_trigger.name.clone(),
-                );
+                let trigger_id = Self::trigger_key(&create_trigger.table, &create_trigger.name);
+                if matches!(
+                    self.local.triggers.get(&trigger_id),
+                    Some(TriggerOverlay::Present(_))
+                ) {
+                    return MutationResult::Conflict {
+                        reason: format!(
+                            "trigger '{}' already exists on relation '{}'",
+                            create_trigger.name, create_trigger.table
+                        ),
+                    };
+                }
                 self.snapshot_trigger(&trigger_id);
                 self.local.triggers.insert(
                     trigger_id.clone(),
                     TriggerOverlay::Present(crate::model::trigger::TriggerState {
+                        name: create_trigger.name.clone(),
                         id: trigger_id.clone(),
                         table_id: create_trigger.table.clone(),
                         enabled_mode: crate::model::trigger::TriggerEnableMode::Origin,
@@ -1100,8 +1203,18 @@ impl AnalysisState {
                 MutationResult::Applied
             }
             Mutation::DropTrigger(drop_trigger) => {
-                let trigger_id =
-                    ObjectId::new(drop_trigger.table.schema.clone(), drop_trigger.name.clone());
+                let trigger_id = Self::trigger_key(&drop_trigger.table, &drop_trigger.name);
+                if !matches!(
+                    self.local.triggers.get(&trigger_id),
+                    Some(TriggerOverlay::Present(_))
+                ) {
+                    return MutationResult::Conflict {
+                        reason: format!(
+                            "trigger '{}' does not exist on relation '{}'",
+                            drop_trigger.name, drop_trigger.table
+                        ),
+                    };
+                }
                 self.snapshot_trigger(&trigger_id);
                 self.local
                     .triggers
@@ -1145,7 +1258,7 @@ impl AnalysisState {
                                 return None;
                             };
                             (trigger.table_id == alter.id
-                                && (all || trigger_name == Some(id.name.as_str())))
+                                && (all || trigger_name == Some(trigger.name.as_str())))
                             .then(|| id.clone())
                         })
                         .collect();
@@ -1173,38 +1286,37 @@ impl AnalysisState {
                             default,
                             depends_on,
                         } => {
-                            if !(*if_not_exists && rel.has_column(name)) {
-                                if let Some(existing_col) =
-                                    rel.columns.iter().find(|c| c.name == *name)
-                                    && existing_col.data_type.as_deref() != ty.as_deref()
-                                {
-                                    return MutationResult::Conflict {
-                                        reason: format!(
-                                            "column '{}' already added with type {} (likely an earlier file in this chain), this file adds it again with type {}",
-                                            name,
-                                            existing_col.data_type.as_deref().unwrap_or("unknown"),
-                                            ty.as_deref().unwrap_or("unknown")
-                                        ),
-                                    };
+                            if let Some(existing_col) = rel.columns.iter().find(|c| c.name == *name)
+                            {
+                                if *if_not_exists {
+                                    return MutationResult::Skipped;
                                 }
-                                rel.apply_column_action(&ColumnAction::Add {
-                                    name: name.clone(),
-                                    data_type: ty.clone(),
-                                    not_null: *not_null,
-                                    default: default.clone(),
-                                });
+                                return MutationResult::Conflict {
+                                    reason: format!(
+                                        "column '{}' already exists with type {}; this statement adds it again with type {}",
+                                        name,
+                                        existing_col.data_type.as_deref().unwrap_or("unknown"),
+                                        ty.as_deref().unwrap_or("unknown")
+                                    ),
+                                };
+                            }
+                            rel.apply_column_action(&ColumnAction::Add {
+                                name: name.clone(),
+                                data_type: ty.clone(),
+                                not_null: *not_null,
+                                default: default.clone(),
+                            });
 
-                                if let Some((source_table, source_col)) = depends_on {
-                                    self.snapshot_graph();
-                                    self.local.graph.edges.push(DependencyEdge::new(
-                                        alter.id.clone(),
-                                        source_table.clone(),
-                                        DependencyKind::ColumnGeneratedFrom {
-                                            column: name.clone(),
-                                            depends_on_column: source_col.clone(),
-                                        },
-                                    ));
-                                }
+                            if let Some((source_table, source_col)) = depends_on {
+                                self.snapshot_graph();
+                                self.local.graph.edges.push(DependencyEdge::new(
+                                    alter.id.clone(),
+                                    source_table.clone(),
+                                    DependencyKind::ColumnGeneratedFrom {
+                                        column: name.clone(),
+                                        depends_on_column: source_col.clone(),
+                                    },
+                                ));
                             }
                         }
                         AlterTableActionMutation::DropColumn { name, if_exists } => {
@@ -1402,10 +1514,7 @@ impl AnalysisState {
                 MutationResult::Applied
             }
             Mutation::CreateType(create_type) => {
-                if matches!(
-                    self.local.types.get(&create_type.id),
-                    Some(TypeOverlay::Present(_))
-                ) {
+                if self.relation_namespace_is_taken(&create_type.id) {
                     return MutationResult::Conflict {
                         reason: format!("type '{}' already exists", create_type.id),
                     };
@@ -1453,10 +1562,7 @@ impl AnalysisState {
                 MutationResult::Applied
             }
             Mutation::CreateDomain(create_domain) => {
-                if matches!(
-                    self.local.types.get(&create_domain.id),
-                    Some(TypeOverlay::Present(_))
-                ) {
+                if self.relation_namespace_is_taken(&create_domain.id) {
                     return MutationResult::Conflict {
                         reason: format!("type '{}' already exists", create_domain.id),
                     };
@@ -1494,10 +1600,10 @@ impl AnalysisState {
                 MutationResult::Applied
             }
             Mutation::CreateSequence(create_seq) => {
-                if create_seq.if_not_exists && self.local.sequences.contains_key(&create_seq.id) {
+                if create_seq.if_not_exists && self.sequence_is_present(&create_seq.id) {
                     return MutationResult::Skipped;
                 }
-                if !create_seq.if_not_exists && self.local.sequences.contains_key(&create_seq.id) {
+                if self.relation_namespace_is_taken(&create_seq.id) {
                     return MutationResult::Conflict {
                         reason: format!("relation '{}' already exists", create_seq.id),
                     };
@@ -1546,6 +1652,16 @@ impl AnalysisState {
                 MutationResult::Applied
             }
             Mutation::DropSequence(drop_seq) => {
+                let missing = drop_seq.ids.iter().find(|id| !self.sequence_is_present(id));
+                if let Some(id) = missing {
+                    return if drop_seq.if_exists {
+                        MutationResult::Skipped
+                    } else {
+                        MutationResult::Conflict {
+                            reason: format!("sequence '{}' does not exist", id),
+                        }
+                    };
+                }
                 for id in &drop_seq.ids {
                     self.snapshot_sequence(id);
                     self.local
@@ -1655,10 +1771,14 @@ impl AnalysisState {
                 MutationResult::Applied
             }
             Mutation::BeginTransaction => {
-                self.local
-                    .transactions
-                    .push(TransactionFrame::new("transaction"));
-                MutationResult::Applied
+                if self.local.transactions.is_empty() {
+                    self.local.transactions.push(TransactionFrame::root());
+                    MutationResult::Applied
+                } else {
+                    // PostgreSQL emits a warning and leaves the current
+                    // transaction active for a nested BEGIN.
+                    MutationResult::Skipped
+                }
             }
             Mutation::CommitTransaction => {
                 if self.local.transaction_aborted {
@@ -1687,9 +1807,7 @@ impl AnalysisState {
                     while self.local.transactions.pop().is_some() {}
                 }
                 self.local.transaction_aborted = false;
-                self.local
-                    .transactions
-                    .push(TransactionFrame::new("transaction"));
+                self.local.transactions.push(TransactionFrame::root());
                 MutationResult::Applied
             }
             Mutation::RollbackTransaction => {
@@ -1711,18 +1829,16 @@ impl AnalysisState {
                     self.rollback_frame(frame);
                 }
                 self.local.transaction_aborted = false;
-                self.local
-                    .transactions
-                    .push(TransactionFrame::new("transaction"));
+                self.local.transactions.push(TransactionFrame::root());
                 MutationResult::Applied
             }
             Mutation::RollbackToSavepoint(rts) => {
-                if !self
+                let Some(position) = self
                     .local
                     .transactions
                     .iter()
-                    .any(|frame| frame.name == rts.name)
-                {
+                    .rposition(|frame| frame.is_named_savepoint(&rts.name))
+                else {
                     self.local.confidence = Confidence::Tainted;
                     if !self.local.transactions.is_empty() {
                         self.local.transaction_aborted = true;
@@ -1730,27 +1846,17 @@ impl AnalysisState {
                     return MutationResult::Conflict {
                         reason: format!("savepoint '{}' does not exist", rts.name),
                     };
-                }
-                let mut rolled_back = Vec::new();
-                while let Some(frame) = self.local.transactions.last() {
-                    if frame.name == rts.name {
-                        break;
-                    }
-                    rolled_back.push(self.local.transactions.pop().unwrap());
-                }
+                };
+                let rolled_back = self.local.transactions.split_off(position + 1);
                 // Frames are popped newest-first. Restore them in that same
                 // order before restoring changes made after the target
                 // savepoint itself; undo logs are chronological.
-                for frame in rolled_back {
+                for frame in rolled_back.into_iter().rev() {
                     self.rollback_frame(frame);
                 }
-                if let Some(frame) = self.local.transactions.last_mut() {
-                    let mut temp_frame = TransactionFrame::new(&frame.name);
-                    while let Some(change) = frame.undo_log.pop() {
-                        temp_frame.undo_log.push(change);
-                    }
-                    self.rollback_frame(temp_frame);
-                }
+                let undo_log = std::mem::take(&mut self.local.transactions[position].undo_log);
+                self.rollback_undo_log(undo_log);
+                self.local.transaction_aborted = false;
                 MutationResult::Applied
             }
             Mutation::Savepoint(sp) => {
@@ -1762,7 +1868,7 @@ impl AnalysisState {
                 }
                 self.local
                     .transactions
-                    .push(TransactionFrame::new(sp.name.clone()));
+                    .push(TransactionFrame::savepoint(sp.name.clone()));
                 MutationResult::Applied
             }
             Mutation::ReleaseSavepoint(rsp) => {
@@ -1770,7 +1876,7 @@ impl AnalysisState {
                     .local
                     .transactions
                     .iter()
-                    .rposition(|frame| frame.name == rsp.name)
+                    .rposition(|frame| frame.is_named_savepoint(&rsp.name))
                 else {
                     self.local.confidence = Confidence::Tainted;
                     if !self.local.transactions.is_empty() {
@@ -1804,6 +1910,15 @@ impl AnalysisState {
                 MutationResult::Applied
             }
             Mutation::CreateFunction(f) => {
+                if matches!(
+                    self.local.functions.get(&f.id),
+                    Some(crate::model::function::FunctionOverlay::Present(_))
+                ) && !f.or_replace
+                {
+                    return MutationResult::Conflict {
+                        reason: format!("routine '{}' already exists", f.id),
+                    };
+                }
                 self.snapshot_function(&f.id);
                 self.snapshot_generation_counter();
                 self.local.generation_counter += 1;
@@ -1956,8 +2071,9 @@ impl AnalysisState {
                         Some(crate::model::function::FunctionOverlay::Present(_))
                     ) {
                         if !f.if_exists {
-                            self.local.confidence = Confidence::Tainted;
-                            return MutationResult::Skipped;
+                            return MutationResult::Conflict {
+                                reason: format!("function '{}' does not exist", id),
+                            };
                         }
                     } else {
                         let dependent_triggers: Vec<(ObjectId, ObjectId)> = self
@@ -1991,6 +2107,15 @@ impl AnalysisState {
 
                         if f.cascade {
                             for (trigger_id, table_id) in &dependent_triggers {
+                                let trigger_name =
+                                    self.local.triggers.get(trigger_id).and_then(|overlay| {
+                                        match overlay {
+                                            TriggerOverlay::Present(trigger) => {
+                                                Some(trigger.name.clone())
+                                            }
+                                            TriggerOverlay::Dropped => None,
+                                        }
+                                    });
                                 self.snapshot_trigger(trigger_id);
                                 self.local
                                     .triggers
@@ -1999,7 +2124,9 @@ impl AnalysisState {
                                 if let Some(RelationOverlay::Present(relation)) =
                                     self.local.relations.get_mut(table_id)
                                 {
-                                    relation.triggers.remove(&trigger_id.name);
+                                    if let Some(trigger_name) = trigger_name {
+                                        relation.triggers.remove(&trigger_name);
+                                    }
                                 }
                             }
                             if !dependent_triggers.is_empty() {
@@ -2020,6 +2147,15 @@ impl AnalysisState {
                 }
             }
             Mutation::CreateProcedure(p) => {
+                if matches!(
+                    self.local.functions.get(&p.id),
+                    Some(crate::model::function::FunctionOverlay::Present(_))
+                ) && !p.or_replace
+                {
+                    return MutationResult::Conflict {
+                        reason: format!("routine '{}' already exists", p.id),
+                    };
+                }
                 self.snapshot_function(&p.id);
                 self.snapshot_generation_counter();
                 self.local.generation_counter += 1;
@@ -2056,8 +2192,9 @@ impl AnalysisState {
                         Some(crate::model::function::FunctionOverlay::Present(_))
                     ) {
                         if !p.if_exists {
-                            self.local.confidence = Confidence::Tainted;
-                            return MutationResult::Skipped;
+                            return MutationResult::Conflict {
+                                reason: format!("procedure '{}' does not exist", id),
+                            };
                         }
                     } else {
                         any_applied = true;
@@ -2199,6 +2336,14 @@ impl AnalysisState {
             }
             Mutation::CreateRole(r) => {
                 let role_id = ObjectId::new("", &r.name);
+                if matches!(
+                    self.local.roles.get(&role_id),
+                    Some(crate::model::role::RoleOverlay::Present(_))
+                ) {
+                    return MutationResult::Conflict {
+                        reason: format!("role '{}' already exists", r.name),
+                    };
+                }
                 self.snapshot_role(&role_id);
                 self.snapshot_generation_counter();
                 self.local.generation_counter += 1;
@@ -2247,10 +2392,15 @@ impl AnalysisState {
                         &self.local.current_role,
                     ) {
                         self.snapshot_role(&role_id);
-                        if !r.if_exists && !self.local.roles.contains_key(&role_id) {
-                            self.local.confidence = Confidence::Tainted;
-
-                            return MutationResult::Skipped;
+                        if !r.if_exists
+                            && !matches!(
+                                self.local.roles.get(&role_id),
+                                Some(crate::model::role::RoleOverlay::Present(_))
+                            )
+                        {
+                            return MutationResult::Conflict {
+                                reason: format!("role '{}' does not exist", name),
+                            };
                         }
                         self.local
                             .roles
@@ -2487,7 +2637,11 @@ impl AnalysisState {
     }
 
     fn rollback_frame(&mut self, mut frame: TransactionFrame) {
-        while let Some(change) = frame.undo_log.pop() {
+        self.rollback_undo_log(std::mem::take(&mut frame.undo_log));
+    }
+
+    fn rollback_undo_log(&mut self, mut undo_log: Vec<StateChange>) {
+        while let Some(change) = undo_log.pop() {
             match change {
                 StateChange::RelationSnapshot { id, previous } => {
                     if let Some(prev) = *previous {

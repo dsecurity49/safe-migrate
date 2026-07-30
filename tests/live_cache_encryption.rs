@@ -26,6 +26,7 @@ fn live_encrypted_cache_round_trip_and_rejection_contract() {
     let config_path = temp_dir.path().join("encrypted.toml");
     let plain_config_path = temp_dir.path().join("plain.toml");
     let cache_path = temp_dir.path().join("encrypted.cache");
+    let plaintext_cache_path = temp_dir.path().join("plaintext.cache");
     fs::write(&config_path, "cache_encryption = true\n").expect("write encryption config");
     fs::write(&plain_config_path, "").expect("write plain config");
 
@@ -50,6 +51,21 @@ fn live_encrypted_cache_round_trip_and_rejection_contract() {
     assert!(!String::from_utf8_lossy(&sync_output.stdout).contains(TEST_KEY));
     assert!(!String::from_utf8_lossy(&sync_output.stderr).contains(TEST_KEY));
 
+    let mut plain_sync =
+        assert_cmd::Command::cargo_bin("safe-migrate").expect("safe-migrate binary");
+    let plain_sync_output = plain_sync
+        .arg("sync")
+        .arg("--out")
+        .arg(&plaintext_cache_path)
+        .arg("--config")
+        .arg(&plain_config_path)
+        .arg("--schemas")
+        .arg("public")
+        .env("DATABASE_URL", &database_url)
+        .output()
+        .expect("run plaintext sync");
+    assert_success(&plain_sync_output, "plaintext sync");
+
     let cache_bytes = fs::read(&cache_path).expect("read encrypted cache");
     assert!(cache_bytes.starts_with(b"SMENC001"));
     assert!(
@@ -73,10 +89,10 @@ fn live_encrypted_cache_round_trip_and_rejection_contract() {
     assert_success(&inspect_output, "encrypted cache inspect");
     let inspection = parse_json(&inspect_output);
     assert_eq!(inspection["encrypted"], true);
-    assert_eq!(inspection["format_version"], 6);
+    assert_eq!(inspection["format_version"], 3);
 
     let migration_path = temp_dir.path().join("migration.sql");
-    fs::write(&migration_path, "SELECT 1;\n").expect("write lint migration");
+    fs::write(&migration_path, "SET search_path TO public;\n").expect("write lint migration");
     let mut lint = assert_cmd::Command::cargo_bin("safe-migrate").expect("safe-migrate binary");
     let lint_output = lint
         .arg("lint")
@@ -129,10 +145,16 @@ fn live_encrypted_cache_round_trip_and_rejection_contract() {
 
     let migrations_dir = temp_dir.path().join("migrations");
     fs::create_dir(&migrations_dir).expect("create lint-chain directory");
-    fs::write(migrations_dir.join("001_first.sql"), "SELECT 1;\n")
-        .expect("write first chain migration");
-    fs::write(migrations_dir.join("002_second.sql"), "SELECT 2;\n")
-        .expect("write second chain migration");
+    fs::write(
+        migrations_dir.join("001_first.sql"),
+        "SET search_path TO public;\n",
+    )
+    .expect("write first chain migration");
+    fs::write(
+        migrations_dir.join("002_second.sql"),
+        "SET search_path TO public;\n",
+    )
+    .expect("write second chain migration");
     let mut lint_chain =
         assert_cmd::Command::cargo_bin("safe-migrate").expect("safe-migrate binary");
     let chain_output = lint_chain
@@ -154,6 +176,12 @@ fn live_encrypted_cache_round_trip_and_rejection_contract() {
 
     for (label, config, key, expected) in [
         (
+            "plaintext cache with encryption enabled",
+            &config_path,
+            Some(TEST_KEY),
+            "Cache file is not encrypted",
+        ),
+        (
             "disabled encryption",
             &plain_config_path,
             Some(TEST_KEY),
@@ -174,11 +202,16 @@ fn live_encrypted_cache_round_trip_and_rejection_contract() {
     ] {
         let mut rejected =
             assert_cmd::Command::cargo_bin("safe-migrate").expect("safe-migrate binary");
+        let rejection_cache = if label == "plaintext cache with encryption enabled" {
+            &plaintext_cache_path
+        } else {
+            &cache_path
+        };
         rejected
             .arg("cache")
             .arg("inspect")
             .arg("--cache")
-            .arg(&cache_path)
+            .arg(rejection_cache)
             .arg("--config")
             .arg(config);
         if let Some(key) = key {

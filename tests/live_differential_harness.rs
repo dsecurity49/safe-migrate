@@ -1156,7 +1156,7 @@ fn snapshot_simulator_state(state: &AnalysisState, scope: &[ComparisonScope]) ->
             projection.triggers.insert(
                 (
                     qualified_name(&edge.referenced.schema, &edge.referenced.name),
-                    trigger_id.name.clone(),
+                    trigger.name.clone(),
                 ),
                 NormalizedTrigger {
                     function: qualified_name(&function_id.schema, &function_id.name),

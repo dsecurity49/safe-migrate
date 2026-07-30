@@ -21,16 +21,23 @@ fn run_auto_sync_case(database_url: &str, mode: &str) {
     match mode {
         "lint" => {
             let migration_path = temp_dir.path().join("migration.sql");
-            fs::write(&migration_path, "SELECT 1;\n").expect("write lint migration");
+            fs::write(&migration_path, "SET search_path TO public;\n")
+                .expect("write lint migration");
             command.arg("--file").arg(migration_path);
         }
         "lint-chain" => {
             let migrations_dir = temp_dir.path().join("migrations");
             fs::create_dir(&migrations_dir).expect("create lint-chain directory");
-            fs::write(migrations_dir.join("001_first.sql"), "SELECT 1;\n")
-                .expect("write first chain migration");
-            fs::write(migrations_dir.join("002_second.sql"), "SELECT 2;\n")
-                .expect("write second chain migration");
+            fs::write(
+                migrations_dir.join("001_first.sql"),
+                "SET search_path TO public;\n",
+            )
+            .expect("write first chain migration");
+            fs::write(
+                migrations_dir.join("002_second.sql"),
+                "SET search_path TO public;\n",
+            )
+            .expect("write second chain migration");
             command.arg("--dir").arg(migrations_dir);
         }
         other => panic!("unsupported live auto-sync mode: {other}"),

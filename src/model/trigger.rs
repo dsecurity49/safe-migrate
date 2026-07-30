@@ -24,6 +24,10 @@ impl TriggerEnableMode {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TriggerState {
+    /// PostgreSQL trigger names are scoped to their table, not their schema.
+    /// `id` is an internal composite key; retain the display name separately
+    /// for matching ALTER/DROP TRIGGER statements and diagnostics.
+    pub name: String,
     pub id: ObjectId,
     pub table_id: ObjectId,
     pub enabled_mode: TriggerEnableMode,

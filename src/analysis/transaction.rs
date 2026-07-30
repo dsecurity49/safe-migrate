@@ -69,17 +69,34 @@ pub enum StateChange {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransactionFrameKind {
+    Root,
+    Savepoint(String),
+}
+
 #[derive(Debug, Clone)]
 pub struct TransactionFrame {
-    pub name: String,
+    pub kind: TransactionFrameKind,
     pub undo_log: Vec<StateChange>,
 }
 
 impl TransactionFrame {
-    pub fn new(name: impl Into<String>) -> Self {
+    pub fn root() -> Self {
         Self {
-            name: name.into(),
+            kind: TransactionFrameKind::Root,
             undo_log: Vec::new(),
         }
+    }
+
+    pub fn savepoint(name: impl Into<String>) -> Self {
+        Self {
+            kind: TransactionFrameKind::Savepoint(name.into()),
+            undo_log: Vec::new(),
+        }
+    }
+
+    pub fn is_named_savepoint(&self, name: &str) -> bool {
+        matches!(&self.kind, TransactionFrameKind::Savepoint(candidate) if candidate == name)
     }
 }

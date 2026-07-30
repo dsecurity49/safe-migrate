@@ -11,7 +11,7 @@ inputs:
     description: Migration file for `lint` or directory for `lint-chain`.
     required: true
   cache:
-    description: Reviewed local cache path to read. The action never refreshes it.
+    description: Reviewed local cache path to read when no-cache is false. The action never refreshes it.
     required: false
     default: .safe-migrate.cache
   config:
@@ -19,9 +19,9 @@ inputs:
     required: false
     default: ""
   no-cache:
-    description: Run with an unavailable baseline instead of reading the cache.
+    description: Run with an unavailable baseline instead of reading a cache. Defaults to true because repository caches are PR-controlled unless explicitly supplied from a trusted workflow artifact.
     required: false
-    default: "false"
+    default: "true"
   output-dir:
     description: Directory for `safe-migrate-report.json` and `safe-migrate-report.md`.
     required: false

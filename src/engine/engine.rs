@@ -240,112 +240,122 @@ impl SafeMigrateEngine {
             // Capture raw statement text for sql field on violations (strip leading comments)
             let stmt_text = Self::strip_sql_leading_comments(&stmt.syntax().text().to_string());
 
-            if let Some(fact) = AstVisitor::extract(&stmt) {
-                let atomic_alter = matches!(
-                    &fact,
-                    crate::analysis::facts::StatementFact::AlterTable { actions, .. }
-                        if actions.len() > 1
+            // PostgreSQL executes a statement atomically. Keep both state
+            // and diagnostics local until all resolved actions succeed so an
+            // earlier action in a failed compound statement cannot leak
+            // state, findings, or deduplication keys. A parsed statement
+            // without a typed extractor is explicitly opaque: silently
+            // ignoring it would claim exact confidence for later SQL.
+            let statement_checkpoint = state.clone();
+            let statement_confidence = state.local.confidence.clone();
+            let mut statement_violations = Vec::new();
+            let mut statement_warned_keys = HashSet::new();
+            let mutations = match AstVisitor::extract(&stmt) {
+                Some(fact) => Resolver::resolve(&fact, state),
+                None => vec![Mutation::Opaque(
+                    crate::analysis::mutations::OpaqueMutation::UnsupportedStatement,
+                )],
+            };
+
+            for mutation in mutations {
+                let pre_cascade = match &mutation {
+                    Mutation::DropTable(d) if d.cascade => Some(state.get_cascade_closure(&d.id)),
+                    _ => None,
+                };
+
+                let pre_state = state.capture_pre_state();
+                let result = state.apply(&mutation, pre_cascade.as_ref());
+
+                let statement_failed = matches!(
+                    result,
+                    crate::analysis::state::MutationResult::Conflict { .. }
                 );
-                let statement_checkpoint = atomic_alter.then(|| state.clone());
-                let mutations = Resolver::resolve(&fact, state);
-
-                for mutation in mutations {
-                    let pre_cascade = match &mutation {
-                        Mutation::DropTable(d) if d.cascade => {
-                            Some(state.get_cascade_closure(&d.id))
-                        }
-                        _ => None,
-                    };
-
-                    let pre_state = state.capture_pre_state();
-                    let result = state.apply(&mutation, pre_cascade.as_ref());
-
-                    let statement_failed = atomic_alter
-                        && matches!(
-                            result,
-                            crate::analysis::state::MutationResult::Conflict { .. }
-                        );
-                    if statement_failed && let Some(checkpoint) = &statement_checkpoint {
-                        let transaction_aborted = state.local.transaction_aborted;
-                        *state = checkpoint.clone();
-                        if transaction_aborted && !state.local.transactions.is_empty() {
-                            state.local.transaction_aborted = true;
-                        }
+                if statement_failed {
+                    let transaction_aborted = state.local.transaction_aborted;
+                    *state = statement_checkpoint.clone();
+                    if transaction_aborted && !state.local.transactions.is_empty() {
+                        state.local.transaction_aborted = true;
                     }
+                    statement_violations.clear();
+                    statement_warned_keys.clear();
+                }
 
-                    if result == crate::analysis::state::MutationResult::NotExecuted {
+                if result == crate::analysis::state::MutationResult::NotExecuted {
+                    continue;
+                }
+
+                for rule in &self.rules {
+                    if file_ignores.contains(rule.id())
+                        || stmt_ignores.contains(rule.id())
+                        || self.config.is_rule_disabled(rule.id())
+                    {
                         continue;
                     }
 
-                    for rule in &self.rules {
-                        if file_ignores.contains(rule.id())
-                            || stmt_ignores.contains(rule.id())
-                            || self.config.is_rule_disabled(rule.id())
+                    let violations = rule.evaluate(
+                        &mutation,
+                        &result,
+                        &pre_state,
+                        state,
+                        &self.config,
+                        pre_cascade.as_ref(),
+                    );
+
+                    for v in violations {
+                        if let Some(key) = &v.dedup_key
+                            && (warned_keys.contains(key)
+                                || !statement_warned_keys.insert(key.clone()))
                         {
                             continue;
                         }
-
-                        let violations = rule.evaluate(
-                            &mutation,
-                            &result,
-                            &pre_state,
-                            state,
-                            &self.config,
-                            pre_cascade.as_ref(),
-                        );
-
-                        for v in violations {
-                            if let Some(key) = &v.dedup_key
-                                && !warned_keys.insert(key.clone())
-                            {
-                                continue;
-                            }
-                            let mut v = v;
-                            if v.source_range.is_none() {
-                                let start = stmt
-                                    .syntax()
-                                    .descendants_with_tokens()
-                                    .filter_map(|element| element.into_token())
-                                    .find(|token| {
-                                        let text = token.text().trim();
-                                        !text.is_empty()
-                                            && !text.starts_with("--")
-                                            && !text.starts_with("/*")
-                                    })
-                                    .map(|token| token.text_range().start())
-                                    .unwrap_or_else(|| stmt.syntax().text_range().start());
-                                let end = stmt.syntax().text_range().end();
-                                v.source_range = Some(rowan::TextRange::new(start, end));
-                            }
-                            if v.sql.is_none() {
-                                if let Some(range) = v.source_range {
-                                    let start = usize::from(range.start());
-                                    let end = usize::from(range.end());
-                                    if start < sql.len() && end <= sql.len() {
-                                        v.sql = Some(sql[start..end].trim().to_string());
-                                    } else {
-                                        v.sql = Some(stmt_text.trim().to_string());
-                                    }
+                        let mut v = v;
+                        if v.source_range.is_none() {
+                            let start = stmt
+                                .syntax()
+                                .descendants_with_tokens()
+                                .filter_map(|element| element.into_token())
+                                .find(|token| {
+                                    let text = token.text().trim();
+                                    !text.is_empty()
+                                        && !text.starts_with("--")
+                                        && !text.starts_with("/*")
+                                })
+                                .map(|token| token.text_range().start())
+                                .unwrap_or_else(|| stmt.syntax().text_range().start());
+                            let end = stmt.syntax().text_range().end();
+                            v.source_range = Some(rowan::TextRange::new(start, end));
+                        }
+                        if v.sql.is_none() {
+                            if let Some(range) = v.source_range {
+                                let start = usize::from(range.start());
+                                let end = usize::from(range.end());
+                                if start < sql.len() && end <= sql.len() {
+                                    v.sql = Some(sql[start..end].trim().to_string());
                                 } else {
                                     v.sql = Some(stmt_text.trim().to_string());
                                 }
+                            } else {
+                                v.sql = Some(stmt_text.trim().to_string());
                             }
-                            // Downgrade tier at push time if confidence was already tainted
-                            // BEFORE this mutation was applied.
-                            if state.local.confidence == crate::analysis::state::Confidence::Tainted
-                                && v.tier == crate::report::violations::ViolationTier::Tier1
-                            {
-                                v.tier = crate::report::violations::ViolationTier::Tier2;
-                            }
-                            all_violations.push(v);
                         }
-                    }
-
-                    if statement_failed {
-                        break;
+                        // A taint produced by this statement must not
+                        // downgrade that same statement's findings.
+                        if statement_confidence == crate::analysis::state::Confidence::Tainted
+                            && v.tier == crate::report::violations::ViolationTier::Tier1
+                        {
+                            v.tier = crate::report::violations::ViolationTier::Tier2;
+                        }
+                        statement_violations.push(v);
                     }
                 }
+
+                if statement_failed {
+                    break;
+                }
             }
+
+            warned_keys.extend(statement_warned_keys);
+            all_violations.extend(statement_violations);
         }
 
         Ok(all_violations)

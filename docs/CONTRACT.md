@@ -171,7 +171,12 @@ in either case.
 Sync writes replace an existing cache only after the new payload has been fully
 produced. Encrypted caches require `cache_encryption = true` and a valid
 `SAFE_MIGRATE_CACHE_KEY`; missing or invalid key material is an operational
-failure and is never accepted from TOML or command-line arguments.
+failure and is never accepted from TOML or command-line arguments. Conversely,
+when `cache_encryption = true`, plaintext cache files are rejected rather than
+silently weakening the configured protection.
+
+V3 cache payloads carry an explicit format header. V1 and V2 remain compatible;
+unheadered V3–V6 cache files are rejected and require `safe-migrate sync`.
 
 Errors must identify the failed input or subsystem without printing
 `DATABASE_URL`, credentials, or migration contents not already requested in the

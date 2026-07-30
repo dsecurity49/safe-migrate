@@ -70,6 +70,11 @@ pub fn protect_cache_bytes(cache_bytes: Vec<u8>, encryption_enabled: bool) -> Re
 /// intentionally do not distinguish a wrong key from modified ciphertext.
 pub fn unprotect_cache_bytes(cache_bytes: Vec<u8>, encryption_enabled: bool) -> Result<Vec<u8>> {
     if !is_encrypted_cache_bytes(&cache_bytes) {
+        if encryption_enabled {
+            bail!(
+                "Cache file is not encrypted, but cache_encryption = true. Run `safe-migrate sync` to create an encrypted cache."
+            );
+        }
         return Ok(cache_bytes);
     }
 
@@ -189,5 +194,12 @@ mod tests {
             modified[last] ^= 1;
             assert!(unprotect_cache_bytes(modified, true).is_err());
         });
+    }
+
+    #[test]
+    fn encryption_required_rejects_plaintext_cache_bytes() {
+        let error = unprotect_cache_bytes(b"plaintext cache".to_vec(), true)
+            .expect_err("encryption-enabled configuration must reject plaintext caches");
+        assert!(error.to_string().contains("not encrypted"));
     }
 }

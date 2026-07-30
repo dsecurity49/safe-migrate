@@ -104,60 +104,18 @@ pub struct DbCache {
     pub dependencies: Vec<DependencyCache>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DbCacheV5 {
-    pub pg_version_num: Option<u32>,
-    pub search_path: Vec<String>,
-    pub relations: HashMap<ObjectId, RelationState>,
-    pub foreign_keys: Vec<ForeignKeyCache>,
-    pub indexes: Vec<IndexCache>,
-    pub constraints: Vec<ConstraintState>,
-    pub triggers: Vec<TriggerCache>,
-    pub functions: HashMap<ObjectId, FunctionState>,
-    pub types: HashMap<ObjectId, TypeState>,
-    pub dependencies: Vec<DependencyCache>,
-}
+pub const CACHE_FORMAT_VERSION: u32 = 3;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DbCacheV3 {
-    pub pg_version_num: Option<u32>,
-    pub search_path: Vec<String>,
-    pub relations: HashMap<ObjectId, RelationState>,
-    pub foreign_keys: Vec<ForeignKeyCache>,
-    pub indexes: Vec<IndexCache>,
-    pub triggers: Vec<LegacyTriggerCache>,
-    pub functions: HashMap<ObjectId, FunctionState>,
-    pub dependencies: Vec<DependencyCache>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DbCacheV4 {
-    pub pg_version_num: Option<u32>,
-    pub search_path: Vec<String>,
-    pub relations: HashMap<ObjectId, RelationState>,
-    pub foreign_keys: Vec<ForeignKeyCache>,
-    pub indexes: Vec<IndexCache>,
-    pub constraints: Vec<ConstraintState>,
-    pub triggers: Vec<TriggerCache>,
-    pub functions: HashMap<ObjectId, FunctionState>,
-    pub dependencies: Vec<DependencyCache>,
-}
-
-pub const CACHE_FORMAT_VERSION: u32 = 6;
-
-const _: () = assert!(
-    CACHE_FORMAT_VERSION == 6,
-    "CACHE_FORMAT_VERSION must be updated when new DbCacheVersioned variants are added",
-);
+/// Prefixes every V3 payload after zstd decompression. Older caches did not
+/// have a payload header, so this prevents their bincode V3 discriminator from
+/// being mistaken for the redesigned V3 schema.
+pub const CACHE_V3_MAGIC: &[u8] = b"SMCACHE03";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DbCacheVersioned {
     V1(DbCacheV1),
     V2(DbCacheV2),
-    V3(DbCacheV3),
-    V4(DbCacheV4),
-    V5(DbCacheV5),
-    V6(DbCache),
+    V3(DbCache),
 }
 
 impl DbCacheVersioned {
@@ -166,9 +124,6 @@ impl DbCacheVersioned {
             DbCacheVersioned::V1(_) => 1,
             DbCacheVersioned::V2(_) => 2,
             DbCacheVersioned::V3(_) => 3,
-            DbCacheVersioned::V4(_) => 4,
-            DbCacheVersioned::V5(_) => 5,
-            DbCacheVersioned::V6(_) => 6,
         }
     }
 
@@ -200,48 +155,18 @@ impl DbCacheVersioned {
                 types: HashMap::new(),
                 dependencies: c.dependencies,
             }),
-            DbCacheVersioned::V3(c) => Ok(DbCache {
-                pg_version_num: c.pg_version_num,
-                metadata: CacheMetadata::default(),
-                search_path: c.search_path,
-                relations: c.relations,
-                foreign_keys: c.foreign_keys,
-                indexes: c.indexes,
-                constraints: Vec::new(),
-                triggers: upgrade_legacy_triggers(c.triggers),
-                functions: c.functions,
-                types: HashMap::new(),
-                dependencies: c.dependencies,
-            }),
-            DbCacheVersioned::V4(c) => Ok(DbCache {
-                pg_version_num: c.pg_version_num,
-                metadata: CacheMetadata::default(),
-                search_path: c.search_path,
-                relations: c.relations,
-                foreign_keys: c.foreign_keys,
-                indexes: c.indexes,
-                constraints: c.constraints,
-                triggers: c.triggers,
-                functions: c.functions,
-                types: HashMap::new(),
-                dependencies: c.dependencies,
-            }),
-            DbCacheVersioned::V5(c) => Ok(DbCache {
-                pg_version_num: c.pg_version_num,
-                metadata: CacheMetadata::default(),
-                search_path: c.search_path,
-                relations: c.relations,
-                foreign_keys: c.foreign_keys,
-                indexes: c.indexes,
-                constraints: c.constraints,
-                triggers: c.triggers,
-                functions: c.functions,
-                types: c.types,
-                dependencies: c.dependencies,
-            }),
-            DbCacheVersioned::V6(c) => Ok(c),
+            DbCacheVersioned::V3(c) => Ok(c),
         }
     }
+}
+
+/// Returns the historical enum version encoded at the beginning of an
+/// unheadered bincode cache. The configured bincode format uses a single-byte
+/// variable integer for the historical versions. Versions 3 and above are
+/// intentionally not compatible with v0.4.3 and must be rebuilt by
+/// `safe-migrate sync`.
+pub fn legacy_cache_format_version(payload: &[u8]) -> Option<u32> {
+    payload.first().map(|tag| u32::from(*tag) + 1)
 }
 
 fn upgrade_legacy_triggers(triggers: Vec<LegacyTriggerCache>) -> Vec<TriggerCache> {
@@ -293,8 +218,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_bug019_into_cache_succeeds_for_v1() {
-        // 1d: into_cache() must succeed for the current format version (V1).
+    fn legacy_v1_cache_upgrades_to_current_model() {
         let cache = DbCacheV1 {
             pg_version_num: None,
             relations: HashMap::new(),
@@ -314,20 +238,9 @@ mod tests {
     }
 
     #[test]
-    fn test_bug019_format_version_constant_matches_v1_variant() {
-        // 1d: CACHE_FORMAT_VERSION must equal the discriminant reported by V1.
-        let versioned = DbCacheVersioned::V1(DbCacheV1 {
-            pg_version_num: None,
-            relations: HashMap::new(),
-            foreign_keys: Vec::new(),
-            indexes: Vec::new(),
-            triggers: Vec::new(),
-            functions: HashMap::new(),
-        });
-        assert_eq!(
-            versioned.format_version(),
-            1,
-            "format_version() for V1 must match 1"
-        );
+    fn current_cache_format_is_v3() {
+        assert_eq!(CACHE_FORMAT_VERSION, 3);
+        assert_eq!(DbCacheVersioned::V3(DbCache::new()).format_version(), 3);
+        assert_eq!(CACHE_V3_MAGIC, b"SMCACHE03");
     }
 }

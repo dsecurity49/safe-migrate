@@ -878,7 +878,8 @@ mod state_mutation_tests {
         let Some(TriggerOverlay::Present(trigger)) = state
             .local
             .triggers
-            .get(&object_id("public", "check_trigger"))
+            .values()
+            .find(|overlay| matches!(overlay, TriggerOverlay::Present(trigger) if trigger.name == "check_trigger"))
         else {
             panic!("baseline trigger should be hydrated");
         };
@@ -998,12 +999,48 @@ mod state_mutation_tests {
             Some(FunctionOverlay::Dropped)
         ));
         assert!(matches!(
-            state
-                .local
-                .triggers
-                .get(&object_id("public", "compute_row")),
+            state.local.triggers.values().next(),
             Some(TriggerOverlay::Dropped)
         ));
+    }
+
+    #[test]
+    fn same_named_triggers_on_different_tables_remain_independent() {
+        use safe_migrate::model::trigger::{TriggerEnableMode, TriggerOverlay};
+
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "
+                CREATE TABLE first_table (id integer);
+                CREATE TABLE second_table (id integer);
+                CREATE FUNCTION audit_trigger() RETURNS trigger
+                    LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';
+                CREATE TRIGGER audit AFTER INSERT ON first_table
+                    EXECUTE FUNCTION audit_trigger();
+                CREATE TRIGGER audit AFTER INSERT ON second_table
+                    EXECUTE FUNCTION audit_trigger();
+                ALTER TABLE first_table DISABLE TRIGGER audit;
+                ",
+                &mut state,
+            )
+            .unwrap();
+
+        let modes: Vec<_> = state
+            .local
+            .triggers
+            .values()
+            .filter_map(|overlay| match overlay {
+                TriggerOverlay::Present(trigger) if trigger.name == "audit" => {
+                    Some((trigger.table_id.name.as_str(), trigger.enabled_mode))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(modes.len(), 2);
+        assert!(modes.contains(&("first_table", TriggerEnableMode::Disabled)));
+        assert!(modes.contains(&("second_table", TriggerEnableMode::Origin)));
     }
 
     #[test]

@@ -120,6 +120,10 @@ metadata and needs a database role able to read those catalogs; use a
 least-privilege role and do not put `DATABASE_URL` or its credentials in
 `safe-migrate.toml`.
 
+v0.4.3 writes cache format V3. It continues to read legacy V1/V2 caches, but
+intentionally rejects unheadered V3–V6 caches (including v0.4.2 caches). Run
+`safe-migrate sync` after upgrading to create a fresh V3 baseline.
+
 For safety, this build only syncs through localhost or a Unix socket. For a
 remote database, create an SSH tunnel and point `DATABASE_URL` at the local
 end, for example `ssh -N -L 5433:db.internal:5432 bastion` followed by
@@ -205,7 +209,7 @@ rejected instead of being silently ignored.
 | `assume_pg_version` | `100000` | PostgreSQL version assumed only when no cache supplies one. |
 | `schemas` | unset | Schemas included by `sync` and configured automatic sync. Explicit `sync --schemas` takes precedence. |
 | `auto_sync` | `false` | Refreshes the cache before `lint` and `lint-chain`. It has no command-line flag. |
-| `cache_encryption` | `false` | Encrypts new cache files and requires `SAFE_MIGRATE_CACHE_KEY` to read them. |
+| `cache_encryption` | `false` | Encrypts new cache files and requires `SAFE_MIGRATE_CACHE_KEY` to read them. When true, plaintext caches are rejected and must be recreated with `sync`. |
 | `disabled_rules` | `[]` | Primary rule IDs disabled globally. |
 
 ### Automatic sync
@@ -229,8 +233,9 @@ export SAFE_MIGRATE_CACHE_KEY='64 hexadecimal characters (32 bytes)'
 safe-migrate uses authenticated XChaCha20-Poly1305 encryption with a fresh
 random nonce for each cache write. The key is deliberately not accepted in
 TOML, command-line flags, or cache metadata. Keep it in your secret manager.
-An encrypted cache without the setting and key fails closed; regenerate a cache
-after enabling encryption rather than committing a key or decrypted cache.
+Encrypted and plaintext caches both fail closed when they do not match the
+setting: regenerate the cache with `sync` after enabling or disabling
+encryption rather than committing a key or decrypted cache.
 
 ## Commands
 
@@ -370,6 +375,10 @@ available in v0.4.2. The Action does not synchronize a database or use
 `DATABASE_URL`; prepare a reviewed cache in a separate, explicit step if your
 workflow needs database-aware findings.
 
+For safety, the Action defaults to `no-cache: "true"`; a checkout-local cache
+is controlled by the pull request. Set `no-cache: "false"` only when `cache`
+comes from a trusted workflow artifact or another reviewed source.
+
 ```yaml
 - id: safe_migrate
   uses: dsecurity49/safe-migrate@v0.4.3
@@ -377,6 +386,7 @@ workflow needs database-aware findings.
     mode: lint-chain
     path: migrations
     cache: .safe-migrate.cache
+    no-cache: "false"
     output-dir: safe-migrate-artifacts
 
 - uses: actions/upload-artifact@v4

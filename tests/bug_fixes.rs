@@ -2,11 +2,30 @@ mod common;
 
 mod phase10_bug_fixes_and_sorting_tests {
     use crate::common::*;
-    use safe_migrate::analysis::state::AnalysisState;
+    use safe_migrate::analysis::state::{AnalysisState, Confidence};
     use safe_migrate::ast::identifiers::ObjectId;
     use safe_migrate::db::cache::DbCache;
     use safe_migrate::model::relation::{Persistence, RelationKind};
     use safe_migrate::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
+
+    #[test]
+    fn parsed_statement_without_typed_extraction_is_reported_and_taints_state() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let violations = engine
+            .analyze(
+                "COMMENT ON TABLE future_table IS 'created elsewhere';",
+                &mut state,
+            )
+            .expect("Squawk should parse COMMENT ON statements");
+
+        assert!(violations.iter().any(|violation| {
+            violation.rule_id == "opaque-dynamic-sql"
+                && violation.reason.contains("unsupported SQL statement")
+        }));
+        assert_eq!(state.local.confidence, Confidence::Tainted);
+    }
 
     #[test]
     fn test_bug008_index_not_in_baseline_relations() {

@@ -73,6 +73,29 @@ mod tests {
     }
 
     #[test]
+    fn markdown_report_uses_a_safe_fence_for_sql_containing_backticks() {
+        let finding = ReportFinding {
+            location: None,
+            violation: Violation {
+                source_range: None,
+                rule_id: "test-rule",
+                operation_kind: OperationKind::Other("test".to_string()),
+                object_kind: ObjectKind::Table,
+                object_name: "example".to_string(),
+                tier: ViolationTier::Tier2,
+                reason: "needs review".to_string(),
+                recipe: "review it",
+                dedup_key: None,
+                sql: Some("SELECT '```';".to_string()),
+                fk_dependency_related: false,
+            },
+        };
+
+        let markdown = Reporter::markdown_report(&[finding], &Confidence::Exact);
+        assert!(markdown.contains("\n````sql\nSELECT '```';\n````\n"));
+    }
+
+    #[test]
     fn test_verdict_halt_tier1() {
         let violations = vec![make_violation("test-rule", ViolationTier::Tier1, "halt")];
         assert_eq!(compute_verdict(&violations), Verdict::Halt);

@@ -37,6 +37,9 @@ impl Rule for OpaqueDynamicSqlRule {
                 return vec![];
             }
             let (block_type, is_collision) = match &op {
+                crate::analysis::mutations::OpaqueMutation::UnsupportedStatement => {
+                    ("unsupported SQL statement", false)
+                }
                 crate::analysis::mutations::OpaqueMutation::DoBlock => ("DO block", false),
                 crate::analysis::mutations::OpaqueMutation::Execute => ("EXECUTE statement", false),
                 crate::analysis::mutations::OpaqueMutation::DynamicSql => ("Dynamic SQL", false),

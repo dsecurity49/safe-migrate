@@ -895,4 +895,27 @@ mod rule_evaluation_tests {
             "Small table DROP INDEX should still be flagged at Tier3 or not at all"
         );
     }
+
+    #[test]
+    fn scoped_cache_reports_unknown_schema_as_coverage_not_drift() {
+        let engine = setup_engine();
+        let mut cache = safe_migrate::db::cache::DbCache::new();
+        cache.metadata.schemas = Some(vec!["app".to_string()]);
+        let mut state = AnalysisState::new(cache);
+
+        let violations = engine
+            .analyze(
+                "ALTER TABLE public.external_table ADD COLUMN note text;",
+                &mut state,
+            )
+            .unwrap();
+
+        let coverage = violations
+            .iter()
+            .find(|violation| violation.rule_id == "schema-drift")
+            .expect("an omitted schema must be reported as unknown coverage");
+        assert_eq!(coverage.tier, ViolationTier::Tier2);
+        assert!(coverage.reason.contains("does not cover schema \"public\""));
+        assert!(!coverage.reason.contains("does not exist"));
+    }
 }
