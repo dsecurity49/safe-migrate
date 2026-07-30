@@ -176,6 +176,13 @@ impl AnalysisState {
             };
             let dependent = ObjectId::new(obj_schema, obj_name);
             let referenced = ObjectId::new(ref_schema, ref_name);
+            // Older caches created on PostgreSQL 14/15 can contain an
+            // internal pg_rewrite self-edge for a view. Ignore it while
+            // loading so upgrading safe-migrate does not require a re-sync to
+            // restore a meaningful dependency graph.
+            if dependent == referenced {
+                continue;
+            }
             let is_view = relations.get(&dependent).is_some_and(|relation| {
                 matches!(
                     relation,

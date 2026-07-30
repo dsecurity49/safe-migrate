@@ -5,7 +5,10 @@ mod state_mutation_tests {
     use safe_migrate::analysis::graph::{DependencyEdge, DependencyGraph, DependencyKind};
     use safe_migrate::analysis::state::Confidence;
     use safe_migrate::ast::identifiers::ObjectId;
-    use safe_migrate::model::relation::RelationOverlay;
+    use safe_migrate::db::cache::{DbCache, DependencyCache};
+    use safe_migrate::model::relation::{
+        Persistence, RelationKind, RelationOverlay, RelationState,
+    };
     use safe_migrate::model::sequence::SequenceOverlay;
     use safe_migrate::model::types::{TypeKind, TypeOverlay, TypeState};
 
@@ -29,6 +32,59 @@ mod state_mutation_tests {
         } else {
             panic!("relation should be present");
         }
+    }
+
+    #[test]
+    fn cached_view_rewrite_self_edge_is_ignored_but_real_dependency_is_kept() {
+        let view_id = object_id("public", "v");
+        let table_id = object_id("public", "t");
+        let mut cache = DbCache::new();
+
+        for (id, kind) in [
+            (view_id.clone(), RelationKind::View),
+            (table_id.clone(), RelationKind::Table),
+        ] {
+            cache.insert_baseline(
+                id.clone(),
+                RelationState::new(
+                    id,
+                    object_id("public", "owner"),
+                    0,
+                    None,
+                    kind,
+                    Persistence::Permanent,
+                    0,
+                ),
+            );
+        }
+
+        let dependency = |referenced: &ObjectId| DependencyCache {
+            classid: 0,
+            objid: 0,
+            objsubid: 0,
+            refclassid: 0,
+            refobjid: 0,
+            refobjsubid: 0,
+            deptype: "view".to_string(),
+            obj_schema: Some(view_id.schema.clone()),
+            obj_name: Some(view_id.name.clone()),
+            ref_schema: Some(referenced.schema.clone()),
+            ref_name: Some(referenced.name.clone()),
+        };
+        cache.dependencies.push(dependency(&view_id));
+        cache.dependencies.push(dependency(&table_id));
+
+        let state = safe_migrate::AnalysisState::new(cache);
+        assert!(!state.local.graph.edges.iter().any(|edge| {
+            matches!(edge.kind, DependencyKind::ViewDependency { .. })
+                && edge.dependent == view_id
+                && edge.referenced == view_id
+        }));
+        assert!(state.local.graph.edges.iter().any(|edge| {
+            matches!(edge.kind, DependencyKind::ViewDependency { .. })
+                && edge.dependent == view_id
+                && edge.referenced == table_id
+        }));
     }
 
     #[test]

@@ -850,6 +850,10 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
         JOIN pg_namespace tn ON tn.oid = tc.relnamespace
         WHERE vc.relkind IN ('v', 'm')
           AND d.deptype = 'n'
+          -- PostgreSQL 14/15 expose an internal rewrite-rule self-edge. It is
+          -- not a dependency of the view definition and must not enter the
+          -- modeled dependency graph.
+          AND tc.oid <> vc.oid
           AND (
               $1::text[] IS NULL
               OR (vn.nspname = ANY($1) AND tn.nspname = ANY($1))
