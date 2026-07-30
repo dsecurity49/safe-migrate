@@ -1,0 +1,149 @@
+#!/bin/sh
+set -eu
+
+repository_root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
+cd "$repository_root"
+
+command -v timeout >/dev/null 2>&1 || {
+    printf '%s\n' "The fuzz runner requires the timeout command." >&2
+    exit 2
+}
+command -v jq >/dev/null 2>&1 || {
+    printf '%s\n' "The fuzz runner requires jq." >&2
+    exit 2
+}
+
+fuzz_temp_root=$(mktemp -d "${TMPDIR:-/tmp}/safe-migrate-fuzz.XXXXXX")
+cleanup() {
+    rm -rf -- "$fuzz_temp_root"
+}
+trap cleanup EXIT
+
+corpus_dir="$fuzz_temp_root/sql"
+stdout_file="$fuzz_temp_root/stdout.json"
+stderr_file="$fuzz_temp_root/stderr.log"
+
+bash tests/fuzz_migrations/generate.sh "$corpus_dir"
+cargo build --locked --bin safe-migrate
+
+total=$(find "$corpus_dir" -maxdepth 1 -type f -name '*.sql' | wc -l)
+if [ "$total" -lt 400 ]; then
+    printf '%s\n' "Fuzz corpus is unexpectedly small: $total files." >&2
+    exit 1
+fi
+
+completed=0
+expected_parser_rejections=0
+unexpected_parser_rejections=0
+operational_errors=0
+invalid_reports=0
+crashes=0
+timeouts=0
+halt=0
+cautious=0
+safe=0
+safe_with_risk=0
+
+for migration in "$corpus_dir"/*.sql; do
+    set +e
+    timeout 10 ./target/debug/safe-migrate \
+        lint --no-cache --json --file "$migration" \
+        >"$stdout_file" 2>"$stderr_file"
+    status=$?
+    set -e
+
+    if grep -Eq 'panicked|assertion failed|stack overflow' "$stderr_file"; then
+        crashes=$((crashes + 1))
+        printf 'CRASH %s\n' "$(basename "$migration")" >&2
+        sed -n '1,20p' "$stderr_file" >&2
+        continue
+    fi
+
+    case "$status" in
+        0|2)
+            if ! verdict=$(
+                jq -er '
+                    select(.schema_version == 1)
+                    | .verdict
+                    | select(
+                        . == "SAFE"
+                        or . == "SAFE WITH RISK"
+                        or . == "CAUTIOUS"
+                        or . == "HALT"
+                    )
+                ' "$stdout_file"
+            ); then
+                invalid_reports=$((invalid_reports + 1))
+                printf 'INVALID_JSON %s\n' "$(basename "$migration")" >&2
+                sed -n '1,20p' "$stdout_file" >&2
+                continue
+            fi
+            if { [ "$status" -eq 2 ] && [ "$verdict" != "HALT" ]; } ||
+                { [ "$status" -eq 0 ] && [ "$verdict" = "HALT" ]; }; then
+                invalid_reports=$((invalid_reports + 1))
+                printf 'EXIT_VERDICT_MISMATCH %s status=%s verdict=%s\n' \
+                    "$(basename "$migration")" "$status" "$verdict" >&2
+                continue
+            fi
+            completed=$((completed + 1))
+            case "$verdict" in
+                HALT) halt=$((halt + 1)) ;;
+                CAUTIOUS) cautious=$((cautious + 1)) ;;
+                "SAFE WITH RISK") safe_with_risk=$((safe_with_risk + 1)) ;;
+                SAFE) safe=$((safe + 1)) ;;
+            esac
+            ;;
+        1)
+            if grep -q 'Failed to parse SQL migration' "$stderr_file"; then
+                migration_name=$(basename "$migration")
+                case "$migration_name" in
+                    *_do_block_nested.sql)
+                        expected_parser_rejections=$((expected_parser_rejections + 1))
+                        printf 'EXPECTED_PARSER_REJECTION %s\n' "$migration_name"
+                        ;;
+                    *)
+                        unexpected_parser_rejections=$((unexpected_parser_rejections + 1))
+                        printf 'UNEXPECTED_PARSER_REJECTION %s\n' "$migration_name" >&2
+                        ;;
+                esac
+            else
+                operational_errors=$((operational_errors + 1))
+                printf 'OPERATIONAL_ERROR %s\n' "$(basename "$migration")" >&2
+                sed -n '1,20p' "$stderr_file" >&2
+            fi
+            ;;
+        124)
+            timeouts=$((timeouts + 1))
+            printf 'TIMEOUT %s\n' "$(basename "$migration")" >&2
+            ;;
+        *)
+            crashes=$((crashes + 1))
+            printf 'CRASH_EXIT_%s %s\n' "$status" "$(basename "$migration")" >&2
+            sed -n '1,20p' "$stderr_file" >&2
+            ;;
+    esac
+done
+
+printf '%s\n' \
+    "Fuzz corpus:        $total" \
+    "Completed reports:  $completed" \
+    "Expected parser rejections:   $expected_parser_rejections" \
+    "Unexpected parser rejections: $unexpected_parser_rejections" \
+    "HALT:               $halt" \
+    "CAUTIOUS:           $cautious" \
+    "SAFE WITH RISK:     $safe_with_risk" \
+    "SAFE:               $safe" \
+    "Operational errors: $operational_errors" \
+    "Invalid reports:    $invalid_reports" \
+    "Crashes:            $crashes" \
+    "Timeouts:           $timeouts"
+
+if [ "$((completed + expected_parser_rejections + unexpected_parser_rejections))" -ne "$total" ] ||
+    [ "$expected_parser_rejections" -ne 1 ] ||
+    [ "$unexpected_parser_rejections" -ne 0 ] ||
+    [ "$operational_errors" -ne 0 ] ||
+    [ "$invalid_reports" -ne 0 ] ||
+    [ "$crashes" -ne 0 ] ||
+    [ "$timeouts" -ne 0 ]; then
+    exit 1
+fi

@@ -2,7 +2,9 @@
 mod tests {
     use crate::analysis::state::Confidence;
     use crate::report::reporter::{Reporter, Verdict, compute_verdict};
-    use crate::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
+    use crate::report::violations::{
+        ObjectKind, OperationKind, ReportFinding, SourceLocation, Violation, ViolationTier,
+    };
 
     fn make_violation(rule_id: &'static str, tier: ViolationTier, reason: &str) -> Violation {
         Violation {
@@ -44,8 +46,53 @@ mod tests {
         let has_failures = Reporter::print_report(&violations, &confidence);
         assert!(has_failures);
 
-        // Also call the JSON output function to cover that branch
-        Reporter::print_json_report(&violations, &confidence);
+        let report = Reporter::json_report(&violations, &confidence);
+        assert_eq!(report["schema_version"], Reporter::JSON_SCHEMA_VERSION);
+        assert_eq!(report["confidence"], "Tainted");
+        assert_eq!(report["verdict"], "HALT");
+        assert_eq!(report["violations"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn test_markdown_report_includes_the_same_finding_and_location_data() {
+        let finding = ReportFinding {
+            violation: make_violation("test-rule", ViolationTier::Tier2, "needs review"),
+            location: Some(SourceLocation {
+                file: "migrations/001.sql".to_string(),
+                line: 3,
+                column: 5,
+            }),
+        };
+
+        let markdown = Reporter::markdown_report(&[finding], &Confidence::Exact);
+        assert!(markdown.starts_with("# safe-migrate report\n"));
+        assert!(markdown.contains("**Verdict:** CAUTIOUS"));
+        assert!(markdown.contains("### WARN — `test-rule`"));
+        assert!(markdown.contains("`migrations/001.sql:3:5`"));
+        assert!(markdown.contains("needs review"));
+    }
+
+    #[test]
+    fn markdown_report_uses_a_safe_fence_for_sql_containing_backticks() {
+        let finding = ReportFinding {
+            location: None,
+            violation: Violation {
+                source_range: None,
+                rule_id: "test-rule",
+                operation_kind: OperationKind::Other("test".to_string()),
+                object_kind: ObjectKind::Table,
+                object_name: "example".to_string(),
+                tier: ViolationTier::Tier2,
+                reason: "needs review".to_string(),
+                recipe: "review it",
+                dedup_key: None,
+                sql: Some("SELECT '```';".to_string()),
+                fk_dependency_related: false,
+            },
+        };
+
+        let markdown = Reporter::markdown_report(&[finding], &Confidence::Exact);
+        assert!(markdown.contains("\n````sql\nSELECT '```';\n````\n"));
     }
 
     #[test]
@@ -95,6 +142,29 @@ mod tests {
     fn test_verdict_empty() {
         let violations: Vec<Violation> = vec![];
         assert_eq!(compute_verdict(&violations), Verdict::Safe);
+    }
+
+    #[test]
+    fn test_tainted_safe_verdict_requires_review() {
+        assert_eq!(
+            Verdict::Safe.recommendation(&Confidence::Tainted),
+            "no blocking finding, but baseline evidence is uncertain — review before deploying"
+        );
+    }
+
+    #[test]
+    fn test_tainted_safe_with_risk_keeps_backup_guidance() {
+        assert_eq!(
+            Verdict::SafeWithRisk.recommendation(&Confidence::Tainted),
+            "irreversible operations present and baseline evidence is uncertain — ensure backups exist and review before deploying"
+        );
+    }
+
+    #[test]
+    fn test_exact_safe_verdict_does_not_guarantee_deployment() {
+        let recommendation = Verdict::Safe.recommendation(&Confidence::Exact);
+        assert_eq!(recommendation, "no modeled blocking findings");
+        assert!(!recommendation.contains("safe to deploy"));
     }
 
     #[test]

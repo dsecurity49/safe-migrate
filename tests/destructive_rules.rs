@@ -294,11 +294,12 @@ mod destructive_rule_tests {
             v.iter().any(|v| v.rule_id == "schema-drift"),
             "DriftDetectionRule should flag DROP on table not in baseline"
         );
-        // Dropping a nonexistent table taints confidence, which downgrades Tier1->Tier2
+        // The cache is authoritative for this schema. Taint produced by this
+        // statement must not downgrade the statement's own drift evidence.
         assert_eq!(
             v.iter().find(|v| v.rule_id == "schema-drift").unwrap().tier,
-            ViolationTier::Tier2,
-            "Drift becomes Tier2 after confidence is tainted by missing DROP"
+            ViolationTier::Tier1,
+            "An exact baseline proves this missing DROP is production drift"
         );
     }
 

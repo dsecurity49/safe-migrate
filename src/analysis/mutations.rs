@@ -42,7 +42,9 @@ pub enum Mutation {
     SearchPath(SearchPathChange),
     BeginTransaction,
     CommitTransaction,
+    CommitAndChain,
     RollbackTransaction,
+    RollbackAndChain,
     RollbackToSavepoint(RollbackToSavepointMutation),
     Savepoint(SavepointMutation),
     ReleaseSavepoint(ReleaseSavepointMutation),
@@ -447,6 +449,9 @@ pub struct DropDatabaseMutation {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum OpaqueMutation {
+    /// Squawk accepted the statement but safe-migrate has no typed extractor
+    /// for it. Treating it as a no-op would leave later analysis falsely exact.
+    UnsupportedStatement,
     DoBlock,
     Execute,
     DynamicSql,

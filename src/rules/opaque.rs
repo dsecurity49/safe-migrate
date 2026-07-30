@@ -36,21 +36,32 @@ impl Rule for OpaqueDynamicSqlRule {
             ) {
                 return vec![];
             }
-            let (block_type, is_collision) = match &op {
-                crate::analysis::mutations::OpaqueMutation::DoBlock => ("DO block", false),
-                crate::analysis::mutations::OpaqueMutation::Execute => ("EXECUTE statement", false),
-                crate::analysis::mutations::OpaqueMutation::DynamicSql => ("Dynamic SQL", false),
+            let (block_type, is_collision, recipe) = match &op {
+                crate::analysis::mutations::OpaqueMutation::UnsupportedStatement => (
+                    "unsupported SQL statement",
+                    false,
+                    "This SQL statement is not modeled. Review its PostgreSQL behavior before deploying.",
+                ),
+                crate::analysis::mutations::OpaqueMutation::DoBlock => {
+                    ("DO block", false, self.recipe())
+                }
+                crate::analysis::mutations::OpaqueMutation::Execute => {
+                    ("EXECUTE statement", false, self.recipe())
+                }
+                crate::analysis::mutations::OpaqueMutation::DynamicSql => {
+                    ("Dynamic SQL", false, self.recipe())
+                }
                 crate::analysis::mutations::OpaqueMutation::PrepareTransaction => {
-                    ("PREPARE TRANSACTION", false)
+                    ("PREPARE TRANSACTION", false, self.recipe())
                 }
                 crate::analysis::mutations::OpaqueMutation::SetTransaction => {
-                    ("SET TRANSACTION", false)
+                    ("SET TRANSACTION", false, self.recipe())
                 }
                 crate::analysis::mutations::OpaqueMutation::SetConstraints => {
-                    ("SET CONSTRAINTS", false)
+                    ("SET CONSTRAINTS", false, self.recipe())
                 }
                 crate::analysis::mutations::OpaqueMutation::StateCollision(msg) => {
-                    (msg.as_str(), true)
+                    (msg.as_str(), true, self.recipe())
                 }
                 crate::analysis::mutations::OpaqueMutation::UnresolvedReference { .. } => {
                     unreachable!()
@@ -80,7 +91,7 @@ impl Rule for OpaqueDynamicSqlRule {
                     object_name: "<dynamic>".to_string(),
                     tier: self.default_tier(),
                     reason: format!("Encountered opaque {}", block_type),
-                    recipe: self.recipe(),
+                    recipe,
                     dedup_key: None,
                     sql: None,
                     fk_dependency_related: false,

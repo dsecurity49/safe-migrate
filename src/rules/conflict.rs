@@ -11,7 +11,7 @@ pub struct ConflictRule;
 impl ConflictRule {
     const ID: &'static str = "chain-conflict";
     const DEFAULT_TIER: ViolationTier = ViolationTier::Tier1;
-    const RECIPE: &'static str = "Refactor the migration chain so each column is added only once with a consistent type, or consolidate into a single DDL statement.";
+    const RECIPE: &'static str = "Correct the migration so this statement can execute against the schema state produced by earlier statements. Use an idempotency guard only when a no-op is intended.";
 
     fn extract_conflict_reason(result: &MutationResult) -> Option<&str> {
         match result {
@@ -48,8 +48,8 @@ impl Rule for ConflictRule {
                 source_range: None,
                 rule_id: Self::ID,
                 operation_kind: OperationKind::Conflict,
-                object_kind: ObjectKind::Table,
-                object_name: "unknown".to_string(),
+                object_kind: ObjectKind::Unknown,
+                object_name: "<migration-state>".to_string(),
                 tier: Self::DEFAULT_TIER,
                 reason: format!("Migration chain conflict: {}", reason),
                 recipe: Self::RECIPE,
@@ -97,7 +97,11 @@ mod tests {
         assert_eq!(violations.len(), 1);
         assert_eq!(violations[0].rule_id, "chain-conflict");
         assert_eq!(violations[0].tier, ViolationTier::Tier1);
+        assert_eq!(violations[0].object_kind, ObjectKind::Unknown);
+        assert_eq!(violations[0].object_name, "<migration-state>");
         assert!(violations[0].reason.contains("Migration chain conflict"));
+        assert!(violations[0].recipe.contains("schema state"));
+        assert!(!violations[0].recipe.contains("each column"));
     }
 
     #[test]

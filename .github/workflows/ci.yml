@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [ "main" ]
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -16,18 +19,23 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable 2026-07-16
         with:
           components: clippy, rustfmt
 
       - name: Cache dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       - name: Check formatting
         run: cargo fmt -- --check
+
+      - name: Verify installer contract
+        run: sh scripts/test-install-dry-run
 
       - name: Build (locked)
         run: cargo build --locked --verbose
@@ -35,10 +43,180 @@ jobs:
       - name: Run tests (locked)
         run: cargo test --locked --verbose
 
+      - name: Run generated migration fuzz corpus
+        run: scripts/fuzz
+
       - name: Run Clippy (Linter)
         run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: Install and run cargo-audit
         run: |
-          cargo install cargo-audit --locked
+          cargo install cargo-audit --version 0.22.2 --locked
+          test "$(cargo-audit --version)" = "cargo-audit 0.22.2"
           cargo audit
+
+  live-differential:
+    name: PostgreSQL ${{ matrix.postgres }} differential harness
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - postgres: "14"
+            image: postgres:14@sha256:caf49e3b10d377aa2cfee478591d623808527beb27125d38797b418013f72d81
+          - postgres: "15"
+            image: postgres:15@sha256:74e110c41804365e3915fcc09d5e7a1eff50161aaa94d5da0e58e0cd75ae509c
+          - postgres: "16"
+            image: postgres:16@sha256:33f923b05f64ca54ac4401c01126a6b92afe839a0aa0a52bc5aeb5cc958e5f20
+          - postgres: "17"
+            image: postgres:17@sha256:a426e44bac0b759c95894d68e1a0ac03ecc20b619f498a91aae373bf06d8508d
+          - postgres: "18"
+            image: postgres:18@sha256:3a82e1f56c8f0f5616a11103ac3d47e632c3938698946a7ad26da0df1334744a
+    services:
+      postgres:
+        image: ${{ matrix.image }}
+        env:
+          POSTGRES_DB: safe_migrate
+          POSTGRES_USER: safe_migrate
+          POSTGRES_PASSWORD: safe_migrate
+        options: >-
+          --health-cmd "pg_isready -U safe_migrate -d safe_migrate"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+    env:
+      DATABASE_URL: postgres://safe_migrate:safe_migrate@localhost:5432/safe_migrate
+      SAFE_MIGRATE_DIFF_VERBOSITY: 2
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable 2026-07-16
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Reject an unreachable live database
+        shell: bash
+        env:
+          DATABASE_URL: postgres://127.0.0.1:1/postgres?connect_timeout=1
+        run: |
+          set +e
+          output="$(scripts/live-differential --rule rule_02_drop-database 2>&1)"
+          status=$?
+          set -e
+          printf '%s\n' "$output"
+          test "$status" -ne 0
+          grep -q 'requires reachable PostgreSQL' <<< "$output"
+
+      - name: Verify successful automatic synchronization
+        run: scripts/live-auto-sync
+
+      - name: Verify encrypted cache CLI contract
+        run: scripts/live-cache-encryption
+
+      - name: Compare simulator state with PostgreSQL
+        shell: bash
+        run: |
+          set -o pipefail
+          scripts/live-differential 2>&1 | tee "live-differential-postgres-${{ matrix.postgres }}.log"
+
+      - name: Upload differential log
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: live-differential-postgres-${{ matrix.postgres }}
+          path: live-differential-postgres-${{ matrix.postgres }}.log
+          if-no-files-found: error
+
+  action-smoke:
+    name: Reusable Action smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Generate review artifacts with the local Action
+        id: safe_migrate
+        uses: ./
+        with:
+          mode: lint
+          path: live_tests/rule_01_irreversible-migration/safe_002_add_col.sql
+          no-cache: "true"
+          output-dir: action-smoke-artifacts
+
+      - name: Verify generated artifacts
+        shell: bash
+        env:
+          JSON_REPORT: ${{ steps.safe_migrate.outputs.json-report }}
+          MARKDOWN_REPORT: ${{ steps.safe_migrate.outputs.markdown-report }}
+          EXIT_CODE: ${{ steps.safe_migrate.outputs.exit-code }}
+        run: |
+          test -s "$JSON_REPORT"
+          test -s "$MARKDOWN_REPORT"
+          test "$EXIT_CODE" = "0"
+
+      - name: Plant untrusted workspace configuration
+        shell: bash
+        run: |
+          printf '%s\n' '[rules.drop-database]' 'disabled = true' > safe-migrate.toml
+
+      - name: Verify Action defaults ignore workspace configuration
+        id: untrusted_config
+        continue-on-error: true
+        uses: ./
+        with:
+          mode: lint
+          path: live_tests/rule_02_drop-database/001_drop_db.sql
+          no-cache: "true"
+          output-dir: action-untrusted-config-artifacts
+
+      - name: Assert security rule remained enabled
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.untrusted_config.outcome }}
+          EXIT_CODE: ${{ steps.untrusted_config.outputs.exit-code }}
+          JSON_REPORT: ${{ steps.untrusted_config.outputs.json-report }}
+        run: |
+          test "$OUTCOME" = "failure"
+          test "$EXIT_CODE" = "2"
+          grep -q '"rule_id": "drop-database"' \
+            "$JSON_REPORT"
+
+      - name: Verify operational failures produce diagnostic artifacts
+        id: operational_error
+        continue-on-error: true
+        uses: ./
+        with:
+          mode: lint
+          path: missing-migration.sql
+          no-cache: "true"
+          output-dir: action-operational-error-artifacts
+
+      - name: Assert operational error artifact contract
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.operational_error.outcome }}
+          EXIT_CODE: ${{ steps.operational_error.outputs.exit-code }}
+          JSON_REPORT: ${{ steps.operational_error.outputs.json-report }}
+          MARKDOWN_REPORT: ${{ steps.operational_error.outputs.markdown-report }}
+          DIAGNOSTIC_LOG: ${{ steps.operational_error.outputs.diagnostic-log }}
+        run: |
+          test "$OUTCOME" = "failure"
+          test "$EXIT_CODE" = "1"
+          test -s "$JSON_REPORT"
+          test -s "$MARKDOWN_REPORT"
+          test -s "$DIAGNOSTIC_LOG"
+          jq -e \
+            '.status == "operational_error" and .exit_code == 1' \
+            "$JSON_REPORT"
+          grep -q 'missing-migration.sql' \
+            "$DIAGNOSTIC_LOG"

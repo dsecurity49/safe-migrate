@@ -1,6 +1,7 @@
 // FILE: src/report/reporter.rs
 use crate::analysis::state::Confidence;
-use crate::report::violations::{Violation, ViolationTier};
+use crate::report::violations::{ReportFinding, Violation, ViolationTier};
+use crate::rules::destructive::IRREVERSIBLE_MIGRATION_RULE_ID;
 use comfy_table::Table;
 use owo_colors::{OwoColorize, Style};
 
@@ -23,12 +24,23 @@ impl Verdict {
         }
     }
 
-    pub fn recommendation(&self) -> &'static str {
+    pub fn recommendation(&self, confidence: &Confidence) -> &'static str {
+        if confidence == &Confidence::Tainted {
+            return match self {
+                Verdict::Halt => "do not deploy",
+                Verdict::SafeWithRisk => {
+                    "irreversible operations present and baseline evidence is uncertain — ensure backups exist and review before deploying"
+                }
+                _ => {
+                    "no blocking finding, but baseline evidence is uncertain — review before deploying"
+                }
+            };
+        }
         match self {
             Verdict::Halt => "do not deploy",
             Verdict::Cautious => "review warnings before deploy",
             Verdict::SafeWithRisk => "irreversible operations present — ensure backups exist",
-            Verdict::Safe => "safe to deploy",
+            Verdict::Safe => "no modeled blocking findings",
         }
     }
 }
@@ -39,7 +51,7 @@ pub fn compute_verdict(violations: &[Violation]) -> Verdict {
     let has_tier2 = violations.iter().any(|v| v.tier == ViolationTier::Tier2);
     let has_irreversible_tier3 = violations
         .iter()
-        .any(|v| v.tier == ViolationTier::Tier3 && v.rule_id == "irreversible-migration");
+        .any(|v| v.tier == ViolationTier::Tier3 && v.rule_id == IRREVERSIBLE_MIGRATION_RULE_ID);
 
     match (has_tier1, has_tier2, has_irreversible_tier3) {
         (true, _, _) => Verdict::Halt,
@@ -79,17 +91,118 @@ fn terminal_width() -> usize {
 pub struct Reporter;
 
 impl Reporter {
-    pub fn print_json_report(violations: &[Violation], confidence: &Confidence) {
+    pub const JSON_SCHEMA_VERSION: u32 = 1;
+
+    pub fn json_report(violations: &[Violation], confidence: &Confidence) -> serde_json::Value {
         let verdict = compute_verdict(violations);
-        let output = serde_json::json!({
+        serde_json::json!({
+            "schema_version": Self::JSON_SCHEMA_VERSION,
             "confidence": match confidence {
                 Confidence::Exact => "Exact",
                 Confidence::Tainted => "Tainted",
             },
             "verdict": verdict.label(),
             "violations": violations,
-        });
-        println!("{}", serde_json::to_string_pretty(&output).unwrap());
+        })
+    }
+
+    /// Additive JSON rendering that includes file/line locations when analysis
+    /// was invoked with source-aware reporting.
+    pub fn json_report_with_locations(
+        findings: &[ReportFinding],
+        confidence: &Confidence,
+    ) -> serde_json::Value {
+        let violations: Vec<_> = findings
+            .iter()
+            .map(|finding| finding.violation.clone())
+            .collect();
+        let mut report = Self::json_report(&violations, confidence);
+        report["violations"] =
+            serde_json::to_value(findings).expect("Report findings must always serialize to JSON");
+        report
+    }
+
+    /// Deterministic Markdown rendering for pull-request artifacts. It uses
+    /// the same verdict, confidence, tier, and finding data as JSON output.
+    pub fn markdown_report(findings: &[ReportFinding], confidence: &Confidence) -> String {
+        let violations: Vec<_> = findings
+            .iter()
+            .map(|finding| finding.violation.clone())
+            .collect();
+        let verdict = compute_verdict(&violations);
+        let confidence = match confidence {
+            Confidence::Exact => "Exact",
+            Confidence::Tainted => "Tainted",
+        };
+        let tier1 = violations
+            .iter()
+            .filter(|violation| violation.tier == ViolationTier::Tier1)
+            .count();
+        let tier2 = violations
+            .iter()
+            .filter(|violation| violation.tier == ViolationTier::Tier2)
+            .count();
+        let tier3 = violations
+            .iter()
+            .filter(|violation| violation.tier == ViolationTier::Tier3)
+            .count();
+
+        let mut output = format!(
+            "# safe-migrate report\n\n**Verdict:** {}  \n**Confidence:** {}\n\n| Severity | Findings |\n| --- | ---: |\n| HALT (Tier 1) | {} |\n| WARN (Tier 2) | {} |\n| SAFE (Tier 3) | {} |\n",
+            verdict.label(),
+            confidence,
+            tier1,
+            tier2,
+            tier3
+        );
+
+        if findings.is_empty() {
+            output.push_str("\nNo findings detected.\n");
+            return output;
+        }
+
+        output.push_str("\n## Findings\n");
+        for finding in findings {
+            let violation = &finding.violation;
+            output.push_str(&format!(
+                "\n### {} — `{}`\n\n",
+                markdown_tier_label(&violation.tier),
+                markdown_code(violation.rule_id)
+            ));
+            if let Some(location) = &finding.location {
+                output.push_str(&format!(
+                    "**Location:** `{}:{}:{}`  \n",
+                    markdown_code(&location.file),
+                    location.line,
+                    location.column
+                ));
+            }
+            output.push_str(&format!(
+                "**Object:** {} {}  \n**Reason:** {}  \n**Recommendation:** {}\n",
+                violation.object_kind,
+                markdown_escape(&violation.object_name),
+                markdown_escape(&violation.reason),
+                markdown_escape(
+                    &violation
+                        .recipe
+                        .lines()
+                        .map(str::trim)
+                        .filter(|line| !line.is_empty())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                )
+            ));
+            if let Some(sql) = &violation.sql
+                && !sql.trim().is_empty()
+            {
+                output.push_str(&markdown_sql_block(sql.trim()));
+            }
+        }
+        output
+    }
+
+    pub fn should_halt(violations: &[Violation]) -> bool {
+        compute_verdict(violations) == Verdict::Halt
     }
 
     pub fn print_report(violations: &[Violation], confidence: &Confidence) -> bool {
@@ -240,13 +353,39 @@ impl Reporter {
         summary_table.add_row(vec!["Verdict", &format!(": {}", verdict.label())]);
         summary_table.add_row(vec![
             "Recommendation",
-            &format!(": {}", verdict.recommendation()),
+            &format!(": {}", verdict.recommendation(confidence)),
         ]);
         summary_table.add_row(vec!["HALT (Tier 1)", &format!(": {}", tier1)]);
         summary_table.add_row(vec!["WARN (Tier 2)", &format!(": {}", tier2)]);
         summary_table.add_row(vec!["SAFE (Tier 3)", &format!(": {}", tier3)]);
         println!("{}", summary_table);
 
-        verdict == Verdict::Halt
+        Self::should_halt(violations)
     }
+}
+
+fn markdown_tier_label(tier: &ViolationTier) -> &'static str {
+    match tier {
+        ViolationTier::Tier1 => "HALT",
+        ViolationTier::Tier2 => "WARN",
+        ViolationTier::Tier3 => "SAFE",
+    }
+}
+
+fn markdown_escape(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('|', "\\|")
+}
+
+fn markdown_code(value: &str) -> String {
+    value.replace('`', "'")
+}
+
+fn markdown_sql_block(sql: &str) -> String {
+    let longest_backtick_run = sql
+        .split(|character| character != '`')
+        .map(str::len)
+        .max()
+        .unwrap_or(0);
+    let fence = "`".repeat(longest_backtick_run.max(2) + 1);
+    format!("\n{fence}sql\n{sql}\n{fence}\n")
 }

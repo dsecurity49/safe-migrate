@@ -1,140 +1,267 @@
 // FILE: src/sync.rs
 
 use crate::ast::identifiers::ObjectId;
-use crate::db::cache::{DbCache, ForeignKeyCache, IndexCache};
+use crate::db::cache::{CACHE_V3_MAGIC, DbCache, DbCacheVersioned, ForeignKeyCache, IndexCache};
+use crate::db::cache_file::protect_cache_bytes;
 use crate::model::relation::{Persistence, RelationKind, RelationState};
 use anyhow::{Context, Result};
-use postgres::{Client, NoTls};
-use std::fs;
+use postgres::config::Host;
+use postgres::{Client, Config as PostgresConfig, NoTls};
+use std::io::Write;
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tempfile::NamedTempFile;
 
-pub fn sync_cache(out_path: &Path, schemas: Option<&[String]>) -> Result<()> {
+#[cfg(windows)]
+use std::fs;
+
+pub fn sync_cache(
+    out_path: &Path,
+    schemas: Option<&[String]>,
+    cache_encryption: bool,
+) -> Result<()> {
     // Strict env-only credential enforcement
     let db_url = std::env::var("DATABASE_URL")
-        .context("DATABASE_URL environment variable is required to sync database stats. Do not pass credentials via CLI flags or config files.")?;
+        .context("DATABASE_URL environment variable is required to sync PostgreSQL schema metadata and statistics. Do not pass credentials via CLI flags or config files.")?;
 
-    // Destructive cache removal prevents corrupted reads on failures
-    if out_path.exists() {
-        fs::remove_file(out_path).context("Failed to remove old cache file before sync")?;
-    }
-
-    // Warn if connecting to a non-local host without TLS
-    let host = db_url
-        .split('@')
-        .nth(1)
-        .and_then(|h| h.split('/').next())
-        .unwrap_or("localhost");
-    if !host.starts_with("localhost")
-        && !host.starts_with("127.")
-        && !host.starts_with("/")
-        && host != "::1"
-    {
-        eprintln!(
-            "[WARN] Connecting to PostgreSQL at {} without TLS encryption.\n\
-             The database password will be sent in cleartext over the network.\n\
-             Use an SSH tunnel or a local connection for sensitive databases,\n\
-             or add native-tls support (see https://github.com/dsecurity49/safe-migrate).",
-            host
-        );
-    }
-
-    let mut client = Client::connect(&db_url, NoTls).context("Failed to connect to PostgreSQL")?;
+    let mut client = connect_database(&db_url)?;
 
     let cache = populate_cache(&mut client, schemas)?;
 
-    // Atomic write via temp file
-    let tmp_path = out_path.with_extension("tmp");
-    let file = std::fs::File::create(&tmp_path).context("Failed to create temporary cache file")?;
-    let writer = std::io::BufWriter::new(file);
-    let mut encoder =
-        zstd::stream::Encoder::new(writer, 3).context("Failed to init zstd compression")?;
+    write_cache(out_path, cache, cache_encryption)
+}
 
-    let versioned = crate::db::cache::DbCacheVersioned::V5(cache);
+fn connect_database(db_url: &str) -> Result<Client> {
+    let config: PostgresConfig = db_url
+        .parse()
+        .context("DATABASE_URL is not a valid PostgreSQL connection string")?;
+
+    if config
+        .get_hosts()
+        .iter()
+        .any(|host| matches!(host, Host::Tcp(name) if !is_local_host(name)))
+    {
+        anyhow::bail!(
+            "Remote DATABASE_URL connections are not supported by this build. Use an SSH tunnel and connect through localhost or a Unix socket."
+        );
+    }
+
+    config
+        .connect(NoTls)
+        .context("Failed to connect to PostgreSQL")
+}
+
+pub(crate) fn is_local_host(host: &str) -> bool {
+    if host.starts_with('/') || host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|address| address.is_loopback())
+}
+
+pub(crate) fn cache_search_path(
+    database_search_path: Vec<String>,
+    schemas: Option<&[String]>,
+) -> Vec<String> {
+    let Some(schemas) = schemas else {
+        return database_search_path;
+    };
+
+    let mut scoped_search_path = Vec::new();
+    for schema in database_search_path
+        .into_iter()
+        .filter(|schema| schemas.contains(schema))
+        .chain(schemas.iter().cloned())
+    {
+        if !scoped_search_path.contains(&schema) {
+            scoped_search_path.push(schema);
+        }
+    }
+    scoped_search_path
+}
+
+pub(crate) fn relation_owner_id(owner_name: impl Into<String>) -> ObjectId {
+    ObjectId::new("", owner_name)
+}
+
+pub(crate) fn is_system_schema(schema: &str) -> bool {
+    schema == "information_schema" || schema.starts_with("pg_")
+}
+
+fn write_cache(out_path: &Path, cache: DbCache, cache_encryption: bool) -> Result<()> {
+    write_cache_with_protection(out_path, cache, |compressed| {
+        protect_cache_bytes(compressed, cache_encryption)
+    })
+}
+
+fn write_cache_with_protection(
+    out_path: &Path,
+    cache: DbCache,
+    protect: impl FnOnce(Vec<u8>) -> Result<Vec<u8>>,
+) -> Result<()> {
+    let parent = out_path.parent().unwrap_or_else(|| Path::new("."));
+    let mut temp_file = NamedTempFile::new_in(parent).with_context(|| {
+        format!(
+            "Failed to create temporary cache file beside {}",
+            out_path.display()
+        )
+    })?;
+    let mut compressed = Vec::new();
+    let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3)
+        .context("Failed to init zstd compression")?;
+
+    encoder
+        .write_all(CACHE_V3_MAGIC)
+        .context("Failed to write cache V3 payload header")?;
+
+    let versioned = DbCacheVersioned::V3(cache);
     let bincode_config = bincode::config::standard().with_variable_int_encoding();
 
     bincode::serde::encode_into_std_write(&versioned, &mut encoder, bincode_config)
-        .context("Failed binary bincode 2.0 schema compilation and write")?;
+        .context("Failed bincode schema compilation and write")?;
 
     encoder
         .finish()
         .context("Failed to flush final zstd stream to disk")?;
 
-    fs::rename(&tmp_path, out_path).context("Failed to atomically rename cache file")?;
+    let cache_bytes = protect(compressed)?;
+    temp_file
+        .write_all(&cache_bytes)
+        .context("Failed to write cache payload")?;
+    temp_file.flush().context("Failed to flush cache payload")?;
+
+    replace_cache(temp_file, out_path)?;
 
     Ok(())
 }
 
+#[cfg(not(windows))]
+fn replace_cache(temp_file: NamedTempFile, out_path: &Path) -> Result<()> {
+    temp_file
+        .persist(out_path)
+        .map_err(|error| error.error)
+        .with_context(|| {
+            format!(
+                "Failed to atomically replace cache file: {}",
+                out_path.display()
+            )
+        })?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn replace_cache(temp_file: NamedTempFile, out_path: &Path) -> Result<()> {
+    if !out_path.exists() {
+        temp_file
+            .persist(out_path)
+            .map_err(|error| error.error)
+            .with_context(|| format!("Failed to install cache file: {}", out_path.display()))?;
+        return Ok(());
+    }
+
+    let backup = out_path.with_extension("safe-migrate.backup");
+    fs::rename(out_path, &backup).with_context(|| {
+        format!(
+            "Failed to stage existing cache for replacement: {}",
+            out_path.display()
+        )
+    })?;
+
+    match temp_file.persist(out_path) {
+        Ok(_) => {
+            fs::remove_file(&backup).with_context(|| {
+                format!(
+                    "Installed new cache but failed to remove backup: {}",
+                    backup.display()
+                )
+            })?;
+            Ok(())
+        }
+        Err(error) => {
+            let restore_result = fs::rename(&backup, out_path);
+            let message = if let Err(restore_error) = restore_result {
+                format!(
+                    "Failed to install new cache: {}. The old cache could not be restored: {}",
+                    error.error, restore_error
+                )
+            } else {
+                format!(
+                    "Failed to install new cache; restored the previous cache: {}",
+                    error.error
+                )
+            };
+            Err(anyhow::anyhow!(message))
+        }
+    }
+}
+
 pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result<DbCache> {
     let mut cache = DbCache::new();
+    let schema_values = schemas.map(|items| items.to_vec());
+    cache.metadata.created_at_unix_secs = Some(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    );
+    cache.metadata.schemas = schema_values.clone();
 
-    let schema_filter = if let Some(s) = schemas {
-        format!("AND n.nspname = ANY(ARRAY['{}'])", s.join("','"))
-    } else {
-        "".to_string()
-    };
-
-    let schema_filter_with_fk = if let Some(s) = schemas {
-        let arr = format!("ARRAY['{}']", s.join("','"));
-        format!(
-            "AND (
-            n.nspname = ANY({arr})
+    let schema_filter = "AND ($1::text[] IS NULL OR n.nspname = ANY($1))";
+    let schema_filter_with_fk = r#"
+        AND (
+            $1::text[] IS NULL
+            OR n.nspname = ANY($1)
             OR c.oid IN (
                 SELECT conrelid FROM pg_constraint cst
                 JOIN pg_class c2 ON c2.oid = cst.confrelid
                 JOIN pg_namespace n2 ON n2.oid = c2.relnamespace
-                WHERE n2.nspname = ANY({arr})
+                WHERE n2.nspname = ANY($1)
             )
             OR c.oid IN (
                 SELECT confrelid FROM pg_constraint cst
                 JOIN pg_class c2 ON c2.oid = cst.conrelid
                 JOIN pg_namespace n2 ON n2.oid = c2.relnamespace
-                WHERE n2.nspname = ANY({arr})
+                WHERE n2.nspname = ANY($1)
             )
-        )"
         )
-    } else {
-        "".to_string()
-    };
-
-    let schema_filter_n1_or_n2 = if let Some(s) = schemas {
-        let arr = format!("ARRAY['{}']", s.join("','"));
-        format!("AND (n1.nspname = ANY({arr}) OR n2.nspname = ANY({arr}))")
-    } else {
-        "".to_string()
-    };
-
-    let schema_filter_nt = if let Some(s) = schemas {
-        let arr = format!("ARRAY['{}']", s.join("','"));
-        format!(
-            "AND (
-            n_t.nspname = ANY({arr})
+    "#;
+    let schema_filter_n1_or_n2 =
+        "AND ($1::text[] IS NULL OR n1.nspname = ANY($1) OR n2.nspname = ANY($1))";
+    let schema_filter_nt = r#"
+        AND (
+            $1::text[] IS NULL
+            OR n_t.nspname = ANY($1)
             OR t.oid IN (
                 SELECT conrelid FROM pg_constraint cst
                 JOIN pg_class c2 ON c2.oid = cst.confrelid
                 JOIN pg_namespace n2 ON n2.oid = c2.relnamespace
-                WHERE n2.nspname = ANY({arr})
+                WHERE n2.nspname = ANY($1)
             )
             OR t.oid IN (
                 SELECT confrelid FROM pg_constraint cst
                 JOIN pg_class c2 ON c2.oid = cst.conrelid
                 JOIN pg_namespace n2 ON n2.oid = c2.relnamespace
-                WHERE n2.nspname = ANY({arr})
+                WHERE n2.nspname = ANY($1)
             )
-        )"
         )
-    } else {
-        "".to_string()
-    };
+    "#;
 
     // Query 1: Server Version
     let version_row = client.query_one("SHOW server_version_num;", &[])?;
     let version_str: String = version_row.get(0);
     cache.pg_version_num = version_str.parse::<u32>().ok();
 
+    let database_row = client.query_one("SELECT current_database();", &[])?;
+    cache.metadata.source_database = Some(database_row.get(0));
+
     // Resolve role/database defaults and special entries such as "$user" exactly
-    // as PostgreSQL does, while excluding the implicit pg_catalog lookup.
+    // as PostgreSQL does, while excluding the implicit pg_catalog lookup. An
+    // explicit schema scope remains the resolution boundary, but selected
+    // schemas retain their live PostgreSQL priority.
     let search_path_row = client.query_one("SELECT current_schemas(false);", &[])?;
-    cache.search_path = search_path_row.get(0);
+    cache.search_path = cache_search_path(search_path_row.get(0), schemas);
 
     // Query 2: Relations + Staleness
     let table_query = format!(
@@ -144,6 +271,7 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
             c.relname AS relation_name,
             c.relkind AS relation_kind,
             c.relpersistence AS persistence,
+            pg_catalog.pg_get_userbyid(c.relowner) AS owner_name,
             CASE WHEN c.reltuples < 0 THEN -1 ELSE c.reltuples::bigint END AS estimated_rows,
             c.relpages::bigint AS relpages,
             to_char(s.last_analyze, 'YYYY-MM-DD HH24:MI:SS') AS last_analyze,
@@ -159,11 +287,12 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
     "
     );
 
-    for row in client.query(&table_query, &[])? {
+    for row in client.query(&table_query, &[&schema_values])? {
         let schema_name: String = row.get("schema_name");
         let relation_name: String = row.get("relation_name");
         let relkind: i8 = row.get("relation_kind");
         let persistence_char: i8 = row.get("persistence");
+        let owner_name: String = row.get("owner_name");
         let raw_rows: i64 = row.get("estimated_rows");
         let relpages: i64 = row.get("relpages");
 
@@ -192,7 +321,7 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
 
         let mut state = RelationState::new(
             object_id.clone(),
-            ObjectId::new("public", "postgres"),
+            relation_owner_id(owner_name),
             0,
             estimated_rows,
             kind,
@@ -245,10 +374,7 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
         ORDER BY n.nspname, c.relname;
     ");
 
-    let mut current_object_id: Option<ObjectId> = None;
-    let mut current_rel: Option<*mut crate::model::relation::RelationState> = None;
-
-    for row in client.query(&col_query, &[])? {
+    for row in client.query(&col_query, &[&schema_values])? {
         let schema_name: String = row.get("schema_name");
         let relation_name: String = row.get("relation_name");
         let column_name: String = row.get("column_name");
@@ -258,27 +384,8 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
         let default_expr_text: Option<String> = row.get("default_expr_text");
         let type_modifier: Option<i32> = row.get("type_modifier");
 
-        // Fast path: reuse the mutable reference if the relation hasn't changed
-        let is_same_rel = if let Some(ref cur) = current_object_id {
-            cur.schema == schema_name && cur.name == relation_name
-        } else {
-            false
-        };
-
-        if !is_same_rel {
-            let new_oid = ObjectId::new(&schema_name, &relation_name);
-            if let Some(rel) = cache.relations.get_mut(&new_oid) {
-                current_rel = Some(rel as *mut _);
-            } else {
-                current_rel = None;
-            }
-            current_object_id = Some(new_oid);
-        }
-
-        if let Some(rel_ptr) = current_rel {
-            // SAFE: We are strictly single-threaded here, iterating rows sequentially.
-            // We just need a way to bypass the borrow checker for caching the map lookup.
-            let rel = unsafe { &mut *rel_ptr };
+        let relation_id = ObjectId::new(&schema_name, &relation_name);
+        if let Some(rel) = cache.relations.get_mut(&relation_id) {
             rel.columns.push(crate::model::column::Column {
                 name: column_name,
                 data_type: Some(type_name),
@@ -307,7 +414,7 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
         GROUP BY n.nspname, c.relname;
     ");
 
-    for row in client.query(&tp_query, &[])? {
+    for row in client.query(&tp_query, &[&schema_values])? {
         let schema_name: String = row.get("schema_name");
         let relation_name: String = row.get("relation_name");
         let triggers: Vec<String> = row.get("triggers");
@@ -342,7 +449,7 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
         "
     );
 
-    for row in client.query(&acl_query, &[])? {
+    for row in client.query(&acl_query, &[&schema_values])? {
         let schema_name: String = row.get("schema_name");
         let relation_name: String = row.get("relation_name");
         let grantee: String = row.get("grantee");
@@ -389,7 +496,7 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
     "
     );
 
-    for row in client.query(&trig_query, &[])? {
+    for row in client.query(&trig_query, &[&schema_values])? {
         let table_schema: String = row.get("table_schema");
         let table_name: String = row.get("table_name");
         let trigger_name: String = row.get("trigger_name");
@@ -426,7 +533,7 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
         "
     );
 
-    for row in client.query(&constraint_query, &[])? {
+    for row in client.query(&constraint_query, &[&schema_values])? {
         let table_schema: String = row.get("table_schema");
         let table_name: String = row.get("table_name");
         let constraint_name: String = row.get("constraint_name");
@@ -467,7 +574,7 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
     "
     );
 
-    for row in client.query(&fk_query, &[])? {
+    for row in client.query(&fk_query, &[&schema_values])? {
         let constraint_name: String = row.get("constraint_name");
         let from_schema: String = row.get("from_schema");
         let from_table: String = row.get("from_table");
@@ -513,15 +620,23 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
         JOIN pg_class t ON t.oid = x.indrelid
         JOIN pg_namespace n_t ON n_t.oid = t.relnamespace
         WHERE x.indisvalid = true
+          AND n_i.nspname !~ '^pg_'
+          AND n_i.nspname <> 'information_schema'
+          AND n_t.nspname !~ '^pg_'
+          AND n_t.nspname <> 'information_schema'
         {schema_filter_nt};
     "
     );
 
-    for row in client.query(&idx_query, &[])? {
+    for row in client.query(&idx_query, &[&schema_values])? {
         let index_schema: String = row.get("index_schema");
         let index_name: String = row.get("index_name");
         let table_schema: String = row.get("table_schema");
         let table_name: String = row.get("table_name");
+
+        if is_system_schema(&index_schema) || is_system_schema(&table_schema) {
+            continue;
+        }
 
         cache.indexes.push(IndexCache {
             index_id: ObjectId::new(&index_schema, &index_name),
@@ -553,7 +668,7 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
     "
     );
 
-    for row in client.query(&func_query, &[])? {
+    for row in client.query(&func_query, &[&schema_values])? {
         let schema_name: String = row.get("schema_name");
         let func_name: String = row.get("func_name");
         let arg_types_str: String = row.get("arg_types");
@@ -629,7 +744,7 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
         "
     );
 
-    for row in client.query(&type_query, &[])? {
+    for row in client.query(&type_query, &[&schema_values])? {
         let schema_name: String = row.get("schema_name");
         let type_name: String = row.get("type_name");
         let type_kind: String = row.get("type_kind");
@@ -656,7 +771,6 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
     }
 
     // Query 9: Dependencies (pg_depend)
-    let dependency_schemas = schemas.map(|items| items.to_vec());
     let depend_query = r#"
         SELECT
             d.classid, d.objid, d.objsubid,
@@ -689,7 +803,7 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
           )
     "#;
 
-    for row in client.query(depend_query, &[&dependency_schemas])? {
+    for row in client.query(depend_query, &[&schema_values])? {
         let classid: u32 = row.get(0);
         let objid: u32 = row.get(1);
         let objsubid: i32 = row.get(2);
@@ -739,13 +853,17 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
         JOIN pg_namespace tn ON tn.oid = tc.relnamespace
         WHERE vc.relkind IN ('v', 'm')
           AND d.deptype = 'n'
+          -- PostgreSQL 14/15 expose an internal rewrite-rule self-edge. It is
+          -- not a dependency of the view definition and must not enter the
+          -- modeled dependency graph.
+          AND tc.oid <> vc.oid
           AND (
               $1::text[] IS NULL
               OR (vn.nspname = ANY($1) AND tn.nspname = ANY($1))
           )
     "#;
 
-    for row in client.query(view_depend_query, &[&dependency_schemas])? {
+    for row in client.query(view_depend_query, &[&schema_values])? {
         cache.dependencies.push(crate::db::cache::DependencyCache {
             classid: row.get(0),
             objid: row.get(1),
@@ -762,4 +880,59 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
     }
 
     Ok(cache)
+}
+
+#[cfg(test)]
+mod atomic_write_tests {
+    use super::*;
+    use crate::db::cache::DbCacheVersioned;
+    use std::fs;
+    use std::io::Read;
+
+    #[test]
+    fn production_cache_writer_atomically_replaces_and_decodes() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cache_path = temp_dir.path().join("baseline.cache");
+        fs::write(&cache_path, b"old-cache").unwrap();
+
+        let mut cache = DbCache::new();
+        cache.pg_version_num = Some(180002);
+        write_cache(&cache_path, cache, false).unwrap();
+
+        let encoded = fs::read(&cache_path).unwrap();
+        assert_ne!(encoded, b"old-cache");
+        let reader = std::io::Cursor::new(encoded);
+        let mut decoder = zstd::stream::Decoder::new(reader).unwrap();
+        let mut payload = Vec::new();
+        decoder.read_to_end(&mut payload).unwrap();
+        let payload = payload
+            .strip_prefix(CACHE_V3_MAGIC)
+            .expect("writer must prefix V3 cache payloads");
+        let config = bincode::config::standard().with_variable_int_encoding();
+        let versioned: DbCacheVersioned = bincode::serde::decode_from_slice(payload, config)
+            .unwrap()
+            .0;
+        assert_eq!(versioned.into_cache().unwrap().pg_version_num, Some(180002));
+        assert_eq!(fs::read_dir(temp_dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn production_cache_writer_preserves_old_bytes_after_pre_install_failure() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cache_path = temp_dir.path().join("baseline.cache");
+        fs::write(&cache_path, b"known-good-cache").unwrap();
+
+        let error = write_cache_with_protection(&cache_path, DbCache::new(), |_| {
+            Err(anyhow::anyhow!("injected payload-protection failure"))
+        })
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("injected payload-protection failure")
+        );
+        assert_eq!(fs::read(&cache_path).unwrap(), b"known-good-cache");
+        assert_eq!(fs::read_dir(temp_dir.path()).unwrap().count(), 1);
+    }
 }

@@ -2,10 +2,13 @@ mod common;
 
 mod state_mutation_tests {
     use crate::common::*;
-    use safe_migrate::analysis::graph::DependencyKind;
+    use safe_migrate::analysis::graph::{DependencyEdge, DependencyGraph, DependencyKind};
     use safe_migrate::analysis::state::Confidence;
     use safe_migrate::ast::identifiers::ObjectId;
-    use safe_migrate::model::relation::RelationOverlay;
+    use safe_migrate::db::cache::{DbCache, DependencyCache};
+    use safe_migrate::model::relation::{
+        Persistence, RelationKind, RelationOverlay, RelationState,
+    };
     use safe_migrate::model::sequence::SequenceOverlay;
     use safe_migrate::model::types::{TypeKind, TypeOverlay, TypeState};
 
@@ -32,6 +35,59 @@ mod state_mutation_tests {
     }
 
     #[test]
+    fn cached_view_rewrite_self_edge_is_ignored_but_real_dependency_is_kept() {
+        let view_id = object_id("public", "v");
+        let table_id = object_id("public", "t");
+        let mut cache = DbCache::new();
+
+        for (id, kind) in [
+            (view_id.clone(), RelationKind::View),
+            (table_id.clone(), RelationKind::Table),
+        ] {
+            cache.insert_baseline(
+                id.clone(),
+                RelationState::new(
+                    id,
+                    object_id("public", "owner"),
+                    0,
+                    None,
+                    kind,
+                    Persistence::Permanent,
+                    0,
+                ),
+            );
+        }
+
+        let dependency = |referenced: &ObjectId| DependencyCache {
+            classid: 0,
+            objid: 0,
+            objsubid: 0,
+            refclassid: 0,
+            refobjid: 0,
+            refobjsubid: 0,
+            deptype: "view".to_string(),
+            obj_schema: Some(view_id.schema.clone()),
+            obj_name: Some(view_id.name.clone()),
+            ref_schema: Some(referenced.schema.clone()),
+            ref_name: Some(referenced.name.clone()),
+        };
+        cache.dependencies.push(dependency(&view_id));
+        cache.dependencies.push(dependency(&table_id));
+
+        let state = safe_migrate::AnalysisState::new(cache);
+        assert!(!state.local.graph.edges.iter().any(|edge| {
+            matches!(edge.kind, DependencyKind::ViewDependency { .. })
+                && edge.dependent == view_id
+                && edge.referenced == view_id
+        }));
+        assert!(state.local.graph.edges.iter().any(|edge| {
+            matches!(edge.kind, DependencyKind::ViewDependency { .. })
+                && edge.dependent == view_id
+                && edge.referenced == table_id
+        }));
+    }
+
+    #[test]
     fn test_topology_drop_table() {
         let engine = setup_engine();
         let mut state = setup_state();
@@ -40,6 +96,156 @@ mod state_mutation_tests {
             .analyze("CREATE TABLE t(id int); DROP TABLE t;", &mut state)
             .unwrap();
         assert!(!state.relation_is_present(&object_id("public", "t")));
+    }
+
+    #[test]
+    fn create_if_not_exists_skips_when_another_relation_kind_uses_the_name() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let violations = engine
+            .analyze(
+                "CREATE SEQUENCE occupied; CREATE TABLE IF NOT EXISTS occupied (id int); CREATE TABLE after_skip (id int);",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict")
+        );
+        assert!(state.relation_is_present(&object_id("public", "after_skip")));
+    }
+
+    #[test]
+    fn create_sequence_if_not_exists_skips_when_a_table_uses_the_name() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let violations = engine
+            .analyze(
+                "CREATE TABLE occupied (id int); CREATE SEQUENCE IF NOT EXISTS occupied; CREATE TABLE after_skip (id int);",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict")
+        );
+        assert!(state.relation_is_present(&object_id("public", "after_skip")));
+    }
+
+    #[test]
+    fn drop_trigger_if_exists_is_a_no_op_when_missing() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let violations = engine
+            .analyze(
+                "CREATE TABLE t (id int); DROP TRIGGER IF EXISTS missing ON t; ALTER TABLE t ADD COLUMN later int;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict")
+        );
+        let Some(RelationOverlay::Present(table)) = state.get_relation(&object_id("public", "t"))
+        else {
+            panic!("table should remain present");
+        };
+        assert!(table.has_column("later"));
+    }
+
+    #[test]
+    fn drop_sequence_if_exists_drops_present_names_after_missing_ones() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE SEQUENCE present; DROP SEQUENCE IF EXISTS missing, present;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(!matches!(
+            state.local.sequences.get(&object_id("public", "present")),
+            Some(SequenceOverlay::Present(_))
+        ));
+    }
+
+    #[test]
+    fn cascade_drop_marks_triggers_on_partition_children_as_dropped() {
+        use safe_migrate::model::trigger::TriggerOverlay;
+
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE TABLE parent (id int) PARTITION BY LIST (id); CREATE TABLE child PARTITION OF parent FOR VALUES IN (1); CREATE FUNCTION audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END; $$; CREATE TRIGGER audit_trigger BEFORE INSERT ON child FOR EACH ROW EXECUTE FUNCTION audit(); DROP TABLE parent CASCADE;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(
+            state
+                .local
+                .triggers
+                .values()
+                .all(|trigger| { matches!(trigger, TriggerOverlay::Dropped) })
+        );
+    }
+
+    #[test]
+    fn cascade_drop_removes_constraints_on_cascade_dropped_relations() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE TABLE parent (id int) PARTITION BY LIST (id); CREATE TABLE child PARTITION OF parent FOR VALUES IN (1); ALTER TABLE child ADD CONSTRAINT child_check CHECK (id > 0); DROP TABLE parent CASCADE;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(
+            !state
+                .local
+                .constraints
+                .contains_key(&(object_id("public", "child"), "child_check".to_string())),
+            "constraints for cascade-dropped relations must not remain in state"
+        );
+    }
+
+    #[test]
+    fn failed_drop_table_keeps_owned_triggers_for_later_dependency_checks() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let violations = engine
+            .analyze(
+                "CREATE TABLE t(id int); CREATE FUNCTION f() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END; $$; CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION f(); CREATE VIEW v AS SELECT * FROM t; DROP TABLE t; DROP FUNCTION f();",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(violations.iter().any(|violation| {
+            violation.reason.contains("relation 'public.t")
+                && violation.reason.contains("still has dependent objects")
+        }));
+        assert!(violations.iter().any(|violation| {
+            violation
+                .reason
+                .contains("function 'public.f()' still has dependent triggers")
+        }));
+        assert!(state.relation_is_present(&object_id("public", "t")));
     }
 
     #[test]
@@ -69,6 +275,41 @@ mod state_mutation_tests {
                 .any(|e| e.dependent == object_id("public", "a")
                     && e.referenced == object_id("public", "b"))
         );
+    }
+
+    #[test]
+    fn rename_back_to_original_name_does_not_loop_during_drop() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE TABLE a(id int); ALTER TABLE a RENAME TO b; ALTER TABLE b RENAME TO a; DROP TABLE a;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(!state.relation_is_present(&object_id("public", "a")));
+    }
+
+    #[test]
+    fn malformed_partition_ancestry_is_rejected_without_looping() {
+        let a = object_id("public", "a");
+        let b = object_id("public", "b");
+        let child = object_id("public", "new_child");
+        let mut graph = DependencyGraph::new();
+        graph.edges.push(DependencyEdge::new(
+            a.clone(),
+            b.clone(),
+            DependencyKind::PartitionOf,
+        ));
+        graph.edges.push(DependencyEdge::new(
+            b,
+            a.clone(),
+            DependencyKind::PartitionOf,
+        ));
+
+        assert!(graph.check_partition_cycle(&a, &child));
     }
 
     #[test]
@@ -507,6 +748,22 @@ mod state_mutation_tests {
     }
 
     #[test]
+    fn set_time_zone_does_not_reset_search_path() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "SET search_path TO tenant, public; SET TIME ZONE DEFAULT; CREATE TABLE t(id int);",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(state.relation_is_present(&object_id("tenant", "t")));
+        assert_eq!(state.local.search_path, ["tenant", "public"]);
+    }
+
+    #[test]
     fn test_synced_search_path_is_initial_and_default_path() {
         let engine = setup_engine();
         let mut cache = safe_migrate::db::cache::DbCache::new();
@@ -803,7 +1060,8 @@ mod state_mutation_tests {
         let Some(TriggerOverlay::Present(trigger)) = state
             .local
             .triggers
-            .get(&object_id("public", "check_trigger"))
+            .values()
+            .find(|overlay| matches!(overlay, TriggerOverlay::Present(trigger) if trigger.name == "check_trigger"))
         else {
             panic!("baseline trigger should be hydrated");
         };
@@ -923,12 +1181,48 @@ mod state_mutation_tests {
             Some(FunctionOverlay::Dropped)
         ));
         assert!(matches!(
-            state
-                .local
-                .triggers
-                .get(&object_id("public", "compute_row")),
+            state.local.triggers.values().next(),
             Some(TriggerOverlay::Dropped)
         ));
+    }
+
+    #[test]
+    fn same_named_triggers_on_different_tables_remain_independent() {
+        use safe_migrate::model::trigger::{TriggerEnableMode, TriggerOverlay};
+
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "
+                CREATE TABLE first_table (id integer);
+                CREATE TABLE second_table (id integer);
+                CREATE FUNCTION audit_trigger() RETURNS trigger
+                    LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';
+                CREATE TRIGGER audit AFTER INSERT ON first_table
+                    EXECUTE FUNCTION audit_trigger();
+                CREATE TRIGGER audit AFTER INSERT ON second_table
+                    EXECUTE FUNCTION audit_trigger();
+                ALTER TABLE first_table DISABLE TRIGGER audit;
+                ",
+                &mut state,
+            )
+            .unwrap();
+
+        let modes: Vec<_> = state
+            .local
+            .triggers
+            .values()
+            .filter_map(|overlay| match overlay {
+                TriggerOverlay::Present(trigger) if trigger.name == "audit" => {
+                    Some((trigger.table_id.name.as_str(), trigger.enabled_mode))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(modes.len(), 2);
+        assert!(modes.contains(&("first_table", TriggerEnableMode::Disabled)));
+        assert!(modes.contains(&("second_table", TriggerEnableMode::Origin)));
     }
 
     #[test]

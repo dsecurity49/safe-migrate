@@ -181,3 +181,22 @@ pub struct Violation {
     #[serde(default)]
     pub fk_dependency_related: bool,
 }
+
+/// Stable source location attached at reporting time. Rules remain independent
+/// of file layout; the engine derives this from the parsed statement range.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SourceLocation {
+    pub file: String,
+    pub line: usize,
+    pub column: usize,
+}
+
+/// A violation paired with the file and line that produced it. The flattened
+/// serialization keeps the JSON violation schema additive.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ReportFinding {
+    #[serde(flatten)]
+    pub violation: Violation,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<SourceLocation>,
+}

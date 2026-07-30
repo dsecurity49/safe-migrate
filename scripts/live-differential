@@ -2,38 +2,40 @@
 set -eu
 
 verbosity=0
-rule_filter=
+rule_filter=""
+fixture_filter=""
 
 usage() {
-    printf '%s\n' \
-        'Usage: scripts/live-differential [-v|-vv|-vvv] [--rule RULE_DIR]' \
-        '' \
-        '  -v     Show harness, rule, and fixture lifecycle.' \
-        '  -vv    Also show scopes, search paths, and state counts.' \
-        '  -vvv   Also dump complete normalized live and simulator states.' \
-        '  --rule Run one enabled manifest rule in isolation.' \
-        '' \
-        'DATABASE_URL must identify the PostgreSQL database to validate.'
+    printf '%s\n' "Usage: scripts/live-differential [-v|-vv|-vvv] [--rule RULE_DIRECTORY] [--fixture RULE_DIRECTORY/FILE.sql[,RULE_DIRECTORY/FILE.sql...]]"
+    printf '%s\n' "Requires DATABASE_URL for a disposable PostgreSQL database."
 }
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
         -v)
-            verbosity=1
+            verbosity=$((verbosity + 1))
             ;;
         -vv)
-            verbosity=2
+            verbosity=$((verbosity + 2))
             ;;
         -vvv)
-            verbosity=3
+            verbosity=$((verbosity + 3))
             ;;
         --rule)
-            if [ "$#" -lt 2 ]; then
+            shift
+            if [ "$#" -eq 0 ]; then
                 usage >&2
                 exit 2
             fi
-            rule_filter=$2
+            rule_filter=$1
+            ;;
+        --fixture)
             shift
+            if [ "$#" -eq 0 ]; then
+                usage >&2
+                exit 2
+            fi
+            fixture_filter=$1
             ;;
         -h|--help)
             usage
@@ -47,8 +49,19 @@ while [ "$#" -gt 0 ]; do
     shift
 done
 
-export SAFE_MIGRATE_DIFF_VERBOSITY="$verbosity"
-if [ -n "$rule_filter" ]; then
-    export SAFE_MIGRATE_DIFF_RULE="$rule_filter"
+if [ -z "${DATABASE_URL:-}" ]; then
+    printf '%s\n' "DATABASE_URL is required for the live differential harness." >&2
+    exit 2
 fi
-exec cargo test --test live_differential_harness -- --ignored --nocapture
+
+export SAFE_MIGRATE_DIFF_VERBOSITY=$verbosity
+export SAFE_MIGRATE_REQUIRE_LIVE=1
+if [ -n "$rule_filter" ]; then
+    export SAFE_MIGRATE_DIFF_RULE=$rule_filter
+fi
+if [ -n "$fixture_filter" ]; then
+    export SAFE_MIGRATE_DIFF_FIXTURE=$fixture_filter
+fi
+
+cargo test --locked --test live_differential_harness \
+    live_postgres_differential_harness -- --ignored --nocapture

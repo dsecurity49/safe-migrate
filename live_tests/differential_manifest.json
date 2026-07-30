@@ -1275,10 +1275,6 @@
           "reason": "The fixture does not contain RESTRICT and PostgreSQL correctly rejects the dependent function drop without CASCADE."
         },
         {
-          "fixture": "safe_003_drop_func_cascade.sql",
-          "reason": "CASCADE on DROP FUNCTION correctly cascades to dependent triggers; the broken-compute rule does not fire because CASCADE is the proper resolution (covered by destructive-general-cascade rule 04)."
-        },
-        {
           "fixture": "010_drop_func_simple.sql",
           "reason": "PostgreSQL correctly rejects dropping sm_core.f() because trigger public.t depends on it."
         },

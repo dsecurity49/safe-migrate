@@ -170,4 +170,24 @@ mod chain_execution_tests {
             panic!("items table should be present");
         }
     }
+
+    #[test]
+    fn test_chain_conflict_same_column_same_type_without_if_not_exists() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let violations = engine
+            .analyze(
+                "CREATE TABLE items (id INT);
+                 ALTER TABLE items ADD COLUMN code TEXT;
+                 ALTER TABLE items ADD COLUMN code TEXT;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(violations.iter().any(|violation| {
+            violation.rule_id == "chain-conflict"
+                && violation.reason.contains("column 'code' already exists")
+        }));
+    }
 }

@@ -22,11 +22,11 @@ pub struct AstVisitor;
 
 impl AstVisitor {
     fn resolve_name(n: Name) -> String {
-        Ident::new(n.text().to_string(), n.is_quoted()).resolve()
+        Self::identifier_from_name(n.text(), n.is_quoted()).resolve()
     }
 
     fn resolve_name_ref(nr: &NameRef) -> String {
-        Ident::new(nr.text().to_string(), nr.is_quoted()).resolve()
+        Self::identifier_from_name(nr.text(), nr.is_quoted()).resolve()
     }
 
     pub fn extract(stmt: &Stmt) -> Option<StatementFact> {
@@ -49,7 +49,15 @@ impl AstVisitor {
             Stmt::Grant(node) => return Self::extract_grant(node),
             Stmt::Revoke(node) => return Self::extract_revoke(node),
             Stmt::Begin(_) => return Some(StatementFact::BeginTransaction),
-            Stmt::Commit(_) => return Some(StatementFact::CommitTransaction),
+            Stmt::Commit(node) => {
+                return Some(
+                    if node.chain_token().is_some() && node.no_token().is_none() {
+                        StatementFact::CommitAndChain
+                    } else {
+                        StatementFact::CommitTransaction
+                    },
+                );
+            }
             Stmt::Rollback(node) => return Self::extract_rollback(node),
             Stmt::SavepointCreate(node) => return Some(Self::extract_savepoint(node)),
             Stmt::ReleaseSavepoint(node) => return Some(Self::extract_release_savepoint(node)),
@@ -218,10 +226,7 @@ impl AstVisitor {
             ast::CreateSchemaTarget::NamedSchema(ns) => ns.schema()?.ident_token(),
             ast::CreateSchemaTarget::AuthorizationSchema(aus) => aus.role()?.ident_token(),
         }
-        .map(|n| {
-            let text = n.text().to_string();
-            Ident::new(text.trim_matches('"').to_string(), text.starts_with('"'))
-        })?;
+        .map(|n| Self::identifier_from_token(n.text()))?;
 
         Some(StatementFact::CreateSchema {
             name: QualifiedName::new(None, name),
@@ -231,18 +236,12 @@ impl AstVisitor {
 
     fn extract_alter_schema(node: &ast::AlterSchema) -> Option<StatementFact> {
         let nr = node.schema_ref()?.ident_token()?;
-        let text = nr.text().to_string();
-        let name = QualifiedName::new(
-            None,
-            Ident::new(text.trim_matches('"').to_string(), text.starts_with('"')),
-        );
+        let name = QualifiedName::new(None, Self::identifier_from_token(nr.text()));
         let new_name = node.alter_schema_action().and_then(|a| match a {
-            ast::AlterSchemaAction::SchemaRenameTo(rt) => {
-                rt.schema().and_then(|s| s.ident_token()).map(|n| {
-                    let text = n.text().to_string();
-                    Ident::new(text.trim_matches('"').to_string(), text.starts_with('"'))
-                })
-            }
+            ast::AlterSchemaAction::SchemaRenameTo(rt) => rt
+                .schema()
+                .and_then(|s| s.ident_token())
+                .map(|n| Self::identifier_from_token(n.text())),
             _ => None,
         });
         Some(StatementFact::AlterSchema { name, new_name })
@@ -254,11 +253,7 @@ impl AstVisitor {
         let names: Vec<QualifiedName> = node
             .schema_refs()
             .filter_map(|r| r.ident_token())
-            .map(|nr| {
-                let text = nr.text().to_string();
-                let ident = Ident::new(text.trim_matches('"').to_string(), text.starts_with('"'));
-                QualifiedName::new(None, ident)
-            })
+            .map(|nr| QualifiedName::new(None, Self::identifier_from_token(nr.text())))
             .collect();
 
         if names.is_empty() {
@@ -417,11 +412,7 @@ impl AstVisitor {
                                     .find(|t| t.kind() != SyntaxKind::WHITESPACE)
                             })
                         })
-                        .map(|n| {
-                            let text = n.text().to_string();
-                            Ident::new(text.trim_matches('"').to_string(), text.starts_with('"'))
-                                .resolve()
-                        })
+                        .map(|n| Self::resolve_identifier_token(n.text()))
                     {
                         let mut not_null = false;
                         let mut default = None;
@@ -458,11 +449,7 @@ impl AstVisitor {
                                     .find(|t| t.kind() != SyntaxKind::WHITESPACE)
                             })
                         })
-                        .map(|n| {
-                            let text = n.text().to_string();
-                            Ident::new(text.trim_matches('"').to_string(), text.starts_with('"'))
-                                .resolve()
-                        })
+                        .map(|n| Self::resolve_identifier_token(n.text()))
                     {
                         actions.push(AlterTableActionFact::DropColumn {
                             name,
@@ -474,17 +461,12 @@ impl AstVisitor {
                     let from_ident = rc
                         .column_name_ref()
                         .and_then(|nr| nr.ident_token())
-                        .map(|nr| {
-                            let text = nr.text().to_string();
-                            Ident::new(text.trim_matches('"').to_string(), text.starts_with('"'))
-                        })
+                        .map(|nr| Self::identifier_from_token(nr.text()))
                         .or_else(|| {
-                            rc.syntax().descendants().find_map(NameRef::cast).map(|nr| {
-                                Ident::new(
-                                    nr.text().to_string().trim_matches('"').to_string(),
-                                    nr.is_quoted(),
-                                )
-                            })
+                            rc.syntax()
+                                .descendants()
+                                .find_map(NameRef::cast)
+                                .map(|nr| Self::identifier_from_name(nr.text(), nr.is_quoted()))
                         })
                         .or_else(|| {
                             rc.column_name_ref().and_then(|cnr| {
@@ -492,30 +474,19 @@ impl AstVisitor {
                                     .descendants_with_tokens()
                                     .filter_map(|e| e.into_token())
                                     .find(|t| t.kind() != SyntaxKind::WHITESPACE)
-                                    .map(|t| {
-                                        let text = t.text().to_string();
-                                        Ident::new(
-                                            text.trim_matches('"').to_string(),
-                                            text.starts_with('"'),
-                                        )
-                                    })
+                                    .map(|t| Self::identifier_from_token(t.text()))
                             })
                         });
 
                     let to_ident = rc
                         .column_name()
                         .and_then(|n| n.ident_token())
-                        .map(|nr| {
-                            let text = nr.text().to_string();
-                            Ident::new(text.trim_matches('"').to_string(), text.starts_with('"'))
-                        })
+                        .map(|nr| Self::identifier_from_token(nr.text()))
                         .or_else(|| {
-                            rc.syntax().descendants().find_map(Name::cast).map(|n| {
-                                Ident::new(
-                                    n.text().to_string().trim_matches('"').to_string(),
-                                    n.is_quoted(),
-                                )
-                            })
+                            rc.syntax()
+                                .descendants()
+                                .find_map(Name::cast)
+                                .map(|n| Self::identifier_from_name(n.text(), n.is_quoted()))
                         })
                         .or_else(|| {
                             rc.column_name().and_then(|cn| {
@@ -523,13 +494,7 @@ impl AstVisitor {
                                     .descendants_with_tokens()
                                     .filter_map(|e| e.into_token())
                                     .find(|t| t.kind() != SyntaxKind::WHITESPACE)
-                                    .map(|t| {
-                                        let text = t.text().to_string();
-                                        Ident::new(
-                                            text.trim_matches('"').to_string(),
-                                            text.starts_with('"'),
-                                        )
-                                    })
+                                    .map(|t| Self::identifier_from_token(t.text()))
                             })
                         });
 
@@ -611,11 +576,7 @@ impl AstVisitor {
                     let trigger_name = dt
                         .trigger_ref()
                         .and_then(|tr| tr.ident_token())
-                        .map(|n| {
-                            let text = n.text().to_string();
-                            Ident::new(text.trim_matches('"').to_string(), text.starts_with('"'))
-                                .resolve()
-                        })
+                        .map(|n| Self::resolve_identifier_token(n.text()))
                         .or_else(|| {
                             if dt.all_token().is_some() {
                                 Some("ALL".to_string())
@@ -635,11 +596,7 @@ impl AstVisitor {
                     let trigger_name = et
                         .trigger_ref()
                         .and_then(|tr| tr.ident_token())
-                        .map(|n| {
-                            let text = n.text().to_string();
-                            Ident::new(text.trim_matches('"').to_string(), text.starts_with('"'))
-                                .resolve()
-                        })
+                        .map(|n| Self::resolve_identifier_token(n.text()))
                         .or_else(|| {
                             if et.all_token().is_some() {
                                 Some("ALL".to_string())
@@ -657,22 +614,14 @@ impl AstVisitor {
                 }
                 AlterTableAction::SetSchema(ss) => {
                     if let Some(nr) = ss.schema_ref().and_then(|sr| sr.ident_token()) {
-                        let text = nr.text().to_string();
                         actions.push(AlterTableActionFact::SetSchema {
-                            new_schema: Ident::new(
-                                text.trim_matches('"').to_string(),
-                                text.starts_with('"'),
-                            )
-                            .resolve(),
+                            new_schema: Self::resolve_identifier_token(nr.text()),
                         });
                     }
                 }
                 AlterTableAction::SetTablespace(st) => {
                     if let Some(token) = st.tablespace_ref().and_then(|tr| tr.ident_token()) {
-                        let text = token.text().to_string();
-                        let tablespace =
-                            Ident::new(text.trim_matches('"').to_string(), text.starts_with('"'))
-                                .resolve();
+                        let tablespace = Self::resolve_identifier_token(token.text());
                         actions.push(AlterTableActionFact::SetTablespace { tablespace });
                     }
                 }
@@ -680,11 +629,7 @@ impl AstVisitor {
                     let owner = ot
                         .role_ref()
                         .and_then(|r| r.ident_token())
-                        .map(|t| {
-                            let text = t.text().to_string();
-                            Ident::new(text.trim_matches('"').to_string(), text.starts_with('"'))
-                                .resolve()
-                        })
+                        .map(|t| Self::resolve_identifier_token(t.text()))
                         .or_else(|| {
                             ot.syntax()
                                 .descendants()
@@ -787,11 +732,7 @@ impl AstVisitor {
                     let trigger_name = eat
                         .trigger_ref()
                         .and_then(|tr| tr.ident_token())
-                        .map(|n| {
-                            let text = n.text().to_string();
-                            Ident::new(text.trim_matches('"').to_string(), text.starts_with('"'))
-                                .resolve()
-                        })
+                        .map(|n| Self::resolve_identifier_token(n.text()))
                         .or_else(|| {
                             eat.syntax()
                                 .descendants()
@@ -804,11 +745,7 @@ impl AstVisitor {
                     let trigger_name = ert
                         .trigger_ref()
                         .and_then(|tr| tr.ident_token())
-                        .map(|n| {
-                            let text = n.text().to_string();
-                            Ident::new(text.trim_matches('"').to_string(), text.starts_with('"'))
-                                .resolve()
-                        })
+                        .map(|n| Self::resolve_identifier_token(n.text()))
                         .or_else(|| {
                             ert.syntax()
                                 .descendants()
@@ -825,7 +762,7 @@ impl AstVisitor {
                         if let Some(idx) = parts.iter().position(|&p| p == "column")
                             && idx + 1 < parts.len()
                         {
-                            let c_name = parts[idx + 1].trim_matches('"').to_string();
+                            let c_name = Self::resolve_identifier_token(parts[idx + 1]);
                             actions.push(AlterTableActionFact::SetStorage { column: c_name });
                         }
                     }
@@ -885,8 +822,7 @@ impl AstVisitor {
                 .filter_map(|e| e.into_token())
                 .find(|t| t.kind() != SyntaxKind::WHITESPACE)
         })?;
-        let text = name_token.text().to_string();
-        let name = Ident::new(text.trim_matches('"').to_string(), text.starts_with('"')).resolve();
+        let name = Self::resolve_identifier_token(name_token.text());
         let ty = col.ty().map(|t| t.syntax().text().to_string());
         let not_null = col
             .constraints()
@@ -1013,20 +949,13 @@ impl AstVisitor {
                 .constraint_name_clause()
                 .and_then(|cn| cn.constraint_name())
                 .and_then(|cn| cn.ident_token())
-                .map(|t| {
-                    let text = t.text().to_string();
-                    Ident::new(text.trim_matches('"').to_string(), text.starts_with('"')).resolve()
-                })
+                .map(|t| Self::resolve_identifier_token(t.text()))
                 .or_else(|| {
                     ac.syntax()
                         .descendants()
                         .find_map(ast::ConstraintName::cast)
                         .and_then(|cn| cn.ident_token())
-                        .map(|t| {
-                            let text = t.text().to_string();
-                            Ident::new(text.trim_matches('"').to_string(), text.starts_with('"'))
-                                .resolve()
-                        })
+                        .map(|t| Self::resolve_identifier_token(t.text()))
                 });
             let path = fkc.table_name_ref()?.path_ref()?;
             let references = Self::path_ref_to_qualified_name(&path)?;
@@ -1060,20 +989,13 @@ impl AstVisitor {
                 .constraint_name_clause()
                 .and_then(|cn| cn.constraint_name())
                 .and_then(|cn| cn.ident_token())
-                .map(|t| {
-                    let text = t.text().to_string();
-                    Ident::new(text.trim_matches('"').to_string(), text.starts_with('"')).resolve()
-                })
+                .map(|t| Self::resolve_identifier_token(t.text()))
                 .or_else(|| {
                     ac.syntax()
                         .descendants()
                         .find_map(ast::ConstraintName::cast)
                         .and_then(|cn| cn.ident_token())
-                        .map(|t| {
-                            let text = t.text().to_string();
-                            Ident::new(text.trim_matches('"').to_string(), text.starts_with('"'))
-                                .resolve()
-                        })
+                        .map(|t| Self::resolve_identifier_token(t.text()))
                 });
             return Some(AlterTableActionFact::AddCheckConstraint {
                 constraint_name,
@@ -1091,10 +1013,7 @@ impl AstVisitor {
                 .descendants()
                 .find_map(ast::ConstraintName::cast)
                 .and_then(|cn| cn.ident_token())
-                .map(|t| {
-                    let text = t.text().to_string();
-                    Ident::new(text.trim_matches('"').to_string(), text.starts_with('"')).resolve()
-                });
+                .map(|t| Self::resolve_identifier_token(t.text()));
             return Some(AlterTableActionFact::AddUniqueConstraint { constraint_name });
         }
 
@@ -1142,10 +1061,7 @@ impl AstVisitor {
                         .find(|t| t.kind() != SyntaxKind::WHITESPACE)
                 })
             })
-            .map(|t| {
-                let text = t.text().to_string();
-                Ident::new(text.trim_matches('"').to_string(), text.starts_with('"')).resolve()
-            });
+            .map(|t| Self::resolve_identifier_token(t.text()));
         col.constraints()
             .filter_map(|c| {
                 if let ColumnConstraint::ReferencesConstraint(rc) = c {
@@ -1182,10 +1098,7 @@ impl AstVisitor {
                 .constraint_name_clause()
                 .and_then(|cn| cn.constraint_name())
                 .and_then(|cn| cn.ident_token())
-                .map(|t| {
-                    let text = t.text().to_string();
-                    Ident::new(text.trim_matches('"').to_string(), text.starts_with('"')).resolve()
-                });
+                .map(|t| Self::resolve_identifier_token(t.text()));
             let path = fkc
                 .table_name_ref()
                 .and_then(|t| t.path_ref())
@@ -1219,10 +1132,9 @@ impl AstVisitor {
     fn extract_column_list_names(cl: ast::ColumnRefList) -> Vec<String> {
         cl.column_refs()
             .filter_map(|col| {
-                col.name_ref().and_then(|nr| nr.ident_token()).map(|nr| {
-                    let text = nr.text().to_string();
-                    Ident::new(text.trim_matches('"').to_string(), text.starts_with('"')).resolve()
-                })
+                col.name_ref()
+                    .and_then(|nr| nr.ident_token())
+                    .map(|nr| Self::resolve_identifier_token(nr.text()))
             })
             .collect()
     }
@@ -1330,37 +1242,25 @@ impl AstVisitor {
             }
             ast::AlterViewAction::OwnerTo(ot) => {
                 let token = ot.role_ref()?.ident_token()?;
-                let text = token.text().to_string();
                 Some(StatementFact::AlterView {
                     name,
                     action: crate::analysis::facts::AlterViewAction::OwnerTo {
-                        new_owner: Ident::new(
-                            text.trim_matches('"').to_string(),
-                            text.starts_with('"'),
-                        )
-                        .resolve(),
+                        new_owner: Self::resolve_identifier_token(token.text()),
                     },
                 })
             }
             ast::AlterViewAction::SetSchema(ss) => {
                 let token = ss.schema_ref()?.ident_token()?;
-                let text = token.text().to_string();
                 Some(StatementFact::AlterView {
                     name,
                     action: crate::analysis::facts::AlterViewAction::SetSchema {
-                        new_schema: Ident::new(
-                            text.trim_matches('"').to_string(),
-                            text.starts_with('"'),
-                        )
-                        .resolve(),
+                        new_schema: Self::resolve_identifier_token(token.text()),
                     },
                 })
             }
             ast::AlterViewAction::AlterViewColumn(avc) => {
                 let col_token = avc.name()?.ident_token()?;
-                let text = col_token.text().to_string();
-                let col_name =
-                    Ident::new(text.trim_matches('"').to_string(), text.starts_with('"')).resolve();
+                let col_name = Self::resolve_identifier_token(col_token.text());
 
                 if avc.drop_default().is_some() {
                     Some(StatementFact::AlterView {
@@ -1386,18 +1286,10 @@ impl AstVisitor {
             }
             ast::AlterViewAction::RenameColumn(rc) => {
                 let from_token = rc.column_name_ref()?.ident_token()?;
-                let text_from = from_token.text().to_string();
-                let from = Ident::new(
-                    text_from.trim_matches('"').to_string(),
-                    text_from.starts_with('"'),
-                );
+                let from = Self::identifier_from_token(from_token.text());
 
                 let to_token = rc.column_name()?.ident_token()?;
-                let text_to = to_token.text().to_string();
-                let to = Ident::new(
-                    text_to.trim_matches('"').to_string(),
-                    text_to.starts_with('"'),
-                );
+                let to = Self::identifier_from_token(to_token.text());
 
                 Some(StatementFact::AlterView {
                     name,
@@ -1431,12 +1323,11 @@ impl AstVisitor {
         let path = node.view_ref()?.path_ref()?;
         let new_name = node.action().find_map(|action| {
             if let squawk_syntax::ast::AlterMaterializedViewAction::ViewRenameTo(rt) = action {
-                rt.view()?.path()?.segment()?.name().map(|n| {
-                    Ident::new(
-                        n.text().to_string().trim_matches('"').to_string(),
-                        n.is_quoted(),
-                    )
-                })
+                rt.view()?
+                    .path()?
+                    .segment()?
+                    .name()
+                    .map(|n| Self::identifier_from_name(n.text(), n.is_quoted()))
             } else {
                 None
             }
@@ -1518,7 +1409,9 @@ impl AstVisitor {
 
         let mut local_declarations = Vec::new();
         for name_node in syntax.descendants().filter_map(Name::cast) {
-            local_declarations.push(name_node.text().to_string().trim_matches('"').to_string());
+            local_declarations.push(
+                Self::identifier_from_name(name_node.text(), name_node.is_quoted()).resolve(),
+            );
         }
         for cte_name in syntax.descendants().filter_map(CteName::cast) {
             if let Some(tok) = cte_name.ident_token() {
@@ -1530,7 +1423,7 @@ impl AstVisitor {
             let text = n.text().to_string();
             let upper = text.to_uppercase();
             let is_quoted = n.is_quoted();
-            let clean_text = text.trim_matches('"').to_string();
+            let clean_text = Self::identifier_from_token(&text).text;
 
             if !is_quoted && keywords.contains(&upper.as_str()) {
                 continue;
@@ -1771,8 +1664,7 @@ impl AstVisitor {
 
     fn extract_create_policy(node: &CreatePolicy) -> Option<StatementFact> {
         let name_token = node.policy()?.ident_token()?;
-        let text = name_token.text().to_string();
-        let name = Ident::new(text.trim_matches('"').to_string(), text.starts_with('"')).resolve();
+        let name = Self::resolve_identifier_token(name_token.text());
         let path = node.on_table()?.table_name_ref()?.path_ref()?;
         let table = Self::path_ref_to_qualified_name(&path)?;
 
@@ -1812,8 +1704,7 @@ impl AstVisitor {
         let path = node.on_table()?.table_name_ref()?.path_ref()?;
         let table = Self::path_ref_to_qualified_name(&path)?;
         let name_token = node.policy_ref()?.ident_token()?;
-        let text = name_token.text().to_string();
-        let name = Ident::new(text.trim_matches('"').to_string(), text.starts_with('"')).resolve();
+        let name = Self::resolve_identifier_token(name_token.text());
         Some(StatementFact::DropPolicy {
             name,
             table,
@@ -1823,28 +1714,19 @@ impl AstVisitor {
 
     fn extract_create_trigger(node: &CreateTrigger) -> Option<StatementFact> {
         let name_token = node.trigger()?.ident_token()?;
-        let text = name_token.text().to_string();
-        let name = Ident::new(text.trim_matches('"').to_string(), text.starts_with('"')).resolve();
+        let name = Self::resolve_identifier_token(name_token.text());
         let path = node.on_relation()?.relation_name_ref()?.path_ref()?;
         let table = Self::path_ref_to_qualified_name(&path)?;
         let function = node.call_expr().and_then(|call| {
             let node_ref = call.syntax();
             let fn_name = node_ref.descendants().find_map(Name::cast).map(|n| {
-                let ident = Ident::new(
-                    n.text().to_string().trim_matches('"').to_string(),
-                    n.is_quoted(),
-                );
-                QualifiedName::new(None, ident)
+                QualifiedName::new(None, Self::identifier_from_name(n.text(), n.is_quoted()))
             });
             if fn_name.is_some() {
                 return fn_name;
             }
             node_ref.descendants().find_map(NameRef::cast).map(|n| {
-                let ident = Ident::new(
-                    n.text().to_string().trim_matches('"').to_string(),
-                    n.is_quoted(),
-                );
-                QualifiedName::new(None, ident)
+                QualifiedName::new(None, Self::identifier_from_name(n.text(), n.is_quoted()))
             })
         });
         Some(StatementFact::CreateTrigger {
@@ -1856,9 +1738,7 @@ impl AstVisitor {
 
     fn extract_drop_trigger(node: &DropTrigger) -> Option<StatementFact> {
         let trigger_token = node.trigger_ref()?.ident_token()?;
-        let text = trigger_token.text().to_string();
-        let trigger_name =
-            Ident::new(text.trim_matches('"').to_string(), text.starts_with('"')).resolve();
+        let trigger_name = Self::resolve_identifier_token(trigger_token.text());
         let table_path = node.on_relation()?.relation_name_ref()?.path_ref()?;
         let table = Self::path_ref_to_qualified_name(&table_path)?;
         Some(StatementFact::DropTrigger {
@@ -1878,10 +1758,10 @@ impl AstVisitor {
                 Some(ast::ParamMode::ParamOut(_)) => crate::analysis::facts::ParamModeFact::Out,
                 _ => crate::analysis::facts::ParamModeFact::In,
             },
-            name: param.name().and_then(|n| n.ident_token()).map(|t| {
-                let text = t.text().to_string();
-                Ident::new(text.trim_matches('"').to_string(), text.starts_with('"')).resolve()
-            }),
+            name: param
+                .name()
+                .and_then(|n| n.ident_token())
+                .map(|t| Self::resolve_identifier_token(t.text())),
             ty: param
                 .ty()
                 .map(|t| t.syntax().text().to_string())
@@ -2059,13 +1939,8 @@ impl AstVisitor {
             }
             ast::AlterFunctionAction::SetSchema(ss) => {
                 let token = ss.schema_ref()?.ident_token()?;
-                let text = token.text().to_string();
                 Some(crate::analysis::facts::AlterFunctionAction::SchemaChange {
-                    new_schema: Ident::new(
-                        text.trim_matches('"').to_string(),
-                        text.starts_with('"'),
-                    )
-                    .resolve(),
+                    new_schema: Self::resolve_identifier_token(token.text()),
                 })
             }
             ast::AlterFunctionAction::DependsOnExtension(de) => {
@@ -2471,12 +2346,7 @@ impl AstVisitor {
 
     fn extract_role(role_ref: &squawk_syntax::ast::RoleRef) -> crate::analysis::facts::RoleFact {
         if let Some(token) = role_ref.ident_token() {
-            let raw = token.text().to_string();
-            let name = if !raw.starts_with('"') {
-                raw.to_lowercase()
-            } else {
-                raw.trim_matches('"').to_string()
-            };
+            let name = Self::resolve_identifier_token(token.text());
             return crate::analysis::facts::RoleFact::Named {
                 name,
                 via_legacy_group_syntax: role_ref.group_token().is_some(),
@@ -2498,12 +2368,7 @@ impl AstVisitor {
             .filter_map(|x| x.into_token())
             .find(|t| t.kind() != SyntaxKind::WHITESPACE && t.kind() != SyntaxKind::COMMENT)
         {
-            let raw = token.text().to_string();
-            let name = if !raw.starts_with('"') {
-                raw.to_lowercase()
-            } else {
-                raw.trim_matches('"').to_string()
-            };
+            let name = Self::resolve_identifier_token(token.text());
             return crate::analysis::facts::RoleFact::Named {
                 name,
                 via_legacy_group_syntax: via_group,
@@ -2589,8 +2454,8 @@ impl AstVisitor {
         } else if let Some(role_ref) = cmd.role_ref() {
             if let Some(ident) = role_ref.ident_token() {
                 let raw = ident.text().to_string();
-                let name = raw.trim_matches('"').to_string();
-                if !raw.starts_with('"') {
+                let name = Self::resolve_identifier_token(&raw);
+                if !Self::identifier_from_token(&raw).quoted {
                     match name.as_str() {
                         "insert" => return crate::analysis::facts::PrivilegeFact::Insert,
                         "update" => return crate::analysis::facts::PrivilegeFact::Update,
@@ -2883,10 +2748,9 @@ impl AstVisitor {
                 let schemas: Vec<String> = sc
                     .config_values()
                     .filter_map(|cv| match cv {
-                        ast::ConfigValue::ConfigValueName(cvn) => cvn.ident_token().map(|t| {
-                            let text = t.text().to_string();
-                            text.trim_matches('"').to_string()
-                        }),
+                        ast::ConfigValue::ConfigValueName(cvn) => cvn
+                            .ident_token()
+                            .map(|t| Self::resolve_identifier_token(t.text())),
                         ast::ConfigValue::Literal(_) => None,
                     })
                     .filter(|s| s.to_lowercase() != "default")
@@ -2902,11 +2766,6 @@ impl AstVisitor {
                     })
                 }
             }
-            SetTarget::SetTimeZone(stz) if stz.default_token().is_some() => {
-                Some(StatementFact::SetSearchPath {
-                    target: SearchPathTarget::Default,
-                })
-            }
             _ => None,
         }
     }
@@ -2919,9 +2778,12 @@ impl AstVisitor {
         match node
             .savepoint_ref()
             .and_then(|s| s.ident_token())
-            .map(|t| t.text().to_string())
+            .map(|t| Self::resolve_identifier_token(t.text()))
         {
             Some(name) => Some(StatementFact::RollbackToSavepoint { name }),
+            None if node.chain_token().is_some() && node.no_token().is_none() => {
+                Some(StatementFact::RollbackAndChain)
+            }
             None => Some(StatementFact::RollbackTransaction),
         }
     }
@@ -2931,7 +2793,7 @@ impl AstVisitor {
             name: node
                 .savepoint()
                 .and_then(|s| s.ident_token())
-                .map(|n| n.text().to_string())
+                .map(|n| Self::resolve_identifier_token(n.text()))
                 .unwrap_or_default(),
         }
     }
@@ -2941,20 +2803,39 @@ impl AstVisitor {
             name: node
                 .savepoint_ref()
                 .and_then(|s| s.ident_token())
-                .map(|t| t.text().to_string())
+                .map(|t| Self::resolve_identifier_token(t.text()))
                 .unwrap_or_default(),
+        }
+    }
+
+    fn resolve_identifier_token(text: impl AsRef<str>) -> String {
+        Self::identifier_from_token(text).resolve()
+    }
+
+    fn identifier_from_token(text: impl AsRef<str>) -> Ident {
+        Self::identifier_from_name(text, false)
+    }
+
+    fn identifier_from_name(text: impl AsRef<str>, quoted: bool) -> Ident {
+        let text = text.as_ref();
+        match text
+            .strip_prefix('"')
+            .and_then(|rest| rest.strip_suffix('"'))
+        {
+            Some(inner) => Ident::new(inner.replace("\"\"", "\""), true),
+            None => Ident::new(text.to_string(), quoted),
         }
     }
 
     fn segment_ident(segment: PathSegment) -> Option<Ident> {
         if let Some(nr) = segment.syntax().descendants().find_map(NameRef::cast) {
-            Some(Ident::new(nr.text().to_string(), nr.is_quoted()))
+            Some(Self::identifier_from_name(nr.text(), nr.is_quoted()))
         } else {
             segment
                 .syntax()
                 .descendants()
                 .find_map(Name::cast)
-                .map(|n| Ident::new(n.text().to_string(), n.is_quoted()))
+                .map(|n| Self::identifier_from_name(n.text(), n.is_quoted()))
         }
     }
 
@@ -2966,7 +2847,7 @@ impl AstVisitor {
             if let Some(segment) = pr.segment()
                 && let Some(nr) = segment.name_ref()
             {
-                segments.push(Ident::new(nr.text().to_string(), nr.is_quoted()));
+                segments.push(Self::identifier_from_name(nr.text(), nr.is_quoted()));
             }
             current_ref = pr.qualifier();
         }
@@ -3000,7 +2881,7 @@ impl AstVisitor {
                 if let Some(seg) = r.segment()
                     && let Some(nr) = seg.name_ref()
                 {
-                    segments.push(Ident::new(nr.text().to_string(), nr.is_quoted()));
+                    segments.push(Self::identifier_from_name(nr.text(), nr.is_quoted()));
                 }
                 current_ref = r.qualifier();
             }

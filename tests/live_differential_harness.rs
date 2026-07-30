@@ -18,6 +18,8 @@ use std::time::{Duration, Instant};
 
 const VERBOSITY_ENV: &str = "SAFE_MIGRATE_DIFF_VERBOSITY";
 const RULE_FILTER_ENV: &str = "SAFE_MIGRATE_DIFF_RULE";
+const FIXTURE_FILTER_ENV: &str = "SAFE_MIGRATE_DIFF_FIXTURE";
+const REQUIRE_LIVE_ENV: &str = "SAFE_MIGRATE_REQUIRE_LIVE";
 
 #[derive(Debug, Deserialize)]
 struct DifferentialManifest {
@@ -217,6 +219,10 @@ fn live_postgres_differential_harness() {
     let database_url = match std::env::var("DATABASE_URL") {
         Ok(value) => value,
         Err(_) => {
+            assert!(
+                !live_database_is_required(),
+                "live differential harness requires DATABASE_URL"
+            );
             eprintln!("skipping live differential harness: DATABASE_URL is not set");
             return;
         }
@@ -225,6 +231,10 @@ fn live_postgres_differential_harness() {
     let mut client = match Client::connect(&database_url, NoTls) {
         Ok(client) => client,
         Err(error) => {
+            assert!(
+                !live_database_is_required(),
+                "live differential harness requires reachable PostgreSQL: {error}"
+            );
             eprintln!("skipping live differential harness: PostgreSQL is unreachable: {error}");
             return;
         }
@@ -257,6 +267,7 @@ fn live_postgres_differential_harness() {
     let engine = SafeMigrateEngine::new(Config::default());
     let mut mismatches = Vec::new();
     let rule_filter = std::env::var(RULE_FILTER_ENV).ok();
+    let fixture_filter = std::env::var(FIXTURE_FILTER_ENV).ok();
     let selected_rules = || {
         manifest.rules.iter().filter(|rule| {
             rule.enabled
@@ -266,21 +277,18 @@ fn live_postgres_differential_harness() {
         })
     };
     let enabled_rules = selected_rules().count();
-    let enabled_fixtures = manifest
-        .rules
-        .iter()
-        .filter(|rule| {
-            rule.enabled
-                && rule_filter
-                    .as_deref()
-                    .is_none_or(|selected| selected == rule.rule_dir)
+    let enabled_fixtures = selected_rules()
+        .map(|rule| {
+            rule.fixtures
+                .iter()
+                .filter(|fixture| fixture_is_selected(&fixture_filter, &rule.rule_dir, fixture))
+                .count()
         })
-        .map(|rule| rule.fixtures.len())
         .sum::<usize>();
-    if enabled_rules == 0 {
+    if enabled_rules == 0 || enabled_fixtures == 0 {
         panic!(
-            "no enabled differential rule matched {}={:?}",
-            RULE_FILTER_ENV, rule_filter
+            "no enabled differential fixture matched {}={:?}, {}={:?}",
+            RULE_FILTER_ENV, rule_filter, FIXTURE_FILTER_ENV, fixture_filter
         );
     }
     verbose(
@@ -327,7 +335,11 @@ fn live_postgres_differential_harness() {
                 );
             }
         }
-        for fixture in &rule.fixtures {
+        for fixture in rule
+            .fixtures
+            .iter()
+            .filter(|fixture| fixture_is_selected(&fixture_filter, &rule.rule_dir, fixture))
+        {
             let scope = rule
                 .fixture_scopes
                 .get(fixture)
@@ -591,12 +603,25 @@ fn live_postgres_differential_harness() {
     );
 }
 
+fn fixture_is_selected(filter: &Option<String>, rule_dir: &str, fixture: &str) -> bool {
+    filter.as_deref().is_none_or(|selected| {
+        selected
+            .split(',')
+            .map(str::trim)
+            .any(|candidate| candidate == format!("{rule_dir}/{fixture}"))
+    })
+}
+
 fn differential_verbosity() -> u8 {
     std::env::var(VERBOSITY_ENV)
         .ok()
         .and_then(|value| value.parse::<u8>().ok())
         .unwrap_or(0)
         .min(3)
+}
+
+fn live_database_is_required() -> bool {
+    std::env::var_os(REQUIRE_LIVE_ENV).is_some()
 }
 
 fn verbose(verbosity: u8, level: u8, message: impl std::fmt::Display) {
@@ -630,11 +655,170 @@ fn repo_path(relative: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(relative)
 }
 
+#[test]
+fn differential_manifest_accounts_for_every_sql_fixture() {
+    load_manifest(&repo_path("live_tests/differential_manifest.json"));
+}
+
 fn load_manifest(path: &Path) -> DifferentialManifest {
     let raw = fs::read_to_string(path)
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
-    serde_json::from_str(&raw)
-        .unwrap_or_else(|error| panic!("failed to parse {}: {error}", path.display()))
+    let manifest = serde_json::from_str(&raw)
+        .unwrap_or_else(|error| panic!("failed to parse {}: {error}", path.display()));
+    validate_manifest(&manifest, path);
+    manifest
+}
+
+fn validate_manifest(manifest: &DifferentialManifest, path: &Path) {
+    let live_tests_dir = path
+        .parent()
+        .unwrap_or_else(|| panic!("manifest has no parent directory: {}", path.display()));
+    let actual_rule_dirs = directory_names(live_tests_dir);
+    let mut manifest_rule_dirs = BTreeSet::new();
+
+    for rule in &manifest.rules {
+        assert!(
+            manifest_rule_dirs.insert(rule.rule_dir.clone()),
+            "duplicate differential manifest rule directory: {}",
+            rule.rule_dir
+        );
+
+        let included = unique_fixture_names(
+            &rule.rule_dir,
+            "fixtures",
+            rule.fixtures.iter().map(String::as_str),
+        );
+        let excluded = unique_fixture_names(
+            &rule.rule_dir,
+            "excluded_fixtures",
+            rule.excluded_fixtures
+                .iter()
+                .map(|exclusion| exclusion.fixture.as_str()),
+        );
+        for exclusion in &rule.excluded_fixtures {
+            assert!(
+                !exclusion.reason.trim().is_empty(),
+                "excluded fixture {}/{} has no reason",
+                rule.rule_dir,
+                exclusion.fixture
+            );
+        }
+
+        let overlap = included
+            .intersection(&excluded)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(
+            overlap.is_empty(),
+            "differential fixtures cannot be both included and excluded for {}: {overlap:?}",
+            rule.rule_dir
+        );
+
+        for fixture in rule.fixture_scopes.keys() {
+            assert!(
+                included.contains(fixture),
+                "fixture scope references a non-included fixture: {}/{}",
+                rule.rule_dir,
+                fixture
+            );
+        }
+
+        let rule_dir = live_tests_dir.join(&rule.rule_dir);
+        let actual_fixtures = sql_fixture_names(&rule_dir);
+        let accounted_for = included.union(&excluded).cloned().collect::<BTreeSet<_>>();
+        let unlisted = actual_fixtures
+            .difference(&accounted_for)
+            .cloned()
+            .collect::<Vec<_>>();
+        let missing = accounted_for
+            .difference(&actual_fixtures)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(
+            unlisted.is_empty() && missing.is_empty(),
+            "differential manifest mismatch for {}: unlisted={unlisted:?}, missing={missing:?}",
+            rule.rule_dir
+        );
+    }
+
+    assert_eq!(
+        manifest_rule_dirs, actual_rule_dirs,
+        "differential manifest rule directories do not match live_tests"
+    );
+}
+
+fn unique_fixture_names<'a>(
+    rule_dir: &str,
+    field: &str,
+    fixtures: impl Iterator<Item = &'a str>,
+) -> BTreeSet<String> {
+    let mut unique = BTreeSet::new();
+    for fixture in fixtures {
+        assert!(
+            unique.insert(fixture.to_string()),
+            "duplicate fixture in {rule_dir}.{field}: {fixture}"
+        );
+    }
+    unique
+}
+
+fn directory_names(path: &Path) -> BTreeSet<String> {
+    fs::read_dir(path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
+        .map(|entry| {
+            entry.unwrap_or_else(|error| {
+                panic!(
+                    "failed to read directory entry in {}: {error}",
+                    path.display()
+                )
+            })
+        })
+        .filter(|entry| {
+            entry
+                .file_type()
+                .unwrap_or_else(|error| {
+                    panic!("failed to inspect {}: {error}", entry.path().display())
+                })
+                .is_dir()
+        })
+        .map(|entry| {
+            entry.file_name().into_string().unwrap_or_else(|name| {
+                panic!("non-UTF-8 directory name in {}: {name:?}", path.display())
+            })
+        })
+        .filter(|name| name.starts_with("rule_"))
+        .collect()
+}
+
+fn sql_fixture_names(path: &Path) -> BTreeSet<String> {
+    fs::read_dir(path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
+        .map(|entry| {
+            entry.unwrap_or_else(|error| {
+                panic!(
+                    "failed to read directory entry in {}: {error}",
+                    path.display()
+                )
+            })
+        })
+        .filter(|entry| {
+            entry
+                .file_type()
+                .unwrap_or_else(|error| {
+                    panic!("failed to inspect {}: {error}", entry.path().display())
+                })
+                .is_file()
+                && entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "sql")
+        })
+        .map(|entry| {
+            entry.file_name().into_string().unwrap_or_else(|name| {
+                panic!("non-UTF-8 fixture name in {}: {name:?}", path.display())
+            })
+        })
+        .collect()
 }
 
 fn check_required_relations(rule: &RuleManifest, fixture: &str, cache: &DbCache) -> Vec<Mismatch> {
@@ -870,6 +1054,10 @@ fn snapshot_live_state(
               AND vn.nspname = ANY($1)
               AND tn.nspname = ANY($1)
               AND d.deptype = 'n'
+              -- PostgreSQL 14/15 expose an internal rewrite-rule self-edge
+              -- here. It is not a view-to-relation dependency that the
+              -- simulator should model.
+              AND tc.oid <> vc.oid
             ",
             &[&schema_names],
         )? {
@@ -972,7 +1160,7 @@ fn snapshot_simulator_state(state: &AnalysisState, scope: &[ComparisonScope]) ->
             projection.triggers.insert(
                 (
                     qualified_name(&edge.referenced.schema, &edge.referenced.name),
-                    trigger_id.name.clone(),
+                    trigger.name.clone(),
                 ),
                 NormalizedTrigger {
                     function: qualified_name(&function_id.schema, &function_id.name),

@@ -81,6 +81,44 @@ mod tests {
     }
 
     #[test]
+    fn test_quoted_identifiers_unescape_doubled_quotes() {
+        let facts = parse_and_extract(
+            r#"
+            CREATE SCHEMA "schema""name";
+            CREATE TABLE "table""name" ("column""name" int);
+            CREATE POLICY "policy""name" ON "table""name";
+            CREATE TRIGGER "trigger""name" BEFORE INSERT ON "table""name"
+                FOR EACH ROW EXECUTE FUNCTION "function""name"();
+        "#,
+        );
+
+        match &facts[0] {
+            StatementFact::CreateSchema { name, .. } => {
+                assert_eq!(name.name.resolve(), "schema\"name");
+            }
+            _ => panic!("expected create schema fact"),
+        }
+        match &facts[1] {
+            StatementFact::CreateTable { name, columns, .. } => {
+                assert_eq!(name.name.resolve(), "table\"name");
+                assert_eq!(columns[0].name, "column\"name");
+            }
+            _ => panic!("expected create table fact"),
+        }
+        match &facts[2] {
+            StatementFact::CreatePolicy { name, .. } => assert_eq!(name, "policy\"name"),
+            _ => panic!("expected create policy fact"),
+        }
+        match &facts[3] {
+            StatementFact::CreateTrigger { name, function, .. } => {
+                assert_eq!(name, "trigger\"name");
+                assert_eq!(function.as_ref().unwrap().name.resolve(), "function\"name");
+            }
+            _ => panic!("expected create trigger fact"),
+        }
+    }
+
+    #[test]
     fn test_create_table_with_default_expr() {
         let sql = "CREATE TABLE events (id INT, created_at TIMESTAMP DEFAULT NOW());";
         let facts = parse_and_extract_statement(sql);
@@ -453,6 +491,24 @@ mod tests {
     }
 
     #[test]
+    fn test_commit_and_chain() {
+        let facts = parse_and_extract_statement("COMMIT AND CHAIN;");
+        assert!(matches!(facts, Some(StatementFact::CommitAndChain)));
+
+        let facts = parse_and_extract_statement("COMMIT AND NO CHAIN;");
+        assert!(matches!(facts, Some(StatementFact::CommitTransaction)));
+    }
+
+    #[test]
+    fn test_rollback_and_chain() {
+        let facts = parse_and_extract_statement("ROLLBACK AND CHAIN;");
+        assert!(matches!(facts, Some(StatementFact::RollbackAndChain)));
+
+        let facts = parse_and_extract_statement("ROLLBACK AND NO CHAIN;");
+        assert!(matches!(facts, Some(StatementFact::RollbackTransaction)));
+    }
+
+    #[test]
     fn test_savepoint() {
         let sql = "SAVEPOINT sp1;";
         let facts = parse_and_extract_statement(sql);
@@ -462,6 +518,41 @@ mod tests {
                 assert_eq!(name, "sp1");
             }
             _ => panic!("Expected Savepoint fact"),
+        }
+    }
+
+    #[test]
+    fn test_savepoint_identifier_casing_matches_postgres() {
+        let unquoted = parse_and_extract_statement("SAVEPOINT MixedCase;").unwrap();
+        assert!(matches!(
+            unquoted,
+            StatementFact::Savepoint { name } if name == "mixedcase"
+        ));
+
+        let quoted = parse_and_extract_statement("SAVEPOINT \"MixedCase\";").unwrap();
+        assert!(matches!(
+            quoted,
+            StatementFact::Savepoint { name } if name == "MixedCase"
+        ));
+
+        let escaped = parse_and_extract_statement("SAVEPOINT \"a\"\"b\";").unwrap();
+        assert!(matches!(
+            escaped,
+            StatementFact::Savepoint { name } if name == "a\"b"
+        ));
+
+        for (sql, expected) in [
+            ("ROLLBACK TO MixedCase;", "mixedcase"),
+            ("ROLLBACK TO \"MixedCase\";", "MixedCase"),
+            ("RELEASE SAVEPOINT MixedCase;", "mixedcase"),
+            ("RELEASE SAVEPOINT \"MixedCase\";", "MixedCase"),
+        ] {
+            let fact = parse_and_extract_statement(sql).unwrap();
+            match fact {
+                StatementFact::RollbackToSavepoint { name }
+                | StatementFact::ReleaseSavepoint { name } => assert_eq!(name, expected),
+                _ => panic!("expected savepoint reference"),
+            }
         }
     }
 
@@ -489,6 +580,11 @@ mod tests {
             } => {}
             _ => panic!("Expected SetSearchPath fact"),
         }
+    }
+
+    #[test]
+    fn test_set_time_zone_does_not_produce_a_search_path_fact() {
+        assert!(parse_and_extract_statement("SET TIME ZONE DEFAULT;").is_none());
     }
 
     #[test]

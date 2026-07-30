@@ -27,6 +27,13 @@ impl Rule for DriftDetectionRule {
         _config: &Config,
         _cascade_closure: Option<&CascadeResult>,
     ) -> Vec<Violation> {
+        // A missing cache is not proof that production lacks an object. Keep
+        // the stateful analyzer useful offline without turning every ALTER or
+        // DROP into a false blocking baseline-drift finding.
+        if !state.baseline_available {
+            return Vec::new();
+        }
+
         let mut violations = Vec::new();
 
         match mutation {
@@ -361,6 +368,22 @@ impl Rule for DriftDetectionRule {
                 }
             }
             _ => {}
+        }
+
+        // When sync was deliberately scoped, an omitted schema is unknown,
+        // not proof of production drift. Keep the warning, but make it a
+        // coverage warning rather than a false Tier 1 absence claim.
+        for violation in &mut violations {
+            if let Some(schema) =
+                state.baseline_scope_omits_displayed_object(&violation.object_name)
+            {
+                violation.tier = ViolationTier::Tier2;
+                violation.reason = format!(
+                    "Cache does not cover schema \"{}\"; safe-migrate cannot verify whether {} exists in the production baseline",
+                    schema, violation.object_name
+                );
+                violation.recipe = "Run `safe-migrate sync --schemas ...` with this schema included, or use an unscoped sync, before treating this as a production-drift result.";
+            }
         }
 
         violations

@@ -5,26 +5,18 @@ on:
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+'
 
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  create-release:
-    name: Create GitHub Release
-    runs-on: ubuntu-latest
-    outputs:
-      upload_url: ${{ steps.create_release.outputs.upload_url }}
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Create Release
-        id: create_release
-        uses: softprops/action-gh-release@v2
-        with:
-          generate_release_notes: true
-
   build-release:
-    name: Build and Upload Binaries
-    needs: create-release
+    name: Build ${{ matrix.target }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           # Standard Linux (Ubuntu/Debian)
@@ -51,18 +43,110 @@ jobs:
     
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable 2026-07-16
         with:
           targets: ${{ matrix.target }}
 
-      - name: Build and Upload Binary
-        uses: taiki-e/upload-rust-binary-action@v1
+      - name: Verify release tag matches Cargo package version
+        shell: bash
+        run: |
+          package_version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          test -n "$package_version"
+          test "$GITHUB_REF_NAME" = "v$package_version"
+
+      - name: Build and package binary
+        id: package
+        uses: taiki-e/upload-rust-binary-action@f0d45ae91ee7b8ee928de7a9d04d893a08bcbec6 # v1.30.2
         with:
           bin: safe-migrate
           target: ${{ matrix.target }}
-          token: ${{ secrets.GITHUB_TOKEN }}
           archive: $bin-$target
           checksum: sha256
+          locked: true
+          dry-run: true
+          dry-run-intended: true
+
+      - name: Verify packaged release assets
+        shell: bash
+        run: |
+          archive="${{ steps.package.outputs.tar || steps.package.outputs.zip }}"
+          checksum="${{ steps.package.outputs.sha256 }}"
+          test -n "$archive"
+          test -n "$checksum"
+          test -f "$archive"
+          test -f "$checksum"
+
+      - name: Stage packaged release assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            ${{ steps.package.outputs.tar || steps.package.outputs.zip }}
+            ${{ steps.package.outputs.sha256 }}
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: build-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all packaged release assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Verify complete release asset set
+        shell: bash
+        working-directory: release-assets
+        run: |
+          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 14
+          test "$(find . -maxdepth 1 -type f -name '*.sha256' | wc -l)" -eq 7
+          for checksum in *.sha256; do
+            sha256sum --check "$checksum"
+          done
+
+      - name: Refuse to alter a published release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          release_state="$(
+            gh api --paginate \
+              "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+              --jq '.[] | [.tag_name, .draft] | @tsv' |
+              awk -v tag="$GITHUB_REF_NAME" '$1 == tag { print $2 }'
+          )"
+          case "$release_state" in
+            "")
+              ;;
+            true)
+              ;;
+            *)
+              echo "Refusing to alter an existing published release for ${GITHUB_REF_NAME}." >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Upload assets to a draft release
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        with:
+          draft: true
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: release-assets/*
+
+      - name: Publish the complete release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release edit "$GITHUB_REF_NAME"
+          --repo "$GITHUB_REPOSITORY"
+          --draft=false
+          --latest

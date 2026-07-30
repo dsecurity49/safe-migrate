@@ -1,5 +1,6 @@
 // FILE: src/analysis/graph.rs
 use crate::ast::identifiers::ObjectId;
+use std::collections::HashSet;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum DependencyKind {
@@ -120,7 +121,15 @@ impl DependencyGraph {
 
     pub fn resolve_rename<'a>(&'a self, id: &'a ObjectId) -> &'a ObjectId {
         let mut current = id;
+        let mut visited = HashSet::new();
         loop {
+            // A rename back to an earlier name is valid PostgreSQL. The graph
+            // retains historical aliases, so resolve only acyclic paths; a
+            // cycle has no unique alias target and must leave the supplied
+            // identity unchanged.
+            if !visited.insert(current.clone()) {
+                return id;
+            }
             match self
                 .edges
                 .iter()
@@ -141,7 +150,13 @@ impl DependencyGraph {
         }
 
         let mut current_parent = resolved_parent;
+        let mut visited = HashSet::new();
         loop {
+            if !visited.insert(current_parent.clone()) {
+                // The existing ancestry is already malformed. Reject another
+                // attachment instead of looping or extending the cycle.
+                return true;
+            }
             let maybe_edge = self.edges.iter().find(|e| {
                 matches!(e.kind, DependencyKind::PartitionOf)
                     && self.resolve_rename(&e.dependent) == current_parent

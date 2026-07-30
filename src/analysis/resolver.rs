@@ -777,7 +777,9 @@ impl Resolver {
             }
             StatementFact::BeginTransaction => mutations.push(Mutation::BeginTransaction),
             StatementFact::CommitTransaction => mutations.push(Mutation::CommitTransaction),
+            StatementFact::CommitAndChain => mutations.push(Mutation::CommitAndChain),
             StatementFact::RollbackTransaction => mutations.push(Mutation::RollbackTransaction),
+            StatementFact::RollbackAndChain => mutations.push(Mutation::RollbackAndChain),
             StatementFact::RollbackToSavepoint { name } => {
                 mutations.push(Mutation::RollbackToSavepoint(RollbackToSavepointMutation {
                     name: name.clone(),

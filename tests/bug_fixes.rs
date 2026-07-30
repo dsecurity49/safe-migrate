@@ -2,11 +2,46 @@ mod common;
 
 mod phase10_bug_fixes_and_sorting_tests {
     use crate::common::*;
-    use safe_migrate::analysis::state::AnalysisState;
+    use safe_migrate::analysis::state::{AnalysisState, Confidence};
     use safe_migrate::ast::identifiers::ObjectId;
     use safe_migrate::db::cache::DbCache;
     use safe_migrate::model::relation::{Persistence, RelationKind};
     use safe_migrate::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
+
+    #[test]
+    fn parsed_statement_without_typed_extraction_is_reported_and_taints_state() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let violations = engine
+            .analyze(
+                "COMMENT ON TABLE future_table IS 'created elsewhere';",
+                &mut state,
+            )
+            .expect("Squawk should parse COMMENT ON statements");
+
+        assert!(violations.iter().any(|violation| {
+            violation.rule_id == "opaque-dynamic-sql"
+                && violation.reason.contains("unsupported SQL statement")
+                && violation.recipe.contains("not modeled")
+        }));
+        assert_eq!(state.local.confidence, Confidence::Tainted);
+    }
+
+    #[test]
+    fn non_ascii_sql_before_execute_prefix_does_not_panic_normalization() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            engine.analyze("SELECT 'é';", &mut state)
+        }));
+
+        assert!(
+            result.is_ok(),
+            "normalizing valid non-ASCII SQL must not panic"
+        );
+    }
 
     #[test]
     fn test_bug008_index_not_in_baseline_relations() {
@@ -742,7 +777,7 @@ mod phase10_bug_fixes_and_sorting_tests {
     }
 
     #[test]
-    fn test_finding8_drop_column_no_if_exists_on_nonexistent() {
+    fn drop_nonexistent_column_without_if_exists_reports_exact_conflict() {
         let engine = setup_engine();
         let mut state = setup_state();
 
@@ -750,15 +785,27 @@ mod phase10_bug_fixes_and_sorting_tests {
             .analyze("CREATE TABLE t(id int);", &mut state)
             .unwrap();
 
-        let _v = engine
+        let violations = engine
             .analyze("ALTER TABLE t DROP COLUMN nonexistent_col;", &mut state)
             .unwrap();
 
-        // Without IF EXISTS, confidence should be tainted (table in unknown state)
+        assert!(violations.iter().any(|violation| {
+            violation.rule_id == "chain-conflict"
+                && violation.tier == ViolationTier::Tier1
+                && violation
+                    .reason
+                    .contains("column 'nonexistent_col' does not exist")
+        }));
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.rule_id == "irreversible-migration"),
+            "A failed DROP COLUMN did not perform an irreversible operation"
+        );
         assert_eq!(
             state.local.confidence,
-            safe_migrate::analysis::state::Confidence::Tainted,
-            "Confidence should be Tainted when dropping a nonexistent column without IF EXISTS"
+            safe_migrate::analysis::state::Confidence::Exact,
+            "A known PostgreSQL column conflict does not make simulation uncertain"
         );
     }
 
@@ -979,6 +1026,20 @@ mod phase10_bug_fixes_and_sorting_tests {
         assert!(
             !violations.iter().any(|v| v.rule_id == "drop-database"),
             "ignore directive in line comment should suppress the rule"
+        );
+    }
+
+    #[test]
+    fn directives_in_sql_literals_do_not_suppress_rules() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let sql = "SELECT 'safe-migrate: ignore-file(drop-database)'; DROP DATABASE my_db;";
+        let violations = engine.analyze(sql, &mut state).unwrap();
+
+        assert!(
+            violations.iter().any(|v| v.rule_id == "drop-database"),
+            "directive-like text in a SQL literal must not suppress a rule"
         );
     }
 

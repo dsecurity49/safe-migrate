@@ -4,6 +4,7 @@ mod exhaustive_fuzz_tests {
     use crate::common::*;
     use safe_migrate::analysis::state::AnalysisState;
     use safe_migrate::db::cache::DbCache;
+    use safe_migrate::report::violations::ObjectKind;
 
     /// Helper: create a DbCache with a table in the baseline
     fn cache_with_table(schema: &str, name: &str, rows: Option<u64>) -> DbCache {
@@ -474,23 +475,29 @@ mod exhaustive_fuzz_tests {
     }
 
     #[test]
-    fn fuzz_txn_010_multi_savepoint_chain() {
+    fn rollback_to_savepoint_discards_later_savepoints() {
         let engine = setup_engine();
         let mut state = setup_state();
-        // Pure transaction-control only: no DDL means no violations.
-        // The test verifies that the engine does not panic on a
-        // ROLLBACK-TO followed by RELEASE of the rolled-back savepoint.
-        let v = engine
+        let violations = engine
             .analyze(
                 "BEGIN; SAVEPOINT s1; SAVEPOINT s2; SAVEPOINT s3; ROLLBACK TO s2; RELEASE SAVEPOINT s3; COMMIT;",
                 &mut state,
             )
             .unwrap();
-        assert!(
-            v.is_empty(),
-            "Expected no violations for pure transaction-control SQL, got: {:?}",
-            v
-        );
+
+        let conflict = violations
+            .iter()
+            .find(|violation| {
+                violation.rule_id == "chain-conflict"
+                    && violation.reason.contains("savepoint 's3' does not exist")
+            })
+            .expect("releasing a savepoint discarded by ROLLBACK TO must be reported");
+        assert_eq!(conflict.object_kind, ObjectKind::Unknown);
+        assert_eq!(conflict.object_name, "<migration-state>");
+        assert!(conflict.recipe.contains("schema state"));
+        assert!(!conflict.recipe.contains("each column"));
+        assert!(state.local.transactions.is_empty());
+        assert!(!state.local.transaction_aborted);
     }
 
     // --- Fuzz Group 3: Confidence taint + tier downgrade (30 cases) ---

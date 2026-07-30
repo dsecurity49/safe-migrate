@@ -70,6 +70,22 @@ build_url() {
     "$REPO" "$version" "$BIN_NAME" "$target"
 }
 
+sha256_digest() {
+  file="$1"
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$file" | cut -d' ' -f1
+    return
+  fi
+
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$file" | cut -d' ' -f1
+    return
+  fi
+
+  die "sha256sum or shasum is required to verify release checksums"
+}
+
 candidate_targets() {
   os="$1"
   arch="$2"
@@ -145,26 +161,37 @@ download_asset() {
     return 2
   fi
 
-  # Verify checksum if available
-  sha_url="${url}.sha256"
+  # Every published archive must have an adjacent checksum. Never install an
+  # archive whose checksum is unavailable, malformed, or mismatched.
+  sha_url="${url%.tar.gz}.sha256"
   sha_file="${part}.sha256"
-  if curl -fsSL -o "$sha_file" "$sha_url" 2>/dev/null; then
-    expected=$(cut -d' ' -f1 < "$sha_file" 2>/dev/null || true)
-    if [ -n "$expected" ]; then
-      actual=$(sha256sum "$part" 2>/dev/null | cut -d' ' -f1 || true)
-      if [ "$actual" != "$expected" ]; then
-        rm -f "$part" "$sha_file"
-        log "Checksum mismatch for ${target}. Expected ${expected}, got ${actual}."
-        return 1
-      fi
-      [ "$VERBOSE" -eq 1 ] && log "Checksum verified for ${target}"
-    fi
-    rm -f "$sha_file"
+  if ! curl -fsSL -o "$sha_file" "$sha_url" 2>/dev/null; then
+    rm -f "$part" "$sha_file"
+    printf '%s\n' "integrity-error:${target}:checksum file is unavailable" >&2
+    return 3
   fi
+
+  expected=$(cut -d' ' -f1 < "$sha_file" 2>/dev/null || true)
+  if ! printf '%s\n' "$expected" | grep -Eq '^[[:xdigit:]]{64}$'; then
+    rm -f "$sha_file"
+    rm -f "$part"
+    printf '%s\n' "integrity-error:${target}:checksum file is malformed" >&2
+    return 3
+  fi
+
+  actual=$(sha256_digest "$part")
+  if [ "$actual" != "$expected" ]; then
+    rm -f "$part" "$sha_file"
+    printf '%s\n' "integrity-error:${target}:checksum mismatch" >&2
+    return 3
+  fi
+  rm -f "$sha_file"
+  [ "$VERBOSE" -eq 1 ] && log "Checksum verified for ${target}"
 
   tar -tzf "$part" >/dev/null 2>&1 || {
     rm -f "$part"
-    return 1
+    printf '%s\n' "integrity-error:${target}:archive is invalid" >&2
+    return 3
   }
 
   mv "$part" "$out"
@@ -257,9 +284,46 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+need uname
+
+REQUESTED_VERSION="$(normalize_version "$REQUESTED_VERSION")"
+
+log "Detecting operating system and architecture..."
+
+OS="$(uname -s)"
+ARCH="$(uname -m)"
+
+CANDIDATES="$(candidate_targets "$OS" "$ARCH")"
+INSTALL_DIR="$(pick_install_dir)"
+DEST="${INSTALL_DIR}/${BIN_NAME}"
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  log "[dry-run] No network requests or filesystem changes will be made."
+  if [ "$REQUESTED_VERSION" = "latest" ]; then
+    log "[dry-run] Would query GitHub Releases for the latest version."
+    VERSION_LABEL="<latest release>"
+  else
+    VERSION_LABEL="$REQUESTED_VERSION"
+  fi
+
+  log "[dry-run] Version: ${VERSION_LABEL}"
+  log "[dry-run] Candidate targets: $(printf '%s ' $CANDIDATES)"
+  for candidate in $CANDIDATES; do
+    if [ "$REQUESTED_VERSION" = "latest" ]; then
+      log "[dry-run] Would download and verify ${BIN_NAME}-${candidate}.tar.gz after resolving the release version."
+    else
+      log "[dry-run] Would download and verify $(build_url "$REQUESTED_VERSION" "$candidate")"
+    fi
+  done
+  log "[dry-run] Would extract the selected archive and atomically install ${DEST}"
+  if [ -e "$DEST" ] && [ "$FORCE" -ne 1 ]; then
+    warn "${DEST} already exists; a real install would require --force."
+  fi
+  exit 0
+fi
+
 need curl
 need tar
-need uname
 need sed
 need head
 need grep
@@ -269,13 +333,6 @@ need chmod
 need mkdir
 need mv
 need rm
-
-REQUESTED_VERSION="$(normalize_version "$REQUESTED_VERSION")"
-
-log "Detecting operating system and architecture..."
-
-OS="$(uname -s)"
-ARCH="$(uname -m)"
 
 if [ "$REQUESTED_VERSION" = "latest" ]; then
   log "Fetching latest release version..."
@@ -290,11 +347,10 @@ log "Using version: ${RESOLVED_VERSION}"
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT HUP INT TERM
 
-CANDIDATES="$(candidate_targets "$OS" "$ARCH")"
-
 TAR_FILE=""
 SELECTED_TARGET=""
 NETWORK_ERROR=""
+INTEGRITY_ERROR=""
 
 for candidate in $CANDIDATES; do
   rc=0
@@ -304,11 +360,20 @@ for candidate in $CANDIDATES; do
     break
   elif [ "$rc" -eq 2 ]; then
     NETWORK_ERROR="$(cat "${TMP_DIR}/dl_err" 2>/dev/null || true)"
+  elif [ "$rc" -eq 3 ]; then
+    INTEGRITY_ERROR="$(cat "${TMP_DIR}/dl_err" 2>/dev/null || true)"
+    break
   fi
 done
 
 if [ -z "$TAR_FILE" ]; then
-  if [ -n "$NETWORK_ERROR" ]; then
+  if [ -n "$INTEGRITY_ERROR" ]; then
+    printf 'Error: release integrity verification failed for %s\n' "$RESOLVED_VERSION" >&2
+    if echo "$INTEGRITY_ERROR" | grep -q '^integrity-error:'; then
+      printf '  Target : %s\n' "$(echo "$INTEGRITY_ERROR" | cut -d: -f2)" >&2
+      printf '  Reason : %s\n' "$(echo "$INTEGRITY_ERROR" | cut -d: -f3-)" >&2
+    fi
+  elif [ -n "$NETWORK_ERROR" ]; then
     printf 'Error: network failure downloading %s\n' "$RESOLVED_VERSION" >&2
     if echo "$NETWORK_ERROR" | grep -q '^network-error:'; then
       printf '  Target : %s\n' "$(echo "$NETWORK_ERROR" | cut -d: -f2)" >&2
@@ -334,9 +399,6 @@ if [ ! -f "$BIN_PATH" ]; then
   BIN_PATH="$(find "$TMP_DIR" -type f -name "$BIN_NAME" | head -n 1 || true)"
 fi
 [ -n "$BIN_PATH" ] || die "Binary not found inside archive"
-
-INSTALL_DIR="$(pick_install_dir)"
-DEST="${INSTALL_DIR}/${BIN_NAME}"
 
 if [ -e "$DEST" ] && [ "$FORCE" -ne 1 ]; then
   die "${DEST} already exists. Use --force to overwrite."
