@@ -284,3 +284,7 @@ set both `cache: <path>` and `no-cache: "false"`. The Action exposes
 - [Maintainer documentation](docs/README.md)
 - [Release history](CHANGELOG.md)
 - [Releases and binary downloads](https://github.com/dsecurity49/safe-migrate/releases)
+
+## License
+
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE).
