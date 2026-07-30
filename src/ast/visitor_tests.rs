@@ -81,6 +81,44 @@ mod tests {
     }
 
     #[test]
+    fn test_quoted_identifiers_unescape_doubled_quotes() {
+        let facts = parse_and_extract(
+            r#"
+            CREATE SCHEMA "schema""name";
+            CREATE TABLE "table""name" ("column""name" int);
+            CREATE POLICY "policy""name" ON "table""name";
+            CREATE TRIGGER "trigger""name" BEFORE INSERT ON "table""name"
+                FOR EACH ROW EXECUTE FUNCTION "function""name"();
+        "#,
+        );
+
+        match &facts[0] {
+            StatementFact::CreateSchema { name, .. } => {
+                assert_eq!(name.name.resolve(), "schema\"name");
+            }
+            _ => panic!("expected create schema fact"),
+        }
+        match &facts[1] {
+            StatementFact::CreateTable { name, columns, .. } => {
+                assert_eq!(name.name.resolve(), "table\"name");
+                assert_eq!(columns[0].name, "column\"name");
+            }
+            _ => panic!("expected create table fact"),
+        }
+        match &facts[2] {
+            StatementFact::CreatePolicy { name, .. } => assert_eq!(name, "policy\"name"),
+            _ => panic!("expected create policy fact"),
+        }
+        match &facts[3] {
+            StatementFact::CreateTrigger { name, function, .. } => {
+                assert_eq!(name, "trigger\"name");
+                assert_eq!(function.as_ref().unwrap().name.resolve(), "function\"name");
+            }
+            _ => panic!("expected create trigger fact"),
+        }
+    }
+
+    #[test]
     fn test_create_table_with_default_expr() {
         let sql = "CREATE TABLE events (id INT, created_at TIMESTAMP DEFAULT NOW());";
         let facts = parse_and_extract_statement(sql);

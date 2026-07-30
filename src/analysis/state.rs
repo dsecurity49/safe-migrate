@@ -857,18 +857,16 @@ impl AnalysisState {
                     });
                 }
 
-                let constraints_to_drop: Vec<String> = self
+                let constraints_to_drop: Vec<(ObjectId, String)> = self
                     .local
                     .constraints
                     .keys()
-                    .filter(|(table_id, _)| table_id == &drop_table.id)
-                    .map(|(_, name)| name.clone())
+                    .filter(|(table_id, _)| dropped_relations.contains(&resolve(table_id)))
+                    .cloned()
                     .collect();
-                for name in constraints_to_drop {
-                    self.snapshot_constraint(&drop_table.id, &name);
-                    self.local
-                        .constraints
-                        .remove(&(drop_table.id.clone(), name));
+                for (table_id, name) in constraints_to_drop {
+                    self.snapshot_constraint(&table_id, &name);
+                    self.local.constraints.remove(&(table_id, name));
                 }
 
                 let triggers_to_drop: Vec<ObjectId> = self

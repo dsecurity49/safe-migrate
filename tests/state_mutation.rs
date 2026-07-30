@@ -204,6 +204,27 @@ mod state_mutation_tests {
     }
 
     #[test]
+    fn cascade_drop_removes_constraints_on_cascade_dropped_relations() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE TABLE parent (id int) PARTITION BY LIST (id); CREATE TABLE child PARTITION OF parent FOR VALUES IN (1); ALTER TABLE child ADD CONSTRAINT child_check CHECK (id > 0); DROP TABLE parent CASCADE;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(
+            !state
+                .local
+                .constraints
+                .contains_key(&(object_id("public", "child"), "child_check".to_string())),
+            "constraints for cascade-dropped relations must not remain in state"
+        );
+    }
+
+    #[test]
     fn failed_drop_table_keeps_owned_triggers_for_later_dependency_checks() {
         let engine = setup_engine();
         let mut state = setup_state();
