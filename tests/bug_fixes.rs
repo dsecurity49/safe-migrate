@@ -23,8 +23,24 @@ mod phase10_bug_fixes_and_sorting_tests {
         assert!(violations.iter().any(|violation| {
             violation.rule_id == "opaque-dynamic-sql"
                 && violation.reason.contains("unsupported SQL statement")
+                && violation.recipe.contains("not modeled")
         }));
         assert_eq!(state.local.confidence, Confidence::Tainted);
+    }
+
+    #[test]
+    fn non_ascii_sql_before_execute_prefix_does_not_panic_normalization() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            engine.analyze("SELECT 'é';", &mut state)
+        }));
+
+        assert!(
+            result.is_ok(),
+            "normalizing valid non-ASCII SQL must not panic"
+        );
     }
 
     #[test]

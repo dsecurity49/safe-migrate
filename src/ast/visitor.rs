@@ -2953,8 +2953,13 @@ impl AstVisitor {
     }
 
     fn resolve_identifier_token(text: &str) -> String {
-        let quoted = text.starts_with('"');
-        Ident::new(text.trim_matches('"').to_string(), quoted).resolve()
+        match text
+            .strip_prefix('"')
+            .and_then(|rest| rest.strip_suffix('"'))
+        {
+            Some(inner) => Ident::new(inner.replace("\"\"", "\""), true).resolve(),
+            None => Ident::new(text.to_string(), false).resolve(),
+        }
     }
 
     fn segment_ident(segment: PathSegment) -> Option<Ident> {

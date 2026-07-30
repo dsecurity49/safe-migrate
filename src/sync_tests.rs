@@ -8,6 +8,7 @@ mod tests {
     use crate::sync::{
         cache_search_path, is_local_host, is_system_schema, relation_owner_id, sync_cache,
     };
+    use crate::test_support::EnvironmentValueGuard;
     use std::io::Write;
     use tempfile::NamedTempFile;
 
@@ -16,10 +17,7 @@ mod tests {
         let tmp = NamedTempFile::new().unwrap();
         let path = tmp.path();
 
-        // Ensure DATABASE_URL is not set
-        unsafe {
-            std::env::remove_var("DATABASE_URL");
-        }
+        let _database_url = EnvironmentValueGuard::remove("DATABASE_URL");
 
         let result = sync_cache(path, None, false);
         let error = result.expect_err("sync without DATABASE_URL must fail");
@@ -36,9 +34,7 @@ mod tests {
         tmp.write_all(b"known-good-cache").unwrap();
         tmp.flush().unwrap();
 
-        unsafe {
-            std::env::remove_var("DATABASE_URL");
-        }
+        let _database_url = EnvironmentValueGuard::remove("DATABASE_URL");
 
         assert!(sync_cache(tmp.path(), None, false).is_err());
         assert_eq!(std::fs::read(tmp.path()).unwrap(), b"known-good-cache");
@@ -49,8 +45,10 @@ mod tests {
         assert!(is_local_host("localhost"));
         assert!(is_local_host("127.0.0.1"));
         assert!(is_local_host("::1"));
+        assert!(is_local_host("[::1]"));
         assert!(is_local_host("/var/run/postgresql"));
         assert!(!is_local_host("db.internal.example"));
+        assert!(!is_local_host("127.0.0.1.attacker.example"));
     }
 
     #[test]

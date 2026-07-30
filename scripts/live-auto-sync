@@ -1,6 +1,9 @@
 #!/bin/sh
 set -eu
 
+repository_root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
+cd "$repository_root"
+
 if [ -z "${DATABASE_URL:-}" ]; then
     printf '%s\n' "DATABASE_URL is required for the live auto-sync contract." >&2
     exit 2

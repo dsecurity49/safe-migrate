@@ -1,4 +1,5 @@
 #!/bin/sh
 set -eu
 
-exec scripts/fuzz
+repository_root=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)
+exec "$repository_root/scripts/fuzz"

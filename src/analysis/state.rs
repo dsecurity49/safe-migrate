@@ -771,6 +771,7 @@ impl AnalysisState {
                 };
 
                 let resolved_drop = resolve(&drop_table.id);
+                let mut dropped_relations = HashSet::from([resolved_drop.clone()]);
 
                 if drop_table.cascade {
                     let local_closure;
@@ -781,6 +782,7 @@ impl AnalysisState {
                             &local_closure
                         }
                     };
+                    dropped_relations = closure.dropped_relations.clone();
 
                     for dropped_rel_id in &closure.dropped_relations {
                         self.snapshot_relation(dropped_rel_id);
@@ -880,9 +882,10 @@ impl AnalysisState {
                         let graph_matches = self.local.graph.edges.iter().any(|edge| {
                             matches!(edge.kind, DependencyKind::TriggerOnTable { .. })
                                 && edge.dependent == *id
-                                && edge.referenced == drop_table.id
+                                && dropped_relations.contains(&resolve(&edge.referenced))
                         });
-                        (trigger.table_id == drop_table.id || graph_matches).then(|| id.clone())
+                        (dropped_relations.contains(&resolve(&trigger.table_id)) || graph_matches)
+                            .then(|| id.clone())
                     })
                     .collect();
                 for trigger_id in triggers_to_drop {
@@ -896,7 +899,7 @@ impl AnalysisState {
                 self.snapshot_graph_full();
                 self.local.graph.edges.retain(|e| {
                     !(matches!(e.kind, DependencyKind::TriggerOnTable { .. })
-                        && e.referenced == drop_table.id)
+                        && dropped_relations.contains(&resolve(&e.referenced)))
                 });
 
                 self.snapshot_graph_full();
@@ -912,7 +915,7 @@ impl AnalysisState {
                 MutationResult::Applied
             }
             Mutation::CreateTable(create) => {
-                if create.if_not_exists && self.relation_is_present(&create.id) {
+                if create.if_not_exists && self.relation_namespace_is_taken(&create.id) {
                     return MutationResult::Skipped;
                 }
                 if self.relation_namespace_is_taken(&create.id) {
@@ -1218,11 +1221,15 @@ impl AnalysisState {
                     self.local.triggers.get(&trigger_id),
                     Some(TriggerOverlay::Present(_))
                 ) {
-                    return MutationResult::Conflict {
-                        reason: format!(
-                            "trigger '{}' does not exist on relation '{}'",
-                            drop_trigger.name, drop_trigger.table
-                        ),
+                    return if drop_trigger.if_exists {
+                        MutationResult::Skipped
+                    } else {
+                        MutationResult::Conflict {
+                            reason: format!(
+                                "trigger '{}' does not exist on relation '{}'",
+                                drop_trigger.name, drop_trigger.table
+                            ),
+                        }
                     };
                 }
                 self.snapshot_trigger(&trigger_id);
@@ -1610,7 +1617,7 @@ impl AnalysisState {
                 MutationResult::Applied
             }
             Mutation::CreateSequence(create_seq) => {
-                if create_seq.if_not_exists && self.sequence_is_present(&create_seq.id) {
+                if create_seq.if_not_exists && self.relation_namespace_is_taken(&create_seq.id) {
                     return MutationResult::Skipped;
                 }
                 if self.relation_namespace_is_taken(&create_seq.id) {
@@ -1662,17 +1669,23 @@ impl AnalysisState {
                 MutationResult::Applied
             }
             Mutation::DropSequence(drop_seq) => {
-                let missing = drop_seq.ids.iter().find(|id| !self.sequence_is_present(id));
-                if let Some(id) = missing {
-                    return if drop_seq.if_exists {
-                        MutationResult::Skipped
-                    } else {
-                        MutationResult::Conflict {
-                            reason: format!("sequence '{}' does not exist", id),
-                        }
+                if !drop_seq.if_exists
+                    && let Some(id) = drop_seq.ids.iter().find(|id| !self.sequence_is_present(id))
+                {
+                    return MutationResult::Conflict {
+                        reason: format!("sequence '{}' does not exist", id),
                     };
                 }
-                for id in &drop_seq.ids {
+                let present: Vec<ObjectId> = drop_seq
+                    .ids
+                    .iter()
+                    .filter(|id| self.sequence_is_present(id))
+                    .cloned()
+                    .collect();
+                if present.is_empty() {
+                    return MutationResult::Skipped;
+                }
+                for id in &present {
                     self.snapshot_sequence(id);
                     self.local
                         .sequences
@@ -1681,7 +1694,7 @@ impl AnalysisState {
                 self.snapshot_graph_full();
                 self.local.graph.edges.retain(|e| {
                     !(matches!(e.kind, DependencyKind::SequenceOwnedBy { .. })
-                        && drop_seq.ids.contains(&e.dependent))
+                        && present.contains(&e.dependent))
                 });
                 MutationResult::Applied
             }

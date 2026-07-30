@@ -1,4 +1,5 @@
 // FILE: src/engine/config.rs
+use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
@@ -93,8 +94,17 @@ impl Config {
 
     /// Returns the schema filter for a direct sync. An explicit CLI value wins
     /// over the team-wide configuration default.
-    pub fn sync_schemas<'a>(&'a self, cli_schemas: Option<&'a [String]>) -> Option<&'a [String]> {
-        cli_schemas.or(self.schemas.as_deref())
+    pub fn sync_schemas<'a>(
+        &'a self,
+        cli_schemas: Option<&'a [String]>,
+    ) -> Result<Option<&'a [String]>> {
+        let schemas = cli_schemas.or(self.schemas.as_deref());
+        if schemas.is_some_and(|schemas| {
+            schemas.is_empty() || schemas.iter().any(|schema| schema.trim().is_empty())
+        }) {
+            bail!("schemas must contain at least one non-empty schema name");
+        }
+        Ok(schemas)
     }
 
     /// Reject misspelled primary rule IDs instead of silently accepting no-op
@@ -173,13 +183,20 @@ mod tests {
         let cli_schemas = vec!["auth".to_string()];
 
         assert_eq!(
-            config.sync_schemas(None),
+            config.sync_schemas(None).unwrap(),
             Some(["public".to_string()].as_slice())
         );
         assert_eq!(
-            config.sync_schemas(Some(&cli_schemas)),
+            config.sync_schemas(Some(&cli_schemas)).unwrap(),
             Some(["auth".to_string()].as_slice())
         );
+    }
+
+    #[test]
+    fn test_direct_sync_rejects_empty_schema_scope() {
+        let config = Config::default();
+        assert!(config.sync_schemas(Some(&[])).is_err());
+        assert!(config.sync_schemas(Some(&["".to_string()])).is_err());
     }
 
     #[test]

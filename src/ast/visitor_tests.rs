@@ -496,6 +496,26 @@ mod tests {
             quoted,
             StatementFact::Savepoint { name } if name == "MixedCase"
         ));
+
+        let escaped = parse_and_extract_statement("SAVEPOINT \"a\"\"b\";").unwrap();
+        assert!(matches!(
+            escaped,
+            StatementFact::Savepoint { name } if name == "a\"b"
+        ));
+
+        for (sql, expected) in [
+            ("ROLLBACK TO MixedCase;", "mixedcase"),
+            ("ROLLBACK TO \"MixedCase\";", "MixedCase"),
+            ("RELEASE SAVEPOINT MixedCase;", "mixedcase"),
+            ("RELEASE SAVEPOINT \"MixedCase\";", "MixedCase"),
+        ] {
+            let fact = parse_and_extract_statement(sql).unwrap();
+            match fact {
+                StatementFact::RollbackToSavepoint { name }
+                | StatementFact::ReleaseSavepoint { name } => assert_eq!(name, expected),
+                _ => panic!("expected savepoint reference"),
+            }
+        }
     }
 
     #[test]

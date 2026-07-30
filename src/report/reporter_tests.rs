@@ -153,6 +153,14 @@ mod tests {
     }
 
     #[test]
+    fn test_tainted_safe_with_risk_keeps_backup_guidance() {
+        assert_eq!(
+            Verdict::SafeWithRisk.recommendation(&Confidence::Tainted),
+            "irreversible operations present and baseline evidence is uncertain — ensure backups exist and review before deploying"
+        );
+    }
+
+    #[test]
     fn test_exact_safe_verdict_does_not_guarantee_deployment() {
         let recommendation = Verdict::Safe.recommendation(&Confidence::Exact);
         assert_eq!(recommendation, "no modeled blocking findings");

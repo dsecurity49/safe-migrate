@@ -77,7 +77,7 @@ runs:
         if [ -n "$INPUT_CONFIG" ]; then
           command+=(--config "$INPUT_CONFIG")
         else
-          default_config="$(mktemp "${RUNNER_TEMP}/safe-migrate-default.XXXXXX.toml")"
+          default_config="$(mktemp "${RUNNER_TEMP}/safe-migrate-default.XXXXXX")"
           command+=(--config "$default_config")
         fi
         if [ "$INPUT_NO_CACHE" = "true" ]; then
@@ -88,6 +88,9 @@ runs:
         install_root="${RUNNER_TEMP}/safe-migrate-action"
         cargo install --path "$GITHUB_ACTION_PATH" --locked --root "$install_root"
         binary="${install_root}/bin/safe-migrate"
+        if [ "$RUNNER_OS" = "Windows" ]; then
+          binary="${binary}.exe"
+        fi
         json_report="${INPUT_OUTPUT_DIR}/safe-migrate-report.json"
         markdown_report="${INPUT_OUTPUT_DIR}/safe-migrate-report.md"
         diagnostic_log="${INPUT_OUTPUT_DIR}/safe-migrate-diagnostics.log"

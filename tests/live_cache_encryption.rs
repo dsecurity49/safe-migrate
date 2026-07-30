@@ -174,27 +174,31 @@ fn live_encrypted_cache_round_trip_and_rejection_contract() {
     assert_eq!(chain_report["baseline"]["status"], "available");
     assert_eq!(chain_report["confidence"], "Exact");
 
-    for (label, config, key, expected) in [
+    for (label, rejection_cache, config, key, expected) in [
         (
             "plaintext cache with encryption enabled",
+            &plaintext_cache_path,
             &config_path,
             Some(TEST_KEY),
             "Cache file is not encrypted",
         ),
         (
             "disabled encryption",
+            &cache_path,
             &plain_config_path,
             Some(TEST_KEY),
             "Cache file is encrypted",
         ),
         (
             "missing key",
+            &cache_path,
             &config_path,
             None,
             "SAFE_MIGRATE_CACHE_KEY must contain",
         ),
         (
             "wrong key",
+            &cache_path,
             &config_path,
             Some(WRONG_KEY),
             "key is incorrect or the file was modified",
@@ -202,11 +206,6 @@ fn live_encrypted_cache_round_trip_and_rejection_contract() {
     ] {
         let mut rejected =
             assert_cmd::Command::cargo_bin("safe-migrate").expect("safe-migrate binary");
-        let rejection_cache = if label == "plaintext cache with encryption enabled" {
-            &plaintext_cache_path
-        } else {
-            &cache_path
-        };
         rejected
             .arg("cache")
             .arg("inspect")

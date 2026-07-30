@@ -395,12 +395,13 @@ impl SafeMigrateEngine {
         let mut out = String::with_capacity(sql.len());
         for line in sql.split_inclusive('\n') {
             let trimmed = line.trim_start();
-            if trimmed.len() > 9 && trimmed[..9].eq_ignore_ascii_case("EXECUTE '") {
+            let bytes = trimmed.as_bytes();
+            if bytes.len() > 9 && bytes[..9].eq_ignore_ascii_case(b"EXECUTE '") {
                 let indent = &line[..line.len() - trimmed.len()];
                 out.push_str(indent);
                 out.push_str("DO      '");
                 out.push_str(&trimmed[9..]);
-            } else if trimmed.len() > 10 && trimmed[..10].eq_ignore_ascii_case("EXECUTE $$") {
+            } else if bytes.len() > 10 && bytes[..10].eq_ignore_ascii_case(b"EXECUTE $$") {
                 let indent = &line[..line.len() - trimmed.len()];
                 out.push_str(indent);
                 out.push_str("DO      $$");

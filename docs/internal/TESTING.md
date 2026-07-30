@@ -84,7 +84,7 @@ The harness resets only its `sm_*` schemas and named fixture objects, but it
 still mutates the selected database. Never point it at a shared or production
 database.
 
-GitHub Actions runs the enabled manifest against PostgreSQL 14, 15, and 16.
+GitHub Actions runs the enabled manifest against PostgreSQL 14 through 18.
 It uploads a verbose log for each version, including failed runs. Treat that
 matrix as the supported live-differential scope; excluded fixtures remain
 documented in `live_tests/differential_manifest.json` with their reasons.

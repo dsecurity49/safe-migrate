@@ -140,26 +140,13 @@ fn hex_nibble(byte: u8) -> Result<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::EnvironmentValueGuard;
     use std::io::Write;
-    use std::sync::Mutex;
     use tempfile::NamedTempFile;
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
     fn with_test_key(test: impl FnOnce()) {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let previous = std::env::var(CACHE_KEY_ENV).ok();
-        unsafe {
-            std::env::set_var(CACHE_KEY_ENV, "42".repeat(32));
-        }
+        let _guard = EnvironmentValueGuard::set(CACHE_KEY_ENV, &"42".repeat(32));
         test();
-        unsafe {
-            if let Some(previous) = previous {
-                std::env::set_var(CACHE_KEY_ENV, previous);
-            } else {
-                std::env::remove_var(CACHE_KEY_ENV);
-            }
-        }
     }
 
     #[test]

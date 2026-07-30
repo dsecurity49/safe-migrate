@@ -25,8 +25,16 @@ impl Verdict {
     }
 
     pub fn recommendation(&self, confidence: &Confidence) -> &'static str {
-        if confidence == &Confidence::Tainted && !matches!(self, Verdict::Halt) {
-            return "no blocking finding, but baseline evidence is uncertain — review before deploying";
+        if confidence == &Confidence::Tainted {
+            return match self {
+                Verdict::Halt => "do not deploy",
+                Verdict::SafeWithRisk => {
+                    "irreversible operations present and baseline evidence is uncertain — ensure backups exist and review before deploying"
+                }
+                _ => {
+                    "no blocking finding, but baseline evidence is uncertain — review before deploying"
+                }
+            };
         }
         match self {
             Verdict::Halt => "do not deploy",

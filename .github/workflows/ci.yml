@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [ "main" ]
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -17,6 +20,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable 2026-07-16
@@ -63,6 +68,10 @@ jobs:
             image: postgres:15@sha256:74e110c41804365e3915fcc09d5e7a1eff50161aaa94d5da0e58e0cd75ae509c
           - postgres: "16"
             image: postgres:16@sha256:33f923b05f64ca54ac4401c01126a6b92afe839a0aa0a52bc5aeb5cc958e5f20
+          - postgres: "17"
+            image: postgres:17@sha256:a426e44bac0b759c95894d68e1a0ac03ecc20b619f498a91aae373bf06d8508d
+          - postgres: "18"
+            image: postgres:18@sha256:3a82e1f56c8f0f5616a11103ac3d47e632c3938698946a7ad26da0df1334744a
     services:
       postgres:
         image: ${{ matrix.image }}
@@ -84,6 +93,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable 2026-07-16
@@ -130,6 +141,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Generate review artifacts with the local Action
         id: safe_migrate
@@ -142,10 +155,14 @@ jobs:
 
       - name: Verify generated artifacts
         shell: bash
+        env:
+          JSON_REPORT: ${{ steps.safe_migrate.outputs.json-report }}
+          MARKDOWN_REPORT: ${{ steps.safe_migrate.outputs.markdown-report }}
+          EXIT_CODE: ${{ steps.safe_migrate.outputs.exit-code }}
         run: |
-          test -s "${{ steps.safe_migrate.outputs.json-report }}"
-          test -s "${{ steps.safe_migrate.outputs.markdown-report }}"
-          test "${{ steps.safe_migrate.outputs.exit-code }}" = "0"
+          test -s "$JSON_REPORT"
+          test -s "$MARKDOWN_REPORT"
+          test "$EXIT_CODE" = "0"
 
       - name: Plant untrusted workspace configuration
         shell: bash
@@ -164,11 +181,15 @@ jobs:
 
       - name: Assert security rule remained enabled
         shell: bash
+        env:
+          OUTCOME: ${{ steps.untrusted_config.outcome }}
+          EXIT_CODE: ${{ steps.untrusted_config.outputs.exit-code }}
+          JSON_REPORT: ${{ steps.untrusted_config.outputs.json-report }}
         run: |
-          test "${{ steps.untrusted_config.outcome }}" = "failure"
-          test "${{ steps.untrusted_config.outputs.exit-code }}" = "2"
+          test "$OUTCOME" = "failure"
+          test "$EXIT_CODE" = "2"
           grep -q '"rule_id": "drop-database"' \
-            "${{ steps.untrusted_config.outputs.json-report }}"
+            "$JSON_REPORT"
 
       - name: Verify operational failures produce diagnostic artifacts
         id: operational_error
@@ -182,14 +203,20 @@ jobs:
 
       - name: Assert operational error artifact contract
         shell: bash
+        env:
+          OUTCOME: ${{ steps.operational_error.outcome }}
+          EXIT_CODE: ${{ steps.operational_error.outputs.exit-code }}
+          JSON_REPORT: ${{ steps.operational_error.outputs.json-report }}
+          MARKDOWN_REPORT: ${{ steps.operational_error.outputs.markdown-report }}
+          DIAGNOSTIC_LOG: ${{ steps.operational_error.outputs.diagnostic-log }}
         run: |
-          test "${{ steps.operational_error.outcome }}" = "failure"
-          test "${{ steps.operational_error.outputs.exit-code }}" = "1"
-          test -s "${{ steps.operational_error.outputs.json-report }}"
-          test -s "${{ steps.operational_error.outputs.markdown-report }}"
-          test -s "${{ steps.operational_error.outputs.diagnostic-log }}"
+          test "$OUTCOME" = "failure"
+          test "$EXIT_CODE" = "1"
+          test -s "$JSON_REPORT"
+          test -s "$MARKDOWN_REPORT"
+          test -s "$DIAGNOSTIC_LOG"
           jq -e \
             '.status == "operational_error" and .exit_code == 1' \
-            "${{ steps.operational_error.outputs.json-report }}"
+            "$JSON_REPORT"
           grep -q 'missing-migration.sql' \
-            "${{ steps.operational_error.outputs.diagnostic-log }}"
+            "$DIAGNOSTIC_LOG"

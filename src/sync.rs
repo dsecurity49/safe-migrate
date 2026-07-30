@@ -52,10 +52,13 @@ fn connect_database(db_url: &str) -> Result<Client> {
 }
 
 pub(crate) fn is_local_host(host: &str) -> bool {
-    host.eq_ignore_ascii_case("localhost")
-        || host == "::1"
-        || host.starts_with("127.")
-        || host.starts_with('/')
+    if host.starts_with('/') || host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|address| address.is_loopback())
 }
 
 pub(crate) fn cache_search_path(

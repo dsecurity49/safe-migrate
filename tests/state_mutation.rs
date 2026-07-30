@@ -99,6 +99,111 @@ mod state_mutation_tests {
     }
 
     #[test]
+    fn create_if_not_exists_skips_when_another_relation_kind_uses_the_name() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let violations = engine
+            .analyze(
+                "CREATE SEQUENCE occupied; CREATE TABLE IF NOT EXISTS occupied (id int); CREATE TABLE after_skip (id int);",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict")
+        );
+        assert!(state.relation_is_present(&object_id("public", "after_skip")));
+    }
+
+    #[test]
+    fn create_sequence_if_not_exists_skips_when_a_table_uses_the_name() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let violations = engine
+            .analyze(
+                "CREATE TABLE occupied (id int); CREATE SEQUENCE IF NOT EXISTS occupied; CREATE TABLE after_skip (id int);",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict")
+        );
+        assert!(state.relation_is_present(&object_id("public", "after_skip")));
+    }
+
+    #[test]
+    fn drop_trigger_if_exists_is_a_no_op_when_missing() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let violations = engine
+            .analyze(
+                "CREATE TABLE t (id int); DROP TRIGGER IF EXISTS missing ON t; ALTER TABLE t ADD COLUMN later int;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict")
+        );
+        let Some(RelationOverlay::Present(table)) = state.get_relation(&object_id("public", "t"))
+        else {
+            panic!("table should remain present");
+        };
+        assert!(table.has_column("later"));
+    }
+
+    #[test]
+    fn drop_sequence_if_exists_drops_present_names_after_missing_ones() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE SEQUENCE present; DROP SEQUENCE IF EXISTS missing, present;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(!matches!(
+            state.local.sequences.get(&object_id("public", "present")),
+            Some(SequenceOverlay::Present(_))
+        ));
+    }
+
+    #[test]
+    fn cascade_drop_marks_triggers_on_partition_children_as_dropped() {
+        use safe_migrate::model::trigger::TriggerOverlay;
+
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE TABLE parent (id int) PARTITION BY LIST (id); CREATE TABLE child PARTITION OF parent FOR VALUES IN (1); CREATE FUNCTION audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END; $$; CREATE TRIGGER audit_trigger BEFORE INSERT ON child FOR EACH ROW EXECUTE FUNCTION audit(); DROP TABLE parent CASCADE;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(
+            state
+                .local
+                .triggers
+                .values()
+                .all(|trigger| { matches!(trigger, TriggerOverlay::Dropped) })
+        );
+    }
+
+    #[test]
     fn failed_drop_table_keeps_owned_triggers_for_later_dependency_checks() {
         let engine = setup_engine();
         let mut state = setup_state();

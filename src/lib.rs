@@ -12,6 +12,8 @@ pub mod rules;
 pub mod sync;
 #[cfg(test)]
 pub mod sync_tests;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 pub use analysis::state::AnalysisState;
 pub use db::cache::DbCache;
