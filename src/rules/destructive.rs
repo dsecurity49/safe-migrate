@@ -5,6 +5,8 @@ use crate::engine::config::Config;
 use crate::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
 use crate::rules::Rule;
 
+pub const IRREVERSIBLE_MIGRATION_RULE_ID: &str = "irreversible-migration";
+
 pub struct CascadingDropRule;
 
 impl Rule for CascadingDropRule {
@@ -380,7 +382,7 @@ pub struct ReversibilityRule;
 
 impl Rule for ReversibilityRule {
     fn id(&self) -> &'static str {
-        "irreversible-migration"
+        IRREVERSIBLE_MIGRATION_RULE_ID
     }
     fn default_tier(&self) -> ViolationTier {
         ViolationTier::Tier1

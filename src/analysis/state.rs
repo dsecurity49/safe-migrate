@@ -255,6 +255,9 @@ impl AnalysisState {
                 graph,
                 search_path: default_search_path.clone(),
                 default_search_path,
+                // The cache does not yet record session-role provenance.
+                // This is a modeling placeholder, not a claim about the live
+                // database user.
                 current_role: "postgres".to_string(),
                 confidence: Confidence::Exact,
                 transactions: Vec::new(),

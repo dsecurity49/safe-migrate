@@ -371,9 +371,6 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
         ORDER BY n.nspname, c.relname;
     ");
 
-    let mut current_object_id: Option<ObjectId> = None;
-    let mut current_rel: Option<*mut crate::model::relation::RelationState> = None;
-
     for row in client.query(&col_query, &[&schema_values])? {
         let schema_name: String = row.get("schema_name");
         let relation_name: String = row.get("relation_name");
@@ -384,27 +381,8 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
         let default_expr_text: Option<String> = row.get("default_expr_text");
         let type_modifier: Option<i32> = row.get("type_modifier");
 
-        // Fast path: reuse the mutable reference if the relation hasn't changed
-        let is_same_rel = if let Some(ref cur) = current_object_id {
-            cur.schema == schema_name && cur.name == relation_name
-        } else {
-            false
-        };
-
-        if !is_same_rel {
-            let new_oid = ObjectId::new(&schema_name, &relation_name);
-            if let Some(rel) = cache.relations.get_mut(&new_oid) {
-                current_rel = Some(rel as *mut _);
-            } else {
-                current_rel = None;
-            }
-            current_object_id = Some(new_oid);
-        }
-
-        if let Some(rel_ptr) = current_rel {
-            // SAFE: We are strictly single-threaded here, iterating rows sequentially.
-            // We just need a way to bypass the borrow checker for caching the map lookup.
-            let rel = unsafe { &mut *rel_ptr };
+        let relation_id = ObjectId::new(&schema_name, &relation_name);
+        if let Some(rel) = cache.relations.get_mut(&relation_id) {
             rel.columns.push(crate::model::column::Column {
                 name: column_name,
                 data_type: Some(type_name),

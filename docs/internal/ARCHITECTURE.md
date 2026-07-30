@@ -12,7 +12,7 @@ SQL
   -> resolved mutations
   -> AnalysisState transitions
   -> rule evaluation
-  -> human, JSON, or interactive report
+  -> human, JSON, Markdown, or interactive report
 ```
 
 Database synchronization is separate:

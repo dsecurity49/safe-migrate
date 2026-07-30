@@ -173,10 +173,14 @@ produced. Encrypted caches require `cache_encryption = true` and a valid
 `SAFE_MIGRATE_CACHE_KEY`; missing or invalid key material is an operational
 failure and is never accepted from TOML or command-line arguments. Conversely,
 when `cache_encryption = true`, plaintext cache files are rejected rather than
-silently weakening the configured protection.
+silently weakening the configured protection. When encryption is disabled,
+encrypted cache files are also rejected; changing modes requires a fresh
+`safe-migrate sync`.
 
-V3 cache payloads carry an explicit format header. V1 and V2 remain compatible;
-unheadered V3–V6 cache files are rejected and require `safe-migrate sync`.
+V3 cache payloads carry an explicit format header. V1 and V2 remain compatible.
+Legacy unheadered payloads using internal cache tags 3 through 6—including the
+V5 format written by v0.4.2—are rejected and require `safe-migrate sync`.
+These tag numbers identify cache layouts, not safe-migrate release versions.
 
 Errors must identify the failed input or subsystem without printing
 `DATABASE_URL`, credentials, or migration contents not already requested in the

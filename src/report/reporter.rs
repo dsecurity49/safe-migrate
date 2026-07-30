@@ -1,6 +1,7 @@
 // FILE: src/report/reporter.rs
 use crate::analysis::state::Confidence;
 use crate::report::violations::{ReportFinding, Violation, ViolationTier};
+use crate::rules::destructive::IRREVERSIBLE_MIGRATION_RULE_ID;
 use comfy_table::Table;
 use owo_colors::{OwoColorize, Style};
 
@@ -42,7 +43,7 @@ pub fn compute_verdict(violations: &[Violation]) -> Verdict {
     let has_tier2 = violations.iter().any(|v| v.tier == ViolationTier::Tier2);
     let has_irreversible_tier3 = violations
         .iter()
-        .any(|v| v.tier == ViolationTier::Tier3 && v.rule_id == "irreversible-migration");
+        .any(|v| v.tier == ViolationTier::Tier3 && v.rule_id == IRREVERSIBLE_MIGRATION_RULE_ID);
 
     match (has_tier1, has_tier2, has_irreversible_tier3) {
         (true, _, _) => Verdict::Halt,
