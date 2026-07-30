@@ -5,7 +5,7 @@ commits and pull requests. Published binaries, checksums, and generated release
 notes are available on the
 [GitHub Releases page](https://github.com/dsecurity49/safe-migrate/releases).
 
-## v0.4.3 — Unreleased
+## v0.4.3 — 2026-07-30
 
 Reliability and trust-contract release.
 
