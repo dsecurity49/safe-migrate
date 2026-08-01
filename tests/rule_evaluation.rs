@@ -95,7 +95,7 @@ mod rule_evaluation_tests {
     }
 
     #[test]
-    fn test_rule_blocking_constraint_check_and_fk() {
+    fn test_rule_blocking_constraint_check_and_not_valid_fast_path() {
         let engine = setup_engine();
 
         let mut cache = safe_migrate::db::cache::DbCache::new();
@@ -137,8 +137,7 @@ mod rule_evaluation_tests {
             )
             .unwrap();
 
-        // actual implementation still flags this
-        assert!(v2.iter().any(|v| v.rule_id.contains("constraint")));
+        assert!(!v2.iter().any(|v| v.rule_id == "blocking-constraint"));
     }
 
     #[test]

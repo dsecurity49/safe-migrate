@@ -993,6 +993,44 @@ impl AnalysisState {
                     .relations
                     .insert(create.id.clone(), RelationOverlay::Present(rel_state));
 
+                let has_primary_key = create.columns.iter().any(|column| column.is_primary_key)
+                    || create.table_constraints.iter().any(|constraint| {
+                        matches!(constraint, TableConstraintFact::PrimaryKey { .. })
+                    });
+                if has_primary_key {
+                    let name = format!("{}_pkey", create.id.name);
+                    self.snapshot_constraint(&create.id, &name);
+                    self.local.constraints.insert(
+                        (create.id.clone(), name.clone()),
+                        ConstraintState {
+                            table_id: create.id.clone(),
+                            name,
+                            kind: ConstraintKind::PrimaryKey,
+                            validated: true,
+                        },
+                    );
+                }
+
+                for columns in create.table_constraints.iter().filter_map(|constraint| {
+                    if let TableConstraintFact::Unique { columns } = constraint {
+                        Some(columns)
+                    } else {
+                        None
+                    }
+                }) {
+                    let name = format!("{}_{}_key", create.id.name, columns.join("_"));
+                    self.snapshot_constraint(&create.id, &name);
+                    self.local.constraints.insert(
+                        (create.id.clone(), name.clone()),
+                        ConstraintState {
+                            table_id: create.id.clone(),
+                            name,
+                            kind: ConstraintKind::Unique,
+                            validated: true,
+                        },
+                    );
+                }
+
                 if let Some(parent_id) = &create.partition_of {
                     self.snapshot_graph();
                     self.local.graph.edges.push(DependencyEdge::new(
@@ -1288,6 +1326,67 @@ impl AnalysisState {
                     return MutationResult::Applied;
                 }
 
+                if let AlterTableActionMutation::AddForeignKey {
+                    to_table,
+                    from_columns,
+                    to_columns,
+                    ..
+                } = &alter.action
+                {
+                    if let Some(RelationOverlay::Present(child)) =
+                        self.local.relations.get(&alter.id)
+                    {
+                        if let Some(column) =
+                            from_columns.iter().find(|column| !child.has_column(column))
+                        {
+                            return MutationResult::Conflict {
+                                reason: format!(
+                                    "foreign key column '{}' does not exist on relation '{}'",
+                                    column, alter.id
+                                ),
+                            };
+                        }
+                    }
+
+                    let Some(RelationOverlay::Present(parent)) = self.local.relations.get(to_table)
+                    else {
+                        return MutationResult::Conflict {
+                            reason: format!(
+                                "foreign key references relation '{}' which does not exist",
+                                to_table
+                            ),
+                        };
+                    };
+                    if let Some(column) =
+                        to_columns.iter().find(|column| !parent.has_column(column))
+                    {
+                        return MutationResult::Conflict {
+                            reason: format!(
+                                "foreign key references column '{}.{}' which does not exist",
+                                to_table, column
+                            ),
+                        };
+                    }
+                }
+
+                let using_index = match &alter.action {
+                    AlterTableActionMutation::AddUniqueConstraint { using_index, .. }
+                    | AlterTableActionMutation::AddPrimaryKeyConstraint { using_index, .. } => {
+                        using_index.as_ref()
+                    }
+                    _ => None,
+                };
+                if let Some(index) = using_index
+                    && !self.index_is_present(index)
+                {
+                    return MutationResult::Conflict {
+                        reason: format!(
+                            "constraint references index '{}' which does not exist",
+                            index
+                        ),
+                    };
+                }
+
                 self.snapshot_relation(&alter.id);
                 let rel_overlay = self.local.relations.get_mut(&alter.id);
                 if let Some(RelationOverlay::Present(rel)) = rel_overlay {
@@ -1388,7 +1487,7 @@ impl AnalysisState {
                             to_table,
                             from_columns,
                             to_columns,
-                            ..
+                            not_valid,
                         } => {
                             let constraint_name = constraint_name.clone().unwrap_or_else(|| {
                                 format!("{}_{}_fkey", alter.id.name, from_columns.join("_"))
@@ -1400,7 +1499,7 @@ impl AnalysisState {
                                     table_id: alter.id.clone(),
                                     name: constraint_name.clone(),
                                     kind: ConstraintKind::ForeignKey,
-                                    validated: true,
+                                    validated: !not_valid,
                                 },
                             );
                             self.snapshot_graph();
@@ -1476,9 +1575,13 @@ impl AnalysisState {
                                 },
                             );
                         }
-                        AlterTableActionMutation::AddUniqueConstraint { constraint_name } => {
+                        AlterTableActionMutation::AddUniqueConstraint {
+                            constraint_name,
+                            using_index,
+                        } => {
                             let constraint_name = constraint_name
                                 .clone()
+                                .or_else(|| using_index.as_ref().map(|index| index.name.clone()))
                                 .unwrap_or_else(|| format!("{}_key", alter.id.name));
                             self.snapshot_constraint(&alter.id, &constraint_name);
                             self.local.constraints.insert(
@@ -1487,6 +1590,40 @@ impl AnalysisState {
                                     table_id: alter.id.clone(),
                                     name: constraint_name,
                                     kind: ConstraintKind::Unique,
+                                    validated: true,
+                                },
+                            );
+                        }
+                        AlterTableActionMutation::AddPrimaryKeyConstraint {
+                            constraint_name,
+                            using_index,
+                        } => {
+                            let constraint_name = constraint_name
+                                .clone()
+                                .or_else(|| using_index.as_ref().map(|index| index.name.clone()))
+                                .unwrap_or_else(|| format!("{}_pkey", alter.id.name));
+                            self.snapshot_constraint(&alter.id, &constraint_name);
+                            self.local.constraints.insert(
+                                (alter.id.clone(), constraint_name.clone()),
+                                ConstraintState {
+                                    table_id: alter.id.clone(),
+                                    name: constraint_name,
+                                    kind: ConstraintKind::PrimaryKey,
+                                    validated: true,
+                                },
+                            );
+                        }
+                        AlterTableActionMutation::AddExcludeConstraint { constraint_name } => {
+                            let constraint_name = constraint_name
+                                .clone()
+                                .unwrap_or_else(|| format!("{}_excl", alter.id.name));
+                            self.snapshot_constraint(&alter.id, &constraint_name);
+                            self.local.constraints.insert(
+                                (alter.id.clone(), constraint_name.clone()),
+                                ConstraintState {
+                                    table_id: alter.id.clone(),
+                                    name: constraint_name,
+                                    kind: ConstraintKind::Exclusion,
                                     validated: true,
                                 },
                             );

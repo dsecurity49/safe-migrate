@@ -6,6 +6,8 @@ The repository keeps two kinds of documentation:
 
 - [CLI and report contract](CONTRACT.md) — user-visible behavior that must be
   protected by tests.
+- [Real-world-inspired cases](REAL_WORLD_CASES.md) — sourced migration
+  hypotheses and reproducible PostgreSQL differential fixtures.
 - The root [README](../README.md) — installation, quick start, rules, and
   product-level guidance.
 

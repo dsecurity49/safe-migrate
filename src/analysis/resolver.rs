@@ -615,16 +615,28 @@ impl Resolver {
                             constraint_name: constraint_name.clone(),
                             not_valid: *not_valid,
                         },
-                        AlterTableActionFact::AddUniqueConstraint { constraint_name } => {
-                            AlterTableActionMutation::AddUniqueConstraint {
+                        AlterTableActionFact::AddUniqueConstraint {
+                            constraint_name,
+                            using_index,
+                        } => AlterTableActionMutation::AddUniqueConstraint {
+                            constraint_name: constraint_name.clone(),
+                            using_index: using_index
+                                .as_ref()
+                                .map(|name| Self::resolve_lookup_name(name, state)),
+                        },
+                        AlterTableActionFact::AddPrimaryKeyConstraint {
+                            constraint_name,
+                            using_index,
+                        } => AlterTableActionMutation::AddPrimaryKeyConstraint {
+                            constraint_name: constraint_name.clone(),
+                            using_index: using_index
+                                .as_ref()
+                                .map(|name| Self::resolve_lookup_name(name, state)),
+                        },
+                        AlterTableActionFact::AddExcludeConstraint { constraint_name } => {
+                            AlterTableActionMutation::AddExcludeConstraint {
                                 constraint_name: constraint_name.clone(),
                             }
-                        }
-                        AlterTableActionFact::AddPrimaryKeyConstraint => {
-                            AlterTableActionMutation::AddPrimaryKeyConstraint
-                        }
-                        AlterTableActionFact::AddExcludeConstraint => {
-                            AlterTableActionMutation::AddExcludeConstraint
                         }
                         AlterTableActionFact::SetNotNull { column } => {
                             AlterTableActionMutation::SetNotNull {

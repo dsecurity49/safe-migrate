@@ -1003,26 +1003,59 @@ impl AstVisitor {
             });
         }
 
-        if ac
+        if let Some(unique) = ac
             .syntax()
             .descendants()
-            .any(|n| ast::UniqueConstraint::can_cast(n.kind()))
+            .find_map(ast::UniqueConstraint::cast)
         {
-            let constraint_name = ac
-                .syntax()
-                .descendants()
-                .find_map(ast::ConstraintName::cast)
-                .and_then(|cn| cn.ident_token())
-                .map(|t| Self::resolve_identifier_token(t.text()));
-            return Some(AlterTableActionFact::AddUniqueConstraint { constraint_name });
+            let constraint_name = unique
+                .constraint_name_clause()
+                .and_then(|clause| clause.constraint_name())
+                .and_then(|name| name.ident_token())
+                .map(|token| Self::resolve_identifier_token(token.text()));
+            let using_index = unique
+                .using_index()
+                .and_then(|using_index| using_index.index_ref())
+                .and_then(|index_ref| index_ref.path_ref())
+                .and_then(|path| Self::path_ref_to_qualified_name(&path));
+            return Some(AlterTableActionFact::AddUniqueConstraint {
+                constraint_name,
+                using_index,
+            });
         }
 
-        if ac
+        if let Some(primary_key) = ac
             .syntax()
             .descendants()
-            .any(|n| ast::PrimaryKeyConstraint::can_cast(n.kind()))
+            .find_map(ast::PrimaryKeyConstraint::cast)
         {
-            return Some(AlterTableActionFact::AddPrimaryKeyConstraint);
+            let constraint_name = primary_key
+                .constraint_name_clause()
+                .and_then(|clause| clause.constraint_name())
+                .and_then(|name| name.ident_token())
+                .map(|token| Self::resolve_identifier_token(token.text()));
+            let using_index = primary_key
+                .using_index()
+                .and_then(|using_index| using_index.index_ref())
+                .and_then(|index_ref| index_ref.path_ref())
+                .and_then(|path| Self::path_ref_to_qualified_name(&path));
+            return Some(AlterTableActionFact::AddPrimaryKeyConstraint {
+                constraint_name,
+                using_index,
+            });
+        }
+
+        if let Some(exclusion) = ac
+            .syntax()
+            .descendants()
+            .find_map(ast::ExcludeConstraint::cast)
+        {
+            let constraint_name = exclusion
+                .constraint_name_clause()
+                .and_then(|clause| clause.constraint_name())
+                .and_then(|name| name.ident_token())
+                .map(|token| Self::resolve_identifier_token(token.text()));
+            return Some(AlterTableActionFact::AddExcludeConstraint { constraint_name });
         }
 
         None

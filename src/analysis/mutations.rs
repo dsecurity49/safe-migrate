@@ -507,9 +507,15 @@ pub enum AlterTableActionMutation {
     },
     AddUniqueConstraint {
         constraint_name: Option<String>,
+        using_index: Option<ObjectId>,
     },
-    AddPrimaryKeyConstraint,
-    AddExcludeConstraint,
+    AddPrimaryKeyConstraint {
+        constraint_name: Option<String>,
+        using_index: Option<ObjectId>,
+    },
+    AddExcludeConstraint {
+        constraint_name: Option<String>,
+    },
     SetNotNull {
         column: String,
     },

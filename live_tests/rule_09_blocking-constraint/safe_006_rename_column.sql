@@ -1,1 +1,1 @@
-COMMENT ON TABLE test_table IS 'sample table';
+ALTER TABLE t_large RENAME COLUMN created_at TO recorded_at;

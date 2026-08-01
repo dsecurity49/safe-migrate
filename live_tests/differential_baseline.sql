@@ -151,6 +151,7 @@ CREATE TABLE sm_core.t_large (
     col2 integer,
     created_at timestamptz
 );
+CREATE UNIQUE INDEX t_large_col1_prebuilt_key ON sm_core.t_large (col1);
 
 CREATE TABLE sm_core.items (
     id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,

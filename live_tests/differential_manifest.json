@@ -1163,9 +1163,18 @@
         "008_exclude_constraint.sql",
         "009_unique_multi_column.sql",
         "010_primary_key_multi_column.sql",
+        "safe_001_check_not_valid.sql",
+        "safe_002_drop_not_null.sql",
+        "safe_003_create_table.sql",
         "safe_004_add_column.sql",
+        "safe_005_drop_column.sql",
+        "safe_006_rename_column.sql",
         "safe_007_create_index.sql",
-        "safe_009_alter_set_default.sql"
+        "safe_008_drop_constraint.sql",
+        "safe_009_alter_set_default.sql",
+        "safe_011_foreign_key_not_valid.sql",
+        "safe_012_foreign_key_validate_later.sql",
+        "safe_013_unique_using_index.sql"
       ],
       "excluded_fixtures": [
         {
@@ -1175,30 +1184,6 @@
         {
           "fixture": "007_set_access_method.sql",
           "reason": "Table access method identity is not synchronized or normalized by the differential harness."
-        },
-        {
-          "fixture": "safe_001_check_not_valid.sql",
-          "reason": "SELECT 1 has no resulting schema state."
-        },
-        {
-          "fixture": "safe_002_drop_not_null.sql",
-          "reason": "The cumulative canonical baseline already contains sm_core.t, so CREATE TABLE IF NOT EXISTS is a no-op."
-        },
-        {
-          "fixture": "safe_003_create_table.sql",
-          "reason": "PostgreSQL correctly rejects creating sm_core.t because the cumulative canonical baseline contains it."
-        },
-        {
-          "fixture": "safe_005_drop_column.sql",
-          "reason": "PostgreSQL correctly rejects dropping absent column public.test_table.c."
-        },
-        {
-          "fixture": "safe_006_rename_column.sql",
-          "reason": "Table comments are not synchronized or normalized by the differential harness."
-        },
-        {
-          "fixture": "safe_008_drop_constraint.sql",
-          "reason": "DROP INDEX IF EXISTS idx_t_id is a no-op against the canonical baseline."
         },
         {
           "fixture": "safe_010_drop_index.sql",
@@ -1227,14 +1212,49 @@
           "relations",
           "columns"
         ],
+        "safe_001_check_not_valid.sql": [
+          "constraints"
+        ],
+        "safe_002_drop_not_null.sql": [
+          "relations",
+          "columns"
+        ],
+        "safe_003_create_table.sql": [
+          "relations",
+          "columns",
+          "constraints"
+        ],
         "safe_004_add_column.sql": [
-          "indexes"
+          "relations",
+          "columns"
+        ],
+        "safe_005_drop_column.sql": [
+          "relations",
+          "columns"
+        ],
+        "safe_006_rename_column.sql": [
+          "relations",
+          "columns"
         ],
         "safe_007_create_index.sql": [
           "indexes"
         ],
+        "safe_008_drop_constraint.sql": [
+          "constraints"
+        ],
         "safe_009_alter_set_default.sql": [
           "relations",
+          "columns"
+        ],
+        "safe_011_foreign_key_not_valid.sql": [
+          "constraints",
+          "foreign_keys"
+        ],
+        "safe_012_foreign_key_validate_later.sql": [
+          "constraints",
+          "foreign_keys"
+        ],
+        "safe_013_unique_using_index.sql": [
           "constraints"
         ]
       },
@@ -1243,7 +1263,7 @@
         "sm_core.t",
         "sm_core.t_large"
       ],
-      "notes": "Fifteenth incremental slice. Compares generic table-constraint identity, kind, validation state, unnamed FK naming/topology, nullability, and control index outcomes."
+      "notes": "Real-world-inspired constraint slice. Covers each advertised constraint kind, NOT VALID/VALIDATE state transitions, and conversion of a prebuilt unique index into a constraint."
     },
     {
       "rule_dir": "rule_16_broken-compute",
@@ -1682,6 +1702,7 @@
       "fixtures": [
         "004_conflict.sql",
         "010_conflict.sql",
+        "011_missing_fk_source_column.sql",
         "safe_001_chain.sql",
         "safe_001_create_table.sql",
         "safe_002_create_index.sql",
@@ -1690,6 +1711,12 @@
         "safe_005_create_view.sql",
         "safe_007_grant_select.sql"
       ],
+      "expected_live_errors": {
+        "011_missing_fk_source_column.sql": {
+          "sqlstate": "42703",
+          "simulator_rule": "chain-conflict"
+        }
+      },
       "excluded_fixtures": [
         {
           "fixture": "001_chain.sql",
@@ -1788,7 +1815,7 @@
       "required_relations": [
         "public.test_table"
       ],
-      "notes": "Twenty-first incremental slice. Compares valid multi-statement chain outcomes and state controls; PostgreSQL-rejected duplicate-definition chains are documented separately because the state harness compares successful resulting state."
+      "notes": "Compares valid multi-statement outcomes and expected PostgreSQL rejections. The real-world-inspired missing-FK-column case must agree on SQLSTATE 42703 and a chain-conflict finding."
     },
     {
       "rule_dir": "rule_19_concurrent-in-transaction",
@@ -1974,10 +2001,10 @@
         "010_do_block_with_declare.sql",
         "safe_001_create_table.sql",
         "safe_002_alter_table.sql",
-        "safe_003_select.sql",
+        "011_select.sql",
         "safe_004_create_index.sql",
-        "safe_006_update.sql",
-        "safe_007_delete.sql"
+        "013_update.sql",
+        "014_delete.sql"
       ],
       "excluded_fixtures": [
         {
@@ -1997,7 +2024,7 @@
           "reason": "Requires a constraint named fk_constraint, which is absent from the canonical enterprise baseline."
         },
         {
-          "fixture": "safe_005_insert.sql",
+          "fixture": "012_insert.sql",
           "reason": "PostgreSQL rejects the single unqualified value because public.test_table has multiple non-generated columns."
         },
         {
@@ -2039,7 +2066,7 @@
       "required_relations": [
         "public.test_table"
       ],
-      "notes": "Twenty-fourth incremental slice. Executes valid opaque procedural and transaction-control statements against PostgreSQL, verifies their schema-state neutrality, and compares explicit DDL controls."
+      "notes": "Twenty-fourth incremental slice. Executes opaque procedural, transaction-control, and currently unmodeled DML statements against PostgreSQL, verifies their schema-state neutrality, and compares explicit DDL controls."
     },
     {
       "rule_dir": "rule_02_drop-database",

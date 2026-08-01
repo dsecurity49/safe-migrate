@@ -9,6 +9,10 @@ different suites use them:
   disposable PostgreSQL database for fixtures enabled in
   `differential_manifest.json`.
 
+The manifest can also declare an expected PostgreSQL SQLSTATE and the
+safe-migrate rule that must predict that rejection. These cases prove modeled
+failure behavior instead of comparing a successful resulting schema.
+
 ## Fixture convention
 
 - `safe_*.sql` must not emit the directory's target rule.
@@ -59,6 +63,6 @@ Verbosity is cumulative:
 - `-vv` adds cache and normalized-state counts.
 - `-vvv` prints complete normalized PostgreSQL and simulator projections.
 
-CI runs the enabled manifest against PostgreSQL 14, 15, and 16 and uploads one
+CI runs the enabled manifest against PostgreSQL 14, 15, 16, 17, and 18 and uploads one
 verbose log per version. Excluded fixtures remain documented in
 `differential_manifest.json` with their reasons.

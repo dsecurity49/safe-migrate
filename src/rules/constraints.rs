@@ -54,6 +54,31 @@ impl Rule for BlockingConstraintRule {
                 return violations;
             }
 
+            let action_is_relevant = matches!(
+                &alter.action,
+                AlterTableActionMutation::AddCheckConstraint {
+                    not_valid: false,
+                    ..
+                } | AlterTableActionMutation::AddForeignKey {
+                    not_valid: false,
+                    ..
+                } | AlterTableActionMutation::SetNotNull { .. }
+                    | AlterTableActionMutation::AddUniqueConstraint {
+                        using_index: None,
+                        ..
+                    }
+                    | AlterTableActionMutation::AddPrimaryKeyConstraint {
+                        using_index: None,
+                        ..
+                    }
+                    | AlterTableActionMutation::AddExcludeConstraint { .. }
+                    | AlterTableActionMutation::SetStorage { .. }
+                    | AlterTableActionMutation::SetAccessMethod
+            );
+            if !action_is_relevant {
+                return violations;
+            }
+
             // Evaluate max locked rows based on the specific action
             let max_locked_rows = match &alter.action {
                 AlterTableActionMutation::AddForeignKey { to_table, .. } => {
@@ -225,10 +250,14 @@ impl Rule for BlockingConstraintRule {
                         });
                     }
                 }
-                AlterTableActionMutation::AddUniqueConstraint { .. }
-                | AlterTableActionMutation::AddPrimaryKeyConstraint => {
-                    let mut reason =
-                        format!("Adding a UNIQUE or PRIMARY KEY constraint to {}", alter.id);
+                AlterTableActionMutation::AddUniqueConstraint {
+                    using_index: None, ..
+                }
+                | AlterTableActionMutation::AddPrimaryKeyConstraint {
+                    using_index: None, ..
+                }
+                | AlterTableActionMutation::AddExcludeConstraint { .. } => {
+                    let mut reason = format!("Adding an index-backed constraint to {}", alter.id);
                     if is_stale {
                         reason.push_str(" [WARNING: Based on offline/stale statistics]");
                     }

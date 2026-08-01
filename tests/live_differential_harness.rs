@@ -40,9 +40,17 @@ struct RuleManifest {
     #[serde(default)]
     fixture_scopes: BTreeMap<String, Vec<ComparisonScope>>,
     #[serde(default)]
+    expected_live_errors: BTreeMap<String, ExpectedLiveError>,
+    #[serde(default)]
     required_relations: Vec<String>,
     #[serde(default)]
     notes: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExpectedLiveError {
+    sqlstate: String,
+    simulator_rule: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -190,6 +198,9 @@ enum MismatchCategory {
     ExtraViewDependencyInSimulator,
     BaselineObjectAbsent,
     LiveExecutionFailed,
+    ExpectedLiveErrorMismatch,
+    MissingExpectedSimulatorFinding,
+    UnexpectedLiveSuccess,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -430,19 +441,22 @@ fn live_postgres_differential_harness() {
             mismatches.extend(check_required_relations(rule, fixture, &baseline_cache));
 
             let mut simulator_state = AnalysisState::new(baseline_cache);
-            if let Err(parse_errors) = engine.analyze(&sql, &mut simulator_state) {
-                mismatches.push(Mismatch {
-                    rule_dir: rule.rule_dir.clone(),
-                    fixture: fixture.clone(),
-                    category: MismatchCategory::LiveExecutionFailed,
-                    root_cause: RootCauseClassification::HarnessBug,
-                    note: format!(
-                        "fixture failed to parse in simulator: {}",
-                        parse_errors.join("; ")
-                    ),
-                });
-                continue;
-            }
+            let simulator_violations = match engine.analyze(&sql, &mut simulator_state) {
+                Ok(violations) => violations,
+                Err(parse_errors) => {
+                    mismatches.push(Mismatch {
+                        rule_dir: rule.rule_dir.clone(),
+                        fixture: fixture.clone(),
+                        category: MismatchCategory::LiveExecutionFailed,
+                        root_cause: RootCauseClassification::HarnessBug,
+                        note: format!(
+                            "fixture failed to parse in simulator: {}",
+                            parse_errors.join("; ")
+                        ),
+                    });
+                    continue;
+                }
+            };
             verbose(
                 verbosity,
                 2,
@@ -474,10 +488,64 @@ fn live_postgres_differential_harness() {
             }
 
             if let Err(error) = client.batch_execute(&sql) {
-                let root_cause = classify_live_execution_error(&error);
                 if rule.transactional {
                     let _ = client.batch_execute("ROLLBACK");
                 }
+                if let Some(expected) = rule.expected_live_errors.get(fixture) {
+                    let actual_sqlstate = error
+                        .as_db_error()
+                        .map(|db_error| db_error.code().code())
+                        .unwrap_or("<none>");
+                    if actual_sqlstate != expected.sqlstate {
+                        mismatches.push(Mismatch {
+                            rule_dir: rule.rule_dir.clone(),
+                            fixture: fixture.clone(),
+                            category: MismatchCategory::ExpectedLiveErrorMismatch,
+                            root_cause: RootCauseClassification::HarnessBug,
+                            note: format!(
+                                "expected PostgreSQL SQLSTATE {}, got {}: {}",
+                                expected.sqlstate,
+                                actual_sqlstate,
+                                format_postgres_error(&error)
+                            ),
+                        });
+                    } else if !simulator_violations
+                        .iter()
+                        .any(|violation| violation.rule_id == expected.simulator_rule)
+                    {
+                        mismatches.push(Mismatch {
+                            rule_dir: rule.rule_dir.clone(),
+                            fixture: fixture.clone(),
+                            category: MismatchCategory::MissingExpectedSimulatorFinding,
+                            root_cause: RootCauseClassification::SimulatorBug,
+                            note: format!(
+                                "PostgreSQL rejected with SQLSTATE {}, but safe-migrate did not emit rule {}",
+                                expected.sqlstate, expected.simulator_rule
+                            ),
+                        });
+                    }
+                    let case_mismatches = mismatches.len() - mismatches_before;
+                    verbose(
+                        verbosity,
+                        1,
+                        format!(
+                            "case={}/{} result={} expected_sqlstate={} simulator_rule={} mismatches={} elapsed={}",
+                            rule.rule_dir,
+                            fixture,
+                            if case_mismatches == 0 {
+                                "match"
+                            } else {
+                                "mismatch"
+                            },
+                            expected.sqlstate,
+                            expected.simulator_rule,
+                            case_mismatches,
+                            format_duration(fixture_started.elapsed())
+                        ),
+                    );
+                    continue;
+                }
+                let root_cause = classify_live_execution_error(&error);
                 mismatches.push(Mismatch {
                     rule_dir: rule.rule_dir.clone(),
                     fixture: fixture.clone(),
@@ -486,6 +554,23 @@ fn live_postgres_differential_harness() {
                     note: format!(
                         "live PostgreSQL rejected fixture: {}",
                         format_postgres_error(&error)
+                    ),
+                });
+                continue;
+            }
+
+            if let Some(expected) = rule.expected_live_errors.get(fixture) {
+                if rule.transactional {
+                    let _ = client.batch_execute("ROLLBACK");
+                }
+                mismatches.push(Mismatch {
+                    rule_dir: rule.rule_dir.clone(),
+                    fixture: fixture.clone(),
+                    category: MismatchCategory::UnexpectedLiveSuccess,
+                    root_cause: RootCauseClassification::HarnessBug,
+                    note: format!(
+                        "expected PostgreSQL SQLSTATE {}, but the fixture executed successfully",
+                        expected.sqlstate
                     ),
                 });
                 continue;

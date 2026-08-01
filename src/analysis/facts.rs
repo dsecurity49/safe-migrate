@@ -685,9 +685,15 @@ pub enum AlterTableActionFact {
     },
     AddUniqueConstraint {
         constraint_name: Option<String>,
+        using_index: Option<QualifiedName>,
     },
-    AddPrimaryKeyConstraint,
-    AddExcludeConstraint,
+    AddPrimaryKeyConstraint {
+        constraint_name: Option<String>,
+        using_index: Option<QualifiedName>,
+    },
+    AddExcludeConstraint {
+        constraint_name: Option<String>,
+    },
     SetNotNull {
         column: String,
     },
