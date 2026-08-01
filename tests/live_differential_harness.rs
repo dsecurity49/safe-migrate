@@ -22,11 +22,13 @@ const FIXTURE_FILTER_ENV: &str = "SAFE_MIGRATE_DIFF_FIXTURE";
 const REQUIRE_LIVE_ENV: &str = "SAFE_MIGRATE_REQUIRE_LIVE";
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DifferentialManifest {
     rules: Vec<RuleManifest>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RuleManifest {
     rule_dir: String,
     enabled: bool,
@@ -40,12 +42,22 @@ struct RuleManifest {
     #[serde(default)]
     fixture_scopes: BTreeMap<String, Vec<ComparisonScope>>,
     #[serde(default)]
+    expected_live_errors: BTreeMap<String, ExpectedLiveError>,
+    #[serde(default)]
     required_relations: Vec<String>,
     #[serde(default)]
     notes: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExpectedLiveError {
+    sqlstate: String,
+    simulator_rule: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FixtureExclusion {
     fixture: String,
     reason: String,
@@ -190,6 +202,9 @@ enum MismatchCategory {
     ExtraViewDependencyInSimulator,
     BaselineObjectAbsent,
     LiveExecutionFailed,
+    ExpectedLiveErrorMismatch,
+    MissingExpectedSimulatorFinding,
+    UnexpectedLiveSuccess,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -430,19 +445,22 @@ fn live_postgres_differential_harness() {
             mismatches.extend(check_required_relations(rule, fixture, &baseline_cache));
 
             let mut simulator_state = AnalysisState::new(baseline_cache);
-            if let Err(parse_errors) = engine.analyze(&sql, &mut simulator_state) {
-                mismatches.push(Mismatch {
-                    rule_dir: rule.rule_dir.clone(),
-                    fixture: fixture.clone(),
-                    category: MismatchCategory::LiveExecutionFailed,
-                    root_cause: RootCauseClassification::HarnessBug,
-                    note: format!(
-                        "fixture failed to parse in simulator: {}",
-                        parse_errors.join("; ")
-                    ),
-                });
-                continue;
-            }
+            let simulator_violations = match engine.analyze(&sql, &mut simulator_state) {
+                Ok(violations) => violations,
+                Err(parse_errors) => {
+                    mismatches.push(Mismatch {
+                        rule_dir: rule.rule_dir.clone(),
+                        fixture: fixture.clone(),
+                        category: MismatchCategory::LiveExecutionFailed,
+                        root_cause: RootCauseClassification::HarnessBug,
+                        note: format!(
+                            "fixture failed to parse in simulator: {}",
+                            parse_errors.join("; ")
+                        ),
+                    });
+                    continue;
+                }
+            };
             verbose(
                 verbosity,
                 2,
@@ -474,10 +492,64 @@ fn live_postgres_differential_harness() {
             }
 
             if let Err(error) = client.batch_execute(&sql) {
-                let root_cause = classify_live_execution_error(&error);
                 if rule.transactional {
                     let _ = client.batch_execute("ROLLBACK");
                 }
+                if let Some(expected) = rule.expected_live_errors.get(fixture) {
+                    let actual_sqlstate = error
+                        .as_db_error()
+                        .map(|db_error| db_error.code().code())
+                        .unwrap_or("<none>");
+                    if actual_sqlstate != expected.sqlstate {
+                        mismatches.push(Mismatch {
+                            rule_dir: rule.rule_dir.clone(),
+                            fixture: fixture.clone(),
+                            category: MismatchCategory::ExpectedLiveErrorMismatch,
+                            root_cause: RootCauseClassification::HarnessBug,
+                            note: format!(
+                                "expected PostgreSQL SQLSTATE {}, got {}: {}",
+                                expected.sqlstate,
+                                actual_sqlstate,
+                                format_postgres_error(&error)
+                            ),
+                        });
+                    } else if !simulator_violations
+                        .iter()
+                        .any(|violation| violation.rule_id == expected.simulator_rule)
+                    {
+                        mismatches.push(Mismatch {
+                            rule_dir: rule.rule_dir.clone(),
+                            fixture: fixture.clone(),
+                            category: MismatchCategory::MissingExpectedSimulatorFinding,
+                            root_cause: RootCauseClassification::SimulatorBug,
+                            note: format!(
+                                "PostgreSQL rejected with SQLSTATE {}, but safe-migrate did not emit rule {}",
+                                expected.sqlstate, expected.simulator_rule
+                            ),
+                        });
+                    }
+                    let case_mismatches = mismatches.len() - mismatches_before;
+                    verbose(
+                        verbosity,
+                        1,
+                        format!(
+                            "case={}/{} result={} expected_sqlstate={} simulator_rule={} mismatches={} elapsed={}",
+                            rule.rule_dir,
+                            fixture,
+                            if case_mismatches == 0 {
+                                "match"
+                            } else {
+                                "mismatch"
+                            },
+                            expected.sqlstate,
+                            expected.simulator_rule,
+                            case_mismatches,
+                            format_duration(fixture_started.elapsed())
+                        ),
+                    );
+                    continue;
+                }
+                let root_cause = classify_live_execution_error(&error);
                 mismatches.push(Mismatch {
                     rule_dir: rule.rule_dir.clone(),
                     fixture: fixture.clone(),
@@ -486,6 +558,23 @@ fn live_postgres_differential_harness() {
                     note: format!(
                         "live PostgreSQL rejected fixture: {}",
                         format_postgres_error(&error)
+                    ),
+                });
+                continue;
+            }
+
+            if let Some(expected) = rule.expected_live_errors.get(fixture) {
+                if rule.transactional {
+                    let _ = client.batch_execute("ROLLBACK");
+                }
+                mismatches.push(Mismatch {
+                    rule_dir: rule.rule_dir.clone(),
+                    fixture: fixture.clone(),
+                    category: MismatchCategory::UnexpectedLiveSuccess,
+                    root_cause: RootCauseClassification::HarnessBug,
+                    note: format!(
+                        "expected PostgreSQL SQLSTATE {}, but the fixture executed successfully",
+                        expected.sqlstate
                     ),
                 });
                 continue;
@@ -675,6 +764,10 @@ fn validate_manifest(manifest: &DifferentialManifest, path: &Path) {
         .unwrap_or_else(|| panic!("manifest has no parent directory: {}", path.display()));
     let actual_rule_dirs = directory_names(live_tests_dir);
     let mut manifest_rule_dirs = BTreeSet::new();
+    let valid_rule_ids = SafeMigrateEngine::new(Config::default())
+        .primary_rule_ids()
+        .into_iter()
+        .collect::<BTreeSet<_>>();
 
     for rule in &manifest.rules {
         assert!(
@@ -723,6 +816,8 @@ fn validate_manifest(manifest: &DifferentialManifest, path: &Path) {
             );
         }
 
+        validate_expected_live_errors(rule, &included, &valid_rule_ids);
+
         let rule_dir = live_tests_dir.join(&rule.rule_dir);
         let actual_fixtures = sql_fixture_names(&rule_dir);
         let accounted_for = included.union(&excluded).cloned().collect::<BTreeSet<_>>();
@@ -744,6 +839,101 @@ fn validate_manifest(manifest: &DifferentialManifest, path: &Path) {
     assert_eq!(
         manifest_rule_dirs, actual_rule_dirs,
         "differential manifest rule directories do not match live_tests"
+    );
+}
+
+fn validate_expected_live_errors(
+    rule: &RuleManifest,
+    included: &BTreeSet<String>,
+    valid_rule_ids: &BTreeSet<&str>,
+) {
+    for (fixture, expected) in &rule.expected_live_errors {
+        assert!(
+            included.contains(fixture),
+            "expected live error references a non-included fixture: {}/{}",
+            rule.rule_dir,
+            fixture
+        );
+        assert!(
+            expected.sqlstate.len() == 5
+                && expected
+                    .sqlstate
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric()),
+            "expected live error has invalid SQLSTATE for {}/{}: {}",
+            rule.rule_dir,
+            fixture,
+            expected.sqlstate
+        );
+        assert!(
+            valid_rule_ids.contains(expected.simulator_rule.as_str()),
+            "expected live error has unknown simulator rule for {}/{}: {}",
+            rule.rule_dir,
+            fixture,
+            expected.simulator_rule
+        );
+    }
+}
+
+#[test]
+fn expected_live_error_schema_rejects_unknown_fields() {
+    let result = serde_json::from_str::<ExpectedLiveError>(
+        r#"{"sqlstate":"42703","simulator_rule":"chain-conflict","typo":true}"#,
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+#[should_panic(expected = "expected live error references a non-included fixture")]
+fn expected_live_error_must_reference_an_included_fixture() {
+    let rule = RuleManifest {
+        rule_dir: "rule".to_string(),
+        enabled: true,
+        fixtures: Vec::new(),
+        transactional: true,
+        excluded_fixtures: Vec::new(),
+        schemas: Vec::new(),
+        scope: Vec::new(),
+        fixture_scopes: BTreeMap::new(),
+        expected_live_errors: BTreeMap::from([(
+            "missing.sql".to_string(),
+            ExpectedLiveError {
+                sqlstate: "42703".to_string(),
+                simulator_rule: "chain-conflict".to_string(),
+            },
+        )]),
+        required_relations: Vec::new(),
+        notes: None,
+    };
+    validate_expected_live_errors(&rule, &BTreeSet::new(), &BTreeSet::from(["chain-conflict"]));
+}
+
+#[test]
+#[should_panic(expected = "expected live error has unknown simulator rule")]
+fn expected_live_error_must_reference_a_known_simulator_rule() {
+    let rule = RuleManifest {
+        rule_dir: "rule".to_string(),
+        enabled: true,
+        fixtures: vec!["case.sql".to_string()],
+        transactional: true,
+        excluded_fixtures: Vec::new(),
+        schemas: Vec::new(),
+        scope: Vec::new(),
+        fixture_scopes: BTreeMap::new(),
+        expected_live_errors: BTreeMap::from([(
+            "case.sql".to_string(),
+            ExpectedLiveError {
+                sqlstate: "42703".to_string(),
+                simulator_rule: "typo-rule".to_string(),
+            },
+        )]),
+        required_relations: Vec::new(),
+        notes: None,
+    };
+    validate_expected_live_errors(
+        &rule,
+        &BTreeSet::from(["case.sql".to_string()]),
+        &BTreeSet::from(["chain-conflict"]),
     );
 }
 

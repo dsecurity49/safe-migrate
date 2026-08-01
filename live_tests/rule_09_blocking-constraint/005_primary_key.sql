@@ -1,1 +1,1 @@
-ALTER TABLE t_large ADD CONSTRAINT chk_id CHECK (id > 0);
+ALTER TABLE t_large ADD CONSTRAINT t_large_pkey PRIMARY KEY (id);

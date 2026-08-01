@@ -5,6 +5,20 @@ commits and pull requests. Published binaries, checksums, and generated release
 notes are available on the
 [GitHub Releases page](https://github.com/dsecurity49/safe-migrate/releases).
 
+## v0.4.4 — Unreleased
+
+- Added sourced, real-world-inspired differential cases for staged foreign-key
+  validation, missing foreign-key columns, and index-backed constraints.
+- Corrected constraint fixtures that previously reused CHECK statements under
+  UNIQUE, PRIMARY KEY, and exclusion filenames.
+- Modeled `NOT VALID` foreign keys, later validation, exclusion and primary-key
+  constraint state, and `UNIQUE ... USING INDEX` without a false blocking-index
+  finding.
+- Preserved PostgreSQL constraint names and tightened `USING INDEX` resolution
+  and eligibility checks for indexes created within a migration.
+- Added differential assertions for expected PostgreSQL errors, including the
+  exact SQLSTATE and the safe-migrate rule that must predict the rejection.
+
 ## v0.4.3 — 2026-07-30
 
 Reliability and trust-contract release.

@@ -3,7 +3,7 @@
 #[cfg(test)]
 mod tests {
     use crate::analysis::expr_ir::ExprIr;
-    use crate::analysis::facts::StatementFact;
+    use crate::analysis::facts::{AlterTableActionFact, StatementFact, TableConstraintFact};
     use crate::ast::identifiers::{Ident, QualifiedName};
     use crate::ast::visitor::AstVisitor;
     use squawk_syntax::ast::SourceFile;
@@ -63,6 +63,43 @@ mod tests {
             }
             _ => panic!("Expected CreateTable fact"),
         }
+    }
+
+    #[test]
+    fn test_create_table_preserves_inline_constraint_names() {
+        let fact = parse_and_extract_statement(
+            "CREATE TABLE users (
+                id integer CONSTRAINT users_pk PRIMARY KEY,
+                email text CONSTRAINT users_email_unique UNIQUE,
+                tenant_id integer,
+                CONSTRAINT users_tenant_unique UNIQUE (tenant_id)
+            );",
+        )
+        .expect("create table fact");
+
+        let StatementFact::CreateTable {
+            columns,
+            table_constraints,
+            ..
+        } = fact
+        else {
+            panic!("expected create table fact");
+        };
+        assert_eq!(
+            columns[0].primary_key_constraint_name.as_deref(),
+            Some("users_pk")
+        );
+        assert_eq!(
+            columns[1].unique_constraint_name.as_deref(),
+            Some("users_email_unique")
+        );
+        assert!(matches!(
+            &table_constraints[0],
+            TableConstraintFact::Unique {
+                constraint_name: Some(name),
+                columns,
+            } if name == "users_tenant_unique" && columns == &["tenant_id"]
+        ));
     }
 
     #[test]
@@ -273,6 +310,71 @@ mod tests {
             }
             _ => panic!("Expected AlterTable fact"),
         }
+    }
+
+    #[test]
+    fn test_alter_table_unique_using_index() {
+        let fact = parse_and_extract_statement(
+            "ALTER TABLE users ADD CONSTRAINT users_email_key UNIQUE USING INDEX users_email_key;",
+        )
+        .expect("alter table fact");
+
+        let StatementFact::AlterTable { actions, .. } = fact else {
+            panic!("expected alter table fact");
+        };
+        let AlterTableActionFact::AddUniqueConstraint {
+            constraint_name,
+            using_index,
+        } = &actions[0]
+        else {
+            panic!("expected unique constraint fact");
+        };
+        assert_eq!(constraint_name.as_deref(), Some("users_email_key"));
+        assert_eq!(
+            using_index.as_ref().map(|name| name.name.resolve()),
+            Some("users_email_key".to_string())
+        );
+    }
+
+    #[test]
+    fn test_alter_table_primary_key_using_index() {
+        let fact = parse_and_extract_statement(
+            "ALTER TABLE users ADD CONSTRAINT users_pkey PRIMARY KEY USING INDEX users_id_key;",
+        )
+        .expect("alter table fact");
+
+        let StatementFact::AlterTable { actions, .. } = fact else {
+            panic!("expected alter table fact");
+        };
+        let AlterTableActionFact::AddPrimaryKeyConstraint {
+            constraint_name,
+            using_index,
+        } = &actions[0]
+        else {
+            panic!("expected primary-key constraint fact");
+        };
+        assert_eq!(constraint_name.as_deref(), Some("users_pkey"));
+        assert_eq!(
+            using_index.as_ref().map(|name| name.name.resolve()),
+            Some("users_id_key".to_string())
+        );
+    }
+
+    #[test]
+    fn test_alter_table_exclusion_constraint() {
+        let fact = parse_and_extract_statement(
+            "ALTER TABLE reservations ADD CONSTRAINT no_overlap EXCLUDE USING gist (period WITH &&);",
+        )
+        .expect("alter table fact");
+
+        let StatementFact::AlterTable { actions, .. } = fact else {
+            panic!("expected alter table fact");
+        };
+        assert!(matches!(
+            actions.as_slice(),
+            [AlterTableActionFact::AddExcludeConstraint { constraint_name }]
+                if constraint_name.as_deref() == Some("no_overlap")
+        ));
     }
 
     #[test]

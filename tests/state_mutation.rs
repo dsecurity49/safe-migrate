@@ -6,6 +6,7 @@ mod state_mutation_tests {
     use safe_migrate::analysis::state::Confidence;
     use safe_migrate::ast::identifiers::ObjectId;
     use safe_migrate::db::cache::{DbCache, DependencyCache};
+    use safe_migrate::model::constraint::ConstraintKind;
     use safe_migrate::model::relation::{
         Persistence, RelationKind, RelationOverlay, RelationState,
     };
@@ -1255,6 +1256,300 @@ mod state_mutation_tests {
             state.local.functions.get(&function_id),
             Some(FunctionOverlay::Dropped)
         ));
+    }
+
+    #[test]
+    fn foreign_key_not_valid_then_validate_updates_constraint_state() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TABLE parent (id integer PRIMARY KEY);
+                 CREATE TABLE child (parent_id integer);
+                 ALTER TABLE child ADD CONSTRAINT child_parent_fk
+                    FOREIGN KEY (parent_id) REFERENCES parent(id) NOT VALID;",
+                &mut state,
+            )
+            .unwrap();
+
+        let key = (object_id("public", "child"), "child_parent_fk".to_string());
+        let constraint = state
+            .local
+            .constraints
+            .get(&key)
+            .expect("foreign key should be recorded");
+        assert_eq!(constraint.kind, ConstraintKind::ForeignKey);
+        assert!(!constraint.validated);
+
+        engine
+            .analyze(
+                "ALTER TABLE child VALIDATE CONSTRAINT child_parent_fk;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(state.local.constraints[&key].validated);
+    }
+
+    #[test]
+    fn missing_foreign_key_source_column_is_a_conflict() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let violations = engine
+            .analyze(
+                "CREATE TABLE parent (id integer PRIMARY KEY);
+                 CREATE TABLE child (parent_id integer);
+                 ALTER TABLE child ADD CONSTRAINT child_parent_fk
+                    FOREIGN KEY (missing_parent_id) REFERENCES parent(id) NOT VALID;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(violations.iter().any(|violation| {
+            violation.rule_id == "chain-conflict" && violation.reason.contains("missing_parent_id")
+        }));
+        assert!(
+            !state
+                .local
+                .constraints
+                .contains_key(&(object_id("public", "child"), "child_parent_fk".to_string()))
+        );
+    }
+
+    #[test]
+    fn create_table_records_inline_primary_key_and_table_unique_constraints() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TABLE accounts (
+                    id integer PRIMARY KEY,
+                    tenant_id integer,
+                    email text,
+                    UNIQUE (tenant_id, email)
+                );",
+                &mut state,
+            )
+            .unwrap();
+
+        let table_id = object_id("public", "accounts");
+        let primary_key = state
+            .local
+            .constraints
+            .get(&(table_id.clone(), "accounts_pkey".to_string()))
+            .expect("inline primary key should be recorded");
+        assert_eq!(primary_key.kind, ConstraintKind::PrimaryKey);
+        assert!(primary_key.validated);
+
+        let unique = state
+            .local
+            .constraints
+            .get(&(table_id, "accounts_tenant_id_email_key".to_string()))
+            .expect("table unique constraint should be recorded");
+        assert_eq!(unique.kind, ConstraintKind::Unique);
+        assert!(unique.validated);
+    }
+
+    #[test]
+    fn create_table_preserves_explicit_constraint_names_and_avoids_generated_collisions() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TABLE accounts (
+                    id integer CONSTRAINT accounts_primary PRIMARY KEY,
+                    email text CONSTRAINT accounts_email_unique UNIQUE,
+                    a_b integer,
+                    c integer,
+                    a integer,
+                    b_c integer,
+                    UNIQUE (a_b, c),
+                    UNIQUE (a, b_c)
+                );",
+                &mut state,
+            )
+            .unwrap();
+
+        let table = object_id("public", "accounts");
+        for (name, kind) in [
+            ("accounts_primary", ConstraintKind::PrimaryKey),
+            ("accounts_email_unique", ConstraintKind::Unique),
+            ("accounts_a_b_c_key", ConstraintKind::Unique),
+            ("accounts_a_b_c_key1", ConstraintKind::Unique),
+        ] {
+            assert_eq!(
+                state
+                    .local
+                    .constraints
+                    .get(&(table.clone(), name.to_string()))
+                    .map(|constraint| constraint.kind),
+                Some(kind),
+                "missing constraint {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn generated_constraint_names_follow_postgres_identifier_length_limit() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TABLE abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwx (
+                    abcdefghijklmnopqrstuvwxyzabcd integer UNIQUE
+                );",
+                &mut state,
+            )
+            .unwrap();
+
+        let table = object_id(
+            "public",
+            "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwx",
+        );
+        let expected =
+            "abcdefghijklmnopqrstuvwxyzabc_abcdefghijklmnopqrstuvwxyzabc_key".to_string();
+        assert_eq!(expected.len(), 63);
+        assert!(state.local.constraints.contains_key(&(table, expected)));
+    }
+
+    #[test]
+    fn unique_using_index_attaches_constraint_without_blocking_index_finding() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let violations = engine
+            .analyze(
+                "CREATE TABLE users (email text);
+                 CREATE UNIQUE INDEX users_email_key ON users(email);
+                 ALTER TABLE users ADD CONSTRAINT users_email_key
+                    UNIQUE USING INDEX users_email_key;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.rule_id == "blocking-index-constraint")
+        );
+        let constraint = state
+            .local
+            .constraints
+            .get(&(object_id("public", "users"), "users_email_key".to_string()))
+            .expect("unique constraint should be recorded");
+        assert_eq!(constraint.kind, ConstraintKind::Unique);
+        assert!(constraint.validated);
+    }
+
+    #[test]
+    fn using_index_resolves_in_the_altered_tables_schema_and_preserves_quoting() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let violations = engine
+            .analyze(
+                "CREATE SCHEMA tenant;
+                 SET search_path TO public;
+                 CREATE TABLE tenant.users (email text);
+                 CREATE UNIQUE INDEX \"UserEmailKey\" ON tenant.users(email);
+                 ALTER TABLE tenant.users ADD CONSTRAINT users_email_key
+                    UNIQUE USING INDEX \"UserEmailKey\";",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict")
+        );
+        assert!(
+            state
+                .local
+                .constraints
+                .contains_key(&(object_id("tenant", "users"), "users_email_key".to_string()))
+        );
+    }
+
+    #[test]
+    fn using_index_rejects_wrong_table_non_unique_and_partial_indexes() {
+        for (index_sql, expected_reason) in [
+            (
+                "CREATE UNIQUE INDEX candidate ON other(id);",
+                "belongs to relation",
+            ),
+            (
+                "CREATE INDEX candidate ON target(id);",
+                "unique and non-partial",
+            ),
+            (
+                "CREATE UNIQUE INDEX candidate ON target(id) WHERE id > 0;",
+                "unique and non-partial",
+            ),
+        ] {
+            let engine = setup_engine();
+            let mut state = setup_state();
+            let sql = format!(
+                "CREATE TABLE target(id integer); CREATE TABLE other(id integer); {index_sql}
+                 ALTER TABLE target ADD CONSTRAINT target_id_key UNIQUE USING INDEX candidate;"
+            );
+            let violations = engine.analyze(&sql, &mut state).unwrap();
+
+            assert!(violations.iter().any(|violation| {
+                violation.rule_id == "chain-conflict" && violation.reason.contains(expected_reason)
+            }));
+            assert!(
+                !state
+                    .local
+                    .constraints
+                    .contains_key(&(object_id("public", "target"), "target_id_key".to_string()))
+            );
+        }
+    }
+
+    #[test]
+    fn exclusion_constraint_is_recorded_and_reported() {
+        let engine = setup_engine();
+        let table_id = object_id("public", "reservations");
+        let mut relation = RelationState::new(
+            table_id.clone(),
+            object_id("public", "postgres"),
+            0,
+            Some(500_000),
+            RelationKind::Table,
+            Persistence::Permanent,
+            0,
+        );
+        relation.columns.push(safe_migrate::model::column::Column {
+            name: "period".to_string(),
+            data_type: Some("int4range".to_string()),
+            is_nullable: true,
+            default: None,
+            avg_width: None,
+            default_expr_text: None,
+            type_modifier: None,
+        });
+        let mut cache = DbCache::new();
+        cache.insert_baseline(table_id, relation);
+        let mut state = safe_migrate::AnalysisState::new(cache);
+        let violations = engine
+            .analyze(
+                "ALTER TABLE reservations ADD CONSTRAINT no_overlap
+                    EXCLUDE USING gist (period WITH &&);",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.rule_id == "blocking-index-constraint")
+        );
+        assert_eq!(
+            state.local.constraints[&(
+                object_id("public", "reservations"),
+                "no_overlap".to_string()
+            )]
+                .kind,
+            ConstraintKind::Exclusion
+        );
     }
 }
 

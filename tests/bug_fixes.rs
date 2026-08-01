@@ -111,6 +111,38 @@ mod phase10_bug_fixes_and_sorting_tests {
     }
 
     #[test]
+    fn stale_constraint_stats_do_not_flag_unrelated_alter_table_actions() {
+        let engine = setup_engine();
+        let mut cache = DbCache::new();
+        cache.insert_baseline(
+            object_id("public", "accounts"),
+            safe_migrate::model::relation::RelationState::new(
+                object_id("public", "accounts"),
+                ObjectId::new("public", "postgres"),
+                0,
+                Some(500_000),
+                RelationKind::Table,
+                Persistence::Permanent,
+                0,
+            ),
+        );
+        let mut state = AnalysisState::new(cache);
+
+        let violations = engine
+            .analyze(
+                "ALTER TABLE accounts ADD COLUMN display_name text;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.rule_id == "blocking-constraint")
+        );
+    }
+
+    #[test]
     fn test_add_column_now_default_not_flagged() {
         let engine = setup_engine();
         let mut cache = DbCache::new();

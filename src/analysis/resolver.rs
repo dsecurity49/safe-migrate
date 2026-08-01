@@ -78,6 +78,15 @@ impl Resolver {
         id
     }
 
+    fn resolve_constraint_index_name(name: &QualifiedName, table: &ObjectId) -> ObjectId {
+        let schema = name
+            .schema
+            .as_ref()
+            .map(|schema| schema.resolve())
+            .unwrap_or_else(|| table.schema.clone());
+        ObjectId::new(schema, name.name.resolve())
+    }
+
     fn resolve_function_id(
         name: &QualifiedName,
         params: &[crate::analysis::facts::ParamFact],
@@ -205,6 +214,9 @@ impl Resolver {
                         ty: c.ty.clone(),
                         not_null: c.not_null,
                         is_primary_key: c.is_primary_key,
+                        primary_key_constraint_name: c.primary_key_constraint_name.clone(),
+                        is_unique: c.is_unique,
+                        unique_constraint_name: c.unique_constraint_name.clone(),
                         default: c.default.clone(),
                     })
                     .collect();
@@ -615,16 +627,28 @@ impl Resolver {
                             constraint_name: constraint_name.clone(),
                             not_valid: *not_valid,
                         },
-                        AlterTableActionFact::AddUniqueConstraint { constraint_name } => {
-                            AlterTableActionMutation::AddUniqueConstraint {
+                        AlterTableActionFact::AddUniqueConstraint {
+                            constraint_name,
+                            using_index,
+                        } => AlterTableActionMutation::AddUniqueConstraint {
+                            constraint_name: constraint_name.clone(),
+                            using_index: using_index
+                                .as_ref()
+                                .map(|name| Self::resolve_constraint_index_name(name, &id)),
+                        },
+                        AlterTableActionFact::AddPrimaryKeyConstraint {
+                            constraint_name,
+                            using_index,
+                        } => AlterTableActionMutation::AddPrimaryKeyConstraint {
+                            constraint_name: constraint_name.clone(),
+                            using_index: using_index
+                                .as_ref()
+                                .map(|name| Self::resolve_constraint_index_name(name, &id)),
+                        },
+                        AlterTableActionFact::AddExcludeConstraint { constraint_name } => {
+                            AlterTableActionMutation::AddExcludeConstraint {
                                 constraint_name: constraint_name.clone(),
                             }
-                        }
-                        AlterTableActionFact::AddPrimaryKeyConstraint => {
-                            AlterTableActionMutation::AddPrimaryKeyConstraint
-                        }
-                        AlterTableActionFact::AddExcludeConstraint => {
-                            AlterTableActionMutation::AddExcludeConstraint
                         }
                         AlterTableActionFact::SetNotNull { column } => {
                             AlterTableActionMutation::SetNotNull {

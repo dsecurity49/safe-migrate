@@ -1,1 +1,1 @@
-CREATE INDEX IF NOT EXISTS idx_t_id ON t(id);
+ALTER TABLE t_large ADD COLUMN optional_note text;

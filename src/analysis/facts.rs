@@ -607,6 +607,9 @@ pub struct ColumnFact {
     pub ty: Option<String>,
     pub not_null: bool,
     pub is_primary_key: bool,
+    pub primary_key_constraint_name: Option<String>,
+    pub is_unique: bool,
+    pub unique_constraint_name: Option<String>,
     pub default: Option<ExprIr>,
 }
 
@@ -620,8 +623,14 @@ pub struct FkFact {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum TableConstraintFact {
-    PrimaryKey { columns: Vec<String> },
-    Unique { columns: Vec<String> },
+    PrimaryKey {
+        constraint_name: Option<String>,
+        columns: Vec<String>,
+    },
+    Unique {
+        constraint_name: Option<String>,
+        columns: Vec<String>,
+    },
     Check,
     Exclude,
 }
@@ -685,9 +694,15 @@ pub enum AlterTableActionFact {
     },
     AddUniqueConstraint {
         constraint_name: Option<String>,
+        using_index: Option<QualifiedName>,
     },
-    AddPrimaryKeyConstraint,
-    AddExcludeConstraint,
+    AddPrimaryKeyConstraint {
+        constraint_name: Option<String>,
+        using_index: Option<QualifiedName>,
+    },
+    AddExcludeConstraint {
+        constraint_name: Option<String>,
+    },
     SetNotNull {
         column: String,
     },

@@ -1,1 +1,1 @@
-ALTER TABLE test_table DROP COLUMN c;
+ALTER TABLE t_large DROP COLUMN created_at;

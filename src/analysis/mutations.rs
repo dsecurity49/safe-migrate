@@ -230,6 +230,9 @@ pub struct ColumnMutation {
     pub ty: Option<String>,
     pub not_null: bool,
     pub is_primary_key: bool,
+    pub primary_key_constraint_name: Option<String>,
+    pub is_unique: bool,
+    pub unique_constraint_name: Option<String>,
     pub default: Option<ExprIr>,
 }
 
@@ -507,9 +510,15 @@ pub enum AlterTableActionMutation {
     },
     AddUniqueConstraint {
         constraint_name: Option<String>,
+        using_index: Option<ObjectId>,
     },
-    AddPrimaryKeyConstraint,
-    AddExcludeConstraint,
+    AddPrimaryKeyConstraint {
+        constraint_name: Option<String>,
+        using_index: Option<ObjectId>,
+    },
+    AddExcludeConstraint {
+        constraint_name: Option<String>,
+    },
     SetNotNull {
         column: String,
     },
