@@ -3,7 +3,7 @@
 #[cfg(test)]
 mod tests {
     use crate::analysis::expr_ir::ExprIr;
-    use crate::analysis::facts::{AlterTableActionFact, StatementFact};
+    use crate::analysis::facts::{AlterTableActionFact, StatementFact, TableConstraintFact};
     use crate::ast::identifiers::{Ident, QualifiedName};
     use crate::ast::visitor::AstVisitor;
     use squawk_syntax::ast::SourceFile;
@@ -63,6 +63,43 @@ mod tests {
             }
             _ => panic!("Expected CreateTable fact"),
         }
+    }
+
+    #[test]
+    fn test_create_table_preserves_inline_constraint_names() {
+        let fact = parse_and_extract_statement(
+            "CREATE TABLE users (
+                id integer CONSTRAINT users_pk PRIMARY KEY,
+                email text CONSTRAINT users_email_unique UNIQUE,
+                tenant_id integer,
+                CONSTRAINT users_tenant_unique UNIQUE (tenant_id)
+            );",
+        )
+        .expect("create table fact");
+
+        let StatementFact::CreateTable {
+            columns,
+            table_constraints,
+            ..
+        } = fact
+        else {
+            panic!("expected create table fact");
+        };
+        assert_eq!(
+            columns[0].primary_key_constraint_name.as_deref(),
+            Some("users_pk")
+        );
+        assert_eq!(
+            columns[1].unique_constraint_name.as_deref(),
+            Some("users_email_unique")
+        );
+        assert!(matches!(
+            &table_constraints[0],
+            TableConstraintFact::Unique {
+                constraint_name: Some(name),
+                columns,
+            } if name == "users_tenant_unique" && columns == &["tenant_id"]
+        ));
     }
 
     #[test]

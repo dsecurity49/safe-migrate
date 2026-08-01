@@ -18,6 +18,7 @@ pub enum DependencyKind {
         has_predicate: bool,
         is_concurrent: bool,
         is_unique: bool,
+        eligibility_known: bool,
     },
     RenameTo,
     PartitionOf,

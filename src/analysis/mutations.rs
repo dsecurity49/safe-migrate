@@ -230,6 +230,9 @@ pub struct ColumnMutation {
     pub ty: Option<String>,
     pub not_null: bool,
     pub is_primary_key: bool,
+    pub primary_key_constraint_name: Option<String>,
+    pub is_unique: bool,
+    pub unique_constraint_name: Option<String>,
     pub default: Option<ExprIr>,
 }
 

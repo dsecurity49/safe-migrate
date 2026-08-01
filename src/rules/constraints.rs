@@ -257,7 +257,10 @@ impl Rule for BlockingConstraintRule {
                     using_index: None, ..
                 }
                 | AlterTableActionMutation::AddExcludeConstraint { .. } => {
-                    let mut reason = format!("Adding an index-backed constraint to {}", alter.id);
+                    let mut reason = format!(
+                        "Building an index for a UNIQUE, PRIMARY KEY, or EXCLUDE constraint on {}",
+                        alter.id
+                    );
                     if is_stale {
                         reason.push_str(" [WARNING: Based on offline/stale statistics]");
                     }

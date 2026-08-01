@@ -14,6 +14,8 @@ notes are available on the
 - Modeled `NOT VALID` foreign keys, later validation, exclusion and primary-key
   constraint state, and `UNIQUE ... USING INDEX` without a false blocking-index
   finding.
+- Preserved PostgreSQL constraint names and tightened `USING INDEX` resolution
+  and eligibility checks for indexes created within a migration.
 - Added differential assertions for expected PostgreSQL errors, including the
   exact SQLSTATE and the safe-migrate rule that must predict the rejection.
 
