@@ -1737,12 +1737,10 @@ impl AstVisitor {
                     .collect::<Option<Vec<_>>>()?;
                 let new_value = literals.first()?.clone();
                 let neighbor = literals.get(1).cloned();
-                let before = add_value
-                    .syntax()
-                    .text()
-                    .to_string()
-                    .to_ascii_lowercase()
-                    .contains(" before ");
+                let before = matches!(
+                    add_value.value_position(),
+                    Some(ast::ValuePosition::BeforeValue(_))
+                );
                 actions.push(AlterTypeActionFact::AddValue {
                     new_value,
                     neighbor,
@@ -2922,21 +2920,14 @@ impl AstVisitor {
             });
         }
         // A literal string is also valid: SET SESSION AUTHORIZATION 'rolename'.
-        let role_from_literal = node.literal().and_then(|lit| {
-            let text = lit.syntax().text().to_string();
-            let unescaped = text
-                .strip_prefix('\'')
-                .and_then(|inner| inner.strip_suffix('\''))
-                .map(|inner| inner.replace("''", "'"));
-            if unescaped.as_deref().is_none_or(str::is_empty) {
-                None
-            } else {
-                Some(crate::analysis::facts::RoleFact::Named {
-                    name: unescaped.expect("checked above"),
-                    via_legacy_group_syntax: false,
-                })
-            }
-        });
+        let role_from_literal = node
+            .literal()
+            .and_then(|literal| Self::resolve_string_literal(&literal))
+            .filter(|name| !name.is_empty())
+            .map(|name| crate::analysis::facts::RoleFact::Named {
+                name,
+                via_legacy_group_syntax: false,
+            });
         let role = role_from_literal.or_else(|| node.role_ref().map(|r| Self::extract_role(&r)));
         if matches!(
             role,

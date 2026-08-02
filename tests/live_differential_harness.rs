@@ -48,7 +48,26 @@ struct RuleManifest {
     #[serde(default)]
     required_relations: Vec<String>,
     #[serde(default)]
+    required_role_edges: Vec<RequiredRoleEdge>,
+    #[serde(default)]
     notes: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RequiredRoleEdge {
+    member: String,
+    role: String,
+    kind: RequiredRoleEdgeKind,
+    #[serde(default)]
+    min_pg_version_num: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RequiredRoleEdgeKind {
+    CanSetRoleTo,
+    MemberOfWithoutSet,
 }
 
 #[derive(Debug, Deserialize)]
@@ -923,6 +942,7 @@ fn expected_live_error_must_reference_an_included_fixture() {
             },
         )]),
         required_relations: Vec::new(),
+        required_role_edges: Vec::new(),
         notes: None,
     };
     validate_expected_live_errors(&rule, &BTreeSet::new(), &BTreeSet::from(["chain-conflict"]));
@@ -949,6 +969,7 @@ fn expected_live_error_must_reference_a_known_simulator_rule() {
             },
         )]),
         required_relations: Vec::new(),
+        required_role_edges: Vec::new(),
         notes: None,
     };
     validate_expected_live_errors(
@@ -1057,10 +1078,6 @@ fn check_role_membership_cache(
     fixture: &str,
     cache: &DbCache,
 ) -> Vec<Mismatch> {
-    if rule.rule_dir != "rule_26_chain-conflict" {
-        return Vec::new();
-    }
-
     let role = |name: &str| {
         cache
             .roles
@@ -1070,40 +1087,114 @@ fn check_role_membership_cache(
         ids.iter()
             .any(|id| id.schema.is_empty() && id.name == target)
     };
-    let mut errors = Vec::new();
+    let active_edges: Vec<&RequiredRoleEdge> = rule
+        .required_role_edges
+        .iter()
+        .filter(|required| {
+            required.min_pg_version_num.is_none_or(|minimum| {
+                cache
+                    .pg_version_num
+                    .is_some_and(|version| version >= minimum)
+            })
+        })
+        .collect();
+    let required_roles: BTreeSet<&str> = active_edges
+        .iter()
+        .flat_map(|required| [required.member.as_str(), required.role.as_str()])
+        .collect();
+    let mut mismatches: Vec<Mismatch> = required_roles
+        .into_iter()
+        .filter(|name| role(name).is_none())
+        .map(|name| Mismatch {
+            rule_dir: rule.rule_dir.clone(),
+            fixture: fixture.to_string(),
+            category: MismatchCategory::BaselineObjectAbsent,
+            root_cause: RootCauseClassification::BaselineSetupGap,
+            note: format!(
+                "baseline is missing required role {name}; check live_tests/differential_baseline.sql"
+            ),
+        })
+        .collect();
 
-    match role("sm_set_member") {
-        Some(member) if edge(&member.can_set_role_to, "sm_set_bridge") => {}
-        _ => errors.push("sm_set_member is missing its SET edge to sm_set_bridge"),
-    }
-    match role("sm_set_bridge") {
-        Some(bridge) if edge(&bridge.can_set_role_to, "sm_set_target") => {}
-        _ => errors.push("sm_set_bridge is missing its SET edge to sm_set_target"),
-    }
-
-    if cache
-        .pg_version_num
-        .is_some_and(|version| version >= 160_000)
-    {
-        match role("sm_set_member") {
-            Some(member)
-                if edge(&member.member_of, "sm_no_set_target")
-                    && !edge(&member.can_set_role_to, "sm_no_set_target") => {}
-            _ => errors
-                .push("PostgreSQL 16+ SET FALSE membership was not kept out of can_set_role_to"),
+    for required in active_edges {
+        let (Some(member), Some(_)) = (role(&required.member), role(&required.role)) else {
+            continue;
+        };
+        let matches = match required.kind {
+            RequiredRoleEdgeKind::CanSetRoleTo => edge(&member.can_set_role_to, &required.role),
+            RequiredRoleEdgeKind::MemberOfWithoutSet => {
+                edge(&member.member_of, &required.role)
+                    && !edge(&member.can_set_role_to, &required.role)
+            }
+        };
+        if !matches {
+            mismatches.push(Mismatch {
+                rule_dir: rule.rule_dir.clone(),
+                fixture: fixture.to_string(),
+                category: MismatchCategory::RoleMembershipMismatch,
+                root_cause: RootCauseClassification::SimulatorBug,
+                note: format!(
+                    "role {} does not satisfy {:?} edge to {}",
+                    required.member, required.kind, required.role
+                ),
+            });
         }
     }
 
-    errors
-        .into_iter()
-        .map(|error| Mismatch {
-            rule_dir: rule.rule_dir.clone(),
-            fixture: fixture.to_string(),
-            category: MismatchCategory::RoleMembershipMismatch,
-            root_cause: RootCauseClassification::SimulatorBug,
-            note: error.to_string(),
-        })
-        .collect()
+    mismatches
+}
+
+#[test]
+fn required_role_edges_distinguish_missing_roles_from_incorrect_edges() {
+    let rule: RuleManifest = serde_json::from_str(
+        r#"{
+            "rule_dir": "rule",
+            "enabled": true,
+            "fixtures": [],
+            "schemas": [],
+            "scope": [],
+            "required_role_edges": [
+                {
+                    "member": "member",
+                    "role": "target",
+                    "kind": "can_set_role_to"
+                }
+            ]
+        }"#,
+    )
+    .expect("role edge manifest");
+    let missing = check_role_membership_cache(&rule, "fixture.sql", &DbCache::new());
+    assert_eq!(missing.len(), 2);
+    assert!(missing.iter().all(|mismatch| {
+        mismatch.category == MismatchCategory::BaselineObjectAbsent
+            && mismatch.root_cause == RootCauseClassification::BaselineSetupGap
+    }));
+
+    let mut cache = DbCache::new();
+    for name in ["member", "target"] {
+        let id = safe_migrate::ast::identifiers::ObjectId::new("", name);
+        cache.roles.insert(
+            id.clone(),
+            safe_migrate::model::role::RoleState {
+                id,
+                can_login: false,
+                is_superuser: false,
+                member_of: Vec::new(),
+                can_set_role_to: Vec::new(),
+                granted_privileges: Vec::new(),
+            },
+        );
+    }
+    let incorrect = check_role_membership_cache(&rule, "fixture.sql", &cache);
+    assert_eq!(incorrect.len(), 1);
+    assert_eq!(
+        incorrect[0].category,
+        MismatchCategory::RoleMembershipMismatch
+    );
+    assert_eq!(
+        incorrect[0].root_cause,
+        RootCauseClassification::SimulatorBug
+    );
 }
 
 fn classify_live_execution_error(error: &postgres::Error) -> RootCauseClassification {

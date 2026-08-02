@@ -4,7 +4,12 @@ use std::path::Path;
 
 use safe_migrate::db::cache::{CACHE_V4_MAGIC, DbCacheVersioned};
 
-fn run_auto_sync_case(database_url: &str, expected_role: &str, mode: &str) {
+fn run_auto_sync_case(
+    database_url: &str,
+    expected_role: &str,
+    expected_session_role: &str,
+    mode: &str,
+) {
     let temp_dir = tempfile::tempdir().expect("create live auto-sync temp directory");
     let config_path = temp_dir.path().join("safe-migrate.toml");
     let cache_path = temp_dir.path().join("baseline.cache");
@@ -81,7 +86,7 @@ fn run_auto_sync_case(database_url: &str, expected_role: &str, mode: &str) {
     assert_eq!(cache.metadata.source_role.as_deref(), Some(expected_role));
     assert_eq!(
         cache.metadata.source_session_role.as_deref(),
-        Some(expected_role)
+        Some(expected_session_role)
     );
     assert!(cache.metadata.source_search_path.is_some());
     assert!(!cache.roles.is_empty());
@@ -98,10 +103,21 @@ fn live_auto_sync_refreshes_lint_and_lint_chain() {
         std::env::var("DATABASE_URL").expect("DATABASE_URL is required for live auto-sync proof");
     let mut client = postgres::Client::connect(&database_url, postgres::NoTls)
         .expect("connect for current_user oracle");
-    let expected_role: String = client
-        .query_one("SELECT current_user", &[])
-        .expect("query current_user")
-        .get(0);
-    run_auto_sync_case(&database_url, &expected_role, "lint");
-    run_auto_sync_case(&database_url, &expected_role, "lint-chain");
+    let role_oracle = client
+        .query_one("SELECT current_user, session_user", &[])
+        .expect("query role oracle");
+    let expected_role: String = role_oracle.get(0);
+    let expected_session_role: String = role_oracle.get(1);
+    run_auto_sync_case(
+        &database_url,
+        &expected_role,
+        &expected_session_role,
+        "lint",
+    );
+    run_auto_sync_case(
+        &database_url,
+        &expected_role,
+        &expected_session_role,
+        "lint-chain",
+    );
 }

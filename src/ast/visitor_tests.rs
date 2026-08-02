@@ -263,6 +263,26 @@ mod tests {
     }
 
     #[test]
+    fn alter_type_add_value_uses_ast_position_when_label_contains_before() {
+        let fact = parse_and_extract_statement(
+            "ALTER TYPE mood ADD VALUE 'not before now' AFTER 'ready';",
+        )
+        .expect("alter type fact");
+
+        let StatementFact::AlterType(alter_type) = fact else {
+            panic!("expected alter type fact");
+        };
+        assert_eq!(
+            alter_type.actions,
+            vec![AlterTypeActionFact::AddValue {
+                new_value: "not before now".into(),
+                neighbor: Some("ready".into()),
+                before: false,
+            }]
+        );
+    }
+
+    #[test]
     fn test_create_table_if_not_exists() {
         let sql = "CREATE TABLE IF NOT EXISTS existing_table (id INT);";
         let facts = parse_and_extract_statement(sql);
@@ -1161,6 +1181,22 @@ mod tests {
             role,
             Some(crate::analysis::facts::RoleFact::Named {
                 name: "owner's_role".to_string(),
+                via_legacy_group_syntax: false,
+            })
+        );
+    }
+
+    #[test]
+    fn set_session_authorization_decodes_escape_string_literal() {
+        let fact = parse_and_extract_statement(r"SET SESSION AUTHORIZATION E'app\x5fuser';")
+            .expect("should extract a fact");
+        let StatementFact::SetRole { role, .. } = fact else {
+            panic!("expected SetRole");
+        };
+        assert_eq!(
+            role,
+            Some(crate::analysis::facts::RoleFact::Named {
+                name: "app_user".to_string(),
                 via_legacy_group_syntax: false,
             })
         );

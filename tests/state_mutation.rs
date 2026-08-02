@@ -704,7 +704,7 @@ mod state_mutation_tests {
     }
 
     #[test]
-    fn v3_without_role_provenance_taints_explicit_user_search_path() {
+    fn cache_without_role_provenance_taints_explicit_user_search_path() {
         let engine = setup_engine();
         let mut cache = DbCache::new();
         let id = object_id("public", "mood");
@@ -1938,14 +1938,16 @@ mod state_mutation_tests {
         state.local.current_role = "start_role".to_string();
         state.local.current_role_known = true;
 
-        let _ = engine.analyze(
-            "BEGIN;
-             SET ROLE temp_admin;
-             CREATE TABLE inside_txn(id int);
-             ROLLBACK;
-             CREATE TABLE outside_txn(id int);",
-            &mut state,
-        );
+        engine
+            .analyze(
+                "BEGIN;
+                 SET ROLE temp_admin;
+                 CREATE TABLE inside_txn(id int);
+                 ROLLBACK;
+                 CREATE TABLE outside_txn(id int);",
+                &mut state,
+            )
+            .unwrap();
 
         // Outside the transaction, the role should be restored
         assert_eq!(state.local.current_role, "start_role");

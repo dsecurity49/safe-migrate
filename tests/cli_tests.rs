@@ -2,10 +2,11 @@ use std::fs;
 use std::io::Write;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use safe_migrate::ast::identifiers::ObjectId;
 use safe_migrate::db::cache::{
     CACHE_V3_MAGIC, CACHE_V4_MAGIC, DbCache, DbCacheV2, DbCacheVersioned,
 };
-use std::io::Read;
+use safe_migrate::model::relation::{Persistence, RelationKind, RelationState};
 
 fn parse_json_stdout(output: &std::process::Output) -> serde_json::Value {
     serde_json::from_slice(&output.stdout).expect("stdout must contain exactly one JSON document")
@@ -22,20 +23,21 @@ fn write_fresh_cache(path: &std::path::Path) {
 }
 
 fn write_cache_with_timestamp(path: &std::path::Path, created_at_unix_secs: u64) {
-    let encoded = fs::read("live_tests/.safe-migrate.cache").unwrap();
-    let reader = std::io::Cursor::new(encoded);
-    let mut decoder = zstd::stream::Decoder::new(reader).unwrap();
-    let mut payload = Vec::new();
-    decoder.read_to_end(&mut payload).unwrap();
-    let cache_payload = payload
-        .strip_prefix(CACHE_V4_MAGIC)
-        .expect("frozen fixture must be V4");
-    let config = bincode::config::standard().with_variable_int_encoding();
-    let versioned: DbCacheVersioned = bincode::serde::decode_from_slice(cache_payload, config)
-        .unwrap()
-        .0;
-    let mut cache = versioned.into_cache().unwrap();
+    let mut cache = DbCache::new();
     cache.metadata.created_at_unix_secs = Some(created_at_unix_secs);
+    let relation_id = ObjectId::new("public", "test_table");
+    cache.insert_baseline(
+        relation_id.clone(),
+        RelationState::new(
+            relation_id,
+            ObjectId::new("", "postgres"),
+            0,
+            Some(0),
+            RelationKind::Table,
+            Persistence::Permanent,
+            0,
+        ),
+    );
     let mut compressed = Vec::new();
     let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3).unwrap();
     let config = bincode::config::standard().with_variable_int_encoding();
