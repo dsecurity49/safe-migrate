@@ -16,8 +16,15 @@ notes are available on the
   finding.
 - Preserved PostgreSQL constraint names and tightened `USING INDEX` resolution
   and eligibility checks for indexes created within a migration.
+- Modeled ordered enum labels from `CREATE TYPE ... AS ENUM` and PostgreSQL-
+  compatible `ALTER TYPE ... RENAME VALUE` behavior, including search-path
+  resolution, conflicts, quoted labels, and transaction rollback.
 - Added differential assertions for expected PostgreSQL errors, including the
   exact SQLSTATE and the safe-migrate rule that must predict the rejection.
+- Added headered V4 caches with synchronization-role provenance for `$user`
+  search-path resolution. Headered V3 caches remain readable; older formats
+  now require `safe-migrate sync` and are rejected without internal version
+  labels.
 
 ## v0.4.3 — 2026-07-30
 

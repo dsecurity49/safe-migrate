@@ -55,6 +55,7 @@ pub struct LocalState {
     pub search_path: Vec<String>,
     pub default_search_path: Vec<String>,
     pub current_role: String,
+    pub current_role_known: bool,
     pub confidence: Confidence,
     pub transactions: Vec<TransactionFrame>,
     pub transaction_aborted: bool,
@@ -106,6 +107,12 @@ impl AnalysisState {
 
     pub fn with_baseline(cache: DbCache, baseline_available: bool) -> Self {
         let default_search_path = cache.search_path.clone();
+        let current_role_known = cache.metadata.source_role.is_some();
+        let current_role = cache
+            .metadata
+            .source_role
+            .clone()
+            .unwrap_or_else(|| "postgres".to_string());
         let baseline_schemas = cache
             .metadata
             .schemas
@@ -263,10 +270,8 @@ impl AnalysisState {
                 graph,
                 search_path: default_search_path.clone(),
                 default_search_path,
-                // The cache does not yet record session-role provenance.
-                // This is a modeling placeholder, not a claim about the live
-                // database user.
-                current_role: "postgres".to_string(),
+                current_role,
+                current_role_known,
                 confidence: Confidence::Exact,
                 transactions: Vec::new(),
                 transaction_aborted: false,
@@ -629,8 +634,8 @@ impl AnalysisState {
         let name = match role {
             crate::analysis::facts::RoleFact::Named { name, .. } => Some(name.clone()),
             crate::analysis::facts::RoleFact::CurrentUser
-            | crate::analysis::facts::RoleFact::CurrentRole => Some(current_role.to_string()),
-            crate::analysis::facts::RoleFact::SessionUser => Some("postgres".to_string()),
+            | crate::analysis::facts::RoleFact::CurrentRole
+            | crate::analysis::facts::RoleFact::SessionUser => Some(current_role.to_string()),
             crate::analysis::facts::RoleFact::Unknown => None,
         }?;
         Some(ObjectId::new("", name))
@@ -1839,7 +1844,43 @@ impl AnalysisState {
                                 variants.insert(insertion_index, new_value.clone());
                             }
                         }
+                        AlterTypeActionMutation::RenameValue {
+                            old_value,
+                            new_value,
+                        } => {
+                            let TypeKind::Enum { variants } = &mut t.kind else {
+                                return MutationResult::Conflict {
+                                    reason: format!("type '{}' is not an enum", alter_type.id),
+                                };
+                            };
+                            let Some(old_index) =
+                                variants.iter().position(|value| value == old_value)
+                            else {
+                                return MutationResult::Conflict {
+                                    reason: format!(
+                                        "'{}' is not an existing label of enum '{}'",
+                                        old_value, alter_type.id
+                                    ),
+                                };
+                            };
+                            if variants.iter().any(|value| value == new_value) {
+                                return MutationResult::Conflict {
+                                    reason: format!(
+                                        "enum label '{}' already exists on type '{}'",
+                                        new_value, alter_type.id
+                                    ),
+                                };
+                            }
+                            variants[old_index] = new_value.clone();
+                        }
                     }
+                } else if matches!(
+                    alter_type.action,
+                    AlterTypeActionMutation::RenameValue { .. }
+                ) {
+                    return MutationResult::Conflict {
+                        reason: format!("type '{}' does not exist", alter_type.id),
+                    };
                 }
                 MutationResult::Applied
             }
@@ -2053,7 +2094,20 @@ impl AnalysisState {
                         self.local.search_path = self.local.default_search_path.clone();
                     }
                     SearchPathTarget::Schemas(schemas) => {
-                        self.local.search_path = schemas.clone();
+                        self.local.search_path = schemas
+                            .iter()
+                            .filter_map(|schema| {
+                                if schema != "$user" {
+                                    return Some(schema.clone());
+                                }
+                                if self.local.current_role_known {
+                                    Some(self.local.current_role.clone())
+                                } else {
+                                    self.local.confidence = Confidence::Tainted;
+                                    None
+                                }
+                            })
+                            .collect();
                     }
                 }
                 MutationResult::Applied

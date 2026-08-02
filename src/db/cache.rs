@@ -59,8 +59,20 @@ pub struct CacheMetadata {
     /// PostgreSQL database name only; connection credentials and host details
     /// are deliberately never stored in a cache.
     pub source_database: Option<String>,
+    /// Session role used when the cache was synchronized. This is needed to
+    /// resolve PostgreSQL's special `$user` search-path entry.
+    pub source_role: Option<String>,
     /// Explicit schema scope passed to sync. `None` means all non-system
     /// schemas were requested.
+    pub schemas: Option<Vec<String>>,
+}
+
+/// Metadata layout written by cache V3. Keep this byte-for-byte stable so V3
+/// remains readable after the current cache schema evolves.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CacheMetadataV3 {
+    pub created_at_unix_secs: Option<u64>,
+    pub source_database: Option<String>,
     pub schemas: Option<Vec<String>>,
 }
 
@@ -89,6 +101,22 @@ pub struct DbCacheV2 {
     pub dependencies: Vec<DependencyCache>,
 }
 
+/// Cache layout written by safe-migrate v0.4.3.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbCacheV3 {
+    pub pg_version_num: Option<u32>,
+    pub metadata: CacheMetadataV3,
+    pub search_path: Vec<String>,
+    pub relations: HashMap<ObjectId, RelationState>,
+    pub foreign_keys: Vec<ForeignKeyCache>,
+    pub indexes: Vec<IndexCache>,
+    pub constraints: Vec<ConstraintState>,
+    pub triggers: Vec<TriggerCache>,
+    pub functions: HashMap<ObjectId, FunctionState>,
+    pub types: HashMap<ObjectId, TypeState>,
+    pub dependencies: Vec<DependencyCache>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DbCache {
     pub pg_version_num: Option<u32>,
@@ -104,18 +132,20 @@ pub struct DbCache {
     pub dependencies: Vec<DependencyCache>,
 }
 
-pub const CACHE_FORMAT_VERSION: u32 = 3;
+pub const CACHE_FORMAT_VERSION: u32 = 4;
 
 /// Prefixes every V3 payload after zstd decompression. Older caches did not
 /// have a payload header, so this prevents their bincode V3 discriminator from
 /// being mistaken for the redesigned V3 schema.
 pub const CACHE_V3_MAGIC: &[u8] = b"SMCACHE03";
+pub const CACHE_V4_MAGIC: &[u8] = b"SMCACHE04";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DbCacheVersioned {
     V1(DbCacheV1),
     V2(DbCacheV2),
-    V3(DbCache),
+    V3(DbCacheV3),
+    V4(DbCache),
 }
 
 impl DbCacheVersioned {
@@ -124,61 +154,65 @@ impl DbCacheVersioned {
             DbCacheVersioned::V1(_) => 1,
             DbCacheVersioned::V2(_) => 2,
             DbCacheVersioned::V3(_) => 3,
+            DbCacheVersioned::V4(_) => 4,
         }
     }
 
     pub fn into_cache(self) -> Result<DbCache, String> {
         match self {
-            DbCacheVersioned::V1(c) => Ok(DbCache {
-                pg_version_num: c.pg_version_num,
-                metadata: CacheMetadata::default(),
-                relations: c.relations,
-                foreign_keys: c.foreign_keys,
-                indexes: c.indexes,
-                constraints: Vec::new(),
-                triggers: upgrade_legacy_triggers(c.triggers),
-                functions: c.functions,
-                types: HashMap::new(),
-                dependencies: Vec::new(),
-                search_path: vec!["public".to_string()],
-            }),
-            DbCacheVersioned::V2(c) => Ok(DbCache {
-                pg_version_num: c.pg_version_num,
-                metadata: CacheMetadata::default(),
-                search_path: vec!["public".to_string()],
-                relations: c.relations,
-                foreign_keys: c.foreign_keys,
-                indexes: c.indexes,
-                constraints: Vec::new(),
-                triggers: upgrade_legacy_triggers(c.triggers),
-                functions: c.functions,
-                types: HashMap::new(),
-                dependencies: c.dependencies,
-            }),
-            DbCacheVersioned::V3(c) => Ok(c),
+            DbCacheVersioned::V1(_) | DbCacheVersioned::V2(_) => Err(
+                "This cache format is unsupported. Run `safe-migrate sync` to rebuild it."
+                    .to_string(),
+            ),
+            DbCacheVersioned::V3(c) => Ok(c.into()),
+            DbCacheVersioned::V4(c) => Ok(c),
         }
     }
 }
 
-/// Returns the historical enum version encoded at the beginning of an
-/// unheadered bincode cache. The configured bincode format uses a single-byte
-/// variable integer for the historical versions. Versions 3 and above are
-/// intentionally not compatible with v0.4.3 and must be rebuilt by
-/// `safe-migrate sync`.
-pub fn legacy_cache_format_version(payload: &[u8]) -> Option<u32> {
-    payload.first().map(|tag| u32::from(*tag) + 1)
+impl From<DbCacheV3> for DbCache {
+    fn from(cache: DbCacheV3) -> Self {
+        Self {
+            pg_version_num: cache.pg_version_num,
+            metadata: CacheMetadata {
+                created_at_unix_secs: cache.metadata.created_at_unix_secs,
+                source_database: cache.metadata.source_database,
+                source_role: None,
+                schemas: cache.metadata.schemas,
+            },
+            search_path: cache.search_path,
+            relations: cache.relations,
+            foreign_keys: cache.foreign_keys,
+            indexes: cache.indexes,
+            constraints: cache.constraints,
+            triggers: cache.triggers,
+            functions: cache.functions,
+            types: cache.types,
+            dependencies: cache.dependencies,
+        }
+    }
 }
 
-fn upgrade_legacy_triggers(triggers: Vec<LegacyTriggerCache>) -> Vec<TriggerCache> {
-    triggers
-        .into_iter()
-        .map(|trigger| TriggerCache {
-            trigger_id: trigger.trigger_id,
-            table_id: trigger.table_id,
-            function_id: trigger.function_id,
-            enabled_mode: TriggerEnableMode::Origin,
-        })
-        .collect()
+impl From<DbCache> for DbCacheV3 {
+    fn from(cache: DbCache) -> Self {
+        Self {
+            pg_version_num: cache.pg_version_num,
+            metadata: CacheMetadataV3 {
+                created_at_unix_secs: cache.metadata.created_at_unix_secs,
+                source_database: cache.metadata.source_database,
+                schemas: cache.metadata.schemas,
+            },
+            search_path: cache.search_path,
+            relations: cache.relations,
+            foreign_keys: cache.foreign_keys,
+            indexes: cache.indexes,
+            constraints: cache.constraints,
+            triggers: cache.triggers,
+            functions: cache.functions,
+            types: cache.types,
+            dependencies: cache.dependencies,
+        }
+    }
 }
 
 impl Default for DbCache {
@@ -218,7 +252,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn legacy_v1_cache_upgrades_to_current_model() {
+    fn legacy_v1_cache_is_rejected() {
         let cache = DbCacheV1 {
             pg_version_num: None,
             relations: HashMap::new(),
@@ -230,17 +264,24 @@ mod tests {
         let versioned = DbCacheVersioned::V1(cache);
         assert_eq!(versioned.format_version(), 1);
         let result = versioned.into_cache();
-        assert!(
-            result.is_ok(),
-            "into_cache() should succeed for V1: {:?}",
-            result
+        assert_eq!(
+            result.unwrap_err(),
+            "This cache format is unsupported. Run `safe-migrate sync` to rebuild it."
         );
     }
 
     #[test]
-    fn current_cache_format_is_v3() {
-        assert_eq!(CACHE_FORMAT_VERSION, 3);
-        assert_eq!(DbCacheVersioned::V3(DbCache::new()).format_version(), 3);
+    fn current_cache_format_is_v4() {
+        assert_eq!(CACHE_FORMAT_VERSION, 4);
+        assert_eq!(DbCacheVersioned::V4(DbCache::new()).format_version(), 4);
         assert_eq!(CACHE_V3_MAGIC, b"SMCACHE03");
+        assert_eq!(CACHE_V4_MAGIC, b"SMCACHE04");
+    }
+
+    #[test]
+    fn v3_cache_remains_readable_without_inventing_a_source_role() {
+        let v3 = DbCacheV3::from(DbCache::new());
+        let cache = DbCacheVersioned::V3(v3).into_cache().unwrap();
+        assert_eq!(cache.metadata.source_role, None);
     }
 }

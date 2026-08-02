@@ -204,8 +204,9 @@ still be treated as sensitive and kept out of public artifacts.
 
 ### Cache compatibility
 
-v0.4.3 writes the headered V3 cache format. V1 and V2 caches remain readable;
-v0.4.2 caches must be rebuilt:
+v0.4.4 writes the headered V4 cache format. Headered V3 caches remain readable
+with limited role provenance. Older cache formats are unsupported and must be
+rebuilt:
 
 ```bash
 safe-migrate sync

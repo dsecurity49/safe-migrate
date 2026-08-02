@@ -21,6 +21,44 @@ use squawk_syntax::{SyntaxKind, ast};
 pub struct AstVisitor;
 
 impl AstVisitor {
+    fn resolve_string_literal(literal: &ast::Literal) -> Option<String> {
+        let token = literal.syntax().first_token()?;
+        let raw = token.text();
+        let mut decoded = String::new();
+        match token.kind() {
+            SyntaxKind::STRING => {
+                squawk_syntax::unescape::decode_plain_string(
+                    squawk_syntax::quote::strip_quotes(raw)?,
+                    &mut decoded,
+                );
+            }
+            SyntaxKind::ESC_STRING => {
+                squawk_syntax::unescape::decode_esc_string(
+                    squawk_syntax::quote::strip_prefixed_quotes(raw, ['e', 'E'])?,
+                    &mut decoded,
+                );
+            }
+            SyntaxKind::NATIONAL_STRING => {
+                squawk_syntax::unescape::decode_plain_string(
+                    squawk_syntax::quote::strip_prefixed_quotes(raw, ['n', 'N'])?,
+                    &mut decoded,
+                );
+            }
+            SyntaxKind::UNICODE_ESC_STRING => {
+                squawk_syntax::unescape::decode_unicode_esc_string(
+                    squawk_syntax::quote::strip_unicode_esc_prefix(raw)?,
+                    '\\',
+                    &mut decoded,
+                );
+            }
+            SyntaxKind::DOLLAR_QUOTED_STRING => {
+                decoded.push_str(squawk_syntax::quote::strip_dollar_quotes(raw)?);
+            }
+            _ => return None,
+        }
+        Some(decoded)
+    }
+
     fn resolve_name(n: Name) -> String {
         Self::identifier_from_name(n.text(), n.is_quoted()).resolve()
     }
@@ -1686,7 +1724,17 @@ impl AstVisitor {
         let name = Self::path_to_qualified_name(&path)?;
 
         let kind = match node.kind()? {
-            ast::CreateTypeKind::EnumType(_) => TypeCreationKind::Enum,
+            ast::CreateTypeKind::EnumType(enum_type) => TypeCreationKind::Enum {
+                variants: enum_type
+                    .variant_list()?
+                    .variants()
+                    .map(|variant| {
+                        variant
+                            .literal()
+                            .and_then(|literal| Self::resolve_string_literal(&literal))
+                    })
+                    .collect::<Option<Vec<_>>>()?,
+            },
             ast::CreateTypeKind::RangeType(_) => TypeCreationKind::Range,
             ast::CreateTypeKind::CompositeType(_) => TypeCreationKind::Composite,
             ast::CreateTypeKind::BaseType(_) => TypeCreationKind::Base,
@@ -1700,34 +1748,41 @@ impl AstVisitor {
         let name = Self::path_ref_to_qualified_name(&path)?;
         let mut actions = Vec::new();
 
-        if let Some(squawk_syntax::ast::AlterTypeAction::AddValue(av)) = node.action()
-            && let Some(lit) = av.literal()
-        {
-            let action_sql = av.syntax().text().to_string();
-            let action_lower = action_sql.to_ascii_lowercase();
-            let neighbor = av
-                .syntax()
-                .descendants()
-                .filter_map(ast::Literal::cast)
-                .map(|literal| {
-                    literal
-                        .syntax()
-                        .text()
-                        .to_string()
-                        .trim_matches('\'')
-                        .replace("''", "'")
-                })
-                .nth(1);
-            actions.push(AlterTypeActionFact::AddValue {
-                new_value: lit
+        match node.action()? {
+            ast::AlterTypeAction::AddValue(add_value) => {
+                let literals = add_value
+                    .syntax()
+                    .descendants()
+                    .filter_map(ast::Literal::cast)
+                    .map(|literal| Self::resolve_string_literal(&literal))
+                    .collect::<Option<Vec<_>>>()?;
+                let new_value = literals.first()?.clone();
+                let neighbor = literals.get(1).cloned();
+                let before = add_value
                     .syntax()
                     .text()
                     .to_string()
-                    .trim_matches('\'')
-                    .replace("''", "'"),
-                neighbor,
-                before: action_lower.contains(" before "),
-            });
+                    .to_ascii_lowercase()
+                    .contains(" before ");
+                actions.push(AlterTypeActionFact::AddValue {
+                    new_value,
+                    neighbor,
+                    before,
+                });
+            }
+            ast::AlterTypeAction::RenameValue(rename_value) => {
+                let literals = rename_value
+                    .syntax()
+                    .descendants()
+                    .filter_map(ast::Literal::cast)
+                    .map(|literal| Self::resolve_string_literal(&literal))
+                    .collect::<Option<Vec<_>>>()?;
+                actions.push(AlterTypeActionFact::RenameValue {
+                    old_value: literals.first()?.clone(),
+                    new_value: literals.get(1)?.clone(),
+                });
+            }
+            _ => return Some(StatementFact::AlterType(AlterTypeFact { name, actions })),
         }
 
         Some(StatementFact::AlterType(AlterTypeFact { name, actions }))

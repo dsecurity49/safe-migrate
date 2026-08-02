@@ -208,6 +208,10 @@ pub enum AlterTypeActionMutation {
         neighbor: Option<String>,
         before: bool,
     },
+    RenameValue {
+        old_value: String,
+        new_value: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]

@@ -1,7 +1,10 @@
 use std::fs;
+use std::io::Read;
 use std::path::Path;
 
-fn run_auto_sync_case(database_url: &str, mode: &str) {
+use safe_migrate::db::cache::{CACHE_V4_MAGIC, DbCacheVersioned};
+
+fn run_auto_sync_case(database_url: &str, expected_role: &str, mode: &str) {
     let temp_dir = tempfile::tempdir().expect("create live auto-sync temp directory");
     let config_path = temp_dir.path().join("safe-migrate.toml");
     let cache_path = temp_dir.path().join("baseline.cache");
@@ -59,6 +62,23 @@ fn run_auto_sync_case(database_url: &str, mode: &str) {
         Path::new(&cache_path).is_file(),
         "auto-sync cache was not written"
     );
+    let encoded = fs::read(&cache_path).expect("read auto-sync cache");
+    let mut decoder = zstd::stream::Decoder::new(encoded.as_slice()).expect("decode cache zstd");
+    let mut payload = Vec::new();
+    decoder
+        .read_to_end(&mut payload)
+        .expect("read decoded cache payload");
+    let v4_payload = payload
+        .strip_prefix(CACHE_V4_MAGIC)
+        .expect("auto-sync must write a V4 cache");
+    let config = bincode::config::standard().with_variable_int_encoding();
+    let (versioned, bytes_read): (DbCacheVersioned, usize) =
+        bincode::serde::decode_from_slice(v4_payload, config).expect("decode V4 cache");
+    assert_eq!(bytes_read, v4_payload.len());
+    let DbCacheVersioned::V4(cache) = versioned else {
+        panic!("auto-sync must encode the V4 cache variant");
+    };
+    assert_eq!(cache.metadata.source_role.as_deref(), Some(expected_role));
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("Automatic cache sync enabled"));
@@ -70,6 +90,12 @@ fn run_auto_sync_case(database_url: &str, mode: &str) {
 fn live_auto_sync_refreshes_lint_and_lint_chain() {
     let database_url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL is required for live auto-sync proof");
-    run_auto_sync_case(&database_url, "lint");
-    run_auto_sync_case(&database_url, "lint-chain");
+    let mut client = postgres::Client::connect(&database_url, postgres::NoTls)
+        .expect("connect for current_user oracle");
+    let expected_role: String = client
+        .query_one("SELECT current_user", &[])
+        .expect("query current_user")
+        .get(0);
+    run_auto_sync_case(&database_url, &expected_role, "lint");
+    run_auto_sync_case(&database_url, &expected_role, "lint-chain");
 }

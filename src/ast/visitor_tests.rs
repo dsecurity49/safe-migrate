@@ -3,7 +3,10 @@
 #[cfg(test)]
 mod tests {
     use crate::analysis::expr_ir::ExprIr;
-    use crate::analysis::facts::{AlterTableActionFact, StatementFact, TableConstraintFact};
+    use crate::analysis::facts::{
+        AlterTableActionFact, AlterTypeActionFact, StatementFact, TableConstraintFact,
+        TypeCreationKind,
+    };
     use crate::ast::identifiers::{Ident, QualifiedName};
     use crate::ast::visitor::AstVisitor;
     use squawk_syntax::ast::SourceFile;
@@ -208,6 +211,55 @@ mod tests {
             }
             _ => panic!("Expected CreateTable fact"),
         }
+    }
+
+    #[test]
+    fn create_enum_extracts_ordered_and_escaped_labels() {
+        let fact = parse_and_extract_statement(
+            r#"CREATE TYPE "Mood" AS ENUM ('sad', 'it''s fine', E'line\nbreak');"#,
+        )
+        .expect("create type fact");
+
+        let StatementFact::CreateType(create_type) = fact else {
+            panic!("expected create type fact");
+        };
+        assert_eq!(create_type.name.name.resolve(), "Mood");
+        assert!(create_type.name.name.quoted);
+        assert_eq!(
+            create_type.kind,
+            TypeCreationKind::Enum {
+                variants: vec!["sad".into(), "it's fine".into(), "line\nbreak".into()]
+            }
+        );
+    }
+
+    #[test]
+    fn alter_type_rename_value_extracts_qualified_identity_and_labels() {
+        let fact = parse_and_extract_statement(
+            r#"ALTER TYPE sm_core."Mood" RENAME VALUE 'it''s fine' TO 'it''s great';"#,
+        )
+        .expect("alter type fact");
+
+        let StatementFact::AlterType(alter_type) = fact else {
+            panic!("expected alter type fact");
+        };
+        assert_eq!(
+            alter_type
+                .name
+                .schema
+                .as_ref()
+                .map(|schema| schema.resolve()),
+            Some("sm_core".to_string())
+        );
+        assert_eq!(alter_type.name.name.resolve(), "Mood");
+        assert!(alter_type.name.name.quoted);
+        assert_eq!(
+            alter_type.actions,
+            vec![AlterTypeActionFact::RenameValue {
+                old_value: "it's fine".into(),
+                new_value: "it's great".into(),
+            }]
+        );
     }
 
     #[test]
@@ -682,6 +734,21 @@ mod tests {
             } => {}
             _ => panic!("Expected SetSearchPath fact"),
         }
+    }
+
+    #[test]
+    fn test_set_search_path_preserves_user_placeholder() {
+        let facts = parse_and_extract_statement("SET search_path TO \"$user\", public;")
+            .expect("search_path fact");
+        assert_eq!(
+            facts,
+            StatementFact::SetSearchPath {
+                target: crate::analysis::facts::SearchPathTarget::Schemas(vec![
+                    "$user".into(),
+                    "public".into(),
+                ]),
+            }
+        );
     }
 
     #[test]

@@ -177,10 +177,12 @@ silently weakening the configured protection. When encryption is disabled,
 encrypted cache files are also rejected; changing modes requires a fresh
 `safe-migrate sync`.
 
-V3 cache payloads carry an explicit format header. V1 and V2 remain compatible.
-Legacy unheadered payloads using internal cache tags 3 through 6—including the
-V5 format written by v0.4.2—are rejected and require `safe-migrate sync`.
-These tag numbers identify cache layouts, not safe-migrate release versions.
+V4 cache payloads carry an explicit format header and record the synchronization
+role needed to resolve PostgreSQL's special `$user` search-path entry. Headered
+V3 payloads remain readable; when a migration explicitly uses `$user`, missing
+V3 role provenance taints confidence. All older and unheadered payloads are
+rejected with generic guidance to run `safe-migrate sync`; errors do not expose
+internal cache-version labels.
 
 Errors must identify the failed input or subsystem without printing
 `DATABASE_URL`, credentials, or migration contents not already requested in the

@@ -1385,9 +1385,13 @@
         "006_add_value_if_not_exists_after.sql",
         "008_add_value_quoted_type.sql",
         "009_add_value_status_type.sql",
+        "safe_002_rename_value.sql",
         "safe_004_alter_table.sql",
         "safe_006_drop_type.sql",
-        "safe_008_create_index.sql"
+        "safe_008_create_index.sql",
+        "safe_010_rename_value_search_path.sql",
+        "safe_011_rename_value_quoted.sql",
+        "safe_012_create_then_rename_value.sql"
       ],
       "excluded_fixtures": [
         {
@@ -1405,10 +1409,6 @@
         {
           "fixture": "safe_001_rename_type.sql",
           "reason": "ALTER TYPE RENAME TO is not represented by the current parser/state mutation model; tracked as a future type-topology slice."
-        },
-        {
-          "fixture": "safe_002_rename_value.sql",
-          "reason": "ALTER TYPE RENAME VALUE is not represented by the current parser/state mutation model; tracked as a future enum-label mutation slice."
         },
         {
           "fixture": "safe_003_create_table.sql",
@@ -1453,7 +1453,7 @@
         "public.test_table",
         "sm_core.t"
       ],
-      "notes": "Seventeenth incremental slice. Hydrates enterprise enum/domain state from PostgreSQL and compares enum existence, ordered labels, positional additions, quoted identity, and drops."
+      "notes": "Seventeenth incremental slice. Hydrates enterprise enum/domain state from PostgreSQL and compares enum existence, ordered labels, positional additions, value renames, search-path and quoted identity, create-then-rename chains, and drops."
     },
     {
       "rule_dir": "rule_13_partition-strategy-mismatch",
@@ -1703,6 +1703,10 @@
         "004_conflict.sql",
         "010_conflict.sql",
         "011_missing_fk_source_column.sql",
+        "012_rename_enum_missing_label.sql",
+        "013_rename_enum_duplicate_label.sql",
+        "014_rename_value_non_enum.sql",
+        "015_rename_value_missing_type.sql",
         "safe_001_chain.sql",
         "safe_001_create_table.sql",
         "safe_002_create_index.sql",
@@ -1714,6 +1718,22 @@
       "expected_live_errors": {
         "011_missing_fk_source_column.sql": {
           "sqlstate": "42703",
+          "simulator_rule": "chain-conflict"
+        },
+        "012_rename_enum_missing_label.sql": {
+          "sqlstate": "22023",
+          "simulator_rule": "chain-conflict"
+        },
+        "013_rename_enum_duplicate_label.sql": {
+          "sqlstate": "42710",
+          "simulator_rule": "chain-conflict"
+        },
+        "014_rename_value_non_enum.sql": {
+          "sqlstate": "42809",
+          "simulator_rule": "chain-conflict"
+        },
+        "015_rename_value_missing_type.sql": {
+          "sqlstate": "42704",
           "simulator_rule": "chain-conflict"
         }
       },

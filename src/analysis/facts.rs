@@ -26,7 +26,7 @@ pub enum SearchPathTarget {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum TypeCreationKind {
-    Enum,
+    Enum { variants: Vec<String> },
     Range,
     Composite,
     Base,
@@ -275,6 +275,10 @@ pub enum AlterTypeActionFact {
         new_value: String,
         neighbor: Option<String>,
         before: bool,
+    },
+    RenameValue {
+        old_value: String,
+        new_value: String,
     },
 }
 

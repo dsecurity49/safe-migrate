@@ -2,7 +2,9 @@ use std::fs;
 use std::io::Write;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use safe_migrate::db::cache::{CACHE_V3_MAGIC, DbCache, DbCacheV2, DbCacheVersioned};
+use safe_migrate::db::cache::{
+    CACHE_V3_MAGIC, CACHE_V4_MAGIC, DbCache, DbCacheV2, DbCacheVersioned,
+};
 use std::io::Read;
 
 fn parse_json_stdout(output: &std::process::Output) -> serde_json::Value {
@@ -25,9 +27,10 @@ fn write_cache_with_timestamp(path: &std::path::Path, created_at_unix_secs: u64)
     let mut decoder = zstd::stream::Decoder::new(reader).unwrap();
     let mut payload = Vec::new();
     decoder.read_to_end(&mut payload).unwrap();
-
+    let cache_payload = payload
+        .strip_prefix(CACHE_V4_MAGIC)
+        .expect("frozen fixture must be V4");
     let config = bincode::config::standard().with_variable_int_encoding();
-    let cache_payload = payload.strip_prefix(CACHE_V3_MAGIC).unwrap_or(&payload);
     let versioned: DbCacheVersioned = bincode::serde::decode_from_slice(cache_payload, config)
         .unwrap()
         .0;
@@ -36,8 +39,8 @@ fn write_cache_with_timestamp(path: &std::path::Path, created_at_unix_secs: u64)
     let mut compressed = Vec::new();
     let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3).unwrap();
     let config = bincode::config::standard().with_variable_int_encoding();
-    encoder.write_all(CACHE_V3_MAGIC).unwrap();
-    bincode::serde::encode_into_std_write(DbCacheVersioned::V3(cache), &mut encoder, config)
+    encoder.write_all(CACHE_V4_MAGIC).unwrap();
+    bincode::serde::encode_into_std_write(DbCacheVersioned::V4(cache), &mut encoder, config)
         .unwrap();
     encoder.finish().unwrap();
     fs::write(path, compressed).unwrap();
@@ -128,8 +131,8 @@ fn test_cli_lint_invalid_cache() {
 fn test_cli_rejects_cache_with_oversized_decoded_container() {
     let config = bincode::config::standard().with_variable_int_encoding();
     let encoded =
-        bincode::serde::encode_to_vec(DbCacheVersioned::V3(DbCache::new()), config).unwrap();
-    assert_eq!(&encoded[..4], &[2, 0, 0, 0]);
+        bincode::serde::encode_to_vec(DbCacheVersioned::V4(DbCache::new()), config).unwrap();
+    assert_eq!(&encoded[..4], &[3, 0, 0, 0]);
 
     let mut malicious = encoded[..3].to_vec();
     malicious.push(1);
@@ -138,7 +141,7 @@ fn test_cli_rejects_cache_with_oversized_decoded_container() {
 
     let mut compressed = Vec::new();
     let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3).unwrap();
-    encoder.write_all(CACHE_V3_MAGIC).unwrap();
+    encoder.write_all(CACHE_V4_MAGIC).unwrap();
     encoder.write_all(&malicious).unwrap();
     encoder.finish().unwrap();
 
@@ -160,7 +163,7 @@ fn test_cli_rejects_cache_with_oversized_decoded_container() {
 }
 
 #[test]
-fn test_cache_inspect_reads_legacy_v2_cache() {
+fn test_cache_inspect_rejects_unsupported_legacy_cache_without_exposing_its_version() {
     let legacy = DbCacheV2 {
         pg_version_num: Some(160000),
         relations: Default::default(),
@@ -186,30 +189,41 @@ fn test_cache_inspect_reads_legacy_v2_cache() {
         .arg("inspect")
         .arg("--cache")
         .arg(cache.path())
-        .arg("--json")
         .assert()
-        .success();
-    assert_eq!(parse_json_stdout(assert.get_output())["format_version"], 2);
+        .failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(stderr.contains("unsupported cache format"));
+    assert!(stderr.contains("safe-migrate sync"));
+    assert!(!stderr.contains("V1"));
+    assert!(!stderr.contains("V2"));
 }
 
 #[test]
-fn test_cache_inspect_reads_frozen_legacy_v1_cache() {
+fn test_cache_inspect_reads_headered_v3_cache() {
+    let config = bincode::config::standard().with_variable_int_encoding();
+    let v3 = safe_migrate::db::cache::DbCacheV3::from(DbCache::new());
+    let mut compressed = Vec::new();
+    let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3).unwrap();
+    encoder.write_all(CACHE_V3_MAGIC).unwrap();
+    bincode::serde::encode_into_std_write(DbCacheVersioned::V3(v3), &mut encoder, config).unwrap();
+    encoder.finish().unwrap();
+    let cache = tempfile::NamedTempFile::new().unwrap();
+    fs::write(cache.path(), compressed).unwrap();
+
     let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
     let assert = cmd
         .arg("cache")
         .arg("inspect")
         .arg("--cache")
-        .arg("live_tests/.safe-migrate.cache")
+        .arg(cache.path())
         .arg("--json")
         .assert()
         .success();
-    assert_eq!(parse_json_stdout(assert.get_output())["format_version"], 1);
+    assert_eq!(parse_json_stdout(assert.get_output())["format_version"], 3);
 }
 
 #[test]
-fn test_cache_inspect_rejects_released_v5_cache_and_requires_sync() {
-    // V5 was historical enum tag 4 under the variable-integer bincode
-    // configuration. The reader must reject it before deserializing it.
+fn test_cache_inspect_rejects_unknown_unheadered_cache_generically() {
     let mut compressed = Vec::new();
     let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3).unwrap();
     encoder.write_all(&[4, 0, 0, 0]).unwrap();
@@ -227,8 +241,9 @@ fn test_cache_inspect_rejects_released_v5_cache_and_requires_sync() {
         .assert()
         .failure();
     let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
-    assert!(stderr.contains("unsupported legacy format V5"));
+    assert!(stderr.contains("unsupported cache format"));
     assert!(stderr.contains("safe-migrate sync"));
+    assert!(!stderr.contains("V5"));
 }
 
 #[test]
@@ -258,7 +273,7 @@ fn test_cache_inspect_outputs_a_redacted_json_summary() {
     let report = parse_json_stdout(assert.get_output());
 
     assert_eq!(report["path"], cache_path.display().to_string());
-    assert_eq!(report["format_version"], 3);
+    assert_eq!(report["format_version"], 4);
     assert_eq!(report["encrypted"], false);
     assert!(report["contents"]["relations"].is_number());
     assert!(report["contents"]["columns"].is_number());

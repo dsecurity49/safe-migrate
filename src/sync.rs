@@ -1,7 +1,7 @@
 // FILE: src/sync.rs
 
 use crate::ast::identifiers::ObjectId;
-use crate::db::cache::{CACHE_V3_MAGIC, DbCache, DbCacheVersioned, ForeignKeyCache, IndexCache};
+use crate::db::cache::{CACHE_V4_MAGIC, DbCache, DbCacheVersioned, ForeignKeyCache, IndexCache};
 use crate::db::cache_file::protect_cache_bytes;
 use crate::model::relation::{Persistence, RelationKind, RelationState};
 use anyhow::{Context, Result};
@@ -113,10 +113,10 @@ fn write_cache_with_protection(
         .context("Failed to init zstd compression")?;
 
     encoder
-        .write_all(CACHE_V3_MAGIC)
-        .context("Failed to write cache V3 payload header")?;
+        .write_all(CACHE_V4_MAGIC)
+        .context("Failed to write cache V4 payload header")?;
 
-    let versioned = DbCacheVersioned::V3(cache);
+    let versioned = DbCacheVersioned::V4(cache);
     let bincode_config = bincode::config::standard().with_variable_int_encoding();
 
     bincode::serde::encode_into_std_write(&versioned, &mut encoder, bincode_config)
@@ -253,8 +253,9 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
     let version_str: String = version_row.get(0);
     cache.pg_version_num = version_str.parse::<u32>().ok();
 
-    let database_row = client.query_one("SELECT current_database();", &[])?;
-    cache.metadata.source_database = Some(database_row.get(0));
+    let provenance_row = client.query_one("SELECT current_database(), current_user;", &[])?;
+    cache.metadata.source_database = Some(provenance_row.get(0));
+    cache.metadata.source_role = Some(provenance_row.get(1));
 
     // Resolve role/database defaults and special entries such as "$user" exactly
     // as PostgreSQL does, while excluding the implicit pg_catalog lookup. An
@@ -906,8 +907,8 @@ mod atomic_write_tests {
         let mut payload = Vec::new();
         decoder.read_to_end(&mut payload).unwrap();
         let payload = payload
-            .strip_prefix(CACHE_V3_MAGIC)
-            .expect("writer must prefix V3 cache payloads");
+            .strip_prefix(CACHE_V4_MAGIC)
+            .expect("writer must prefix V4 cache payloads");
         let config = bincode::config::standard().with_variable_int_encoding();
         let versioned: DbCacheVersioned = bincode::serde::decode_from_slice(payload, config)
             .unwrap()

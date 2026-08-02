@@ -1,10 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use safe_migrate::analysis::state::Confidence;
-use safe_migrate::db::cache::{
-    CACHE_FORMAT_VERSION, CACHE_V3_MAGIC, CacheMetadata, DbCacheVersioned,
-    legacy_cache_format_version,
-};
+use safe_migrate::db::cache::{CACHE_V3_MAGIC, CACHE_V4_MAGIC, CacheMetadata, DbCacheVersioned};
 use safe_migrate::db::cache_file::{
     MAX_CACHE_DECODE_BYTES, is_encrypted_cache_bytes, read_cache_bytes, unprotect_cache_bytes,
 };
@@ -618,66 +615,45 @@ fn decode_cache(cache_path: &Path, cache_encryption: bool) -> Result<(DbCache, u
         .with_variable_int_encoding()
         .with_limit::<MAX_CACHE_DECODE_BYTES>();
 
-    let (versioned, is_v3_payload): (DbCacheVersioned, bool) = if let Some(v3_payload) =
-        payload.strip_prefix(CACHE_V3_MAGIC)
+    let (encoded_payload, header_version) = if let Some(v4_payload) =
+        payload.strip_prefix(CACHE_V4_MAGIC)
     {
-        let (versioned, bytes_read): (DbCacheVersioned, usize) =
-                bincode::serde::decode_from_slice(v3_payload, config).map_err(|error| {
-                    if matches!(&error, bincode::error::DecodeError::LimitExceeded) {
-                        return anyhow!(
-                            "Cache file '{}' exceeds the {} MiB decoded-size limit",
-                            cache_path.display(),
-                            MAX_CACHE_DECODE_BYTES / (1024 * 1024)
-                        );
-                    }
-                    anyhow!(
-                        "Cache file '{}' is corrupted (bincode): {}. Run `safe-migrate sync` to rebuild it.",
-                        cache_path.display(),
-                        error
-                    )
-                })?;
-        if bytes_read != v3_payload.len() {
-            anyhow::bail!(
-                "Cache file '{}' is corrupted (trailing V3 payload data). Run `safe-migrate sync` to rebuild it.",
-                cache_path.display()
-            );
-        }
-        (versioned, true)
+        (v4_payload, 4)
+    } else if let Some(v3_payload) = payload.strip_prefix(CACHE_V3_MAGIC) {
+        (v3_payload, 3)
     } else {
-        if let Some(version) = legacy_cache_format_version(&payload)
-            && version >= CACHE_FORMAT_VERSION
-        {
-            anyhow::bail!(
-                "Cache file '{}' uses unsupported legacy format V{}. Run `safe-migrate sync` to rebuild it for v0.4.3.",
-                cache_path.display(),
-                version
-            );
-        }
-        let (versioned, bytes_read): (DbCacheVersioned, usize) =
-                bincode::serde::decode_from_slice(&payload, config).map_err(|error| {
-            if matches!(&error, bincode::error::DecodeError::LimitExceeded) {
-                return anyhow!(
-                    "Cache file '{}' exceeds the {} MiB decoded-size limit",
-                    cache_path.display(),
-                    MAX_CACHE_DECODE_BYTES / (1024 * 1024)
-                );
-            }
-            anyhow!(
-                "Cache file '{}' is corrupted (bincode): {}. Run `safe-migrate sync` to rebuild it.",
-                cache_path.display(),
-                error
-            )
-                })?;
-        if bytes_read != payload.len() {
-            anyhow::bail!(
-                "Cache file '{}' is corrupted (trailing legacy payload data). Run `safe-migrate sync` to rebuild it.",
-                cache_path.display()
-            );
-        }
-        (versioned, false)
+        anyhow::bail!(
+            "Cache file '{}' uses an unsupported cache format. Run `safe-migrate sync` to rebuild it.",
+            cache_path.display()
+        );
     };
+
+    let (versioned, bytes_read): (DbCacheVersioned, usize) = bincode::serde::decode_from_slice(
+        encoded_payload,
+        config,
+    )
+    .map_err(|error| {
+        if matches!(&error, bincode::error::DecodeError::LimitExceeded) {
+            return anyhow!(
+                "Cache file '{}' exceeds the {} MiB decoded-size limit",
+                cache_path.display(),
+                MAX_CACHE_DECODE_BYTES / (1024 * 1024)
+            );
+        }
+        anyhow!(
+            "Cache file '{}' is corrupted (bincode): {}. Run `safe-migrate sync` to rebuild it.",
+            cache_path.display(),
+            error
+        )
+    })?;
+    if bytes_read != encoded_payload.len() {
+        anyhow::bail!(
+            "Cache file '{}' is corrupted (trailing payload data). Run `safe-migrate sync` to rebuild it.",
+            cache_path.display()
+        );
+    }
     let format_version = versioned.format_version();
-    if is_v3_payload != (format_version == CACHE_FORMAT_VERSION) {
+    if format_version != header_version {
         anyhow::bail!(
             "Cache file '{}' has a mismatched cache format header. Run `safe-migrate sync` to rebuild it.",
             cache_path.display()

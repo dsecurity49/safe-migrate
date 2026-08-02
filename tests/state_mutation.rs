@@ -580,6 +580,308 @@ mod state_mutation_tests {
     }
 
     #[test]
+    fn create_then_rename_enum_value_preserves_order_and_escaped_labels() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let violations = engine
+            .analyze(
+                "CREATE TYPE mood AS ENUM ('sad', 'it''s fine', 'happy');
+                 ALTER TYPE mood RENAME VALUE 'it''s fine' TO 'it''s great';",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict")
+        );
+        let Some(TypeOverlay::Present(type_state)) =
+            state.local.types.get(&object_id("public", "mood"))
+        else {
+            panic!("enum mood missing");
+        };
+        assert_eq!(
+            type_state.kind,
+            TypeKind::Enum {
+                variants: vec!["sad".into(), "it's great".into(), "happy".into()]
+            }
+        );
+    }
+
+    #[test]
+    fn enum_value_rename_obeys_cached_explicit_and_default_search_path_order() {
+        let engine = setup_engine();
+        let mut cache = safe_migrate::db::cache::DbCache::new();
+        cache.search_path = vec!["sm_core".into(), "public".into()];
+        for schema in ["sm_core", "public"] {
+            let id = object_id(schema, "mood");
+            cache.types.insert(
+                id.clone(),
+                TypeState {
+                    id,
+                    generation: 0,
+                    kind: TypeKind::Enum {
+                        variants: vec!["old".into(), format!("{schema}_only")],
+                    },
+                },
+            );
+        }
+        let mut state = safe_migrate::AnalysisState::new(cache);
+
+        engine
+            .analyze(
+                "ALTER TYPE mood RENAME VALUE 'old' TO 'core_new';
+                 SET search_path TO public, sm_core;
+                 ALTER TYPE mood RENAME VALUE 'old' TO 'public_new';
+                 SET search_path TO DEFAULT;
+                 ALTER TYPE mood RENAME VALUE 'core_new' TO 'core_final';",
+                &mut state,
+            )
+            .unwrap();
+
+        let variants = |schema: &str| {
+            let Some(TypeOverlay::Present(type_state)) =
+                state.local.types.get(&object_id(schema, "mood"))
+            else {
+                panic!("{schema}.mood missing");
+            };
+            let TypeKind::Enum { variants } = &type_state.kind else {
+                panic!("{schema}.mood is not an enum");
+            };
+            variants.clone()
+        };
+        assert_eq!(variants("sm_core"), ["core_final", "sm_core_only"]);
+        assert_eq!(variants("public"), ["public_new", "public_only"]);
+        assert_eq!(state.local.search_path, ["sm_core", "public"]);
+    }
+
+    #[test]
+    fn enum_value_rename_expands_user_search_path_from_v4_role_provenance() {
+        let engine = setup_engine();
+        let mut cache = DbCache::new();
+        cache.metadata.source_role = Some("app_user".into());
+        for schema in ["app_user", "public"] {
+            let id = object_id(schema, "mood");
+            cache.types.insert(
+                id.clone(),
+                TypeState {
+                    id,
+                    generation: 0,
+                    kind: TypeKind::Enum {
+                        variants: vec!["old".into()],
+                    },
+                },
+            );
+        }
+        let mut state = safe_migrate::AnalysisState::new(cache);
+
+        engine
+            .analyze(
+                "SET search_path TO \"$user\", public;
+                 ALTER TYPE mood RENAME VALUE 'old' TO 'new';",
+                &mut state,
+            )
+            .unwrap();
+
+        assert_eq!(state.local.current_role, "app_user");
+        assert!(state.local.current_role_known);
+        assert_eq!(state.local.search_path, ["app_user", "public"]);
+        assert_eq!(state.local.confidence, Confidence::Exact);
+        let Some(TypeOverlay::Present(type_state)) =
+            state.local.types.get(&object_id("app_user", "mood"))
+        else {
+            panic!("app_user.mood missing");
+        };
+        assert_eq!(
+            type_state.kind,
+            TypeKind::Enum {
+                variants: vec!["new".into()]
+            }
+        );
+    }
+
+    #[test]
+    fn v3_without_role_provenance_taints_explicit_user_search_path() {
+        let engine = setup_engine();
+        let mut cache = DbCache::new();
+        let id = object_id("public", "mood");
+        cache.types.insert(
+            id.clone(),
+            TypeState {
+                id: id.clone(),
+                generation: 0,
+                kind: TypeKind::Enum {
+                    variants: vec!["old".into()],
+                },
+            },
+        );
+        let mut state = safe_migrate::AnalysisState::new(cache);
+
+        engine
+            .analyze(
+                "SET search_path TO \"$user\", public;
+                 ALTER TYPE mood RENAME VALUE 'old' TO 'new';",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(!state.local.current_role_known);
+        assert_eq!(state.local.search_path, ["public"]);
+        assert_eq!(state.local.confidence, Confidence::Tainted);
+    }
+
+    #[test]
+    fn enum_value_rename_skips_dropped_type_tombstones_in_the_search_path() {
+        let engine = setup_engine();
+        let mut cache = safe_migrate::db::cache::DbCache::new();
+        cache.search_path = vec!["first".into(), "second".into()];
+        for schema in ["first", "second"] {
+            let id = object_id(schema, "mood");
+            cache.types.insert(
+                id.clone(),
+                TypeState {
+                    id,
+                    generation: 0,
+                    kind: TypeKind::Enum {
+                        variants: vec!["old".into(), format!("{schema}_only")],
+                    },
+                },
+            );
+        }
+        let mut state = safe_migrate::AnalysisState::new(cache);
+
+        let violations = engine
+            .analyze(
+                "DROP TYPE first.mood;
+                 ALTER TYPE mood RENAME VALUE 'old' TO 'second_new';",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict")
+        );
+        assert!(matches!(
+            state.local.types.get(&object_id("first", "mood")),
+            Some(TypeOverlay::Dropped)
+        ));
+        let Some(TypeOverlay::Present(type_state)) =
+            state.local.types.get(&object_id("second", "mood"))
+        else {
+            panic!("second.mood missing");
+        };
+        assert_eq!(
+            type_state.kind,
+            TypeKind::Enum {
+                variants: vec!["second_new".into(), "second_only".into()]
+            }
+        );
+    }
+
+    #[test]
+    fn enum_value_rename_reports_postgres_conflicts_without_mutating_state() {
+        for (sql, expected_reason) in [
+            (
+                "ALTER TYPE mood RENAME VALUE 'missing' TO 'new';",
+                "not an existing label",
+            ),
+            (
+                "ALTER TYPE mood RENAME VALUE 'old' TO 'existing';",
+                "already exists",
+            ),
+            (
+                "ALTER TYPE mood RENAME VALUE 'old' TO 'old';",
+                "already exists",
+            ),
+        ] {
+            let engine = setup_engine();
+            let mut cache = safe_migrate::db::cache::DbCache::new();
+            let id = object_id("public", "mood");
+            cache.types.insert(
+                id.clone(),
+                TypeState {
+                    id: id.clone(),
+                    generation: 0,
+                    kind: TypeKind::Enum {
+                        variants: vec!["old".into(), "existing".into()],
+                    },
+                },
+            );
+            let mut state = safe_migrate::AnalysisState::new(cache);
+            let violations = engine.analyze(sql, &mut state).unwrap();
+
+            assert!(violations.iter().any(|violation| {
+                violation.rule_id == "chain-conflict" && violation.reason.contains(expected_reason)
+            }));
+            assert_eq!(
+                state.local.types.get(&id),
+                Some(&TypeOverlay::Present(TypeState {
+                    id: id.clone(),
+                    generation: 0,
+                    kind: TypeKind::Enum {
+                        variants: vec!["old".into(), "existing".into()]
+                    }
+                }))
+            );
+        }
+    }
+
+    #[test]
+    fn enum_value_rename_rejects_missing_and_non_enum_types() {
+        let engine = setup_engine();
+        for (setup, rename, expected_reason) in [
+            (
+                "",
+                "ALTER TYPE missing_type RENAME VALUE 'old' TO 'new';",
+                "does not exist",
+            ),
+            (
+                "CREATE DOMAIN not_enum AS text;",
+                "ALTER TYPE not_enum RENAME VALUE 'old' TO 'new';",
+                "is not an enum",
+            ),
+        ] {
+            let mut state = setup_state();
+            let sql = format!("{setup} {rename}");
+            let violations = engine.analyze(&sql, &mut state).unwrap();
+            assert!(violations.iter().any(|violation| {
+                violation.rule_id == "chain-conflict" && violation.reason.contains(expected_reason)
+            }));
+        }
+    }
+
+    #[test]
+    fn enum_value_rename_rolls_back_with_the_transaction() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TYPE mood AS ENUM ('old', 'stable');
+                 BEGIN;
+                 ALTER TYPE mood RENAME VALUE 'old' TO 'temporary';
+                 ROLLBACK;",
+                &mut state,
+            )
+            .unwrap();
+
+        let Some(TypeOverlay::Present(type_state)) =
+            state.local.types.get(&object_id("public", "mood"))
+        else {
+            panic!("enum mood missing");
+        };
+        assert_eq!(
+            type_state.kind,
+            TypeKind::Enum {
+                variants: vec!["old".into(), "stable".into()]
+            }
+        );
+    }
+
+    #[test]
     fn test_topology_replication_graph() {
         let engine = setup_engine();
         let mut state = setup_state();
