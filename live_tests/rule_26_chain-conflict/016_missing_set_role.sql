@@ -1,0 +1,1 @@
+SET ROLE safe_migrate_role_that_does_not_exist;

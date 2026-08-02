@@ -78,6 +78,34 @@ impl Resolver {
         id
     }
 
+    fn resolve_type_lookup_name(name: &QualifiedName, state: &AnalysisState) -> ObjectId {
+        if let Some(schema_ident) = &name.schema {
+            return ObjectId::new(schema_ident.resolve(), name.name.resolve());
+        }
+
+        let resolved_name = name.name.resolve();
+        for schema in &state.local.search_path {
+            let mut candidate = ObjectId::new(schema.clone(), resolved_name.clone());
+            if matches!(
+                state.local.types.get(&candidate),
+                Some(crate::model::types::TypeOverlay::Present(_))
+            ) {
+                candidate.inferred_schema = true;
+                return candidate;
+            }
+        }
+
+        let schema = state
+            .local
+            .search_path
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "public".to_string());
+        let mut id = ObjectId::new(schema, resolved_name);
+        id.inferred_schema = true;
+        id
+    }
+
     fn resolve_constraint_index_name(name: &QualifiedName, table: &ObjectId) -> ObjectId {
         let schema = name
             .schema
@@ -280,8 +308,13 @@ impl Resolver {
                         // SET SCHEMA — rename tracked at object-id level is handled by state machine
                         // No mutation needed since schema changes don't change ObjectId
                     }
-                    crate::analysis::facts::AlterViewAction::OwnerTo { .. }
-                    | crate::analysis::facts::AlterViewAction::SetDefault { .. }
+                    crate::analysis::facts::AlterViewAction::OwnerTo { new_owner } => {
+                        mutations.push(Mutation::ChangeRelationOwner {
+                            id: Self::resolve_lookup_name(name, state),
+                            new_owner: new_owner.clone(),
+                        });
+                    }
+                    crate::analysis::facts::AlterViewAction::SetDefault { .. }
                     | crate::analysis::facts::AlterViewAction::DropDefault { .. }
                     | crate::analysis::facts::AlterViewAction::RenameColumn { .. }
                     | crate::analysis::facts::AlterViewAction::SetOptions { .. }
@@ -421,8 +454,10 @@ impl Resolver {
             StatementFact::CreateType(create_type) => {
                 let id = Self::resolve_creation_name(&create_type.name, state);
 
-                let mapped_kind = match create_type.kind {
-                    TypeCreationKind::Enum => TypeKind::Enum { variants: vec![] },
+                let mapped_kind = match &create_type.kind {
+                    TypeCreationKind::Enum { variants } => TypeKind::Enum {
+                        variants: variants.clone(),
+                    },
                     TypeCreationKind::Range => TypeKind::Range,
                     TypeCreationKind::Composite => TypeKind::Composite,
                     TypeCreationKind::Base => TypeKind::Base,
@@ -434,7 +469,7 @@ impl Resolver {
                 }));
             }
             StatementFact::AlterType(alter_type) => {
-                let id = Self::resolve_lookup_name(&alter_type.name, state);
+                let id = Self::resolve_type_lookup_name(&alter_type.name, state);
                 for action_fact in &alter_type.actions {
                     match action_fact {
                         crate::analysis::facts::AlterTypeActionFact::AddValue {
@@ -448,6 +483,18 @@ impl Resolver {
                                     new_value: new_value.clone(),
                                     neighbor: neighbor.clone(),
                                     before: *before,
+                                },
+                            }));
+                        }
+                        crate::analysis::facts::AlterTypeActionFact::RenameValue {
+                            old_value,
+                            new_value,
+                        } => {
+                            mutations.push(Mutation::AlterType(AlterTypeMutation {
+                                id: id.clone(),
+                                action: AlterTypeActionMutation::RenameValue {
+                                    old_value: old_value.clone(),
+                                    new_value: new_value.clone(),
                                 },
                             }));
                         }
@@ -721,7 +768,6 @@ impl Resolver {
                         | AlterTableActionFact::SetTablespace { .. }
                         | AlterTableActionFact::SetLogged
                         | AlterTableActionFact::SetUnlogged
-                        | AlterTableActionFact::OwnerTo { .. }
                         | AlterTableActionFact::ReplicaIdentity { .. }
                         | AlterTableActionFact::ForceRls
                         | AlterTableActionFact::EnableRls
@@ -729,6 +775,11 @@ impl Resolver {
                         | AlterTableActionFact::EnableAlwaysTrigger { .. }
                         | AlterTableActionFact::EnableReplicaTrigger { .. } => {
                             AlterTableActionMutation::Opaque
+                        }
+                        AlterTableActionFact::OwnerTo { new_owner } => {
+                            AlterTableActionMutation::OwnerTo {
+                                new_owner: new_owner.clone(),
+                            }
                         }
                     };
                     mutations.push(Mutation::AlterTable(AlterTable {
@@ -999,6 +1050,17 @@ impl Resolver {
                     id,
                     if_exists: d.if_exists,
                 }));
+            }
+            StatementFact::SetRole {
+                role,
+                local,
+                is_session_auth,
+            } => {
+                mutations.push(Mutation::SwitchRole {
+                    role: role.clone(),
+                    local: *local,
+                    is_session_auth: *is_session_auth,
+                });
             }
         }
         mutations

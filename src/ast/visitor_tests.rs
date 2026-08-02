@@ -3,7 +3,10 @@
 #[cfg(test)]
 mod tests {
     use crate::analysis::expr_ir::ExprIr;
-    use crate::analysis::facts::{AlterTableActionFact, StatementFact, TableConstraintFact};
+    use crate::analysis::facts::{
+        AlterTableActionFact, AlterTypeActionFact, StatementFact, TableConstraintFact,
+        TypeCreationKind,
+    };
     use crate::ast::identifiers::{Ident, QualifiedName};
     use crate::ast::visitor::AstVisitor;
     use squawk_syntax::ast::SourceFile;
@@ -208,6 +211,75 @@ mod tests {
             }
             _ => panic!("Expected CreateTable fact"),
         }
+    }
+
+    #[test]
+    fn create_enum_extracts_ordered_and_escaped_labels() {
+        let fact = parse_and_extract_statement(
+            r#"CREATE TYPE "Mood" AS ENUM ('sad', 'it''s fine', E'line\nbreak');"#,
+        )
+        .expect("create type fact");
+
+        let StatementFact::CreateType(create_type) = fact else {
+            panic!("expected create type fact");
+        };
+        assert_eq!(create_type.name.name.resolve(), "Mood");
+        assert!(create_type.name.name.quoted);
+        assert_eq!(
+            create_type.kind,
+            TypeCreationKind::Enum {
+                variants: vec!["sad".into(), "it's fine".into(), "line\nbreak".into()]
+            }
+        );
+    }
+
+    #[test]
+    fn alter_type_rename_value_extracts_qualified_identity_and_labels() {
+        let fact = parse_and_extract_statement(
+            r#"ALTER TYPE sm_core."Mood" RENAME VALUE 'it''s fine' TO 'it''s great';"#,
+        )
+        .expect("alter type fact");
+
+        let StatementFact::AlterType(alter_type) = fact else {
+            panic!("expected alter type fact");
+        };
+        assert_eq!(
+            alter_type
+                .name
+                .schema
+                .as_ref()
+                .map(|schema| schema.resolve()),
+            Some("sm_core".to_string())
+        );
+        assert_eq!(alter_type.name.name.resolve(), "Mood");
+        assert!(alter_type.name.name.quoted);
+        assert_eq!(
+            alter_type.actions,
+            vec![AlterTypeActionFact::RenameValue {
+                old_value: "it's fine".into(),
+                new_value: "it's great".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn alter_type_add_value_uses_ast_position_when_label_contains_before() {
+        let fact = parse_and_extract_statement(
+            "ALTER TYPE mood ADD VALUE 'not before now' AFTER 'ready';",
+        )
+        .expect("alter type fact");
+
+        let StatementFact::AlterType(alter_type) = fact else {
+            panic!("expected alter type fact");
+        };
+        assert_eq!(
+            alter_type.actions,
+            vec![AlterTypeActionFact::AddValue {
+                new_value: "not before now".into(),
+                neighbor: Some("ready".into()),
+                before: false,
+            }]
+        );
     }
 
     #[test]
@@ -685,6 +757,21 @@ mod tests {
     }
 
     #[test]
+    fn test_set_search_path_preserves_user_placeholder() {
+        let facts = parse_and_extract_statement("SET search_path TO \"$user\", public;")
+            .expect("search_path fact");
+        assert_eq!(
+            facts,
+            StatementFact::SetSearchPath {
+                target: crate::analysis::facts::SearchPathTarget::Schemas(vec![
+                    "$user".into(),
+                    "public".into(),
+                ]),
+            }
+        );
+    }
+
+    #[test]
     fn test_set_time_zone_does_not_produce_a_search_path_fact() {
         assert!(parse_and_extract_statement("SET TIME ZONE DEFAULT;").is_none());
     }
@@ -979,5 +1066,172 @@ mod tests {
             StatementFact::Execute => {}
             _ => panic!("Expected Execute fact"),
         }
+    }
+
+    // ========================================================================
+    // SET ROLE / SET SESSION AUTHORIZATION tests
+    // ========================================================================
+
+    #[test]
+    fn set_role_named_produces_set_role_fact() {
+        let fact =
+            parse_and_extract_statement("SET ROLE app_user;").expect("should extract a fact");
+        let StatementFact::SetRole {
+            role,
+            local,
+            is_session_auth,
+        } = fact
+        else {
+            panic!("expected SetRole, got {fact:?}");
+        };
+        assert_eq!(
+            role,
+            Some(crate::analysis::facts::RoleFact::Named {
+                name: "app_user".to_string(),
+                via_legacy_group_syntax: false,
+            })
+        );
+        assert!(!local);
+        assert!(!is_session_auth);
+    }
+
+    #[test]
+    fn set_local_role_sets_local_flag() {
+        let fact =
+            parse_and_extract_statement("SET LOCAL ROLE analyst;").expect("should extract a fact");
+        let StatementFact::SetRole { local, .. } = fact else {
+            panic!("expected SetRole");
+        };
+        assert!(local);
+    }
+
+    #[test]
+    fn set_role_none_produces_none_role() {
+        let fact = parse_and_extract_statement("SET ROLE NONE;").expect("should extract a fact");
+        let StatementFact::SetRole {
+            role,
+            local,
+            is_session_auth,
+        } = fact
+        else {
+            panic!("expected SetRole");
+        };
+        assert_eq!(role, None);
+        assert!(!local);
+        assert!(!is_session_auth);
+    }
+
+    #[test]
+    fn set_role_current_user_is_not_treated_as_valid_postgres_sql() {
+        assert!(parse_and_extract_statement("SET ROLE CURRENT_USER;").is_none());
+    }
+
+    #[test]
+    fn set_role_current_role_is_not_treated_as_valid_postgres_sql() {
+        assert!(parse_and_extract_statement("SET ROLE CURRENT_ROLE;").is_none());
+    }
+
+    #[test]
+    fn set_session_authorization_named_is_session_auth() {
+        let fact = parse_and_extract_statement("SET SESSION AUTHORIZATION app_user;")
+            .expect("should extract a fact");
+        let StatementFact::SetRole {
+            role,
+            local,
+            is_session_auth,
+        } = fact
+        else {
+            panic!("expected SetRole");
+        };
+        assert_eq!(
+            role,
+            Some(crate::analysis::facts::RoleFact::Named {
+                name: "app_user".to_string(),
+                via_legacy_group_syntax: false,
+            })
+        );
+        assert!(!local);
+        assert!(is_session_auth);
+    }
+
+    #[test]
+    fn set_session_authorization_default_produces_none_role() {
+        let fact = parse_and_extract_statement("SET SESSION AUTHORIZATION DEFAULT;")
+            .expect("should extract a fact");
+        let StatementFact::SetRole {
+            role,
+            is_session_auth,
+            ..
+        } = fact
+        else {
+            panic!("expected SetRole");
+        };
+        assert_eq!(role, None);
+        assert!(is_session_auth);
+    }
+
+    #[test]
+    fn set_session_authorization_literal_unescapes_sql_quotes() {
+        let fact = parse_and_extract_statement("SET SESSION AUTHORIZATION 'owner''s_role';")
+            .expect("should extract a fact");
+        let StatementFact::SetRole { role, .. } = fact else {
+            panic!("expected SetRole");
+        };
+        assert_eq!(
+            role,
+            Some(crate::analysis::facts::RoleFact::Named {
+                name: "owner's_role".to_string(),
+                via_legacy_group_syntax: false,
+            })
+        );
+    }
+
+    #[test]
+    fn set_session_authorization_decodes_escape_string_literal() {
+        let fact = parse_and_extract_statement(r"SET SESSION AUTHORIZATION E'app\x5fuser';")
+            .expect("should extract a fact");
+        let StatementFact::SetRole { role, .. } = fact else {
+            panic!("expected SetRole");
+        };
+        assert_eq!(
+            role,
+            Some(crate::analysis::facts::RoleFact::Named {
+                name: "app_user".to_string(),
+                via_legacy_group_syntax: false,
+            })
+        );
+    }
+
+    #[test]
+    fn set_local_session_authorization_sets_local_flag() {
+        let fact = parse_and_extract_statement("SET LOCAL SESSION AUTHORIZATION analyst;")
+            .expect("should extract a fact");
+        let StatementFact::SetRole {
+            local,
+            is_session_auth,
+            ..
+        } = fact
+        else {
+            panic!("expected SetRole");
+        };
+        assert!(local);
+        assert!(is_session_auth);
+    }
+
+    #[test]
+    fn alter_table_owner_to_session_user_is_captured() {
+        let fact = parse_and_extract_statement("ALTER TABLE foo OWNER TO SESSION_USER;")
+            .expect("should extract a fact");
+        let StatementFact::AlterTable { actions, .. } = fact else {
+            panic!("expected AlterTable");
+        };
+        let owner = actions.iter().find_map(|a| {
+            if let AlterTableActionFact::OwnerTo { new_owner } = a {
+                Some(new_owner.clone())
+            } else {
+                None
+            }
+        });
+        assert_eq!(owner, Some(crate::analysis::facts::RoleFact::SessionUser));
     }
 }

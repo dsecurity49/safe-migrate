@@ -26,7 +26,11 @@ pub struct RoleState {
     pub id: ObjectId, // role name, no schema
     pub can_login: bool,
     pub is_superuser: bool,
-    pub member_of: Vec<ObjectId>, // roles this role inherits from
+    pub member_of: Vec<ObjectId>, // roles this role is a member of
+    /// Roles this role may select with `SET ROLE`. PostgreSQL 16+ can grant
+    /// membership without the SET option, so this is deliberately distinct
+    /// from inherited membership.
+    pub can_set_role_to: Vec<ObjectId>,
     pub granted_privileges: Vec<PrivilegeGrant>,
 }
 

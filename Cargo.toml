@@ -1,12 +1,13 @@
 [package]
 name = "safe-migrate"
-version = "0.4.3"
+version = "0.4.4"
 edition = "2024"
 rust-version = "1.85"
 description = "Analyze PostgreSQL migrations for schema and locking risks"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/dsecurity49/safe-migrate"
 readme = "README.md"
+exclude = ["live_tests/.safe-migrate.cache"]
 keywords = ["postgres", "migration", "linter", "ast", "database"]
 categories = ["command-line-utilities", "database"]
 

@@ -36,6 +36,8 @@ struct RuleManifest {
     #[serde(default = "default_transactional")]
     transactional: bool,
     #[serde(default)]
+    fixture_transactional: BTreeMap<String, bool>,
+    #[serde(default)]
     excluded_fixtures: Vec<FixtureExclusion>,
     schemas: Vec<String>,
     scope: Vec<ComparisonScope>,
@@ -46,7 +48,26 @@ struct RuleManifest {
     #[serde(default)]
     required_relations: Vec<String>,
     #[serde(default)]
+    required_role_edges: Vec<RequiredRoleEdge>,
+    #[serde(default)]
     notes: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RequiredRoleEdge {
+    member: String,
+    role: String,
+    kind: RequiredRoleEdgeKind,
+    #[serde(default)]
+    min_pg_version_num: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RequiredRoleEdgeKind {
+    CanSetRoleTo,
+    MemberOfWithoutSet,
 }
 
 #[derive(Debug, Deserialize)]
@@ -102,6 +123,7 @@ struct NormalizedState {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct NormalizedRelation {
     kind: NormalizedRelationKind,
+    owner: String,
     partition_strategy: Option<String>,
     columns: BTreeMap<String, NormalizedColumn>,
 }
@@ -174,6 +196,7 @@ enum MismatchCategory {
     MissingObjectInSimulator,
     ExtraObjectInSimulator,
     RelationKindMismatch,
+    RelationOwnerMismatch,
     PartitionStrategyMismatch,
     ColumnMismatch,
     MissingIndexInSimulator,
@@ -200,6 +223,7 @@ enum MismatchCategory {
     ExtraPartitionEdgeInSimulator,
     MissingViewDependencyInSimulator,
     ExtraViewDependencyInSimulator,
+    RoleMembershipMismatch,
     BaselineObjectAbsent,
     LiveExecutionFailed,
     ExpectedLiveErrorMismatch,
@@ -355,6 +379,11 @@ fn live_postgres_differential_harness() {
             .iter()
             .filter(|fixture| fixture_is_selected(&fixture_filter, &rule.rule_dir, fixture))
         {
+            let transactional = rule
+                .fixture_transactional
+                .get(fixture)
+                .copied()
+                .unwrap_or(rule.transactional);
             let scope = rule
                 .fixture_scopes
                 .get(fixture)
@@ -443,6 +472,7 @@ fn live_postgres_differential_harness() {
             );
 
             mismatches.extend(check_required_relations(rule, fixture, &baseline_cache));
+            mismatches.extend(check_role_membership_cache(rule, fixture, &baseline_cache));
 
             let mut simulator_state = AnalysisState::new(baseline_cache);
             let simulator_violations = match engine.analyze(&sql, &mut simulator_state) {
@@ -467,7 +497,7 @@ fn live_postgres_differential_harness() {
                 format!("case={}/{} phase=simulated", rule.rule_dir, fixture),
             );
 
-            if rule.transactional {
+            if transactional {
                 if let Err(error) = client.batch_execute("BEGIN") {
                     mismatches.push(Mismatch {
                         rule_dir: rule.rule_dir.clone(),
@@ -492,9 +522,9 @@ fn live_postgres_differential_harness() {
             }
 
             if let Err(error) = client.batch_execute(&sql) {
-                if rule.transactional {
-                    let _ = client.batch_execute("ROLLBACK");
-                }
+                // Recover the shared harness connection even when a fixture
+                // owns its transaction boundaries and leaves one aborted.
+                let _ = client.batch_execute("ROLLBACK");
                 if let Some(expected) = rule.expected_live_errors.get(fixture) {
                     let actual_sqlstate = error
                         .as_db_error()
@@ -564,7 +594,7 @@ fn live_postgres_differential_harness() {
             }
 
             if let Some(expected) = rule.expected_live_errors.get(fixture) {
-                if rule.transactional {
+                if transactional {
                     let _ = client.batch_execute("ROLLBACK");
                 }
                 mismatches.push(Mismatch {
@@ -586,7 +616,7 @@ fn live_postgres_differential_harness() {
             );
 
             let live_state_result = snapshot_live_state(&mut client, &rule.schemas, scope);
-            if rule.transactional {
+            if transactional {
                 if let Err(error) = client.batch_execute("ROLLBACK") {
                     mismatches.push(Mismatch {
                         rule_dir: rule.rule_dir.clone(),
@@ -815,6 +845,14 @@ fn validate_manifest(manifest: &DifferentialManifest, path: &Path) {
                 fixture
             );
         }
+        for fixture in rule.fixture_transactional.keys() {
+            assert!(
+                included.contains(fixture),
+                "fixture transaction override references a non-included fixture: {}/{}",
+                rule.rule_dir,
+                fixture
+            );
+        }
 
         validate_expected_live_errors(rule, &included, &valid_rule_ids);
 
@@ -891,6 +929,7 @@ fn expected_live_error_must_reference_an_included_fixture() {
         enabled: true,
         fixtures: Vec::new(),
         transactional: true,
+        fixture_transactional: BTreeMap::new(),
         excluded_fixtures: Vec::new(),
         schemas: Vec::new(),
         scope: Vec::new(),
@@ -903,6 +942,7 @@ fn expected_live_error_must_reference_an_included_fixture() {
             },
         )]),
         required_relations: Vec::new(),
+        required_role_edges: Vec::new(),
         notes: None,
     };
     validate_expected_live_errors(&rule, &BTreeSet::new(), &BTreeSet::from(["chain-conflict"]));
@@ -916,6 +956,7 @@ fn expected_live_error_must_reference_a_known_simulator_rule() {
         enabled: true,
         fixtures: vec!["case.sql".to_string()],
         transactional: true,
+        fixture_transactional: BTreeMap::new(),
         excluded_fixtures: Vec::new(),
         schemas: Vec::new(),
         scope: Vec::new(),
@@ -928,6 +969,7 @@ fn expected_live_error_must_reference_a_known_simulator_rule() {
             },
         )]),
         required_relations: Vec::new(),
+        required_role_edges: Vec::new(),
         notes: None,
     };
     validate_expected_live_errors(
@@ -1029,6 +1071,130 @@ fn check_required_relations(rule: &RuleManifest, fixture: &str, cache: &DbCache)
         }
     }
     mismatches
+}
+
+fn check_role_membership_cache(
+    rule: &RuleManifest,
+    fixture: &str,
+    cache: &DbCache,
+) -> Vec<Mismatch> {
+    let role = |name: &str| {
+        cache
+            .roles
+            .get(&safe_migrate::ast::identifiers::ObjectId::new("", name))
+    };
+    let edge = |ids: &[safe_migrate::ast::identifiers::ObjectId], target: &str| {
+        ids.iter()
+            .any(|id| id.schema.is_empty() && id.name == target)
+    };
+    let active_edges: Vec<&RequiredRoleEdge> = rule
+        .required_role_edges
+        .iter()
+        .filter(|required| {
+            required.min_pg_version_num.is_none_or(|minimum| {
+                cache
+                    .pg_version_num
+                    .is_some_and(|version| version >= minimum)
+            })
+        })
+        .collect();
+    let required_roles: BTreeSet<&str> = active_edges
+        .iter()
+        .flat_map(|required| [required.member.as_str(), required.role.as_str()])
+        .collect();
+    let mut mismatches: Vec<Mismatch> = required_roles
+        .into_iter()
+        .filter(|name| role(name).is_none())
+        .map(|name| Mismatch {
+            rule_dir: rule.rule_dir.clone(),
+            fixture: fixture.to_string(),
+            category: MismatchCategory::BaselineObjectAbsent,
+            root_cause: RootCauseClassification::BaselineSetupGap,
+            note: format!(
+                "baseline is missing required role {name}; check live_tests/differential_baseline.sql"
+            ),
+        })
+        .collect();
+
+    for required in active_edges {
+        let (Some(member), Some(_)) = (role(&required.member), role(&required.role)) else {
+            continue;
+        };
+        let matches = match required.kind {
+            RequiredRoleEdgeKind::CanSetRoleTo => edge(&member.can_set_role_to, &required.role),
+            RequiredRoleEdgeKind::MemberOfWithoutSet => {
+                edge(&member.member_of, &required.role)
+                    && !edge(&member.can_set_role_to, &required.role)
+            }
+        };
+        if !matches {
+            mismatches.push(Mismatch {
+                rule_dir: rule.rule_dir.clone(),
+                fixture: fixture.to_string(),
+                category: MismatchCategory::RoleMembershipMismatch,
+                root_cause: RootCauseClassification::SimulatorBug,
+                note: format!(
+                    "role {} does not satisfy {:?} edge to {}",
+                    required.member, required.kind, required.role
+                ),
+            });
+        }
+    }
+
+    mismatches
+}
+
+#[test]
+fn required_role_edges_distinguish_missing_roles_from_incorrect_edges() {
+    let rule: RuleManifest = serde_json::from_str(
+        r#"{
+            "rule_dir": "rule",
+            "enabled": true,
+            "fixtures": [],
+            "schemas": [],
+            "scope": [],
+            "required_role_edges": [
+                {
+                    "member": "member",
+                    "role": "target",
+                    "kind": "can_set_role_to"
+                }
+            ]
+        }"#,
+    )
+    .expect("role edge manifest");
+    let missing = check_role_membership_cache(&rule, "fixture.sql", &DbCache::new());
+    assert_eq!(missing.len(), 2);
+    assert!(missing.iter().all(|mismatch| {
+        mismatch.category == MismatchCategory::BaselineObjectAbsent
+            && mismatch.root_cause == RootCauseClassification::BaselineSetupGap
+    }));
+
+    let mut cache = DbCache::new();
+    for name in ["member", "target"] {
+        let id = safe_migrate::ast::identifiers::ObjectId::new("", name);
+        cache.roles.insert(
+            id.clone(),
+            safe_migrate::model::role::RoleState {
+                id,
+                can_login: false,
+                is_superuser: false,
+                member_of: Vec::new(),
+                can_set_role_to: Vec::new(),
+                granted_privileges: Vec::new(),
+            },
+        );
+    }
+    let incorrect = check_role_membership_cache(&rule, "fixture.sql", &cache);
+    assert_eq!(incorrect.len(), 1);
+    assert_eq!(
+        incorrect[0].category,
+        MismatchCategory::RoleMembershipMismatch
+    );
+    assert_eq!(
+        incorrect[0].root_cause,
+        RootCauseClassification::SimulatorBug
+    );
 }
 
 fn classify_live_execution_error(error: &postgres::Error) -> RootCauseClassification {
@@ -1153,6 +1319,7 @@ fn snapshot_live_state(
         for (id, relation) in cache.relations {
             let mut normalized = NormalizedRelation {
                 kind: normalize_relation_kind(relation.kind),
+                owner: relation.owner.name,
                 partition_strategy: relation.partition_type,
                 columns: BTreeMap::new(),
             };
@@ -1367,6 +1534,7 @@ fn snapshot_simulator_state(state: &AnalysisState, scope: &[ComparisonScope]) ->
             };
             let mut normalized = NormalizedRelation {
                 kind: normalize_relation_kind(relation.kind.clone()),
+                owner: relation.owner.name.clone(),
                 partition_strategy: relation.partition_type.clone(),
                 columns: BTreeMap::new(),
             };
@@ -1462,6 +1630,18 @@ fn compare_states(
                         note: format!(
                             "relation kind mismatch for {name}: live={:?}, simulator={:?}",
                             live_relation.kind, sim_relation.kind
+                        ),
+                    });
+                }
+                Some(sim_relation) if sim_relation.owner != live_relation.owner => {
+                    mismatches.push(Mismatch {
+                        rule_dir: rule_dir.to_string(),
+                        fixture: fixture.to_string(),
+                        category: MismatchCategory::RelationOwnerMismatch,
+                        root_cause: RootCauseClassification::SimulatorBug,
+                        note: format!(
+                            "relation owner mismatch for {name}: live={}, simulator={}",
+                            live_relation.owner, sim_relation.owner
                         ),
                     });
                 }

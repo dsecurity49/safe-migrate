@@ -63,6 +63,6 @@ Verbosity is cumulative:
 - `-vv` adds cache and normalized-state counts.
 - `-vvv` prints complete normalized PostgreSQL and simulator projections.
 
-CI runs the enabled manifest against PostgreSQL 14, 15, 16, 17, and 18 and uploads one
-verbose log per version. Excluded fixtures remain documented in
+CI runs the enabled manifest against PostgreSQL 14, 15, 16, 17, and 18 and
+uploads one verbose log per version. Excluded fixtures remain documented in
 `differential_manifest.json` with their reasons.

@@ -22,6 +22,7 @@ AGENTS.md
 *.json
 !live_tests/differential_baseline.sql
 !live_tests/differential_manifest.json
+!live_tests/**/*.sql
 test_migrations/
 *.opencode/
 .safe-migrate.cache

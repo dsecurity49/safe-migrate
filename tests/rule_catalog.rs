@@ -6,7 +6,7 @@ fn documented_primary_rule_ids() -> Vec<&'static str> {
     let readme = include_str!("../README.md");
     let catalog = readme
         .split_once("## Rule catalog")
-        .and_then(|(_, rest)| rest.split_once("The `blocking-constraint` rule"))
+        .and_then(|(_, rest)| rest.split_once("\n## "))
         .map(|(catalog, _)| catalog)
         .expect("README must contain the primary rule catalog");
 

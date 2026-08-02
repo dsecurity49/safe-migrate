@@ -50,6 +50,11 @@ Transactions record reversible state snapshots in an undo log. Every new state
 component that can change in a transaction needs a corresponding undo entry and
 rollback test.
 
+Role-sensitive state keeps effective role, session authorization, authenticated
+identity, persistent transaction settings, and the unexpanded search-path
+template distinct. Do not collapse these fields: PostgreSQL changes and rolls
+them back under different rules.
+
 ### Dependency graph
 
 Graph edges represent safe-migrate-owned dependency semantics. Baseline edges
@@ -80,6 +85,8 @@ and deterministic ordering follow [the contract](../CONTRACT.md).
   filename order.
 - Baseline state and migration-created state remain distinguishable.
 - Transaction rollback restores every modeled mutable component.
+- Role switches use synchronized `SET OPTION` edges; ordinary membership alone
+  is not authorization on PostgreSQL 16 and newer.
 - Unsupported or unresolved behavior lowers confidence or fails explicitly; it
   must not silently become a clean result.
 - User-visible contracts are protected by integration or golden tests.

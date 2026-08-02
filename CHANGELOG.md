@@ -5,7 +5,7 @@ commits and pull requests. Published binaries, checksums, and generated release
 notes are available on the
 [GitHub Releases page](https://github.com/dsecurity49/safe-migrate/releases).
 
-## v0.4.4 — Unreleased
+## v0.4.4 — 2026-08-02
 
 - Added sourced, real-world-inspired differential cases for staged foreign-key
   validation, missing foreign-key columns, and index-backed constraints.
@@ -16,8 +16,24 @@ notes are available on the
   finding.
 - Preserved PostgreSQL constraint names and tightened `USING INDEX` resolution
   and eligibility checks for indexes created within a migration.
+- Modeled ordered enum labels from `CREATE TYPE ... AS ENUM` and PostgreSQL-
+  compatible `ALTER TYPE ... RENAME VALUE` behavior, including search-path
+  resolution, conflicts, quoted labels, and transaction rollback.
 - Added differential assertions for expected PostgreSQL errors, including the
   exact SQLSTATE and the safe-migrate rule that must predict the rejection.
+- Added role-sensitive chain analysis for `SET ROLE`, transaction-local role
+  settings, session authorization, `$user` search paths, grants, and relation
+  ownership. V4 caches include effective/session identities and role
+  memberships so missing or unauthorized switches match PostgreSQL behavior.
+- Added live PostgreSQL differential coverage for role transaction semantics,
+  session resets and rollback, ownership, quoted role names, dynamic search
+  paths, transitive role memberships, PostgreSQL 16+ `SET OPTION`, and rejected
+  role switches.
+- Added headered V4 caches for the expanded role/search-path provenance.
+  Headered V3 caches remain readable; older formats now require
+  `safe-migrate sync` and are rejected without internal version labels.
+- Added a redacted role count to `cache inspect`; role names and membership
+  edges remain omitted from inspection output.
 
 ## v0.4.3 — 2026-07-30
 

@@ -23,6 +23,7 @@ pub enum StateChange {
     },
     SearchPathSnapshot {
         previous: Vec<String>,
+        previous_template: Vec<String>,
     },
     GenerationCounterSnapshot {
         previous: u64,
@@ -61,8 +62,15 @@ pub enum StateChange {
         name: String,
         previous: Option<crate::model::constraint::ConstraintState>,
     },
-    CurrentRoleSnapshot {
-        previous: String,
+    RoleContextSnapshot {
+        current_role: String,
+        current_role_known: bool,
+        persistent_current_role: String,
+        persistent_current_role_known: bool,
+        session_role: String,
+        session_role_known: bool,
+        persistent_session_role: String,
+        persistent_session_role_known: bool,
     },
     ConfidenceSnapshot {
         previous: crate::analysis::state::Confidence,

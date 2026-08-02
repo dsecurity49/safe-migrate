@@ -1,8 +1,7 @@
 # CLI and Report Contract
 
-This document defines the user-visible behavior safe-migrate intends to
-stabilize for v0.4.3. A requirement is not complete until an automated test
-enforces it.
+This document defines the user-visible behavior of safe-migrate v0.4.4. A
+requirement is not complete until an automated test enforces it.
 
 ## Commands
 
@@ -21,9 +20,10 @@ enforces it.
 `--no-cache`. When `auto_sync = true` is set in configuration, they may refresh
 the cache before analysis. `--no-cache` always bypasses automatic sync.
 
-`cache inspect` never lists object, column, role, or dependency names. Its
-source database, schema scope, versions, and counts still describe sensitive
-infrastructure and must not be published automatically.
+`cache inspect` never lists object, column, role, membership, or dependency
+names and edges. Its source database, schema scope, versions, and redacted
+counts—including the role count—still describe sensitive infrastructure and
+must not be published automatically.
 
 ## Output channels
 
@@ -116,7 +116,7 @@ The report verdict is derived from findings:
   finding.
 - `SAFE`: no higher verdict applies.
 
-The v0.4.3 exit-status contract is:
+The exit-status contract is:
 
 - `0`: analysis completed without a Tier 1 finding;
 - `1`: invocation, configuration, I/O, cache, parser, or internal failure;
@@ -177,10 +177,13 @@ silently weakening the configured protection. When encryption is disabled,
 encrypted cache files are also rejected; changing modes requires a fresh
 `safe-migrate sync`.
 
-V3 cache payloads carry an explicit format header. V1 and V2 remain compatible.
-Legacy unheadered payloads using internal cache tags 3 through 6—including the
-V5 format written by v0.4.2—are rejected and require `safe-migrate sync`.
-These tag numbers identify cache layouts, not safe-migrate release versions.
+V4 cache payloads carry an explicit format header and record effective and
+session role provenance, the unexpanded search-path setting, and PostgreSQL
+role membership needed to evaluate role switches. They never include password
+hashes. Headered V3 payloads remain readable; role-sensitive operations with
+missing V3 provenance taint confidence. All older and unheadered payloads are
+rejected with generic guidance to run `safe-migrate sync`; errors do not expose
+internal cache-version labels.
 
 Errors must identify the failed input or subsystem without printing
 `DATABASE_URL`, credentials, or migration contents not already requested in the

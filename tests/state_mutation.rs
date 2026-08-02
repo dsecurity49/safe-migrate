@@ -10,6 +10,7 @@ mod state_mutation_tests {
     use safe_migrate::model::relation::{
         Persistence, RelationKind, RelationOverlay, RelationState,
     };
+    use safe_migrate::model::role::RoleState;
     use safe_migrate::model::sequence::SequenceOverlay;
     use safe_migrate::model::types::{TypeKind, TypeOverlay, TypeState};
 
@@ -575,6 +576,308 @@ mod state_mutation_tests {
                     "last".into(),
                     "tail".into()
                 ]
+            }
+        );
+    }
+
+    #[test]
+    fn create_then_rename_enum_value_preserves_order_and_escaped_labels() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let violations = engine
+            .analyze(
+                "CREATE TYPE mood AS ENUM ('sad', 'it''s fine', 'happy');
+                 ALTER TYPE mood RENAME VALUE 'it''s fine' TO 'it''s great';",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict")
+        );
+        let Some(TypeOverlay::Present(type_state)) =
+            state.local.types.get(&object_id("public", "mood"))
+        else {
+            panic!("enum mood missing");
+        };
+        assert_eq!(
+            type_state.kind,
+            TypeKind::Enum {
+                variants: vec!["sad".into(), "it's great".into(), "happy".into()]
+            }
+        );
+    }
+
+    #[test]
+    fn enum_value_rename_obeys_cached_explicit_and_default_search_path_order() {
+        let engine = setup_engine();
+        let mut cache = safe_migrate::db::cache::DbCache::new();
+        cache.search_path = vec!["sm_core".into(), "public".into()];
+        for schema in ["sm_core", "public"] {
+            let id = object_id(schema, "mood");
+            cache.types.insert(
+                id.clone(),
+                TypeState {
+                    id,
+                    generation: 0,
+                    kind: TypeKind::Enum {
+                        variants: vec!["old".into(), format!("{schema}_only")],
+                    },
+                },
+            );
+        }
+        let mut state = safe_migrate::AnalysisState::new(cache);
+
+        engine
+            .analyze(
+                "ALTER TYPE mood RENAME VALUE 'old' TO 'core_new';
+                 SET search_path TO public, sm_core;
+                 ALTER TYPE mood RENAME VALUE 'old' TO 'public_new';
+                 SET search_path TO DEFAULT;
+                 ALTER TYPE mood RENAME VALUE 'core_new' TO 'core_final';",
+                &mut state,
+            )
+            .unwrap();
+
+        let variants = |schema: &str| {
+            let Some(TypeOverlay::Present(type_state)) =
+                state.local.types.get(&object_id(schema, "mood"))
+            else {
+                panic!("{schema}.mood missing");
+            };
+            let TypeKind::Enum { variants } = &type_state.kind else {
+                panic!("{schema}.mood is not an enum");
+            };
+            variants.clone()
+        };
+        assert_eq!(variants("sm_core"), ["core_final", "sm_core_only"]);
+        assert_eq!(variants("public"), ["public_new", "public_only"]);
+        assert_eq!(state.local.search_path, ["sm_core", "public"]);
+    }
+
+    #[test]
+    fn enum_value_rename_expands_user_search_path_from_v4_role_provenance() {
+        let engine = setup_engine();
+        let mut cache = DbCache::new();
+        cache.metadata.source_role = Some("app_user".into());
+        for schema in ["app_user", "public"] {
+            let id = object_id(schema, "mood");
+            cache.types.insert(
+                id.clone(),
+                TypeState {
+                    id,
+                    generation: 0,
+                    kind: TypeKind::Enum {
+                        variants: vec!["old".into()],
+                    },
+                },
+            );
+        }
+        let mut state = safe_migrate::AnalysisState::new(cache);
+
+        engine
+            .analyze(
+                "SET search_path TO \"$user\", public;
+                 ALTER TYPE mood RENAME VALUE 'old' TO 'new';",
+                &mut state,
+            )
+            .unwrap();
+
+        assert_eq!(state.local.current_role, "app_user");
+        assert!(state.local.current_role_known);
+        assert_eq!(state.local.search_path, ["app_user", "public"]);
+        assert_eq!(state.local.confidence, Confidence::Exact);
+        let Some(TypeOverlay::Present(type_state)) =
+            state.local.types.get(&object_id("app_user", "mood"))
+        else {
+            panic!("app_user.mood missing");
+        };
+        assert_eq!(
+            type_state.kind,
+            TypeKind::Enum {
+                variants: vec!["new".into()]
+            }
+        );
+    }
+
+    #[test]
+    fn cache_without_role_provenance_taints_explicit_user_search_path() {
+        let engine = setup_engine();
+        let mut cache = DbCache::new();
+        let id = object_id("public", "mood");
+        cache.types.insert(
+            id.clone(),
+            TypeState {
+                id: id.clone(),
+                generation: 0,
+                kind: TypeKind::Enum {
+                    variants: vec!["old".into()],
+                },
+            },
+        );
+        let mut state = safe_migrate::AnalysisState::new(cache);
+
+        engine
+            .analyze(
+                "SET search_path TO \"$user\", public;
+                 ALTER TYPE mood RENAME VALUE 'old' TO 'new';",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(!state.local.current_role_known);
+        assert_eq!(state.local.search_path, ["public"]);
+        assert_eq!(state.local.confidence, Confidence::Tainted);
+    }
+
+    #[test]
+    fn enum_value_rename_skips_dropped_type_tombstones_in_the_search_path() {
+        let engine = setup_engine();
+        let mut cache = safe_migrate::db::cache::DbCache::new();
+        cache.search_path = vec!["first".into(), "second".into()];
+        for schema in ["first", "second"] {
+            let id = object_id(schema, "mood");
+            cache.types.insert(
+                id.clone(),
+                TypeState {
+                    id,
+                    generation: 0,
+                    kind: TypeKind::Enum {
+                        variants: vec!["old".into(), format!("{schema}_only")],
+                    },
+                },
+            );
+        }
+        let mut state = safe_migrate::AnalysisState::new(cache);
+
+        let violations = engine
+            .analyze(
+                "DROP TYPE first.mood;
+                 ALTER TYPE mood RENAME VALUE 'old' TO 'second_new';",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict")
+        );
+        assert!(matches!(
+            state.local.types.get(&object_id("first", "mood")),
+            Some(TypeOverlay::Dropped)
+        ));
+        let Some(TypeOverlay::Present(type_state)) =
+            state.local.types.get(&object_id("second", "mood"))
+        else {
+            panic!("second.mood missing");
+        };
+        assert_eq!(
+            type_state.kind,
+            TypeKind::Enum {
+                variants: vec!["second_new".into(), "second_only".into()]
+            }
+        );
+    }
+
+    #[test]
+    fn enum_value_rename_reports_postgres_conflicts_without_mutating_state() {
+        for (sql, expected_reason) in [
+            (
+                "ALTER TYPE mood RENAME VALUE 'missing' TO 'new';",
+                "not an existing label",
+            ),
+            (
+                "ALTER TYPE mood RENAME VALUE 'old' TO 'existing';",
+                "already exists",
+            ),
+            (
+                "ALTER TYPE mood RENAME VALUE 'old' TO 'old';",
+                "already exists",
+            ),
+        ] {
+            let engine = setup_engine();
+            let mut cache = safe_migrate::db::cache::DbCache::new();
+            let id = object_id("public", "mood");
+            cache.types.insert(
+                id.clone(),
+                TypeState {
+                    id: id.clone(),
+                    generation: 0,
+                    kind: TypeKind::Enum {
+                        variants: vec!["old".into(), "existing".into()],
+                    },
+                },
+            );
+            let mut state = safe_migrate::AnalysisState::new(cache);
+            let violations = engine.analyze(sql, &mut state).unwrap();
+
+            assert!(violations.iter().any(|violation| {
+                violation.rule_id == "chain-conflict" && violation.reason.contains(expected_reason)
+            }));
+            assert_eq!(
+                state.local.types.get(&id),
+                Some(&TypeOverlay::Present(TypeState {
+                    id: id.clone(),
+                    generation: 0,
+                    kind: TypeKind::Enum {
+                        variants: vec!["old".into(), "existing".into()]
+                    }
+                }))
+            );
+        }
+    }
+
+    #[test]
+    fn enum_value_rename_rejects_missing_and_non_enum_types() {
+        let engine = setup_engine();
+        for (setup, rename, expected_reason) in [
+            (
+                "",
+                "ALTER TYPE missing_type RENAME VALUE 'old' TO 'new';",
+                "does not exist",
+            ),
+            (
+                "CREATE DOMAIN not_enum AS text;",
+                "ALTER TYPE not_enum RENAME VALUE 'old' TO 'new';",
+                "is not an enum",
+            ),
+        ] {
+            let mut state = setup_state();
+            let sql = format!("{setup} {rename}");
+            let violations = engine.analyze(&sql, &mut state).unwrap();
+            assert!(violations.iter().any(|violation| {
+                violation.rule_id == "chain-conflict" && violation.reason.contains(expected_reason)
+            }));
+        }
+    }
+
+    #[test]
+    fn enum_value_rename_rolls_back_with_the_transaction() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TYPE mood AS ENUM ('old', 'stable');
+                 BEGIN;
+                 ALTER TYPE mood RENAME VALUE 'old' TO 'temporary';
+                 ROLLBACK;",
+                &mut state,
+            )
+            .unwrap();
+
+        let Some(TypeOverlay::Present(type_state)) =
+            state.local.types.get(&object_id("public", "mood"))
+        else {
+            panic!("enum mood missing");
+        };
+        assert_eq!(
+            type_state.kind,
+            TypeKind::Enum {
+                variants: vec!["old".into(), "stable".into()]
             }
         );
     }
@@ -1550,6 +1853,448 @@ mod state_mutation_tests {
                 .kind,
             ConstraintKind::Exclusion
         );
+    }
+
+    #[test]
+    fn set_role_updates_current_role_and_owner_assignments() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        assert_eq!(state.local.current_role, "postgres");
+        assert!(!state.local.current_role_known); // default mock state
+
+        engine
+            .analyze(
+                "SET ROLE app_admin;
+                 CREATE TABLE admin_log(id int);",
+                &mut state,
+            )
+            .unwrap();
+
+        assert_eq!(state.local.current_role, "app_admin");
+        assert!(state.local.current_role_known);
+        // session_role should not have changed
+        assert_eq!(state.local.session_role, "postgres");
+        assert!(!state.local.session_role_known);
+
+        // The table should be owned by app_admin
+        let rel = state
+            .get_relation(&object_id("public", "admin_log"))
+            .unwrap();
+        if let RelationOverlay::Present(r) = rel {
+            assert_eq!(r.owner, object_id("", "app_admin"));
+        } else {
+            panic!("Expected admin_log to be present");
+        }
+    }
+
+    #[test]
+    fn set_session_authorization_updates_session_role_and_allows_reset() {
+        let engine = setup_engine();
+        let mut cache = DbCache::new();
+        cache.metadata.source_role = Some("app_user".to_string());
+        cache.metadata.source_session_role = Some("app_user".to_string());
+        for (name, superuser) in [
+            ("app_user", true),
+            ("new_owner", false),
+            ("temp_role", false),
+        ] {
+            let id = object_id("", name);
+            cache.roles.insert(
+                id.clone(),
+                RoleState {
+                    id,
+                    can_login: true,
+                    is_superuser: superuser,
+                    member_of: Vec::new(),
+                    can_set_role_to: Vec::new(),
+                    granted_privileges: Vec::new(),
+                },
+            );
+        }
+        let mut state = safe_migrate::AnalysisState::new(cache);
+
+        assert_eq!(state.local.current_role, "app_user");
+        assert_eq!(state.local.session_role, "app_user");
+
+        engine
+            .analyze(
+                "SET SESSION AUTHORIZATION new_owner;
+                 SET ROLE NONE;
+                 SET SESSION AUTHORIZATION DEFAULT;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert_eq!(state.local.current_role, "app_user");
+        assert_eq!(state.local.session_role, "app_user");
+        assert_eq!(state.local.authenticated_role, "app_user");
+    }
+
+    #[test]
+    fn set_role_is_rolled_back_on_abort() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        state.local.current_role = "start_role".to_string();
+        state.local.current_role_known = true;
+
+        engine
+            .analyze(
+                "BEGIN;
+                 SET ROLE temp_admin;
+                 CREATE TABLE inside_txn(id int);
+                 ROLLBACK;
+                 CREATE TABLE outside_txn(id int);",
+                &mut state,
+            )
+            .unwrap();
+
+        // Outside the transaction, the role should be restored
+        assert_eq!(state.local.current_role, "start_role");
+
+        // Table inside txn was rolled back, so it shouldn't exist
+        assert!(
+            state
+                .get_relation(&object_id("public", "inside_txn"))
+                .is_none()
+        );
+
+        // Table outside txn was created by start_role
+        if let RelationOverlay::Present(r) = state
+            .get_relation(&object_id("public", "outside_txn"))
+            .unwrap()
+        {
+            assert_eq!(r.owner, object_id("", "start_role"));
+        } else {
+            panic!("missing outside_txn");
+        }
+    }
+
+    #[test]
+    fn local_role_expires_on_commit_while_session_role_setting_persists() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        state.local.current_role = "login_role".into();
+        state.local.current_role_known = true;
+        state.local.persistent_current_role = "login_role".into();
+        state.local.persistent_current_role_known = true;
+        state.local.session_role = "login_role".into();
+        state.local.session_role_known = true;
+
+        engine
+            .analyze(
+                "BEGIN;
+                 SET LOCAL ROLE local_role;
+                 CREATE TABLE local_owned(id int);
+                 COMMIT;
+                 CREATE TABLE login_owned(id int);
+                 BEGIN;
+                 SET ROLE persistent_role;
+                 COMMIT;
+                 CREATE TABLE persistent_owned(id int);",
+                &mut state,
+            )
+            .unwrap();
+
+        let owner = |table: &str| match state
+            .get_relation(&object_id("public", table))
+            .expect("table")
+        {
+            RelationOverlay::Present(relation) => relation.owner.name.clone(),
+            RelationOverlay::Dropped => panic!("table dropped"),
+        };
+        assert_eq!(owner("local_owned"), "local_role");
+        assert_eq!(owner("login_owned"), "login_role");
+        assert_eq!(owner("persistent_owned"), "persistent_role");
+    }
+
+    #[test]
+    fn local_role_outside_transaction_has_no_effect() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        state.local.current_role = "login_role".into();
+        state.local.current_role_known = true;
+        state.local.persistent_current_role = "login_role".into();
+        state.local.persistent_current_role_known = true;
+
+        engine
+            .analyze(
+                "SET LOCAL ROLE ignored_role;
+                 CREATE TABLE still_login_owned(id int);",
+                &mut state,
+            )
+            .unwrap();
+
+        let RelationOverlay::Present(relation) = state
+            .get_relation(&object_id("public", "still_login_owned"))
+            .unwrap()
+        else {
+            panic!("table missing");
+        };
+        assert_eq!(relation.owner, object_id("", "login_role"));
+    }
+
+    #[test]
+    fn session_authorization_local_and_rollback_restore_all_identity_fields() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        for field in [
+            &mut state.local.current_role,
+            &mut state.local.persistent_current_role,
+            &mut state.local.session_role,
+            &mut state.local.persistent_session_role,
+            &mut state.local.authenticated_role,
+        ] {
+            *field = "login_role".into();
+        }
+        state.local.current_role_known = true;
+        state.local.persistent_current_role_known = true;
+        state.local.session_role_known = true;
+        state.local.persistent_session_role_known = true;
+        state.local.authenticated_role_known = true;
+
+        engine
+            .analyze(
+                "BEGIN;
+                 SET LOCAL SESSION AUTHORIZATION local_auth;
+                 CREATE TABLE local_auth_owned(id int);
+                 COMMIT;
+                 CREATE TABLE login_auth_owned(id int);
+                 BEGIN;
+                 SET SESSION AUTHORIZATION rolled_back_auth;
+                 ROLLBACK;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert_eq!(state.local.current_role, "login_role");
+        assert_eq!(state.local.session_role, "login_role");
+        assert_eq!(state.local.persistent_current_role, "login_role");
+        assert_eq!(state.local.persistent_session_role, "login_role");
+        assert!(state.local.current_role_known);
+        assert!(state.local.session_role_known);
+    }
+
+    #[test]
+    fn role_none_during_local_session_authorization_restores_persistent_session_on_commit() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        for field in [
+            &mut state.local.current_role,
+            &mut state.local.persistent_current_role,
+            &mut state.local.session_role,
+            &mut state.local.persistent_session_role,
+            &mut state.local.authenticated_role,
+        ] {
+            *field = "login_role".into();
+        }
+        state.local.current_role_known = true;
+        state.local.persistent_current_role_known = true;
+        state.local.session_role_known = true;
+        state.local.persistent_session_role_known = true;
+        state.local.authenticated_role_known = true;
+
+        engine
+            .analyze(
+                "BEGIN;
+                 SET LOCAL SESSION AUTHORIZATION local_auth;
+                 SET ROLE NONE;
+                 COMMIT;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert_eq!(state.local.current_role, "login_role");
+        assert_eq!(state.local.session_role, "login_role");
+    }
+
+    #[test]
+    fn role_switch_recomputes_user_search_path_and_owner_keywords() {
+        let engine = setup_engine();
+        let mut cache = DbCache::new();
+        cache.metadata.source_role = Some("login_role".into());
+        cache.metadata.source_session_role = Some("login_role".into());
+        cache.metadata.source_search_path = Some(vec!["$user".into(), "public".into()]);
+        cache.search_path = vec!["login_role".into(), "public".into()];
+        for (name, superuser) in [("login_role", true), ("app_role", false)] {
+            let id = object_id("", name);
+            cache.roles.insert(
+                id.clone(),
+                RoleState {
+                    id,
+                    can_login: true,
+                    is_superuser: superuser,
+                    member_of: Vec::new(),
+                    can_set_role_to: Vec::new(),
+                    granted_privileges: Vec::new(),
+                },
+            );
+        }
+        let table = object_id("public", "owned_table");
+        cache.insert_baseline(
+            table.clone(),
+            RelationState::new(
+                table.clone(),
+                object_id("", "login_role"),
+                0,
+                Some(0),
+                RelationKind::Table,
+                Persistence::Permanent,
+                0,
+            ),
+        );
+        let mut state = safe_migrate::AnalysisState::new(cache);
+
+        engine
+            .analyze(
+                "SET ROLE app_role;
+                 ALTER TABLE public.owned_table OWNER TO SESSION_USER;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert_eq!(state.local.search_path, ["app_role", "public"]);
+        let RelationOverlay::Present(relation) = state.get_relation(&table).unwrap() else {
+            panic!("table missing");
+        };
+        assert_eq!(relation.owner, object_id("", "login_role"));
+    }
+
+    #[test]
+    fn alter_view_owner_updates_relation_metadata() {
+        let engine = setup_engine();
+        let mut cache = DbCache::new();
+        let view = object_id("public", "owned_view");
+        cache.insert_baseline(
+            view.clone(),
+            RelationState::new(
+                view.clone(),
+                object_id("", "old_owner"),
+                0,
+                None,
+                RelationKind::View,
+                Persistence::Permanent,
+                0,
+            ),
+        );
+        let mut state = safe_migrate::AnalysisState::new(cache);
+
+        engine
+            .analyze(
+                "ALTER VIEW public.owned_view OWNER TO new_owner;",
+                &mut state,
+            )
+            .unwrap();
+
+        let RelationOverlay::Present(relation) = state.get_relation(&view).unwrap() else {
+            panic!("view missing");
+        };
+        assert_eq!(relation.owner, object_id("", "new_owner"));
+    }
+
+    #[test]
+    fn complete_role_catalog_rejects_missing_role_switch() {
+        let engine = setup_engine();
+        let mut cache = DbCache::new();
+        cache.metadata.source_role = Some("login_role".into());
+        cache.metadata.source_session_role = Some("login_role".into());
+        let login = object_id("", "login_role");
+        cache.roles.insert(
+            login.clone(),
+            RoleState {
+                id: login,
+                can_login: true,
+                is_superuser: false,
+                member_of: Vec::new(),
+                can_set_role_to: Vec::new(),
+                granted_privileges: Vec::new(),
+            },
+        );
+        let mut state = safe_migrate::AnalysisState::new(cache);
+
+        let violations = engine
+            .analyze("SET ROLE role_that_does_not_exist;", &mut state)
+            .unwrap();
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict")
+        );
+        assert_eq!(state.local.current_role, "login_role");
+    }
+
+    #[test]
+    fn set_role_follows_transitive_set_option_edges() {
+        let engine = setup_engine();
+        let mut cache = DbCache::new();
+        cache.metadata.source_role = Some("member".into());
+        cache.metadata.source_session_role = Some("member".into());
+        for (name, can_set_role_to) in [
+            ("member", vec![object_id("", "bridge")]),
+            ("bridge", vec![object_id("", "target")]),
+            ("target", Vec::new()),
+        ] {
+            let id = object_id("", name);
+            cache.roles.insert(
+                id.clone(),
+                RoleState {
+                    id,
+                    can_login: name == "member",
+                    is_superuser: false,
+                    member_of: can_set_role_to.clone(),
+                    can_set_role_to,
+                    granted_privileges: Vec::new(),
+                },
+            );
+        }
+        let mut state = safe_migrate::AnalysisState::new(cache);
+
+        let violations = engine
+            .analyze(
+                "SET ROLE target; CREATE TABLE transitively_owned(id integer);",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(!violations.iter().any(|v| v.rule_id == "chain-conflict"));
+        let RelationOverlay::Present(relation) = state
+            .get_relation(&object_id("public", "transitively_owned"))
+            .unwrap()
+        else {
+            panic!("table missing");
+        };
+        assert_eq!(relation.owner, object_id("", "target"));
+    }
+
+    #[test]
+    fn membership_without_set_option_does_not_authorize_set_role() {
+        let engine = setup_engine();
+        let mut cache = DbCache::new();
+        cache.metadata.source_role = Some("member".into());
+        cache.metadata.source_session_role = Some("member".into());
+        for (name, member_of) in [
+            ("member", vec![object_id("", "target")]),
+            ("target", Vec::new()),
+        ] {
+            let id = object_id("", name);
+            cache.roles.insert(
+                id.clone(),
+                RoleState {
+                    id,
+                    can_login: name == "member",
+                    is_superuser: false,
+                    member_of,
+                    can_set_role_to: Vec::new(),
+                    granted_privileges: Vec::new(),
+                },
+            );
+        }
+        let mut state = safe_migrate::AnalysisState::new(cache);
+
+        let violations = engine.analyze("SET ROLE target;", &mut state).unwrap();
+
+        assert!(violations.iter().any(|v| v.rule_id == "chain-conflict"));
+        assert_eq!(state.local.current_role, "member");
     }
 }
 

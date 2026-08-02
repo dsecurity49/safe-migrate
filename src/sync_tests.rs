@@ -6,7 +6,8 @@ use crate::model::relation::{Persistence, RelationKind, RelationState};
 mod tests {
     use super::*;
     use crate::sync::{
-        cache_search_path, is_local_host, is_system_schema, relation_owner_id, sync_cache,
+        cache_search_path, is_local_host, is_system_schema, parse_search_path_setting,
+        relation_owner_id, sync_cache,
     };
     use crate::test_support::EnvironmentValueGuard;
     use std::io::Write;
@@ -84,6 +85,14 @@ mod tests {
     }
 
     #[test]
+    fn test_search_path_setting_parser_preserves_user_and_quoted_identifiers() {
+        assert_eq!(
+            parse_search_path_setting("\"$user\", public, \"Mixed,Schema\", \"a\"\"b\""),
+            ["$user", "public", "Mixed,Schema", "a\"b"]
+        );
+    }
+
+    #[test]
     fn test_synced_relation_owner_uses_role_identity() {
         assert_eq!(
             relation_owner_id("app_owner"),
@@ -106,6 +115,9 @@ mod tests {
         cache.pg_version_num = Some(160000);
         cache.metadata.created_at_unix_secs = Some(1_700_000_000);
         cache.metadata.source_database = Some("app".into());
+        cache.metadata.source_role = Some("app_user".into());
+        cache.metadata.source_session_role = Some("login_user".into());
+        cache.metadata.source_search_path = Some(vec!["$user".into(), "public".into()]);
         cache.metadata.schemas = Some(vec!["app".into(), "public".into()]);
         cache.search_path = vec!["app".into(), "public".into()];
 
@@ -156,7 +168,7 @@ mod tests {
         );
 
         // Serialize to JSON
-        let versioned = crate::db::cache::DbCacheVersioned::V3(cache);
+        let versioned = crate::db::cache::DbCacheVersioned::V4(cache);
         let config = bincode::config::standard().with_variable_int_encoding();
         let encoded = bincode::serde::encode_to_vec(&versioned, config).unwrap();
 
@@ -165,8 +177,8 @@ mod tests {
             bincode::serde::decode_from_slice(&encoded, config)
                 .unwrap()
                 .0;
-        let crate::db::cache::DbCacheVersioned::V3(deserialized) = decoded else {
-            panic!("Expected V3");
+        let crate::db::cache::DbCacheVersioned::V4(deserialized) = decoded else {
+            panic!("Expected V4");
         };
         assert_eq!(deserialized.pg_version_num, Some(160000));
         assert_eq!(
@@ -176,6 +188,18 @@ mod tests {
         assert_eq!(
             deserialized.metadata.source_database.as_deref(),
             Some("app")
+        );
+        assert_eq!(
+            deserialized.metadata.source_role.as_deref(),
+            Some("app_user")
+        );
+        assert_eq!(
+            deserialized.metadata.source_session_role.as_deref(),
+            Some("login_user")
+        );
+        assert_eq!(
+            deserialized.metadata.source_search_path.as_deref(),
+            Some(["$user".to_string(), "public".to_string()].as_slice())
         );
         assert_eq!(
             deserialized.metadata.schemas.as_deref(),
@@ -230,15 +254,15 @@ mod tests {
         });
         cache.insert_baseline(id.clone(), rel);
 
-        let versioned = crate::db::cache::DbCacheVersioned::V3(cache);
+        let versioned = crate::db::cache::DbCacheVersioned::V4(cache);
         let config = bincode::config::standard().with_variable_int_encoding();
         let encoded = bincode::serde::encode_to_vec(&versioned, config).unwrap();
         let decoded: crate::db::cache::DbCacheVersioned =
             bincode::serde::decode_from_slice(&encoded, config)
                 .unwrap()
                 .0;
-        let crate::db::cache::DbCacheVersioned::V3(deserialized) = decoded else {
-            panic!("Expected V3");
+        let crate::db::cache::DbCacheVersioned::V4(deserialized) = decoded else {
+            panic!("Expected V4");
         };
         let rel = deserialized.relations.get(&id).unwrap();
         assert_eq!(rel.columns[0].default_expr_text, Some("now()".into()));
@@ -265,11 +289,12 @@ mod tests {
         v3.metadata.created_at_unix_secs = Some(1_700_000_000);
         v3.metadata.source_database = Some("app".into());
 
-        let cache = crate::db::cache::DbCacheVersioned::V3(v3)
+        let cache = crate::db::cache::DbCacheVersioned::V3(v3.into())
             .into_cache()
             .unwrap();
         assert_eq!(cache.pg_version_num, Some(160000));
         assert_eq!(cache.metadata.created_at_unix_secs, Some(1_700_000_000));
         assert_eq!(cache.metadata.source_database.as_deref(), Some("app"));
+        assert_eq!(cache.metadata.source_role, None);
     }
 }
