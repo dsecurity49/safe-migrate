@@ -39,6 +39,10 @@ pub enum Mutation {
     DropView(DropViewMutation),
     DropMaterializedView(DropMaterializedViewMutation),
     DropIndex(DropIndex),
+    ChangeRelationOwner {
+        id: ObjectId,
+        new_owner: crate::analysis::facts::RoleFact,
+    },
     SearchPath(SearchPathChange),
     BeginTransaction,
     CommitTransaction,
@@ -68,6 +72,14 @@ pub enum Mutation {
     CreateDatabase(CreateDatabaseMutation),
     AlterDatabase(AlterDatabaseMutation),
     DropDatabase(DropDatabaseMutation),
+    /// Produced by `SET [LOCAL] ROLE` and `SET [LOCAL] SESSION AUTHORIZATION`.
+    /// `role = None` means ROLE NONE / SESSION AUTHORIZATION DEFAULT.
+    /// `local = true` means the active value expires at transaction end.
+    SwitchRole {
+        role: Option<crate::analysis::facts::RoleFact>,
+        local: bool,
+        is_session_auth: bool,
+    },
     Opaque(OpaqueMutation),
     Vacuum {
         table_id: Option<ObjectId>,
@@ -557,5 +569,8 @@ pub enum AlterTableActionMutation {
         column: String,
     },
     SetAccessMethod,
+    OwnerTo {
+        new_owner: crate::analysis::facts::RoleFact,
+    },
     Opaque,
 }

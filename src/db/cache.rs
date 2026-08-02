@@ -3,6 +3,7 @@ use crate::ast::identifiers::ObjectId;
 use crate::model::constraint::ConstraintState;
 use crate::model::function::FunctionState;
 use crate::model::relation::RelationState;
+use crate::model::role::RoleState;
 use crate::model::trigger::TriggerEnableMode;
 use crate::model::types::TypeState;
 use serde::{Deserialize, Serialize};
@@ -62,6 +63,11 @@ pub struct CacheMetadata {
     /// Session role used when the cache was synchronized. This is needed to
     /// resolve PostgreSQL's special `$user` search-path entry.
     pub source_role: Option<String>,
+    /// `SESSION_USER` at synchronization time. This remains distinct from
+    /// `source_role` when the connection has selected another effective role.
+    pub source_session_role: Option<String>,
+    /// Parsed `search_path` setting before PostgreSQL expands `$user`.
+    pub source_search_path: Option<Vec<String>>,
     /// Explicit schema scope passed to sync. `None` means all non-system
     /// schemas were requested.
     pub schemas: Option<Vec<String>>,
@@ -129,6 +135,7 @@ pub struct DbCache {
     pub triggers: Vec<TriggerCache>,
     pub functions: HashMap<ObjectId, FunctionState>,
     pub types: HashMap<ObjectId, TypeState>,
+    pub roles: HashMap<ObjectId, RoleState>,
     pub dependencies: Vec<DependencyCache>,
 }
 
@@ -178,6 +185,8 @@ impl From<DbCacheV3> for DbCache {
                 created_at_unix_secs: cache.metadata.created_at_unix_secs,
                 source_database: cache.metadata.source_database,
                 source_role: None,
+                source_session_role: None,
+                source_search_path: None,
                 schemas: cache.metadata.schemas,
             },
             search_path: cache.search_path,
@@ -188,6 +197,7 @@ impl From<DbCacheV3> for DbCache {
             triggers: cache.triggers,
             functions: cache.functions,
             types: cache.types,
+            roles: HashMap::new(),
             dependencies: cache.dependencies,
         }
     }
@@ -234,6 +244,7 @@ impl DbCache {
             triggers: Vec::new(),
             functions: HashMap::new(),
             types: HashMap::new(),
+            roles: HashMap::new(),
             dependencies: Vec::new(),
         }
     }

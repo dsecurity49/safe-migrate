@@ -1,7 +1,7 @@
 # CLI and Report Contract
 
 This document defines the user-visible behavior safe-migrate intends to
-stabilize for v0.4.3. A requirement is not complete until an automated test
+stabilize for v0.4.4. A requirement is not complete until an automated test
 enforces it.
 
 ## Commands
@@ -177,10 +177,11 @@ silently weakening the configured protection. When encryption is disabled,
 encrypted cache files are also rejected; changing modes requires a fresh
 `safe-migrate sync`.
 
-V4 cache payloads carry an explicit format header and record the synchronization
-role needed to resolve PostgreSQL's special `$user` search-path entry. Headered
-V3 payloads remain readable; when a migration explicitly uses `$user`, missing
-V3 role provenance taints confidence. All older and unheadered payloads are
+V4 cache payloads carry an explicit format header and record effective and
+session role provenance, the unexpanded search-path setting, and PostgreSQL
+role membership needed to evaluate role switches. They never include password
+hashes. Headered V3 payloads remain readable; role-sensitive operations with
+missing V3 provenance taint confidence. All older and unheadered payloads are
 rejected with generic guidance to run `safe-migrate sync`; errors do not expose
 internal cache-version labels.
 

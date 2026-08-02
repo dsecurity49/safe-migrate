@@ -1707,14 +1707,30 @@
         "013_rename_enum_duplicate_label.sql",
         "014_rename_value_non_enum.sql",
         "015_rename_value_missing_type.sql",
+        "016_missing_set_role.sql",
+        "017_unauthorized_set_role.sql",
         "safe_001_chain.sql",
         "safe_001_create_table.sql",
         "safe_002_create_index.sql",
         "safe_003_add_unique_constraint.sql",
         "safe_004_add_not_null.sql",
         "safe_005_create_view.sql",
-        "safe_007_grant_select.sql"
+        "safe_007_grant_select.sql",
+        "safe_010_role_transaction_semantics.sql",
+        "safe_011_session_authorization.sql",
+        "safe_012_role_search_path_and_owner.sql",
+        "safe_013_quoted_session_authorization.sql",
+        "safe_014_session_authorization_rollback.sql",
+        "safe_015_session_authorization_default.sql"
       ],
+      "fixture_transactional": {
+        "safe_010_role_transaction_semantics.sql": false,
+        "safe_011_session_authorization.sql": false,
+        "safe_012_role_search_path_and_owner.sql": false,
+        "safe_013_quoted_session_authorization.sql": false,
+        "safe_014_session_authorization_rollback.sql": false,
+        "safe_015_session_authorization_default.sql": false
+      },
       "expected_live_errors": {
         "011_missing_fk_source_column.sql": {
           "sqlstate": "42703",
@@ -1734,6 +1750,14 @@
         },
         "015_rename_value_missing_type.sql": {
           "sqlstate": "42704",
+          "simulator_rule": "chain-conflict"
+        },
+        "016_missing_set_role.sql": {
+          "sqlstate": "22023",
+          "simulator_rule": "chain-conflict"
+        },
+        "017_unauthorized_set_role.sql": {
+          "sqlstate": "42501",
           "simulator_rule": "chain-conflict"
         }
       },
@@ -1803,7 +1827,9 @@
         "sm_billing",
         "sm_fulfillment",
         "sm_audit",
-        "sm_analytics"
+        "sm_analytics",
+        "app_user",
+        "sm_role_quote"
       ],
       "scope": [
         "relations",
@@ -1830,6 +1856,25 @@
         ],
         "safe_007_grant_select.sql": [
           "privileges"
+        ],
+        "safe_010_role_transaction_semantics.sql": [
+          "relations"
+        ],
+        "safe_011_session_authorization.sql": [
+          "relations"
+        ],
+        "safe_012_role_search_path_and_owner.sql": [
+          "relations",
+          "privileges"
+        ],
+        "safe_013_quoted_session_authorization.sql": [
+          "relations"
+        ],
+        "safe_014_session_authorization_rollback.sql": [
+          "relations"
+        ],
+        "safe_015_session_authorization_default.sql": [
+          "relations"
         ]
       },
       "required_relations": [
@@ -2019,6 +2064,7 @@
         "006_do_block_language.sql",
         "008_set_transaction_read_only.sql",
         "010_do_block_with_declare.sql",
+        "013_invalid_set_role_current_user.sql",
         "safe_001_create_table.sql",
         "safe_002_alter_table.sql",
         "011_select.sql",
@@ -2026,6 +2072,12 @@
         "013_update.sql",
         "014_delete.sql"
       ],
+      "expected_live_errors": {
+        "013_invalid_set_role_current_user.sql": {
+          "sqlstate": "42601",
+          "simulator_rule": "opaque-dynamic-sql"
+        }
+      },
       "excluded_fixtures": [
         {
           "fixture": "002_execute.sql",

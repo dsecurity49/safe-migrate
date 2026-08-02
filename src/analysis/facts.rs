@@ -38,7 +38,7 @@ pub enum AlterViewAction {
         new_name: Ident,
     },
     OwnerTo {
-        new_owner: String,
+        new_owner: RoleFact,
     },
     SetSchema {
         new_schema: String,
@@ -250,6 +250,17 @@ pub enum StatementFact {
     CreateDatabase(CreateDatabaseFact),
     AlterDatabase(AlterDatabaseFact),
     DropDatabase(DropDatabaseFact),
+    /// `SET [LOCAL] ROLE { rolename | NONE }` or
+    /// `SET [LOCAL] SESSION AUTHORIZATION { rolename | DEFAULT }`.
+    /// `role = None` means NONE / DEFAULT (restore the session default).
+    /// `local = true` means the change is scoped to the current transaction.
+    /// `is_session_auth = true` means SET SESSION AUTHORIZATION (which also
+    /// updates the session-level default, unlike plain SET ROLE).
+    SetRole {
+        role: Option<RoleFact>,
+        local: bool,
+        is_session_auth: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -779,7 +790,7 @@ pub enum AlterTableActionFact {
     SetLogged,
     SetUnlogged,
     OwnerTo {
-        new_owner: String,
+        new_owner: RoleFact,
     },
     ReplicaIdentity {
         option: String,

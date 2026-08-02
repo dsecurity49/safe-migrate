@@ -36,6 +36,8 @@ struct RuleManifest {
     #[serde(default = "default_transactional")]
     transactional: bool,
     #[serde(default)]
+    fixture_transactional: BTreeMap<String, bool>,
+    #[serde(default)]
     excluded_fixtures: Vec<FixtureExclusion>,
     schemas: Vec<String>,
     scope: Vec<ComparisonScope>,
@@ -102,6 +104,7 @@ struct NormalizedState {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct NormalizedRelation {
     kind: NormalizedRelationKind,
+    owner: String,
     partition_strategy: Option<String>,
     columns: BTreeMap<String, NormalizedColumn>,
 }
@@ -174,6 +177,7 @@ enum MismatchCategory {
     MissingObjectInSimulator,
     ExtraObjectInSimulator,
     RelationKindMismatch,
+    RelationOwnerMismatch,
     PartitionStrategyMismatch,
     ColumnMismatch,
     MissingIndexInSimulator,
@@ -355,6 +359,11 @@ fn live_postgres_differential_harness() {
             .iter()
             .filter(|fixture| fixture_is_selected(&fixture_filter, &rule.rule_dir, fixture))
         {
+            let transactional = rule
+                .fixture_transactional
+                .get(fixture)
+                .copied()
+                .unwrap_or(rule.transactional);
             let scope = rule
                 .fixture_scopes
                 .get(fixture)
@@ -467,7 +476,7 @@ fn live_postgres_differential_harness() {
                 format!("case={}/{} phase=simulated", rule.rule_dir, fixture),
             );
 
-            if rule.transactional {
+            if transactional {
                 if let Err(error) = client.batch_execute("BEGIN") {
                     mismatches.push(Mismatch {
                         rule_dir: rule.rule_dir.clone(),
@@ -492,9 +501,9 @@ fn live_postgres_differential_harness() {
             }
 
             if let Err(error) = client.batch_execute(&sql) {
-                if rule.transactional {
-                    let _ = client.batch_execute("ROLLBACK");
-                }
+                // Recover the shared harness connection even when a fixture
+                // owns its transaction boundaries and leaves one aborted.
+                let _ = client.batch_execute("ROLLBACK");
                 if let Some(expected) = rule.expected_live_errors.get(fixture) {
                     let actual_sqlstate = error
                         .as_db_error()
@@ -564,7 +573,7 @@ fn live_postgres_differential_harness() {
             }
 
             if let Some(expected) = rule.expected_live_errors.get(fixture) {
-                if rule.transactional {
+                if transactional {
                     let _ = client.batch_execute("ROLLBACK");
                 }
                 mismatches.push(Mismatch {
@@ -586,7 +595,7 @@ fn live_postgres_differential_harness() {
             );
 
             let live_state_result = snapshot_live_state(&mut client, &rule.schemas, scope);
-            if rule.transactional {
+            if transactional {
                 if let Err(error) = client.batch_execute("ROLLBACK") {
                     mismatches.push(Mismatch {
                         rule_dir: rule.rule_dir.clone(),
@@ -815,6 +824,14 @@ fn validate_manifest(manifest: &DifferentialManifest, path: &Path) {
                 fixture
             );
         }
+        for fixture in rule.fixture_transactional.keys() {
+            assert!(
+                included.contains(fixture),
+                "fixture transaction override references a non-included fixture: {}/{}",
+                rule.rule_dir,
+                fixture
+            );
+        }
 
         validate_expected_live_errors(rule, &included, &valid_rule_ids);
 
@@ -891,6 +908,7 @@ fn expected_live_error_must_reference_an_included_fixture() {
         enabled: true,
         fixtures: Vec::new(),
         transactional: true,
+        fixture_transactional: BTreeMap::new(),
         excluded_fixtures: Vec::new(),
         schemas: Vec::new(),
         scope: Vec::new(),
@@ -916,6 +934,7 @@ fn expected_live_error_must_reference_a_known_simulator_rule() {
         enabled: true,
         fixtures: vec!["case.sql".to_string()],
         transactional: true,
+        fixture_transactional: BTreeMap::new(),
         excluded_fixtures: Vec::new(),
         schemas: Vec::new(),
         scope: Vec::new(),
@@ -1153,6 +1172,7 @@ fn snapshot_live_state(
         for (id, relation) in cache.relations {
             let mut normalized = NormalizedRelation {
                 kind: normalize_relation_kind(relation.kind),
+                owner: relation.owner.name,
                 partition_strategy: relation.partition_type,
                 columns: BTreeMap::new(),
             };
@@ -1367,6 +1387,7 @@ fn snapshot_simulator_state(state: &AnalysisState, scope: &[ComparisonScope]) ->
             };
             let mut normalized = NormalizedRelation {
                 kind: normalize_relation_kind(relation.kind.clone()),
+                owner: relation.owner.name.clone(),
                 partition_strategy: relation.partition_type.clone(),
                 columns: BTreeMap::new(),
             };
@@ -1462,6 +1483,18 @@ fn compare_states(
                         note: format!(
                             "relation kind mismatch for {name}: live={:?}, simulator={:?}",
                             live_relation.kind, sim_relation.kind
+                        ),
+                    });
+                }
+                Some(sim_relation) if sim_relation.owner != live_relation.owner => {
+                    mismatches.push(Mismatch {
+                        rule_dir: rule_dir.to_string(),
+                        fixture: fixture.to_string(),
+                        category: MismatchCategory::RelationOwnerMismatch,
+                        root_cause: RootCauseClassification::SimulatorBug,
+                        note: format!(
+                            "relation owner mismatch for {name}: live={}, simulator={}",
+                            live_relation.owner, sim_relation.owner
                         ),
                     });
                 }

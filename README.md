@@ -77,6 +77,12 @@ safe-migrate sync
 `lint` and `lint-chain` do not connect to PostgreSQL unless `auto_sync = true`
 is configured.
 
+Migration chains model PostgreSQL's effective role and session authorization.
+`SET ROLE`, `RESET ROLE`, `SET SESSION AUTHORIZATION`, transaction-local role
+changes, `$user` search paths, grants to special role identifiers, and relation
+ownership changes affect subsequent statements in the chain. A synchronized
+role catalog is used to reject nonexistent or unauthorized role switches.
+
 ## Commands
 
 ```text
@@ -198,15 +204,17 @@ The key is accepted only through the environment. Encrypted mode rejects
 plaintext caches, and plaintext mode rejects encrypted caches. Changing modes
 requires a fresh `sync`.
 
-Cache files contain schema names, object metadata, dependencies, privileges,
-and statistics. They do not contain `DATABASE_URL` or credentials, but should
-still be treated as sensitive and kept out of public artifacts.
+Cache files contain schema and role names, role memberships, object metadata,
+dependencies, privileges, and statistics. They do not contain `DATABASE_URL`,
+password hashes, or credentials, but should still be treated as sensitive and
+kept out of public artifacts.
 
 ### Cache compatibility
 
-v0.4.4 writes the headered V4 cache format. Headered V3 caches remain readable
-with limited role provenance. Older cache formats are unsupported and must be
-rebuilt:
+v0.4.4 writes the headered V4 cache format. It records effective/session role
+provenance, the unexpanded search-path setting, and role membership needed for
+role-sensitive migration chains. Headered V3 caches remain readable with
+limited role provenance. Older cache formats are unsupported and must be rebuilt:
 
 ```bash
 safe-migrate sync

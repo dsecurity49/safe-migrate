@@ -101,6 +101,8 @@ impl AstVisitor {
             Stmt::ReleaseSavepoint(node) => return Some(Self::extract_release_savepoint(node)),
             Stmt::Do(_) => return Some(StatementFact::OpaqueBlock),
             Stmt::Execute(_) => return Some(StatementFact::Execute),
+            Stmt::SetRole(node) => return Self::extract_set_role(node),
+            Stmt::SetSessionAuth(node) => return Self::extract_set_session_auth(node),
             Stmt::Vacuum(node) => {
                 let relation = if let Some(list) = node.table_and_columns_list() {
                     list.table_and_columnss()
@@ -664,28 +666,7 @@ impl AstVisitor {
                     }
                 }
                 AlterTableAction::OwnerTo(ot) => {
-                    let owner = ot
-                        .role_ref()
-                        .and_then(|r| r.ident_token())
-                        .map(|t| Self::resolve_identifier_token(t.text()))
-                        .or_else(|| {
-                            ot.syntax()
-                                .descendants()
-                                .find_map(squawk_syntax::ast::NameRef::cast)
-                                .map(|nr| Self::resolve_name_ref(&nr))
-                        })
-                        .or_else(|| {
-                            ot.role_ref().and_then(|r| {
-                                if r.current_user_token().is_some() {
-                                    Some("CURRENT_USER".to_string())
-                                } else if r.current_role_token().is_some() {
-                                    Some("CURRENT_ROLE".to_string())
-                                } else {
-                                    None
-                                }
-                            })
-                        });
-                    if let Some(new_owner) = owner {
+                    if let Some(new_owner) = ot.role_ref().map(|role| Self::extract_role(&role)) {
                         actions.push(AlterTableActionFact::OwnerTo { new_owner });
                     }
                 }
@@ -1350,12 +1331,10 @@ impl AstVisitor {
                 })
             }
             ast::AlterViewAction::OwnerTo(ot) => {
-                let token = ot.role_ref()?.ident_token()?;
+                let new_owner = Self::extract_role(&ot.role_ref()?);
                 Some(StatementFact::AlterView {
                     name,
-                    action: crate::analysis::facts::AlterViewAction::OwnerTo {
-                        new_owner: Self::resolve_identifier_token(token.text()),
-                    },
+                    action: crate::analysis::facts::AlterViewAction::OwnerTo { new_owner },
                 })
             }
             ast::AlterViewAction::SetSchema(ss) => {
@@ -2894,6 +2873,86 @@ impl AstVisitor {
             }
             _ => None,
         }
+    }
+
+    /// Extract `SET [LOCAL] ROLE { rolename | NONE }`.
+    fn extract_set_role(node: &squawk_syntax::ast::SetRole) -> Option<StatementFact> {
+        let local = node.local_token().is_some();
+        // ROLE NONE — restore the session default.
+        if node.none_token().is_some() {
+            return Some(StatementFact::SetRole {
+                role: None,
+                local,
+                is_session_auth: false,
+            });
+        }
+        let role = node.role_ref().map(|r| Self::extract_role(&r));
+        if matches!(
+            role,
+            Some(
+                crate::analysis::facts::RoleFact::CurrentUser
+                    | crate::analysis::facts::RoleFact::CurrentRole
+                    | crate::analysis::facts::RoleFact::SessionUser
+            )
+        ) {
+            // PostgreSQL's SET ROLE grammar accepts a role name or NONE, not
+            // the special role-specification keywords accepted by GRANT and
+            // OWNER TO. Squawk currently parses these forms, so leave them
+            // unsupported rather than simulating SQL PostgreSQL rejects.
+            return None;
+        }
+        Some(StatementFact::SetRole {
+            role,
+            local,
+            is_session_auth: false,
+        })
+    }
+
+    /// Extract `SET [LOCAL] SESSION AUTHORIZATION { rolename | DEFAULT }`.
+    fn extract_set_session_auth(
+        node: &squawk_syntax::ast::SetSessionAuth,
+    ) -> Option<StatementFact> {
+        let local = node.local_token().is_some();
+        // DEFAULT — restore the session default.
+        if node.default_token().is_some() {
+            return Some(StatementFact::SetRole {
+                role: None,
+                local,
+                is_session_auth: true,
+            });
+        }
+        // A literal string is also valid: SET SESSION AUTHORIZATION 'rolename'.
+        let role_from_literal = node.literal().and_then(|lit| {
+            let text = lit.syntax().text().to_string();
+            let unescaped = text
+                .strip_prefix('\'')
+                .and_then(|inner| inner.strip_suffix('\''))
+                .map(|inner| inner.replace("''", "'"));
+            if unescaped.as_deref().is_none_or(str::is_empty) {
+                None
+            } else {
+                Some(crate::analysis::facts::RoleFact::Named {
+                    name: unescaped.expect("checked above"),
+                    via_legacy_group_syntax: false,
+                })
+            }
+        });
+        let role = role_from_literal.or_else(|| node.role_ref().map(|r| Self::extract_role(&r)));
+        if matches!(
+            role,
+            Some(
+                crate::analysis::facts::RoleFact::CurrentUser
+                    | crate::analysis::facts::RoleFact::CurrentRole
+                    | crate::analysis::facts::RoleFact::SessionUser
+            )
+        ) {
+            return None;
+        }
+        Some(StatementFact::SetRole {
+            role,
+            local,
+            is_session_auth: true,
+        })
     }
 
     fn extract_rollback(node: &Rollback) -> Option<StatementFact> {

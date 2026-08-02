@@ -6,7 +6,8 @@ use crate::model::relation::{Persistence, RelationKind, RelationState};
 mod tests {
     use super::*;
     use crate::sync::{
-        cache_search_path, is_local_host, is_system_schema, relation_owner_id, sync_cache,
+        cache_search_path, is_local_host, is_system_schema, parse_search_path_setting,
+        relation_owner_id, sync_cache,
     };
     use crate::test_support::EnvironmentValueGuard;
     use std::io::Write;
@@ -84,6 +85,14 @@ mod tests {
     }
 
     #[test]
+    fn test_search_path_setting_parser_preserves_user_and_quoted_identifiers() {
+        assert_eq!(
+            parse_search_path_setting("\"$user\", public, \"Mixed,Schema\", \"a\"\"b\""),
+            ["$user", "public", "Mixed,Schema", "a\"b"]
+        );
+    }
+
+    #[test]
     fn test_synced_relation_owner_uses_role_identity() {
         assert_eq!(
             relation_owner_id("app_owner"),
@@ -107,6 +116,8 @@ mod tests {
         cache.metadata.created_at_unix_secs = Some(1_700_000_000);
         cache.metadata.source_database = Some("app".into());
         cache.metadata.source_role = Some("app_user".into());
+        cache.metadata.source_session_role = Some("login_user".into());
+        cache.metadata.source_search_path = Some(vec!["$user".into(), "public".into()]);
         cache.metadata.schemas = Some(vec!["app".into(), "public".into()]);
         cache.search_path = vec!["app".into(), "public".into()];
 
@@ -181,6 +192,14 @@ mod tests {
         assert_eq!(
             deserialized.metadata.source_role.as_deref(),
             Some("app_user")
+        );
+        assert_eq!(
+            deserialized.metadata.source_session_role.as_deref(),
+            Some("login_user")
+        );
+        assert_eq!(
+            deserialized.metadata.source_search_path.as_deref(),
+            Some(["$user".to_string(), "public".to_string()].as_slice())
         );
         assert_eq!(
             deserialized.metadata.schemas.as_deref(),

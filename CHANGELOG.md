@@ -21,10 +21,16 @@ notes are available on the
   resolution, conflicts, quoted labels, and transaction rollback.
 - Added differential assertions for expected PostgreSQL errors, including the
   exact SQLSTATE and the safe-migrate rule that must predict the rejection.
-- Added headered V4 caches with synchronization-role provenance for `$user`
-  search-path resolution. Headered V3 caches remain readable; older formats
-  now require `safe-migrate sync` and are rejected without internal version
-  labels.
+- Added role-sensitive chain analysis for `SET ROLE`, transaction-local role
+  settings, session authorization, `$user` search paths, grants, and relation
+  ownership. V4 caches include effective/session identities and role
+  memberships so missing or unauthorized switches match PostgreSQL behavior.
+- Added live PostgreSQL differential coverage for role transaction semantics,
+  session resets and rollback, ownership, quoted role names, dynamic search
+  paths, and rejected role switches.
+- Added headered V4 caches for the expanded role/search-path provenance.
+  Headered V3 caches remain readable; older formats now require
+  `safe-migrate sync` and are rejected without internal version labels.
 
 ## v0.4.3 — 2026-07-30
 

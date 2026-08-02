@@ -1047,4 +1047,155 @@ mod tests {
             _ => panic!("Expected Execute fact"),
         }
     }
+
+    // ========================================================================
+    // SET ROLE / SET SESSION AUTHORIZATION tests
+    // ========================================================================
+
+    #[test]
+    fn set_role_named_produces_set_role_fact() {
+        let fact =
+            parse_and_extract_statement("SET ROLE app_user;").expect("should extract a fact");
+        let StatementFact::SetRole {
+            role,
+            local,
+            is_session_auth,
+        } = fact
+        else {
+            panic!("expected SetRole, got {fact:?}");
+        };
+        assert_eq!(
+            role,
+            Some(crate::analysis::facts::RoleFact::Named {
+                name: "app_user".to_string(),
+                via_legacy_group_syntax: false,
+            })
+        );
+        assert!(!local);
+        assert!(!is_session_auth);
+    }
+
+    #[test]
+    fn set_local_role_sets_local_flag() {
+        let fact =
+            parse_and_extract_statement("SET LOCAL ROLE analyst;").expect("should extract a fact");
+        let StatementFact::SetRole { local, .. } = fact else {
+            panic!("expected SetRole");
+        };
+        assert!(local);
+    }
+
+    #[test]
+    fn set_role_none_produces_none_role() {
+        let fact = parse_and_extract_statement("SET ROLE NONE;").expect("should extract a fact");
+        let StatementFact::SetRole {
+            role,
+            local,
+            is_session_auth,
+        } = fact
+        else {
+            panic!("expected SetRole");
+        };
+        assert_eq!(role, None);
+        assert!(!local);
+        assert!(!is_session_auth);
+    }
+
+    #[test]
+    fn set_role_current_user_is_not_treated_as_valid_postgres_sql() {
+        assert!(parse_and_extract_statement("SET ROLE CURRENT_USER;").is_none());
+    }
+
+    #[test]
+    fn set_role_current_role_is_not_treated_as_valid_postgres_sql() {
+        assert!(parse_and_extract_statement("SET ROLE CURRENT_ROLE;").is_none());
+    }
+
+    #[test]
+    fn set_session_authorization_named_is_session_auth() {
+        let fact = parse_and_extract_statement("SET SESSION AUTHORIZATION app_user;")
+            .expect("should extract a fact");
+        let StatementFact::SetRole {
+            role,
+            local,
+            is_session_auth,
+        } = fact
+        else {
+            panic!("expected SetRole");
+        };
+        assert_eq!(
+            role,
+            Some(crate::analysis::facts::RoleFact::Named {
+                name: "app_user".to_string(),
+                via_legacy_group_syntax: false,
+            })
+        );
+        assert!(!local);
+        assert!(is_session_auth);
+    }
+
+    #[test]
+    fn set_session_authorization_default_produces_none_role() {
+        let fact = parse_and_extract_statement("SET SESSION AUTHORIZATION DEFAULT;")
+            .expect("should extract a fact");
+        let StatementFact::SetRole {
+            role,
+            is_session_auth,
+            ..
+        } = fact
+        else {
+            panic!("expected SetRole");
+        };
+        assert_eq!(role, None);
+        assert!(is_session_auth);
+    }
+
+    #[test]
+    fn set_session_authorization_literal_unescapes_sql_quotes() {
+        let fact = parse_and_extract_statement("SET SESSION AUTHORIZATION 'owner''s_role';")
+            .expect("should extract a fact");
+        let StatementFact::SetRole { role, .. } = fact else {
+            panic!("expected SetRole");
+        };
+        assert_eq!(
+            role,
+            Some(crate::analysis::facts::RoleFact::Named {
+                name: "owner's_role".to_string(),
+                via_legacy_group_syntax: false,
+            })
+        );
+    }
+
+    #[test]
+    fn set_local_session_authorization_sets_local_flag() {
+        let fact = parse_and_extract_statement("SET LOCAL SESSION AUTHORIZATION analyst;")
+            .expect("should extract a fact");
+        let StatementFact::SetRole {
+            local,
+            is_session_auth,
+            ..
+        } = fact
+        else {
+            panic!("expected SetRole");
+        };
+        assert!(local);
+        assert!(is_session_auth);
+    }
+
+    #[test]
+    fn alter_table_owner_to_session_user_is_captured() {
+        let fact = parse_and_extract_statement("ALTER TABLE foo OWNER TO SESSION_USER;")
+            .expect("should extract a fact");
+        let StatementFact::AlterTable { actions, .. } = fact else {
+            panic!("expected AlterTable");
+        };
+        let owner = actions.iter().find_map(|a| {
+            if let AlterTableActionFact::OwnerTo { new_owner } = a {
+                Some(new_owner.clone())
+            } else {
+                None
+            }
+        });
+        assert_eq!(owner, Some(crate::analysis::facts::RoleFact::SessionUser));
+    }
 }

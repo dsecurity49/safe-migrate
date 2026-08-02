@@ -58,10 +58,11 @@ schema/dependency snapshot.
 ## Least-privilege sync role
 
 `sync` only issues read-only `SHOW`, `SELECT`, and catalog/view-function calls.
-It queries server/version and search-path values plus `pg_class`,
+It queries server/version, effective/session role, and search-path values plus `pg_class`,
 `pg_namespace`, `pg_attribute`, `pg_attrdef`, `pg_constraint`, `pg_depend`,
 `pg_index`, `pg_proc`, `pg_type`, `pg_trigger`, `pg_policy`, `pg_rewrite`,
-`pg_stats`, and `pg_stat_user_tables`.
+`pg_roles`, `pg_auth_members`, `pg_stats`, and `pg_stat_user_tables`. `pg_roles`
+is used instead of `pg_authid`, so password hashes are never cached.
 
 Start with a dedicated `LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION`
 role, `CONNECT` on the target database, and `USAGE` only on schemas included in

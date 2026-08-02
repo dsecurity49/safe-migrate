@@ -82,6 +82,39 @@ pub(crate) fn cache_search_path(
     scoped_search_path
 }
 
+/// Parse PostgreSQL's canonical `SHOW search_path` representation while
+/// preserving the special `$user` placeholder and quoted identifier casing.
+pub(crate) fn parse_search_path_setting(setting: &str) -> Vec<String> {
+    let mut entries = Vec::new();
+    let mut current = String::new();
+    let mut chars = setting.chars().peekable();
+    let mut quoted = false;
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' if quoted && chars.peek() == Some(&'"') => {
+                current.push('"');
+                chars.next();
+            }
+            '"' => quoted = !quoted,
+            ',' if !quoted => {
+                let entry = current.trim();
+                if !entry.is_empty() {
+                    entries.push(entry.to_string());
+                }
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+
+    let entry = current.trim();
+    if !entry.is_empty() {
+        entries.push(entry.to_string());
+    }
+    entries
+}
+
 pub(crate) fn relation_owner_id(owner_name: impl Into<String>) -> ObjectId {
     ObjectId::new("", owner_name)
 }
@@ -253,9 +286,15 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
     let version_str: String = version_row.get(0);
     cache.pg_version_num = version_str.parse::<u32>().ok();
 
-    let provenance_row = client.query_one("SELECT current_database(), current_user;", &[])?;
+    let provenance_row = client.query_one(
+        "SELECT current_database(), current_user, session_user, current_setting('search_path');",
+        &[],
+    )?;
     cache.metadata.source_database = Some(provenance_row.get(0));
     cache.metadata.source_role = Some(provenance_row.get(1));
+    cache.metadata.source_session_role = Some(provenance_row.get(2));
+    let search_path_setting: String = provenance_row.get(3);
+    cache.metadata.source_search_path = Some(parse_search_path_setting(&search_path_setting));
 
     // Resolve role/database defaults and special entries such as "$user" exactly
     // as PostgreSQL does, while excluding the implicit pg_catalog lookup. An
@@ -878,6 +917,51 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
             ref_schema: Some(row.get(8)),
             ref_name: Some(row.get(9)),
         });
+    }
+
+    // Role identity and membership are required to distinguish a valid
+    // `SET ROLE` from a migration that PostgreSQL would reject. pg_roles does
+    // not expose password hashes or other credentials.
+    for row in client.query(
+        "SELECT rolname, rolcanlogin, rolsuper FROM pg_roles ORDER BY rolname;",
+        &[],
+    )? {
+        let name: String = row.get(0);
+        let id = ObjectId::new("", &name);
+        cache.roles.insert(
+            id.clone(),
+            crate::model::role::RoleState {
+                id,
+                can_login: row.get(1),
+                is_superuser: row.get(2),
+                member_of: Vec::new(),
+                can_set_role_to: Vec::new(),
+                granted_privileges: Vec::new(),
+            },
+        );
+    }
+
+    let membership_query = if cache.pg_version_num.unwrap_or_default() >= 160_000 {
+        "SELECT member.rolname, parent.rolname, membership.set_option
+         FROM pg_auth_members membership
+         JOIN pg_roles member ON member.oid = membership.member
+         JOIN pg_roles parent ON parent.oid = membership.roleid;"
+    } else {
+        "SELECT member.rolname, parent.rolname, true AS set_option
+         FROM pg_auth_members membership
+         JOIN pg_roles member ON member.oid = membership.member
+         JOIN pg_roles parent ON parent.oid = membership.roleid;"
+    };
+    for row in client.query(membership_query, &[])? {
+        let member = ObjectId::new("", row.get::<_, String>(0));
+        let parent = ObjectId::new("", row.get::<_, String>(1));
+        let set_option: bool = row.get(2);
+        if let Some(role) = cache.roles.get_mut(&member) {
+            role.member_of.push(parent.clone());
+            if set_option {
+                role.can_set_role_to.push(parent);
+            }
+        }
     }
 
     Ok(cache)

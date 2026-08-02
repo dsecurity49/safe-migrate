@@ -308,8 +308,13 @@ impl Resolver {
                         // SET SCHEMA — rename tracked at object-id level is handled by state machine
                         // No mutation needed since schema changes don't change ObjectId
                     }
-                    crate::analysis::facts::AlterViewAction::OwnerTo { .. }
-                    | crate::analysis::facts::AlterViewAction::SetDefault { .. }
+                    crate::analysis::facts::AlterViewAction::OwnerTo { new_owner } => {
+                        mutations.push(Mutation::ChangeRelationOwner {
+                            id: Self::resolve_lookup_name(name, state),
+                            new_owner: new_owner.clone(),
+                        });
+                    }
+                    crate::analysis::facts::AlterViewAction::SetDefault { .. }
                     | crate::analysis::facts::AlterViewAction::DropDefault { .. }
                     | crate::analysis::facts::AlterViewAction::RenameColumn { .. }
                     | crate::analysis::facts::AlterViewAction::SetOptions { .. }
@@ -763,7 +768,6 @@ impl Resolver {
                         | AlterTableActionFact::SetTablespace { .. }
                         | AlterTableActionFact::SetLogged
                         | AlterTableActionFact::SetUnlogged
-                        | AlterTableActionFact::OwnerTo { .. }
                         | AlterTableActionFact::ReplicaIdentity { .. }
                         | AlterTableActionFact::ForceRls
                         | AlterTableActionFact::EnableRls
@@ -771,6 +775,11 @@ impl Resolver {
                         | AlterTableActionFact::EnableAlwaysTrigger { .. }
                         | AlterTableActionFact::EnableReplicaTrigger { .. } => {
                             AlterTableActionMutation::Opaque
+                        }
+                        AlterTableActionFact::OwnerTo { new_owner } => {
+                            AlterTableActionMutation::OwnerTo {
+                                new_owner: new_owner.clone(),
+                            }
                         }
                     };
                     mutations.push(Mutation::AlterTable(AlterTable {
@@ -1041,6 +1050,17 @@ impl Resolver {
                     id,
                     if_exists: d.if_exists,
                 }));
+            }
+            StatementFact::SetRole {
+                role,
+                local,
+                is_session_auth,
+            } => {
+                mutations.push(Mutation::SwitchRole {
+                    role: role.clone(),
+                    local: *local,
+                    is_session_auth: *is_session_auth,
+                });
             }
         }
         mutations

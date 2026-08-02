@@ -7,6 +7,8 @@ DROP SCHEMA IF EXISTS sm_billing CASCADE;
 DROP SCHEMA IF EXISTS sm_catalog CASCADE;
 DROP SCHEMA IF EXISTS sm_core CASCADE;
 DROP SCHEMA IF EXISTS sm_identity CASCADE;
+DROP SCHEMA IF EXISTS sm_role_quote CASCADE;
+DROP SCHEMA IF EXISTS app_user CASCADE;
 DROP FUNCTION IF EXISTS public.g() CASCADE;
 DROP FUNCTION IF EXISTS public.f() CASCADE;
 DROP TABLE IF EXISTS public.new_table CASCADE;
@@ -31,6 +33,13 @@ BEGIN
     END IF;
 END
 $baseline_role$;
+DO $quoted_baseline_role$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'owner''s_role') THEN
+        CREATE ROLE "owner's_role";
+    END IF;
+END
+$quoted_baseline_role$;
 
 CREATE SCHEMA sm_identity;
 CREATE SCHEMA sm_core;
@@ -39,6 +48,8 @@ CREATE SCHEMA sm_billing;
 CREATE SCHEMA sm_fulfillment;
 CREATE SCHEMA sm_audit;
 CREATE SCHEMA sm_analytics;
+CREATE SCHEMA app_user AUTHORIZATION app_user;
+CREATE SCHEMA sm_role_quote AUTHORIZATION "owner's_role";
 
 CREATE TYPE sm_identity.user_state AS ENUM ('invited', 'active', 'suspended', 'deleted');
 CREATE TYPE sm_core.environment_kind AS ENUM ('development', 'staging', 'production');

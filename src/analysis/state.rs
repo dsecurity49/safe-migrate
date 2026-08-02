@@ -54,8 +54,33 @@ pub struct LocalState {
     pub graph: DependencyGraph,
     pub search_path: Vec<String>,
     pub default_search_path: Vec<String>,
+    pub search_path_template: Vec<String>,
+    pub default_search_path_template: Vec<String>,
+    /// Role currently active for this session context (updated by SET ROLE /
+    /// SET SESSION AUTHORIZATION). Begins equal to `session_role`.
     pub current_role: String,
+    /// Whether `current_role` is statically known. False when no V4 cache was
+    /// loaded and no SET ROLE statement has been processed yet.
     pub current_role_known: bool,
+    /// Effective role setting that survives transaction commit. A LOCAL role
+    /// change updates `current_role` without changing this value.
+    pub persistent_current_role: String,
+    pub persistent_current_role_known: bool,
+    /// The session-level role as captured from the cache's `source_role`. This
+    /// is the value `SET ROLE NONE` / `SET SESSION AUTHORIZATION DEFAULT`
+    /// reverts to.
+    pub session_role: String,
+    /// Whether `session_role` is statically known (mirrors `current_role_known`
+    /// at baseline; a SET SESSION AUTHORIZATION updates this too).
+    pub session_role_known: bool,
+    /// Session authorization that survives transaction commit.
+    pub persistent_session_role: String,
+    pub persistent_session_role_known: bool,
+    /// Login identity restored by `SET SESSION AUTHORIZATION DEFAULT`.
+    pub authenticated_role: String,
+    pub authenticated_role_known: bool,
+    /// Whether the cache contains a complete PostgreSQL role catalog.
+    pub roles_known: bool,
     pub confidence: Confidence,
     pub transactions: Vec<TransactionFrame>,
     pub transaction_aborted: bool,
@@ -107,12 +132,34 @@ impl AnalysisState {
 
     pub fn with_baseline(cache: DbCache, baseline_available: bool) -> Self {
         let default_search_path = cache.search_path.clone();
+        let default_search_path_template = if cache.metadata.schemas.is_none() {
+            cache
+                .metadata
+                .source_search_path
+                .clone()
+                .unwrap_or_else(|| default_search_path.clone())
+        } else {
+            default_search_path.clone()
+        };
         let current_role_known = cache.metadata.source_role.is_some();
         let current_role = cache
             .metadata
             .source_role
             .clone()
             .unwrap_or_else(|| "postgres".to_string());
+        let session_role_known = cache.metadata.source_session_role.is_some();
+        let session_role = cache
+            .metadata
+            .source_session_role
+            .clone()
+            .unwrap_or_else(|| current_role.clone());
+        let authenticated_role = session_role.clone();
+        let authenticated_role_known = session_role_known;
+        let persistent_current_role = current_role.clone();
+        let persistent_current_role_known = current_role_known;
+        let persistent_session_role = session_role.clone();
+        let persistent_session_role_known = session_role_known;
+        let roles_known = cache.metadata.source_session_role.is_some();
         let baseline_schemas = cache
             .metadata
             .schemas
@@ -264,14 +311,29 @@ impl AnalysisState {
                 sequences: HashMap::new(),
                 publications: HashMap::new(),
                 subscriptions: HashMap::new(),
-                roles: HashMap::new(),
+                roles: cache
+                    .roles
+                    .into_iter()
+                    .map(|(id, role)| (id, crate::model::role::RoleOverlay::Present(role)))
+                    .collect(),
                 triggers,
                 constraints,
                 graph,
                 search_path: default_search_path.clone(),
                 default_search_path,
+                search_path_template: default_search_path_template.clone(),
+                default_search_path_template,
                 current_role,
                 current_role_known,
+                persistent_current_role,
+                persistent_current_role_known,
+                session_role,
+                session_role_known,
+                persistent_session_role,
+                persistent_session_role_known,
+                authenticated_role,
+                authenticated_role_known,
+                roles_known,
                 confidence: Confidence::Exact,
                 transactions: Vec::new(),
                 transaction_aborted: false,
@@ -630,15 +692,116 @@ impl AnalysisState {
     fn resolve_role_name(
         role: &crate::analysis::facts::RoleFact,
         current_role: &str,
+        session_role: &str,
     ) -> Option<ObjectId> {
         let name = match role {
             crate::analysis::facts::RoleFact::Named { name, .. } => Some(name.clone()),
             crate::analysis::facts::RoleFact::CurrentUser
-            | crate::analysis::facts::RoleFact::CurrentRole
-            | crate::analysis::facts::RoleFact::SessionUser => Some(current_role.to_string()),
+            | crate::analysis::facts::RoleFact::CurrentRole => Some(current_role.to_string()),
+            crate::analysis::facts::RoleFact::SessionUser => Some(session_role.to_string()),
             crate::analysis::facts::RoleFact::Unknown => None,
         }?;
         Some(ObjectId::new("", name))
+    }
+
+    fn role_fact_identity(
+        &self,
+        role: &crate::analysis::facts::RoleFact,
+    ) -> Option<(String, bool)> {
+        match role {
+            crate::analysis::facts::RoleFact::Named { name, .. } => Some((name.clone(), true)),
+            crate::analysis::facts::RoleFact::CurrentUser
+            | crate::analysis::facts::RoleFact::CurrentRole => Some((
+                self.local.current_role.clone(),
+                self.local.current_role_known,
+            )),
+            crate::analysis::facts::RoleFact::SessionUser => Some((
+                self.local.session_role.clone(),
+                self.local.session_role_known,
+            )),
+            crate::analysis::facts::RoleFact::Unknown => None,
+        }
+    }
+
+    fn present_role(&self, name: &str) -> Option<&crate::model::role::RoleState> {
+        match self.local.roles.get(&ObjectId::new("", name)) {
+            Some(crate::model::role::RoleOverlay::Present(role)) => Some(role),
+            _ => None,
+        }
+    }
+
+    fn can_set_role_to(&self, target: &str) -> Option<bool> {
+        if !self.local.roles_known || !self.local.session_role_known {
+            return None;
+        }
+        if self.present_role(target).is_none() {
+            return Some(false);
+        }
+        if self.local.session_role == target {
+            return Some(true);
+        }
+        let session = self.present_role(&self.local.session_role)?;
+        if session.is_superuser {
+            return Some(true);
+        }
+
+        let mut pending = session.can_set_role_to.clone();
+        let mut visited = HashSet::new();
+        while let Some(role_id) = pending.pop() {
+            if !visited.insert(role_id.clone()) {
+                continue;
+            }
+            if role_id.name == target {
+                return Some(true);
+            }
+            if let Some(role) = self.present_role(&role_id.name) {
+                pending.extend(role.can_set_role_to.iter().cloned());
+            }
+        }
+        Some(false)
+    }
+
+    fn can_set_session_authorization_to(&self, target: &str) -> Option<bool> {
+        if !self.local.roles_known || !self.local.authenticated_role_known {
+            return None;
+        }
+        if self.present_role(target).is_none() {
+            return Some(false);
+        }
+        if self.local.authenticated_role == target {
+            return Some(true);
+        }
+        Some(
+            self.present_role(&self.local.authenticated_role)
+                .is_some_and(|role| role.is_superuser),
+        )
+    }
+
+    fn refresh_role_sensitive_search_path(&mut self) {
+        self.local.search_path = self
+            .local
+            .search_path_template
+            .iter()
+            .filter_map(|schema| {
+                if schema != "$user" {
+                    return Some(schema.clone());
+                }
+                if self.local.current_role_known {
+                    Some(self.local.current_role.clone())
+                } else {
+                    self.local.confidence = Confidence::Tainted;
+                    None
+                }
+            })
+            .collect();
+    }
+
+    fn restore_persistent_role_context(&mut self) {
+        self.local.current_role = self.local.persistent_current_role.clone();
+        self.local.current_role_known = self.local.persistent_current_role_known;
+        self.local.session_role = self.local.persistent_session_role.clone();
+        self.local.session_role_known = self.local.persistent_session_role_known;
+        self.refresh_role_sensitive_search_path();
     }
 
     fn apply_grant_to_relation(
@@ -650,7 +813,11 @@ impl AnalysisState {
         self.snapshot_relation(id);
         if let Some(RelationOverlay::Present(rel)) = self.local.relations.get_mut(id) {
             for grantee in grantees {
-                if let Some(role_id) = Self::resolve_role_name(grantee, &self.local.current_role) {
+                if let Some(role_id) = Self::resolve_role_name(
+                    grantee,
+                    &self.local.current_role,
+                    &self.local.session_role,
+                ) {
                     rel.privileges.grant(role_id, privileges.clone());
                 }
             }
@@ -666,7 +833,11 @@ impl AnalysisState {
         self.snapshot_relation(id);
         if let Some(RelationOverlay::Present(rel)) = self.local.relations.get_mut(id) {
             for revokee in revokees {
-                if let Some(role_id) = Self::resolve_role_name(revokee, &self.local.current_role) {
+                if let Some(role_id) = Self::resolve_role_name(
+                    revokee,
+                    &self.local.current_role,
+                    &self.local.session_role,
+                ) {
                     rel.privileges.revoke(&role_id, privileges);
                 }
             }
@@ -1001,7 +1172,7 @@ impl AnalysisState {
 
                 let mut rel_state = RelationState::new(
                     create.id.clone(),
-                    ObjectId::new("public", &self.local.current_role),
+                    ObjectId::new("", &self.local.current_role),
                     generation,
                     if create.as_select { None } else { Some(0) },
                     RelationKind::Table,
@@ -1187,7 +1358,7 @@ impl AnalysisState {
                     create_view.id.clone(),
                     RelationOverlay::Present(RelationState::new(
                         create_view.id.clone(),
-                        ObjectId::new("public", &self.local.current_role),
+                        ObjectId::new("", &self.local.current_role),
                         generation,
                         None,
                         RelationKind::View,
@@ -1223,7 +1394,7 @@ impl AnalysisState {
                     create_mv.id.clone(),
                     RelationOverlay::Present(RelationState::new(
                         create_mv.id.clone(),
-                        ObjectId::new("public", &self.local.current_role),
+                        ObjectId::new("", &self.local.current_role),
                         generation,
                         None,
                         RelationKind::MaterializedView,
@@ -1397,6 +1568,28 @@ impl AnalysisState {
                 MutationResult::Applied
             }
             Mutation::AlterTable(alter) => {
+                if let AlterTableActionMutation::OwnerTo { new_owner } = &alter.action {
+                    let Some((owner, known)) = self.role_fact_identity(new_owner) else {
+                        self.snapshot_confidence();
+                        self.local.confidence = Confidence::Tainted;
+                        return MutationResult::Skipped;
+                    };
+                    if !known {
+                        self.snapshot_confidence();
+                        self.local.confidence = Confidence::Tainted;
+                    }
+                    self.snapshot_relation(&alter.id);
+                    return match self.local.relations.get_mut(&alter.id) {
+                        Some(RelationOverlay::Present(relation)) => {
+                            relation.owner = ObjectId::new("", owner);
+                            MutationResult::Applied
+                        }
+                        _ => MutationResult::Conflict {
+                            reason: format!("relation '{}' does not exist", alter.id),
+                        },
+                    };
+                }
+
                 let trigger_mode = match &alter.action {
                     AlterTableActionMutation::DisableTrigger { trigger_name } => Some((
                         trigger_name.as_deref(),
@@ -2087,29 +2280,129 @@ impl AnalysisState {
                 });
                 MutationResult::Applied
             }
-            Mutation::SearchPath(sp) => {
-                self.snapshot_search_path();
-                match &sp.target {
-                    SearchPathTarget::Default => {
-                        self.local.search_path = self.local.default_search_path.clone();
-                    }
-                    SearchPathTarget::Schemas(schemas) => {
-                        self.local.search_path = schemas
-                            .iter()
-                            .filter_map(|schema| {
-                                if schema != "$user" {
-                                    return Some(schema.clone());
-                                }
-                                if self.local.current_role_known {
-                                    Some(self.local.current_role.clone())
-                                } else {
-                                    self.local.confidence = Confidence::Tainted;
-                                    None
-                                }
-                            })
-                            .collect();
+            Mutation::ChangeRelationOwner { id, new_owner } => {
+                let Some((owner, known)) = self.role_fact_identity(new_owner) else {
+                    self.snapshot_confidence();
+                    self.local.confidence = Confidence::Tainted;
+                    return MutationResult::Skipped;
+                };
+                if !known {
+                    self.snapshot_confidence();
+                    self.local.confidence = Confidence::Tainted;
+                }
+                self.snapshot_relation(id);
+                if let Some(RelationOverlay::Present(relation)) = self.local.relations.get_mut(id) {
+                    relation.owner = ObjectId::new("", owner);
+                    MutationResult::Applied
+                } else {
+                    MutationResult::Conflict {
+                        reason: format!("relation '{}' does not exist", id),
                     }
                 }
+            }
+            Mutation::SearchPath(sp) => {
+                self.snapshot_search_path();
+                self.snapshot_confidence();
+                match &sp.target {
+                    SearchPathTarget::Default => {
+                        self.local.search_path_template =
+                            self.local.default_search_path_template.clone();
+                        self.refresh_role_sensitive_search_path();
+                    }
+                    SearchPathTarget::Schemas(schemas) => {
+                        self.local.search_path_template = schemas.clone();
+                        self.refresh_role_sensitive_search_path();
+                    }
+                }
+                MutationResult::Applied
+            }
+            Mutation::SwitchRole {
+                role,
+                local,
+                is_session_auth,
+            } => {
+                if *local && self.local.transactions.is_empty() {
+                    // PostgreSQL warns and leaves the setting unchanged.
+                    return MutationResult::Skipped;
+                }
+
+                let target = if let Some(role) = role {
+                    let Some(identity) = self.role_fact_identity(role) else {
+                        self.snapshot_confidence();
+                        self.local.confidence = Confidence::Tainted;
+                        return MutationResult::Skipped;
+                    };
+                    Some(identity)
+                } else if *is_session_auth {
+                    Some((
+                        self.local.authenticated_role.clone(),
+                        self.local.authenticated_role_known,
+                    ))
+                } else {
+                    Some((
+                        self.local.session_role.clone(),
+                        self.local.session_role_known,
+                    ))
+                };
+                let (target_name, target_known) = target.expect("role reset always has a target");
+                let persistent_role_reset_target = if role.is_none() && !*is_session_auth {
+                    Some((
+                        self.local.persistent_session_role.clone(),
+                        self.local.persistent_session_role_known,
+                    ))
+                } else {
+                    None
+                };
+
+                let authorized = if role.is_none() {
+                    Some(true)
+                } else if *is_session_auth {
+                    self.can_set_session_authorization_to(&target_name)
+                } else {
+                    self.can_set_role_to(&target_name)
+                };
+                match authorized {
+                    Some(false) => {
+                        return MutationResult::Conflict {
+                            reason: if self.present_role(&target_name).is_none() {
+                                format!("role '{}' does not exist", target_name)
+                            } else {
+                                format!("permission denied to set role '{}'", target_name)
+                            },
+                        };
+                    }
+                    None => {
+                        self.snapshot_confidence();
+                        self.local.confidence = Confidence::Tainted;
+                    }
+                    Some(true) => {}
+                }
+
+                self.snapshot_role_context();
+                self.snapshot_search_path();
+                self.snapshot_confidence();
+                if *is_session_auth {
+                    self.local.session_role = target_name.clone();
+                    self.local.session_role_known = target_known;
+                    self.local.current_role = target_name.clone();
+                    self.local.current_role_known = target_known;
+                    if !local {
+                        self.local.persistent_session_role = target_name.clone();
+                        self.local.persistent_session_role_known = target_known;
+                        self.local.persistent_current_role = target_name;
+                        self.local.persistent_current_role_known = target_known;
+                    }
+                } else {
+                    self.local.current_role = target_name.clone();
+                    self.local.current_role_known = target_known;
+                    if !local {
+                        let (persistent_name, persistent_known) =
+                            persistent_role_reset_target.unwrap_or((target_name, target_known));
+                        self.local.persistent_current_role = persistent_name;
+                        self.local.persistent_current_role_known = persistent_known;
+                    }
+                }
+                self.refresh_role_sensitive_search_path();
                 MutationResult::Applied
             }
             Mutation::BeginTransaction => {
@@ -2129,6 +2422,7 @@ impl AnalysisState {
                     }
                 } else {
                     while self.local.transactions.pop().is_some() {}
+                    self.restore_persistent_role_context();
                 }
                 self.local.transaction_aborted = false;
                 MutationResult::Applied
@@ -2147,6 +2441,7 @@ impl AnalysisState {
                     }
                 } else {
                     while self.local.transactions.pop().is_some() {}
+                    self.restore_persistent_role_context();
                 }
                 self.local.transaction_aborted = false;
                 self.local.transactions.push(TransactionFrame::root());
@@ -2698,13 +2993,18 @@ impl AnalysisState {
                         can_login: true,
                         is_superuser: false,
                         member_of: Vec::new(),
+                        can_set_role_to: Vec::new(),
                         granted_privileges: Vec::new(),
                     }),
                 );
                 MutationResult::Applied
             }
             Mutation::AlterRole(r) => {
-                if let Some(role_id) = Self::resolve_role_name(&r.name, &self.local.current_role) {
+                if let Some(role_id) = Self::resolve_role_name(
+                    &r.name,
+                    &self.local.current_role,
+                    &self.local.session_role,
+                ) {
                     self.snapshot_role(&role_id);
                     if !self.local.roles.contains_key(&role_id) {
                         self.local.confidence = Confidence::Tainted;
@@ -2732,6 +3032,7 @@ impl AnalysisState {
                             via_legacy_group_syntax: false,
                         },
                         &self.local.current_role,
+                        &self.local.session_role,
                     ) {
                         self.snapshot_role(&role_id);
                         if !r.if_exists
@@ -2920,11 +3221,17 @@ impl AnalysisState {
         }
     }
 
-    #[allow(dead_code)]
-    fn snapshot_current_role(&mut self) {
+    fn snapshot_role_context(&mut self) {
         if let Some(frame) = self.local.transactions.last_mut() {
-            frame.undo_log.push(StateChange::CurrentRoleSnapshot {
-                previous: self.local.current_role.clone(),
+            frame.undo_log.push(StateChange::RoleContextSnapshot {
+                current_role: self.local.current_role.clone(),
+                current_role_known: self.local.current_role_known,
+                persistent_current_role: self.local.persistent_current_role.clone(),
+                persistent_current_role_known: self.local.persistent_current_role_known,
+                session_role: self.local.session_role.clone(),
+                session_role_known: self.local.session_role_known,
+                persistent_session_role: self.local.persistent_session_role.clone(),
+                persistent_session_role_known: self.local.persistent_session_role_known,
             });
         }
     }
@@ -2933,6 +3240,7 @@ impl AnalysisState {
         if let Some(frame) = self.local.transactions.last_mut() {
             frame.undo_log.push(StateChange::SearchPathSnapshot {
                 previous: self.local.search_path.clone(),
+                previous_template: self.local.search_path_template.clone(),
             });
         }
     }
@@ -3059,11 +3367,31 @@ impl AnalysisState {
                 StateChange::GraphSnapshot { previous } => {
                     self.local.graph.edges = previous;
                 }
-                StateChange::CurrentRoleSnapshot { previous } => {
-                    self.local.current_role = previous;
+                StateChange::RoleContextSnapshot {
+                    current_role,
+                    current_role_known,
+                    persistent_current_role,
+                    persistent_current_role_known,
+                    session_role,
+                    session_role_known,
+                    persistent_session_role,
+                    persistent_session_role_known,
+                } => {
+                    self.local.current_role = current_role;
+                    self.local.current_role_known = current_role_known;
+                    self.local.persistent_current_role = persistent_current_role;
+                    self.local.persistent_current_role_known = persistent_current_role_known;
+                    self.local.session_role = session_role;
+                    self.local.session_role_known = session_role_known;
+                    self.local.persistent_session_role = persistent_session_role;
+                    self.local.persistent_session_role_known = persistent_session_role_known;
                 }
-                StateChange::SearchPathSnapshot { previous } => {
+                StateChange::SearchPathSnapshot {
+                    previous,
+                    previous_template,
+                } => {
                     self.local.search_path = previous;
+                    self.local.search_path_template = previous_template;
                 }
                 StateChange::GenerationCounterSnapshot { previous } => {
                     self.local.generation_counter = previous;

@@ -79,6 +79,12 @@ fn run_auto_sync_case(database_url: &str, expected_role: &str, mode: &str) {
         panic!("auto-sync must encode the V4 cache variant");
     };
     assert_eq!(cache.metadata.source_role.as_deref(), Some(expected_role));
+    assert_eq!(
+        cache.metadata.source_session_role.as_deref(),
+        Some(expected_role)
+    );
+    assert!(cache.metadata.source_search_path.is_some());
+    assert!(!cache.roles.is_empty());
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("Automatic cache sync enabled"));
