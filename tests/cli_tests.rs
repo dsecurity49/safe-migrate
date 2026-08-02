@@ -277,6 +277,7 @@ fn test_cache_inspect_outputs_a_redacted_json_summary() {
     assert_eq!(report["encrypted"], false);
     assert!(report["contents"]["relations"].is_number());
     assert!(report["contents"]["columns"].is_number());
+    assert!(report["contents"]["roles"].is_number());
     assert!(report.get("relation_names").is_none());
     assert!(report.get("database_url").is_none());
 }

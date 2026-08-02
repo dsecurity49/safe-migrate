@@ -2220,6 +2220,80 @@ mod state_mutation_tests {
         );
         assert_eq!(state.local.current_role, "login_role");
     }
+
+    #[test]
+    fn set_role_follows_transitive_set_option_edges() {
+        let engine = setup_engine();
+        let mut cache = DbCache::new();
+        cache.metadata.source_role = Some("member".into());
+        cache.metadata.source_session_role = Some("member".into());
+        for (name, can_set_role_to) in [
+            ("member", vec![object_id("", "bridge")]),
+            ("bridge", vec![object_id("", "target")]),
+            ("target", Vec::new()),
+        ] {
+            let id = object_id("", name);
+            cache.roles.insert(
+                id.clone(),
+                RoleState {
+                    id,
+                    can_login: name == "member",
+                    is_superuser: false,
+                    member_of: can_set_role_to.clone(),
+                    can_set_role_to,
+                    granted_privileges: Vec::new(),
+                },
+            );
+        }
+        let mut state = safe_migrate::AnalysisState::new(cache);
+
+        let violations = engine
+            .analyze(
+                "SET ROLE target; CREATE TABLE transitively_owned(id integer);",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(!violations.iter().any(|v| v.rule_id == "chain-conflict"));
+        let RelationOverlay::Present(relation) = state
+            .get_relation(&object_id("public", "transitively_owned"))
+            .unwrap()
+        else {
+            panic!("table missing");
+        };
+        assert_eq!(relation.owner, object_id("", "target"));
+    }
+
+    #[test]
+    fn membership_without_set_option_does_not_authorize_set_role() {
+        let engine = setup_engine();
+        let mut cache = DbCache::new();
+        cache.metadata.source_role = Some("member".into());
+        cache.metadata.source_session_role = Some("member".into());
+        for (name, member_of) in [
+            ("member", vec![object_id("", "target")]),
+            ("target", Vec::new()),
+        ] {
+            let id = object_id("", name);
+            cache.roles.insert(
+                id.clone(),
+                RoleState {
+                    id,
+                    can_login: name == "member",
+                    is_superuser: false,
+                    member_of,
+                    can_set_role_to: Vec::new(),
+                    granted_privileges: Vec::new(),
+                },
+            );
+        }
+        let mut state = safe_migrate::AnalysisState::new(cache);
+
+        let violations = engine.analyze("SET ROLE target;", &mut state).unwrap();
+
+        assert!(violations.iter().any(|v| v.rule_id == "chain-conflict"));
+        assert_eq!(state.local.current_role, "member");
+    }
 }
 
 // ─────────────────────────────────────────────

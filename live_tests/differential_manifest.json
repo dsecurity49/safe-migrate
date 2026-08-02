@@ -1721,7 +1721,8 @@
         "safe_012_role_search_path_and_owner.sql",
         "safe_013_quoted_session_authorization.sql",
         "safe_014_session_authorization_rollback.sql",
-        "safe_015_session_authorization_default.sql"
+        "safe_015_session_authorization_default.sql",
+        "safe_016_transitive_set_role_membership.sql"
       ],
       "fixture_transactional": {
         "safe_010_role_transaction_semantics.sql": false,
@@ -1729,7 +1730,8 @@
         "safe_012_role_search_path_and_owner.sql": false,
         "safe_013_quoted_session_authorization.sql": false,
         "safe_014_session_authorization_rollback.sql": false,
-        "safe_015_session_authorization_default.sql": false
+        "safe_015_session_authorization_default.sql": false,
+        "safe_016_transitive_set_role_membership.sql": false
       },
       "expected_live_errors": {
         "011_missing_fk_source_column.sql": {
@@ -1874,6 +1876,9 @@
           "relations"
         ],
         "safe_015_session_authorization_default.sql": [
+          "relations"
+        ],
+        "safe_016_transitive_set_role_membership.sql": [
           "relations"
         ]
       },

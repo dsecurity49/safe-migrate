@@ -40,6 +40,32 @@ BEGIN
     END IF;
 END
 $quoted_baseline_role$;
+DO $membership_roles$
+DECLARE
+    role_name text;
+BEGIN
+    FOREACH role_name IN ARRAY ARRAY[
+        'sm_set_member',
+        'sm_set_bridge',
+        'sm_set_target',
+        'sm_no_set_target'
+    ] LOOP
+        IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = role_name) THEN
+            EXECUTE format('CREATE ROLE %I NOLOGIN', role_name);
+        END IF;
+    END LOOP;
+END
+$membership_roles$;
+
+GRANT sm_set_target TO sm_set_bridge;
+GRANT sm_set_bridge TO sm_set_member;
+DO $set_option_membership$
+BEGIN
+    IF current_setting('server_version_num')::integer >= 160000 THEN
+        EXECUTE 'GRANT sm_no_set_target TO sm_set_member WITH SET FALSE';
+    END IF;
+END
+$set_option_membership$;
 
 CREATE SCHEMA sm_identity;
 CREATE SCHEMA sm_core;
@@ -50,6 +76,7 @@ CREATE SCHEMA sm_audit;
 CREATE SCHEMA sm_analytics;
 CREATE SCHEMA app_user AUTHORIZATION app_user;
 CREATE SCHEMA sm_role_quote AUTHORIZATION "owner's_role";
+GRANT CREATE ON SCHEMA sm_core TO sm_set_target;
 
 CREATE TYPE sm_identity.user_state AS ENUM ('invited', 'active', 'suspended', 'deleted');
 CREATE TYPE sm_core.environment_kind AS ENUM ('development', 'staging', 'production');

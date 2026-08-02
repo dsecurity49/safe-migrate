@@ -1,8 +1,7 @@
 # CLI and Report Contract
 
-This document defines the user-visible behavior safe-migrate intends to
-stabilize for v0.4.4. A requirement is not complete until an automated test
-enforces it.
+This document defines the user-visible behavior of safe-migrate v0.4.4. A
+requirement is not complete until an automated test enforces it.
 
 ## Commands
 
@@ -21,9 +20,10 @@ enforces it.
 `--no-cache`. When `auto_sync = true` is set in configuration, they may refresh
 the cache before analysis. `--no-cache` always bypasses automatic sync.
 
-`cache inspect` never lists object, column, role, or dependency names. Its
-source database, schema scope, versions, and counts still describe sensitive
-infrastructure and must not be published automatically.
+`cache inspect` never lists object, column, role, membership, or dependency
+names and edges. Its source database, schema scope, versions, and redacted
+counts—including the role count—still describe sensitive infrastructure and
+must not be published automatically.
 
 ## Output channels
 
@@ -116,7 +116,7 @@ The report verdict is derived from findings:
   finding.
 - `SAFE`: no higher verdict applies.
 
-The v0.4.3 exit-status contract is:
+The exit-status contract is:
 
 - `0`: analysis completed without a Tier 1 finding;
 - `1`: invocation, configuration, I/O, cache, parser, or internal failure;

@@ -14,11 +14,17 @@ It does contain sensitive metadata: schema, relation, column, constraint,
 index, trigger, function, type, role-grant, dependency, and statistics data.
 Treat the file like a schema inventory, not a safe-to-share build artifact.
 
-New cache files store provenance:
+V4 cache files store provenance and role context:
 
 - creation time as Unix seconds;
 - source database name;
+- effective and session role names;
+- the unexpanded search-path setting, including `$user`;
 - requested schema list, when filtering was used.
+
+They also store the non-secret `pg_roles` catalog fields needed by analysis and
+separate ordinary membership from permission to use `SET ROLE`. On PostgreSQL
+16 and newer, that distinction comes from `pg_auth_members.set_option`.
 
 Older compatible caches without this provenance remain readable but are stale.
 Freshness is calculated from recorded provenance, never filesystem modification
@@ -38,10 +44,11 @@ and automatic synchronization.
 ## Inspection and redaction
 
 `safe-migrate cache inspect --cache <path>` reads a cache locally and prints
-format/provenance plus counts. `--json` makes that summary scriptable. It never
-prints object, column, role, or dependency names and never reads `DATABASE_URL`.
-It can inspect an encrypted cache only when encryption is configured and the
-environment key is available; neither the key nor credentials are emitted.
+format/provenance plus redacted object and role counts. `--json` makes that
+summary scriptable. It never prints object, column, role, membership, or
+dependency names and edges, and never reads `DATABASE_URL`. It can inspect an
+encrypted cache only when encryption is configured and the environment key is
+available; neither the key nor credentials are emitted.
 
 There is intentionally no in-place cache redactor. Removing names or edges
 from a serialized baseline can make later analysis misleading. To produce a
@@ -51,18 +58,21 @@ your normal artifact-retention procedure. For encrypted cache-key rotation,
 write a fresh cache with a new `SAFE_MIGRATE_CACHE_KEY`, update the secret
 store, then remove the old cache and key according to local policy.
 
-Keep caches out of Git and logs. Use owner-only filesystem permissions where
-available, short CI artifact retention, and access controls appropriate for a
-schema/dependency snapshot.
+Keep real database caches out of Git and logs. The tracked
+`live_tests/.safe-migrate.cache` is a deliberate exception containing only
+synthetic fixture data, and Cargo excludes it from published crate packages.
+Use owner-only filesystem permissions where available, short CI artifact
+retention, and access controls appropriate for a schema/dependency snapshot.
 
 ## Least-privilege sync role
 
 `sync` only issues read-only `SHOW`, `SELECT`, and catalog/view-function calls.
-It queries server/version, effective/session role, and search-path values plus `pg_class`,
-`pg_namespace`, `pg_attribute`, `pg_attrdef`, `pg_constraint`, `pg_depend`,
-`pg_index`, `pg_proc`, `pg_type`, `pg_trigger`, `pg_policy`, `pg_rewrite`,
-`pg_roles`, `pg_auth_members`, `pg_stats`, and `pg_stat_user_tables`. `pg_roles`
-is used instead of `pg_authid`, so password hashes are never cached.
+It queries server/version, effective/session role, and search-path values plus
+`pg_class`, `pg_namespace`, `pg_attribute`, `pg_attrdef`, `pg_constraint`,
+`pg_depend`, `pg_index`, `pg_proc`, `pg_type`, `pg_trigger`, `pg_policy`,
+`pg_rewrite`, `pg_roles`, `pg_auth_members`, `pg_stats`, and
+`pg_stat_user_tables`. `pg_roles` is used instead of `pg_authid`, so password
+hashes are never cached.
 
 Start with a dedicated `LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION`
 role, `CONNECT` on the target database, and `USAGE` only on schemas included in

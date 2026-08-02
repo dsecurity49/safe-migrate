@@ -181,6 +181,7 @@ struct CacheContentsSummary {
     triggers: usize,
     functions: usize,
     types: usize,
+    roles: usize,
     dependencies: usize,
 }
 
@@ -416,6 +417,7 @@ fn summarize_cache(cache: &DbCache) -> CacheContentsSummary {
         triggers: cache.triggers.len(),
         functions: cache.functions.len(),
         types: cache.types.len(),
+        roles: cache.roles.len(),
         dependencies: cache.dependencies.len(),
     }
 }
@@ -465,7 +467,7 @@ fn print_cache_inspection(inspection: &CacheInspection) {
     );
     let contents = &inspection.contents;
     println!(
-        "Contents (counts only): {} relations ({} tables, {} views, {} materialized views), {} columns, {} indexes, {} foreign keys, {} constraints, {} triggers, {} functions, {} types, {} dependencies",
+        "Contents (counts only): {} relations ({} tables, {} views, {} materialized views), {} columns, {} indexes, {} foreign keys, {} constraints, {} triggers, {} functions, {} types, {} roles, {} dependencies",
         contents.relations,
         contents.tables,
         contents.views,
@@ -477,6 +479,7 @@ fn print_cache_inspection(inspection: &CacheInspection) {
         contents.triggers,
         contents.functions,
         contents.types,
+        contents.roles,
         contents.dependencies,
     );
     println!(

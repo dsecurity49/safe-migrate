@@ -42,10 +42,9 @@ curl -fsSL "https://raw.githubusercontent.com/dsecurity49/safe-migrate/${VERSION
   bash -s -- --version "${VERSION}"
 ```
 
-The installer also supports `--version`, `--target`, `--install-dir`
-(`--bin-dir`), `--force`, `--dry-run`, and `--verbose`. See
-`bash install.sh --help` after downloading it. Archives, checksums, and manual
-downloads are available on the
+Run `bash install.sh --help` after downloading the installer for pinning and
+destination options. Archives, checksums, and manual downloads are available on
+the
 [GitHub Releases page](https://github.com/dsecurity49/safe-migrate/releases).
 
 ## Quick start
@@ -77,12 +76,6 @@ safe-migrate sync
 `lint` and `lint-chain` do not connect to PostgreSQL unless `auto_sync = true`
 is configured.
 
-Migration chains model PostgreSQL's effective role and session authorization.
-`SET ROLE`, `RESET ROLE`, `SET SESSION AUTHORIZATION`, transaction-local role
-changes, `$user` search paths, grants to special role identifiers, and relation
-ownership changes affect subsequent statements in the chain. A synchronized
-role catalog is used to reject nonexistent or unauthorized role switches.
-
 ## Commands
 
 ```text
@@ -92,17 +85,24 @@ safe-migrate sync
 safe-migrate cache inspect
 ```
 
-Common options:
+Useful options:
 
-- `--cache <path>` selects a cache file.
-- `--config <path>` selects a TOML configuration file.
-- `--no-cache` uses conservative defaults without baseline-aware drift claims.
-- `--json` emits one machine-readable JSON document.
-- `--markdown` emits a deterministic review artifact with source locations.
-- `--interactive` opens the terminal UI.
-- `sync --schemas public,auth` limits the synchronized schema scope.
+- `lint` and `lint-chain`: `--cache <path>`, `--config <path>`, `--no-cache`,
+  `--json`, and `--markdown`.
+- `sync`: `--out <path>` selects the cache destination, `--config <path>`
+  selects configuration, and `--schemas public,auth` limits the synchronized
+  schema scope.
+- `cache inspect`: `--cache <path>`, `--config <path>`, and `--json` for a
+  machine-readable summary.
+- `--no-color` disables colored output for every command.
 
 Run `safe-migrate <command> --help` for the complete command reference.
+
+### Chain analysis
+
+`lint-chain` analyzes files in filename order and carries modeled schema,
+transaction, search-path, and role state across statements and files. This can
+catch failures caused by interactions between otherwise valid migrations.
 
 ## Findings and exit status
 
@@ -204,24 +204,22 @@ The key is accepted only through the environment. Encrypted mode rejects
 plaintext caches, and plaintext mode rejects encrypted caches. Changing modes
 requires a fresh `sync`.
 
-Cache files contain schema and role names, role memberships, object metadata,
-dependencies, privileges, and statistics. They do not contain `DATABASE_URL`,
-password hashes, or credentials, but should still be treated as sensitive and
-kept out of public artifacts.
+Cache files contain schema and role names, dependencies, privileges, and
+statistics. They do not contain connection credentials or password hashes, but
+should still be treated as sensitive and kept out of public artifacts.
 
 ### Cache compatibility
 
-v0.4.4 writes the headered V4 cache format. It records effective/session role
-provenance, the unexpanded search-path setting, and role membership needed for
-role-sensitive migration chains. Headered V3 caches remain readable with
-limited role provenance. Older cache formats are unsupported and must be rebuilt:
+When safe-migrate encounters an unsupported cache format, rebuild it from the
+database:
 
 ```bash
 safe-migrate sync
 ```
 
-Use `safe-migrate cache inspect` to view cache provenance and redacted counts
-without connecting to PostgreSQL.
+Use `safe-migrate cache inspect` to view cache provenance and redacted object
+and role counts without connecting to PostgreSQL. It never lists role names or
+membership edges.
 
 ## Rule catalog
 
@@ -256,11 +254,6 @@ The engine evaluates these 26 primary rules:
 | `schema-drift` | References inconsistent with, or outside, the supplied baseline. |
 | `chain-conflict` | Statements that cannot execute against the simulated migration state. |
 
-The `blocking-constraint` rule can emit `blocking-index-constraint`, and
-`require-concurrent-index` can emit `require-concurrent-drop-index`. Rewrite
-analysis can emit `table-rewrite-storage` or `table-rewrite-access-method`.
-These are finding IDs, not independently configurable primary rules.
-
 ## GitHub Actions
 
 The reusable Action creates JSON and Markdown artifacts without connecting to a
@@ -269,7 +262,7 @@ checkout are controlled by that pull request.
 
 ```yaml
 - id: safe_migrate
-  uses: dsecurity49/safe-migrate@v0.4.3
+  uses: dsecurity49/safe-migrate@v0.4.4
   with:
     mode: lint-chain
     path: migrations
@@ -283,8 +276,14 @@ checkout are controlled by that pull request.
 ```
 
 To use database-aware findings, prepare a cache in a trusted workflow step and
-set both `cache: <path>` and `no-cache: "false"`. The Action exposes
-`json-report`, `markdown-report`, `diagnostic-log`, and `exit-code`.
+set both `cache: <path>` and `no-cache: "false"`.
+
+Set `config: safe-migrate.toml` to use a reviewed project configuration. When
+`config` is omitted, the Action uses built-in defaults and deliberately does
+not read `safe-migrate.toml` from the pull-request workspace.
+
+The Action exposes `json-report`, `markdown-report`, `diagnostic-log`, and
+`exit-code`.
 
 ## Documentation
 

@@ -204,6 +204,7 @@ enum MismatchCategory {
     ExtraPartitionEdgeInSimulator,
     MissingViewDependencyInSimulator,
     ExtraViewDependencyInSimulator,
+    RoleMembershipMismatch,
     BaselineObjectAbsent,
     LiveExecutionFailed,
     ExpectedLiveErrorMismatch,
@@ -452,6 +453,7 @@ fn live_postgres_differential_harness() {
             );
 
             mismatches.extend(check_required_relations(rule, fixture, &baseline_cache));
+            mismatches.extend(check_role_membership_cache(rule, fixture, &baseline_cache));
 
             let mut simulator_state = AnalysisState::new(baseline_cache);
             let simulator_violations = match engine.analyze(&sql, &mut simulator_state) {
@@ -1048,6 +1050,60 @@ fn check_required_relations(rule: &RuleManifest, fixture: &str, cache: &DbCache)
         }
     }
     mismatches
+}
+
+fn check_role_membership_cache(
+    rule: &RuleManifest,
+    fixture: &str,
+    cache: &DbCache,
+) -> Vec<Mismatch> {
+    if rule.rule_dir != "rule_26_chain-conflict" {
+        return Vec::new();
+    }
+
+    let role = |name: &str| {
+        cache
+            .roles
+            .get(&safe_migrate::ast::identifiers::ObjectId::new("", name))
+    };
+    let edge = |ids: &[safe_migrate::ast::identifiers::ObjectId], target: &str| {
+        ids.iter()
+            .any(|id| id.schema.is_empty() && id.name == target)
+    };
+    let mut errors = Vec::new();
+
+    match role("sm_set_member") {
+        Some(member) if edge(&member.can_set_role_to, "sm_set_bridge") => {}
+        _ => errors.push("sm_set_member is missing its SET edge to sm_set_bridge"),
+    }
+    match role("sm_set_bridge") {
+        Some(bridge) if edge(&bridge.can_set_role_to, "sm_set_target") => {}
+        _ => errors.push("sm_set_bridge is missing its SET edge to sm_set_target"),
+    }
+
+    if cache
+        .pg_version_num
+        .is_some_and(|version| version >= 160_000)
+    {
+        match role("sm_set_member") {
+            Some(member)
+                if edge(&member.member_of, "sm_no_set_target")
+                    && !edge(&member.can_set_role_to, "sm_no_set_target") => {}
+            _ => errors
+                .push("PostgreSQL 16+ SET FALSE membership was not kept out of can_set_role_to"),
+        }
+    }
+
+    errors
+        .into_iter()
+        .map(|error| Mismatch {
+            rule_dir: rule.rule_dir.clone(),
+            fixture: fixture.to_string(),
+            category: MismatchCategory::RoleMembershipMismatch,
+            root_cause: RootCauseClassification::SimulatorBug,
+            note: error.to_string(),
+        })
+        .collect()
 }
 
 fn classify_live_execution_error(error: &postgres::Error) -> RootCauseClassification {

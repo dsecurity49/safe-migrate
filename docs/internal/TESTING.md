@@ -38,6 +38,18 @@ migrations, requires every accepted case to produce valid JSON with a matching
 exit status, permits only its named parser rejection, and fails on operational
 errors, crashes, or timeouts.
 
+Before tagging a release, verify the exact crate users will install:
+
+```bash
+cargo package --locked --allow-dirty
+cargo install --locked --path target/package/safe-migrate-<version> \
+  --root <temporary-install-root>
+<temporary-install-root>/bin/safe-migrate --version
+```
+
+`--allow-dirty` is appropriate only for testing an uncommitted release-prep
+worktree. The tagged release commit itself must be clean.
+
 ## Fixture suites
 
 `live_tests/run.sh` checks SQL fixtures through the compiled CLI. Run one rule
