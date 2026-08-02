@@ -22,7 +22,7 @@ AGENTS.md
 *.json
 !live_tests/differential_baseline.sql
 !live_tests/differential_manifest.json
-!live_tests/rule_26_chain-conflict/safe_016_transitive_set_role_membership.sql
+!live_tests/**/*.sql
 test_migrations/
 *.opencode/
 .safe-migrate.cache
