@@ -4,13 +4,14 @@ use crate::analysis::graph::{DependencyEdge, DependencyGraph, DependencyKind};
 use crate::analysis::mutations::{
     AlterTableActionMutation, AlterTypeActionMutation, Mutation, PersistenceMutation,
 };
-use crate::analysis::transaction::{StateChange, TransactionFrame};
+use crate::analysis::transaction::{NamespaceSnapshot, StateChange, TransactionFrame};
 use crate::ast::identifiers::ObjectId;
 use crate::db::cache::DbCache;
 use crate::model::constraint::{ConstraintKind, ConstraintState};
 pub use crate::model::relation::RelationOverlay;
 use crate::model::relation::{ColumnAction, Persistence, Privilege, RelationKind, RelationState};
-use crate::model::sequence::{SequenceOverlay, SequenceState};
+use crate::model::schema::SchemaOverlay;
+use crate::model::sequence::{SequenceKind, SequenceOverlay, SequenceState};
 use crate::model::trigger::TriggerOverlay;
 use crate::model::types::{TypeKind, TypeOverlay, TypeState};
 use std::collections::{HashMap, HashSet};
@@ -42,6 +43,7 @@ pub struct CascadeResult {
 
 #[derive(Clone)]
 pub struct LocalState {
+    pub schemas: HashMap<String, SchemaOverlay>,
     pub relations: HashMap<ObjectId, RelationOverlay>,
     pub types: HashMap<ObjectId, TypeOverlay>,
     pub functions: HashMap<ObjectId, crate::model::function::FunctionOverlay>,
@@ -59,7 +61,7 @@ pub struct LocalState {
     /// Role currently active for this session context (updated by SET ROLE /
     /// SET SESSION AUTHORIZATION). Begins equal to `session_role`.
     pub current_role: String,
-    /// Whether `current_role` is statically known. False when no V4 cache was
+    /// Whether `current_role` is statically known. False when no V5 cache was
     /// loaded and no SET ROLE statement has been processed yet.
     pub current_role_known: bool,
     /// Effective role setting that survives transaction commit. A LOCAL role
@@ -115,6 +117,7 @@ pub struct AnalysisState {
     pub baseline_indexes: HashSet<ObjectId>,
     pub baseline_foreign_keys: HashSet<(ObjectId, String)>,
     pub baseline_fk_dependencies: HashSet<ObjectId>,
+    pub baseline_sequences: HashSet<ObjectId>,
     pub local: LocalState,
 }
 
@@ -174,6 +177,66 @@ impl AnalysisState {
         let mut constraints = HashMap::new();
         let mut types = HashMap::new();
         let mut graph = DependencyGraph::new();
+
+        let mut schemas: HashMap<String, SchemaOverlay> = cache
+            .schemas
+            .iter()
+            .map(|(name, schema)| (name.clone(), SchemaOverlay::Present(schema.clone())))
+            .collect();
+        // Effective cached search-path entries and modeled objects are direct
+        // evidence that their namespaces existed at synchronization time.
+        // This also keeps programmatically assembled V5 caches internally
+        // consistent without treating unrelated out-of-scope schemas as
+        // authoritative catalogs.
+        let inferred_schema_owner = ObjectId::new(
+            "",
+            cache.metadata.source_role.as_deref().unwrap_or("postgres"),
+        );
+        for name in cache
+            .relations
+            .keys()
+            .map(|id| &id.schema)
+            .chain(cache.types.keys().map(|id| &id.schema))
+            .chain(cache.functions.keys().map(|id| &id.schema))
+            .chain(cache.sequences.keys().map(|id| &id.schema))
+        {
+            schemas.entry(name.clone()).or_insert_with(|| {
+                SchemaOverlay::Present(crate::model::schema::SchemaState {
+                    name: name.clone(),
+                    owner: inferred_schema_owner.clone(),
+                    generation: 0,
+                })
+            });
+        }
+        if cache.schemas.is_empty() && cache.metadata.schemas.is_none() {
+            for name in &cache.search_path {
+                schemas.entry(name.clone()).or_insert_with(|| {
+                    SchemaOverlay::Present(crate::model::schema::SchemaState {
+                        name: name.clone(),
+                        owner: inferred_schema_owner.clone(),
+                        generation: 0,
+                    })
+                });
+            }
+        }
+
+        let sequences = cache
+            .sequences
+            .iter()
+            .map(|(id, sequence)| (id.clone(), SequenceOverlay::Present(sequence.clone())))
+            .collect();
+        let baseline_sequences = cache.sequences.keys().cloned().collect();
+        for sequence in cache.sequences.values() {
+            if let Some((table, column)) = &sequence.owned_by {
+                graph.edges.push(DependencyEdge::new(
+                    sequence.id.clone(),
+                    table.clone(),
+                    DependencyKind::SequenceOwnedBy {
+                        column: column.clone(),
+                    },
+                ));
+            }
+        }
 
         for (id, rel_state) in cache.baseline_relations() {
             if rel_state.is_fk_dependency {
@@ -296,7 +359,7 @@ impl AnalysisState {
             );
         }
 
-        Self {
+        let mut state = Self {
             pg_version_num: cache.pg_version_num,
             baseline_available,
             baseline_schemas,
@@ -304,11 +367,13 @@ impl AnalysisState {
             baseline_indexes,
             baseline_foreign_keys,
             baseline_fk_dependencies,
+            baseline_sequences,
             local: LocalState {
+                schemas,
                 relations,
                 types,
                 functions,
-                sequences: HashMap::new(),
+                sequences,
                 publications: HashMap::new(),
                 subscriptions: HashMap::new(),
                 roles: cache
@@ -340,7 +405,10 @@ impl AnalysisState {
                 pending_validation: HashSet::new(),
                 generation_counter: 0,
             },
-        }
+        };
+        state.refresh_role_sensitive_search_path();
+        state.local.default_search_path = state.local.search_path.clone();
+        state
     }
 
     pub fn get_relation(&self, id: &ObjectId) -> Option<&RelationOverlay> {
@@ -493,6 +561,40 @@ impl AnalysisState {
             || self.sequence_is_present(id)
             || self.index_is_present(id)
             || self.type_is_present(id)
+    }
+
+    fn next_implicit_sequence_id(
+        &self,
+        table: &ObjectId,
+        column: &str,
+        reserved: &HashSet<ObjectId>,
+    ) -> ObjectId {
+        (0..)
+            .map(|suffix| {
+                let label = if suffix == 0 {
+                    "seq".to_string()
+                } else {
+                    format!("seq{suffix}")
+                };
+                ObjectId::new(
+                    &table.schema,
+                    Self::postgres_object_name(&table.name, Some(column), &label),
+                )
+            })
+            .find(|candidate| {
+                !reserved.contains(candidate) && !self.relation_namespace_is_taken(candidate)
+            })
+            .expect("implicit sequence suffix space is unbounded")
+    }
+
+    fn sequence_nextval_default(id: &ObjectId) -> crate::analysis::expr_ir::ExprIr {
+        crate::analysis::expr_ir::ExprIr::FunctionCall {
+            name: "nextval".to_string(),
+            args: vec![crate::analysis::expr_ir::ExprIr::Literal(format!(
+                "{}.{}",
+                id.schema, id.name
+            ))],
+        }
     }
 
     pub fn column_was_added_in_transaction(&self, table_id: &ObjectId, column: &str) -> bool {
@@ -777,23 +879,229 @@ impl AnalysisState {
         )
     }
 
+    fn schema_is_present(&self, name: &str) -> bool {
+        matches!(
+            self.local.schemas.get(name),
+            Some(SchemaOverlay::Present(_))
+        )
+    }
+
+    fn schema_absence_is_authoritative(&self, name: &str) -> bool {
+        if matches!(self.local.schemas.get(name), Some(SchemaOverlay::Dropped)) {
+            return true;
+        }
+        self.baseline_available
+            && self
+                .baseline_schemas
+                .as_ref()
+                .is_none_or(|schemas| schemas.contains(name))
+    }
+
     fn refresh_role_sensitive_search_path(&mut self) {
-        self.local.search_path = self
-            .local
-            .search_path_template
-            .iter()
-            .filter_map(|schema| {
-                if schema != "$user" {
-                    return Some(schema.clone());
-                }
+        let template = self.local.search_path_template.clone();
+        let mut effective = Vec::new();
+        for entry in template {
+            let schema = if entry == "$user" {
                 if self.local.current_role_known {
-                    Some(self.local.current_role.clone())
+                    self.local.current_role.clone()
                 } else {
                     self.local.confidence = Confidence::Tainted;
-                    None
+                    continue;
                 }
+            } else {
+                entry
+            };
+            if self.schema_is_present(&schema) {
+                if !effective.contains(&schema) {
+                    effective.push(schema);
+                }
+            } else if !self.schema_absence_is_authoritative(&schema) {
+                self.local.confidence = Confidence::Tainted;
+                if !effective.contains(&schema) {
+                    effective.push(schema);
+                }
+            }
+        }
+        self.local.search_path = effective;
+    }
+
+    fn remap_schema_id(id: &mut ObjectId, old_name: &str, new_name: &str) {
+        if id.schema == old_name {
+            id.schema = new_name.to_string();
+        }
+    }
+
+    fn rename_schema_namespace(&mut self, old_name: &str, new_name: &str) {
+        self.snapshot_namespace();
+
+        let mut aliases = Vec::new();
+        let mut relations = HashMap::new();
+        for (mut id, mut overlay) in std::mem::take(&mut self.local.relations) {
+            let old_id = id.clone();
+            Self::remap_schema_id(&mut id, old_name, new_name);
+            if let RelationOverlay::Present(state) = &mut overlay {
+                Self::remap_schema_id(&mut state.id, old_name, new_name);
+            }
+            if id != old_id {
+                aliases.push((old_id, id.clone()));
+            }
+            relations.insert(id, overlay);
+        }
+        self.local.relations = relations;
+
+        let mut types = HashMap::new();
+        for (mut id, mut overlay) in std::mem::take(&mut self.local.types) {
+            let old_id = id.clone();
+            Self::remap_schema_id(&mut id, old_name, new_name);
+            if let TypeOverlay::Present(state) = &mut overlay {
+                Self::remap_schema_id(&mut state.id, old_name, new_name);
+            }
+            if id != old_id {
+                aliases.push((old_id, id.clone()));
+            }
+            types.insert(id, overlay);
+        }
+        self.local.types = types;
+
+        let mut functions = HashMap::new();
+        for (mut id, mut overlay) in std::mem::take(&mut self.local.functions) {
+            let old_id = id.clone();
+            Self::remap_schema_id(&mut id, old_name, new_name);
+            if let crate::model::function::FunctionOverlay::Present(state) = &mut overlay {
+                Self::remap_schema_id(&mut state.id, old_name, new_name);
+            }
+            if id != old_id {
+                aliases.push((old_id, id.clone()));
+            }
+            functions.insert(id, overlay);
+        }
+        self.local.functions = functions;
+
+        let mut sequences = HashMap::new();
+        for (mut id, mut overlay) in std::mem::take(&mut self.local.sequences) {
+            let old_id = id.clone();
+            Self::remap_schema_id(&mut id, old_name, new_name);
+            if let SequenceOverlay::Present(state) = &mut overlay {
+                Self::remap_schema_id(&mut state.id, old_name, new_name);
+                if let Some((table, _)) = &mut state.owned_by {
+                    Self::remap_schema_id(table, old_name, new_name);
+                }
+            }
+            if id != old_id {
+                aliases.push((old_id, id.clone()));
+            }
+            sequences.insert(id, overlay);
+        }
+        self.local.sequences = sequences;
+
+        let mut triggers = HashMap::new();
+        for (mut id, mut overlay) in std::mem::take(&mut self.local.triggers) {
+            let old_id = id.clone();
+            Self::remap_schema_id(&mut id, old_name, new_name);
+            if let TriggerOverlay::Present(state) = &mut overlay {
+                Self::remap_schema_id(&mut state.id, old_name, new_name);
+                Self::remap_schema_id(&mut state.table_id, old_name, new_name);
+            }
+            if id != old_id {
+                aliases.push((old_id, id.clone()));
+            }
+            triggers.insert(id, overlay);
+        }
+        self.local.triggers = triggers;
+
+        for overlay in self.local.publications.values_mut() {
+            let crate::model::replication::PublicationOverlay::Present(publication) = overlay
+            else {
+                continue;
+            };
+            let crate::analysis::facts::PublicationScope::Explicit(objects) =
+                &mut publication.scope
+            else {
+                continue;
+            };
+            for object in objects {
+                match object {
+                    crate::analysis::facts::PublicationObjectFact::Table { name, .. } => {
+                        if name
+                            .schema
+                            .as_ref()
+                            .is_some_and(|schema| schema.resolve() == old_name)
+                        {
+                            name.schema = Some(crate::ast::identifiers::Ident::new(new_name, true));
+                        }
+                    }
+                    crate::analysis::facts::PublicationObjectFact::SchemaTables {
+                        schema, ..
+                    } if schema == old_name => *schema = new_name.to_string(),
+                    _ => {}
+                }
+            }
+        }
+
+        self.local.constraints = std::mem::take(&mut self.local.constraints)
+            .into_iter()
+            .map(|((mut table, name), mut constraint)| {
+                Self::remap_schema_id(&mut table, old_name, new_name);
+                Self::remap_schema_id(&mut constraint.table_id, old_name, new_name);
+                ((table, name), constraint)
             })
             .collect();
+        self.local.pending_validation = std::mem::take(&mut self.local.pending_validation)
+            .into_iter()
+            .map(|(mut table, name)| {
+                Self::remap_schema_id(&mut table, old_name, new_name);
+                (table, name)
+            })
+            .collect();
+
+        for edge in &mut self.local.graph.edges {
+            Self::remap_schema_id(&mut edge.dependent, old_name, new_name);
+            Self::remap_schema_id(&mut edge.referenced, old_name, new_name);
+            if let DependencyKind::TriggerOnTable {
+                trigger_id,
+                function_id,
+            } = &mut edge.kind
+            {
+                Self::remap_schema_id(trigger_id, old_name, new_name);
+                Self::remap_schema_id(function_id, old_name, new_name);
+            }
+        }
+        for (old_id, new_id) in aliases {
+            self.local.graph.edges.push(DependencyEdge::new(
+                old_id,
+                new_id,
+                DependencyKind::RenameTo,
+            ));
+        }
+
+        let remap_set = |set: &mut HashSet<ObjectId>| {
+            *set = std::mem::take(set)
+                .into_iter()
+                .map(|mut id| {
+                    Self::remap_schema_id(&mut id, old_name, new_name);
+                    id
+                })
+                .collect();
+        };
+        remap_set(&mut self.baseline_relations);
+        remap_set(&mut self.baseline_indexes);
+        remap_set(&mut self.baseline_fk_dependencies);
+        remap_set(&mut self.baseline_sequences);
+        self.baseline_foreign_keys = std::mem::take(&mut self.baseline_foreign_keys)
+            .into_iter()
+            .map(|(mut table, name)| {
+                Self::remap_schema_id(&mut table, old_name, new_name);
+                (table, name)
+            })
+            .collect();
+
+        if let Some(SchemaOverlay::Present(mut schema)) = self.local.schemas.remove(old_name) {
+            schema.name = new_name.to_string();
+            self.local
+                .schemas
+                .insert(new_name.to_string(), SchemaOverlay::Present(schema));
+        }
+        self.refresh_role_sensitive_search_path();
     }
 
     fn restore_persistent_role_context(&mut self) {
@@ -876,9 +1184,140 @@ impl AnalysisState {
         precomputed_cascade: Option<&CascadeResult>,
     ) -> MutationResult {
         match mutation {
-            Mutation::CreateSchema(_) => MutationResult::Applied,
+            Mutation::CreateSchema(create_schema) => {
+                if self.schema_is_present(&create_schema.name) {
+                    return if create_schema.if_not_exists {
+                        MutationResult::Skipped
+                    } else {
+                        MutationResult::Conflict {
+                            reason: format!("schema '{}' already exists", create_schema.name),
+                        }
+                    };
+                }
+                let (owner_name, owner_known) = match &create_schema.authorization {
+                    Some(role) => match self.role_fact_identity(role) {
+                        Some(identity) => identity,
+                        None => {
+                            self.snapshot_confidence();
+                            self.local.confidence = Confidence::Tainted;
+                            (self.local.current_role.clone(), false)
+                        }
+                    },
+                    None => (
+                        self.local.current_role.clone(),
+                        self.local.current_role_known,
+                    ),
+                };
+                if owner_known && self.local.roles_known && self.present_role(&owner_name).is_none()
+                {
+                    return MutationResult::Conflict {
+                        reason: format!("role '{}' does not exist", owner_name),
+                    };
+                }
+                if !owner_known || !self.local.roles_known {
+                    self.snapshot_confidence();
+                    self.local.confidence = Confidence::Tainted;
+                }
+                self.snapshot_generation_counter();
+                self.local.generation_counter += 1;
+                let generation = self.local.generation_counter;
+                self.snapshot_schema(&create_schema.name);
+                self.local.schemas.insert(
+                    create_schema.name.clone(),
+                    SchemaOverlay::Present(crate::model::schema::SchemaState {
+                        name: create_schema.name.clone(),
+                        owner: ObjectId::new("", owner_name),
+                        generation,
+                    }),
+                );
+                self.snapshot_search_path();
+                self.refresh_role_sensitive_search_path();
+                MutationResult::Applied
+            }
+            Mutation::AlterSchema(alter_schema) => match alter_schema {
+                crate::analysis::mutations::AlterSchemaMutation::OwnerTo { name, new_owner } => {
+                    if !self.schema_is_present(name) {
+                        if self.schema_absence_is_authoritative(name) {
+                            return MutationResult::Conflict {
+                                reason: format!("schema '{}' does not exist", name),
+                            };
+                        }
+                        self.snapshot_confidence();
+                        self.local.confidence = Confidence::Tainted;
+                        return MutationResult::Skipped;
+                    }
+                    let Some((owner_name, owner_known)) = self.role_fact_identity(new_owner) else {
+                        self.snapshot_confidence();
+                        self.local.confidence = Confidence::Tainted;
+                        return MutationResult::Skipped;
+                    };
+                    if owner_known
+                        && self.local.roles_known
+                        && self.present_role(&owner_name).is_none()
+                    {
+                        return MutationResult::Conflict {
+                            reason: format!("role '{}' does not exist", owner_name),
+                        };
+                    }
+                    if !owner_known || !self.local.roles_known {
+                        self.snapshot_confidence();
+                        self.local.confidence = Confidence::Tainted;
+                    }
+                    self.snapshot_schema(name);
+                    if let Some(SchemaOverlay::Present(schema)) = self.local.schemas.get_mut(name) {
+                        schema.owner = ObjectId::new("", owner_name);
+                    }
+                    MutationResult::Applied
+                }
+                crate::analysis::mutations::AlterSchemaMutation::Rename { old_name, new_name } => {
+                    if !self.schema_is_present(old_name) {
+                        if !self.schema_absence_is_authoritative(old_name) {
+                            self.snapshot_confidence();
+                            self.local.confidence = Confidence::Tainted;
+                            return MutationResult::Skipped;
+                        }
+                        return MutationResult::Conflict {
+                            reason: format!("schema '{}' does not exist", old_name),
+                        };
+                    }
+                    if self.schema_is_present(new_name) {
+                        return MutationResult::Conflict {
+                            reason: format!("schema '{}' already exists", new_name),
+                        };
+                    }
+                    if !self.schema_absence_is_authoritative(new_name) {
+                        self.snapshot_confidence();
+                        self.local.confidence = Confidence::Tainted;
+                    }
+                    self.snapshot_search_path();
+                    self.rename_schema_namespace(old_name, new_name);
+                    MutationResult::Applied
+                }
+            },
             Mutation::DropSchema(drop_schema) => {
+                for name in &drop_schema.names {
+                    if !self.schema_is_present(name) && self.schema_absence_is_authoritative(name) {
+                        if !drop_schema.if_exists {
+                            return MutationResult::Conflict {
+                                reason: format!("schema '{}' does not exist", name),
+                            };
+                        }
+                    } else if !self.schema_is_present(name) {
+                        self.snapshot_confidence();
+                        self.local.confidence = Confidence::Tainted;
+                    }
+                }
+                let present_names: Vec<String> = drop_schema
+                    .names
+                    .iter()
+                    .filter(|name| self.schema_is_present(name))
+                    .cloned()
+                    .collect();
+                if present_names.is_empty() {
+                    return MutationResult::Skipped;
+                }
                 if drop_schema.cascade {
+                    self.snapshot_namespace();
                     let mut relations_to_drop = Vec::new();
                     for id in self.local.relations.keys() {
                         if drop_schema.names.contains(&id.schema) {
@@ -922,6 +1361,60 @@ impl AnalysisState {
                     for id in seqs_to_drop {
                         self.snapshot_sequence(&id);
                         self.local.sequences.insert(id, SequenceOverlay::Dropped);
+                    }
+
+                    let functions_to_drop: Vec<ObjectId> = self
+                        .local
+                        .functions
+                        .keys()
+                        .filter(|id| drop_schema.names.contains(&id.schema))
+                        .cloned()
+                        .collect();
+                    for id in functions_to_drop {
+                        self.snapshot_function(&id);
+                        self.local
+                            .functions
+                            .insert(id, crate::model::function::FunctionOverlay::Dropped);
+                    }
+
+                    let triggers_to_drop: Vec<ObjectId> = self
+                        .local
+                        .triggers
+                        .keys()
+                        .filter(|id| drop_schema.names.contains(&id.schema))
+                        .cloned()
+                        .collect();
+                    for id in triggers_to_drop {
+                        self.snapshot_trigger(&id);
+                        self.local.triggers.insert(id, TriggerOverlay::Dropped);
+                    }
+
+                    self.local
+                        .pending_validation
+                        .retain(|(table, _)| !drop_schema.names.contains(&table.schema));
+                    for overlay in self.local.publications.values_mut() {
+                        let crate::model::replication::PublicationOverlay::Present(publication) =
+                            overlay
+                        else {
+                            continue;
+                        };
+                        let crate::analysis::facts::PublicationScope::Explicit(objects) =
+                            &mut publication.scope
+                        else {
+                            continue;
+                        };
+                        objects.retain(|object| match object {
+                            crate::analysis::facts::PublicationObjectFact::Table {
+                                name, ..
+                            } => name.schema.as_ref().is_none_or(|schema| {
+                                !drop_schema.names.contains(&schema.resolve())
+                            }),
+                            crate::analysis::facts::PublicationObjectFact::SchemaTables {
+                                schema,
+                                ..
+                            } => !drop_schema.names.contains(schema),
+                            _ => true,
+                        });
                     }
 
                     self.snapshot_graph_full();
@@ -968,6 +1461,12 @@ impl AnalysisState {
                         };
                     }
                 }
+                for name in present_names {
+                    self.snapshot_schema(&name);
+                    self.local.schemas.insert(name, SchemaOverlay::Dropped);
+                }
+                self.snapshot_search_path();
+                self.refresh_role_sensitive_search_path();
                 MutationResult::Applied
             }
             Mutation::DropTable(drop_table) => {
@@ -1089,6 +1588,28 @@ impl AnalysisState {
                     });
                 }
 
+                let owned_sequences_to_drop: Vec<ObjectId> = self
+                    .local
+                    .sequences
+                    .iter()
+                    .filter_map(|(id, overlay)| match overlay {
+                        SequenceOverlay::Present(sequence)
+                            if sequence.owned_by.as_ref().is_some_and(|(table, _)| {
+                                dropped_relations.contains(&resolve(table))
+                            }) =>
+                        {
+                            Some(id.clone())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                for sequence_id in owned_sequences_to_drop {
+                    self.snapshot_sequence(&sequence_id);
+                    self.local
+                        .sequences
+                        .insert(sequence_id, SequenceOverlay::Dropped);
+                }
+
                 let constraints_to_drop: Vec<(ObjectId, String)> = self
                     .local
                     .constraints
@@ -1152,6 +1673,32 @@ impl AnalysisState {
                     return MutationResult::Conflict {
                         reason: format!("relation '{}' already exists", create.id),
                     };
+                }
+
+                // PostgreSQL chooses all implicit sequence names before the
+                // table becomes visible. Reserve them up front so a collision
+                // or malformed statement cannot leave partial local state.
+                let mut reserved_sequences = HashSet::new();
+                let mut implicit_sequences = Vec::new();
+                for column in &create.columns {
+                    let kind = match column.generation {
+                        crate::analysis::facts::ColumnGeneration::Serial => {
+                            Some(SequenceKind::SerialLike)
+                        }
+                        crate::analysis::facts::ColumnGeneration::Identity => {
+                            Some(SequenceKind::Identity)
+                        }
+                        crate::analysis::facts::ColumnGeneration::Ordinary => None,
+                    };
+                    if let Some(kind) = kind {
+                        let sequence_id = self.next_implicit_sequence_id(
+                            &create.id,
+                            &column.name,
+                            &reserved_sequences,
+                        );
+                        reserved_sequences.insert(sequence_id.clone());
+                        implicit_sequences.push((sequence_id, column.name.clone(), kind));
+                    }
                 }
 
                 self.snapshot_relation(&create.id);
@@ -1221,9 +1768,48 @@ impl AnalysisState {
                     });
                 }
 
+                for (sequence_id, column_name, _) in &implicit_sequences {
+                    if let Some(column) = rel_state
+                        .columns
+                        .iter_mut()
+                        .find(|column| column.name == *column_name)
+                    {
+                        column.default = Some(Self::sequence_nextval_default(sequence_id));
+                        column.default_expr_text = Some(format!(
+                            "nextval('{}.{}'::regclass)",
+                            sequence_id.schema, sequence_id.name
+                        ));
+                        column.is_nullable = false;
+                    }
+                }
+
                 self.local
                     .relations
                     .insert(create.id.clone(), RelationOverlay::Present(rel_state));
+
+                for (sequence_id, column_name, kind) in implicit_sequences {
+                    self.snapshot_sequence(&sequence_id);
+                    self.snapshot_generation_counter();
+                    self.local.generation_counter += 1;
+                    self.local.sequences.insert(
+                        sequence_id.clone(),
+                        SequenceOverlay::Present(SequenceState {
+                            id: sequence_id.clone(),
+                            owner: ObjectId::new("", &self.local.current_role),
+                            owned_by: Some((create.id.clone(), column_name.clone())),
+                            kind,
+                            generation: self.local.generation_counter,
+                        }),
+                    );
+                    self.snapshot_graph();
+                    self.local.graph.edges.push(DependencyEdge::new(
+                        sequence_id,
+                        create.id.clone(),
+                        DependencyKind::SequenceOwnedBy {
+                            column: column_name,
+                        },
+                    ));
+                }
 
                 let primary_key_name = create
                     .columns
@@ -1670,6 +2256,43 @@ impl AnalysisState {
                     }
                 }
 
+                let implicit_add = match &alter.action {
+                    AlterTableActionMutation::AddColumn {
+                        name, generation, ..
+                    } => match generation {
+                        crate::analysis::facts::ColumnGeneration::Serial => Some((
+                            self.next_implicit_sequence_id(&alter.id, name, &HashSet::new()),
+                            name.clone(),
+                            SequenceKind::SerialLike,
+                        )),
+                        crate::analysis::facts::ColumnGeneration::Identity => Some((
+                            self.next_implicit_sequence_id(&alter.id, name, &HashSet::new()),
+                            name.clone(),
+                            SequenceKind::Identity,
+                        )),
+                        crate::analysis::facts::ColumnGeneration::Ordinary => None,
+                    },
+                    _ => None,
+                };
+                let owned_sequences_for_column: Vec<ObjectId> = match &alter.action {
+                    AlterTableActionMutation::DropColumn { name, .. }
+                    | AlterTableActionMutation::RenameColumn { from: name, .. } => self
+                        .local
+                        .sequences
+                        .iter()
+                        .filter_map(|(id, overlay)| match overlay {
+                            SequenceOverlay::Present(sequence)
+                                if sequence.owned_by.as_ref()
+                                    == Some(&(alter.id.clone(), name.clone())) =>
+                            {
+                                Some(id.clone())
+                            }
+                            _ => None,
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                };
+
                 let using_index = match &alter.action {
                     AlterTableActionMutation::AddUniqueConstraint { using_index, .. }
                     | AlterTableActionMutation::AddPrimaryKeyConstraint { using_index, .. } => {
@@ -1727,6 +2350,7 @@ impl AnalysisState {
                             not_null,
                             default,
                             depends_on,
+                            generation: _,
                         } => {
                             if let Some(existing_col) = rel.columns.iter().find(|c| c.name == *name)
                             {
@@ -1748,6 +2372,19 @@ impl AnalysisState {
                                 not_null: *not_null,
                                 default: default.clone(),
                             });
+
+                            if let Some((sequence_id, column_name, _)) = &implicit_add
+                                && column_name == name
+                                && let Some(column) =
+                                    rel.columns.iter_mut().find(|column| column.name == *name)
+                            {
+                                column.default = Some(Self::sequence_nextval_default(sequence_id));
+                                column.default_expr_text = Some(format!(
+                                    "nextval('{}.{}'::regclass)",
+                                    sequence_id.schema, sequence_id.name
+                                ));
+                                column.is_nullable = false;
+                            }
 
                             if let Some((source_table, source_col)) = depends_on {
                                 self.snapshot_graph();
@@ -1966,7 +2603,7 @@ impl AnalysisState {
                                 constraint.validated = true;
                             }
                         }
-                        AlterTableActionMutation::AttachPartition { child } => {
+                        AlterTableActionMutation::AttachPartition { child, .. } => {
                             // BUG-012: Reject cycle topologies before inserting the edge.
                             if self.local.graph.check_partition_cycle(&alter.id, child) {
                                 self.snapshot_confidence();
@@ -1990,6 +2627,73 @@ impl AnalysisState {
                         }
                         _ => {}
                     }
+                }
+                if let Some((sequence_id, column_name, kind)) = implicit_add {
+                    self.snapshot_sequence(&sequence_id);
+                    self.snapshot_generation_counter();
+                    self.local.generation_counter += 1;
+                    self.local.sequences.insert(
+                        sequence_id.clone(),
+                        SequenceOverlay::Present(SequenceState {
+                            id: sequence_id.clone(),
+                            owner: self
+                                .local
+                                .relations
+                                .get(&alter.id)
+                                .and_then(|overlay| match overlay {
+                                    RelationOverlay::Present(table) => Some(table.owner.clone()),
+                                    RelationOverlay::Dropped => None,
+                                })
+                                .unwrap_or_else(|| ObjectId::new("", &self.local.current_role)),
+                            owned_by: Some((alter.id.clone(), column_name.clone())),
+                            kind,
+                            generation: self.local.generation_counter,
+                        }),
+                    );
+                    self.snapshot_graph();
+                    self.local.graph.edges.push(DependencyEdge::new(
+                        sequence_id,
+                        alter.id.clone(),
+                        DependencyKind::SequenceOwnedBy {
+                            column: column_name,
+                        },
+                    ));
+                }
+                match &alter.action {
+                    AlterTableActionMutation::DropColumn { .. } => {
+                        for sequence_id in owned_sequences_for_column {
+                            self.snapshot_sequence(&sequence_id);
+                            self.local
+                                .sequences
+                                .insert(sequence_id.clone(), SequenceOverlay::Dropped);
+                            self.snapshot_graph_full();
+                            self.local.graph.edges.retain(|edge| {
+                                !(matches!(edge.kind, DependencyKind::SequenceOwnedBy { .. })
+                                    && edge.dependent == sequence_id)
+                            });
+                        }
+                    }
+                    AlterTableActionMutation::RenameColumn { to, .. } => {
+                        for sequence_id in owned_sequences_for_column {
+                            self.snapshot_sequence(&sequence_id);
+                            if let Some(SequenceOverlay::Present(sequence)) =
+                                self.local.sequences.get_mut(&sequence_id)
+                                && let Some((_, column)) = &mut sequence.owned_by
+                            {
+                                *column = to.clone();
+                            }
+                            self.snapshot_graph_full();
+                            for edge in &mut self.local.graph.edges {
+                                if edge.dependent == sequence_id
+                                    && let DependencyKind::SequenceOwnedBy { column } =
+                                        &mut edge.kind
+                                {
+                                    *column = to.clone();
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
                 }
                 MutationResult::Applied
             }
@@ -2124,6 +2828,43 @@ impl AnalysisState {
                         reason: format!("relation '{}' already exists", create_seq.id),
                     };
                 }
+                if let Some((table_id, column)) = &create_seq.owned_by {
+                    if table_id.schema != create_seq.id.schema {
+                        return MutationResult::Conflict {
+                            reason: "sequence must be in the same schema as its owning table"
+                                .to_string(),
+                        };
+                    }
+                    match self.local.relations.get(table_id) {
+                        Some(RelationOverlay::Present(table)) => {
+                            if !table.has_column(column) {
+                                return MutationResult::Conflict {
+                                    reason: format!(
+                                        "column '{}.{}' does not exist",
+                                        table_id, column
+                                    ),
+                                };
+                            }
+                            if self.local.current_role_known
+                                && table.owner.name != self.local.current_role
+                            {
+                                return MutationResult::Conflict {
+                                    reason: "sequence and table must have the same owner"
+                                        .to_string(),
+                                };
+                            }
+                        }
+                        _ if self.baseline_covers_object(table_id) && self.baseline_available => {
+                            return MutationResult::Conflict {
+                                reason: format!("relation '{}' does not exist", table_id),
+                            };
+                        }
+                        _ => {
+                            self.snapshot_confidence();
+                            self.local.confidence = Confidence::Tainted;
+                        }
+                    }
+                }
                 self.snapshot_sequence(&create_seq.id);
                 self.snapshot_generation_counter();
                 self.local.generation_counter += 1;
@@ -2133,6 +2874,13 @@ impl AnalysisState {
                     create_seq.id.clone(),
                     SequenceOverlay::Present(SequenceState {
                         id: create_seq.id.clone(),
+                        owner: ObjectId::new("", self.local.current_role.clone()),
+                        owned_by: create_seq.owned_by.clone(),
+                        kind: if create_seq.owned_by.is_some() {
+                            SequenceKind::Owned
+                        } else {
+                            SequenceKind::Standalone
+                        },
                         generation,
                     }),
                 );
@@ -2150,30 +2898,186 @@ impl AnalysisState {
                 MutationResult::Applied
             }
             Mutation::AlterSequence(alter_seq) => {
-                self.snapshot_sequence(&alter_seq.id);
-                self.snapshot_graph();
-                self.local.graph.edges.retain(|e| {
-                    !(matches!(e.kind, DependencyKind::SequenceOwnedBy { .. })
-                        && e.dependent == alter_seq.id)
-                });
-                if let Some((table_id, col)) = &alter_seq.owned_by {
-                    self.local.graph.edges.push(DependencyEdge::new(
-                        alter_seq.id.clone(),
-                        table_id.clone(),
-                        DependencyKind::SequenceOwnedBy {
-                            column: col.clone(),
-                        },
-                    ));
+                if !self.sequence_is_present(&alter_seq.id) {
+                    if alter_seq.if_exists {
+                        return MutationResult::Skipped;
+                    }
+                    if self.baseline_covers_object(&alter_seq.id) && self.baseline_available {
+                        return MutationResult::Conflict {
+                            reason: format!("sequence '{}' does not exist", alter_seq.id),
+                        };
+                    }
+                    self.snapshot_confidence();
+                    self.local.confidence = Confidence::Tainted;
+                    return MutationResult::Skipped;
                 }
-                MutationResult::Applied
+                let current = match self.local.sequences.get(&alter_seq.id) {
+                    Some(SequenceOverlay::Present(sequence)) => sequence.clone(),
+                    _ => unreachable!("presence checked above"),
+                };
+                match &alter_seq.action {
+                    crate::analysis::mutations::AlterSequenceActionMutation::OwnedBy(owned_by) => {
+                        if current.kind == SequenceKind::Identity {
+                            return MutationResult::Conflict {
+                                reason: "cannot change ownership of an identity sequence"
+                                    .to_string(),
+                            };
+                        }
+                        if let Some((table_id, column)) = owned_by {
+                            if table_id.schema != alter_seq.id.schema {
+                                return MutationResult::Conflict {
+                                    reason:
+                                        "sequence must be in the same schema as its owning table"
+                                            .to_string(),
+                                };
+                            }
+                            let Some(RelationOverlay::Present(table)) =
+                                self.local.relations.get(table_id)
+                            else {
+                                return MutationResult::Conflict {
+                                    reason: format!("relation '{}' does not exist", table_id),
+                                };
+                            };
+                            if !table.has_column(column) {
+                                return MutationResult::Conflict {
+                                    reason: format!(
+                                        "column '{}.{}' does not exist",
+                                        table_id, column
+                                    ),
+                                };
+                            }
+                            if table.owner != current.owner {
+                                return MutationResult::Conflict {
+                                    reason: "sequence and table must have the same owner"
+                                        .to_string(),
+                                };
+                            }
+                        }
+                        self.snapshot_sequence(&alter_seq.id);
+                        self.snapshot_graph();
+                        self.local.graph.edges.retain(|edge| {
+                            !(matches!(edge.kind, DependencyKind::SequenceOwnedBy { .. })
+                                && edge.dependent == alter_seq.id)
+                        });
+                        if let Some(SequenceOverlay::Present(sequence)) =
+                            self.local.sequences.get_mut(&alter_seq.id)
+                        {
+                            sequence.owned_by = owned_by.clone();
+                            sequence.kind = if owned_by.is_some() {
+                                SequenceKind::Owned
+                            } else {
+                                SequenceKind::Standalone
+                            };
+                        }
+                        if let Some((table_id, column)) = owned_by {
+                            self.local.graph.edges.push(DependencyEdge::new(
+                                alter_seq.id.clone(),
+                                table_id.clone(),
+                                DependencyKind::SequenceOwnedBy {
+                                    column: column.clone(),
+                                },
+                            ));
+                        }
+                        MutationResult::Applied
+                    }
+                    crate::analysis::mutations::AlterSequenceActionMutation::OwnerTo(owner) => {
+                        if current.kind == SequenceKind::Identity {
+                            return MutationResult::Conflict {
+                                reason: "cannot alter an identity sequence independently"
+                                    .to_string(),
+                            };
+                        }
+                        let Some((owner_name, known)) = self.role_fact_identity(owner) else {
+                            self.snapshot_confidence();
+                            self.local.confidence = Confidence::Tainted;
+                            return MutationResult::Skipped;
+                        };
+                        if known
+                            && self.local.roles_known
+                            && self.present_role(&owner_name).is_none()
+                        {
+                            return MutationResult::Conflict {
+                                reason: format!("role '{}' does not exist", owner_name),
+                            };
+                        }
+                        if let Some((table_id, _)) = &current.owned_by
+                            && let Some(RelationOverlay::Present(table)) =
+                                self.local.relations.get(table_id)
+                            && table.owner.name != owner_name
+                        {
+                            return MutationResult::Conflict {
+                                reason: "sequence and table must have the same owner".to_string(),
+                            };
+                        }
+                        self.snapshot_sequence(&alter_seq.id);
+                        if let Some(SequenceOverlay::Present(sequence)) =
+                            self.local.sequences.get_mut(&alter_seq.id)
+                        {
+                            sequence.owner = ObjectId::new("", owner_name);
+                        }
+                        MutationResult::Applied
+                    }
+                    crate::analysis::mutations::AlterSequenceActionMutation::RenameTo(new_id)
+                    | crate::analysis::mutations::AlterSequenceActionMutation::SetSchema(new_id) => {
+                        if current.kind == SequenceKind::Identity {
+                            return MutationResult::Conflict {
+                                reason: "cannot alter an identity sequence independently"
+                                    .to_string(),
+                            };
+                        }
+                        if self.relation_namespace_is_taken(new_id) {
+                            return MutationResult::Conflict {
+                                reason: format!("relation '{}' already exists", new_id),
+                            };
+                        }
+                        if let Some((table_id, _)) = &current.owned_by
+                            && table_id.schema != new_id.schema
+                        {
+                            return MutationResult::Conflict {
+                                reason: "sequence must be in the same schema as its owning table"
+                                    .to_string(),
+                            };
+                        }
+                        self.snapshot_namespace();
+                        let mut moved = current;
+                        moved.id = new_id.clone();
+                        self.local.sequences.remove(&alter_seq.id);
+                        self.local
+                            .sequences
+                            .insert(new_id.clone(), SequenceOverlay::Present(moved));
+                        self.local.graph.propagate_rename(&alter_seq.id, new_id);
+                        self.local.graph.edges.push(DependencyEdge::new(
+                            alter_seq.id.clone(),
+                            new_id.clone(),
+                            DependencyKind::RenameTo,
+                        ));
+                        if self.baseline_sequences.remove(&alter_seq.id) {
+                            self.baseline_sequences.insert(new_id.clone());
+                        }
+                        MutationResult::Applied
+                    }
+                    crate::analysis::mutations::AlterSequenceActionMutation::Other => {
+                        MutationResult::Applied
+                    }
+                }
             }
             Mutation::DropSequence(drop_seq) => {
-                if !drop_seq.if_exists
-                    && let Some(id) = drop_seq.ids.iter().find(|id| !self.sequence_is_present(id))
-                {
-                    return MutationResult::Conflict {
-                        reason: format!("sequence '{}' does not exist", id),
-                    };
+                if !drop_seq.if_exists {
+                    let missing: Vec<ObjectId> = drop_seq
+                        .ids
+                        .iter()
+                        .filter(|id| !self.sequence_is_present(id))
+                        .cloned()
+                        .collect();
+                    for id in &missing {
+                        if self.baseline_covers_object(id) && self.baseline_available {
+                            return MutationResult::Conflict {
+                                reason: format!("sequence '{}' does not exist", id),
+                            };
+                        }
+                        self.snapshot_confidence();
+                        self.local.confidence = Confidence::Tainted;
+                    }
                 }
                 let present: Vec<ObjectId> = drop_seq
                     .ids
@@ -2183,6 +3087,46 @@ impl AnalysisState {
                     .collect();
                 if present.is_empty() {
                     return MutationResult::Skipped;
+                }
+                for id in &present {
+                    let Some(SequenceOverlay::Present(sequence)) = self.local.sequences.get(id)
+                    else {
+                        continue;
+                    };
+                    if sequence.kind == SequenceKind::Identity {
+                        return MutationResult::Conflict {
+                            reason: format!("cannot drop identity sequence '{}' independently", id),
+                        };
+                    }
+                    if sequence.kind == SequenceKind::SerialLike && !drop_seq.cascade {
+                        return MutationResult::Conflict {
+                            reason: format!("sequence '{}' still has dependent defaults", id),
+                        };
+                    }
+                }
+                if drop_seq.cascade {
+                    let serial_owners: Vec<(ObjectId, String)> = present
+                        .iter()
+                        .filter_map(|id| match self.local.sequences.get(id) {
+                            Some(SequenceOverlay::Present(sequence))
+                                if sequence.kind == SequenceKind::SerialLike =>
+                            {
+                                sequence.owned_by.clone()
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    for (table_id, column) in serial_owners {
+                        self.snapshot_relation(&table_id);
+                        if let Some(RelationOverlay::Present(table)) =
+                            self.local.relations.get_mut(&table_id)
+                            && let Some(column) =
+                                table.columns.iter_mut().find(|item| item.name == column)
+                        {
+                            column.default = None;
+                            column.default_expr_text = None;
+                        }
+                    }
                 }
                 for id in &present {
                     self.snapshot_sequence(id);
@@ -2198,8 +3142,39 @@ impl AnalysisState {
                 MutationResult::Applied
             }
             Mutation::Rename(rename) => {
-                self.snapshot_relation(&rename.old_id);
-                self.snapshot_relation(&rename.new_id);
+                let renames_relation = self.relation_is_present(&rename.old_id);
+                let renames_index = self.index_is_present(&rename.old_id);
+                if !renames_relation && !renames_index {
+                    if self.baseline_covers_object(&rename.old_id) {
+                        return MutationResult::Conflict {
+                            reason: format!("relation '{}' does not exist", rename.old_id),
+                        };
+                    }
+                    self.snapshot_confidence();
+                    self.local.confidence = Confidence::Tainted;
+                    return MutationResult::Skipped;
+                }
+                if rename.old_id != rename.new_id
+                    && self.relation_namespace_is_taken(&rename.new_id)
+                {
+                    return MutationResult::Conflict {
+                        reason: format!("relation '{}' already exists", rename.new_id),
+                    };
+                }
+                if rename.old_id.schema != rename.new_id.schema
+                    && !self.schema_is_present(&rename.new_id.schema)
+                {
+                    if self.schema_absence_is_authoritative(&rename.new_id.schema) {
+                        return MutationResult::Conflict {
+                            reason: format!("schema '{}' does not exist", rename.new_id.schema),
+                        };
+                    }
+                    self.snapshot_confidence();
+                    self.local.confidence = Confidence::Tainted;
+                    return MutationResult::Skipped;
+                }
+
+                self.snapshot_namespace();
                 if let Some(RelationOverlay::Present(mut state)) =
                     self.local.relations.remove(&rename.old_id)
                 {
@@ -2207,6 +3182,59 @@ impl AnalysisState {
                     self.local
                         .relations
                         .insert(rename.new_id.clone(), RelationOverlay::Present(state));
+                }
+                let owned_sequence_ids: Vec<ObjectId> = self
+                    .local
+                    .sequences
+                    .iter()
+                    .filter_map(|(id, overlay)| match overlay {
+                        SequenceOverlay::Present(sequence)
+                            if sequence
+                                .owned_by
+                                .as_ref()
+                                .is_some_and(|(table, _)| table == &rename.old_id) =>
+                        {
+                            Some(id.clone())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                for sequence_id in owned_sequence_ids {
+                    self.snapshot_sequence(&sequence_id);
+                    if let Some(SequenceOverlay::Present(sequence)) =
+                        self.local.sequences.get_mut(&sequence_id)
+                        && let Some((table, _)) = &mut sequence.owned_by
+                    {
+                        *table = rename.new_id.clone();
+                    }
+                }
+                let triggers_to_move: Vec<(ObjectId, crate::model::trigger::TriggerState)> = self
+                    .local
+                    .triggers
+                    .iter()
+                    .filter_map(|(id, overlay)| match overlay {
+                        TriggerOverlay::Present(trigger) if trigger.table_id == rename.old_id => {
+                            Some((id.clone(), trigger.clone()))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                for (old_trigger_id, mut trigger) in triggers_to_move {
+                    let new_trigger_id = Self::trigger_key(&rename.new_id, &trigger.name);
+                    self.local.triggers.remove(&old_trigger_id);
+                    trigger.id = new_trigger_id.clone();
+                    trigger.table_id = rename.new_id.clone();
+                    self.local
+                        .triggers
+                        .insert(new_trigger_id.clone(), TriggerOverlay::Present(trigger));
+                    self.local
+                        .graph
+                        .propagate_rename(&old_trigger_id, &new_trigger_id);
+                    self.local.graph.edges.push(DependencyEdge::new(
+                        old_trigger_id,
+                        new_trigger_id,
+                        DependencyKind::RenameTo,
+                    ));
                 }
                 let constraints_to_move: Vec<(String, ConstraintState)> = self
                     .local
@@ -2226,19 +3254,46 @@ impl AnalysisState {
                         .constraints
                         .insert((rename.new_id.clone(), name), constraint);
                 }
-                self.snapshot_graph();
+                self.local.pending_validation = std::mem::take(&mut self.local.pending_validation)
+                    .into_iter()
+                    .map(|(table, name)| {
+                        if table == rename.old_id {
+                            (rename.new_id.clone(), name)
+                        } else {
+                            (table, name)
+                        }
+                    })
+                    .collect();
                 self.local.graph.edges.push(DependencyEdge::new(
                     rename.old_id.clone(),
                     rename.new_id.clone(),
                     DependencyKind::RenameTo,
                 ));
-
-                // Snapshot all 8 affected graph edge lists before calling propagate_rename
-                self.snapshot_graph_full();
-
                 self.local
                     .graph
                     .propagate_rename(&rename.old_id, &rename.new_id);
+
+                if renames_relation {
+                    if self.baseline_relations.remove(&rename.old_id) {
+                        self.baseline_relations.insert(rename.new_id.clone());
+                    }
+                    if self.baseline_fk_dependencies.remove(&rename.old_id) {
+                        self.baseline_fk_dependencies.insert(rename.new_id.clone());
+                    }
+                    self.baseline_foreign_keys = std::mem::take(&mut self.baseline_foreign_keys)
+                        .into_iter()
+                        .map(|(table, name)| {
+                            if table == rename.old_id {
+                                (rename.new_id.clone(), name)
+                            } else {
+                                (table, name)
+                            }
+                        })
+                        .collect();
+                }
+                if renames_index && self.baseline_indexes.remove(&rename.old_id) {
+                    self.baseline_indexes.insert(rename.new_id.clone());
+                }
 
                 MutationResult::Applied
             }
@@ -3117,6 +4172,39 @@ impl AnalysisState {
         }
     }
 
+    fn snapshot_schema(&mut self, name: &str) {
+        if let Some(frame) = self.local.transactions.last_mut() {
+            frame.undo_log.push(StateChange::SchemaSnapshot {
+                name: name.to_string(),
+                previous: self.local.schemas.get(name).cloned(),
+            });
+        }
+    }
+
+    fn snapshot_namespace(&mut self) {
+        if let Some(frame) = self.local.transactions.last_mut() {
+            frame.undo_log.push(StateChange::NamespaceSnapshot(Box::new(
+                NamespaceSnapshot {
+                    schemas: self.local.schemas.clone(),
+                    relations: self.local.relations.clone(),
+                    types: self.local.types.clone(),
+                    functions: self.local.functions.clone(),
+                    sequences: self.local.sequences.clone(),
+                    publications: self.local.publications.clone(),
+                    triggers: self.local.triggers.clone(),
+                    constraints: self.local.constraints.clone(),
+                    graph: self.local.graph.edges.clone(),
+                    pending_validation: self.local.pending_validation.clone(),
+                    baseline_relations: self.baseline_relations.clone(),
+                    baseline_indexes: self.baseline_indexes.clone(),
+                    baseline_foreign_keys: self.baseline_foreign_keys.clone(),
+                    baseline_fk_dependencies: self.baseline_fk_dependencies.clone(),
+                    baseline_sequences: self.baseline_sequences.clone(),
+                },
+            )));
+        }
+    }
+
     fn snapshot_type(&mut self, id: &ObjectId) {
         if let Some(frame) = self.local.transactions.last_mut() {
             let previous = self.local.types.get(id).cloned();
@@ -3293,6 +4381,31 @@ impl AnalysisState {
     fn rollback_undo_log(&mut self, mut undo_log: Vec<StateChange>) {
         while let Some(change) = undo_log.pop() {
             match change {
+                StateChange::SchemaSnapshot { name, previous } => match previous {
+                    Some(overlay) => {
+                        self.local.schemas.insert(name, overlay);
+                    }
+                    None => {
+                        self.local.schemas.remove(&name);
+                    }
+                },
+                StateChange::NamespaceSnapshot(snapshot) => {
+                    self.local.schemas = snapshot.schemas;
+                    self.local.relations = snapshot.relations;
+                    self.local.types = snapshot.types;
+                    self.local.functions = snapshot.functions;
+                    self.local.sequences = snapshot.sequences;
+                    self.local.publications = snapshot.publications;
+                    self.local.triggers = snapshot.triggers;
+                    self.local.constraints = snapshot.constraints;
+                    self.local.graph.edges = snapshot.graph;
+                    self.local.pending_validation = snapshot.pending_validation;
+                    self.baseline_relations = snapshot.baseline_relations;
+                    self.baseline_indexes = snapshot.baseline_indexes;
+                    self.baseline_foreign_keys = snapshot.baseline_foreign_keys;
+                    self.baseline_fk_dependencies = snapshot.baseline_fk_dependencies;
+                    self.baseline_sequences = snapshot.baseline_sequences;
+                }
                 StateChange::RelationSnapshot { id, previous } => {
                     if let Some(prev) = *previous {
                         self.local.relations.insert(id, prev);

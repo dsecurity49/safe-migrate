@@ -262,29 +262,48 @@ impl AstVisitor {
     }
 
     fn extract_create_schema(node: &ast::CreateSchema) -> Option<StatementFact> {
-        let name = match node.create_schema_target()? {
-            ast::CreateSchemaTarget::NamedSchema(ns) => ns.schema()?.ident_token(),
-            ast::CreateSchemaTarget::AuthorizationSchema(aus) => aus.role()?.ident_token(),
-        }
-        .map(|n| Self::identifier_from_token(n.text()))?;
+        let (name, authorization) = match node.create_schema_target()? {
+            ast::CreateSchemaTarget::NamedSchema(ns) => (
+                ns.schema()
+                    .and_then(|schema| schema.ident_token())
+                    .map(|token| Self::identifier_from_token(token.text()))?,
+                ns.role_ref().map(|role| Self::extract_role(&role)),
+            ),
+            ast::CreateSchemaTarget::AuthorizationSchema(aus) => {
+                let role = aus.role()?;
+                let authorization = Self::extract_role_node(&role);
+                let crate::analysis::facts::RoleFact::Named { name, .. } = &authorization else {
+                    return None;
+                };
+                (Ident::new(name.clone(), true), Some(authorization))
+            }
+        };
 
         Some(StatementFact::CreateSchema {
             name: QualifiedName::new(None, name),
             if_not_exists: node.if_not_exists().is_some(),
+            authorization,
         })
     }
 
     fn extract_alter_schema(node: &ast::AlterSchema) -> Option<StatementFact> {
         let nr = node.schema_ref()?.ident_token()?;
         let name = QualifiedName::new(None, Self::identifier_from_token(nr.text()));
-        let new_name = node.alter_schema_action().and_then(|a| match a {
-            ast::AlterSchemaAction::SchemaRenameTo(rt) => rt
-                .schema()
-                .and_then(|s| s.ident_token())
-                .map(|n| Self::identifier_from_token(n.text())),
-            _ => None,
-        });
-        Some(StatementFact::AlterSchema { name, new_name })
+        let action = node.alter_schema_action().and_then(|a| match a {
+            ast::AlterSchemaAction::SchemaRenameTo(rt) => {
+                rt.schema().and_then(|s| s.ident_token()).map(|n| {
+                    crate::analysis::facts::AlterSchemaActionFact::RenameTo {
+                        new_name: Self::identifier_from_token(n.text()),
+                    }
+                })
+            }
+            ast::AlterSchemaAction::OwnerTo(owner) => owner.role_ref().map(|role| {
+                crate::analysis::facts::AlterSchemaActionFact::OwnerTo {
+                    new_owner: Self::extract_role(&role),
+                }
+            }),
+        })?;
+        Some(StatementFact::AlterSchema { name, action })
     }
 
     fn extract_drop_schema(node: &ast::DropSchema) -> Option<StatementFact> {
@@ -400,7 +419,17 @@ impl AstVisitor {
                     .and_then(|tn| tn.path_ref())
                     .and_then(|p| Self::path_ref_to_qualified_name(&p))
                 {
-                    actions.push(AlterTableActionFact::AttachPartition { child });
+                    let text = ap.syntax().text().to_string().to_uppercase();
+                    let strategy = if text.contains("FOR VALUES IN") {
+                        Some("LIST".to_string())
+                    } else if text.contains("FOR VALUES FROM") {
+                        Some("RANGE".to_string())
+                    } else if text.contains("FOR VALUES WITH") {
+                        Some("HASH".to_string())
+                    } else {
+                        None
+                    };
+                    actions.push(AlterTableActionFact::AttachPartition { child, strategy });
                 }
                 continue;
             }
@@ -456,6 +485,7 @@ impl AstVisitor {
                     {
                         let mut not_null = false;
                         let mut default = None;
+                        let mut generation = crate::analysis::facts::ColumnGeneration::Ordinary;
                         for c in add.constraints() {
                             match c {
                                 Constraint::NotNullConstraint(_) => not_null = true,
@@ -464,6 +494,12 @@ impl AstVisitor {
                                     default = dc
                                         .expr()
                                         .map(crate::analysis::expr_visitor::ExprVisitor::convert)
+                                }
+                                Constraint::GeneratedConstraint(generated)
+                                    if generated.generated_identity().is_some() =>
+                                {
+                                    generation = crate::analysis::facts::ColumnGeneration::Identity;
+                                    not_null = true;
                                 }
                                 _ => {}
                             }
@@ -474,6 +510,13 @@ impl AstVisitor {
                             if_not_exists: add.if_not_exists().is_some(),
                             not_null,
                             default,
+                            generation: if Self::is_serial_type(
+                                add.ty().map(|ty| ty.syntax().text().to_string()).as_deref(),
+                            ) {
+                                crate::analysis::facts::ColumnGeneration::Serial
+                            } else {
+                                generation
+                            },
                         });
                     }
                 }
@@ -883,6 +926,16 @@ impl AstVisitor {
                 None
             }
         });
+        let generation = if Self::is_serial_type(ty.as_deref()) {
+            crate::analysis::facts::ColumnGeneration::Serial
+        } else if col.constraints().any(|constraint| {
+            matches!(constraint, ColumnConstraint::GeneratedConstraint(generated)
+                if generated.generated_identity().is_some())
+        }) {
+            crate::analysis::facts::ColumnGeneration::Identity
+        } else {
+            crate::analysis::facts::ColumnGeneration::Ordinary
+        };
         Some(ColumnFact {
             name,
             ty,
@@ -892,7 +945,19 @@ impl AstVisitor {
             is_unique,
             unique_constraint_name,
             default,
+            generation,
         })
+    }
+
+    fn is_serial_type(ty: Option<&str>) -> bool {
+        ty.map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .is_some_and(|ty| {
+                matches!(
+                    ty.as_str(),
+                    "smallserial" | "serial2" | "serial" | "serial4" | "bigserial" | "serial8"
+                )
+            })
     }
 
     fn extract_alter_column_option(
@@ -1561,9 +1626,51 @@ impl AstVisitor {
     fn extract_alter_sequence(node: &AlterSequence) -> Option<StatementFact> {
         let path = node.sequence_ref()?.path_ref()?;
         let name = Self::path_ref_to_qualified_name(&path)?;
+        let action = match node.actions().next() {
+            Some(ast::AlterSequenceAction::OwnerTo(owner)) => owner
+                .role_ref()
+                .map(|role| {
+                    crate::analysis::facts::AlterSequenceActionFact::OwnerTo(Self::extract_role(
+                        &role,
+                    ))
+                })
+                .unwrap_or(crate::analysis::facts::AlterSequenceActionFact::Other),
+            Some(ast::AlterSequenceAction::SequenceRenameTo(rename)) => rename
+                .sequence()
+                .and_then(|sequence| sequence.path())
+                .and_then(|path| Self::path_to_qualified_name(&path))
+                .map(|name| crate::analysis::facts::AlterSequenceActionFact::RenameTo(name.name))
+                .unwrap_or(crate::analysis::facts::AlterSequenceActionFact::Other),
+            Some(ast::AlterSequenceAction::SetSchema(set_schema)) => set_schema
+                .schema_ref()
+                .and_then(|schema| schema.ident_token())
+                .map(|token| {
+                    crate::analysis::facts::AlterSequenceActionFact::SetSchema(
+                        Self::resolve_identifier_token(token.text()),
+                    )
+                })
+                .unwrap_or(crate::analysis::facts::AlterSequenceActionFact::Other),
+            Some(ast::AlterSequenceAction::SequenceOption(_)) => {
+                let owned_option = node
+                    .syntax()
+                    .descendants()
+                    .find_map(ast::OptionOwnedBy::cast);
+                match owned_option {
+                    Some(option) if option.none_token().is_some() => {
+                        crate::analysis::facts::AlterSequenceActionFact::OwnedBy(None)
+                    }
+                    Some(_) => crate::analysis::facts::AlterSequenceActionFact::OwnedBy(
+                        Self::extract_owned_by(node.syntax()),
+                    ),
+                    None => crate::analysis::facts::AlterSequenceActionFact::Other,
+                }
+            }
+            _ => crate::analysis::facts::AlterSequenceActionFact::Other,
+        };
         Some(StatementFact::AlterSequence {
             name,
-            owned_by: Self::extract_owned_by(node.syntax()),
+            if_exists: node.if_exists().is_some(),
+            action,
         })
     }
 
@@ -2476,6 +2583,25 @@ impl AstVisitor {
                 name,
                 via_legacy_group_syntax: via_group,
             };
+        }
+        crate::analysis::facts::RoleFact::Unknown
+    }
+
+    fn extract_role_node(role: &squawk_syntax::ast::Role) -> crate::analysis::facts::RoleFact {
+        if let Some(token) = role.ident_token() {
+            return crate::analysis::facts::RoleFact::Named {
+                name: Self::resolve_identifier_token(token.text()),
+                via_legacy_group_syntax: role.group_token().is_some(),
+            };
+        }
+        if role.current_role_token().is_some() {
+            return crate::analysis::facts::RoleFact::CurrentRole;
+        }
+        if role.current_user_token().is_some() {
+            return crate::analysis::facts::RoleFact::CurrentUser;
+        }
+        if role.session_user_token().is_some() {
+            return crate::analysis::facts::RoleFact::SessionUser;
         }
         crate::analysis::facts::RoleFact::Unknown
     }

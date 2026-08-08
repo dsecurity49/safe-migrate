@@ -1,0 +1,37 @@
+#!/bin/sh
+set -eu
+
+repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+resolver="$repo_root/scripts/action-resolve-version"
+gate="$repo_root/scripts/action-final-gate"
+manifest="$repo_root/action.yml"
+
+test "$(/bin/sh "$resolver" v0.4.5 "$repo_root/Cargo.toml")" = v0.4.5
+test "$(/bin/sh "$resolver" 0123456789abcdef0123456789abcdef01234567 "$repo_root/Cargo.toml")" = v0.4.5
+
+if /bin/sh "$resolver" main "$repo_root/Cargo.toml" >/dev/null 2>&1; then
+  printf '%s\n' 'mutable Action branch reference was accepted' >&2
+  exit 1
+fi
+if /bin/sh "$resolver" v0.4.4 "$repo_root/Cargo.toml" >/dev/null 2>&1; then
+  printf '%s\n' 'mismatched Action tag was accepted' >&2
+  exit 1
+fi
+
+/bin/sh "$gate" 0 false
+/bin/sh "$gate" 2 true
+set +e
+/bin/sh "$gate" 2 false >/dev/null 2>&1
+blocking_status=$?
+/bin/sh "$gate" 1 true >/dev/null 2>&1
+operational_status=$?
+set -e
+test "$blocking_status" -eq 2
+test "$operational_status" -eq 1
+
+grep -F 'default: "false"' "$manifest" >/dev/null
+grep -F 'await core.summary.addRaw(markdown).write();' "$manifest" >/dev/null
+grep -F 'core.error(message, properties);' "$manifest" >/dev/null
+grep -F 'core.warning(message, properties);' "$manifest" >/dev/null
+grep -E 'actions/github-script@[0-9a-f]{40}' "$manifest" >/dev/null
+grep -F 'env -u DATABASE_URL' "$manifest" >/dev/null

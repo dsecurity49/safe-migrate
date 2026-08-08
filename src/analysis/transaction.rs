@@ -3,12 +3,37 @@
 use crate::analysis::graph::DependencyEdge;
 use crate::ast::identifiers::ObjectId;
 use crate::model::relation::RelationOverlay;
+use crate::model::schema::SchemaOverlay;
 use crate::model::sequence::SequenceOverlay;
 use crate::model::types::TypeOverlay;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+
+#[derive(Debug, Clone)]
+pub struct NamespaceSnapshot {
+    pub schemas: HashMap<String, SchemaOverlay>,
+    pub relations: HashMap<ObjectId, RelationOverlay>,
+    pub types: HashMap<ObjectId, TypeOverlay>,
+    pub functions: HashMap<ObjectId, crate::model::function::FunctionOverlay>,
+    pub sequences: HashMap<ObjectId, SequenceOverlay>,
+    pub publications: HashMap<String, crate::model::replication::PublicationOverlay>,
+    pub triggers: HashMap<ObjectId, crate::model::trigger::TriggerOverlay>,
+    pub constraints: HashMap<(ObjectId, String), crate::model::constraint::ConstraintState>,
+    pub graph: Vec<DependencyEdge>,
+    pub pending_validation: HashSet<(ObjectId, String)>,
+    pub baseline_relations: HashSet<ObjectId>,
+    pub baseline_indexes: HashSet<ObjectId>,
+    pub baseline_foreign_keys: HashSet<(ObjectId, String)>,
+    pub baseline_fk_dependencies: HashSet<ObjectId>,
+    pub baseline_sequences: HashSet<ObjectId>,
+}
 
 #[derive(Debug, Clone)]
 pub enum StateChange {
+    SchemaSnapshot {
+        name: String,
+        previous: Option<SchemaOverlay>,
+    },
+    NamespaceSnapshot(Box<NamespaceSnapshot>),
     RelationSnapshot {
         id: ObjectId,
         previous: Box<Option<RelationOverlay>>,

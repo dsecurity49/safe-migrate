@@ -1,1 +1,1 @@
-ALTER FUNCTION f(integer) IMMUTABLE;
+ALTER FUNCTION sm_core.f(integer) IMMUTABLE;

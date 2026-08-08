@@ -14,7 +14,7 @@ It does contain sensitive metadata: schema, relation, column, constraint,
 index, trigger, function, type, role-grant, dependency, and statistics data.
 Treat the file like a schema inventory, not a safe-to-share build artifact.
 
-V4 cache files store provenance and role context:
+V5 cache files store provenance and role context:
 
 - creation time as Unix seconds;
 - source database name;
@@ -26,9 +26,14 @@ They also store the non-secret `pg_roles` catalog fields needed by analysis and
 separate ordinary membership from permission to use `SET ROLE`. On PostgreSQL
 16 and newer, that distinction comes from `pg_auth_members.set_option`.
 
-Older compatible caches without this provenance remain readable but are stale.
-Freshness is calculated from recorded provenance, never filesystem modification
-time.
+V5 additionally stores authoritative synchronized schema states and sequence
+states, including owner, owning table/column, generation, and mutually
+exclusive standalone, owned, serial-like, or identity kind. With scoped sync,
+only requested schemas are authoritative; schemas pulled in solely for
+cross-schema foreign keys remain dependency evidence, not complete catalogs.
+
+V1–V4 caches are unsupported and must be rebuilt. Freshness is calculated from
+recorded provenance, never filesystem modification time.
 
 ## Connection boundary
 
@@ -92,8 +97,9 @@ replace the destination only after the compressed payload is complete. A sync
 failure must not remove or corrupt a previous cache.
 
 When automatic sync fails, report the underlying failure and load the previous
-readable cache. Its confidence is determined by cache freshness and analysis,
-not by the refresh failure alone. With no readable cache, analysis continues
+readable V5 cache. Its confidence is determined by cache freshness and
+analysis, not by the refresh failure alone. An unsupported older cache cannot
+be used after a failed refresh. With no readable cache, analysis continues
 against an unavailable baseline and is tainted.
 
 ## Encryption
@@ -111,7 +117,7 @@ fallback decryption, key storage in TOML, or a command-line key option.
 Changes to cache layout, provenance, encryption, or synchronization behavior
 need:
 
-1. versioned decode coverage, including compatible legacy caches;
+1. versioned decode coverage, including generic legacy rejection;
 2. atomic-write and failure-preservation tests;
 3. CLI JSON/provenance coverage where user-visible;
 4. encryption round-trip and rejection-path tests when applicable;

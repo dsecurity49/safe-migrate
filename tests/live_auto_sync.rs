@@ -2,7 +2,7 @@ use std::fs;
 use std::io::Read;
 use std::path::Path;
 
-use safe_migrate::db::cache::{CACHE_V4_MAGIC, DbCacheVersioned};
+use safe_migrate::db::cache::{CACHE_V5_MAGIC, DbCacheVersioned};
 
 fn run_auto_sync_case(
     database_url: &str,
@@ -73,15 +73,15 @@ fn run_auto_sync_case(
     decoder
         .read_to_end(&mut payload)
         .expect("read decoded cache payload");
-    let v4_payload = payload
-        .strip_prefix(CACHE_V4_MAGIC)
-        .expect("auto-sync must write a V4 cache");
+    let v5_payload = payload
+        .strip_prefix(CACHE_V5_MAGIC)
+        .expect("auto-sync must write a V5 cache");
     let config = bincode::config::standard().with_variable_int_encoding();
     let (versioned, bytes_read): (DbCacheVersioned, usize) =
-        bincode::serde::decode_from_slice(v4_payload, config).expect("decode V4 cache");
-    assert_eq!(bytes_read, v4_payload.len());
-    let DbCacheVersioned::V4(cache) = versioned else {
-        panic!("auto-sync must encode the V4 cache variant");
+        bincode::serde::decode_from_slice(v5_payload, config).expect("decode V5 cache");
+    assert_eq!(bytes_read, v5_payload.len());
+    let DbCacheVersioned::V5(cache) = versioned else {
+        panic!("auto-sync must encode the V5 cache variant");
     };
     assert_eq!(cache.metadata.source_role.as_deref(), Some(expected_role));
     assert_eq!(

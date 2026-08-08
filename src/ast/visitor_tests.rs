@@ -809,9 +809,11 @@ mod tests {
         let facts = parse_and_extract_statement(sql);
         assert!(facts.is_some());
         match facts.unwrap() {
-            StatementFact::AlterSchema { name, new_name } => {
+            StatementFact::AlterSchema { name, action } => {
                 assert_eq!(name.name.resolve(), "my_schema");
-                assert!(new_name.is_some());
+                assert!(
+                    matches!(action, crate::analysis::facts::AlterSchemaActionFact::RenameTo { new_name } if new_name.resolve() == "new_schema")
+                );
             }
             _ => panic!("Expected AlterSchema fact"),
         }
@@ -886,8 +888,17 @@ mod tests {
     #[test]
     fn test_alter_table_attach_partition() {
         let sql = "ALTER TABLE parent ATTACH PARTITION child FOR VALUES FROM (1) TO (100);";
-        let facts = parse_and_extract_statement(sql);
-        assert!(facts.is_some());
+        let fact = parse_and_extract_statement(sql).expect("attach partition fact");
+        let StatementFact::AlterTable { actions, .. } = fact else {
+            panic!("expected alter table fact");
+        };
+        assert!(matches!(
+            actions.as_slice(),
+            [AlterTableActionFact::AttachPartition {
+                strategy: Some(strategy),
+                ..
+            }] if strategy == "RANGE"
+        ));
     }
 
     #[test]

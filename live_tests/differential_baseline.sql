@@ -9,6 +9,8 @@ DROP SCHEMA IF EXISTS sm_core CASCADE;
 DROP SCHEMA IF EXISTS sm_identity CASCADE;
 DROP SCHEMA IF EXISTS sm_role_quote CASCADE;
 DROP SCHEMA IF EXISTS app_user CASCADE;
+DROP SCHEMA IF EXISTS staging CASCADE;
+DROP SCHEMA IF EXISTS pub CASCADE;
 DROP FUNCTION IF EXISTS public.g() CASCADE;
 DROP FUNCTION IF EXISTS public.f() CASCADE;
 DROP TABLE IF EXISTS public.new_table CASCADE;
@@ -251,11 +253,11 @@ CREATE TABLE public.child_table (
 );
 
 CREATE TABLE public.list_parent (id integer) PARTITION BY LIST (id);
-CREATE TABLE public.list_child (id integer);
+CREATE TABLE public.list_child (id integer) PARTITION BY LIST (id);
 CREATE TABLE public.range_parent (id integer) PARTITION BY RANGE (id);
-CREATE TABLE public.range_child (id integer);
+CREATE TABLE public.range_child (id integer) PARTITION BY RANGE (id);
 CREATE TABLE public.hash_parent (id integer) PARTITION BY HASH (id);
-CREATE TABLE public.hash_child (id integer);
+CREATE TABLE public.hash_child (id integer) PARTITION BY HASH (id);
 
 CREATE TABLE public.parent (
     id integer,

@@ -1,0 +1,22 @@
+#!/bin/sh
+set -eu
+
+status=${1-}
+advisory=${2-}
+
+case "$advisory" in
+  true|false) ;;
+  *) printf 'advisory must be true or false, got: %s\n' "$advisory" >&2; exit 1 ;;
+esac
+
+case "$status" in
+  0) exit 0 ;;
+  2)
+    if [ "$advisory" = true ]; then
+      printf '%s\n' 'safe-migrate found blocking issues; advisory mode leaves the job successful.'
+      exit 0
+    fi
+    exit 2
+    ;;
+  *) exit 1 ;;
+esac

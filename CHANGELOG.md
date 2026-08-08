@@ -5,6 +5,24 @@ commits and pull requests. Published binaries, checksums, and generated release
 notes are available on the
 [GitHub Releases page](https://github.com/dsecurity49/safe-migrate/releases).
 
+## v0.4.5 — 2026-08-08
+
+- Introduced Cache V5 with authoritative synchronized schema and sequence
+  catalogs, sequence owner/ownership/kind metadata, redacted inspect counts,
+  scoped-catalog boundaries, and a required resync from V1–V4.
+- Modeled schema authorization, ownership, duplicate/missing behavior,
+  restrict/cascade removal, atomic namespace rename, search-path recomputation,
+  baseline provenance remapping, and transaction/savepoint rollback.
+- Modeled standalone, owned, serial-like, and identity sequence lifecycles,
+  including `OWNED BY`, owner/rename/schema changes, implicit PostgreSQL-style
+  sequence names and defaults, ownership updates, dependent drops, and rollback.
+- Made the GitHub Action use checksum-verified exact release binaries for
+  immutable refs, add job summaries and Tier 1/2 annotations, preserve all
+  report artifacts, and support optional advisory gating without hiding exit
+  code `2` or operational failures.
+- Added Windows/MSYS `.zip` support to the existing installer while retaining
+  Linux, macOS, GNU, musl, Termux, exact-version, curl-pipe, and dry-run paths.
+
 ## v0.4.4 — 2026-08-02
 
 - Added sourced, real-world-inspired differential cases for staged foreign-key

@@ -63,14 +63,21 @@ pub enum AlterViewAction {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub enum AlterSchemaActionFact {
+    RenameTo { new_name: Ident },
+    OwnerTo { new_owner: RoleFact },
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum StatementFact {
     CreateSchema {
         name: QualifiedName,
         if_not_exists: bool,
+        authorization: Option<RoleFact>,
     },
     AlterSchema {
         name: QualifiedName,
-        new_name: Option<Ident>,
+        action: AlterSchemaActionFact,
     },
     DropSchema {
         names: Vec<QualifiedName>,
@@ -175,7 +182,8 @@ pub enum StatementFact {
     },
     AlterSequence {
         name: QualifiedName,
-        owned_by: Option<(QualifiedName, String)>,
+        if_exists: bool,
+        action: AlterSequenceActionFact,
     },
     DropSequence {
         names: Vec<QualifiedName>,
@@ -261,6 +269,15 @@ pub enum StatementFact {
         local: bool,
         is_session_auth: bool,
     },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum AlterSequenceActionFact {
+    OwnedBy(Option<(QualifiedName, String)>),
+    OwnerTo(RoleFact),
+    RenameTo(Ident),
+    SetSchema(String),
+    Other,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -616,6 +633,13 @@ pub struct AttributeFact {
     pub value: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ColumnGeneration {
+    Ordinary,
+    Serial,
+    Identity,
+}
+
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ColumnFact {
     pub name: String,
@@ -626,6 +650,7 @@ pub struct ColumnFact {
     pub is_unique: bool,
     pub unique_constraint_name: Option<String>,
     pub default: Option<ExprIr>,
+    pub generation: ColumnGeneration,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -673,6 +698,7 @@ pub enum AlterTableActionFact {
         if_not_exists: bool,
         not_null: bool,
         default: Option<ExprIr>,
+        generation: ColumnGeneration,
     },
     DropColumn {
         name: String,
@@ -760,6 +786,7 @@ pub enum AlterTableActionFact {
     },
     AttachPartition {
         child: QualifiedName,
+        strategy: Option<String>,
     },
     DetachPartition {
         child: QualifiedName,

@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use safe_migrate::analysis::state::Confidence;
-use safe_migrate::db::cache::{CACHE_V3_MAGIC, CACHE_V4_MAGIC, CacheMetadata, DbCacheVersioned};
+use safe_migrate::db::cache::{CACHE_V5_MAGIC, CacheMetadata, DbCacheVersioned};
 use safe_migrate::db::cache_file::{
     MAX_CACHE_DECODE_BYTES, is_encrypted_cache_bytes, read_cache_bytes, unprotect_cache_bytes,
 };
@@ -170,6 +170,8 @@ struct CacheInspection {
 
 #[derive(serde::Serialize)]
 struct CacheContentsSummary {
+    schemas: usize,
+    sequences: usize,
     relations: usize,
     tables: usize,
     views: usize,
@@ -406,6 +408,8 @@ fn summarize_cache(cache: &DbCache) -> CacheContentsSummary {
         }
     }
     CacheContentsSummary {
+        schemas: cache.schemas.len(),
+        sequences: cache.sequences.len(),
         relations: cache.relations.len(),
         tables,
         views,
@@ -467,7 +471,9 @@ fn print_cache_inspection(inspection: &CacheInspection) {
     );
     let contents = &inspection.contents;
     println!(
-        "Contents (counts only): {} relations ({} tables, {} views, {} materialized views), {} columns, {} indexes, {} foreign keys, {} constraints, {} triggers, {} functions, {} types, {} roles, {} dependencies",
+        "Contents (counts only): {} schemas, {} sequences, {} relations ({} tables, {} views, {} materialized views), {} columns, {} indexes, {} foreign keys, {} constraints, {} triggers, {} functions, {} types, {} roles, {} dependencies",
+        contents.schemas,
+        contents.sequences,
         contents.relations,
         contents.tables,
         contents.views,
@@ -618,12 +624,10 @@ fn decode_cache(cache_path: &Path, cache_encryption: bool) -> Result<(DbCache, u
         .with_variable_int_encoding()
         .with_limit::<MAX_CACHE_DECODE_BYTES>();
 
-    let (encoded_payload, header_version) = if let Some(v4_payload) =
-        payload.strip_prefix(CACHE_V4_MAGIC)
+    let (encoded_payload, header_version) = if let Some(v5_payload) =
+        payload.strip_prefix(CACHE_V5_MAGIC)
     {
-        (v4_payload, 4)
-    } else if let Some(v3_payload) = payload.strip_prefix(CACHE_V3_MAGIC) {
-        (v3_payload, 3)
+        (v5_payload, 5)
     } else {
         anyhow::bail!(
             "Cache file '{}' uses an unsupported cache format. Run `safe-migrate sync` to rebuild it.",

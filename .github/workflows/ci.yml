@@ -37,6 +37,9 @@ jobs:
       - name: Verify installer contract
         run: sh scripts/test-install-dry-run
 
+      - name: Verify Action shell contracts
+        run: sh scripts/test-action-contract
+
       - name: Build (locked)
         run: cargo build --locked --verbose
 
@@ -190,6 +193,26 @@ jobs:
           test "$EXIT_CODE" = "2"
           grep -q '"rule_id": "drop-database"' \
             "$JSON_REPORT"
+
+      - name: Verify advisory mode preserves the analyzer status
+        id: advisory
+        uses: ./
+        with:
+          mode: lint
+          path: live_tests/rule_02_drop-database/001_drop_db.sql
+          no-cache: "true"
+          advisory: "true"
+          output-dir: action-advisory-artifacts
+
+      - name: Assert advisory mode succeeded with blocking findings
+        shell: bash
+        env:
+          EXIT_CODE: ${{ steps.advisory.outputs.exit-code }}
+          JSON_REPORT: ${{ steps.advisory.outputs.json-report }}
+        run: |
+          test "$EXIT_CODE" = "2"
+          test -s "$JSON_REPORT"
+          grep -q '"tier": "Tier1"' "$JSON_REPORT"
 
       - name: Verify operational failures produce diagnostic artifacts
         id: operational_error

@@ -66,8 +66,12 @@ detect_linux_flavor() {
 build_url() {
   version="$1"
   target="$2"
-  printf 'https://github.com/%s/releases/download/%s/%s-%s.tar.gz' \
-    "$REPO" "$version" "$BIN_NAME" "$target"
+  case "$target" in
+    *-pc-windows-*) extension=zip ;;
+    *) extension=tar.gz ;;
+  esac
+  printf 'https://github.com/%s/releases/download/%s/%s-%s.%s' \
+    "$REPO" "$version" "$BIN_NAME" "$target" "$extension"
 }
 
 sha256_digest() {
@@ -123,6 +127,14 @@ candidate_targets() {
         printf '%s\n' "${arch}-unknown-linux-musl"
       fi
       ;;
+    MINGW*|MSYS*|CYGWIN*)
+      case "$arch" in
+        x86_64|amd64) arch="x86_64" ;;
+        aarch64|arm64) arch="aarch64" ;;
+        *) die "Unsupported architecture: $arch" ;;
+      esac
+      printf '%s\n' "${arch}-pc-windows-msvc"
+      ;;
     *)
       die "Unsupported OS: $os"
       ;;
@@ -133,7 +145,11 @@ download_asset() {
   version="$1"
   target="$2"
   url="$(build_url "$version" "$target")"
-  out="${TMP_DIR}/${BIN_NAME}-${target}.tar.gz"
+  case "$target" in
+    *-pc-windows-*) extension=zip ;;
+    *) extension=tar.gz ;;
+  esac
+  out="${TMP_DIR}/${BIN_NAME}-${target}.${extension}"
   part="${out}.partial"
 
   [ "$VERBOSE" -eq 1 ] && log "Trying ${target}: ${url}"
@@ -163,7 +179,10 @@ download_asset() {
 
   # Every published archive must have an adjacent checksum. Never install an
   # archive whose checksum is unavailable, malformed, or mismatched.
-  sha_url="${url%.tar.gz}.sha256"
+  case "$extension" in
+    zip) sha_url="${url%.zip}.sha256" ;;
+    tar.gz) sha_url="${url%.tar.gz}.sha256" ;;
+  esac
   sha_file="${part}.sha256"
   if ! curl -fsSL -o "$sha_file" "$sha_url" 2>/dev/null; then
     rm -f "$part" "$sha_file"
@@ -188,11 +207,19 @@ download_asset() {
   rm -f "$sha_file"
   [ "$VERBOSE" -eq 1 ] && log "Checksum verified for ${target}"
 
-  tar -tzf "$part" >/dev/null 2>&1 || {
-    rm -f "$part"
-    printf '%s\n' "integrity-error:${target}:archive is invalid" >&2
-    return 3
-  }
+  if [ "$extension" = zip ]; then
+    unzip -tq "$part" >/dev/null 2>&1 || {
+      rm -f "$part"
+      printf '%s\n' "integrity-error:${target}:archive is invalid" >&2
+      return 3
+    }
+  else
+    tar -tzf "$part" >/dev/null 2>&1 || {
+      rm -f "$part"
+      printf '%s\n' "integrity-error:${target}:archive is invalid" >&2
+      return 3
+    }
+  fi
 
   mv "$part" "$out"
   printf '%s\n' "$out"
@@ -296,6 +323,9 @@ ARCH="$(uname -m)"
 CANDIDATES="$(candidate_targets "$OS" "$ARCH")"
 INSTALL_DIR="$(pick_install_dir)"
 DEST="${INSTALL_DIR}/${BIN_NAME}"
+case "$CANDIDATES" in
+  *-pc-windows-*) DEST="${DEST}.exe" ;;
+esac
 
 if [ "$DRY_RUN" -eq 1 ]; then
   log "[dry-run] No network requests or filesystem changes will be made."
@@ -310,7 +340,7 @@ if [ "$DRY_RUN" -eq 1 ]; then
   log "[dry-run] Candidate targets: $(printf '%s ' $CANDIDATES)"
   for candidate in $CANDIDATES; do
     if [ "$REQUESTED_VERSION" = "latest" ]; then
-      log "[dry-run] Would download and verify ${BIN_NAME}-${candidate}.tar.gz after resolving the release version."
+      log "[dry-run] Would download and verify $(build_url '<latest release>' "$candidate") after resolving the release version."
     else
       log "[dry-run] Would download and verify $(build_url "$REQUESTED_VERSION" "$candidate")"
     fi
@@ -323,7 +353,6 @@ if [ "$DRY_RUN" -eq 1 ]; then
 fi
 
 need curl
-need tar
 need sed
 need head
 need grep
@@ -333,6 +362,10 @@ need chmod
 need mkdir
 need mv
 need rm
+case "$CANDIDATES" in
+  *-pc-windows-*) need unzip ;;
+  *) need tar ;;
+esac
 
 if [ "$REQUESTED_VERSION" = "latest" ]; then
   log "Fetching latest release version..."
@@ -347,14 +380,14 @@ log "Using version: ${RESOLVED_VERSION}"
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT HUP INT TERM
 
-TAR_FILE=""
+ARCHIVE_FILE=""
 SELECTED_TARGET=""
 NETWORK_ERROR=""
 INTEGRITY_ERROR=""
 
 for candidate in $CANDIDATES; do
   rc=0
-  TAR_FILE="$(download_asset "$RESOLVED_VERSION" "$candidate" 2>"${TMP_DIR}/dl_err")" || rc=$?
+  ARCHIVE_FILE="$(download_asset "$RESOLVED_VERSION" "$candidate" 2>"${TMP_DIR}/dl_err")" || rc=$?
   if [ "$rc" -eq 0 ]; then
     SELECTED_TARGET="$candidate"
     break
@@ -366,7 +399,7 @@ for candidate in $CANDIDATES; do
   fi
 done
 
-if [ -z "$TAR_FILE" ]; then
+if [ -z "$ARCHIVE_FILE" ]; then
   if [ -n "$INTEGRITY_ERROR" ]; then
     printf 'Error: release integrity verification failed for %s\n' "$RESOLVED_VERSION" >&2
     if echo "$INTEGRITY_ERROR" | grep -q '^integrity-error:'; then
@@ -392,11 +425,21 @@ fi
 
 log "Selected target: ${SELECTED_TARGET}"
 log "Extracting archive..."
-run tar -xzf "$TAR_FILE" -C "$TMP_DIR"
+case "$SELECTED_TARGET" in
+  *-pc-windows-*) run unzip -q "$ARCHIVE_FILE" -d "$TMP_DIR" ;;
+  *) run tar -xzf "$ARCHIVE_FILE" -C "$TMP_DIR" ;;
+esac
 
 BIN_PATH="${TMP_DIR}/${BIN_NAME}"
+case "$SELECTED_TARGET" in
+  *-pc-windows-*) BIN_PATH="${BIN_PATH}.exe" ;;
+esac
 if [ ! -f "$BIN_PATH" ]; then
-  BIN_PATH="$(find "$TMP_DIR" -type f -name "$BIN_NAME" | head -n 1 || true)"
+  case "$SELECTED_TARGET" in
+    *-pc-windows-*) search_name="${BIN_NAME}.exe" ;;
+    *) search_name="$BIN_NAME" ;;
+  esac
+  BIN_PATH="$(find "$TMP_DIR" -type f -name "$search_name" | head -n 1 || true)"
 fi
 [ -n "$BIN_PATH" ] || die "Binary not found inside archive"
 

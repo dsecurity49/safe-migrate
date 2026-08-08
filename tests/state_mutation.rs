@@ -1048,7 +1048,8 @@ mod state_mutation_tests {
             )
             .unwrap();
 
-        assert!(state.relation_is_present(&object_id("myschema", "t")));
+        assert!(state.relation_is_present(&object_id("public", "t")));
+        assert_eq!(state.local.search_path, ["public"]);
     }
 
     #[test]
@@ -1063,8 +1064,8 @@ mod state_mutation_tests {
             )
             .unwrap();
 
-        assert!(state.relation_is_present(&object_id("tenant", "t")));
-        assert_eq!(state.local.search_path, ["tenant", "public"]);
+        assert!(state.relation_is_present(&object_id("public", "t")));
+        assert_eq!(state.local.search_path, ["public"]);
     }
 
     #[test]
@@ -2153,7 +2154,7 @@ mod state_mutation_tests {
             )
             .unwrap();
 
-        assert_eq!(state.local.search_path, ["app_role", "public"]);
+        assert_eq!(state.local.search_path, ["public"]);
         let RelationOverlay::Present(relation) = state.get_relation(&table).unwrap() else {
             panic!("table missing");
         };

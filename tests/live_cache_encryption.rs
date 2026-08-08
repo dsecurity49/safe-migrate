@@ -89,7 +89,7 @@ fn live_encrypted_cache_round_trip_and_rejection_contract() {
     assert_success(&inspect_output, "encrypted cache inspect");
     let inspection = parse_json(&inspect_output);
     assert_eq!(inspection["encrypted"], true);
-    assert_eq!(inspection["format_version"], 4);
+    assert_eq!(inspection["format_version"], 5);
     assert!(inspection["contents"]["roles"].is_number());
 
     let migration_path = temp_dir.path().join("migration.sql");

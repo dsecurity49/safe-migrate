@@ -1,0 +1,35 @@
+#!/bin/sh
+set -eu
+
+action_ref=${1-}
+cargo_toml=${2-}
+
+[ -n "$action_ref" ] || {
+  printf '%s\n' 'Action reference is required' >&2
+  exit 1
+}
+[ -f "$cargo_toml" ] || {
+  printf 'Cargo manifest does not exist: %s\n' "$cargo_toml" >&2
+  exit 1
+}
+
+package_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$cargo_toml" | head -n 1)
+printf '%s\n' "$package_version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || {
+  printf '%s\n' 'Could not derive an exact semantic safe-migrate version from Cargo.toml' >&2
+  exit 1
+}
+
+if printf '%s\n' "$action_ref" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+  [ "$action_ref" = "v${package_version}" ] || {
+    printf 'Action tag %s does not match package version v%s\n' \
+      "$action_ref" "$package_version" >&2
+    exit 1
+  }
+  printf '%s\n' "$action_ref"
+elif printf '%s\n' "$action_ref" | grep -Eq '^[0-9a-f]{40}$'; then
+  printf 'v%s\n' "$package_version"
+else
+  printf "Published safe-migrate Action references must be an exact semantic tag or full 40-character commit SHA; mutable reference '%s' is not supported\n" \
+    "$action_ref" >&2
+  exit 1
+fi

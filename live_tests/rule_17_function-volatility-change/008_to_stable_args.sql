@@ -1,1 +1,1 @@
-ALTER FUNCTION f(integer) STABLE;
+ALTER FUNCTION sm_core.f(integer) STABLE;

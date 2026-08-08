@@ -7,6 +7,8 @@ use safe_migrate::engine::engine::SafeMigrateEngine;
 use safe_migrate::model::constraint::ConstraintKind;
 use safe_migrate::model::function::{FunctionOverlay, Volatility};
 use safe_migrate::model::relation::{Privilege, RelationKind, RelationOverlay};
+use safe_migrate::model::schema::SchemaOverlay;
+use safe_migrate::model::sequence::{SequenceKind, SequenceOverlay};
 use safe_migrate::model::trigger::TriggerOverlay;
 use safe_migrate::model::types::{TypeKind, TypeOverlay};
 use safe_migrate::sync::populate_cache;
@@ -91,6 +93,8 @@ fn default_transactional() -> bool {
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum ComparisonScope {
+    Schemas,
+    Sequences,
     Relations,
     Columns,
     Indexes,
@@ -107,6 +111,8 @@ enum ComparisonScope {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct NormalizedState {
+    schemas: BTreeMap<String, String>,
+    sequences: BTreeMap<String, NormalizedSequence>,
     relations: BTreeMap<String, NormalizedRelation>,
     indexes: BTreeSet<NormalizedIndex>,
     foreign_keys: BTreeSet<NormalizedForeignKey>,
@@ -118,6 +124,13 @@ struct NormalizedState {
     triggers: BTreeMap<(String, String), NormalizedTrigger>,
     partition_edges: BTreeSet<(String, String)>,
     view_dependencies: BTreeSet<(String, String)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NormalizedSequence {
+    owner: String,
+    owned_by: Option<String>,
+    kind: SequenceKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -193,6 +206,12 @@ struct NormalizedPrivilege {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MismatchCategory {
+    MissingSchemaInSimulator,
+    ExtraSchemaInSimulator,
+    SchemaOwnerMismatch,
+    MissingSequenceInSimulator,
+    ExtraSequenceInSimulator,
+    SequenceDefinitionMismatch,
     MissingObjectInSimulator,
     ExtraObjectInSimulator,
     RelationKindMismatch,
@@ -751,7 +770,9 @@ fn verbose(verbosity: u8, level: u8, message: impl std::fmt::Display) {
 
 fn state_counts(state: &NormalizedState) -> String {
     format!(
-        "relations:{} indexes:{} constraints:{} foreign_keys:{} functions:{} types:{} privileges:{} policies:{} triggers:{} partitions:{} view_dependencies:{}",
+        "schemas:{} sequences:{} relations:{} indexes:{} constraints:{} foreign_keys:{} functions:{} types:{} privileges:{} policies:{} triggers:{} partitions:{} view_dependencies:{}",
+        state.schemas.len(),
+        state.sequences.len(),
         state.relations.len(),
         state.indexes.len(),
         state.constraints.len(),
@@ -1243,6 +1264,29 @@ fn snapshot_live_state(
     let cache = populate_cache(client, Some(schemas))?;
     let mut state = NormalizedState::default();
 
+    if scope.contains(&ComparisonScope::Schemas) {
+        for (name, schema) in &cache.schemas {
+            state
+                .schemas
+                .insert(name.clone(), schema.owner.name.clone());
+        }
+    }
+
+    if scope.contains(&ComparisonScope::Sequences) {
+        for (id, sequence) in &cache.sequences {
+            state.sequences.insert(
+                qualified_name(&id.schema, &id.name),
+                NormalizedSequence {
+                    owner: sequence.owner.name.clone(),
+                    owned_by: sequence.owned_by.as_ref().map(|(table, column)| {
+                        format!("{}.{}", qualified_name(&table.schema, &table.name), column)
+                    }),
+                    kind: sequence.kind.clone(),
+                },
+            );
+        }
+    }
+
     if scope.contains(&ComparisonScope::Policies) {
         for (id, relation) in &cache.relations {
             for policy in &relation.policies {
@@ -1435,6 +1479,35 @@ fn snapshot_live_state(
 fn snapshot_simulator_state(state: &AnalysisState, scope: &[ComparisonScope]) -> NormalizedState {
     let mut projection = NormalizedState::default();
 
+    if scope.contains(&ComparisonScope::Schemas) {
+        for (name, overlay) in &state.local.schemas {
+            let SchemaOverlay::Present(schema) = overlay else {
+                continue;
+            };
+            projection
+                .schemas
+                .insert(name.clone(), schema.owner.name.clone());
+        }
+    }
+
+    if scope.contains(&ComparisonScope::Sequences) {
+        for (id, overlay) in &state.local.sequences {
+            let SequenceOverlay::Present(sequence) = overlay else {
+                continue;
+            };
+            projection.sequences.insert(
+                qualified_name(&id.schema, &id.name),
+                NormalizedSequence {
+                    owner: sequence.owner.name.clone(),
+                    owned_by: sequence.owned_by.as_ref().map(|(table, column)| {
+                        format!("{}.{}", qualified_name(&table.schema, &table.name), column)
+                    }),
+                    kind: sequence.kind.clone(),
+                },
+            );
+        }
+    }
+
     if scope.contains(&ComparisonScope::Policies) {
         for (id, overlay) in &state.local.relations {
             let RelationOverlay::Present(relation) = overlay else {
@@ -1610,6 +1683,80 @@ fn compare_states(
     simulator: &NormalizedState,
 ) -> Vec<Mismatch> {
     let mut mismatches = Vec::new();
+
+    if scope.contains(&ComparisonScope::Schemas) {
+        for (name, live_owner) in &live.schemas {
+            match simulator.schemas.get(name) {
+                None => mismatches.push(Mismatch {
+                    rule_dir: rule_dir.to_string(),
+                    fixture: fixture.to_string(),
+                    category: MismatchCategory::MissingSchemaInSimulator,
+                    root_cause: RootCauseClassification::SimulatorBug,
+                    note: format!("live PostgreSQL kept schema {name}, but simulator removed it"),
+                }),
+                Some(simulator_owner) if simulator_owner != live_owner => {
+                    mismatches.push(Mismatch {
+                        rule_dir: rule_dir.to_string(),
+                        fixture: fixture.to_string(),
+                        category: MismatchCategory::SchemaOwnerMismatch,
+                        root_cause: RootCauseClassification::SimulatorBug,
+                        note: format!(
+                            "schema {name} owner mismatch: live={live_owner}, simulator={simulator_owner}"
+                        ),
+                    });
+                }
+                Some(_) => {}
+            }
+        }
+        for name in simulator.schemas.keys() {
+            if !live.schemas.contains_key(name) {
+                mismatches.push(Mismatch {
+                    rule_dir: rule_dir.to_string(),
+                    fixture: fixture.to_string(),
+                    category: MismatchCategory::ExtraSchemaInSimulator,
+                    root_cause: RootCauseClassification::SimulatorBug,
+                    note: format!("simulator kept schema {name}, but live PostgreSQL removed it"),
+                });
+            }
+        }
+    }
+
+    if scope.contains(&ComparisonScope::Sequences) {
+        for (name, live_sequence) in &live.sequences {
+            match simulator.sequences.get(name) {
+                None => mismatches.push(Mismatch {
+                    rule_dir: rule_dir.to_string(),
+                    fixture: fixture.to_string(),
+                    category: MismatchCategory::MissingSequenceInSimulator,
+                    root_cause: RootCauseClassification::SimulatorBug,
+                    note: format!("live PostgreSQL kept sequence {name}, but simulator removed it"),
+                }),
+                Some(simulator_sequence) if simulator_sequence != live_sequence => {
+                    mismatches.push(Mismatch {
+                        rule_dir: rule_dir.to_string(),
+                        fixture: fixture.to_string(),
+                        category: MismatchCategory::SequenceDefinitionMismatch,
+                        root_cause: RootCauseClassification::SimulatorBug,
+                        note: format!(
+                            "sequence {name} mismatch: live={live_sequence:?}, simulator={simulator_sequence:?}"
+                        ),
+                    });
+                }
+                Some(_) => {}
+            }
+        }
+        for name in simulator.sequences.keys() {
+            if !live.sequences.contains_key(name) {
+                mismatches.push(Mismatch {
+                    rule_dir: rule_dir.to_string(),
+                    fixture: fixture.to_string(),
+                    category: MismatchCategory::ExtraSequenceInSimulator,
+                    root_cause: RootCauseClassification::SimulatorBug,
+                    note: format!("simulator kept sequence {name}, but live PostgreSQL removed it"),
+                });
+            }
+        }
+    }
 
     if scope.contains(&ComparisonScope::Relations) {
         for (name, live_relation) in &live.relations {

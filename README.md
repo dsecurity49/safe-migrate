@@ -24,7 +24,7 @@ safe-migrate --version
 
 ### Prebuilt binary
 
-The installer detects supported Linux, macOS, and Termux targets, verifies the
+The installer detects supported Linux, macOS, Windows/MSYS, and Termux targets, verifies the
 release checksum, and installs the latest published binary:
 
 ```bash
@@ -188,7 +188,8 @@ its review.
 no command-line flag for it. If refresh fails, safe-migrate prints the cause and
 continues with the previous readable cache; the old cache is replaced only
 after a new cache has been written successfully. `--no-cache` bypasses
-automatic sync.
+automatic sync. The previous cache must already be V5; an unsupported V1–V4
+cache cannot be reused after a failed refresh.
 
 ### Cache encryption
 
@@ -216,6 +217,9 @@ database:
 ```bash
 safe-migrate sync
 ```
+
+v0.4.5 uses Cache V5, which adds authoritative schema and sequence catalogs.
+Caches written by v0.4.4 and earlier require this resynchronization.
 
 Use `safe-migrate cache inspect` to view cache provenance and redacted object
 and role counts without connecting to PostgreSQL. It never lists role names or
@@ -256,17 +260,20 @@ The engine evaluates these 26 primary rules:
 
 ## GitHub Actions
 
-The reusable Action creates JSON and Markdown artifacts without connecting to a
-database. It defaults to `no-cache: "true"` because files in a pull-request
-checkout are controlled by that pull request.
+The reusable Action downloads and verifies the exact release binary, creates
+JSON and Markdown artifacts, appends the Markdown report to the job summary,
+and emits Tier 1 errors and Tier 2 warnings as source annotations. It does not
+connect to a database and defaults to `no-cache: "true"` because files in a
+pull-request checkout are controlled by that pull request.
 
 ```yaml
 - id: safe_migrate
-  uses: dsecurity49/safe-migrate@v0.4.4
+  uses: dsecurity49/safe-migrate@v0.4.5
   with:
     mode: lint-chain
     path: migrations
     output-dir: safe-migrate-artifacts
+    advisory: "false"
 
 - uses: actions/upload-artifact@v4
   if: always()
@@ -283,7 +290,11 @@ Set `config: safe-migrate.toml` to use a reviewed project configuration. When
 not read `safe-migrate.toml` from the pull-request workspace.
 
 The Action exposes `json-report`, `markdown-report`, `diagnostic-log`, and
-`exit-code`.
+`exit-code`. Set `advisory: "true"` to keep a completed analysis with Tier 1
+findings from failing the job; its `exit-code` output remains `2`. Operational
+errors always fail. Published uses must be pinned to an exact semantic tag or a
+full commit SHA; mutable branch references are rejected. Local `uses: ./`
+testing retains locked source installation.
 
 ## Documentation
 

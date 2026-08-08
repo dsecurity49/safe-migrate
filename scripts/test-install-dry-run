@@ -33,15 +33,18 @@ fi
 # Exercise real installer integrity handling without network access.
 archive_root="$test_tmp/archive"
 archive="$test_tmp/safe-migrate-x86_64-unknown-linux-musl.tar.gz"
+zip_archive="$test_tmp/safe-migrate-x86_64-pc-windows-msvc.zip"
 mkdir "$archive_root"
 printf '%s\n' '#!/bin/sh' 'printf "mock safe-migrate\n"' > "$archive_root/safe-migrate"
 chmod +x "$archive_root/safe-migrate"
 tar -czf "$archive" -C "$archive_root" safe-migrate
+cp "$archive_root/safe-migrate" "$archive_root/safe-migrate.exe"
+(cd "$archive_root" && zip -q "$zip_archive" safe-migrate.exe)
 
 mock_dir="$test_tmp/mock-commands"
 mkdir "$mock_dir"
 for command_name in \
-  uname tar gzip sed head grep mktemp cp chmod mkdir mv rm cut cat find sha256sum
+  uname tar gzip unzip sed head grep mktemp cp chmod mkdir mv rm cut cat find sha256sum
 do
   ln -s "$(command -v "$command_name")" "$mock_dir/$command_name"
 done
@@ -74,6 +77,7 @@ printf '%s\n' \
   '    esac' \
   '    ;;' \
   '  *.tar.gz) cp "$MOCK_ARCHIVE" "$output" ;;' \
+  '  *.zip) cp "$MOCK_ARCHIVE" "$output" ;;' \
   '  *) exit 22 ;;' \
   'esac' \
   > "$mock_curl"
@@ -121,3 +125,15 @@ run_mock_install missing 1
 run_mock_install malformed 1
 run_mock_install mismatch 1
 run_mock_install valid 0
+
+zip_case="$test_tmp/zip"
+mkdir "$zip_case"
+PATH="$mock_dir" \
+  MOCK_ARCHIVE="$zip_archive" \
+  MOCK_CHECKSUM_MODE=valid \
+  /bin/sh "$repo_root/install.sh" \
+    --version v0.4.2 \
+    --target x86_64-pc-windows-msvc \
+    --install-dir "$zip_case/install" \
+    >"$zip_case/output" 2>&1
+test -x "$zip_case/install/safe-migrate.exe"

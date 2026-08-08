@@ -1,1 +1,1 @@
-DROP FUNCTION f();
+DROP FUNCTION sm_core.f();

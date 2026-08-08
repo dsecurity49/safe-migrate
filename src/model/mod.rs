@@ -5,6 +5,7 @@ pub mod function;
 pub mod relation;
 pub mod replication;
 pub mod role;
+pub mod schema;
 pub mod sequence;
 pub mod trigger;
 pub mod types;

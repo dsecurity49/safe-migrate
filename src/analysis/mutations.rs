@@ -14,6 +14,7 @@ pub enum PersistenceMutation {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Mutation {
     CreateSchema(CreateSchemaMutation),
+    AlterSchema(AlterSchemaMutation),
     DropSchema(DropSchemaMutation),
     CreateTable(CreateTable),
     CreateView(CreateView),
@@ -91,6 +92,19 @@ pub enum Mutation {
 pub struct CreateSchemaMutation {
     pub name: String,
     pub if_not_exists: bool,
+    pub authorization: Option<crate::analysis::facts::RoleFact>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum AlterSchemaMutation {
+    Rename {
+        old_name: String,
+        new_name: String,
+    },
+    OwnerTo {
+        name: String,
+        new_owner: crate::analysis::facts::RoleFact,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -165,7 +179,17 @@ pub struct CreateSequenceMutation {
 #[derive(Clone, Debug, PartialEq)]
 pub struct AlterSequenceMutation {
     pub id: ObjectId,
-    pub owned_by: Option<(ObjectId, String)>,
+    pub if_exists: bool,
+    pub action: AlterSequenceActionMutation,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum AlterSequenceActionMutation {
+    OwnedBy(Option<(ObjectId, String)>),
+    OwnerTo(crate::analysis::facts::RoleFact),
+    RenameTo(ObjectId),
+    SetSchema(ObjectId),
+    Other,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -250,6 +274,7 @@ pub struct ColumnMutation {
     pub is_unique: bool,
     pub unique_constraint_name: Option<String>,
     pub default: Option<ExprIr>,
+    pub generation: crate::analysis::facts::ColumnGeneration,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -493,6 +518,7 @@ pub enum AlterTableActionMutation {
         not_null: bool,
         default: Option<ExprIr>,
         depends_on: Option<(ObjectId, String)>,
+        generation: crate::analysis::facts::ColumnGeneration,
     },
     DropColumn {
         name: String,
@@ -561,6 +587,7 @@ pub enum AlterTableActionMutation {
     },
     AttachPartition {
         child: ObjectId,
+        strategy: Option<String>,
     },
     DetachPartition {
         child: ObjectId,

@@ -3,9 +3,7 @@ use std::io::Write;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use safe_migrate::ast::identifiers::ObjectId;
-use safe_migrate::db::cache::{
-    CACHE_V3_MAGIC, CACHE_V4_MAGIC, DbCache, DbCacheV2, DbCacheVersioned,
-};
+use safe_migrate::db::cache::{CACHE_V5_MAGIC, DbCache, DbCacheVersioned};
 use safe_migrate::model::relation::{Persistence, RelationKind, RelationState};
 
 fn parse_json_stdout(output: &std::process::Output) -> serde_json::Value {
@@ -41,9 +39,13 @@ fn write_cache_with_timestamp(path: &std::path::Path, created_at_unix_secs: u64)
     let mut compressed = Vec::new();
     let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3).unwrap();
     let config = bincode::config::standard().with_variable_int_encoding();
-    encoder.write_all(CACHE_V4_MAGIC).unwrap();
-    bincode::serde::encode_into_std_write(DbCacheVersioned::V4(cache), &mut encoder, config)
-        .unwrap();
+    encoder.write_all(CACHE_V5_MAGIC).unwrap();
+    bincode::serde::encode_into_std_write(
+        DbCacheVersioned::V5(Box::new(cache)),
+        &mut encoder,
+        config,
+    )
+    .unwrap();
     encoder.finish().unwrap();
     fs::write(path, compressed).unwrap();
 }
@@ -133,8 +135,8 @@ fn test_cli_lint_invalid_cache() {
 fn test_cli_rejects_cache_with_oversized_decoded_container() {
     let config = bincode::config::standard().with_variable_int_encoding();
     let encoded =
-        bincode::serde::encode_to_vec(DbCacheVersioned::V4(DbCache::new()), config).unwrap();
-    assert_eq!(&encoded[..4], &[3, 0, 0, 0]);
+        bincode::serde::encode_to_vec(DbCacheVersioned::V5(Box::default()), config).unwrap();
+    assert_eq!(&encoded[..4], &[4, 0, 0, 0]);
 
     let mut malicious = encoded[..3].to_vec();
     malicious.push(1);
@@ -143,7 +145,7 @@ fn test_cli_rejects_cache_with_oversized_decoded_container() {
 
     let mut compressed = Vec::new();
     let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3).unwrap();
-    encoder.write_all(CACHE_V4_MAGIC).unwrap();
+    encoder.write_all(CACHE_V5_MAGIC).unwrap();
     encoder.write_all(&malicious).unwrap();
     encoder.finish().unwrap();
 
@@ -166,20 +168,9 @@ fn test_cli_rejects_cache_with_oversized_decoded_container() {
 
 #[test]
 fn test_cache_inspect_rejects_unsupported_legacy_cache_without_exposing_its_version() {
-    let legacy = DbCacheV2 {
-        pg_version_num: Some(160000),
-        relations: Default::default(),
-        foreign_keys: Vec::new(),
-        indexes: Vec::new(),
-        triggers: Vec::new(),
-        functions: Default::default(),
-        dependencies: Vec::new(),
-    };
-    let config = bincode::config::standard().with_variable_int_encoding();
-    let payload = bincode::serde::encode_to_vec(DbCacheVersioned::V2(legacy), config).unwrap();
     let mut compressed = Vec::new();
     let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3).unwrap();
-    encoder.write_all(&payload).unwrap();
+    encoder.write_all(b"legacy unheadered cache").unwrap();
     encoder.finish().unwrap();
 
     let cache = tempfile::NamedTempFile::new().unwrap();
@@ -201,13 +192,11 @@ fn test_cache_inspect_rejects_unsupported_legacy_cache_without_exposing_its_vers
 }
 
 #[test]
-fn test_cache_inspect_reads_headered_v3_cache() {
-    let config = bincode::config::standard().with_variable_int_encoding();
-    let v3 = safe_migrate::db::cache::DbCacheV3::from(DbCache::new());
+fn test_cache_inspect_rejects_headered_v3_cache() {
     let mut compressed = Vec::new();
     let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3).unwrap();
-    encoder.write_all(CACHE_V3_MAGIC).unwrap();
-    bincode::serde::encode_into_std_write(DbCacheVersioned::V3(v3), &mut encoder, config).unwrap();
+    encoder.write_all(b"SMCACHE03").unwrap();
+    encoder.write_all(b"legacy v3 payload").unwrap();
     encoder.finish().unwrap();
     let cache = tempfile::NamedTempFile::new().unwrap();
     fs::write(cache.path(), compressed).unwrap();
@@ -220,8 +209,10 @@ fn test_cache_inspect_reads_headered_v3_cache() {
         .arg(cache.path())
         .arg("--json")
         .assert()
-        .success();
-    assert_eq!(parse_json_stdout(assert.get_output())["format_version"], 3);
+        .failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(stderr.contains("unsupported cache format"));
+    assert!(!stderr.contains("V3"));
 }
 
 #[test]
@@ -275,11 +266,13 @@ fn test_cache_inspect_outputs_a_redacted_json_summary() {
     let report = parse_json_stdout(assert.get_output());
 
     assert_eq!(report["path"], cache_path.display().to_string());
-    assert_eq!(report["format_version"], 4);
+    assert_eq!(report["format_version"], 5);
     assert_eq!(report["encrypted"], false);
     assert!(report["contents"]["relations"].is_number());
     assert!(report["contents"]["columns"].is_number());
     assert!(report["contents"]["roles"].is_number());
+    assert!(report["contents"]["schemas"].is_number());
+    assert!(report["contents"]["sequences"].is_number());
     assert!(report.get("relation_names").is_none());
     assert!(report.get("database_url").is_none());
 }

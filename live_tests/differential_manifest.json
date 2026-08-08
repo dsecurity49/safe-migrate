@@ -6,7 +6,9 @@
       "fixtures": [
         "001_cascade.sql",
         "002_cascade_if_exists.sql",
-        "009_cascade_upper.sql"
+        "009_cascade_upper.sql",
+        "safe_003_create.sql",
+        "safe_004_rename.sql"
       ],
       "excluded_fixtures": [
         {
@@ -42,20 +44,12 @@
           "reason": "PostgreSQL correctly rejects dropping the populated public schema with RESTRICT."
         },
         {
-          "fixture": "safe_003_create.sql",
-          "reason": "Schema existence is not represented in normalized simulator state."
-        },
-        {
-          "fixture": "safe_004_rename.sql",
-          "reason": "Schema rename state is not yet represented separately from relation rename mutations."
-        },
-        {
           "fixture": "safe_005_drop_if_exists_no_cascade.sql",
           "reason": "PostgreSQL correctly rejects dropping the populated public schema without CASCADE."
         },
         {
           "fixture": "safe_006_create_auth.sql",
-          "reason": "Schema ownership and existence are not represented in normalized simulator state."
+          "reason": "Requires a postgres role, while the differential matrix intentionally runs as its harness-specific safe_migrate role."
         },
         {
           "fixture": "safe_007_multi_no_cascade.sql",
@@ -78,9 +72,12 @@
         "sm_billing",
         "sm_fulfillment",
         "sm_audit",
-        "sm_analytics"
+        "sm_analytics",
+        "staging",
+        "pub"
       ],
       "scope": [
+        "schemas",
         "relations",
         "indexes",
         "foreign_keys",
@@ -333,7 +330,7 @@
         "007_lossy_numeric_to_int.sql",
         "008_rewrite_bigint_to_int.sql",
         "009_lossy_timestamptz_to_date.sql",
-        "010_rewrite_float_to_numeric.sql",
+        "010_rewrite_numeric_to_float.sql",
         "011_lossy_numeric.sql",
         "012_lossy_timestamptz_to_date.sql",
         "013_lossy_varchar.sql",
@@ -940,7 +937,8 @@
         "safe_003_alter_known_table.sql",
         "safe_004_create_view.sql",
         "safe_005_create_index.sql",
-        "safe_008_rename_known_table.sql"
+        "safe_008_rename_known_table.sql",
+        "safe_009_create_seq.sql"
       ],
       "excluded_fixtures": [
         {
@@ -990,10 +988,6 @@
         {
           "fixture": "safe_007_insert.sql",
           "reason": "Data writes do not change normalized schema state."
-        },
-        {
-          "fixture": "safe_009_create_seq.sql",
-          "reason": "Sequence state is not yet hydrated or normalized by the differential harness."
         }
       ],
       "schemas": [
@@ -1015,6 +1009,9 @@
       "fixture_scopes": {
         "safe_004_create_view.sql": [
           "relations"
+        ],
+        "safe_009_create_seq.sql": [
+          "sequences"
         ]
       },
       "required_relations": [
@@ -1269,7 +1266,7 @@
       "rule_dir": "rule_16_broken-compute",
       "enabled": true,
       "fixtures": [
-        "005_drop_func_public.sql",
+        "safe_019_drop_func_public.sql",
         "safe_003_drop_func_cascade.sql",
         "safe_003_alter_table.sql",
         "safe_005_drop_table.sql",
@@ -1715,6 +1712,7 @@
         "safe_003_add_unique_constraint.sql",
         "safe_004_add_not_null.sql",
         "safe_005_create_view.sql",
+        "safe_006_create_seq.sql",
         "safe_007_grant_select.sql",
         "safe_010_role_transaction_semantics.sql",
         "safe_011_session_authorization.sql",
@@ -1809,10 +1807,6 @@
           "reason": "Fixture requires baseline column c, while participating add-column chains require c to be absent."
         },
         {
-          "fixture": "safe_006_create_seq.sql",
-          "reason": "Sequence state is not yet synchronized or normalized by the differential harness."
-        },
-        {
           "fixture": "safe_008_insert.sql",
           "reason": "Data writes are outside the normalized schema-state comparison."
         },
@@ -1855,6 +1849,9 @@
         "safe_005_create_view.sql": [
           "relations",
           "view_dependencies"
+        ],
+        "safe_006_create_seq.sql": [
+          "sequences"
         ],
         "safe_007_grant_select.sql": [
           "privileges"

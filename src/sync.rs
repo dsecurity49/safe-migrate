@@ -1,7 +1,7 @@
 // FILE: src/sync.rs
 
 use crate::ast::identifiers::ObjectId;
-use crate::db::cache::{CACHE_V4_MAGIC, DbCache, DbCacheVersioned, ForeignKeyCache, IndexCache};
+use crate::db::cache::{CACHE_V5_MAGIC, DbCache, DbCacheVersioned, ForeignKeyCache, IndexCache};
 use crate::db::cache_file::protect_cache_bytes;
 use crate::model::relation::{Persistence, RelationKind, RelationState};
 use anyhow::{Context, Result};
@@ -146,10 +146,10 @@ fn write_cache_with_protection(
         .context("Failed to init zstd compression")?;
 
     encoder
-        .write_all(CACHE_V4_MAGIC)
-        .context("Failed to write cache V4 payload header")?;
+        .write_all(CACHE_V5_MAGIC)
+        .context("Failed to write cache V5 payload header")?;
 
-    let versioned = DbCacheVersioned::V4(cache);
+    let versioned = DbCacheVersioned::V5(Box::new(cache));
     let bincode_config = bincode::config::standard().with_variable_int_encoding();
 
     bincode::serde::encode_into_std_write(&versioned, &mut encoder, bincode_config)
@@ -302,6 +302,101 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
     // schemas retain their live PostgreSQL priority.
     let search_path_row = client.query_one("SELECT current_schemas(false);", &[])?;
     cache.search_path = cache_search_path(search_path_row.get(0), schemas);
+
+    // Schemas are an authoritative catalog only for the requested sync scope.
+    // FK-only external schemas pulled in below deliberately do not enter it.
+    let schema_query = format!(
+        "SELECT n.nspname, pg_catalog.pg_get_userbyid(n.nspowner)
+         FROM pg_namespace n
+         WHERE n.nspname NOT LIKE 'pg\\_%' ESCAPE '\\'
+           AND n.nspname <> 'information_schema'
+           {schema_filter}
+         ORDER BY n.nspname;"
+    );
+    for row in client.query(&schema_query, &[&schema_values])? {
+        let name: String = row.get(0);
+        let owner: String = row.get(1);
+        cache.schemas.insert(
+            name.clone(),
+            crate::model::schema::SchemaState {
+                name,
+                owner: relation_owner_id(owner),
+                generation: 0,
+            },
+        );
+    }
+    // A scoped request can name schemas that do not exist yet. PostgreSQL's
+    // effective search path skips those entries, so do not let them become
+    // inferred-present namespaces when the cache is hydrated.
+    cache
+        .search_path
+        .retain(|schema| cache.schemas.contains_key(schema));
+
+    // A sequence can have at most one pg_depend ownership relationship. The
+    // dependency flavor distinguishes identity's internal dependency from an
+    // ordinary OWNED BY relationship. An auto dependency is serial-like only
+    // when the owning column also has the sequence-backed nextval default.
+    let sequence_query = format!(
+        "SELECT
+             n.nspname AS sequence_schema,
+             s.relname AS sequence_name,
+             pg_catalog.pg_get_userbyid(s.relowner) AS owner_name,
+             tn.nspname AS table_schema,
+             t.relname AS table_name,
+             a.attname AS column_name,
+             d.deptype::text AS dependency_type,
+             CASE WHEN ad.adbin IS NULL THEN false
+                  ELSE pg_catalog.pg_get_expr(ad.adbin, ad.adrelid) LIKE '%nextval(%'
+             END AS has_nextval_default
+         FROM pg_class s
+         JOIN pg_namespace n ON n.oid = s.relnamespace
+         LEFT JOIN pg_depend d
+           ON d.classid = 'pg_class'::regclass
+          AND d.objid = s.oid
+          AND d.objsubid = 0
+          AND d.refclassid = 'pg_class'::regclass
+          AND d.deptype IN ('a', 'i')
+         LEFT JOIN pg_class t ON t.oid = d.refobjid
+         LEFT JOIN pg_namespace tn ON tn.oid = t.relnamespace
+         LEFT JOIN pg_attribute a
+           ON a.attrelid = d.refobjid AND a.attnum = d.refobjsubid
+         LEFT JOIN pg_attrdef ad
+           ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum
+         WHERE s.relkind = 'S'
+           AND n.nspname NOT LIKE 'pg\\_%' ESCAPE '\\'
+           AND n.nspname <> 'information_schema'
+           {schema_filter}
+         ORDER BY n.nspname, s.relname;"
+    );
+    for row in client.query(&sequence_query, &[&schema_values])? {
+        let id = ObjectId::new(row.get::<_, String>(0), row.get::<_, String>(1));
+        let owner = relation_owner_id(row.get::<_, String>(2));
+        let table_schema: Option<String> = row.get(3);
+        let table_name: Option<String> = row.get(4);
+        let column_name: Option<String> = row.get(5);
+        let dependency_type: Option<String> = row.get(6);
+        let has_nextval_default: bool = row.get(7);
+        let owned_by = table_schema
+            .zip(table_name)
+            .zip(column_name)
+            .map(|((schema, table), column)| (ObjectId::new(schema, table), column));
+        let kind = match dependency_type.as_deref() {
+            Some("i") => crate::model::sequence::SequenceKind::Identity,
+            Some("a") if has_nextval_default => crate::model::sequence::SequenceKind::SerialLike,
+            Some("a") => crate::model::sequence::SequenceKind::Owned,
+            _ => crate::model::sequence::SequenceKind::Standalone,
+        };
+        cache.sequences.insert(
+            id.clone(),
+            crate::model::sequence::SequenceState {
+                id,
+                owner,
+                owned_by,
+                kind,
+                generation: 0,
+            },
+        );
+    }
 
     // Query 2: Relations + Staleness
     let table_query = format!(
@@ -991,8 +1086,8 @@ mod atomic_write_tests {
         let mut payload = Vec::new();
         decoder.read_to_end(&mut payload).unwrap();
         let payload = payload
-            .strip_prefix(CACHE_V4_MAGIC)
-            .expect("writer must prefix V4 cache payloads");
+            .strip_prefix(CACHE_V5_MAGIC)
+            .expect("writer must prefix V5 cache payloads");
         let config = bincode::config::standard().with_variable_int_encoding();
         let versioned: DbCacheVersioned = bincode::serde::decode_from_slice(payload, config)
             .unwrap()

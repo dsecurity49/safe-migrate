@@ -4,6 +4,8 @@ use crate::model::constraint::ConstraintState;
 use crate::model::function::FunctionState;
 use crate::model::relation::RelationState;
 use crate::model::role::RoleState;
+use crate::model::schema::SchemaState;
+use crate::model::sequence::SequenceState;
 use crate::model::trigger::TriggerEnableMode;
 use crate::model::types::TypeState;
 use serde::{Deserialize, Serialize};
@@ -28,13 +30,6 @@ pub struct TriggerCache {
     pub table_id: ObjectId,
     pub function_id: ObjectId,
     pub enabled_mode: TriggerEnableMode,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LegacyTriggerCache {
-    pub trigger_id: ObjectId,
-    pub table_id: ObjectId,
-    pub function_id: ObjectId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,56 +68,6 @@ pub struct CacheMetadata {
     pub schemas: Option<Vec<String>>,
 }
 
-/// Metadata layout written by cache V3. Keep this byte-for-byte stable so V3
-/// remains readable after the current cache schema evolves.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct CacheMetadataV3 {
-    pub created_at_unix_secs: Option<u64>,
-    pub source_database: Option<String>,
-    pub schemas: Option<Vec<String>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DbCacheV1 {
-    pub pg_version_num: Option<u32>,
-    pub relations: HashMap<ObjectId, RelationState>,
-    #[serde(default)]
-    pub foreign_keys: Vec<ForeignKeyCache>,
-    #[serde(default)]
-    pub indexes: Vec<IndexCache>,
-    #[serde(default)]
-    pub triggers: Vec<LegacyTriggerCache>,
-    #[serde(default)]
-    pub functions: HashMap<ObjectId, FunctionState>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DbCacheV2 {
-    pub pg_version_num: Option<u32>,
-    pub relations: HashMap<ObjectId, RelationState>,
-    pub foreign_keys: Vec<ForeignKeyCache>,
-    pub indexes: Vec<IndexCache>,
-    pub triggers: Vec<LegacyTriggerCache>,
-    pub functions: HashMap<ObjectId, FunctionState>,
-    pub dependencies: Vec<DependencyCache>,
-}
-
-/// Cache layout written by safe-migrate v0.4.3.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DbCacheV3 {
-    pub pg_version_num: Option<u32>,
-    pub metadata: CacheMetadataV3,
-    pub search_path: Vec<String>,
-    pub relations: HashMap<ObjectId, RelationState>,
-    pub foreign_keys: Vec<ForeignKeyCache>,
-    pub indexes: Vec<IndexCache>,
-    pub constraints: Vec<ConstraintState>,
-    pub triggers: Vec<TriggerCache>,
-    pub functions: HashMap<ObjectId, FunctionState>,
-    pub types: HashMap<ObjectId, TypeState>,
-    pub dependencies: Vec<DependencyCache>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DbCache {
     pub pg_version_num: Option<u32>,
@@ -136,91 +81,48 @@ pub struct DbCache {
     pub functions: HashMap<ObjectId, FunctionState>,
     pub types: HashMap<ObjectId, TypeState>,
     pub roles: HashMap<ObjectId, RoleState>,
+    pub schemas: HashMap<String, SchemaState>,
+    pub sequences: HashMap<ObjectId, SequenceState>,
     pub dependencies: Vec<DependencyCache>,
 }
 
-pub const CACHE_FORMAT_VERSION: u32 = 4;
+pub const CACHE_FORMAT_VERSION: u32 = 5;
 
-/// Prefixes every V3 payload after zstd decompression. Older caches did not
-/// have a payload header, so this prevents their bincode V3 discriminator from
-/// being mistaken for the redesigned V3 schema.
-pub const CACHE_V3_MAGIC: &[u8] = b"SMCACHE03";
-pub const CACHE_V4_MAGIC: &[u8] = b"SMCACHE04";
+pub const CACHE_V5_MAGIC: &[u8] = b"SMCACHE05";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DbCacheVersioned {
-    V1(DbCacheV1),
-    V2(DbCacheV2),
-    V3(DbCacheV3),
-    V4(DbCache),
+    // Unit variants reserve the historic bincode discriminants. The reader
+    // rejects non-V5 headers before decoding, so legacy layouts are not part
+    // of the production model and cannot be converted accidentally.
+    V1,
+    V2,
+    V3,
+    V4,
+    V5(Box<DbCache>),
 }
 
 impl DbCacheVersioned {
     pub fn format_version(&self) -> u32 {
         match self {
-            DbCacheVersioned::V1(_) => 1,
-            DbCacheVersioned::V2(_) => 2,
-            DbCacheVersioned::V3(_) => 3,
-            DbCacheVersioned::V4(_) => 4,
+            DbCacheVersioned::V1 => 1,
+            DbCacheVersioned::V2 => 2,
+            DbCacheVersioned::V3 => 3,
+            DbCacheVersioned::V4 => 4,
+            DbCacheVersioned::V5(_) => 5,
         }
     }
 
     pub fn into_cache(self) -> Result<DbCache, String> {
         match self {
-            DbCacheVersioned::V1(_) | DbCacheVersioned::V2(_) => Err(
+            DbCacheVersioned::V1
+            | DbCacheVersioned::V2
+            | DbCacheVersioned::V3
+            | DbCacheVersioned::V4 => Err(
                 "This cache format is unsupported. Run `safe-migrate sync` to rebuild it."
                     .to_string(),
             ),
-            DbCacheVersioned::V3(c) => Ok(c.into()),
-            DbCacheVersioned::V4(c) => Ok(c),
-        }
-    }
-}
-
-impl From<DbCacheV3> for DbCache {
-    fn from(cache: DbCacheV3) -> Self {
-        Self {
-            pg_version_num: cache.pg_version_num,
-            metadata: CacheMetadata {
-                created_at_unix_secs: cache.metadata.created_at_unix_secs,
-                source_database: cache.metadata.source_database,
-                source_role: None,
-                source_session_role: None,
-                source_search_path: None,
-                schemas: cache.metadata.schemas,
-            },
-            search_path: cache.search_path,
-            relations: cache.relations,
-            foreign_keys: cache.foreign_keys,
-            indexes: cache.indexes,
-            constraints: cache.constraints,
-            triggers: cache.triggers,
-            functions: cache.functions,
-            types: cache.types,
-            roles: HashMap::new(),
-            dependencies: cache.dependencies,
-        }
-    }
-}
-
-impl From<DbCache> for DbCacheV3 {
-    fn from(cache: DbCache) -> Self {
-        Self {
-            pg_version_num: cache.pg_version_num,
-            metadata: CacheMetadataV3 {
-                created_at_unix_secs: cache.metadata.created_at_unix_secs,
-                source_database: cache.metadata.source_database,
-                schemas: cache.metadata.schemas,
-            },
-            search_path: cache.search_path,
-            relations: cache.relations,
-            foreign_keys: cache.foreign_keys,
-            indexes: cache.indexes,
-            constraints: cache.constraints,
-            triggers: cache.triggers,
-            functions: cache.functions,
-            types: cache.types,
-            dependencies: cache.dependencies,
+            DbCacheVersioned::V5(c) => Ok(*c),
         }
     }
 }
@@ -245,6 +147,8 @@ impl DbCache {
             functions: HashMap::new(),
             types: HashMap::new(),
             roles: HashMap::new(),
+            schemas: HashMap::new(),
+            sequences: HashMap::new(),
             dependencies: Vec::new(),
         }
     }
@@ -263,36 +167,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn legacy_v1_cache_is_rejected() {
-        let cache = DbCacheV1 {
-            pg_version_num: None,
-            relations: HashMap::new(),
-            foreign_keys: Vec::new(),
-            indexes: Vec::new(),
-            triggers: Vec::new(),
-            functions: HashMap::new(),
-        };
-        let versioned = DbCacheVersioned::V1(cache);
-        assert_eq!(versioned.format_version(), 1);
-        let result = versioned.into_cache();
-        assert_eq!(
-            result.unwrap_err(),
-            "This cache format is unsupported. Run `safe-migrate sync` to rebuild it."
-        );
+    fn every_legacy_cache_variant_is_rejected_generically() {
+        for (versioned, expected_version) in [
+            (DbCacheVersioned::V1, 1),
+            (DbCacheVersioned::V2, 2),
+            (DbCacheVersioned::V3, 3),
+            (DbCacheVersioned::V4, 4),
+        ] {
+            assert_eq!(versioned.format_version(), expected_version);
+            assert_eq!(
+                versioned.into_cache().unwrap_err(),
+                "This cache format is unsupported. Run `safe-migrate sync` to rebuild it."
+            );
+        }
     }
 
     #[test]
-    fn current_cache_format_is_v4() {
-        assert_eq!(CACHE_FORMAT_VERSION, 4);
-        assert_eq!(DbCacheVersioned::V4(DbCache::new()).format_version(), 4);
-        assert_eq!(CACHE_V3_MAGIC, b"SMCACHE03");
-        assert_eq!(CACHE_V4_MAGIC, b"SMCACHE04");
-    }
-
-    #[test]
-    fn v3_cache_remains_readable_without_inventing_a_source_role() {
-        let v3 = DbCacheV3::from(DbCache::new());
-        let cache = DbCacheVersioned::V3(v3).into_cache().unwrap();
-        assert_eq!(cache.metadata.source_role, None);
+    fn current_cache_format_is_v5() {
+        assert_eq!(CACHE_FORMAT_VERSION, 5);
+        assert_eq!(DbCacheVersioned::V5(Box::default()).format_version(), 5);
+        assert_eq!(CACHE_V5_MAGIC, b"SMCACHE05");
     }
 }

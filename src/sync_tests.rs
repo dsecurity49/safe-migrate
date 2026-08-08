@@ -168,7 +168,7 @@ mod tests {
         );
 
         // Serialize to JSON
-        let versioned = crate::db::cache::DbCacheVersioned::V4(cache);
+        let versioned = crate::db::cache::DbCacheVersioned::V5(Box::new(cache));
         let config = bincode::config::standard().with_variable_int_encoding();
         let encoded = bincode::serde::encode_to_vec(&versioned, config).unwrap();
 
@@ -177,8 +177,8 @@ mod tests {
             bincode::serde::decode_from_slice(&encoded, config)
                 .unwrap()
                 .0;
-        let crate::db::cache::DbCacheVersioned::V4(deserialized) = decoded else {
-            panic!("Expected V4");
+        let crate::db::cache::DbCacheVersioned::V5(deserialized) = decoded else {
+            panic!("Expected V5");
         };
         assert_eq!(deserialized.pg_version_num, Some(160000));
         assert_eq!(
@@ -254,15 +254,15 @@ mod tests {
         });
         cache.insert_baseline(id.clone(), rel);
 
-        let versioned = crate::db::cache::DbCacheVersioned::V4(cache);
+        let versioned = crate::db::cache::DbCacheVersioned::V5(Box::new(cache));
         let config = bincode::config::standard().with_variable_int_encoding();
         let encoded = bincode::serde::encode_to_vec(&versioned, config).unwrap();
         let decoded: crate::db::cache::DbCacheVersioned =
             bincode::serde::decode_from_slice(&encoded, config)
                 .unwrap()
                 .0;
-        let crate::db::cache::DbCacheVersioned::V4(deserialized) = decoded else {
-            panic!("Expected V4");
+        let crate::db::cache::DbCacheVersioned::V5(deserialized) = decoded else {
+            panic!("Expected V5");
         };
         let rel = deserialized.relations.get(&id).unwrap();
         assert_eq!(rel.columns[0].default_expr_text, Some("now()".into()));
@@ -283,18 +283,10 @@ mod tests {
     }
 
     #[test]
-    fn test_v3_cache_preserves_provenance() {
-        let mut v3 = DbCache::new();
-        v3.pg_version_num = Some(160000);
-        v3.metadata.created_at_unix_secs = Some(1_700_000_000);
-        v3.metadata.source_database = Some("app".into());
-
-        let cache = crate::db::cache::DbCacheVersioned::V3(v3.into())
+    fn test_v3_cache_requires_resync() {
+        let error = crate::db::cache::DbCacheVersioned::V3
             .into_cache()
-            .unwrap();
-        assert_eq!(cache.pg_version_num, Some(160000));
-        assert_eq!(cache.metadata.created_at_unix_secs, Some(1_700_000_000));
-        assert_eq!(cache.metadata.source_database.as_deref(), Some("app"));
-        assert_eq!(cache.metadata.source_role, None);
+            .unwrap_err();
+        assert!(error.contains("unsupported"));
     }
 }

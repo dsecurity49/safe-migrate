@@ -174,43 +174,51 @@ impl Rule for PartitionStrategyMismatchRule {
         let mut violations = Vec::new();
 
         if let Mutation::AlterTable(alter) = mutation
-            && let AlterTableActionMutation::AttachPartition { child } = &alter.action
+            && let AlterTableActionMutation::AttachPartition { child, strategy } = &alter.action
         {
             let parent_partition_type = pre_state
                 .relations
                 .get(&alter.id)
                 .and_then(|rel| rel.partition_type.clone());
 
-            let partition_partition_type = pre_state
-                .relations
-                .get(child)
-                .and_then(|rel| rel.partition_type.clone());
-
             if let Some(parent_type) = parent_partition_type {
-                match partition_partition_type {
-                    Some(part_type)
-                        if !part_type
-                            .to_uppercase()
-                            .contains(&parent_type.to_uppercase()) =>
-                    {
-                        violations.push(Violation {
-                            source_range: None,
-                            rule_id: self.id(),
-                            operation_kind: OperationKind::AttachPartition,
-                            object_kind: ObjectKind::Table,
-                            object_name: format!("{} -> {}", child, alter.id),
-                            tier: self.default_tier(),
-                            reason: format!(
-                                "ATTACH PARTITION: partition {} is {} but parent {} is {} (mismatch)",
-                                child, part_type, alter.id, parent_type
-                            ),
-                            recipe: self.recipe(),
-                            dedup_key: None,
-                            sql: None,
-                            fk_dependency_related: false,
-                        });
-                    }
-                    _ => {}
+                let normalized = |value: &str| {
+                    value
+                        .to_uppercase()
+                        .split('(')
+                        .next()
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string()
+                };
+                let parent_kind = normalized(&parent_type);
+                let child_kind = pre_state
+                    .relations
+                    .get(child)
+                    .and_then(|rel| rel.partition_type.as_deref())
+                    .map(normalized);
+                let bound_kind = strategy.as_deref().map(normalized);
+                let mismatch_kind = child_kind
+                    .filter(|kind| kind != &parent_kind)
+                    .or_else(|| bound_kind.filter(|kind| kind != &parent_kind));
+
+                if let Some(part_type) = mismatch_kind {
+                    violations.push(Violation {
+                        source_range: None,
+                        rule_id: self.id(),
+                        operation_kind: OperationKind::AttachPartition,
+                        object_kind: ObjectKind::Table,
+                        object_name: format!("{} -> {}", child, alter.id),
+                        tier: self.default_tier(),
+                        reason: format!(
+                            "ATTACH PARTITION: partition {} is {} but parent {} is {} (mismatch)",
+                            child, part_type, alter.id, parent_type
+                        ),
+                        recipe: self.recipe(),
+                        dedup_key: None,
+                        sql: None,
+                        fk_dependency_related: false,
+                    });
                 }
             }
         }

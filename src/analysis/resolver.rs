@@ -4,19 +4,20 @@ use crate::analysis::facts::{
 };
 use crate::analysis::mutations::{
     AlterDatabaseMutation, AlterDomainMutation, AlterFunctionMutation, AlterProcedureMutation,
-    AlterPublicationMutation, AlterRoleMutation, AlterSequenceMutation, AlterSubscriptionMutation,
-    AlterTable, AlterTableActionMutation, AlterTypeActionMutation, AlterTypeMutation,
-    ColumnMutation, CreateDatabaseMutation, CreateDomainMutation, CreateFunctionMutation,
-    CreateIndex, CreateMaterializedView, CreatePolicyMutation, CreateProcedureMutation,
-    CreatePublicationMutation, CreateRoleMutation, CreateSchemaMutation, CreateSequenceMutation,
-    CreateSubscriptionMutation, CreateTable, CreateTriggerMutation, CreateTypeMutation, CreateView,
-    DropDatabaseMutation, DropDomainMutation, DropFunctionMutation, DropIndex,
-    DropMaterializedViewMutation, DropPolicyMutation, DropProcedureMutation,
-    DropPublicationMutation, DropRoleMutation, DropSchemaMutation, DropSequenceMutation,
-    DropSubscriptionMutation, DropTable, DropTriggerMutation, DropTypeMutation, DropViewMutation,
-    FkMutation, GrantMutation, Mutation, OpaqueMutation, PersistenceMutation,
-    RefreshMaterializedViewMutation, ReleaseSavepointMutation, Rename, ResolvedGrantTarget,
-    RevokeMutation, RollbackToSavepointMutation, SavepointMutation, SearchPathChange,
+    AlterPublicationMutation, AlterRoleMutation, AlterSchemaMutation, AlterSequenceActionMutation,
+    AlterSequenceMutation, AlterSubscriptionMutation, AlterTable, AlterTableActionMutation,
+    AlterTypeActionMutation, AlterTypeMutation, ColumnMutation, CreateDatabaseMutation,
+    CreateDomainMutation, CreateFunctionMutation, CreateIndex, CreateMaterializedView,
+    CreatePolicyMutation, CreateProcedureMutation, CreatePublicationMutation, CreateRoleMutation,
+    CreateSchemaMutation, CreateSequenceMutation, CreateSubscriptionMutation, CreateTable,
+    CreateTriggerMutation, CreateTypeMutation, CreateView, DropDatabaseMutation,
+    DropDomainMutation, DropFunctionMutation, DropIndex, DropMaterializedViewMutation,
+    DropPolicyMutation, DropProcedureMutation, DropPublicationMutation, DropRoleMutation,
+    DropSchemaMutation, DropSequenceMutation, DropSubscriptionMutation, DropTable,
+    DropTriggerMutation, DropTypeMutation, DropViewMutation, FkMutation, GrantMutation, Mutation,
+    OpaqueMutation, PersistenceMutation, RefreshMaterializedViewMutation, ReleaseSavepointMutation,
+    Rename, ResolvedGrantTarget, RevokeMutation, RollbackToSavepointMutation, SavepointMutation,
+    SearchPathChange,
 };
 use crate::analysis::state::AnalysisState;
 use crate::ast::identifiers::{ObjectId, QualifiedName};
@@ -190,19 +191,31 @@ impl Resolver {
             StatementFact::CreateSchema {
                 name,
                 if_not_exists,
+                authorization,
             } => {
                 mutations.push(Mutation::CreateSchema(CreateSchemaMutation {
                     name: name.name.resolve(),
                     if_not_exists: *if_not_exists,
+                    authorization: authorization.clone(),
                 }));
             }
-            StatementFact::AlterSchema { name, new_name } => {
-                if let Some(nn) = new_name {
-                    let id = Self::resolve_lookup_name(name, state);
-                    let mut new_id = ObjectId::new(id.schema.clone(), nn.resolve());
-                    new_id.inferred_schema = id.inferred_schema;
-                    mutations.push(Mutation::Rename(Rename { old_id: id, new_id }));
-                }
+            StatementFact::AlterSchema { name, action } => {
+                let name = name.name.resolve();
+                let action = match action {
+                    crate::analysis::facts::AlterSchemaActionFact::RenameTo { new_name } => {
+                        AlterSchemaMutation::Rename {
+                            old_name: name,
+                            new_name: new_name.resolve(),
+                        }
+                    }
+                    crate::analysis::facts::AlterSchemaActionFact::OwnerTo { new_owner } => {
+                        AlterSchemaMutation::OwnerTo {
+                            name,
+                            new_owner: new_owner.clone(),
+                        }
+                    }
+                };
+                mutations.push(Mutation::AlterSchema(action));
             }
             StatementFact::DropSchema {
                 names,
@@ -246,6 +259,7 @@ impl Resolver {
                         is_unique: c.is_unique,
                         unique_constraint_name: c.unique_constraint_name.clone(),
                         default: c.default.clone(),
+                        generation: c.generation,
                     })
                     .collect();
 
@@ -304,9 +318,10 @@ impl Resolver {
                         new_id.inferred_schema = id.inferred_schema;
                         mutations.push(Mutation::Rename(Rename { old_id: id, new_id }));
                     }
-                    crate::analysis::facts::AlterViewAction::SetSchema { .. } => {
-                        // SET SCHEMA — rename tracked at object-id level is handled by state machine
-                        // No mutation needed since schema changes don't change ObjectId
+                    crate::analysis::facts::AlterViewAction::SetSchema { new_schema } => {
+                        let id = Self::resolve_lookup_name(name, state);
+                        let new_id = ObjectId::new(new_schema, &id.name);
+                        mutations.push(Mutation::Rename(Rename { old_id: id, new_id }));
                     }
                     crate::analysis::facts::AlterViewAction::OwnerTo { new_owner } => {
                         mutations.push(Mutation::ChangeRelationOwner {
@@ -561,13 +576,40 @@ impl Resolver {
                     owned_by: resolved_owned_by,
                 }));
             }
-            StatementFact::AlterSequence { name, owned_by } => {
-                let resolved_owned_by = owned_by.as_ref().map(|(table_name, col)| {
-                    (Self::resolve_lookup_name(table_name, state), col.clone())
-                });
+            StatementFact::AlterSequence {
+                name,
+                if_exists,
+                action,
+            } => {
+                let id = Self::resolve_lookup_name(name, state);
+                let action = match action {
+                    crate::analysis::facts::AlterSequenceActionFact::OwnedBy(owned_by) => {
+                        AlterSequenceActionMutation::OwnedBy(owned_by.as_ref().map(
+                            |(table_name, col)| {
+                                (Self::resolve_lookup_name(table_name, state), col.clone())
+                            },
+                        ))
+                    }
+                    crate::analysis::facts::AlterSequenceActionFact::OwnerTo(owner) => {
+                        AlterSequenceActionMutation::OwnerTo(owner.clone())
+                    }
+                    crate::analysis::facts::AlterSequenceActionFact::RenameTo(new_name) => {
+                        AlterSequenceActionMutation::RenameTo(ObjectId::new(
+                            &id.schema,
+                            new_name.resolve(),
+                        ))
+                    }
+                    crate::analysis::facts::AlterSequenceActionFact::SetSchema(schema) => {
+                        AlterSequenceActionMutation::SetSchema(ObjectId::new(schema, &id.name))
+                    }
+                    crate::analysis::facts::AlterSequenceActionFact::Other => {
+                        AlterSequenceActionMutation::Other
+                    }
+                };
                 mutations.push(Mutation::AlterSequence(AlterSequenceMutation {
-                    id: Self::resolve_lookup_name(name, state),
-                    owned_by: resolved_owned_by,
+                    id,
+                    if_exists: *if_exists,
+                    action,
                 }));
             }
             StatementFact::DropSequence {
@@ -595,6 +637,7 @@ impl Resolver {
                             if_not_exists,
                             not_null,
                             default,
+                            generation,
                         } => AlterTableActionMutation::AddColumn {
                             name: col_name.clone(),
                             ty: ty.clone(),
@@ -602,6 +645,7 @@ impl Resolver {
                             not_null: *not_null,
                             default: default.clone(),
                             depends_on: None, // Logic for extraction can be added later if needed
+                            generation: *generation,
                         },
                         AlterTableActionFact::DropColumn {
                             name: col_name,
@@ -619,6 +663,14 @@ impl Resolver {
                         AlterTableActionFact::RenameTo { new_name } => {
                             let mut new_id = ObjectId::new(id.schema.clone(), new_name.resolve());
                             new_id.inferred_schema = id.inferred_schema;
+                            mutations.push(Mutation::Rename(Rename {
+                                old_id: id.clone(),
+                                new_id,
+                            }));
+                            continue;
+                        }
+                        AlterTableActionFact::SetSchema { new_schema } => {
+                            let new_id = ObjectId::new(new_schema, &id.name);
                             mutations.push(Mutation::Rename(Rename {
                                 old_id: id.clone(),
                                 new_id,
@@ -727,10 +779,13 @@ impl Resolver {
                                 constraint_name: constraint_name.clone(),
                             }
                         }
-                        AlterTableActionFact::AttachPartition { child } => {
+                        AlterTableActionFact::AttachPartition { child, strategy } => {
                             let child_id = Self::resolve_lookup_name(child, state);
 
-                            AlterTableActionMutation::AttachPartition { child: child_id }
+                            AlterTableActionMutation::AttachPartition {
+                                child: child_id,
+                                strategy: strategy.clone(),
+                            }
                         }
                         AlterTableActionFact::DetachPartition { child } => {
                             AlterTableActionMutation::DetachPartition {
@@ -764,7 +819,6 @@ impl Resolver {
                         | AlterTableActionFact::NoInheritTable { .. }
                         | AlterTableActionFact::MergePartitions { .. }
                         | AlterTableActionFact::SplitPartition
-                        | AlterTableActionFact::SetSchema { .. }
                         | AlterTableActionFact::SetTablespace { .. }
                         | AlterTableActionFact::SetLogged
                         | AlterTableActionFact::SetUnlogged

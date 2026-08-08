@@ -1,6 +1,6 @@
 # CLI and Report Contract
 
-This document defines the user-visible behavior of safe-migrate v0.4.4. A
+This document defines the user-visible behavior of safe-migrate v0.4.5. A
 requirement is not complete until an automated test enforces it.
 
 ## Commands
@@ -163,7 +163,7 @@ The following conditions must never produce a successful clean report:
 - internal serialization or analysis failure.
 
 Automatic cache refresh failure is different: it prints the underlying error
-and analysis continues with the old readable cache, or with an unavailable
+and analysis continues with the old readable V5 cache, or with an unavailable
 baseline if none exists. A retained cache that is still within
 `stale_stats_days` keeps its existing confidence; an unavailable or stale
 baseline is reported as `Tainted`. The JSON baseline records the failed refresh
@@ -177,13 +177,24 @@ silently weakening the configured protection. When encryption is disabled,
 encrypted cache files are also rejected; changing modes requires a fresh
 `safe-migrate sync`.
 
-V4 cache payloads carry an explicit format header and record effective and
-session role provenance, the unexpanded search-path setting, and PostgreSQL
-role membership needed to evaluate role switches. They never include password
-hashes. Headered V3 payloads remain readable; role-sensitive operations with
-missing V3 provenance taint confidence. All older and unheadered payloads are
-rejected with generic guidance to run `safe-migrate sync`; errors do not expose
-internal cache-version labels.
+V5 cache payloads carry an explicit format header and record effective/session
+role provenance, the unexpanded search-path setting, PostgreSQL role
+membership, authoritative synchronized schemas, and synchronized sequence
+ownership/kind. They never include password hashes. V1–V4 and unheadered
+payloads are rejected with generic guidance to run `safe-migrate sync`; errors
+do not expose internal cache-version labels. A failed automatic refresh may
+reuse an existing readable V5 cache, but never an unsupported older cache.
+
+When analysis is reached, the GitHub Action writes JSON, Markdown, and
+diagnostics. It appends the Markdown report to the job summary, annotates Tier
+1 findings as errors and Tier 2 findings as warnings, and leaves Tier 3 in the
+summary only. Analyzer status `2` fails normally; `advisory: "true"` makes the
+Action step successful while preserving output `exit-code: 2`. Operational
+status `1` always fails. Published Action accepts only exact semantic tags
+matching `Cargo.toml` or full
+40-character commit SHAs; mutable references are rejected. Release downloads
+are exact-version, exact-target, checksum-verified, and never fall back to
+another release, target, or source build after failure.
 
 Errors must identify the failed input or subsystem without printing
 `DATABASE_URL`, credentials, or migration contents not already requested in the

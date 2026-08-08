@@ -26,29 +26,76 @@ inputs:
     description: Directory for `safe-migrate-report.json` and `safe-migrate-report.md`.
     required: false
     default: safe-migrate-artifacts
+  advisory:
+    description: Report blocking findings without failing the job. Operational errors still fail.
+    required: false
+    default: "false"
 
 outputs:
   json-report:
     description: Path to the generated JSON report.
-    value: ${{ steps.report.outputs.json-report }}
+    value: ${{ steps.analysis.outputs.json-report }}
   markdown-report:
     description: Path to the generated Markdown report.
-    value: ${{ steps.report.outputs.markdown-report }}
+    value: ${{ steps.analysis.outputs.markdown-report }}
   exit-code:
     description: "Analyzer exit status: 0 completed, 1 operational failure, 2 blocking findings."
-    value: ${{ steps.report.outputs.exit-code }}
+    value: ${{ steps.analysis.outputs.exit-code }}
   diagnostic-log:
     description: Path to analyzer diagnostics, including the reason for operational failures.
-    value: ${{ steps.report.outputs.diagnostic-log }}
+    value: ${{ steps.analysis.outputs.diagnostic-log }}
 
 runs:
   using: composite
   steps:
     - name: Install Rust
+      if: ${{ github.action_ref == '' }}
       uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable 2026-07-16
 
+    - name: Install safe-migrate
+      id: install
+      shell: bash
+      env:
+        ACTION_REF: ${{ github.action_ref }}
+      run: |
+        set -euo pipefail
+        install_root="${RUNNER_TEMP}/safe-migrate-action"
+        mkdir -p "$install_root"
+
+        if [ -z "$ACTION_REF" ]; then
+          cargo install --path "$GITHUB_ACTION_PATH" --locked --root "$install_root/source"
+          binary="${install_root}/source/bin/safe-migrate"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            binary="${binary}.exe"
+          fi
+        else
+          release_version="$(/bin/sh "$GITHUB_ACTION_PATH/scripts/action-resolve-version" \
+            "$ACTION_REF" "$GITHUB_ACTION_PATH/Cargo.toml")"
+          case "${RUNNER_OS}:${RUNNER_ARCH}" in
+            Linux:X64) target=x86_64-unknown-linux-gnu ;;
+            Linux:ARM64) target=aarch64-unknown-linux-gnu ;;
+            macOS:X64) target=x86_64-apple-darwin ;;
+            macOS:ARM64) target=aarch64-apple-darwin ;;
+            Windows:X64) target=x86_64-pc-windows-msvc ;;
+            Windows:ARM64) target=aarch64-pc-windows-msvc ;;
+            *) echo "Unsupported GitHub runner: ${RUNNER_OS}/${RUNNER_ARCH}" >&2; exit 1 ;;
+          esac
+          /bin/sh "$GITHUB_ACTION_PATH/install.sh" \
+            --version "$release_version" \
+            --target "$target" \
+            --install-dir "$install_root" \
+            --force
+          binary="${install_root}/safe-migrate"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            binary="${binary}.exe"
+          fi
+        fi
+        [ -x "$binary" ] || { echo "Installed binary is not executable: $binary" >&2; exit 1; }
+        echo "binary=${binary}" >> "$GITHUB_OUTPUT"
+
     - name: Analyze migrations
-      id: report
+      id: analysis
+      continue-on-error: true
       shell: bash
       env:
         INPUT_MODE: ${{ inputs.mode }}
@@ -57,9 +104,18 @@ runs:
         INPUT_CONFIG: ${{ inputs.config }}
         INPUT_NO_CACHE: ${{ inputs.no-cache }}
         INPUT_OUTPUT_DIR: ${{ inputs.output-dir }}
+        SAFE_MIGRATE_BINARY: ${{ steps.install.outputs.binary }}
       run: |
         set -euo pipefail
 
+        mkdir -p "$INPUT_OUTPUT_DIR"
+        binary="$SAFE_MIGRATE_BINARY"
+        json_report="${INPUT_OUTPUT_DIR}/safe-migrate-report.json"
+        markdown_report="${INPUT_OUTPUT_DIR}/safe-migrate-report.md"
+        diagnostic_log="${INPUT_OUTPUT_DIR}/safe-migrate-diagnostics.log"
+        : > "$diagnostic_log"
+
+        command=()
         case "$INPUT_MODE" in
           lint)
             command=(lint --file "$INPUT_PATH")
@@ -68,52 +124,48 @@ runs:
             command=(lint-chain --dir "$INPUT_PATH")
             ;;
           *)
-            echo "mode must be lint or lint-chain, got: $INPUT_MODE" >&2
-            exit 1
+            echo "mode must be lint or lint-chain, got: $INPUT_MODE" \
+              | tee -a "$diagnostic_log" >&2
             ;;
         esac
 
-        command+=(--cache "$INPUT_CACHE")
-        if [ -n "$INPUT_CONFIG" ]; then
-          command+=(--config "$INPUT_CONFIG")
-        else
-          default_config="$(mktemp "${RUNNER_TEMP}/safe-migrate-default.XXXXXX")"
-          command+=(--config "$default_config")
-        fi
-        if [ "$INPUT_NO_CACHE" = "true" ]; then
-          command+=(--no-cache)
-        fi
-
-        mkdir -p "$INPUT_OUTPUT_DIR"
-        install_root="${RUNNER_TEMP}/safe-migrate-action"
-        cargo install --path "$GITHUB_ACTION_PATH" --locked --root "$install_root"
-        binary="${install_root}/bin/safe-migrate"
-        if [ "$RUNNER_OS" = "Windows" ]; then
-          binary="${binary}.exe"
-        fi
-        json_report="${INPUT_OUTPUT_DIR}/safe-migrate-report.json"
-        markdown_report="${INPUT_OUTPUT_DIR}/safe-migrate-report.md"
-        diagnostic_log="${INPUT_OUTPUT_DIR}/safe-migrate-diagnostics.log"
-        : > "$diagnostic_log"
-
-        # Database synchronization is intentionally outside the Action's
-        # default path. A separate workflow step can prepare a reviewed cache.
-        set +e
-        env -u DATABASE_URL "$binary" "${command[@]}" --json \
-          > "$json_report" 2> >(tee -a "$diagnostic_log" >&2)
-        json_status=$?
-        env -u DATABASE_URL "$binary" "${command[@]}" --markdown \
-          > "$markdown_report" 2> >(tee -a "$diagnostic_log" >&2)
-        markdown_status=$?
-        set -e
-
-        final_status="$json_status"
-        if [ "$json_status" -ne "$markdown_status" ]; then
+        if [ "${#command[@]}" -eq 0 ]; then
           final_status=1
-          echo "JSON and Markdown runs returned different statuses: ${json_status} and ${markdown_status}" \
-            | tee -a "$diagnostic_log" >&2
+        else
+          command+=(--cache "$INPUT_CACHE")
+          if [ -n "$INPUT_CONFIG" ]; then
+            command+=(--config "$INPUT_CONFIG")
+          else
+            default_config="$(mktemp "${RUNNER_TEMP}/safe-migrate-default.XXXXXX")"
+            command+=(--config "$default_config")
+          fi
+          if [ "$INPUT_NO_CACHE" = "true" ]; then
+            command+=(--no-cache)
+          fi
+
+          # Database synchronization is intentionally outside the Action's
+          # default path. A separate workflow step can prepare a reviewed cache.
+          set +e
+          env -u DATABASE_URL "$binary" "${command[@]}" --json \
+            > "$json_report" 2> >(tee -a "$diagnostic_log" >&2)
+          json_status=$?
+          env -u DATABASE_URL "$binary" "${command[@]}" --markdown \
+            > "$markdown_report" 2> >(tee -a "$diagnostic_log" >&2)
+          markdown_status=$?
+          set -e
+
+          final_status="$json_status"
+          if [ "$json_status" -ne "$markdown_status" ]; then
+            final_status=1
+            echo "JSON and Markdown runs returned different statuses: ${json_status} and ${markdown_status}" \
+              | tee -a "$diagnostic_log" >&2
+          fi
         fi
 
+        case "$final_status" in
+          0|2) ;;
+          *) final_status=1 ;;
+        esac
         if [ "$final_status" -eq 1 ]; then
           if [ ! -s "$diagnostic_log" ]; then
             echo "safe-migrate failed without emitting a diagnostic" \
@@ -138,3 +190,48 @@ runs:
         echo "diagnostic-log=${diagnostic_log}" >> "$GITHUB_OUTPUT"
         echo "exit-code=${final_status}" >> "$GITHUB_OUTPUT"
         exit "$final_status"
+
+    - name: Publish summary and annotations
+      if: ${{ always() }}
+      uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7
+      env:
+        JSON_REPORT: ${{ steps.analysis.outputs.json-report }}
+        MARKDOWN_REPORT: ${{ steps.analysis.outputs.markdown-report }}
+      with:
+        script: |
+          const fs = require('fs');
+          if (process.env.MARKDOWN_REPORT && fs.existsSync(process.env.MARKDOWN_REPORT)) {
+            const markdown = fs.readFileSync(process.env.MARKDOWN_REPORT, 'utf8');
+            await core.summary.addRaw(markdown).write();
+          }
+          if (!process.env.JSON_REPORT || !fs.existsSync(process.env.JSON_REPORT)) return;
+          let report;
+          try {
+            report = JSON.parse(fs.readFileSync(process.env.JSON_REPORT, 'utf8'));
+          } catch (error) {
+            core.error(`Could not parse safe-migrate JSON report: ${error.message}`);
+            return;
+          }
+          for (const finding of report.violations || []) {
+            if (finding.tier !== 'Tier1' && finding.tier !== 'Tier2') continue;
+            const location = finding.location || {};
+            const properties = {
+              title: `safe-migrate: ${finding.rule_id || 'finding'}`,
+              file: location.file,
+              startLine: location.line,
+              startColumn: location.column,
+            };
+            const message = `${finding.reason || 'Migration finding'}${finding.recipe ? ` — ${finding.recipe}` : ''}`;
+            if (finding.tier === 'Tier1') core.error(message, properties);
+            else core.warning(message, properties);
+          }
+
+    - name: Apply final gate
+      if: ${{ always() }}
+      shell: bash
+      env:
+        ANALYZER_STATUS: ${{ steps.analysis.outputs.exit-code }}
+        ADVISORY: ${{ inputs.advisory }}
+      run: |
+        /bin/sh "$GITHUB_ACTION_PATH/scripts/action-final-gate" \
+          "${ANALYZER_STATUS:-1}" "$ADVISORY"
