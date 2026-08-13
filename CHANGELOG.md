@@ -5,6 +5,16 @@ commits and pull requests. Published binaries, checksums, and generated release
 notes are available on the
 [GitHub Releases page](https://github.com/dsecurity49/safe-migrate/releases).
 
+## v0.5.0 (unreleased)
+
+- Upgraded the pinned Squawk parser stack from 2.61.0 to 2.62.0 and raised the
+  minimum supported Rust version to 1.94, as required by that release.
+- Adapted typed AST extraction to Squawk 2.62's updated representation while
+  retaining table-constraint, view-dependency, and foreign-key analysis.
+- Modeled `ALTER TYPE ... RENAME TO`, including duplicate and missing-type
+  conflicts, state identity updates, transaction/savepoint rollback, and
+  PostgreSQL differential coverage.
+
 ## v0.4.5 — 2026-08-08
 
 - Introduced Cache V5 with authoritative synchronized schema and sequence
