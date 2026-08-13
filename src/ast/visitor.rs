@@ -12,8 +12,9 @@ use squawk_syntax::ast::{
     CreateDatabase, CreateDomain, CreateIndex, CreateMaterializedView, CreatePolicy,
     CreateSequence, CreateTable, CreateTableAs, CreateTrigger, CreateType, CreateView, CteName,
     DetachPartition, DropDomain, DropIndex, DropMaterializedView, DropPolicy, DropSequence,
-    DropTable, DropTrigger, DropType, DropView, Grant, NameRef, Path, PathSegment, RelationNameRef,
-    ReleaseSavepoint, Revoke, RevokeCommand, Rollback, Set, Stmt, TableArg, TableConstraint,
+    DropTable, DropTrigger, DropType, DropView, Grant, NameRef, Path, PathSegment, PathSegmentRef,
+    RelationNameRef, ReleaseSavepoint, Revoke, RevokeCommand, Rollback, Set, Stmt, TableArg,
+    TableConstraint,
 };
 use squawk_syntax::{SyntaxKind, ast};
 
@@ -1613,18 +1614,13 @@ impl AstVisitor {
         ];
 
         let mut local_declarations = Vec::new();
-        for name_node in syntax.descendants().filter_map(PathSegment::cast) {
-            local_declarations.push(
-                Self::identifier_from_name(name_node.text(), name_node.is_quoted()).resolve(),
-            );
-        }
         for cte_name in syntax.descendants().filter_map(CteName::cast) {
             if let Some(tok) = cte_name.ident_token() {
                 local_declarations.push(tok.text().to_string());
             }
         }
 
-        for n in syntax.descendants().filter_map(NameRef::cast) {
+        for n in syntax.descendants().filter_map(PathSegmentRef::cast) {
             let text = n.text().to_string();
             let upper = text.to_uppercase();
             let is_quoted = n.is_quoted();
