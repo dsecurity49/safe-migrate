@@ -1,6 +1,6 @@
 # CLI and Report Contract
 
-This document defines the user-visible behavior of safe-migrate v0.4.5. A
+This document defines the user-visible behavior of safe-migrate v0.5.0. A
 requirement is not complete until an automated test enforces it.
 
 ## Commands
@@ -15,6 +15,8 @@ requirement is not complete until an automated test enforces it.
 - `safe-migrate cache inspect` reads a local cache without connecting to
   PostgreSQL and prints provenance plus a redacted contents summary. `--json`
   emits that same summary as one JSON document.
+- `safe-migrate rules` lists canonical primary-rule descriptors. `--rule <id>`
+  selects one descriptor and `--json` emits the stable discovery schema.
 
 `lint` and `lint-chain` use an explicit cache, the default cache path, or
 `--no-cache`. When `auto_sync = true` is set in configuration, they may refresh
@@ -75,6 +77,14 @@ Each violation includes:
 - `sql`
 - `fk_dependency_related`
 
+Location-aware lint output additionally includes a one-based
+`statement_index` when the source range belongs to a parsed statement. Known
+primary rules add `rule_title`, `rule_summary`, and `impact`. These are
+additive fields; `rule_id` remains the stable identifier.
+
+The additive top-level `summary` object contains `total`, `tier1`, `tier2`,
+and `tier3` counts.
+
 The additive `baseline` object records cache/baseline status, cache provenance,
 and automatic-sync outcome:
 
@@ -98,6 +108,11 @@ Each JSON violation may include this additive location object:
 ```json
 "location": { "file": "migrations/001_add_status.sql", "line": 12, "column": 1 }
 ```
+
+`rules --json` has its own schema version 1 document. Every descriptor exposes
+its ID, title, summary, impact, default tier, remediation, supported
+configuration fields, and effective enabled/threshold values. Unknown rule IDs
+are operational errors.
 
 Fields may be added compatibly. Removing a field, renaming a field, changing its
 type, or changing the meaning of an existing enum value is a report-contract
@@ -187,10 +202,11 @@ reuse an existing readable V5 cache, but never an unsupported older cache.
 
 When analysis is reached, the GitHub Action writes JSON, Markdown, and
 diagnostics. It appends the Markdown report to the job summary, annotates Tier
-1 findings as errors and Tier 2 findings as warnings, and leaves Tier 3 in the
-summary only. Analyzer status `2` fails normally; `advisory: "true"` makes the
-Action step successful while preserving output `exit-code: 2`. Operational
-status `1` always fails. Published Action accepts only exact semantic tags
+1 findings as errors and Tier 2 findings as warnings using the rule title,
+summary, reason, and remediation, and leaves Tier 3 in the summary only.
+Analyzer status `2` fails normally; `advisory: "true"` makes the Action step
+successful while preserving output `exit-code: 2`. Operational status `1`
+always fails. Published Action accepts only exact semantic tags
 matching `Cargo.toml` or full
 40-character commit SHAs; mutable references are rejected. Release downloads
 are exact-version, exact-target, checksum-verified, and never fall back to

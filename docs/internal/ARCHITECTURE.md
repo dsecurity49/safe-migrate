@@ -69,9 +69,11 @@ side-effect free, and scoped to one safety concept. Rules must handle
 
 ### Reporting
 
-Reporting converts findings into a stable user contract. Human presentation
-may evolve independently, but JSON fields, exit behavior, confidence meaning,
-and deterministic ordering follow [the contract](../CONTRACT.md).
+Reporting converts the shared finding model into terminal, JSON, Markdown, and
+Action output. Human presentation may evolve independently, but JSON fields,
+exit behavior, confidence meaning, and deterministic ordering follow [the
+contract](../CONTRACT.md). Rule titles, summaries, and impact are resolved from
+the canonical registry; stable rule IDs remain the configuration contract.
 
 ## Core invariants
 

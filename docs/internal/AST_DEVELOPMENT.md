@@ -6,7 +6,7 @@ PostgreSQL AST.
 ## Source of truth
 
 Safe-migrate pins `squawk-syntax`, `squawk-parser`, and `squawk-lexer` exactly
-in `Cargo.toml`. Their pinned source and safe-migrate's tests are authoritative.
+in `Cargo.toml` (currently 2.62.0). Their pinned source and safe-migrate's tests are authoritative.
 Do not rely on remembered accessor names or a hand-maintained AST catalog.
 
 Confirm the resolved versions:
@@ -51,7 +51,9 @@ A Squawk upgrade is a parser migration, not a version-number edit.
 2. Run `cargo check --locked` and classify compile failures by AST shape.
 3. Update extraction and expression tests before broad mechanical fixes.
 4. Run formatting, locked tests, Clippy, and the live fixture suite.
-5. Record meaningful AST behavior changes and known limitations in
+5. Add line-ending regressions when lexer behavior changes, and keep newly
+   accepted but unmodeled PostgreSQL syntax explicitly opaque.
+6. Record meaningful AST behavior changes and known limitations in
    `CHANGELOG.md`.
 
 Do not recreate a full external AST reference under `docs/`. Project

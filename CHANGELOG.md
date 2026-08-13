@@ -14,6 +14,18 @@ notes are available on the
 - Modeled `ALTER TYPE ... RENAME TO`, including duplicate and missing-type
   conflicts, state identity updates, transaction/savepoint rollback, and
   PostgreSQL differential coverage.
+- Modeled `ALTER TRIGGER ... RENAME TO` and `ALTER TYPE ... SET SCHEMA`, with
+  collision checks, transaction rollback, and PostgreSQL differential coverage.
+- Treat `COMMENT ON` statements as explicit schema-neutral no-ops instead of
+  emitting an opaque-SQL warning.
+- Added `safe-migrate rules` discovery backed by the canonical rule registry,
+  including JSON output, single-rule lookup, remediation, and effective
+  configuration details.
+- Enriched JSON, Markdown, terminal, and GitHub Action reports with rule titles,
+  impact and summaries, one-based statement indexes, and additive tier counts;
+  JSON remains schema version 1 and Cache V5 remains unchanged.
+- Added parser regressions for LF, CRLF, and CR input, PostgreSQL 19
+  property-graph syntax, and duplicate DML assignments staying opaque.
 
 ## v0.4.5 — 2026-08-08
 
