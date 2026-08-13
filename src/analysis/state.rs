@@ -2222,17 +2222,15 @@ impl AnalysisState {
                 {
                     if let Some(RelationOverlay::Present(child)) =
                         self.local.relations.get(&alter.id)
-                    {
-                        if let Some(column) =
+                        && let Some(column) =
                             from_columns.iter().find(|column| !child.has_column(column))
-                        {
-                            return MutationResult::Conflict {
-                                reason: format!(
-                                    "foreign key column '{}' does not exist on relation '{}'",
-                                    column, alter.id
-                                ),
-                            };
-                        }
+                    {
+                        return MutationResult::Conflict {
+                            reason: format!(
+                                "foreign key column '{}' does not exist on relation '{}'",
+                                column, alter.id
+                            ),
+                        };
                     }
 
                     let Some(RelationOverlay::Present(parent)) = self.local.relations.get(to_table)
@@ -3815,10 +3813,9 @@ impl AnalysisState {
                                 self.snapshot_relation(table_id);
                                 if let Some(RelationOverlay::Present(relation)) =
                                     self.local.relations.get_mut(table_id)
+                                    && let Some(trigger_name) = trigger_name
                                 {
-                                    if let Some(trigger_name) = trigger_name {
-                                        relation.triggers.remove(&trigger_name);
-                                    }
+                                    relation.triggers.remove(&trigger_name);
                                 }
                             }
                             if !dependent_triggers.is_empty() {
