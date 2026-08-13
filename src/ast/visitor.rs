@@ -1886,6 +1886,12 @@ impl AstVisitor {
                     new_name: Self::identifier_from_name(new_name.text(), new_name.is_quoted()),
                 });
             }
+            ast::AlterTypeAction::SetSchema(set_schema) => {
+                let new_schema = set_schema.schema_ref()?.ident_token()?;
+                actions.push(AlterTypeActionFact::SetSchema {
+                    new_schema: Self::resolve_identifier_token(new_schema.text()),
+                });
+            }
             ast::AlterTypeAction::AddValue(add_value) => {
                 let literals = add_value
                     .syntax()

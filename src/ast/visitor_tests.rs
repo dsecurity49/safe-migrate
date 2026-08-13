@@ -284,6 +284,22 @@ mod tests {
     }
 
     #[test]
+    fn alter_type_set_schema_extracts_quoted_schema_name() {
+        let fact = parse_and_extract_statement(r#"ALTER TYPE sm_core.mood SET SCHEMA "App";"#)
+            .expect("alter type fact");
+
+        let StatementFact::AlterType(alter_type) = fact else {
+            panic!("expected alter type fact");
+        };
+        assert_eq!(
+            alter_type.actions,
+            vec![AlterTypeActionFact::SetSchema {
+                new_schema: "App".into(),
+            }]
+        );
+    }
+
+    #[test]
     fn alter_trigger_rename_to_extracts_quoted_name_and_table() {
         let fact = parse_and_extract_statement(
             r#"ALTER TRIGGER old_trigger ON sm_core.events RENAME TO "NewTrigger";"#,

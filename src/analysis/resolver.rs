@@ -504,6 +504,12 @@ impl Resolver {
                                 new_id,
                             }));
                         }
+                        crate::analysis::facts::AlterTypeActionFact::SetSchema { new_schema } => {
+                            mutations.push(Mutation::RenameType(Rename {
+                                old_id: id.clone(),
+                                new_id: ObjectId::new(new_schema, &id.name),
+                            }));
+                        }
                         crate::analysis::facts::AlterTypeActionFact::AddValue {
                             new_value,
                             neighbor,

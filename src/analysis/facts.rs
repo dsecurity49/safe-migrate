@@ -307,6 +307,9 @@ pub enum AlterTypeActionFact {
     RenameTo {
         new_name: Ident,
     },
+    SetSchema {
+        new_schema: String,
+    },
     AddValue {
         new_value: String,
         neighbor: Option<String>,

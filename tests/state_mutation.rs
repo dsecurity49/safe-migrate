@@ -662,6 +662,61 @@ mod state_mutation_tests {
     }
 
     #[test]
+    fn alter_type_set_schema_updates_identity_and_rolls_back() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE SCHEMA app;
+                 CREATE TYPE mood AS ENUM ('sad');
+                 BEGIN;
+                 ALTER TYPE mood SET SCHEMA app;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(!state.local.types.contains_key(&object_id("public", "mood")));
+        assert!(matches!(
+            state.local.types.get(&object_id("app", "mood")),
+            Some(TypeOverlay::Present(_))
+        ));
+
+        engine.analyze("ROLLBACK;", &mut state).unwrap();
+        assert!(matches!(
+            state.local.types.get(&object_id("public", "mood")),
+            Some(TypeOverlay::Present(_))
+        ));
+        assert!(!state.local.types.contains_key(&object_id("app", "mood")));
+    }
+
+    #[test]
+    fn alter_type_set_schema_rejects_missing_schema_and_existing_target() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let violations = engine
+            .analyze(
+                "CREATE TYPE missing_target AS ENUM ('value');
+                 ALTER TYPE missing_target SET SCHEMA missing_schema;
+                 CREATE SCHEMA app;
+                 CREATE TYPE source AS ENUM ('value');
+                 CREATE TYPE app.source AS ENUM ('value');
+                 ALTER TYPE source SET SCHEMA app;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(violations.iter().any(|violation| {
+            violation.rule_id == "chain-conflict"
+                && violation.reason.contains("schema 'missing_schema'")
+        }));
+        assert!(violations.iter().any(|violation| {
+            violation.rule_id == "chain-conflict" && violation.reason.contains("app.source")
+        }));
+    }
+
+    #[test]
     fn enum_value_rename_obeys_cached_explicit_and_default_search_path_order() {
         let engine = setup_engine();
         let mut cache = safe_migrate::db::cache::DbCache::new();

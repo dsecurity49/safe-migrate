@@ -1386,7 +1386,8 @@
         "safe_008_create_index.sql",
         "safe_010_rename_value_search_path.sql",
         "safe_011_rename_value_quoted.sql",
-        "safe_012_create_then_rename_value.sql"
+        "safe_012_create_then_rename_value.sql",
+        "safe_013_set_schema.sql"
       ],
       "excluded_fixtures": [
         {

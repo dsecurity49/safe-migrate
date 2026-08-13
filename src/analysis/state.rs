@@ -2784,6 +2784,18 @@ impl AnalysisState {
                         reason: format!("type '{}' already exists", rename.new_id),
                     };
                 }
+                if rename.old_id.schema != rename.new_id.schema
+                    && !self.schema_is_present(&rename.new_id.schema)
+                {
+                    if self.schema_absence_is_authoritative(&rename.new_id.schema) {
+                        return MutationResult::Conflict {
+                            reason: format!("schema '{}' does not exist", rename.new_id.schema),
+                        };
+                    }
+                    self.snapshot_confidence();
+                    self.local.confidence = Confidence::Tainted;
+                    return MutationResult::Skipped;
+                }
 
                 self.snapshot_namespace();
                 if let Some(TypeOverlay::Present(mut state)) =
