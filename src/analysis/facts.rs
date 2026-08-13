@@ -239,6 +239,9 @@ pub enum StatementFact {
     SetConstraints,
     OpaqueBlock,
     Execute,
+    /// Parsed SQL that changes PostgreSQL metadata but no schema state modeled
+    /// by safe-migrate, such as `COMMENT ON`.
+    SchemaNeutralNoop,
     Vacuum {
         relation: Option<QualifiedName>,
         is_full: bool,

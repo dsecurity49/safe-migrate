@@ -2085,7 +2085,8 @@
         "011_select.sql",
         "safe_004_create_index.sql",
         "013_update.sql",
-        "014_delete.sql"
+        "014_delete.sql",
+        "015_comment_on.sql"
       ],
       "expected_live_errors": {
         "013_invalid_set_role_current_user.sql": {
@@ -2153,7 +2154,7 @@
       "required_relations": [
         "public.test_table"
       ],
-      "notes": "Twenty-fourth incremental slice. Executes opaque procedural, transaction-control, and currently unmodeled DML statements against PostgreSQL, verifies their schema-state neutrality, and compares explicit DDL controls."
+      "notes": "Twenty-fourth incremental slice. Executes opaque procedural, transaction-control, and currently unmodeled DML statements against PostgreSQL, verifies their schema-state neutrality, compares explicit DDL controls, and covers explicit schema-neutral COMMENT ON statements."
     },
     {
       "rule_dir": "rule_02_drop-database",

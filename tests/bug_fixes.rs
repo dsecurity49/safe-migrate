@@ -9,7 +9,7 @@ mod phase10_bug_fixes_and_sorting_tests {
     use safe_migrate::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
 
     #[test]
-    fn parsed_statement_without_typed_extraction_is_reported_and_taints_state() {
+    fn comment_on_is_schema_neutral_and_preserves_confidence() {
         let engine = setup_engine();
         let mut state = setup_state();
 
@@ -20,12 +20,8 @@ mod phase10_bug_fixes_and_sorting_tests {
             )
             .expect("Squawk should parse COMMENT ON statements");
 
-        assert!(violations.iter().any(|violation| {
-            violation.rule_id == "opaque-dynamic-sql"
-                && violation.reason.contains("unsupported SQL statement")
-                && violation.recipe.contains("not modeled")
-        }));
-        assert_eq!(state.local.confidence, Confidence::Tainted);
+        assert!(violations.is_empty());
+        assert_eq!(state.local.confidence, Confidence::Exact);
     }
 
     #[test]

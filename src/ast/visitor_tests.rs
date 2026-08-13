@@ -1140,6 +1140,13 @@ mod tests {
         }
     }
 
+    #[test]
+    fn comment_on_extracts_as_schema_neutral_noop() {
+        let fact = parse_and_extract_statement("COMMENT ON TABLE public.events IS 'audit log';")
+            .expect("comment statement fact");
+        assert!(matches!(fact, StatementFact::SchemaNeutralNoop));
+    }
+
     // ========================================================================
     // SET ROLE / SET SESSION AUTHORIZATION tests
     // ========================================================================

@@ -184,6 +184,9 @@ impl AstVisitor {
         if let Some(node) = AlterTrigger::cast(syntax.clone()) {
             return Self::extract_alter_trigger(&node);
         }
+        if ast::CommentOn::cast(syntax.clone()).is_some() {
+            return Some(StatementFact::SchemaNeutralNoop);
+        }
 
         if ast::PrepareTransaction::cast(syntax.clone()).is_some() {
             let name = syntax

@@ -199,6 +199,7 @@ impl Resolver {
                     authorization: authorization.clone(),
                 }));
             }
+            StatementFact::SchemaNeutralNoop => {}
             StatementFact::AlterSchema { name, action } => {
                 let name = name.name.resolve();
                 let action = match action {
