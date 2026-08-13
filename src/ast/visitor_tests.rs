@@ -284,6 +284,30 @@ mod tests {
     }
 
     #[test]
+    fn alter_trigger_rename_to_extracts_quoted_name_and_table() {
+        let fact = parse_and_extract_statement(
+            r#"ALTER TRIGGER old_trigger ON sm_core.events RENAME TO "NewTrigger";"#,
+        )
+        .expect("alter trigger fact");
+
+        let StatementFact::AlterTrigger {
+            name,
+            table,
+            new_name,
+        } = fact
+        else {
+            panic!("expected alter trigger fact");
+        };
+        assert_eq!(name, "old_trigger");
+        assert_eq!(
+            table.schema.as_ref().map(Ident::resolve),
+            Some("sm_core".into())
+        );
+        assert_eq!(table.name.resolve(), "events");
+        assert_eq!(new_name, "NewTrigger");
+    }
+
+    #[test]
     fn alter_type_add_value_uses_ast_position_when_label_contains_before() {
         let fact = parse_and_extract_statement(
             "ALTER TYPE mood ADD VALUE 'not before now' AFTER 'ready';",

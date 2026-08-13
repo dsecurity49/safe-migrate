@@ -147,6 +147,11 @@ pub enum StatementFact {
         table: QualifiedName,
         if_exists: bool,
     },
+    AlterTrigger {
+        name: String,
+        table: QualifiedName,
+        new_name: String,
+    },
     AlterTable {
         name: QualifiedName,
         actions: Vec<AlterTableActionFact>,

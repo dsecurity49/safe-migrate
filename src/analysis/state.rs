@@ -2153,6 +2153,56 @@ impl AnalysisState {
 
                 MutationResult::Applied
             }
+            Mutation::RenameTrigger(rename_trigger) => {
+                let old_id = Self::trigger_key(&rename_trigger.table, &rename_trigger.name);
+                let new_id = Self::trigger_key(&rename_trigger.table, &rename_trigger.new_name);
+                let Some(TriggerOverlay::Present(mut trigger)) =
+                    self.local.triggers.get(&old_id).cloned()
+                else {
+                    return MutationResult::Conflict {
+                        reason: format!(
+                            "trigger '{}' does not exist on relation '{}'",
+                            rename_trigger.name, rename_trigger.table
+                        ),
+                    };
+                };
+                if old_id != new_id
+                    && matches!(
+                        self.local.triggers.get(&new_id),
+                        Some(TriggerOverlay::Present(_))
+                    )
+                {
+                    return MutationResult::Conflict {
+                        reason: format!(
+                            "trigger '{}' already exists on relation '{}'",
+                            rename_trigger.new_name, rename_trigger.table
+                        ),
+                    };
+                }
+                self.snapshot_trigger(&old_id);
+                self.snapshot_trigger(&new_id);
+                self.snapshot_relation(&rename_trigger.table);
+                self.snapshot_graph_full();
+                self.local.triggers.remove(&old_id);
+                trigger.id = new_id.clone();
+                trigger.name = rename_trigger.new_name.clone();
+                self.local
+                    .triggers
+                    .insert(new_id.clone(), TriggerOverlay::Present(trigger));
+                if let Some(RelationOverlay::Present(relation)) =
+                    self.local.relations.get_mut(&rename_trigger.table)
+                {
+                    relation.triggers.remove(&rename_trigger.name);
+                    relation.triggers.insert(rename_trigger.new_name.clone());
+                }
+                self.local.graph.propagate_rename(&old_id, &new_id);
+                self.local.graph.edges.push(DependencyEdge::new(
+                    old_id,
+                    new_id,
+                    DependencyKind::RenameTo,
+                ));
+                MutationResult::Applied
+            }
             Mutation::AlterTable(alter) => {
                 if let AlterTableActionMutation::OwnerTo { new_owner } = &alter.action {
                     let Some((owner, known)) = self.role_fact_identity(new_owner) else {

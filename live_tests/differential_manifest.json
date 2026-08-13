@@ -1036,6 +1036,7 @@
         "safe_002_drop_trigger.sql",
         "safe_003_add_column.sql",
         "safe_005_create_table.sql",
+        "safe_007_rename_trigger.sql",
         "safe_009_create_index.sql",
         "safe_010_rename_table.sql"
       ],
@@ -1051,10 +1052,6 @@
         {
           "fixture": "safe_006_drop_table.sql",
           "reason": "PostgreSQL correctly rejects DROP TABLE without CASCADE because public.child_table and sm_audit.change_requests depend on public.test_table."
-        },
-        {
-          "fixture": "safe_007_rename_trigger.sql",
-          "reason": "ALTER TRIGGER RENAME is not represented by the current AST mutation layer; deferred rather than treating an opaque statement as differential coverage."
         },
         {
           "fixture": "safe_008_drop_constraint.sql",

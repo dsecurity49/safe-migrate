@@ -16,8 +16,8 @@ use crate::analysis::mutations::{
     DropSchemaMutation, DropSequenceMutation, DropSubscriptionMutation, DropTable,
     DropTriggerMutation, DropTypeMutation, DropViewMutation, FkMutation, GrantMutation, Mutation,
     OpaqueMutation, PersistenceMutation, RefreshMaterializedViewMutation, ReleaseSavepointMutation,
-    Rename, ResolvedGrantTarget, RevokeMutation, RollbackToSavepointMutation, SavepointMutation,
-    SearchPathChange,
+    Rename, RenameTriggerMutation, ResolvedGrantTarget, RevokeMutation,
+    RollbackToSavepointMutation, SavepointMutation, SearchPathChange,
 };
 use crate::analysis::state::AnalysisState;
 use crate::ast::identifiers::{ObjectId, QualifiedName};
@@ -451,6 +451,15 @@ impl Resolver {
                     if_exists: *if_exists,
                 }));
             }
+            StatementFact::AlterTrigger {
+                name,
+                table,
+                new_name,
+            } => mutations.push(Mutation::RenameTrigger(RenameTriggerMutation {
+                name: name.clone(),
+                table: Self::resolve_lookup_name(table, state),
+                new_name: new_name.clone(),
+            })),
             StatementFact::AlterIndex { name, actions } => {
                 let id = Self::resolve_lookup_name(name, state);
                 for action in actions {

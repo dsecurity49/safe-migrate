@@ -989,6 +989,64 @@ mod state_mutation_tests {
     }
 
     #[test]
+    fn rename_trigger_updates_identity_and_rolls_back() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE TABLE t(id int);
+                 CREATE FUNCTION f() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END; $$;
+                 CREATE TRIGGER old_trigger BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION f();
+                 BEGIN;
+                 ALTER TRIGGER old_trigger ON t RENAME TO new_trigger;",
+                &mut state,
+            )
+            .unwrap();
+
+        let RelationOverlay::Present(relation) =
+            state.get_relation(&object_id("public", "t")).unwrap()
+        else {
+            panic!("table missing");
+        };
+        assert!(!relation.triggers.contains("old_trigger"));
+        assert!(relation.triggers.contains("new_trigger"));
+        assert!(state.local.triggers.values().any(|overlay| matches!(overlay,
+            safe_migrate::model::trigger::TriggerOverlay::Present(trigger) if trigger.name == "new_trigger"
+        )));
+
+        engine.analyze("ROLLBACK;", &mut state).unwrap();
+        let RelationOverlay::Present(relation) =
+            state.get_relation(&object_id("public", "t")).unwrap()
+        else {
+            panic!("table missing");
+        };
+        assert!(relation.triggers.contains("old_trigger"));
+        assert!(!relation.triggers.contains("new_trigger"));
+    }
+
+    #[test]
+    fn rename_trigger_rejects_an_existing_target() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let violations = engine
+            .analyze(
+                "CREATE TABLE t(id int);
+                 CREATE FUNCTION f() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END; $$;
+                 CREATE TRIGGER first_trigger BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION f();
+                 CREATE TRIGGER second_trigger BEFORE UPDATE ON t FOR EACH ROW EXECUTE FUNCTION f();
+                 ALTER TRIGGER first_trigger ON t RENAME TO second_trigger;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(violations.iter().any(|violation| {
+            violation.rule_id == "chain-conflict" && violation.reason.contains("second_trigger")
+        }));
+    }
+
+    #[test]
     fn test_topology_publication() {
         let engine = setup_engine();
         let mut state = setup_state();

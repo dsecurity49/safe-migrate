@@ -8,8 +8,8 @@ use crate::analysis::facts::{
 use crate::ast::identifiers::{Ident, QualifiedName};
 use squawk_syntax::ast::{
     AlterColumnOption, AlterConstraint, AlterDomain, AlterIndex, AlterSequence, AlterTable,
-    AlterTableAction, AlterType, AstNode, AttachPartition, Column, ColumnConstraint, Constraint,
-    CreateDatabase, CreateDomain, CreateIndex, CreateMaterializedView, CreatePolicy,
+    AlterTableAction, AlterTrigger, AlterType, AstNode, AttachPartition, Column, ColumnConstraint,
+    Constraint, CreateDatabase, CreateDomain, CreateIndex, CreateMaterializedView, CreatePolicy,
     CreateSequence, CreateTable, CreateTableAs, CreateTrigger, CreateType, CreateView, CteName,
     DetachPartition, DropDomain, DropIndex, DropMaterializedView, DropPolicy, DropSequence,
     DropTable, DropTrigger, DropType, DropView, Grant, NameRef, Path, PathSegment, PathSegmentRef,
@@ -180,6 +180,9 @@ impl AstVisitor {
         }
         if let Some(node) = DropTrigger::cast(syntax.clone()) {
             return Self::extract_drop_trigger(&node);
+        }
+        if let Some(node) = AlterTrigger::cast(syntax.clone()) {
+            return Self::extract_alter_trigger(&node);
         }
 
         if ast::PrepareTransaction::cast(syntax.clone()).is_some() {
@@ -2003,6 +2006,21 @@ impl AstVisitor {
             name: trigger_name,
             table,
             if_exists: node.if_exists().is_some(),
+        })
+    }
+
+    fn extract_alter_trigger(node: &AlterTrigger) -> Option<StatementFact> {
+        let name = Self::resolve_identifier_token(node.trigger_ref()?.ident_token()?.text());
+        let table_path = node.on_relation()?.relation_name_ref()?.path_ref()?;
+        let table = Self::path_ref_to_qualified_name(&table_path)?;
+        let ast::AlterTriggerAction::TriggerRenameTo(rename) = node.action()? else {
+            return None;
+        };
+        let new_name = Self::resolve_identifier_token(rename.trigger()?.ident_token()?.text());
+        Some(StatementFact::AlterTrigger {
+            name,
+            table,
+            new_name,
         })
     }
 
