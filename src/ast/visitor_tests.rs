@@ -1119,6 +1119,34 @@ mod tests {
     }
 
     #[test]
+    fn parser_accepts_lf_crlf_and_cr_line_endings() {
+        for (name, line_ending) in [("LF", "\n"), ("CRLF", "\r\n"), ("CR", "\r")] {
+            let sql = format!(
+                "CREATE TABLE users (id integer);{line_ending}ALTER TABLE users ADD COLUMN name text;"
+            );
+            let parsed = SourceFile::parse(&sql);
+            assert!(parsed.errors().is_empty(), "{name} input must parse");
+            assert_eq!(parse_and_extract(&sql).len(), 2, "{name} input facts");
+        }
+    }
+
+    #[test]
+    fn parser_accepts_postgres_19_property_graph_syntax_as_opaque() {
+        let sql = "CREATE PROPERTY GRAPH social
+            VERTEX TABLES (people)
+            EDGE TABLES (knows SOURCE people DESTINATION people);";
+        let parsed = SourceFile::parse(sql);
+
+        assert!(parsed.errors().is_empty());
+        let statement = parsed
+            .tree()
+            .stmts()
+            .next()
+            .expect("property graph statement");
+        assert!(AstVisitor::extract(&statement).is_none());
+    }
+
+    #[test]
     fn test_do_block() {
         let sql = "DO $$ BEGIN RAISE NOTICE 'hello'; END $$;";
         let facts = parse_and_extract_statement(sql);

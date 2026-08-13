@@ -350,6 +350,23 @@ mod exhaustive_fuzz_tests {
     }
 
     #[test]
+    fn fuzz_ddl_029_duplicate_update_assignment_is_opaque() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let violations = engine
+            .analyze(
+                "UPDATE users SET name = 'first', name = 'second';",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.rule_id == "opaque-dynamic-sql")
+        );
+    }
+
+    #[test]
     fn fuzz_ddl_028_create_policy() {
         let engine = setup_engine();
         let mut state = setup_state();
@@ -723,6 +740,23 @@ mod exhaustive_fuzz_tests {
         let mut state = setup_state();
         let result = engine.analyze("NOT VALID SQL AT ALL", &mut state);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn fuzz_parse_004_cr_line_endings_parse_and_preserve_statement_order() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let violations = engine
+            .analyze(
+                "CREATE TABLE users (id integer);\rALTER TABLE users ADD COLUMN name text;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            violations
+                .iter()
+                .all(|violation| violation.rule_id != "opaque-dynamic-sql")
+        );
     }
 
     // --- Fuzz Group 7: Schema drift with PG cache (20 cases) ---

@@ -25,6 +25,26 @@ mod phase10_bug_fixes_and_sorting_tests {
     }
 
     #[test]
+    fn duplicate_column_assignments_remain_opaque() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let violations = engine
+            .analyze(
+                "UPDATE users SET display_name = 'first', display_name = 'second';",
+                &mut state,
+            )
+            .expect("Squawk should parse duplicate assignments");
+
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.rule_id == "opaque-dynamic-sql")
+        );
+        assert_eq!(state.local.confidence, Confidence::Tainted);
+    }
+
+    #[test]
     fn non_ascii_sql_before_execute_prefix_does_not_panic_normalization() {
         let engine = setup_engine();
         let mut state = setup_state();
