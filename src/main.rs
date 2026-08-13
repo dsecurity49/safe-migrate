@@ -290,6 +290,14 @@ fn rule_descriptor_json(descriptor: &RuleDescriptor, config: &Config) -> serde_j
     })
 }
 
+fn rules_separator() -> String {
+    let width = terminal_size::terminal_size()
+        .map(|(width, _)| width.0 as usize)
+        .unwrap_or(80)
+        .max(60);
+    "-".repeat((width as f32 * 0.82) as usize)
+}
+
 fn run_rules(rule_id: Option<&str>, json: bool, config_path: &Path) -> Result<()> {
     let config = load_config(config_path)?;
     let descriptors: Vec<_> = match rule_id {
@@ -316,6 +324,8 @@ fn run_rules(rule_id: Option<&str>, json: bool, config_path: &Path) -> Result<()
 
     for (index, descriptor) in descriptors.iter().enumerate() {
         if index > 0 {
+            println!();
+            println!("{}", rules_separator());
             println!();
         }
         println!("{} ({})", descriptor.title, descriptor.id);
