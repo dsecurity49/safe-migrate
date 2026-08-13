@@ -64,6 +64,73 @@ fn test_cli_help() {
 }
 
 #[test]
+fn rules_command_lists_registry_descriptors_in_json() {
+    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let output = cmd.arg("rules").arg("--json").output().unwrap();
+    assert!(output.status.success());
+    let report = parse_json_stdout(&output);
+    assert_eq!(report["schema_version"], 1);
+    let rules = report["rules"].as_array().expect("rules array");
+    assert_eq!(rules.len(), 26);
+    assert_eq!(rules[0]["id"], "irreversible-migration");
+    assert_eq!(rules[0]["title"], "Irreversible migration");
+    assert!(
+        rules[0]["supported_configuration_fields"]
+            .as_array()
+            .expect("configuration fields")
+            .iter()
+            .any(|field| field == "disabled")
+    );
+    assert_eq!(rules[0]["effective"]["enabled"], true);
+}
+
+#[test]
+fn rules_command_filters_one_rule_and_rejects_unknown_ids() {
+    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let output = cmd
+        .arg("rules")
+        .arg("--rule")
+        .arg("require-concurrent-index")
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let report = parse_json_stdout(&output);
+    assert_eq!(report["rules"].as_array().unwrap().len(), 1);
+    assert_eq!(report["rules"][0]["id"], "require-concurrent-index");
+
+    let mut config = tempfile::NamedTempFile::new().unwrap();
+    writeln!(config, "[rules.require-concurrent-index]\ndisabled = true").unwrap();
+    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let output = cmd
+        .arg("rules")
+        .arg("--rule")
+        .arg("require-concurrent-index")
+        .arg("--json")
+        .arg("--config")
+        .arg(config.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        parse_json_stdout(&output)["rules"][0]["effective"]["enabled"],
+        false
+    );
+
+    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let assert = cmd
+        .arg("rules")
+        .arg("--rule")
+        .arg("unknown-rule")
+        .assert()
+        .code(1);
+    assert!(
+        String::from_utf8_lossy(&assert.get_output().stderr)
+            .contains("Unknown primary rule ID 'unknown-rule'")
+    );
+}
+
+#[test]
 fn test_cli_rejects_unknown_configured_rule_id() {
     let mut sql_file = tempfile::NamedTempFile::new().unwrap();
     writeln!(sql_file, "SELECT 1;").unwrap();
