@@ -351,7 +351,12 @@ impl AstVisitor {
 
         let (columns, foreign_keys, table_constraints) = node
             .table_arg_list()
-            .map(|tal| Self::extract_table_body(tal.args()))
+            .map(|tal| {
+                let (columns, foreign_keys, mut table_constraints) =
+                    Self::extract_table_body(tal.args());
+                table_constraints.extend(Self::extract_direct_table_constraints(&tal));
+                (columns, foreign_keys, table_constraints)
+            })
             .unwrap_or_else(|| (Vec::new(), Vec::new(), Vec::new()));
 
         Some(StatementFact::CreateTable {
@@ -876,6 +881,49 @@ impl AstVisitor {
         (columns, foreign_keys, table_constraints)
     }
 
+    fn extract_direct_table_constraints(
+        table_args: &ast::TableArgList,
+    ) -> Vec<TableConstraintFact> {
+        table_args
+            .syntax()
+            .children()
+            .filter_map(|node| {
+                if let Some(primary_key) = ast::PrimaryKeyConstraint::cast(node.clone()) {
+                    return Some(TableConstraintFact::PrimaryKey {
+                        constraint_name: Self::extract_constraint_name(&primary_key),
+                        columns: Self::extract_constraint_column_list_names(
+                            primary_key
+                                .syntax()
+                                .descendants()
+                                .find_map(ast::ConstraintColumnRefList::cast)?,
+                        ),
+                    });
+                }
+                if let Some(unique) = ast::UniqueConstraint::cast(node.clone()) {
+                    return Some(TableConstraintFact::Unique {
+                        constraint_name: Self::extract_constraint_name(&unique),
+                        columns: Self::extract_constraint_column_list_names(
+                            unique
+                                .syntax()
+                                .descendants()
+                                .find_map(ast::ConstraintColumnRefList::cast)?,
+                        ),
+                    });
+                }
+                ast::CheckConstraint::cast(node).map(|_| TableConstraintFact::Check)
+            })
+            .collect()
+    }
+
+    fn extract_constraint_name(node: &impl AstNode) -> Option<String> {
+        node.syntax()
+            .descendants()
+            .find_map(ast::ConstraintNameClause::cast)
+            .and_then(|clause| clause.constraint_name())
+            .and_then(|name| name.ident_token())
+            .map(|token| Self::resolve_identifier_token(token.text()))
+    }
+
     fn extract_column_fact(col: &Column) -> Option<ColumnFact> {
         let name_token = col.name().and_then(|n| n.ident_token()).or_else(|| {
             col.syntax()
@@ -1289,6 +1337,13 @@ impl AstVisitor {
                 col.ident_token()
                     .map(|nr| Self::resolve_identifier_token(nr.text()))
             })
+            .collect()
+    }
+
+    fn extract_constraint_column_list_names(cl: ast::ConstraintColumnRefList) -> Vec<String> {
+        cl.column_name_refs()
+            .filter_map(|column| column.ident_token())
+            .map(|token| Self::resolve_identifier_token(token.text()))
             .collect()
     }
 
