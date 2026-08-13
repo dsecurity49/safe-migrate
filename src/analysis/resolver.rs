@@ -487,6 +487,14 @@ impl Resolver {
                 let id = Self::resolve_type_lookup_name(&alter_type.name, state);
                 for action_fact in &alter_type.actions {
                     match action_fact {
+                        crate::analysis::facts::AlterTypeActionFact::RenameTo { new_name } => {
+                            let mut new_id = ObjectId::new(id.schema.clone(), new_name.resolve());
+                            new_id.inferred_schema = id.inferred_schema;
+                            mutations.push(Mutation::RenameType(Rename {
+                                old_id: id.clone(),
+                                new_id,
+                            }));
+                        }
                         crate::analysis::facts::AlterTypeActionFact::AddValue {
                             new_value,
                             neighbor,

@@ -28,6 +28,7 @@ pub enum Mutation {
     AlterTable(AlterTable),
     CreateType(CreateTypeMutation),
     AlterType(AlterTypeMutation),
+    RenameType(Rename),
     CreateDomain(CreateDomainMutation),
     AlterDomain(AlterDomainMutation),
     DropDomain(DropDomainMutation),

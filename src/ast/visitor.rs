@@ -1877,6 +1877,12 @@ impl AstVisitor {
         let mut actions = Vec::new();
 
         match node.action()? {
+            ast::AlterTypeAction::TypeRenameTo(rename_type) => {
+                let new_name = rename_type.type_name()?.path()?.segment()?;
+                actions.push(AlterTypeActionFact::RenameTo {
+                    new_name: Self::identifier_from_name(new_name.text(), new_name.is_quoted()),
+                });
+            }
             ast::AlterTypeAction::AddValue(add_value) => {
                 let literals = add_value
                     .syntax()

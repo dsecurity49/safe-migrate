@@ -2716,6 +2716,36 @@ impl AnalysisState {
                 );
                 MutationResult::Applied
             }
+            Mutation::RenameType(rename) => {
+                if !self.type_is_present(&rename.old_id) {
+                    if self.baseline_covers_object(&rename.old_id) {
+                        return MutationResult::Conflict {
+                            reason: format!("type '{}' does not exist", rename.old_id),
+                        };
+                    }
+                    self.snapshot_confidence();
+                    self.local.confidence = Confidence::Tainted;
+                    return MutationResult::Skipped;
+                }
+                if rename.old_id != rename.new_id
+                    && self.relation_namespace_is_taken(&rename.new_id)
+                {
+                    return MutationResult::Conflict {
+                        reason: format!("type '{}' already exists", rename.new_id),
+                    };
+                }
+
+                self.snapshot_namespace();
+                if let Some(TypeOverlay::Present(mut state)) =
+                    self.local.types.remove(&rename.old_id)
+                {
+                    state.id = rename.new_id.clone();
+                    self.local
+                        .types
+                        .insert(rename.new_id.clone(), TypeOverlay::Present(state));
+                }
+                MutationResult::Applied
+            }
             Mutation::AlterType(alter_type) => {
                 self.snapshot_type(&alter_type.id);
                 if let Some(TypeOverlay::Present(t)) = self.local.types.get_mut(&alter_type.id) {

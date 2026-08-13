@@ -612,6 +612,56 @@ mod state_mutation_tests {
     }
 
     #[test]
+    fn rename_type_updates_identity_and_rolls_back() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "BEGIN; CREATE TYPE mood AS ENUM ('sad'); ALTER TYPE mood RENAME TO emotion;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(!state.local.types.contains_key(&object_id("public", "mood")));
+        let Some(TypeOverlay::Present(type_state)) =
+            state.local.types.get(&object_id("public", "emotion"))
+        else {
+            panic!("renamed type missing");
+        };
+        assert_eq!(type_state.id, object_id("public", "emotion"));
+
+        engine.analyze("ROLLBACK;", &mut state).unwrap();
+        assert!(
+            !state
+                .local
+                .types
+                .contains_key(&object_id("public", "emotion"))
+        );
+        assert!(!state.local.types.contains_key(&object_id("public", "mood")));
+    }
+
+    #[test]
+    fn rename_type_rejects_an_existing_target() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let violations = engine
+            .analyze(
+                "CREATE TYPE old_name AS ENUM ('old'); CREATE TYPE new_name AS ENUM ('new'); ALTER TYPE old_name RENAME TO new_name;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(violations.iter().any(|violation| {
+            violation.rule_id == "chain-conflict" && violation.reason.contains("new_name")
+        }));
+        assert!(matches!(
+            state.local.types.get(&object_id("public", "old_name")),
+            Some(TypeOverlay::Present(_))
+        ));
+    }
+
+    #[test]
     fn enum_value_rename_obeys_cached_explicit_and_default_search_path_order() {
         let engine = setup_engine();
         let mut cache = safe_migrate::db::cache::DbCache::new();

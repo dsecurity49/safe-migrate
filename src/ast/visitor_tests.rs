@@ -263,6 +263,27 @@ mod tests {
     }
 
     #[test]
+    fn alter_type_rename_to_extracts_quoted_name() {
+        let fact =
+            parse_and_extract_statement(r#"ALTER TYPE sm_core.old_name RENAME TO "NewName";"#)
+                .expect("alter type fact");
+
+        let StatementFact::AlterType(alter_type) = fact else {
+            panic!("expected alter type fact");
+        };
+        assert_eq!(
+            alter_type.name.schema.as_ref().map(Ident::resolve),
+            Some("sm_core".into())
+        );
+        assert_eq!(
+            alter_type.actions,
+            vec![AlterTypeActionFact::RenameTo {
+                new_name: Ident::new("NewName", true),
+            }]
+        );
+    }
+
+    #[test]
     fn alter_type_add_value_uses_ast_position_when_label_contains_before() {
         let fact = parse_and_extract_statement(
             "ALTER TYPE mood ADD VALUE 'not before now' AFTER 'ready';",

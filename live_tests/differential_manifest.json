@@ -1382,6 +1382,7 @@
         "006_add_value_if_not_exists_after.sql",
         "008_add_value_quoted_type.sql",
         "009_add_value_status_type.sql",
+        "safe_001_rename_type.sql",
         "safe_002_rename_value.sql",
         "safe_004_alter_table.sql",
         "safe_006_drop_type.sql",
@@ -1402,10 +1403,6 @@
         {
           "fixture": "007_add_value_schema_qualified.sql",
           "reason": "Fixture targets generic schema my_schema outside the harness-owned sm_* schema boundary."
-        },
-        {
-          "fixture": "safe_001_rename_type.sql",
-          "reason": "ALTER TYPE RENAME TO is not represented by the current parser/state mutation model; tracked as a future type-topology slice."
         },
         {
           "fixture": "safe_003_create_table.sql",

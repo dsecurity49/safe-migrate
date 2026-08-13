@@ -299,6 +299,9 @@ pub struct AlterTypeFact {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum AlterTypeActionFact {
+    RenameTo {
+        new_name: Ident,
+    },
     AddValue {
         new_value: String,
         neighbor: Option<String>,
