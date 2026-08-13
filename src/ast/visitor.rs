@@ -649,8 +649,10 @@ impl AstVisitor {
                     if let Some(constraint_name) = vc
                         .syntax()
                         .descendants()
-                        .find_map(NameRef::cast)
-                        .map(|nr| Self::resolve_name_ref(&nr))
+                        .find_map(PathSegmentRef::cast)
+                        .map(|name| {
+                            Self::identifier_from_name(name.text(), name.is_quoted()).resolve()
+                        })
                     {
                         actions.push(AlterTableActionFact::ValidateConstraint { constraint_name });
                     }
@@ -1119,23 +1121,12 @@ impl AstVisitor {
                 });
             let path = fkc.table_name_ref()?.path_ref()?;
             let references = Self::path_ref_to_qualified_name(&path)?;
+            let column_lists = Self::extract_foreign_key_column_lists(&fkc);
             return Some(AlterTableActionFact::AddForeignKey {
                 constraint_name,
                 references,
-                from_columns: fkc
-                    .syntax()
-                    .descendants()
-                    .filter_map(ast::ColumnRefList::cast)
-                    .next()
-                    .map(Self::extract_column_list_names)
-                    .unwrap_or_default(),
-                to_columns: fkc
-                    .syntax()
-                    .descendants()
-                    .filter_map(ast::ColumnRefList::cast)
-                    .nth(1)
-                    .map(Self::extract_column_list_names)
-                    .unwrap_or_default(),
+                from_columns: column_lists.first().cloned().unwrap_or_default(),
+                to_columns: column_lists.get(1).cloned().unwrap_or_default(),
                 not_valid,
             });
         }
@@ -1307,20 +1298,9 @@ impl AstVisitor {
                 .and_then(|t| t.path_ref())
                 .and_then(|p| Self::path_ref_to_qualified_name(&p))?;
             let references = path;
-            let from_columns = fkc
-                .syntax()
-                .descendants()
-                .filter_map(ast::ColumnRefList::cast)
-                .next()
-                .map(Self::extract_column_list_names)
-                .unwrap_or_default();
-            let to_columns = fkc
-                .syntax()
-                .descendants()
-                .filter_map(ast::ColumnRefList::cast)
-                .nth(1)
-                .map(Self::extract_column_list_names)
-                .unwrap_or_default();
+            let column_lists = Self::extract_foreign_key_column_lists(fkc);
+            let from_columns = column_lists.first().cloned().unwrap_or_default();
+            let to_columns = column_lists.get(1).cloned().unwrap_or_default();
 
             return Some(FkFact {
                 constraint_name,
@@ -1345,6 +1325,22 @@ impl AstVisitor {
         cl.column_name_refs()
             .filter_map(|column| column.ident_token())
             .map(|token| Self::resolve_identifier_token(token.text()))
+            .collect()
+    }
+
+    fn extract_foreign_key_column_lists(
+        constraint: &ast::ForeignKeyConstraint,
+    ) -> Vec<Vec<String>> {
+        constraint
+            .syntax()
+            .descendants()
+            .filter_map(ast::ForeignKeyColumnList::cast)
+            .map(|list| {
+                list.column_name_refs()
+                    .filter_map(|column| column.ident_token())
+                    .map(|token| Self::resolve_identifier_token(token.text()))
+                    .collect()
+            })
             .collect()
     }
 
