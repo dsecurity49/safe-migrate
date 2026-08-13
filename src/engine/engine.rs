@@ -81,6 +81,12 @@ impl SafeMigrateEngine {
 
         for (file_index, (filename, sql)) in files.iter().enumerate() {
             let normalized_sql = Self::normalize_execute(sql);
+            let parsed = SourceFile::parse(&normalized_sql);
+            let statement_ranges: Vec<_> = parsed
+                .tree()
+                .stmts()
+                .map(|statement| statement.syntax().text_range())
+                .collect();
             let violations = self.analyze_normalized_file(filename, &normalized_sql, state)?;
             findings.extend(
                 violations
@@ -91,6 +97,12 @@ impl SafeMigrateEngine {
                             &normalized_sql,
                             violation.source_range,
                         ),
+                        statement_index: violation.source_range.and_then(|range| {
+                            statement_ranges
+                                .iter()
+                                .position(|statement| statement.contains_range(range))
+                                .map(|index| index + 1)
+                        }),
                         violation,
                     })
                     .map(|finding| (file_index, finding)),

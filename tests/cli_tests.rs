@@ -565,6 +565,37 @@ fn test_cli_json_halt_is_json_and_uses_blocking_exit_status() {
     );
     assert_eq!(finding["location"]["line"], 1);
     assert_eq!(finding["location"]["column"], 1);
+    assert_eq!(finding["statement_index"], 1);
+    assert_eq!(finding["rule_title"], "Drop database");
+    assert_eq!(finding["impact"], "data loss");
+    assert_eq!(report["summary"]["total"], 1);
+    assert_eq!(report["summary"]["tier1"], 1);
+}
+
+#[test]
+fn test_cli_json_statement_index_counts_preceding_schema_neutral_statements() {
+    let mut sql_file = tempfile::NamedTempFile::new().unwrap();
+    writeln!(sql_file, "COMMENT ON TABLE widgets IS 'migration note';").unwrap();
+    writeln!(sql_file, "DROP DATABASE production;").unwrap();
+
+    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let assert = cmd
+        .arg("lint")
+        .arg("--file")
+        .arg(sql_file.path())
+        .arg("--no-cache")
+        .arg("--json")
+        .assert()
+        .code(2);
+    let report = parse_json_stdout(assert.get_output());
+    let finding = report["violations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|violation| violation["rule_id"] == "drop-database")
+        .expect("drop-database finding");
+
+    assert_eq!(finding["statement_index"], 2);
 }
 
 #[test]
@@ -585,7 +616,9 @@ fn test_cli_markdown_report_is_machine_clean_and_includes_location() {
     let markdown = String::from_utf8_lossy(&output.stdout);
 
     assert!(markdown.starts_with("# safe-migrate report\n"));
-    assert!(markdown.contains("### HALT — `drop-database`"));
+    assert!(markdown.contains("### HALT — Drop database (`drop-database`)"));
+    assert!(markdown.contains("**Impact:** data loss"));
+    assert!(markdown.contains("**Statement:** 1"));
     assert!(markdown.contains(&format!("`{}:1:1`", sql_file.path().display())));
     assert!(markdown.contains("## Baseline"));
     assert!(!markdown.contains("Analyzing migration"));

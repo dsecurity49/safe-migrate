@@ -2,6 +2,7 @@
 use crate::analysis::state::Confidence;
 use crate::report::violations::{ReportFinding, Violation, ViolationTier};
 use crate::rules::destructive::IRREVERSIBLE_MIGRATION_RULE_ID;
+use crate::rules::registry;
 use comfy_table::Table;
 use owo_colors::{OwoColorize, Style};
 
@@ -95,6 +96,18 @@ impl Reporter {
 
     pub fn json_report(violations: &[Violation], confidence: &Confidence) -> serde_json::Value {
         let verdict = compute_verdict(violations);
+        let tier1 = violations
+            .iter()
+            .filter(|violation| violation.tier == ViolationTier::Tier1)
+            .count();
+        let tier2 = violations
+            .iter()
+            .filter(|violation| violation.tier == ViolationTier::Tier2)
+            .count();
+        let tier3 = violations
+            .iter()
+            .filter(|violation| violation.tier == ViolationTier::Tier3)
+            .count();
         serde_json::json!({
             "schema_version": Self::JSON_SCHEMA_VERSION,
             "confidence": match confidence {
@@ -102,6 +115,12 @@ impl Reporter {
                 Confidence::Tainted => "Tainted",
             },
             "verdict": verdict.label(),
+            "summary": {
+                "total": violations.len(),
+                "tier1": tier1,
+                "tier2": tier2,
+                "tier3": tier3,
+            },
             "violations": violations,
         })
     }
@@ -117,8 +136,23 @@ impl Reporter {
             .map(|finding| finding.violation.clone())
             .collect();
         let mut report = Self::json_report(&violations, confidence);
-        report["violations"] =
-            serde_json::to_value(findings).expect("Report findings must always serialize to JSON");
+        report["violations"] = serde_json::Value::Array(
+            findings
+                .iter()
+                .map(|finding| {
+                    let mut value = serde_json::to_value(finding)
+                        .expect("Report findings must always serialize to JSON");
+                    if let Some(descriptor) = registry::find_primary_rule(finding.violation.rule_id)
+                        && let Some(object) = value.as_object_mut()
+                    {
+                        object.insert("rule_title".into(), descriptor.title.into());
+                        object.insert("rule_summary".into(), descriptor.summary.into());
+                        object.insert("impact".into(), descriptor.impact.into());
+                    }
+                    value
+                })
+                .collect(),
+        );
         report
     }
 
@@ -165,10 +199,20 @@ impl Reporter {
         for finding in findings {
             let violation = &finding.violation;
             output.push_str(&format!(
-                "\n### {} — `{}`\n\n",
+                "\n### {} — {} (`{}`)\n\n",
                 markdown_tier_label(&violation.tier),
+                registry::find_primary_rule(violation.rule_id)
+                    .map(|descriptor| descriptor.title)
+                    .unwrap_or(violation.rule_id),
                 markdown_code(violation.rule_id)
             ));
+            if let Some(descriptor) = registry::find_primary_rule(violation.rule_id) {
+                output.push_str(&format!(
+                    "**Impact:** {}  \n**Rule summary:** {}  \n",
+                    markdown_escape(descriptor.impact),
+                    markdown_escape(descriptor.summary)
+                ));
+            }
             if let Some(location) = &finding.location {
                 output.push_str(&format!(
                     "**Location:** `{}:{}:{}`  \n",
@@ -176,6 +220,9 @@ impl Reporter {
                     location.line,
                     location.column
                 ));
+            }
+            if let Some(statement_index) = finding.statement_index {
+                output.push_str(&format!("**Statement:** {}  \n", statement_index));
             }
             output.push_str(&format!(
                 "**Object:** {} {}  \n**Reason:** {}  \n**Recommendation:** {}\n",
@@ -280,7 +327,15 @@ impl Reporter {
             let v = &violations[*primary_idx];
             let tier_str = tier_label_colored(&v.tier);
 
-            println!(" [{}] {}", tier_str, v.rule_id);
+            let descriptor = registry::find_primary_rule(v.rule_id);
+            let rule_label = descriptor
+                .map(|descriptor| format!("{} ({})", descriptor.title, v.rule_id))
+                .unwrap_or_else(|| v.rule_id.to_string());
+            println!(" [{}] {}", tier_str, rule_label);
+            if let Some(descriptor) = descriptor {
+                println!("   impact : {}", descriptor.impact);
+                println!("   summary: {}", descriptor.summary);
+            }
 
             let display_name = match &v.object_kind {
                 crate::report::violations::ObjectKind::Database

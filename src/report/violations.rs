@@ -199,4 +199,7 @@ pub struct ReportFinding {
     pub violation: Violation,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub location: Option<SourceLocation>,
+    /// One-based statement position within the source file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub statement_index: Option<usize>,
 }
