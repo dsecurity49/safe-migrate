@@ -878,6 +878,7 @@ mod phase10_bug_fixes_and_sorting_tests {
         rel.columns.push(Column {
             name: "a".into(),
             data_type: Some("int".into()),
+            type_id: None,
             is_nullable: true,
             default: None,
             avg_width: None,
@@ -887,6 +888,7 @@ mod phase10_bug_fixes_and_sorting_tests {
         rel.columns.push(Column {
             name: "b".into(),
             data_type: Some("int".into()),
+            type_id: None,
             is_nullable: true,
             default: None,
             avg_width: None,

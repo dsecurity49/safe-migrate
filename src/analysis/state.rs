@@ -249,7 +249,37 @@ impl AnalysisState {
         for (id, type_state) in &cache.types {
             types.insert(id.clone(), TypeOverlay::Present(type_state.clone()));
         }
-
+        let type_catalog = types.clone();
+        for overlay in relations.values_mut() {
+            if let RelationOverlay::Present(relation) = overlay {
+                for column in &mut relation.columns {
+                    column.type_id = column.data_type.as_deref().and_then(|raw| {
+                        Self::resolve_type_reference_from_catalog(
+                            raw,
+                            &type_catalog,
+                            &default_search_path,
+                        )
+                    });
+                }
+            }
+        }
+        for overlay in types.values_mut() {
+            if let TypeOverlay::Present(TypeState {
+                kind:
+                    TypeKind::Domain {
+                        base_type,
+                        base_type_id,
+                    },
+                ..
+            }) = overlay
+            {
+                *base_type_id = Self::resolve_type_reference_from_catalog(
+                    base_type,
+                    &type_catalog,
+                    &default_search_path,
+                );
+            }
+        }
         for fk in cache.foreign_keys {
             baseline_foreign_keys.insert((fk.from_table.clone(), fk.constraint_name.clone()));
             graph.edges.push(DependencyEdge::new(
@@ -357,6 +387,26 @@ impl AnalysisState {
                 id.clone(),
                 crate::model::function::FunctionOverlay::Present(func_state.clone()),
             );
+        }
+        for overlay in functions.values_mut() {
+            if let crate::model::function::FunctionOverlay::Present(function) = overlay {
+                function.arg_type_ids = function
+                    .arg_types
+                    .iter()
+                    .map(|raw| {
+                        Self::resolve_type_reference_from_catalog(
+                            raw,
+                            &type_catalog,
+                            &default_search_path,
+                        )
+                    })
+                    .collect();
+                function.return_type_id = Self::resolve_type_reference_from_catalog(
+                    &function.return_type,
+                    &type_catalog,
+                    &default_search_path,
+                );
+            }
         }
 
         let mut state = Self {
@@ -493,6 +543,118 @@ impl AnalysisState {
 
     fn type_is_present(&self, id: &ObjectId) -> bool {
         matches!(self.local.types.get(id), Some(TypeOverlay::Present(_)))
+    }
+
+    fn resolve_type_reference_from_catalog(
+        raw: &str,
+        types: &HashMap<ObjectId, TypeOverlay>,
+        search_path: &[String],
+    ) -> Option<ObjectId> {
+        let (schema, name) = Self::parse_type_reference(raw)?;
+        if let Some(schema) = schema {
+            let candidate = ObjectId::new(schema, name);
+            return matches!(types.get(&candidate), Some(TypeOverlay::Present(_)))
+                .then_some(candidate);
+        }
+        search_path.iter().find_map(|schema| {
+            let candidate = ObjectId::new(schema, &name);
+            matches!(types.get(&candidate), Some(TypeOverlay::Present(_))).then_some(candidate)
+        })
+    }
+
+    /// Parse a SQL type name exactly enough to resolve modeled named types.
+    /// Quoted identifiers retain their case, unquoted identifiers fold to
+    /// lowercase, and any number of array suffixes are ignored for lookup.
+    fn parse_type_reference(raw: &str) -> Option<(Option<String>, String)> {
+        let mut token = raw.trim();
+        while let Some(without_array) = token.strip_suffix("[]") {
+            token = without_array.trim_end();
+        }
+
+        let mut parts = Vec::new();
+        let mut current = String::new();
+        let mut quoted = false;
+        let mut part_is_quoted = false;
+        let mut chars = token.chars().peekable();
+        while let Some(character) = chars.next() {
+            match character {
+                '"' if quoted && chars.peek() == Some(&'"') => {
+                    current.push('"');
+                    chars.next();
+                }
+                '"' => {
+                    quoted = !quoted;
+                    part_is_quoted = true;
+                }
+                '.' if !quoted => {
+                    parts.push(Self::resolve_type_identifier(&current, part_is_quoted)?);
+                    current.clear();
+                    part_is_quoted = false;
+                }
+                character if !quoted && character.is_whitespace() => {}
+                character => current.push(character),
+            }
+        }
+        if quoted {
+            return None;
+        }
+        parts.push(Self::resolve_type_identifier(&current, part_is_quoted)?);
+        match parts.as_slice() {
+            [name] => Some((None, name.clone())),
+            [schema, name] => Some((Some(schema.clone()), name.clone())),
+            _ => None,
+        }
+    }
+
+    fn resolve_type_identifier(identifier: &str, quoted: bool) -> Option<String> {
+        (!identifier.is_empty()).then(|| {
+            if quoted {
+                identifier.to_string()
+            } else {
+                identifier.to_lowercase()
+            }
+        })
+    }
+
+    fn resolve_type_reference(&self, raw: &str) -> Option<ObjectId> {
+        Self::resolve_type_reference_from_catalog(raw, &self.local.types, &self.local.search_path)
+    }
+
+    fn type_reference_name(id: &ObjectId, qualified: bool) -> String {
+        let quote = |identifier: &str| {
+            let unquoted = identifier
+                .chars()
+                .enumerate()
+                .all(|(index, character)| match index {
+                    0 => character.is_ascii_lowercase() || character == '_',
+                    _ => {
+                        character.is_ascii_lowercase()
+                            || character.is_ascii_digit()
+                            || character == '_'
+                            || character == '$'
+                    }
+                });
+            if unquoted {
+                identifier.to_string()
+            } else {
+                format!("\"{}\"", identifier.replace('"', "\"\""))
+            }
+        };
+
+        if qualified {
+            format!("{}.{}", quote(&id.schema), quote(&id.name))
+        } else {
+            quote(&id.name)
+        }
+    }
+
+    fn remapped_type_display(raw: &str, new_id: &ObjectId, schema_changed: bool) -> String {
+        let suffix = raw.find('[').map(|index| &raw[index..]).unwrap_or("");
+        format!(
+            "{}{}",
+            Self::type_reference_name(new_id, schema_changed),
+            suffix
+        )
     }
 
     fn index_is_present(&self, id: &ObjectId) -> bool {
@@ -1766,6 +1928,16 @@ impl AnalysisState {
                         not_null: col.not_null || is_pk,
                         default: col.default.clone(),
                     });
+                    if let Some(column) = rel_state
+                        .columns
+                        .iter_mut()
+                        .find(|column| column.name == col.name)
+                    {
+                        column.type_id = column
+                            .data_type
+                            .as_deref()
+                            .and_then(|raw| self.resolve_type_reference(raw));
+                    }
                 }
 
                 for (sequence_id, column_name, _) in &implicit_sequences {
@@ -2387,6 +2559,13 @@ impl AnalysisState {
                 }
 
                 self.snapshot_relation(&alter.id);
+                let action_type_id = match &alter.action {
+                    AlterTableActionMutation::AddColumn { ty, .. } => ty
+                        .as_deref()
+                        .and_then(|raw| self.resolve_type_reference(raw)),
+                    AlterTableActionMutation::SetType { ty, .. } => self.resolve_type_reference(ty),
+                    _ => None,
+                };
                 let rel_overlay = self.local.relations.get_mut(&alter.id);
                 if let Some(RelationOverlay::Present(rel)) = rel_overlay {
                     let generation = rel.generation;
@@ -2420,6 +2599,11 @@ impl AnalysisState {
                                 not_null: *not_null,
                                 default: default.clone(),
                             });
+                            if let Some(column) =
+                                rel.columns.iter_mut().find(|column| column.name == *name)
+                            {
+                                column.type_id = action_type_id.clone();
+                            }
 
                             if let Some((sequence_id, column_name, _)) = &implicit_add
                                 && column_name == name
@@ -2485,6 +2669,11 @@ impl AnalysisState {
                                 name: column.clone(),
                                 data_type: ty.clone(),
                             });
+                            if let Some(column) =
+                                rel.columns.iter_mut().find(|entry| entry.name == *column)
+                            {
+                                column.type_id = action_type_id.clone();
+                            }
                         }
                         AlterTableActionMutation::SetDefault { column, default } => {
                             if !rel.has_column(column) {
@@ -2797,6 +2986,80 @@ impl AnalysisState {
                     return MutationResult::Skipped;
                 }
 
+                let mut remapped_functions = Vec::new();
+                for (function_id, overlay) in &self.local.functions {
+                    let crate::model::function::FunctionOverlay::Present(function) = overlay else {
+                        continue;
+                    };
+                    let new_arg_types = function
+                        .arg_types
+                        .iter()
+                        .enumerate()
+                        .map(|(index, raw)| {
+                            if function.arg_type_ids.get(index)
+                                == Some(&Some(rename.old_id.clone()))
+                            {
+                                Self::remapped_type_display(
+                                    raw,
+                                    &rename.new_id,
+                                    rename.old_id.schema != rename.new_id.schema,
+                                )
+                            } else {
+                                raw.clone()
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    let new_return_type = if function.return_type_id == Some(rename.old_id.clone())
+                    {
+                        Self::remapped_type_display(
+                            &function.return_type,
+                            &rename.new_id,
+                            rename.old_id.schema != rename.new_id.schema,
+                        )
+                    } else {
+                        function.return_type.clone()
+                    };
+                    let base_name = function_id
+                        .name
+                        .split_once('(')
+                        .map(|(name, _)| name)
+                        .unwrap_or(&function_id.name);
+                    let mut new_function_id = ObjectId::new(
+                        &function_id.schema,
+                        format!("{}({})", base_name, new_arg_types.join(",")),
+                    );
+                    new_function_id.inferred_schema = function_id.inferred_schema;
+                    if new_function_id != *function_id
+                        || new_arg_types != function.arg_types
+                        || new_return_type != function.return_type
+                    {
+                        remapped_functions.push((
+                            function_id.clone(),
+                            new_function_id,
+                            new_arg_types,
+                            new_return_type,
+                        ));
+                    }
+                }
+                let moved_function_ids = remapped_functions
+                    .iter()
+                    .map(|(old_id, _, _, _)| old_id)
+                    .collect::<HashSet<_>>();
+                let mut destinations = HashSet::new();
+                for (_, new_id, _, _) in &remapped_functions {
+                    if !destinations.insert(new_id)
+                        || (self.local.functions.contains_key(new_id)
+                            && !moved_function_ids.contains(new_id))
+                    {
+                        return MutationResult::Conflict {
+                            reason: format!(
+                                "routine '{}' already exists after renaming type '{}'",
+                                new_id, rename.old_id
+                            ),
+                        };
+                    }
+                }
+
                 self.snapshot_namespace();
                 if let Some(TypeOverlay::Present(mut state)) =
                     self.local.types.remove(&rename.old_id)
@@ -2805,6 +3068,68 @@ impl AnalysisState {
                     self.local
                         .types
                         .insert(rename.new_id.clone(), TypeOverlay::Present(state));
+                }
+                for overlay in self.local.relations.values_mut() {
+                    if let RelationOverlay::Present(relation) = overlay {
+                        for column in &mut relation.columns {
+                            if column.type_id == Some(rename.old_id.clone()) {
+                                column.data_type = Some(Self::remapped_type_display(
+                                    column.data_type.as_deref().unwrap_or_default(),
+                                    &rename.new_id,
+                                    rename.old_id.schema != rename.new_id.schema,
+                                ));
+                                column.type_id = Some(rename.new_id.clone());
+                            }
+                        }
+                    }
+                }
+                for overlay in self.local.types.values_mut() {
+                    if let TypeOverlay::Present(TypeState {
+                        kind:
+                            TypeKind::Domain {
+                                base_type,
+                                base_type_id,
+                            },
+                        ..
+                    }) = overlay
+                        && *base_type_id == Some(rename.old_id.clone())
+                    {
+                        *base_type = Self::remapped_type_display(
+                            base_type,
+                            &rename.new_id,
+                            rename.old_id.schema != rename.new_id.schema,
+                        );
+                        *base_type_id = Some(rename.new_id.clone());
+                    }
+                }
+                for (old_id, new_id, arg_types, return_type) in remapped_functions {
+                    if let Some(crate::model::function::FunctionOverlay::Present(mut function)) =
+                        self.local.functions.remove(&old_id)
+                    {
+                        function.id = new_id.clone();
+                        function.arg_types = arg_types;
+                        for type_id in &mut function.arg_type_ids {
+                            if *type_id == Some(rename.old_id.clone()) {
+                                *type_id = Some(rename.new_id.clone());
+                            }
+                        }
+                        function.return_type = return_type;
+                        if function.return_type_id == Some(rename.old_id.clone()) {
+                            function.return_type_id = Some(rename.new_id.clone());
+                        }
+                        self.local.functions.insert(
+                            new_id.clone(),
+                            crate::model::function::FunctionOverlay::Present(function),
+                        );
+                        if old_id != new_id {
+                            self.local.graph.propagate_rename(&old_id, &new_id);
+                            self.local.graph.edges.push(DependencyEdge::new(
+                                old_id,
+                                new_id,
+                                DependencyKind::RenameTo,
+                            ));
+                        }
+                    }
                 }
                 MutationResult::Applied
             }
@@ -2889,6 +3214,7 @@ impl AnalysisState {
                         generation,
                         kind: TypeKind::Domain {
                             base_type: create_domain.base_type.clone(),
+                            base_type_id: self.resolve_type_reference(&create_domain.base_type),
                         },
                     }),
                 );
@@ -3765,11 +4091,37 @@ impl AnalysisState {
                         crate::model::function::FunctionState {
                             id: f.id.clone(),
                             arg_types: f.params.iter().map(|p| p.ty.clone()).collect(),
+                            arg_type_ids: f
+                                .params
+                                .iter()
+                                .map(|parameter| self.resolve_type_reference(&parameter.ty))
+                                .collect(),
                             return_type: f
                                 .return_type
                                 .as_ref()
-                                .map(|rt| format!("{:?}", rt))
+                                .map(|rt| match rt {
+                                    crate::analysis::facts::RetTypeFact::Scalar(ty) => ty.clone(),
+                                    crate::analysis::facts::RetTypeFact::Table(columns) => columns
+                                        .iter()
+                                        .map(|column| {
+                                            format!(
+                                                "{} {}",
+                                                column.name,
+                                                column.ty.as_deref().unwrap_or("unknown")
+                                            )
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join(", "),
+                                })
                                 .unwrap_or_default(),
+                            return_type_id: f.return_type.as_ref().and_then(|return_type| {
+                                match return_type {
+                                    crate::analysis::facts::RetTypeFact::Scalar(ty) => {
+                                        self.resolve_type_reference(ty)
+                                    }
+                                    crate::analysis::facts::RetTypeFact::Table(_) => None,
+                                }
+                            }),
                             volatility,
                             language,
                             security,
@@ -3948,7 +4300,13 @@ impl AnalysisState {
                         crate::model::function::FunctionState {
                             id: p.id.clone(),
                             arg_types: p.params.iter().map(|p| p.ty.clone()).collect(),
+                            arg_type_ids: p
+                                .params
+                                .iter()
+                                .map(|parameter| self.resolve_type_reference(&parameter.ty))
+                                .collect(),
                             return_type: "void".to_string(),
+                            return_type_id: None,
                             volatility: crate::model::function::Volatility::Volatile,
                             language: "sql".to_string(),
                             security: crate::model::function::SecurityMode::Invoker,

@@ -1,10 +1,16 @@
 use crate::analysis::expr_ir::ExprIr;
+use crate::ast::identifiers::ObjectId;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Column {
     pub name: String,
     pub data_type: Option<String>,
+    /// Resolved identity for a tracked user-defined type. The display spelling
+    /// remains for reports and cache compatibility; state transitions use this
+    /// identity so same-named types in different schemas stay distinct.
+    #[serde(skip)]
+    pub type_id: Option<ObjectId>,
     pub is_nullable: bool,
     pub default: Option<ExprIr>,
     pub avg_width: Option<i32>,

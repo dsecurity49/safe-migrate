@@ -2191,7 +2191,7 @@ fn normalize_type_kind(kind: &TypeKind) -> NormalizedType {
         TypeKind::Enum { variants } => NormalizedType::Enum {
             variants: variants.clone(),
         },
-        TypeKind::Domain { base_type } => NormalizedType::Domain {
+        TypeKind::Domain { base_type, .. } => NormalizedType::Domain {
             base_type: normalize_data_type(base_type),
         },
         TypeKind::Base => NormalizedType::Base,

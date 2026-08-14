@@ -159,6 +159,7 @@ mod destructive_rule_tests {
         rel.columns.push(Column {
             name: "data".into(),
             data_type: Some("character varying(255)".into()),
+            type_id: None,
             is_nullable: true,
             default: None,
             avg_width: None,
@@ -198,6 +199,7 @@ mod destructive_rule_tests {
         rel2.columns.push(Column {
             name: "data".into(),
             data_type: Some("character varying(50)".into()),
+            type_id: None,
             is_nullable: true,
             default: None,
             avg_width: None,
@@ -240,6 +242,7 @@ mod destructive_rule_tests {
         rel.columns.push(Column {
             name: "data".into(),
             data_type: Some("text".into()),
+            type_id: None,
             is_nullable: true,
             default: None,
             avg_width: None,

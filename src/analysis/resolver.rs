@@ -146,8 +146,8 @@ impl Resolver {
         id
     }
 
-    fn normalize_function_arg_type(raw: &str) -> String {
-        let normalized = raw.trim().to_lowercase();
+    pub(crate) fn normalize_function_arg_type(raw: &str) -> String {
+        let normalized = Self::fold_unquoted_identifier_case(raw.trim());
         if let Some(element_type) = normalized.strip_suffix("[]") {
             return format!("{}[]", Self::normalize_function_arg_type(element_type));
         }
@@ -166,6 +166,27 @@ impl Resolver {
             "decimal" => "numeric".to_string(),
             _ => normalized,
         }
+    }
+
+    fn fold_unquoted_identifier_case(raw: &str) -> String {
+        let mut folded = String::with_capacity(raw.len());
+        let mut quoted = false;
+        let mut chars = raw.chars().peekable();
+        while let Some(character) = chars.next() {
+            match character {
+                '"' if quoted && chars.peek() == Some(&'"') => {
+                    folded.push('"');
+                    chars.next();
+                }
+                '"' => {
+                    quoted = !quoted;
+                    folded.push(character);
+                }
+                character if quoted => folded.push(character),
+                character => folded.extend(character.to_lowercase()),
+            }
+        }
+        folded
     }
 
     fn resolve_grant_target(

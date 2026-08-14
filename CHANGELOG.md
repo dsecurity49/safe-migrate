@@ -12,8 +12,8 @@ notes are available on the
 - Adapted typed AST extraction to Squawk 2.62's updated representation while
   retaining table-constraint, view-dependency, and foreign-key analysis.
 - Modeled `ALTER TYPE ... RENAME TO`, including duplicate and missing-type
-  conflicts, state identity updates, transaction/savepoint rollback, and
-  PostgreSQL differential coverage.
+  conflicts, transaction/savepoint rollback, PostgreSQL differential coverage,
+  and atomic remapping of tracked column, domain, and routine type references.
 - Modeled `ALTER TRIGGER ... RENAME TO` and `ALTER TYPE ... SET SCHEMA`, with
   collision checks, transaction rollback, and PostgreSQL differential coverage.
 - Treat `COMMENT ON` statements as explicit schema-neutral no-ops instead of
