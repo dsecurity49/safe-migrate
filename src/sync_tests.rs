@@ -330,6 +330,32 @@ mod tests {
     }
 
     #[test]
+    fn domain_type_identity_link_does_not_change_the_v5_bincode_layout() {
+        #[allow(dead_code)]
+        #[derive(Serialize)]
+        enum LegacyTypeKind {
+            Enum { variants: Vec<String> },
+            Domain { base_type: String },
+            Base,
+            Composite,
+            Range,
+        }
+
+        let legacy = LegacyTypeKind::Domain {
+            base_type: "mood".into(),
+        };
+        let current = crate::model::types::TypeKind::Domain {
+            base_type: "mood".into(),
+            base_type_id: Some(ObjectId::new("public", "mood")),
+        };
+        let config = bincode::config::standard().with_variable_int_encoding();
+        let legacy_bytes = bincode::serde::encode_to_vec(&legacy, config).unwrap();
+        let current_bytes = bincode::serde::encode_to_vec(&current, config).unwrap();
+
+        assert_eq!(current_bytes, legacy_bytes);
+    }
+
+    #[test]
     fn test_v3_cache_requires_resync() {
         let error = crate::db::cache::DbCacheVersioned::V3
             .into_cache()

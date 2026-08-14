@@ -27,21 +27,24 @@ mod phase10_bug_fixes_and_sorting_tests {
     #[test]
     fn duplicate_column_assignments_remain_opaque() {
         let engine = setup_engine();
-        let mut state = setup_state();
+        for sql in [
+            "UPDATE users SET display_name = 'first', display_name = 'second';",
+            "INSERT INTO users (id) VALUES (1) ON CONFLICT (id) DO UPDATE
+             SET display_name = 'first', display_name = 'second';",
+        ] {
+            let mut state = setup_state();
+            let violations = engine
+                .analyze(sql, &mut state)
+                .expect("Squawk should parse duplicate assignments");
 
-        let violations = engine
-            .analyze(
-                "UPDATE users SET display_name = 'first', display_name = 'second';",
-                &mut state,
-            )
-            .expect("Squawk should parse duplicate assignments");
-
-        assert!(
-            violations
-                .iter()
-                .any(|violation| violation.rule_id == "opaque-dynamic-sql")
-        );
-        assert_eq!(state.local.confidence, Confidence::Tainted);
+            assert!(
+                violations
+                    .iter()
+                    .any(|violation| violation.rule_id == "opaque-dynamic-sql"),
+                "duplicate DML assignment must remain opaque: {sql}"
+            );
+            assert_eq!(state.local.confidence, Confidence::Tainted);
+        }
     }
 
     #[test]

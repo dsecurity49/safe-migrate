@@ -757,6 +757,14 @@ mod exhaustive_fuzz_tests {
                 .iter()
                 .all(|violation| violation.rule_id != "opaque-dynamic-sql")
         );
+        let Some(safe_migrate::model::relation::RelationOverlay::Present(relation)) = state
+            .get_relation(&safe_migrate::ast::identifiers::ObjectId::new(
+                "public", "users",
+            ))
+        else {
+            panic!("users table missing");
+        };
+        assert!(relation.has_column("name"));
     }
 
     // --- Fuzz Group 7: Schema drift with PG cache (20 cases) ---

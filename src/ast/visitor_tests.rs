@@ -1132,18 +1132,28 @@ mod tests {
 
     #[test]
     fn parser_accepts_postgres_19_property_graph_syntax_as_opaque() {
-        let sql = "CREATE PROPERTY GRAPH social
-            VERTEX TABLES (people)
-            EDGE TABLES (knows SOURCE people DESTINATION people);";
-        let parsed = SourceFile::parse(sql);
-
-        assert!(parsed.errors().is_empty());
-        let statement = parsed
-            .tree()
-            .stmts()
-            .next()
-            .expect("property graph statement");
-        assert!(AstVisitor::extract(&statement).is_none());
+        for sql in [
+            "CREATE PROPERTY GRAPH social
+                VERTEX TABLES (people)
+                EDGE TABLES (knows SOURCE people DESTINATION people);",
+            "ALTER PROPERTY GRAPH social SET SCHEMA graph_schema;",
+            "DROP PROPERTY GRAPH IF EXISTS social CASCADE;",
+        ] {
+            let parsed = SourceFile::parse(sql);
+            assert!(
+                parsed.errors().is_empty(),
+                "property graph must parse: {sql}"
+            );
+            let statement = parsed
+                .tree()
+                .stmts()
+                .next()
+                .expect("property graph statement");
+            assert!(
+                AstVisitor::extract(&statement).is_none(),
+                "unmodeled property graph syntax must stay opaque: {sql}"
+            );
+        }
     }
 
     #[test]

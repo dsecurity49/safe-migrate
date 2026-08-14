@@ -176,6 +176,7 @@ impl Resolver {
             match character {
                 '"' if quoted && chars.peek() == Some(&'"') => {
                     folded.push('"');
+                    folded.push('"');
                     chars.next();
                 }
                 '"' => {

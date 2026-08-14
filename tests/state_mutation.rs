@@ -836,6 +836,37 @@ mod state_mutation_tests {
     }
 
     #[test]
+    fn quoted_embedded_quote_type_resolves_in_function_signature() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                r#"CREATE TYPE public."a""b" AS ENUM ('value');
+                   CREATE FUNCTION accepts_embedded(value public."a""b")
+                   RETURNS public."a""b" LANGUAGE sql AS $$ SELECT value $$;"#,
+                &mut state,
+            )
+            .unwrap();
+
+        let Some(FunctionOverlay::Present(function)) = state
+            .local
+            .functions
+            .values()
+            .find(|function| {
+                matches!(function, FunctionOverlay::Present(function) if function.id.name.starts_with("accepts_embedded("))
+            })
+        else {
+            panic!("embedded-quote function missing");
+        };
+        assert_eq!(
+            function.arg_type_ids,
+            vec![Some(object_id("public", "a\"b"))]
+        );
+        assert_eq!(function.return_type_id, Some(object_id("public", "a\"b")));
+    }
+
+    #[test]
     fn rename_type_updates_cached_routine_signatures_and_undo_restores_them() {
         let engine = setup_engine();
         let mut cache = DbCache::new();

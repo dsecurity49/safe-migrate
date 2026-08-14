@@ -359,9 +359,8 @@ impl AstVisitor {
         let (columns, foreign_keys, table_constraints) = node
             .table_arg_list()
             .map(|tal| {
-                let (columns, foreign_keys, mut table_constraints) =
+                let (columns, foreign_keys, table_constraints) =
                     Self::extract_table_body(tal.args());
-                table_constraints.extend(Self::extract_direct_table_constraints(&tal));
                 (columns, foreign_keys, table_constraints)
             })
             .unwrap_or_else(|| (Vec::new(), Vec::new(), Vec::new()));
@@ -890,49 +889,6 @@ impl AstVisitor {
         (columns, foreign_keys, table_constraints)
     }
 
-    fn extract_direct_table_constraints(
-        table_args: &ast::TableArgList,
-    ) -> Vec<TableConstraintFact> {
-        table_args
-            .syntax()
-            .children()
-            .filter_map(|node| {
-                if let Some(primary_key) = ast::PrimaryKeyConstraint::cast(node.clone()) {
-                    return Some(TableConstraintFact::PrimaryKey {
-                        constraint_name: Self::extract_constraint_name(&primary_key),
-                        columns: Self::extract_constraint_column_list_names(
-                            primary_key
-                                .syntax()
-                                .descendants()
-                                .find_map(ast::ConstraintColumnRefList::cast)?,
-                        ),
-                    });
-                }
-                if let Some(unique) = ast::UniqueConstraint::cast(node.clone()) {
-                    return Some(TableConstraintFact::Unique {
-                        constraint_name: Self::extract_constraint_name(&unique),
-                        columns: Self::extract_constraint_column_list_names(
-                            unique
-                                .syntax()
-                                .descendants()
-                                .find_map(ast::ConstraintColumnRefList::cast)?,
-                        ),
-                    });
-                }
-                ast::CheckConstraint::cast(node).map(|_| TableConstraintFact::Check)
-            })
-            .collect()
-    }
-
-    fn extract_constraint_name(node: &impl AstNode) -> Option<String> {
-        node.syntax()
-            .descendants()
-            .find_map(ast::ConstraintNameClause::cast)
-            .and_then(|clause| clause.constraint_name())
-            .and_then(|name| name.ident_token())
-            .map(|token| Self::resolve_identifier_token(token.text()))
-    }
-
     fn extract_column_fact(col: &Column) -> Option<ColumnFact> {
         let name_token = col.name().and_then(|n| n.ident_token()).or_else(|| {
             col.syntax()
@@ -1226,11 +1182,12 @@ impl AstVisitor {
                     .and_then(|clause| clause.constraint_name())
                     .and_then(|name| name.ident_token())
                     .map(|token| Self::resolve_identifier_token(token.text())),
-                columns: Self::extract_column_list_names(
-                    pkc.syntax()
-                        .descendants()
-                        .find_map(ast::ColumnRefList::cast)?,
-                ),
+                columns: pkc
+                    .syntax()
+                    .descendants()
+                    .find_map(ast::ConstraintColumnRefList::cast)
+                    .map(Self::extract_constraint_column_list_names)
+                    .or_else(|| pkc.using_index().map(|_| Vec::new()))?,
             }),
             TableConstraint::UniqueConstraint(uc) => Some(TableConstraintFact::Unique {
                 constraint_name: uc
@@ -1238,11 +1195,12 @@ impl AstVisitor {
                     .and_then(|clause| clause.constraint_name())
                     .and_then(|name| name.ident_token())
                     .map(|token| Self::resolve_identifier_token(token.text())),
-                columns: Self::extract_column_list_names(
-                    uc.syntax()
-                        .descendants()
-                        .find_map(ast::ColumnRefList::cast)?,
-                ),
+                columns: uc
+                    .syntax()
+                    .descendants()
+                    .find_map(ast::ConstraintColumnRefList::cast)
+                    .map(Self::extract_constraint_column_list_names)
+                    .or_else(|| uc.using_index().map(|_| Vec::new()))?,
             }),
             TableConstraint::CheckConstraint(_) => Some(TableConstraintFact::Check),
             _ => None,
@@ -1318,15 +1276,6 @@ impl AstVisitor {
         None
     }
 
-    fn extract_column_list_names(cl: ast::ColumnRefList) -> Vec<String> {
-        cl.column_name_refs()
-            .filter_map(|col| {
-                col.ident_token()
-                    .map(|nr| Self::resolve_identifier_token(nr.text()))
-            })
-            .collect()
-    }
-
     fn extract_constraint_column_list_names(cl: ast::ConstraintColumnRefList) -> Vec<String> {
         cl.column_name_refs()
             .filter_map(|column| column.ident_token())
@@ -1337,6 +1286,9 @@ impl AstVisitor {
     fn extract_foreign_key_column_lists(
         constraint: &ast::ForeignKeyConstraint,
     ) -> Vec<Vec<String>> {
+        // PostgreSQL lists the referencing columns first and referenced columns
+        // second. Later lists, such as ON DELETE SET NULL (columns), must not
+        // change that positional contract.
         constraint
             .syntax()
             .descendants()

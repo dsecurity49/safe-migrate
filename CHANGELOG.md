@@ -7,25 +7,18 @@ notes are available on the
 
 ## v0.5.0 (unreleased)
 
-- Upgraded the pinned Squawk parser stack from 2.61.0 to 2.62.0 and raised the
-  minimum supported Rust version to 1.94, as required by that release.
-- Adapted typed AST extraction to Squawk 2.62's updated representation while
-  retaining table-constraint, view-dependency, and foreign-key analysis.
-- Modeled `ALTER TYPE ... RENAME TO`, including duplicate and missing-type
-  conflicts, transaction/savepoint rollback, PostgreSQL differential coverage,
-  and atomic remapping of tracked column, domain, and routine type references.
-- Modeled `ALTER TRIGGER ... RENAME TO` and `ALTER TYPE ... SET SCHEMA`, with
-  collision checks, transaction rollback, and PostgreSQL differential coverage.
-- Treat `COMMENT ON` statements as explicit schema-neutral no-ops instead of
-  emitting an opaque-SQL warning.
-- Added `safe-migrate rules` discovery backed by the canonical rule registry,
-  including JSON output, single-rule lookup, remediation, and effective
-  configuration details.
-- Enriched JSON, Markdown, terminal, and GitHub Action reports with rule titles,
-  impact and summaries, one-based statement indexes, and additive tier counts;
-  JSON remains schema version 1 and Cache V5 remains unchanged.
-- Added parser regressions for LF, CRLF, and CR input, PostgreSQL 19
-  property-graph syntax, and duplicate DML assignments staying opaque.
+- Upgraded the pinned Squawk parser stack to 2.62.0 and raised the minimum
+  supported Rust version to 1.94.
+- Modeled `ALTER TYPE ... RENAME TO`, `ALTER TYPE ... SET SCHEMA`, and
+  `ALTER TRIGGER ... RENAME TO`, including tracked dependent references and
+  transaction rollback.
+- Treat `COMMENT ON` as a schema-neutral no-op. PostgreSQL 19 property-graph
+  syntax and duplicate DML assignments parse successfully but remain explicitly
+  opaque, preserving conservative analysis.
+- Added `safe-migrate rules` discovery and richer terminal, Markdown, JSON, and
+  GitHub Action findings with rule metadata and statement indexes.
+- Preserved compatibility: JSON remains schema version 1 and the Cache V5
+  format is unchanged.
 
 ## v0.4.5 — 2026-08-08
 
