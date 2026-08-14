@@ -5,7 +5,7 @@ commits and pull requests. Published binaries, checksums, and generated release
 notes are available on the
 [GitHub Releases page](https://github.com/dsecurity49/safe-migrate/releases).
 
-## v0.5.0 (unreleased)
+## v0.5.0 — 2026-08-14
 
 - Upgraded the pinned Squawk parser stack to 2.62.0 and raised the minimum
   supported Rust version to 1.94.
