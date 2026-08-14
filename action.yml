@@ -216,12 +216,12 @@ runs:
             if (finding.tier !== 'Tier1' && finding.tier !== 'Tier2') continue;
             const location = finding.location || {};
             const properties = {
-              title: `safe-migrate: ${finding.rule_id || 'finding'}`,
+              title: `safe-migrate: ${finding.rule_title || finding.rule_id || 'finding'}${finding.rule_title && finding.rule_id ? ` (${finding.rule_id})` : ''}`,
               file: location.file,
               startLine: location.line,
               startColumn: location.column,
             };
-            const message = `${finding.reason || 'Migration finding'}${finding.recipe ? ` — ${finding.recipe}` : ''}`;
+            const message = `${finding.rule_summary ? `${finding.rule_summary} ` : ''}${finding.reason || 'Migration finding'}${finding.recipe ? ` — ${finding.recipe}` : ''}`;
             if (finding.tier === 'Tier1') core.error(message, properties);
             else core.warning(message, properties);
           }

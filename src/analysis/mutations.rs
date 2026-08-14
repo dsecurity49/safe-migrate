@@ -25,9 +25,11 @@ pub enum Mutation {
     DropPolicy(DropPolicyMutation),
     CreateTrigger(CreateTriggerMutation),
     DropTrigger(DropTriggerMutation),
+    RenameTrigger(RenameTriggerMutation),
     AlterTable(AlterTable),
     CreateType(CreateTypeMutation),
     AlterType(AlterTypeMutation),
+    RenameType(Rename),
     CreateDomain(CreateDomainMutation),
     AlterDomain(AlterDomainMutation),
     DropDomain(DropDomainMutation),
@@ -141,6 +143,13 @@ pub struct DropTriggerMutation {
     pub name: String,
     pub table: ObjectId,
     pub if_exists: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RenameTriggerMutation {
+    pub name: String,
+    pub table: ObjectId,
+    pub new_name: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]

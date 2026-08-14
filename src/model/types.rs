@@ -11,8 +11,16 @@ pub struct TypeState {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum TypeKind {
-    Enum { variants: Vec<String> },
-    Domain { base_type: String },
+    Enum {
+        variants: Vec<String>,
+    },
+    Domain {
+        base_type: String,
+        /// Derived from `base_type` when a cache enters analysis. Keeping it
+        /// out of the cache preserves the V5 binary format.
+        #[serde(skip)]
+        base_type_id: Option<ObjectId>,
+    },
     Base,
     Composite,
     Range,

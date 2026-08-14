@@ -147,6 +147,11 @@ pub enum StatementFact {
         table: QualifiedName,
         if_exists: bool,
     },
+    AlterTrigger {
+        name: String,
+        table: QualifiedName,
+        new_name: String,
+    },
     AlterTable {
         name: QualifiedName,
         actions: Vec<AlterTableActionFact>,
@@ -234,6 +239,9 @@ pub enum StatementFact {
     SetConstraints,
     OpaqueBlock,
     Execute,
+    /// Parsed SQL that changes PostgreSQL metadata but no schema state modeled
+    /// by safe-migrate, such as `COMMENT ON`.
+    SchemaNeutralNoop,
     Vacuum {
         relation: Option<QualifiedName>,
         is_full: bool,
@@ -299,6 +307,12 @@ pub struct AlterTypeFact {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum AlterTypeActionFact {
+    RenameTo {
+        new_name: Ident,
+    },
+    SetSchema {
+        new_schema: String,
+    },
     AddValue {
         new_value: String,
         neighbor: Option<String>,

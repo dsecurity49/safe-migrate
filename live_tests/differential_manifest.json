@@ -1036,6 +1036,7 @@
         "safe_002_drop_trigger.sql",
         "safe_003_add_column.sql",
         "safe_005_create_table.sql",
+        "safe_007_rename_trigger.sql",
         "safe_009_create_index.sql",
         "safe_010_rename_table.sql"
       ],
@@ -1051,10 +1052,6 @@
         {
           "fixture": "safe_006_drop_table.sql",
           "reason": "PostgreSQL correctly rejects DROP TABLE without CASCADE because public.child_table and sm_audit.change_requests depend on public.test_table."
-        },
-        {
-          "fixture": "safe_007_rename_trigger.sql",
-          "reason": "ALTER TRIGGER RENAME is not represented by the current AST mutation layer; deferred rather than treating an opaque statement as differential coverage."
         },
         {
           "fixture": "safe_008_drop_constraint.sql",
@@ -1382,13 +1379,16 @@
         "006_add_value_if_not_exists_after.sql",
         "008_add_value_quoted_type.sql",
         "009_add_value_status_type.sql",
+        "safe_001_rename_type.sql",
         "safe_002_rename_value.sql",
         "safe_004_alter_table.sql",
         "safe_006_drop_type.sql",
         "safe_008_create_index.sql",
         "safe_010_rename_value_search_path.sql",
         "safe_011_rename_value_quoted.sql",
-        "safe_012_create_then_rename_value.sql"
+        "safe_012_create_then_rename_value.sql",
+        "safe_013_set_schema.sql",
+        "safe_014_rename_type_dependents.sql"
       ],
       "excluded_fixtures": [
         {
@@ -1402,10 +1402,6 @@
         {
           "fixture": "007_add_value_schema_qualified.sql",
           "reason": "Fixture targets generic schema my_schema outside the harness-owned sm_* schema boundary."
-        },
-        {
-          "fixture": "safe_001_rename_type.sql",
-          "reason": "ALTER TYPE RENAME TO is not represented by the current parser/state mutation model; tracked as a future type-topology slice."
         },
         {
           "fixture": "safe_003_create_table.sql",
@@ -2090,7 +2086,8 @@
         "011_select.sql",
         "safe_004_create_index.sql",
         "013_update.sql",
-        "014_delete.sql"
+        "014_delete.sql",
+        "015_comment_on.sql"
       ],
       "expected_live_errors": {
         "013_invalid_set_role_current_user.sql": {
@@ -2158,7 +2155,7 @@
       "required_relations": [
         "public.test_table"
       ],
-      "notes": "Twenty-fourth incremental slice. Executes opaque procedural, transaction-control, and currently unmodeled DML statements against PostgreSQL, verifies their schema-state neutrality, and compares explicit DDL controls."
+      "notes": "Twenty-fourth incremental slice. Executes opaque procedural, transaction-control, and currently unmodeled DML statements against PostgreSQL, verifies their schema-state neutrality, compares explicit DDL controls, and covers explicit schema-neutral COMMENT ON statements."
     },
     {
       "rule_dir": "rule_02_drop-database",

@@ -16,8 +16,8 @@ use crate::analysis::mutations::{
     DropSchemaMutation, DropSequenceMutation, DropSubscriptionMutation, DropTable,
     DropTriggerMutation, DropTypeMutation, DropViewMutation, FkMutation, GrantMutation, Mutation,
     OpaqueMutation, PersistenceMutation, RefreshMaterializedViewMutation, ReleaseSavepointMutation,
-    Rename, ResolvedGrantTarget, RevokeMutation, RollbackToSavepointMutation, SavepointMutation,
-    SearchPathChange,
+    Rename, RenameTriggerMutation, ResolvedGrantTarget, RevokeMutation,
+    RollbackToSavepointMutation, SavepointMutation, SearchPathChange,
 };
 use crate::analysis::state::AnalysisState;
 use crate::ast::identifiers::{ObjectId, QualifiedName};
@@ -146,8 +146,8 @@ impl Resolver {
         id
     }
 
-    fn normalize_function_arg_type(raw: &str) -> String {
-        let normalized = raw.trim().to_lowercase();
+    pub(crate) fn normalize_function_arg_type(raw: &str) -> String {
+        let normalized = Self::fold_unquoted_identifier_case(raw.trim());
         if let Some(element_type) = normalized.strip_suffix("[]") {
             return format!("{}[]", Self::normalize_function_arg_type(element_type));
         }
@@ -166,6 +166,28 @@ impl Resolver {
             "decimal" => "numeric".to_string(),
             _ => normalized,
         }
+    }
+
+    fn fold_unquoted_identifier_case(raw: &str) -> String {
+        let mut folded = String::with_capacity(raw.len());
+        let mut quoted = false;
+        let mut chars = raw.chars().peekable();
+        while let Some(character) = chars.next() {
+            match character {
+                '"' if quoted && chars.peek() == Some(&'"') => {
+                    folded.push('"');
+                    folded.push('"');
+                    chars.next();
+                }
+                '"' => {
+                    quoted = !quoted;
+                    folded.push(character);
+                }
+                character if quoted => folded.push(character),
+                character => folded.extend(character.to_lowercase()),
+            }
+        }
+        folded
     }
 
     fn resolve_grant_target(
@@ -199,6 +221,7 @@ impl Resolver {
                     authorization: authorization.clone(),
                 }));
             }
+            StatementFact::SchemaNeutralNoop => {}
             StatementFact::AlterSchema { name, action } => {
                 let name = name.name.resolve();
                 let action = match action {
@@ -451,6 +474,15 @@ impl Resolver {
                     if_exists: *if_exists,
                 }));
             }
+            StatementFact::AlterTrigger {
+                name,
+                table,
+                new_name,
+            } => mutations.push(Mutation::RenameTrigger(RenameTriggerMutation {
+                name: name.clone(),
+                table: Self::resolve_lookup_name(table, state),
+                new_name: new_name.clone(),
+            })),
             StatementFact::AlterIndex { name, actions } => {
                 let id = Self::resolve_lookup_name(name, state);
                 for action in actions {
@@ -487,6 +519,20 @@ impl Resolver {
                 let id = Self::resolve_type_lookup_name(&alter_type.name, state);
                 for action_fact in &alter_type.actions {
                     match action_fact {
+                        crate::analysis::facts::AlterTypeActionFact::RenameTo { new_name } => {
+                            let mut new_id = ObjectId::new(id.schema.clone(), new_name.resolve());
+                            new_id.inferred_schema = id.inferred_schema;
+                            mutations.push(Mutation::RenameType(Rename {
+                                old_id: id.clone(),
+                                new_id,
+                            }));
+                        }
+                        crate::analysis::facts::AlterTypeActionFact::SetSchema { new_schema } => {
+                            mutations.push(Mutation::RenameType(Rename {
+                                old_id: id.clone(),
+                                new_id: ObjectId::new(new_schema, &id.name),
+                            }));
+                        }
                         crate::analysis::facts::AlterTypeActionFact::AddValue {
                             new_value,
                             neighbor,

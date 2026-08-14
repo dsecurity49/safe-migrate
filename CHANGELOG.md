@@ -5,6 +5,21 @@ commits and pull requests. Published binaries, checksums, and generated release
 notes are available on the
 [GitHub Releases page](https://github.com/dsecurity49/safe-migrate/releases).
 
+## v0.5.0 — 2026-08-14
+
+- Upgraded the pinned Squawk parser stack to 2.62.0 and raised the minimum
+  supported Rust version to 1.94.
+- Modeled `ALTER TYPE ... RENAME TO`, `ALTER TYPE ... SET SCHEMA`, and
+  `ALTER TRIGGER ... RENAME TO`, including tracked dependent references and
+  transaction rollback.
+- Treat `COMMENT ON` as a schema-neutral no-op. PostgreSQL 19 property-graph
+  syntax and duplicate DML assignments parse successfully but remain explicitly
+  opaque, preserving conservative analysis.
+- Added `safe-migrate rules` discovery and richer terminal, Markdown, JSON, and
+  GitHub Action findings with rule metadata and statement indexes.
+- Preserved compatibility: JSON remains schema version 1 and the Cache V5
+  format is unchanged.
+
 ## v0.4.5 — 2026-08-08
 
 - Introduced Cache V5 with authoritative synchronized schema and sequence

@@ -6,26 +6,7 @@ use crate::ast::visitor::AstVisitor;
 use crate::engine::config::Config;
 use crate::report::violations::{ReportFinding, SourceLocation, Violation};
 use crate::rules::Rule;
-use crate::rules::conflict::ConflictRule;
-use crate::rules::constraints::BlockingConstraintRule;
-use crate::rules::destructive::{
-    CascadingDropRule, CreateTableAsSelectRule, DropDatabaseRule, DropSchemaCascadeRule,
-    GeneralCascadeRule, ReversibilityRule, SizeAwareAddColumnRule, TypeChangeRewriteRule,
-};
-use crate::rules::drift::DriftDetectionRule;
-use crate::rules::expressions::VolatileDefaultRule;
-use crate::rules::functions::{BrokenComputeRule, FunctionVolatilityRule};
-use crate::rules::idempotency::IdempotencyRule;
-use crate::rules::indexes::ConcurrentIndexRule;
-use crate::rules::opaque::OpaqueDynamicSqlRule;
-use crate::rules::partitions::{PartitionLockRule, PartitionStrategyMismatchRule};
-use crate::rules::policies::RestrictivePolicyRule;
-use crate::rules::security::OverbroadGrantRule;
-use crate::rules::transactions::{
-    AlterTypeAddValueRule, ConcurrentInsideTransactionRule, VacuumFullRule,
-};
-use crate::rules::triggers::DisableTriggerRule;
-use crate::rules::views::MaterializedViewRefreshRule;
+use crate::rules::registry;
 use squawk_syntax::{
     SyntaxKind,
     ast::{AstNode, SourceFile},
@@ -41,41 +22,14 @@ impl SafeMigrateEngine {
     pub fn new(config: Config) -> Self {
         Self {
             config,
-            rules: vec![
-                Box::new(ReversibilityRule),
-                Box::new(DropDatabaseRule),
-                Box::new(DropSchemaCascadeRule),
-                Box::new(GeneralCascadeRule),
-                Box::new(CascadingDropRule),
-                Box::new(CreateTableAsSelectRule),
-                Box::new(SizeAwareAddColumnRule),
-                Box::new(TypeChangeRewriteRule),
-                Box::new(BlockingConstraintRule),
-                Box::new(ConcurrentIndexRule),
-                Box::new(MaterializedViewRefreshRule),
-                Box::new(PartitionLockRule),
-                Box::new(PartitionStrategyMismatchRule),
-                Box::new(RestrictivePolicyRule),
-                Box::new(DisableTriggerRule),
-                Box::new(BrokenComputeRule),
-                Box::new(FunctionVolatilityRule),
-                Box::new(IdempotencyRule),
-                Box::new(ConcurrentInsideTransactionRule),
-                Box::new(AlterTypeAddValueRule),
-                Box::new(VacuumFullRule),
-                Box::new(OpaqueDynamicSqlRule),
-                Box::new(VolatileDefaultRule),
-                Box::new(OverbroadGrantRule),
-                Box::new(DriftDetectionRule),
-                Box::new(ConflictRule),
-            ],
+            rules: registry::build_primary_rules(),
         }
     }
 
     /// Returns the canonical primary rule IDs in evaluation order. This is the
     /// source of truth for configuration and user-facing rule documentation.
     pub fn primary_rule_ids(&self) -> Vec<&'static str> {
-        self.rules.iter().map(|rule| rule.id()).collect()
+        registry::primary_rule_ids().collect()
     }
 
     pub fn analyze_chain(
@@ -127,6 +81,12 @@ impl SafeMigrateEngine {
 
         for (file_index, (filename, sql)) in files.iter().enumerate() {
             let normalized_sql = Self::normalize_execute(sql);
+            let parsed = SourceFile::parse(&normalized_sql);
+            let statement_ranges: Vec<_> = parsed
+                .tree()
+                .stmts()
+                .map(|statement| statement.syntax().text_range())
+                .collect();
             let violations = self.analyze_normalized_file(filename, &normalized_sql, state)?;
             findings.extend(
                 violations
@@ -137,6 +97,12 @@ impl SafeMigrateEngine {
                             &normalized_sql,
                             violation.source_range,
                         ),
+                        statement_index: violation.source_range.and_then(|range| {
+                            statement_ranges
+                                .iter()
+                                .position(|statement| statement.contains_range(range))
+                                .map(|index| index + 1)
+                        }),
                         violation,
                     })
                     .map(|finding| (file_index, finding)),

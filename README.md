@@ -83,6 +83,7 @@ safe-migrate lint --file migration.sql
 safe-migrate lint-chain --dir migrations/
 safe-migrate sync
 safe-migrate cache inspect
+safe-migrate rules
 ```
 
 Useful options:
@@ -94,6 +95,8 @@ Useful options:
   schema scope.
 - `cache inspect`: `--cache <path>`, `--config <path>`, and `--json` for a
   machine-readable summary.
+- `rules`: `--rule <id>` selects one rule, `--json` emits the stable discovery
+  schema, and `--config <path>` shows effective configuration values.
 - `--no-color` disables colored output for every command.
 
 Run `safe-migrate <command> --help` for the complete command reference.
@@ -218,45 +221,27 @@ database:
 safe-migrate sync
 ```
 
-v0.4.5 uses Cache V5, which adds authoritative schema and sequence catalogs.
-Caches written by v0.4.4 and earlier require this resynchronization.
+v0.5.0 retains Cache V5. Caches written by v0.4.4 and earlier require this
+resynchronization.
 
 Use `safe-migrate cache inspect` to view cache provenance and redacted object
 and role counts without connecting to PostgreSQL. It never lists role names or
 membership edges.
 
-## Rule catalog
+## Rule discovery
 
-The engine evaluates these 26 primary rules:
+Use the CLI registry instead of a copied documentation table. It is the
+canonical source for every primary rule's ID, title, impact, default tier,
+remediation, supported configuration fields, and effective configuration.
 
-| ID | Checks |
-|---|---|
-| `irreversible-migration` | Irreversible table/column changes and lossy type changes. |
-| `drop-database` | `DROP DATABASE`. |
-| `drop-schema-cascade` | `DROP SCHEMA ... CASCADE`. |
-| `destructive-general-cascade` | Cascading drops of non-table objects. |
-| `destructive-cascade` | `DROP TABLE ... CASCADE` and dependent objects. |
-| `create-table-as-select` | `CREATE TABLE ... AS SELECT` against an existing baseline. |
-| `size-aware-add-column` | Add-column operations that can rewrite large tables. |
-| `type-change-rewrite` | Type changes requiring a table rewrite. |
-| `blocking-constraint` | Synchronous constraint validation. |
-| `require-concurrent-index` | Synchronous index creation or removal. |
-| `blocking-mat-view-refresh` | Non-concurrent materialized-view refresh. |
-| `blocking-partition-mutation` | Partition attach/detach locking. |
-| `partition-strategy-mismatch` | Incompatible partition strategies. |
-| `restrictive-policy` | Restrictive row-level security policies. |
-| `disable-trigger` | Disabling triggers. |
-| `broken-compute` | Dropping functions still referenced by triggers. |
-| `function-volatility-change` | Changing function volatility. |
-| `missing-idempotency` | Missing safe rerun guards where supported. |
-| `concurrent-in-transaction` | Concurrent index operations inside transactions. |
-| `alter-type-add-value-txn` | Transaction-sensitive enum changes. |
-| `vacuum-full` | `VACUUM FULL`. |
-| `opaque-dynamic-sql` | SQL that cannot be fully simulated. |
-| `volatile-default` | Volatile column defaults. |
-| `overbroad-grant` | Broad grants such as `PUBLIC` or `ALL PRIVILEGES`. |
-| `schema-drift` | References inconsistent with, or outside, the supplied baseline. |
-| `chain-conflict` | Statements that cannot execute against the simulated migration state. |
+```bash
+safe-migrate rules
+safe-migrate rules --rule require-concurrent-index
+safe-migrate rules --rule require-concurrent-index --json
+```
+
+Unknown IDs fail without changing analysis configuration. Use `--config` when
+you need the discovery output to reflect a reviewed non-default configuration.
 
 ## GitHub Actions
 
@@ -268,7 +253,7 @@ pull-request checkout are controlled by that pull request.
 
 ```yaml
 - id: safe_migrate
-  uses: dsecurity49/safe-migrate@v0.4.5
+  uses: dsecurity49/safe-migrate@v0.5.0
   with:
     mode: lint-chain
     path: migrations

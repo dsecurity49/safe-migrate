@@ -7,6 +7,7 @@ use safe_migrate::db::cache_file::{
 };
 use safe_migrate::model::relation::RelationKind;
 use safe_migrate::report::violations::{ReportFinding, Violation};
+use safe_migrate::rules::registry::{self, RuleDescriptor};
 use safe_migrate::sync;
 use safe_migrate::{AnalysisState, Config, DbCache, Reporter, SafeMigrateEngine};
 use std::fs;
@@ -102,6 +103,18 @@ enum Commands {
     Cache {
         #[command(subcommand)]
         command: CacheCommands,
+    },
+    /// List primary migration safety rules and their guidance
+    Rules {
+        /// Show one primary rule by its stable ID
+        #[arg(long)]
+        rule: Option<String>,
+        /// Output the rule catalog as JSON
+        #[arg(long)]
+        json: bool,
+        /// Read effective rule settings from this configuration file
+        #[arg(long, default_value = "safe-migrate.toml")]
+        config: PathBuf,
     },
 }
 
@@ -252,7 +265,83 @@ fn main() -> Result<()> {
                 json,
             } => run_cache_inspect(&cache, &config, json),
         },
+        Commands::Rules { rule, json, config } => run_rules(rule.as_deref(), json, &config),
     }
+}
+
+fn rule_descriptor_json(descriptor: &RuleDescriptor, config: &Config) -> serde_json::Value {
+    serde_json::json!({
+        "id": descriptor.id,
+        "title": descriptor.title,
+        "summary": descriptor.summary,
+        "impact": descriptor.impact,
+        "default_tier": match descriptor.default_tier() {
+            safe_migrate::report::violations::ViolationTier::Tier1 => "Tier1",
+            safe_migrate::report::violations::ViolationTier::Tier2 => "Tier2",
+            safe_migrate::report::violations::ViolationTier::Tier3 => "Tier3",
+        },
+        "remediation": descriptor.recipe(),
+        "supported_configuration_fields": ["disabled", "tier1_threshold_rows", "tier2_threshold_rows"],
+        "effective": {
+            "enabled": !config.is_rule_disabled(descriptor.id),
+            "tier1_threshold_rows": config.rule_tier1_threshold(descriptor.id),
+            "tier2_threshold_rows": config.rule_tier2_threshold(descriptor.id),
+        },
+    })
+}
+
+fn rules_separator() -> String {
+    let width = terminal_size::terminal_size()
+        .map(|(width, _)| width.0 as usize)
+        .unwrap_or(80)
+        .max(60);
+    "-".repeat((width as f32 * 0.82) as usize)
+}
+
+fn run_rules(rule_id: Option<&str>, json: bool, config_path: &Path) -> Result<()> {
+    let config = load_config(config_path)?;
+    let descriptors: Vec<_> = match rule_id {
+        Some(id) => vec![registry::find_primary_rule(id).ok_or_else(|| {
+            anyhow!(
+                "Unknown primary rule ID '{}'. Valid primary rule IDs: {}",
+                id,
+                registry::primary_rule_ids().collect::<Vec<_>>().join(", ")
+            )
+        })?],
+        None => registry::PRIMARY_RULES.iter().collect(),
+    };
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema_version": 1,
+                "rules": descriptors.iter().map(|descriptor| rule_descriptor_json(descriptor, &config)).collect::<Vec<_>>(),
+            }))?
+        );
+        return Ok(());
+    }
+
+    for (index, descriptor) in descriptors.iter().enumerate() {
+        if index > 0 {
+            println!();
+            println!("{}", rules_separator());
+            println!();
+        }
+        println!("{} ({})", descriptor.title, descriptor.id);
+        println!("  Summary: {}", descriptor.summary);
+        println!("  Impact: {}", descriptor.impact);
+        println!("  Default tier: {:?}", descriptor.default_tier());
+        println!("  Remediation: {}", descriptor.recipe());
+        println!("  Configuration: disabled, tier1_threshold_rows, tier2_threshold_rows");
+        println!(
+            "  Effective: enabled={}, tier1_threshold_rows={}, tier2_threshold_rows={}",
+            !config.is_rule_disabled(descriptor.id),
+            config.rule_tier1_threshold(descriptor.id),
+            config.rule_tier2_threshold(descriptor.id)
+        );
+    }
+    Ok(())
 }
 
 fn run_lint(

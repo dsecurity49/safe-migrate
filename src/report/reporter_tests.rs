@@ -50,6 +50,10 @@ mod tests {
         assert_eq!(report["schema_version"], Reporter::JSON_SCHEMA_VERSION);
         assert_eq!(report["confidence"], "Tainted");
         assert_eq!(report["verdict"], "HALT");
+        assert_eq!(report["summary"]["total"], 3);
+        assert_eq!(report["summary"]["tier1"], 1);
+        assert_eq!(report["summary"]["tier2"], 1);
+        assert_eq!(report["summary"]["tier3"], 1);
         assert_eq!(report["violations"].as_array().unwrap().len(), 3);
     }
 
@@ -62,20 +66,46 @@ mod tests {
                 line: 3,
                 column: 5,
             }),
+            statement_index: Some(1),
         };
 
         let markdown = Reporter::markdown_report(&[finding], &Confidence::Exact);
         assert!(markdown.starts_with("# safe-migrate report\n"));
         assert!(markdown.contains("**Verdict:** CAUTIOUS"));
-        assert!(markdown.contains("### WARN — `test-rule`"));
+        assert!(markdown.contains("### WARN — test-rule (`test-rule`)"));
         assert!(markdown.contains("`migrations/001.sql:3:5`"));
+        assert!(markdown.contains("**Statement:** 1"));
         assert!(markdown.contains("needs review"));
+    }
+
+    #[test]
+    fn location_aware_json_adds_registry_metadata_without_changing_schema_version() {
+        let finding = ReportFinding {
+            violation: make_violation(
+                "require-concurrent-index",
+                ViolationTier::Tier1,
+                "index requires a safer strategy",
+            ),
+            location: None,
+            statement_index: Some(1),
+        };
+
+        let report = Reporter::json_report_with_locations(&[finding], &Confidence::Exact);
+        assert_eq!(report["schema_version"], Reporter::JSON_SCHEMA_VERSION);
+        assert_eq!(
+            report["violations"][0]["rule_title"],
+            "Require concurrent index"
+        );
+        assert_eq!(report["violations"][0]["impact"], "locking");
+        assert_eq!(report["violations"][0]["statement_index"], 1);
+        assert!(report["violations"][0]["rule_summary"].is_string());
     }
 
     #[test]
     fn markdown_report_uses_a_safe_fence_for_sql_containing_backticks() {
         let finding = ReportFinding {
             location: None,
+            statement_index: None,
             violation: Violation {
                 source_range: None,
                 rule_id: "test-rule",

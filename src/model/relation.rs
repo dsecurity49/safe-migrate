@@ -181,6 +181,7 @@ impl RelationState {
                         data_type: serial_type
                             .map(str::to_string)
                             .or_else(|| data_type.clone()),
+                        type_id: None,
                         default: normalized_default,
                         is_nullable: !(*not_null || is_serial),
                         avg_width: None,

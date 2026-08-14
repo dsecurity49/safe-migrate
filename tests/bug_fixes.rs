@@ -9,7 +9,7 @@ mod phase10_bug_fixes_and_sorting_tests {
     use safe_migrate::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
 
     #[test]
-    fn parsed_statement_without_typed_extraction_is_reported_and_taints_state() {
+    fn comment_on_is_schema_neutral_and_preserves_confidence() {
         let engine = setup_engine();
         let mut state = setup_state();
 
@@ -20,12 +20,31 @@ mod phase10_bug_fixes_and_sorting_tests {
             )
             .expect("Squawk should parse COMMENT ON statements");
 
-        assert!(violations.iter().any(|violation| {
-            violation.rule_id == "opaque-dynamic-sql"
-                && violation.reason.contains("unsupported SQL statement")
-                && violation.recipe.contains("not modeled")
-        }));
-        assert_eq!(state.local.confidence, Confidence::Tainted);
+        assert!(violations.is_empty());
+        assert_eq!(state.local.confidence, Confidence::Exact);
+    }
+
+    #[test]
+    fn duplicate_column_assignments_remain_opaque() {
+        let engine = setup_engine();
+        for sql in [
+            "UPDATE users SET display_name = 'first', display_name = 'second';",
+            "INSERT INTO users (id) VALUES (1) ON CONFLICT (id) DO UPDATE
+             SET display_name = 'first', display_name = 'second';",
+        ] {
+            let mut state = setup_state();
+            let violations = engine
+                .analyze(sql, &mut state)
+                .expect("Squawk should parse duplicate assignments");
+
+            assert!(
+                violations
+                    .iter()
+                    .any(|violation| violation.rule_id == "opaque-dynamic-sql"),
+                "duplicate DML assignment must remain opaque: {sql}"
+            );
+            assert_eq!(state.local.confidence, Confidence::Tainted);
+        }
     }
 
     #[test]
@@ -862,6 +881,7 @@ mod phase10_bug_fixes_and_sorting_tests {
         rel.columns.push(Column {
             name: "a".into(),
             data_type: Some("int".into()),
+            type_id: None,
             is_nullable: true,
             default: None,
             avg_width: None,
@@ -871,6 +891,7 @@ mod phase10_bug_fixes_and_sorting_tests {
         rel.columns.push(Column {
             name: "b".into(),
             data_type: Some("int".into()),
+            type_id: None,
             is_nullable: true,
             default: None,
             avg_width: None,

@@ -64,6 +64,90 @@ fn test_cli_help() {
 }
 
 #[test]
+fn rules_command_lists_registry_descriptors_in_json() {
+    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let output = cmd.arg("rules").arg("--json").output().unwrap();
+    assert!(output.status.success());
+    let report = parse_json_stdout(&output);
+    assert_eq!(report["schema_version"], 1);
+    let rules = report["rules"].as_array().expect("rules array");
+    assert_eq!(rules.len(), 26);
+    assert_eq!(rules[0]["id"], "irreversible-migration");
+    assert_eq!(rules[0]["title"], "Irreversible migration");
+    assert!(
+        rules[0]["supported_configuration_fields"]
+            .as_array()
+            .expect("configuration fields")
+            .iter()
+            .any(|field| field == "disabled")
+    );
+    assert_eq!(rules[0]["effective"]["enabled"], true);
+}
+
+#[test]
+fn rules_command_separates_human_descriptors() {
+    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let output = cmd.arg("rules").arg("--no-color").output().unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    assert!(stdout.starts_with("Irreversible migration (irreversible-migration)\n"));
+    assert_eq!(
+        stdout
+            .lines()
+            .filter(|line| line.len() >= 40 && line.bytes().all(|byte| byte == b'-'))
+            .count(),
+        25
+    );
+}
+
+#[test]
+fn rules_command_filters_one_rule_and_rejects_unknown_ids() {
+    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let output = cmd
+        .arg("rules")
+        .arg("--rule")
+        .arg("require-concurrent-index")
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let report = parse_json_stdout(&output);
+    assert_eq!(report["rules"].as_array().unwrap().len(), 1);
+    assert_eq!(report["rules"][0]["id"], "require-concurrent-index");
+
+    let mut config = tempfile::NamedTempFile::new().unwrap();
+    writeln!(config, "[rules.require-concurrent-index]\ndisabled = true").unwrap();
+    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let output = cmd
+        .arg("rules")
+        .arg("--rule")
+        .arg("require-concurrent-index")
+        .arg("--json")
+        .arg("--config")
+        .arg(config.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        parse_json_stdout(&output)["rules"][0]["effective"]["enabled"],
+        false
+    );
+
+    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let assert = cmd
+        .arg("rules")
+        .arg("--rule")
+        .arg("unknown-rule")
+        .assert()
+        .code(1);
+    assert!(
+        String::from_utf8_lossy(&assert.get_output().stderr)
+            .contains("Unknown primary rule ID 'unknown-rule'")
+    );
+}
+
+#[test]
 fn test_cli_rejects_unknown_configured_rule_id() {
     let mut sql_file = tempfile::NamedTempFile::new().unwrap();
     writeln!(sql_file, "SELECT 1;").unwrap();
@@ -498,6 +582,37 @@ fn test_cli_json_halt_is_json_and_uses_blocking_exit_status() {
     );
     assert_eq!(finding["location"]["line"], 1);
     assert_eq!(finding["location"]["column"], 1);
+    assert_eq!(finding["statement_index"], 1);
+    assert_eq!(finding["rule_title"], "Drop database");
+    assert_eq!(finding["impact"], "data loss");
+    assert_eq!(report["summary"]["total"], 1);
+    assert_eq!(report["summary"]["tier1"], 1);
+}
+
+#[test]
+fn test_cli_json_statement_index_counts_preceding_schema_neutral_statements() {
+    let mut sql_file = tempfile::NamedTempFile::new().unwrap();
+    writeln!(sql_file, "COMMENT ON TABLE widgets IS 'migration note';").unwrap();
+    writeln!(sql_file, "DROP DATABASE production;").unwrap();
+
+    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let assert = cmd
+        .arg("lint")
+        .arg("--file")
+        .arg(sql_file.path())
+        .arg("--no-cache")
+        .arg("--json")
+        .assert()
+        .code(2);
+    let report = parse_json_stdout(assert.get_output());
+    let finding = report["violations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|violation| violation["rule_id"] == "drop-database")
+        .expect("drop-database finding");
+
+    assert_eq!(finding["statement_index"], 2);
 }
 
 #[test]
@@ -518,7 +633,9 @@ fn test_cli_markdown_report_is_machine_clean_and_includes_location() {
     let markdown = String::from_utf8_lossy(&output.stdout);
 
     assert!(markdown.starts_with("# safe-migrate report\n"));
-    assert!(markdown.contains("### HALT — `drop-database`"));
+    assert!(markdown.contains("### HALT — Drop database (`drop-database`)"));
+    assert!(markdown.contains("**Impact:** data loss"));
+    assert!(markdown.contains("**Statement:** 1"));
     assert!(markdown.contains(&format!("`{}:1:1`", sql_file.path().display())));
     assert!(markdown.contains("## Baseline"));
     assert!(!markdown.contains("Analyzing migration"));

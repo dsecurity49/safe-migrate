@@ -263,6 +263,67 @@ mod tests {
     }
 
     #[test]
+    fn alter_type_rename_to_extracts_quoted_name() {
+        let fact =
+            parse_and_extract_statement(r#"ALTER TYPE sm_core.old_name RENAME TO "NewName";"#)
+                .expect("alter type fact");
+
+        let StatementFact::AlterType(alter_type) = fact else {
+            panic!("expected alter type fact");
+        };
+        assert_eq!(
+            alter_type.name.schema.as_ref().map(Ident::resolve),
+            Some("sm_core".into())
+        );
+        assert_eq!(
+            alter_type.actions,
+            vec![AlterTypeActionFact::RenameTo {
+                new_name: Ident::new("NewName", true),
+            }]
+        );
+    }
+
+    #[test]
+    fn alter_type_set_schema_extracts_quoted_schema_name() {
+        let fact = parse_and_extract_statement(r#"ALTER TYPE sm_core.mood SET SCHEMA "App";"#)
+            .expect("alter type fact");
+
+        let StatementFact::AlterType(alter_type) = fact else {
+            panic!("expected alter type fact");
+        };
+        assert_eq!(
+            alter_type.actions,
+            vec![AlterTypeActionFact::SetSchema {
+                new_schema: "App".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn alter_trigger_rename_to_extracts_quoted_name_and_table() {
+        let fact = parse_and_extract_statement(
+            r#"ALTER TRIGGER old_trigger ON sm_core.events RENAME TO "NewTrigger";"#,
+        )
+        .expect("alter trigger fact");
+
+        let StatementFact::AlterTrigger {
+            name,
+            table,
+            new_name,
+        } = fact
+        else {
+            panic!("expected alter trigger fact");
+        };
+        assert_eq!(name, "old_trigger");
+        assert_eq!(
+            table.schema.as_ref().map(Ident::resolve),
+            Some("sm_core".into())
+        );
+        assert_eq!(table.name.resolve(), "events");
+        assert_eq!(new_name, "NewTrigger");
+    }
+
+    #[test]
     fn alter_type_add_value_uses_ast_position_when_label_contains_before() {
         let fact = parse_and_extract_statement(
             "ALTER TYPE mood ADD VALUE 'not before now' AFTER 'ready';",
@@ -1058,6 +1119,44 @@ mod tests {
     }
 
     #[test]
+    fn parser_accepts_lf_crlf_and_cr_line_endings() {
+        for (name, line_ending) in [("LF", "\n"), ("CRLF", "\r\n"), ("CR", "\r")] {
+            let sql = format!(
+                "CREATE TABLE users (id integer);{line_ending}ALTER TABLE users ADD COLUMN name text;"
+            );
+            let parsed = SourceFile::parse(&sql);
+            assert!(parsed.errors().is_empty(), "{name} input must parse");
+            assert_eq!(parse_and_extract(&sql).len(), 2, "{name} input facts");
+        }
+    }
+
+    #[test]
+    fn parser_accepts_postgres_19_property_graph_syntax_as_opaque() {
+        for sql in [
+            "CREATE PROPERTY GRAPH social
+                VERTEX TABLES (people)
+                EDGE TABLES (knows SOURCE people DESTINATION people);",
+            "ALTER PROPERTY GRAPH social SET SCHEMA graph_schema;",
+            "DROP PROPERTY GRAPH IF EXISTS social CASCADE;",
+        ] {
+            let parsed = SourceFile::parse(sql);
+            assert!(
+                parsed.errors().is_empty(),
+                "property graph must parse: {sql}"
+            );
+            let statement = parsed
+                .tree()
+                .stmts()
+                .next()
+                .expect("property graph statement");
+            assert!(
+                AstVisitor::extract(&statement).is_none(),
+                "unmodeled property graph syntax must stay opaque: {sql}"
+            );
+        }
+    }
+
+    #[test]
     fn test_do_block() {
         let sql = "DO $$ BEGIN RAISE NOTICE 'hello'; END $$;";
         let facts = parse_and_extract_statement(sql);
@@ -1077,6 +1176,13 @@ mod tests {
             StatementFact::Execute => {}
             _ => panic!("Expected Execute fact"),
         }
+    }
+
+    #[test]
+    fn comment_on_extracts_as_schema_neutral_noop() {
+        let fact = parse_and_extract_statement("COMMENT ON TABLE public.events IS 'audit log';")
+            .expect("comment statement fact");
+        assert!(matches!(fact, StatementFact::SchemaNeutralNoop));
     }
 
     // ========================================================================

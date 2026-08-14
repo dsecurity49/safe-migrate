@@ -693,6 +693,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "nohash-hasher"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2bf50223579dc7cdcfb3bfcacf7069ff68243f8c363f62ffa99cf000a6b9c451"
+
+[[package]]
 name = "objc2-core-foundation"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -977,7 +983,7 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "safe-migrate"
-version = "0.4.5"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -1147,15 +1153,26 @@ dependencies = [
 
 [[package]]
 name = "squawk-lexer"
-version = "2.61.0"
+version = "2.62.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "208bb2b80cc4db056c113893ea444d297a853eaa5a4ae87b31731ddfb114b1fe"
+checksum = "030c945c0ddb933143616d0ca9b1640aee616e22adcf038e574483694e67b125"
+
+[[package]]
+name = "squawk-line-index"
+version = "2.62.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab67a92198a752a29e7763014daf978803ca41c8ca4428c8daeae3f2573ea6f6"
+dependencies = [
+ "memchr",
+ "nohash-hasher",
+ "text-size",
+]
 
 [[package]]
 name = "squawk-parser"
-version = "2.61.0"
+version = "2.62.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b44f6c92992a4cd6182960a2505492b7cd3e93d0555f9dd5a520baec3cb64575"
+checksum = "a18956011c1eb5913d361d53cd703a60b11c42fa290d280ae2b553df548e1c3e"
 dependencies = [
  "drop_bomb",
  "squawk-lexer",
@@ -1163,13 +1180,14 @@ dependencies = [
 
 [[package]]
 name = "squawk-syntax"
-version = "2.61.0"
+version = "2.62.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "76cd86d458eebf65c3e191ba1fcc5109067cece857ee7378df7ffedef51405a5"
+checksum = "d7531d70f31cb65a880f00bdc29e020dc3917b90ba2042f33867ee9afa99dc52"
 dependencies = [
  "either",
  "rowan",
  "smol_str",
+ "squawk-line-index",
  "squawk-parser",
 ]
 

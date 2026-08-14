@@ -10,6 +10,7 @@ mod tests {
         relation_owner_id, sync_cache,
     };
     use crate::test_support::EnvironmentValueGuard;
+    use serde::Serialize;
     use std::io::Write;
     use tempfile::NamedTempFile;
 
@@ -135,6 +136,7 @@ mod tests {
         rel.columns.push(crate::model::column::Column {
             name: "id".into(),
             data_type: Some("integer".into()),
+            type_id: None,
             is_nullable: false,
             default: None,
             avg_width: Some(4),
@@ -246,6 +248,7 @@ mod tests {
         rel.columns.push(crate::model::column::Column {
             name: "val".into(),
             data_type: Some("varchar".into()),
+            type_id: None,
             is_nullable: true,
             default: None,
             avg_width: Some(10),
@@ -280,6 +283,87 @@ mod tests {
         assert!(deserialized.relations.is_empty());
         assert!(deserialized.foreign_keys.is_empty());
         assert!(deserialized.indexes.is_empty());
+    }
+
+    #[test]
+    fn type_identity_links_do_not_change_the_v5_bincode_layout() {
+        #[derive(Serialize)]
+        struct LegacyFunctionState {
+            id: ObjectId,
+            arg_types: Vec<String>,
+            return_type: String,
+            volatility: crate::model::function::Volatility,
+            language: String,
+            security: crate::model::function::SecurityMode,
+        }
+
+        let id = ObjectId::new("public", "accepts_mood(mood)");
+        let legacy = LegacyFunctionState {
+            id: id.clone(),
+            arg_types: vec!["mood".into()],
+            return_type: "mood".into(),
+            volatility: crate::model::function::Volatility::Volatile,
+            language: "sql".into(),
+            security: crate::model::function::SecurityMode::Invoker,
+        };
+        let current = crate::model::function::FunctionState {
+            id,
+            arg_types: vec!["mood".into()],
+            arg_type_ids: vec![Some(ObjectId::new("public", "mood"))],
+            return_type: "mood".into(),
+            return_type_id: Some(ObjectId::new("public", "mood")),
+            volatility: crate::model::function::Volatility::Volatile,
+            language: "sql".into(),
+            security: crate::model::function::SecurityMode::Invoker,
+        };
+        let config = bincode::config::standard().with_variable_int_encoding();
+        let legacy_bytes = bincode::serde::encode_to_vec(&legacy, config).unwrap();
+        let current_bytes = bincode::serde::encode_to_vec(&current, config).unwrap();
+
+        assert_eq!(current_bytes, legacy_bytes);
+        let restored: crate::model::function::FunctionState =
+            bincode::serde::decode_from_slice(&legacy_bytes, config)
+                .unwrap()
+                .0;
+        assert!(restored.arg_type_ids.is_empty());
+        assert!(restored.return_type_id.is_none());
+    }
+
+    #[test]
+    fn domain_type_identity_link_does_not_change_the_v5_bincode_layout() {
+        #[allow(dead_code)]
+        #[derive(Serialize)]
+        enum LegacyTypeKind {
+            Enum { variants: Vec<String> },
+            Domain { base_type: String },
+            Base,
+            Composite,
+            Range,
+        }
+
+        let legacy = LegacyTypeKind::Domain {
+            base_type: "mood".into(),
+        };
+        let current = crate::model::types::TypeKind::Domain {
+            base_type: "mood".into(),
+            base_type_id: Some(ObjectId::new("public", "mood")),
+        };
+        let config = bincode::config::standard().with_variable_int_encoding();
+        let legacy_bytes = bincode::serde::encode_to_vec(&legacy, config).unwrap();
+        let current_bytes = bincode::serde::encode_to_vec(&current, config).unwrap();
+
+        assert_eq!(current_bytes, legacy_bytes);
+        let restored: crate::model::types::TypeKind =
+            bincode::serde::decode_from_slice(&legacy_bytes, config)
+                .unwrap()
+                .0;
+        assert!(matches!(
+            restored,
+            crate::model::types::TypeKind::Domain {
+                base_type,
+                base_type_id: None,
+            } if base_type == "mood"
+        ));
     }
 
     #[test]

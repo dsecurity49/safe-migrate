@@ -7,6 +7,7 @@ mod state_mutation_tests {
     use safe_migrate::ast::identifiers::ObjectId;
     use safe_migrate::db::cache::{DbCache, DependencyCache};
     use safe_migrate::model::constraint::ConstraintKind;
+    use safe_migrate::model::function::{FunctionOverlay, FunctionState, SecurityMode, Volatility};
     use safe_migrate::model::relation::{
         Persistence, RelationKind, RelationOverlay, RelationState,
     };
@@ -612,6 +613,421 @@ mod state_mutation_tests {
     }
 
     #[test]
+    fn rename_type_updates_identity_and_rolls_back() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "BEGIN; CREATE TYPE mood AS ENUM ('sad'); ALTER TYPE mood RENAME TO emotion;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(!state.local.types.contains_key(&object_id("public", "mood")));
+        let Some(TypeOverlay::Present(type_state)) =
+            state.local.types.get(&object_id("public", "emotion"))
+        else {
+            panic!("renamed type missing");
+        };
+        assert_eq!(type_state.id, object_id("public", "emotion"));
+
+        engine.analyze("ROLLBACK;", &mut state).unwrap();
+        assert!(
+            !state
+                .local
+                .types
+                .contains_key(&object_id("public", "emotion"))
+        );
+        assert!(!state.local.types.contains_key(&object_id("public", "mood")));
+    }
+
+    #[test]
+    fn rename_type_rejects_an_existing_target() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let violations = engine
+            .analyze(
+                "CREATE TYPE old_name AS ENUM ('old'); CREATE TYPE new_name AS ENUM ('new'); ALTER TYPE old_name RENAME TO new_name;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(violations.iter().any(|violation| {
+            violation.rule_id == "chain-conflict" && violation.reason.contains("new_name")
+        }));
+        assert!(matches!(
+            state.local.types.get(&object_id("public", "old_name")),
+            Some(TypeOverlay::Present(_))
+        ));
+    }
+
+    #[test]
+    fn rename_type_remaps_modeled_dependent_references() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let violations = engine
+            .analyze(
+                "CREATE TYPE mood AS ENUM ('sad');
+                 CREATE TABLE entries (status mood, statuses mood[]);
+                 CREATE DOMAIN mood_alias AS mood;
+                 CREATE FUNCTION accepts_mood(value mood) RETURNS mood LANGUAGE sql AS $$ SELECT value $$;
+                 ALTER TYPE mood RENAME TO emotion;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict")
+        );
+        let RelationOverlay::Present(relation) =
+            state.get_relation(&object_id("public", "entries")).unwrap()
+        else {
+            panic!("entries table missing");
+        };
+        assert_eq!(
+            relation.get_column("status").unwrap().data_type.as_deref(),
+            Some("emotion")
+        );
+        assert_eq!(
+            relation
+                .get_column("statuses")
+                .unwrap()
+                .data_type
+                .as_deref(),
+            Some("emotion[]")
+        );
+        let Some(TypeOverlay::Present(TypeState {
+            kind: TypeKind::Domain { base_type, .. },
+            ..
+        })) = state.local.types.get(&object_id("public", "mood_alias"))
+        else {
+            panic!("domain missing");
+        };
+        assert_eq!(base_type, "emotion");
+        let function_id = object_id("public", "accepts_mood(emotion)");
+        let Some(safe_migrate::model::function::FunctionOverlay::Present(function)) =
+            state.local.functions.get(&function_id)
+        else {
+            panic!("remapped function missing");
+        };
+        assert_eq!(function.arg_types, vec!["emotion"]);
+        assert_eq!(function.return_type, "emotion");
+    }
+
+    #[test]
+    fn rename_type_remaps_only_the_resolved_schema_and_preserves_quoted_identity() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let violations = engine
+            .analyze(
+                "CREATE SCHEMA other;
+                 CREATE TYPE public.mood AS ENUM ('sad');
+                 CREATE TYPE other.mood AS ENUM ('happy');
+                 SET search_path TO other, public;
+                 CREATE TABLE other_entries (status mood);
+                 CREATE TYPE public.\"Mood\" AS ENUM ('calm');
+                 CREATE TABLE public.quoted_entries (status public.\"Mood\");
+                 CREATE FUNCTION quoted_mood(value public.\"Mood\") RETURNS public.\"Mood\" LANGUAGE sql AS $$ SELECT value $$;
+                 ALTER TYPE public.mood RENAME TO emotion;
+                 ALTER TYPE public.\"Mood\" RENAME TO \"Emotion\";",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict")
+        );
+        let RelationOverlay::Present(other_entries) = state
+            .get_relation(&object_id("other", "other_entries"))
+            .unwrap()
+        else {
+            panic!("other_entries table missing");
+        };
+        assert_eq!(
+            other_entries
+                .get_column("status")
+                .unwrap()
+                .data_type
+                .as_deref(),
+            Some("mood")
+        );
+        assert_eq!(
+            other_entries.get_column("status").unwrap().type_id,
+            Some(object_id("other", "mood"))
+        );
+        let RelationOverlay::Present(quoted_entries) = state
+            .get_relation(&object_id("public", "quoted_entries"))
+            .unwrap()
+        else {
+            panic!("quoted_entries table missing");
+        };
+        assert_eq!(
+            quoted_entries
+                .get_column("status")
+                .unwrap()
+                .data_type
+                .as_deref(),
+            Some("\"Emotion\"")
+        );
+        assert_eq!(
+            quoted_entries.get_column("status").unwrap().type_id,
+            Some(object_id("public", "Emotion"))
+        );
+        assert!(
+            state
+                .local
+                .types
+                .contains_key(&object_id("public", "emotion"))
+        );
+        assert!(state.local.types.contains_key(&object_id("other", "mood")));
+        assert!(
+            state
+                .local
+                .types
+                .contains_key(&object_id("public", "Emotion"))
+        );
+        let Some(FunctionOverlay::Present(function)) = state
+            .local
+            .functions
+            .get(&object_id("other", "quoted_mood(\"Emotion\")"))
+        else {
+            panic!("quoted remapped function missing");
+        };
+        assert_eq!(function.return_type, "\"Emotion\"");
+    }
+
+    #[test]
+    fn rename_type_updates_columns_added_or_retyped_later_in_the_chain() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TYPE mood AS ENUM ('sad');
+                 CREATE TABLE entries (status text);
+                 ALTER TABLE entries ALTER COLUMN status TYPE mood;
+                 ALTER TABLE entries ADD COLUMN secondary mood[];
+                 ALTER TYPE mood RENAME TO emotion;",
+                &mut state,
+            )
+            .unwrap();
+
+        let RelationOverlay::Present(relation) =
+            state.get_relation(&object_id("public", "entries")).unwrap()
+        else {
+            panic!("entries table missing");
+        };
+        assert_eq!(
+            relation.get_column("status").unwrap().data_type.as_deref(),
+            Some("emotion")
+        );
+        assert_eq!(
+            relation
+                .get_column("secondary")
+                .unwrap()
+                .data_type
+                .as_deref(),
+            Some("emotion[]")
+        );
+    }
+
+    #[test]
+    fn quoted_embedded_quote_type_resolves_in_function_signature() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                r#"CREATE TYPE public."a""b" AS ENUM ('value');
+                   CREATE FUNCTION accepts_embedded(value public."a""b")
+                   RETURNS public."a""b" LANGUAGE sql AS $$ SELECT value $$;"#,
+                &mut state,
+            )
+            .unwrap();
+
+        let Some(FunctionOverlay::Present(function)) = state
+            .local
+            .functions
+            .values()
+            .find(|function| {
+                matches!(function, FunctionOverlay::Present(function) if function.id.name.starts_with("accepts_embedded("))
+            })
+        else {
+            panic!("embedded-quote function missing");
+        };
+        assert_eq!(
+            function.arg_type_ids,
+            vec![Some(object_id("public", "a\"b"))]
+        );
+        assert_eq!(function.return_type_id, Some(object_id("public", "a\"b")));
+    }
+
+    #[test]
+    fn rename_type_updates_cached_routine_signatures_and_undo_restores_them() {
+        let engine = setup_engine();
+        let mut cache = DbCache::new();
+        let type_id = object_id("public", "mood");
+        cache.types.insert(
+            type_id.clone(),
+            TypeState {
+                id: type_id,
+                generation: 0,
+                kind: TypeKind::Enum {
+                    variants: vec!["sad".into()],
+                },
+            },
+        );
+        let function_id = object_id("public", "accepts_mood(mood)");
+        cache.functions.insert(
+            function_id.clone(),
+            FunctionState {
+                id: function_id.clone(),
+                arg_types: vec!["mood".into()],
+                arg_type_ids: Vec::new(),
+                return_type: "mood".into(),
+                return_type_id: None,
+                volatility: Volatility::Volatile,
+                language: "sql".into(),
+                security: SecurityMode::Invoker,
+            },
+        );
+        let mut state = safe_migrate::AnalysisState::new(cache);
+
+        engine
+            .analyze(
+                "BEGIN; ALTER TYPE mood RENAME TO emotion; ROLLBACK;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            state.local.functions.get(&function_id),
+            Some(FunctionOverlay::Present(function))
+                if function.arg_type_ids == vec![Some(object_id("public", "mood"))]
+                    && function.return_type_id == Some(object_id("public", "mood"))
+        ));
+        assert!(
+            !state
+                .local
+                .functions
+                .contains_key(&object_id("public", "accepts_mood(emotion)"))
+        );
+    }
+
+    #[test]
+    fn alter_type_set_schema_updates_identity_and_rolls_back() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE SCHEMA app;
+                 CREATE TYPE mood AS ENUM ('sad');
+                 BEGIN;
+                 ALTER TYPE mood SET SCHEMA app;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(!state.local.types.contains_key(&object_id("public", "mood")));
+        assert!(matches!(
+            state.local.types.get(&object_id("app", "mood")),
+            Some(TypeOverlay::Present(_))
+        ));
+
+        engine.analyze("ROLLBACK;", &mut state).unwrap();
+        assert!(matches!(
+            state.local.types.get(&object_id("public", "mood")),
+            Some(TypeOverlay::Present(_))
+        ));
+        assert!(!state.local.types.contains_key(&object_id("app", "mood")));
+    }
+
+    #[test]
+    fn alter_type_set_schema_rejects_missing_schema_and_existing_target() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let violations = engine
+            .analyze(
+                "CREATE TYPE missing_target AS ENUM ('value');
+                 ALTER TYPE missing_target SET SCHEMA missing_schema;
+                 CREATE SCHEMA app;
+                 CREATE TYPE source AS ENUM ('value');
+                 CREATE TYPE app.source AS ENUM ('value');
+                 ALTER TYPE source SET SCHEMA app;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(violations.iter().any(|violation| {
+            violation.rule_id == "chain-conflict"
+                && violation.reason.contains("schema 'missing_schema'")
+        }));
+        assert!(violations.iter().any(|violation| {
+            violation.rule_id == "chain-conflict" && violation.reason.contains("app.source")
+        }));
+    }
+
+    #[test]
+    fn alter_type_set_schema_remaps_modeled_dependent_references() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let violations = engine
+            .analyze(
+                "CREATE SCHEMA app;
+                 CREATE TYPE mood AS ENUM ('sad');
+                 CREATE TABLE entries (status mood);
+                 CREATE DOMAIN mood_alias AS mood;
+                 CREATE FUNCTION accepts_mood(value mood) RETURNS mood LANGUAGE sql AS $$ SELECT value $$;
+                 ALTER TYPE mood SET SCHEMA app;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict")
+        );
+        assert!(!state.local.types.contains_key(&object_id("public", "mood")));
+        assert!(matches!(
+            state.local.types.get(&object_id("app", "mood")),
+            Some(TypeOverlay::Present(_))
+        ));
+        let RelationOverlay::Present(relation) =
+            state.get_relation(&object_id("public", "entries")).unwrap()
+        else {
+            panic!("entries table missing");
+        };
+        assert_eq!(
+            relation.get_column("status").unwrap().data_type.as_deref(),
+            Some("app.mood")
+        );
+        let Some(TypeOverlay::Present(TypeState {
+            kind: TypeKind::Domain { base_type, .. },
+            ..
+        })) = state.local.types.get(&object_id("public", "mood_alias"))
+        else {
+            panic!("domain missing");
+        };
+        assert_eq!(base_type, "app.mood");
+        let Some(FunctionOverlay::Present(function)) = state
+            .local
+            .functions
+            .get(&object_id("public", "accepts_mood(app.mood)"))
+        else {
+            panic!("remapped function missing");
+        };
+        assert_eq!(function.return_type, "app.mood");
+    }
+
+    #[test]
     fn enum_value_rename_obeys_cached_explicit_and_default_search_path_order() {
         let engine = setup_engine();
         let mut cache = safe_migrate::db::cache::DbCache::new();
@@ -936,6 +1352,64 @@ mod state_mutation_tests {
             assert!(!r.policies.contains("p"));
             assert!(!r.triggers.contains("tr"));
         }
+    }
+
+    #[test]
+    fn rename_trigger_updates_identity_and_rolls_back() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE TABLE t(id int);
+                 CREATE FUNCTION f() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END; $$;
+                 CREATE TRIGGER old_trigger BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION f();
+                 BEGIN;
+                 ALTER TRIGGER old_trigger ON t RENAME TO new_trigger;",
+                &mut state,
+            )
+            .unwrap();
+
+        let RelationOverlay::Present(relation) =
+            state.get_relation(&object_id("public", "t")).unwrap()
+        else {
+            panic!("table missing");
+        };
+        assert!(!relation.triggers.contains("old_trigger"));
+        assert!(relation.triggers.contains("new_trigger"));
+        assert!(state.local.triggers.values().any(|overlay| matches!(overlay,
+            safe_migrate::model::trigger::TriggerOverlay::Present(trigger) if trigger.name == "new_trigger"
+        )));
+
+        engine.analyze("ROLLBACK;", &mut state).unwrap();
+        let RelationOverlay::Present(relation) =
+            state.get_relation(&object_id("public", "t")).unwrap()
+        else {
+            panic!("table missing");
+        };
+        assert!(relation.triggers.contains("old_trigger"));
+        assert!(!relation.triggers.contains("new_trigger"));
+    }
+
+    #[test]
+    fn rename_trigger_rejects_an_existing_target() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let violations = engine
+            .analyze(
+                "CREATE TABLE t(id int);
+                 CREATE FUNCTION f() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END; $$;
+                 CREATE TRIGGER first_trigger BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION f();
+                 CREATE TRIGGER second_trigger BEFORE UPDATE ON t FOR EACH ROW EXECUTE FUNCTION f();
+                 ALTER TRIGGER first_trigger ON t RENAME TO second_trigger;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(violations.iter().any(|violation| {
+            violation.rule_id == "chain-conflict" && violation.reason.contains("second_trigger")
+        }));
     }
 
     #[test]
@@ -1545,7 +2019,9 @@ mod state_mutation_tests {
             FunctionState {
                 id: function_id.clone(),
                 arg_types: vec!["integer[]".to_string()],
+                arg_type_ids: vec![None],
                 return_type: "integer".to_string(),
+                return_type_id: None,
                 volatility: Volatility::Volatile,
                 language: "sql".to_string(),
                 security: SecurityMode::Invoker,
@@ -1824,6 +2300,7 @@ mod state_mutation_tests {
         relation.columns.push(safe_migrate::model::column::Column {
             name: "period".to_string(),
             data_type: Some("int4range".to_string()),
+            type_id: None,
             is_nullable: true,
             default: None,
             avg_width: None,

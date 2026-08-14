@@ -10,6 +10,7 @@ pub mod indexes;
 pub mod opaque;
 pub mod partitions;
 pub mod policies;
+pub mod registry;
 pub mod security;
 pub mod transactions;
 pub mod triggers;

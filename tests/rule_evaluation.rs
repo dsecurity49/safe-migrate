@@ -68,6 +68,7 @@ mod rule_evaluation_tests {
         rel.columns.push(Column {
             name: "data".into(),
             data_type: Some("text".into()),
+            type_id: None,
             is_nullable: true,
             default: None,
             avg_width: Some(3000),

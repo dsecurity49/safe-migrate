@@ -8,11 +8,11 @@ use crate::analysis::facts::{
 use crate::ast::identifiers::{Ident, QualifiedName};
 use squawk_syntax::ast::{
     AlterColumnOption, AlterConstraint, AlterDomain, AlterIndex, AlterSequence, AlterTable,
-    AlterTableAction, AlterType, AstNode, AttachPartition, Column, ColumnConstraint, Constraint,
-    CreateDatabase, CreateDomain, CreateIndex, CreateMaterializedView, CreatePolicy,
+    AlterTableAction, AlterTrigger, AlterType, AstNode, AttachPartition, Column, ColumnConstraint,
+    Constraint, CreateDatabase, CreateDomain, CreateIndex, CreateMaterializedView, CreatePolicy,
     CreateSequence, CreateTable, CreateTableAs, CreateTrigger, CreateType, CreateView, CteName,
     DetachPartition, DropDomain, DropIndex, DropMaterializedView, DropPolicy, DropSequence,
-    DropTable, DropTrigger, DropType, DropView, Grant, Name, NameRef, Path, PathSegment,
+    DropTable, DropTrigger, DropType, DropView, Grant, NameRef, Path, PathSegment, PathSegmentRef,
     RelationNameRef, ReleaseSavepoint, Revoke, RevokeCommand, Rollback, Set, Stmt, TableArg,
     TableConstraint,
 };
@@ -59,7 +59,7 @@ impl AstVisitor {
         Some(decoded)
     }
 
-    fn resolve_name(n: Name) -> String {
+    fn resolve_name(n: PathSegment) -> String {
         Self::identifier_from_name(n.text(), n.is_quoted()).resolve()
     }
 
@@ -181,6 +181,12 @@ impl AstVisitor {
         if let Some(node) = DropTrigger::cast(syntax.clone()) {
             return Self::extract_drop_trigger(&node);
         }
+        if let Some(node) = AlterTrigger::cast(syntax.clone()) {
+            return Self::extract_alter_trigger(&node);
+        }
+        if ast::CommentOn::cast(syntax.clone()).is_some() {
+            return Some(StatementFact::SchemaNeutralNoop);
+        }
 
         if ast::PrepareTransaction::cast(syntax.clone()).is_some() {
             let name = syntax
@@ -190,7 +196,7 @@ impl AstVisitor {
                 .or_else(|| {
                     syntax
                         .descendants()
-                        .find_map(Name::cast)
+                        .find_map(PathSegment::cast)
                         .map(Self::resolve_name)
                 })
                 .unwrap_or_default();
@@ -289,7 +295,7 @@ impl AstVisitor {
     fn extract_alter_schema(node: &ast::AlterSchema) -> Option<StatementFact> {
         let nr = node.schema_ref()?.ident_token()?;
         let name = QualifiedName::new(None, Self::identifier_from_token(nr.text()));
-        let action = node.alter_schema_action().and_then(|a| match a {
+        let action = node.action().and_then(|a| match a {
             ast::AlterSchemaAction::SchemaRenameTo(rt) => {
                 rt.schema().and_then(|s| s.ident_token()).map(|n| {
                     crate::analysis::facts::AlterSchemaActionFact::RenameTo {
@@ -352,7 +358,11 @@ impl AstVisitor {
 
         let (columns, foreign_keys, table_constraints) = node
             .table_arg_list()
-            .map(|tal| Self::extract_table_body(tal.args()))
+            .map(|tal| {
+                let (columns, foreign_keys, table_constraints) =
+                    Self::extract_table_body(tal.args());
+                (columns, foreign_keys, table_constraints)
+            })
             .unwrap_or_else(|| (Vec::new(), Vec::new(), Vec::new()));
 
         Some(StatementFact::CreateTable {
@@ -460,7 +470,7 @@ impl AstVisitor {
                 let new_name = rc
                     .syntax()
                     .descendants()
-                    .find_map(Name::cast)
+                    .find_map(PathSegment::cast)
                     .map(Self::resolve_name);
                 if let (Some(old_name), Some(new_name)) = (old_name, new_name) {
                     actions.push(AlterTableActionFact::RenameConstraint { old_name, new_name });
@@ -568,7 +578,7 @@ impl AstVisitor {
                         .or_else(|| {
                             rc.syntax()
                                 .descendants()
-                                .find_map(Name::cast)
+                                .find_map(PathSegment::cast)
                                 .map(|n| Self::identifier_from_name(n.text(), n.is_quoted()))
                         })
                         .or_else(|| {
@@ -620,7 +630,7 @@ impl AstVisitor {
                             alter_col
                                 .syntax()
                                 .descendants()
-                                .find_map(Name::cast)
+                                .find_map(PathSegment::cast)
                                 .map(Self::resolve_name)
                         })
                         .or_else(|| {
@@ -644,8 +654,10 @@ impl AstVisitor {
                     if let Some(constraint_name) = vc
                         .syntax()
                         .descendants()
-                        .find_map(NameRef::cast)
-                        .map(|nr| Self::resolve_name_ref(&nr))
+                        .find_map(PathSegmentRef::cast)
+                        .map(|name| {
+                            Self::identifier_from_name(name.text(), name.is_quoted()).resolve()
+                        })
                     {
                         actions.push(AlterTableActionFact::ValidateConstraint { constraint_name });
                     }
@@ -1071,23 +1083,12 @@ impl AstVisitor {
                 });
             let path = fkc.table_name_ref()?.path_ref()?;
             let references = Self::path_ref_to_qualified_name(&path)?;
+            let column_lists = Self::extract_foreign_key_column_lists(&fkc);
             return Some(AlterTableActionFact::AddForeignKey {
                 constraint_name,
                 references,
-                from_columns: fkc
-                    .syntax()
-                    .descendants()
-                    .filter_map(ast::ColumnRefList::cast)
-                    .next()
-                    .map(Self::extract_column_list_names)
-                    .unwrap_or_default(),
-                to_columns: fkc
-                    .syntax()
-                    .descendants()
-                    .filter_map(ast::ColumnRefList::cast)
-                    .nth(1)
-                    .map(Self::extract_column_list_names)
-                    .unwrap_or_default(),
+                from_columns: column_lists.first().cloned().unwrap_or_default(),
+                to_columns: column_lists.get(1).cloned().unwrap_or_default(),
                 not_valid,
             });
         }
@@ -1181,11 +1182,12 @@ impl AstVisitor {
                     .and_then(|clause| clause.constraint_name())
                     .and_then(|name| name.ident_token())
                     .map(|token| Self::resolve_identifier_token(token.text())),
-                columns: Self::extract_column_list_names(
-                    pkc.syntax()
-                        .descendants()
-                        .find_map(ast::ColumnRefList::cast)?,
-                ),
+                columns: pkc
+                    .syntax()
+                    .descendants()
+                    .find_map(ast::ConstraintColumnRefList::cast)
+                    .map(Self::extract_constraint_column_list_names)
+                    .or_else(|| pkc.using_index().map(|_| Vec::new()))?,
             }),
             TableConstraint::UniqueConstraint(uc) => Some(TableConstraintFact::Unique {
                 constraint_name: uc
@@ -1193,11 +1195,12 @@ impl AstVisitor {
                     .and_then(|clause| clause.constraint_name())
                     .and_then(|name| name.ident_token())
                     .map(|token| Self::resolve_identifier_token(token.text())),
-                columns: Self::extract_column_list_names(
-                    uc.syntax()
-                        .descendants()
-                        .find_map(ast::ColumnRefList::cast)?,
-                ),
+                columns: uc
+                    .syntax()
+                    .descendants()
+                    .find_map(ast::ConstraintColumnRefList::cast)
+                    .map(Self::extract_constraint_column_list_names)
+                    .or_else(|| uc.using_index().map(|_| Vec::new()))?,
             }),
             TableConstraint::CheckConstraint(_) => Some(TableConstraintFact::Check),
             _ => None,
@@ -1259,20 +1262,9 @@ impl AstVisitor {
                 .and_then(|t| t.path_ref())
                 .and_then(|p| Self::path_ref_to_qualified_name(&p))?;
             let references = path;
-            let from_columns = fkc
-                .syntax()
-                .descendants()
-                .filter_map(ast::ColumnRefList::cast)
-                .next()
-                .map(Self::extract_column_list_names)
-                .unwrap_or_default();
-            let to_columns = fkc
-                .syntax()
-                .descendants()
-                .filter_map(ast::ColumnRefList::cast)
-                .nth(1)
-                .map(Self::extract_column_list_names)
-                .unwrap_or_default();
+            let column_lists = Self::extract_foreign_key_column_lists(fkc);
+            let from_columns = column_lists.first().cloned().unwrap_or_default();
+            let to_columns = column_lists.get(1).cloned().unwrap_or_default();
 
             return Some(FkFact {
                 constraint_name,
@@ -1284,12 +1276,28 @@ impl AstVisitor {
         None
     }
 
-    fn extract_column_list_names(cl: ast::ColumnRefList) -> Vec<String> {
-        cl.column_refs()
-            .filter_map(|col| {
-                col.name_ref()
-                    .and_then(|nr| nr.ident_token())
-                    .map(|nr| Self::resolve_identifier_token(nr.text()))
+    fn extract_constraint_column_list_names(cl: ast::ConstraintColumnRefList) -> Vec<String> {
+        cl.column_name_refs()
+            .filter_map(|column| column.ident_token())
+            .map(|token| Self::resolve_identifier_token(token.text()))
+            .collect()
+    }
+
+    fn extract_foreign_key_column_lists(
+        constraint: &ast::ForeignKeyConstraint,
+    ) -> Vec<Vec<String>> {
+        // PostgreSQL lists the referencing columns first and referenced columns
+        // second. Later lists, such as ON DELETE SET NULL (columns), must not
+        // change that positional contract.
+        constraint
+            .syntax()
+            .descendants()
+            .filter_map(ast::ForeignKeyColumnList::cast)
+            .map(|list| {
+                list.column_name_refs()
+                    .filter_map(|column| column.ident_token())
+                    .map(|token| Self::resolve_identifier_token(token.text()))
+                    .collect()
             })
             .collect()
     }
@@ -1337,8 +1345,7 @@ impl AstVisitor {
         let name = Self::path_ref_to_qualified_name(&path)?;
         let mut actions = Vec::new();
 
-        if let Some(squawk_syntax::ast::AlterIndexAction::IndexRenameTo(rt)) =
-            node.alter_index_action()
+        if let Some(squawk_syntax::ast::AlterIndexAction::IndexRenameTo(rt)) = node.action()
             && let Some(new_name_node) = rt
                 .index()
                 .and_then(|i| i.path())
@@ -1384,7 +1391,7 @@ impl AstVisitor {
         let path = node.view_ref()?.path_ref()?;
         let name = Self::path_ref_to_qualified_name(&path)?;
 
-        let action = node.alter_view_action()?;
+        let action = node.action()?;
         match action {
             ast::AlterViewAction::ViewRenameTo(rt) => {
                 let new_name_node = rt.view()?.path()?;
@@ -1476,11 +1483,11 @@ impl AstVisitor {
         let path = node.view_ref()?.path_ref()?;
         let new_name = node.action().find_map(|action| {
             if let squawk_syntax::ast::AlterMaterializedViewAction::ViewRenameTo(rt) = action {
-                rt.view()?
-                    .path()?
-                    .segment()?
-                    .name()
-                    .map(|n| Self::identifier_from_name(n.text(), n.is_quoted()))
+                let segment = rt.view()?.path()?.segment()?;
+                Some(Self::identifier_from_name(
+                    segment.text(),
+                    segment.is_quoted(),
+                ))
             } else {
                 None
             }
@@ -1561,18 +1568,13 @@ impl AstVisitor {
         ];
 
         let mut local_declarations = Vec::new();
-        for name_node in syntax.descendants().filter_map(Name::cast) {
-            local_declarations.push(
-                Self::identifier_from_name(name_node.text(), name_node.is_quoted()).resolve(),
-            );
-        }
         for cte_name in syntax.descendants().filter_map(CteName::cast) {
             if let Some(tok) = cte_name.ident_token() {
                 local_declarations.push(tok.text().to_string());
             }
         }
 
-        for n in syntax.descendants().filter_map(NameRef::cast) {
+        for n in syntax.descendants().filter_map(PathSegmentRef::cast) {
             let text = n.text().to_string();
             let upper = text.to_uppercase();
             let is_quoted = n.is_quoted();
@@ -1695,10 +1697,8 @@ impl AstVisitor {
             let mut current_ref = Some(path_ref);
 
             while let Some(pr) = current_ref {
-                if let Some(segment) = pr.segment()
-                    && let Some(nr) = segment.name_ref()
-                {
-                    segments.push(Ident::new(nr.text().to_string(), nr.is_quoted()));
+                if let Some(segment) = pr.segment() {
+                    segments.push(Ident::new(segment.text().to_string(), segment.is_quoted()));
                 }
                 current_ref = pr.qualifier();
             }
@@ -1835,6 +1835,18 @@ impl AstVisitor {
         let mut actions = Vec::new();
 
         match node.action()? {
+            ast::AlterTypeAction::TypeRenameTo(rename_type) => {
+                let new_name = rename_type.type_name()?.path()?.segment()?;
+                actions.push(AlterTypeActionFact::RenameTo {
+                    new_name: Self::identifier_from_name(new_name.text(), new_name.is_quoted()),
+                });
+            }
+            ast::AlterTypeAction::SetSchema(set_schema) => {
+                let new_schema = set_schema.schema_ref()?.ident_token()?;
+                actions.push(AlterTypeActionFact::SetSchema {
+                    new_schema: Self::resolve_identifier_token(new_schema.text()),
+                });
+            }
             ast::AlterTypeAction::AddValue(add_value) => {
                 let literals = add_value
                     .syntax()
@@ -1929,7 +1941,7 @@ impl AstVisitor {
         let table = Self::path_ref_to_qualified_name(&path)?;
         let function = node.call_expr().and_then(|call| {
             let node_ref = call.syntax();
-            let fn_name = node_ref.descendants().find_map(Name::cast).map(|n| {
+            let fn_name = node_ref.descendants().find_map(PathSegment::cast).map(|n| {
                 QualifiedName::new(None, Self::identifier_from_name(n.text(), n.is_quoted()))
             });
             if fn_name.is_some() {
@@ -1955,6 +1967,21 @@ impl AstVisitor {
             name: trigger_name,
             table,
             if_exists: node.if_exists().is_some(),
+        })
+    }
+
+    fn extract_alter_trigger(node: &AlterTrigger) -> Option<StatementFact> {
+        let name = Self::resolve_identifier_token(node.trigger_ref()?.ident_token()?.text());
+        let table_path = node.on_relation()?.relation_name_ref()?.path_ref()?;
+        let table = Self::path_ref_to_qualified_name(&table_path)?;
+        let ast::AlterTriggerAction::TriggerRenameTo(rename) = node.action()? else {
+            return None;
+        };
+        let new_name = Self::resolve_identifier_token(rename.trigger()?.ident_token()?.text());
+        Some(StatementFact::AlterTrigger {
+            name,
+            table,
+            new_name,
         })
     }
 
@@ -2128,15 +2155,9 @@ impl AstVisitor {
             .map(|pl| pl.params().map(|p| p.syntax().text().to_string()).collect())
             .unwrap_or_default();
 
-        let action = node.alter_function_action().and_then(|a| match a {
+        let action = node.action().and_then(|a| match a {
             ast::AlterFunctionAction::FunctionRenameTo(rt) => {
-                let new_name = rt
-                    .function_name()?
-                    .path()?
-                    .segment()?
-                    .name()?
-                    .text()
-                    .to_string();
+                let new_name = rt.function_name()?.path()?.segment()?.text().to_string();
                 Some(crate::analysis::facts::AlterFunctionAction::Rename {
                     from: name.name.resolve(),
                     to: new_name,
@@ -2269,15 +2290,9 @@ impl AstVisitor {
             .map(|pl| pl.params().map(|p| p.syntax().text().to_string()).collect())
             .unwrap_or_default();
 
-        let action = node.alter_procedure_action().and_then(|a| match a {
+        let action = node.action().and_then(|a| match a {
             ast::AlterProcedureAction::ProcedureRenameTo(rt) => {
-                let new_name = rt
-                    .procedure_name()?
-                    .path()?
-                    .segment()?
-                    .name()?
-                    .text()
-                    .to_string();
+                let new_name = rt.procedure_name()?.path()?.segment()?.text().to_string();
                 Some(crate::analysis::facts::AlterFunctionAction::Rename {
                     from: name.name.resolve(),
                     to: new_name,
@@ -2369,26 +2384,31 @@ impl AstVisitor {
         } else {
             let objects = node
                 .publication_objects()
-                .flat_map(|obj| {
-                    if let Some(table_name_ref) = obj.table_name_ref() {
-                        let path = table_name_ref.path_ref()?;
-                        Some(crate::analysis::facts::PublicationObjectFact::Table {
-                            name: Self::path_ref_to_qualified_name(&path)?,
-                            only: obj.only_token().is_some(),
-                            include_partitions: obj.star_token().is_some(),
-                            columns: obj.column_ref_list().map(|cl| {
-                                cl.column_refs()
-                                    .filter_map(|c| c.name_ref())
-                                    .map(|n| n.text().to_string())
-                                    .collect()
-                            }),
-                            row_filter: obj.where_condition_clause().and_then(|w| {
-                                w.expr()
-                                    .map(crate::analysis::expr_visitor::ExprVisitor::convert)
-                            }),
-                        })
-                    } else if let Some(schema_ref) = obj.schema_ref() {
-                        Some(
+                .flat_map(|obj| match obj {
+                    ast::PublicationObject::PublicationObjectTable(obj) => {
+                        if let Some(table_name_ref) = obj.table_name_ref() {
+                            let path = table_name_ref.path_ref()?;
+                            Some(crate::analysis::facts::PublicationObjectFact::Table {
+                                name: Self::path_ref_to_qualified_name(&path)?,
+                                only: obj.only_token().is_some(),
+                                include_partitions: obj.star_token().is_some(),
+                                columns: obj.column_ref_list().map(|cl| {
+                                    cl.column_name_refs()
+                                        .filter_map(|n| n.ident_token())
+                                        .map(|n| n.text().to_string())
+                                        .collect()
+                                }),
+                                row_filter: obj.where_condition_clause().and_then(|w| {
+                                    w.expr()
+                                        .map(crate::analysis::expr_visitor::ExprVisitor::convert)
+                                }),
+                            })
+                        } else {
+                            None
+                        }
+                    }
+                    ast::PublicationObject::PublicationObjectTablesInSchema(obj) => {
+                        obj.schema_ref().map(|schema_ref| {
                             crate::analysis::facts::PublicationObjectFact::SchemaTables {
                                 schema: schema_ref
                                     .ident_token()
@@ -2398,12 +2418,11 @@ impl AstVisitor {
                                     w.expr()
                                         .map(crate::analysis::expr_visitor::ExprVisitor::convert)
                                 }),
-                            },
-                        )
-                    } else if obj.current_schema_token().is_some() {
+                            }
+                        })
+                    }
+                    ast::PublicationObject::PublicationObjectCurrentSchema(_) => {
                         Some(crate::analysis::facts::PublicationObjectFact::CurrentSchemaShorthand)
-                    } else {
-                        None
                     }
                 })
                 .collect();
@@ -2610,7 +2629,10 @@ impl AstVisitor {
         let name = node.role()?.ident_token()?.text().to_string();
         let inherits = node
             .role_option_list()
-            .map(|ol| ol.role_options().any(|o| o.inherit_token().is_some()))
+            .map(|ol| {
+                ol.role_options()
+                    .any(|o| matches!(o, ast::RoleOption::RoleOptionInherit(_)))
+            })
             .unwrap_or(false);
         Some(StatementFact::CreateRole(
             crate::analysis::facts::CreateRoleFact { name, inherits },
@@ -2619,11 +2641,11 @@ impl AstVisitor {
 
     fn extract_alter_role(node: &squawk_syntax::ast::AlterRole) -> Option<StatementFact> {
         let name = Self::extract_role(&node.role_ref()?);
-        let inherits = node.alter_role_action().and_then(|a| match a {
+        let inherits = node.action().and_then(|a| match a {
             ast::AlterRoleAction::RoleOptionList(ol) => {
                 let mut found = None;
                 for o in ol.role_options() {
-                    if o.inherit_token().is_some() {
+                    if matches!(o, ast::RoleOption::RoleOptionInherit(_)) {
                         found = Some(true);
                     }
                 }
@@ -2702,7 +2724,7 @@ impl AstVisitor {
                     _ => crate::analysis::facts::PrivilegeFact::Unknown,
                 }
             }
-        } else if let Some(ident) = cmd.syntax().descendants().find_map(ast::Name::cast) {
+        } else if let Some(ident) = cmd.syntax().descendants().find_map(PathSegment::cast) {
             crate::analysis::facts::PrivilegeFact::Named(ident.text().to_string())
         } else {
             crate::analysis::facts::PrivilegeFact::Unknown
@@ -2729,7 +2751,7 @@ impl AstVisitor {
                         .and_then(|pr| Self::path_ref_to_qualified_name(&pr))
                 })
                 .collect(),
-            PrivilegeObjects::PrivilegeAllInSchema(pais) => {
+            PrivilegeObjects::PrivilegeAllTablesInSchema(pais) => {
                 let schemas: Vec<_> = pais
                     .schema_refs()
                     .filter_map(|sr| sr.ident_token().map(|t| t.text().to_string()))
@@ -2835,29 +2857,58 @@ impl AstVisitor {
     fn extract_db_option(
         opt: squawk_syntax::ast::DatabaseOption,
     ) -> crate::analysis::facts::DatabaseOptionFact {
-        let value = if opt.default_token().is_some() {
-            crate::analysis::facts::DatabaseOptionValue::Default
-        } else {
-            crate::analysis::facts::DatabaseOptionValue::Literal(
-                opt.literal()
-                    .map(|l| l.syntax().text().to_string().trim_matches('\'').to_string()),
-            )
+        let value_for = |default: bool, literal: Option<ast::Literal>| {
+            if default {
+                crate::analysis::facts::DatabaseOptionValue::Default
+            } else {
+                crate::analysis::facts::DatabaseOptionValue::Literal(
+                    literal.map(|l| l.syntax().text().to_string().trim_matches('\'').to_string()),
+                )
+            }
         };
 
-        if opt.owner_token().is_some() {
-            crate::analysis::facts::DatabaseOptionFact::Owner(value)
-        } else if opt.template_token().is_some() {
-            crate::analysis::facts::DatabaseOptionFact::Template(value)
-        } else if opt.encoding_token().is_some() {
-            crate::analysis::facts::DatabaseOptionFact::Encoding(value)
-        } else if opt.tablespace_token().is_some() {
-            crate::analysis::facts::DatabaseOptionFact::Tablespace(value)
-        } else if opt.connection_token().is_some() && opt.limit_token().is_some() {
-            crate::analysis::facts::DatabaseOptionFact::ConnectionLimit(value)
-        } else if let Some(ident) = opt.ident_token() {
-            crate::analysis::facts::DatabaseOptionFact::Named(ident.text().to_string(), value)
-        } else {
-            crate::analysis::facts::DatabaseOptionFact::Unknown(value)
+        match opt {
+            ast::DatabaseOption::DatabaseOptionOwner(opt) => {
+                crate::analysis::facts::DatabaseOptionFact::Owner(value_for(
+                    opt.default_token().is_some(),
+                    opt.literal(),
+                ))
+            }
+            ast::DatabaseOption::DatabaseOptionTemplate(opt) => {
+                crate::analysis::facts::DatabaseOptionFact::Template(value_for(
+                    opt.default_token().is_some(),
+                    opt.literal(),
+                ))
+            }
+            ast::DatabaseOption::DatabaseOptionEncoding(opt) => {
+                crate::analysis::facts::DatabaseOptionFact::Encoding(value_for(
+                    opt.default_token().is_some(),
+                    opt.literal(),
+                ))
+            }
+            ast::DatabaseOption::DatabaseOptionTablespace(opt) => {
+                crate::analysis::facts::DatabaseOptionFact::Tablespace(value_for(
+                    opt.default_token().is_some(),
+                    opt.literal(),
+                ))
+            }
+            ast::DatabaseOption::DatabaseOptionConnectionLimit(opt) => {
+                crate::analysis::facts::DatabaseOptionFact::ConnectionLimit(value_for(
+                    opt.default_token().is_some(),
+                    opt.literal(),
+                ))
+            }
+            ast::DatabaseOption::DatabaseOptionGeneric(opt) => {
+                let value = value_for(opt.default_token().is_some(), opt.literal());
+                opt.ident_token()
+                    .map(|ident| {
+                        crate::analysis::facts::DatabaseOptionFact::Named(
+                            ident.text().to_string(),
+                            value.clone(),
+                        )
+                    })
+                    .unwrap_or(crate::analysis::facts::DatabaseOptionFact::Unknown(value))
+            }
         }
     }
 
@@ -2885,7 +2936,7 @@ impl AstVisitor {
             .unwrap_or_default();
         let name = QualifiedName::new(None, Ident::new(name, false));
 
-        let action = match node.alter_database_action()? {
+        let action = match node.action()? {
             AlterDatabaseAction::DatabaseRenameTo(rt) => {
                 crate::analysis::facts::AlterDatabaseAction::Rename {
                     to: rt
@@ -3130,15 +3181,10 @@ impl AstVisitor {
     }
 
     fn segment_ident(segment: PathSegment) -> Option<Ident> {
-        if let Some(nr) = segment.syntax().descendants().find_map(NameRef::cast) {
-            Some(Self::identifier_from_name(nr.text(), nr.is_quoted()))
-        } else {
-            segment
-                .syntax()
-                .descendants()
-                .find_map(Name::cast)
-                .map(|n| Self::identifier_from_name(n.text(), n.is_quoted()))
-        }
+        Some(Self::identifier_from_name(
+            segment.text(),
+            segment.is_quoted(),
+        ))
     }
 
     fn path_ref_to_qualified_name(path_ref: &squawk_syntax::ast::PathRef) -> Option<QualifiedName> {
@@ -3146,10 +3192,11 @@ impl AstVisitor {
         let mut current_ref = Some(path_ref.clone());
 
         while let Some(pr) = current_ref {
-            if let Some(segment) = pr.segment()
-                && let Some(nr) = segment.name_ref()
-            {
-                segments.push(Self::identifier_from_name(nr.text(), nr.is_quoted()));
+            if let Some(segment) = pr.segment() {
+                segments.push(Self::identifier_from_name(
+                    segment.text(),
+                    segment.is_quoted(),
+                ));
             }
             current_ref = pr.qualifier();
         }
@@ -3180,10 +3227,8 @@ impl AstVisitor {
         {
             let mut current_ref = Some(pr);
             while let Some(r) = current_ref {
-                if let Some(seg) = r.segment()
-                    && let Some(nr) = seg.name_ref()
-                {
-                    segments.push(Self::identifier_from_name(nr.text(), nr.is_quoted()));
+                if let Some(seg) = r.segment() {
+                    segments.push(Self::identifier_from_name(seg.text(), seg.is_quoted()));
                 }
                 current_ref = r.qualifier();
             }

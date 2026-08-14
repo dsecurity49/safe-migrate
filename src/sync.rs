@@ -524,6 +524,7 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
             rel.columns.push(crate::model::column::Column {
                 name: column_name,
                 data_type: Some(type_name),
+                type_id: None,
                 is_nullable: !not_null,
                 default: None,
                 avg_width,
@@ -828,7 +829,7 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
         // Normalize argument types in sync just like in resolver
         let arg_types_str = arg_types_str
             .split(',')
-            .map(|s| s.trim().to_lowercase())
+            .map(crate::analysis::resolver::Resolver::normalize_function_arg_type)
             .collect::<Vec<_>>()
             .join(",");
 
@@ -845,7 +846,9 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
             crate::model::function::FunctionState {
                 id,
                 arg_types,
+                arg_type_ids: Vec::new(),
                 return_type: return_type.unwrap_or_default(),
+                return_type_id: None,
                 volatility,
                 language,
                 security,
@@ -891,6 +894,7 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
             },
             "d" => crate::model::types::TypeKind::Domain {
                 base_type: domain_base_type.unwrap_or_default(),
+                base_type_id: None,
             },
             _ => continue,
         };
