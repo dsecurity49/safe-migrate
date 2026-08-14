@@ -353,6 +353,17 @@ mod tests {
         let current_bytes = bincode::serde::encode_to_vec(&current, config).unwrap();
 
         assert_eq!(current_bytes, legacy_bytes);
+        let restored: crate::model::types::TypeKind =
+            bincode::serde::decode_from_slice(&legacy_bytes, config)
+                .unwrap()
+                .0;
+        assert!(matches!(
+            restored,
+            crate::model::types::TypeKind::Domain {
+                base_type,
+                base_type_id: None,
+            } if base_type == "mood"
+        ));
     }
 
     #[test]
