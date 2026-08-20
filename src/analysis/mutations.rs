@@ -1,6 +1,8 @@
 // FILE: src/analysis/mutations.rs
 use crate::analysis::expr_ir::ExprIr;
-use crate::analysis::facts::{SearchPathTarget, TableConstraintFact};
+use crate::analysis::facts::{
+    ResetSettingTarget, SearchPathTarget, TableConstraintFact, TimeoutSetting, TimeoutSettingValue,
+};
 use crate::ast::identifiers::ObjectId;
 use crate::model::types::TypeKind;
 
@@ -47,6 +49,11 @@ pub enum Mutation {
         new_owner: crate::analysis::facts::RoleFact,
     },
     SearchPath(SearchPathChange),
+    TimeoutSetting(TimeoutSettingChange),
+    ResetSettings(ResetSettingTarget),
+    /// Statement-scoped no-op evaluated after real mutations so timeout
+    /// rules do not report on statements PostgreSQL would not execute.
+    CheckTimeouts,
     BeginTransaction,
     CommitTransaction,
     CommitAndChain,
@@ -341,6 +348,14 @@ pub struct DropIndex {
 #[derive(Clone, Debug, PartialEq)]
 pub struct SearchPathChange {
     pub target: SearchPathTarget,
+    pub local: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TimeoutSettingChange {
+    pub setting: TimeoutSetting,
+    pub value: TimeoutSettingValue,
+    pub local: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]

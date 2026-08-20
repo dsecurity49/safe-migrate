@@ -17,7 +17,7 @@ use crate::analysis::mutations::{
     DropTriggerMutation, DropTypeMutation, DropViewMutation, FkMutation, GrantMutation, Mutation,
     OpaqueMutation, PersistenceMutation, RefreshMaterializedViewMutation, ReleaseSavepointMutation,
     Rename, RenameTriggerMutation, ResolvedGrantTarget, RevokeMutation,
-    RollbackToSavepointMutation, SavepointMutation, SearchPathChange,
+    RollbackToSavepointMutation, SavepointMutation, SearchPathChange, TimeoutSettingChange,
 };
 use crate::analysis::state::AnalysisState;
 use crate::ast::identifiers::{ObjectId, QualifiedName};
@@ -945,10 +945,23 @@ impl Resolver {
                     }));
                 }
             }
-            StatementFact::SetSearchPath { target } => {
+            StatementFact::SetSearchPath { target, local } => {
                 mutations.push(Mutation::SearchPath(SearchPathChange {
                     target: target.clone(),
+                    local: *local,
                 }))
+            }
+            StatementFact::SetTimeout {
+                setting,
+                value,
+                local,
+            } => mutations.push(Mutation::TimeoutSetting(TimeoutSettingChange {
+                setting: *setting,
+                value: value.clone(),
+                local: *local,
+            })),
+            StatementFact::ResetSettings { target } => {
+                mutations.push(Mutation::ResetSettings(*target))
             }
             StatementFact::BeginTransaction => mutations.push(Mutation::BeginTransaction),
             StatementFact::CommitTransaction => mutations.push(Mutation::CommitTransaction),

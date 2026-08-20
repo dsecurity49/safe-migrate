@@ -216,12 +216,15 @@ impl SafeMigrateEngine {
             let statement_confidence = state.local.confidence.clone();
             let mut statement_violations = Vec::new();
             let mut statement_warned_keys = HashSet::new();
-            let mutations = match AstVisitor::extract(&stmt) {
+            let mut mutations = match AstVisitor::extract(&stmt) {
                 Some(fact) => Resolver::resolve(&fact, state),
                 None => vec![Mutation::Opaque(
                     crate::analysis::mutations::OpaqueMutation::UnsupportedStatement,
                 )],
             };
+            if squawk_linter::analyze::possibly_slow_stmt(&stmt) {
+                mutations.push(Mutation::CheckTimeouts);
+            }
 
             for mutation in mutations {
                 let pre_cascade = match &mutation {

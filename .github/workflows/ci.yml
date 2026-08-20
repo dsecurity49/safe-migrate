@@ -141,11 +141,66 @@ jobs:
   action-smoke:
     name: Reusable Action smoke test
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18@sha256:3a82e1f56c8f0f5616a11103ac3d47e632c3938698946a7ad26da0df1334744a
+        env:
+          POSTGRES_DB: safe_migrate
+          POSTGRES_USER: safe_migrate
+          POSTGRES_PASSWORD: safe_migrate
+        options: >-
+          --health-cmd "pg_isready -U safe_migrate -d safe_migrate"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable 2026-07-16
+
+      - name: Create a synchronized Action baseline
+        id: sync_fixture
+        shell: bash
+        env:
+          DATABASE_URL: "host=localhost port=5432 user=safe_migrate password=safe_migrate dbname=safe_migrate options='-c lock_timeout=5s -c statement_timeout=15min'"
+        run: |
+          cache_path="$RUNNER_TEMP/action-smoke.cache"
+          migration_path="$RUNNER_TEMP/action-smoke.sql"
+          printf '%s\n' 'CREATE SCHEMA action_smoke;' > "$migration_path"
+          cargo run --locked -- sync --out "$cache_path" --schemas public
+          echo "cache=$cache_path" >> "$GITHUB_OUTPUT"
+          echo "migration=$migration_path" >> "$GITHUB_OUTPUT"
+
+      - name: Analyze with the synchronized baseline
+        id: synchronized
+        uses: ./
+        with:
+          mode: lint
+          path: ${{ steps.sync_fixture.outputs.migration }}
+          cache: ${{ steps.sync_fixture.outputs.cache }}
+          no-cache: "false"
+          output-dir: action-synchronized-artifacts
+
+      - name: Verify synchronized timeout evidence
+        shell: bash
+        env:
+          JSON_REPORT: ${{ steps.synchronized.outputs.json-report }}
+          EXIT_CODE: ${{ steps.synchronized.outputs.exit-code }}
+        run: |
+          test "$EXIT_CODE" = "0"
+          jq -e \
+            '.baseline.status == "available"
+             and .baseline.observed_settings.lock_timeout_ms == 5000
+             and .baseline.observed_settings.statement_timeout_ms == 900000
+             and ([.violations[].rule_id] | index("require-lock-timeout") | not)
+             and ([.violations[].rule_id] | index("require-statement-timeout") | not)' \
+            "$JSON_REPORT"
 
       - name: Generate review artifacts with the local Action
         id: safe_migrate

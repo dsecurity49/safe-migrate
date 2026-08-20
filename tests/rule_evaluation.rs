@@ -4,6 +4,8 @@ mod rule_evaluation_tests {
     use crate::common::*;
     use safe_migrate::analysis::state::{AnalysisState, Confidence};
     use safe_migrate::ast::identifiers::ObjectId;
+    use safe_migrate::engine::config::{Config, RuleConfig};
+    use safe_migrate::engine::engine::SafeMigrateEngine;
     use safe_migrate::model::column::Column;
     use safe_migrate::model::function::FunctionOverlay;
     use safe_migrate::model::relation::{Persistence, RelationKind, RelationState};
@@ -832,7 +834,16 @@ mod rule_evaluation_tests {
 
     #[test]
     fn test_rule_concurrent_drop_index() {
-        let engine = setup_engine();
+        let mut config = Config::default();
+        config.rules.insert(
+            "require-concurrent-index".to_string(),
+            RuleConfig {
+                tier1_threshold_rows: Some(1_000_000),
+                tier2_threshold_rows: Some(800_000),
+                ..RuleConfig::default()
+            },
+        );
+        let engine = SafeMigrateEngine::new(config);
 
         let mut cache = safe_migrate::db::cache::DbCache::new();
         cache.insert_baseline(
@@ -856,11 +867,11 @@ mod rule_evaluation_tests {
 
         let v = engine.analyze("DROP INDEX i;", &mut state).unwrap();
 
-        assert!(
-            v.iter()
-                .any(|v| v.rule_id == "require-concurrent-drop-index"),
-            "Non-concurrent DROP INDEX on large table should be flagged"
-        );
+        let finding = v
+            .iter()
+            .find(|v| v.rule_id == "require-concurrent-drop-index")
+            .expect("non-concurrent DROP INDEX should be flagged");
+        assert_eq!(finding.tier, ViolationTier::Tier3);
     }
 
     #[test]

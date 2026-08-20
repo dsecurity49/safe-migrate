@@ -1,6 +1,6 @@
 [package]
 name = "safe-migrate"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.94"
 description = "Analyze PostgreSQL migrations for schema and locking risks"
@@ -15,6 +15,7 @@ categories = ["command-line-utilities", "database"]
 squawk-syntax = "=2.62.0"
 squawk-lexer  = "=2.62.0"
 squawk-parser = "=2.62.0"
+squawk-linter = "=2.62.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.8"

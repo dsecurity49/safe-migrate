@@ -2,8 +2,8 @@
 use crate::analysis::expr_ir::ExprIr;
 use crate::analysis::facts::{
     AlterIndexActionFact, AlterTableActionFact, AlterTypeActionFact, AlterTypeFact, ColumnFact,
-    CreateTypeFact, FkFact, PersistenceFact, SearchPathTarget, StatementFact, TableConstraintFact,
-    TypeCreationKind,
+    CreateTypeFact, FkFact, PersistenceFact, ResetSettingTarget, SearchPathTarget, StatementFact,
+    TableConstraintFact, TimeoutSetting, TimeoutSettingValue, TypeCreationKind,
 };
 use crate::ast::identifiers::{Ident, QualifiedName};
 use squawk_syntax::ast::{
@@ -84,6 +84,7 @@ impl AstVisitor {
             Stmt::DropMaterializedView(node) => return Self::extract_drop_materialized_view(node),
             Stmt::DropIndex(node) => return Self::extract_drop_index(node),
             Stmt::Set(node) => return Self::extract_set(node),
+            Stmt::Reset(node) => return Self::extract_reset(node),
             Stmt::Grant(node) => return Self::extract_grant(node),
             Stmt::Revoke(node) => return Self::extract_revoke(node),
             Stmt::Begin(_) => return Some(StatementFact::BeginTransaction),
@@ -3018,36 +3019,103 @@ impl AstVisitor {
                     .config_parameter_ref()
                     .and_then(|cpr| cpr.path_ref())
                     .and_then(|pr| Self::path_ref_to_qualified_name(&pr))
-                    .map(|qn| qn.name.resolve())
-                    .unwrap_or_default()
+                    .filter(|qn| qn.schema.is_none())?
+                    .name
+                    .resolve()
                     .to_lowercase();
-                if setting_name != "search_path" {
-                    return None;
-                }
+                let local = node.local_token().is_some();
 
-                let schemas: Vec<String> = sc
-                    .config_values()
-                    .filter_map(|cv| match cv {
-                        ast::ConfigValue::ConfigValueName(cvn) => cvn
-                            .ident_token()
-                            .map(|t| Self::resolve_identifier_token(t.text())),
-                        ast::ConfigValue::Literal(_) => None,
-                    })
-                    .filter(|s| s.to_lowercase() != "default")
-                    .collect();
+                if setting_name == "search_path" {
+                    if sc.default_token().is_some() {
+                        return Some(StatementFact::SetSearchPath {
+                            target: SearchPathTarget::Default,
+                            local,
+                        });
+                    }
 
-                if schemas.is_empty() {
-                    Some(StatementFact::SetSearchPath {
-                        target: SearchPathTarget::Default,
-                    })
-                } else {
-                    Some(StatementFact::SetSearchPath {
+                    let schemas: Vec<String> = sc
+                        .config_values()
+                        .filter_map(|cv| match cv {
+                            ast::ConfigValue::ConfigValueName(cvn) => cvn
+                                .ident_token()
+                                .map(|t| Self::resolve_identifier_token(t.text())),
+                            ast::ConfigValue::Literal(literal) => {
+                                Self::resolve_string_literal(&literal)
+                            }
+                        })
+                        .collect();
+                    return (!schemas.is_empty()).then_some(StatementFact::SetSearchPath {
                         target: SearchPathTarget::Schemas(schemas),
-                    })
+                        local,
+                    });
                 }
+
+                let timeout_setting = match setting_name.as_str() {
+                    "lock_timeout" => TimeoutSetting::Lock,
+                    "statement_timeout" => TimeoutSetting::Statement,
+                    _ => return None,
+                };
+                let value = if sc.default_token().is_some() {
+                    TimeoutSettingValue::Default
+                } else if sc.current_token().is_some() {
+                    TimeoutSettingValue::Unknown
+                } else {
+                    let values: Vec<String> = sc
+                        .config_values()
+                        .filter_map(|value| match value {
+                            ast::ConfigValue::ConfigValueName(name) => {
+                                name.ident_token().map(|token| token.text().to_string())
+                            }
+                            ast::ConfigValue::Literal(literal) => {
+                                Self::resolve_string_literal(&literal)
+                                    .or_else(|| Some(literal.syntax().text().to_string()))
+                            }
+                        })
+                        .collect();
+                    if values.len() != 1 {
+                        TimeoutSettingValue::Invalid(sc.syntax().text().to_string())
+                    } else {
+                        match crate::analysis::settings::parse_timeout_ms(&values[0]) {
+                            Ok(milliseconds) => TimeoutSettingValue::Milliseconds(milliseconds),
+                            Err(error) => TimeoutSettingValue::Invalid(error),
+                        }
+                    }
+                };
+                Some(StatementFact::SetTimeout {
+                    setting: timeout_setting,
+                    value,
+                    local,
+                })
             }
             _ => None,
         }
+    }
+
+    fn extract_reset(node: &ast::Reset) -> Option<StatementFact> {
+        use squawk_syntax::ast::ResetTarget;
+
+        let target = match node.reset_target()? {
+            ResetTarget::All(_) => ResetSettingTarget::All,
+            ResetTarget::ConfigParameterRef(parameter) => {
+                let name = parameter
+                    .path_ref()
+                    .and_then(|path| Self::path_ref_to_qualified_name(&path))
+                    .filter(|name| name.schema.is_none())?
+                    .name
+                    .resolve()
+                    .to_lowercase();
+                match name.as_str() {
+                    "search_path" => ResetSettingTarget::SearchPath,
+                    "lock_timeout" => ResetSettingTarget::LockTimeout,
+                    "statement_timeout" => ResetSettingTarget::StatementTimeout,
+                    _ => return Some(StatementFact::SchemaNeutralNoop),
+                }
+            }
+            ResetTarget::ResetTimeZone(_) | ResetTarget::ResetTransactionIsolation(_) => {
+                return Some(StatementFact::SchemaNeutralNoop);
+            }
+        };
+        Some(StatementFact::ResetSettings { target })
     }
 
     /// Extract `SET [LOCAL] ROLE { rolename | NONE }`.

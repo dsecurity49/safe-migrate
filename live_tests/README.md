@@ -1,7 +1,9 @@
 # Live Tests
 
-This directory contains end-to-end SQL fixtures for all 26 primary rules. Two
-different suites use them:
+This directory contains the 26 end-to-end fixture groups established before
+v0.6.0. The two timeout rules added in v0.6.0 are covered by
+`tests/v060_timeouts.rs` and live synchronization tests because their result
+depends on session settings. Two different suites use the SQL fixtures here:
 
 - `run.sh` lints fixtures against the frozen local cache. It does not execute
   SQL in PostgreSQL.

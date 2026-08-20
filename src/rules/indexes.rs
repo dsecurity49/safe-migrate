@@ -103,8 +103,8 @@ impl Rule for ConcurrentIndexRule {
             }
             Mutation::DropIndex(drop) if !drop.concurrently => {
                 let rule_id = "require-concurrent-drop-index";
-                let tier1_threshold = config.rule_tier1_threshold(rule_id);
-                let tier2_threshold = config.rule_tier2_threshold(rule_id);
+                let tier1_threshold = config.rule_tier1_threshold(self.id());
+                let tier2_threshold = config.rule_tier2_threshold(self.id());
 
                 // BUG-010: Do not check or push stale statistics warning for DROP INDEX.
                 // We only perform size evaluation for the drop index violation tier.

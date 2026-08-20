@@ -6,14 +6,14 @@ resolver="$repo_root/scripts/action-resolve-version"
 gate="$repo_root/scripts/action-final-gate"
 manifest="$repo_root/action.yml"
 
-test "$(/bin/sh "$resolver" v0.5.0 "$repo_root/Cargo.toml")" = v0.5.0
-test "$(/bin/sh "$resolver" 0123456789abcdef0123456789abcdef01234567 "$repo_root/Cargo.toml")" = v0.5.0
+test "$(/bin/sh "$resolver" v0.6.0 "$repo_root/Cargo.toml")" = v0.6.0
+test "$(/bin/sh "$resolver" 0123456789abcdef0123456789abcdef01234567 "$repo_root/Cargo.toml")" = v0.6.0
 
 if /bin/sh "$resolver" main "$repo_root/Cargo.toml" >/dev/null 2>&1; then
   printf '%s\n' 'mutable Action branch reference was accepted' >&2
   exit 1
 fi
-if /bin/sh "$resolver" v0.4.5 "$repo_root/Cargo.toml" >/dev/null 2>&1; then
+if /bin/sh "$resolver" v0.5.0 "$repo_root/Cargo.toml" >/dev/null 2>&1; then
   printf '%s\n' 'mismatched Action tag was accepted' >&2
   exit 1
 fi

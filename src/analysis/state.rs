@@ -1,9 +1,12 @@
 // FILE: src/analysis/state.rs
-use crate::analysis::facts::{SearchPathTarget, TableConstraintFact};
+use crate::analysis::facts::{
+    ResetSettingTarget, SearchPathTarget, TableConstraintFact, TimeoutSetting, TimeoutSettingValue,
+};
 use crate::analysis::graph::{DependencyEdge, DependencyGraph, DependencyKind};
 use crate::analysis::mutations::{
     AlterTableActionMutation, AlterTypeActionMutation, Mutation, PersistenceMutation,
 };
+use crate::analysis::settings::ScopedSetting;
 use crate::analysis::transaction::{NamespaceSnapshot, StateChange, TransactionFrame};
 use crate::ast::identifiers::ObjectId;
 use crate::db::cache::DbCache;
@@ -57,11 +60,14 @@ pub struct LocalState {
     pub search_path: Vec<String>,
     pub default_search_path: Vec<String>,
     pub search_path_template: Vec<String>,
+    pub session_search_path_template: Vec<String>,
     pub default_search_path_template: Vec<String>,
+    pub lock_timeout: ScopedSetting<Option<u64>>,
+    pub statement_timeout: ScopedSetting<Option<u64>>,
     /// Role currently active for this session context (updated by SET ROLE /
     /// SET SESSION AUTHORIZATION). Begins equal to `session_role`.
     pub current_role: String,
-    /// Whether `current_role` is statically known. False when no V5 cache was
+    /// Whether `current_role` is statically known. False when no synchronized cache was
     /// loaded and no SET ROLE statement has been processed yet.
     pub current_role_known: bool,
     /// Effective role setting that survives transaction commit. A LOCAL role
@@ -134,6 +140,10 @@ impl AnalysisState {
     }
 
     pub fn with_baseline(cache: DbCache, baseline_available: bool) -> Self {
+        let source_lock_timeout =
+            baseline_available.then_some(cache.metadata.source_lock_timeout_ms);
+        let source_statement_timeout =
+            baseline_available.then_some(cache.metadata.source_statement_timeout_ms);
         let default_search_path = cache.search_path.clone();
         let default_search_path_template = if cache.metadata.schemas.is_none() {
             cache
@@ -185,7 +195,7 @@ impl AnalysisState {
             .collect();
         // Effective cached search-path entries and modeled objects are direct
         // evidence that their namespaces existed at synchronization time.
-        // This also keeps programmatically assembled V5 caches internally
+        // This also keeps programmatically assembled caches internally
         // consistent without treating unrelated out-of-scope schemas as
         // authoritative catalogs.
         let inferred_schema_owner = ObjectId::new(
@@ -437,7 +447,10 @@ impl AnalysisState {
                 search_path: default_search_path.clone(),
                 default_search_path,
                 search_path_template: default_search_path_template.clone(),
+                session_search_path_template: default_search_path_template.clone(),
                 default_search_path_template,
+                lock_timeout: ScopedSetting::new(source_lock_timeout),
+                statement_timeout: ScopedSetting::new(source_statement_timeout),
                 current_role,
                 current_role_known,
                 persistent_current_role,
@@ -1271,6 +1284,9 @@ impl AnalysisState {
         self.local.current_role_known = self.local.persistent_current_role_known;
         self.local.session_role = self.local.persistent_session_role.clone();
         self.local.session_role_known = self.local.persistent_session_role_known;
+        self.local.search_path_template = self.local.session_search_path_template.clone();
+        self.local.lock_timeout.reset_effective_to_session();
+        self.local.statement_timeout.reset_effective_to_session();
         self.refresh_role_sensitive_search_path();
     }
 
@@ -3772,21 +3788,94 @@ impl AnalysisState {
                 }
             }
             Mutation::SearchPath(sp) => {
+                if sp.local && self.local.transactions.is_empty() {
+                    // PostgreSQL warns and leaves SET LOCAL unchanged outside
+                    // an explicit transaction block.
+                    return MutationResult::Skipped;
+                }
                 self.snapshot_search_path();
                 self.snapshot_confidence();
-                match &sp.target {
-                    SearchPathTarget::Default => {
-                        self.local.search_path_template =
-                            self.local.default_search_path_template.clone();
-                        self.refresh_role_sensitive_search_path();
+                let template = match &sp.target {
+                    SearchPathTarget::Default => self.local.default_search_path_template.clone(),
+                    SearchPathTarget::Schemas(schemas) => schemas.clone(),
+                };
+                self.local.search_path_template = template.clone();
+                if !sp.local {
+                    self.local.session_search_path_template = template;
+                }
+                self.refresh_role_sensitive_search_path();
+                MutationResult::Applied
+            }
+            Mutation::TimeoutSetting(change) => {
+                if change.local && self.local.transactions.is_empty() {
+                    return MutationResult::Skipped;
+                }
+                let next = match &change.value {
+                    TimeoutSettingValue::Default => match change.setting {
+                        TimeoutSetting::Lock => self.local.lock_timeout.default,
+                        TimeoutSetting::Statement => self.local.statement_timeout.default,
+                    },
+                    TimeoutSettingValue::Milliseconds(milliseconds) => Some(*milliseconds),
+                    TimeoutSettingValue::Unknown => {
+                        self.snapshot_confidence();
+                        self.local.confidence = Confidence::Tainted;
+                        None
                     }
-                    SearchPathTarget::Schemas(schemas) => {
-                        self.local.search_path_template = schemas.clone();
-                        self.refresh_role_sensitive_search_path();
+                    TimeoutSettingValue::Invalid(reason) => {
+                        return MutationResult::Conflict {
+                            reason: reason.clone(),
+                        };
+                    }
+                };
+                self.snapshot_timeout_settings();
+                let setting = match change.setting {
+                    TimeoutSetting::Lock => &mut self.local.lock_timeout,
+                    TimeoutSetting::Statement => &mut self.local.statement_timeout,
+                };
+                setting.effective = next;
+                if !change.local {
+                    setting.session = next;
+                }
+                MutationResult::Applied
+            }
+            Mutation::ResetSettings(target) => {
+                if matches!(
+                    target,
+                    ResetSettingTarget::All | ResetSettingTarget::SearchPath
+                ) {
+                    self.snapshot_search_path();
+                    self.snapshot_confidence();
+                    let template = self.local.default_search_path_template.clone();
+                    self.local.session_search_path_template = template.clone();
+                    self.local.search_path_template = template;
+                    self.refresh_role_sensitive_search_path();
+                }
+                if matches!(
+                    target,
+                    ResetSettingTarget::All
+                        | ResetSettingTarget::LockTimeout
+                        | ResetSettingTarget::StatementTimeout
+                ) {
+                    self.snapshot_timeout_settings();
+                    if matches!(
+                        target,
+                        ResetSettingTarget::All | ResetSettingTarget::LockTimeout
+                    ) {
+                        self.local.lock_timeout.session = self.local.lock_timeout.default;
+                        self.local.lock_timeout.effective = self.local.lock_timeout.default;
+                    }
+                    if matches!(
+                        target,
+                        ResetSettingTarget::All | ResetSettingTarget::StatementTimeout
+                    ) {
+                        self.local.statement_timeout.session = self.local.statement_timeout.default;
+                        self.local.statement_timeout.effective =
+                            self.local.statement_timeout.default;
                     }
                 }
                 MutationResult::Applied
             }
+            Mutation::CheckTimeouts => MutationResult::Applied,
             Mutation::SwitchRole {
                 role,
                 local,
@@ -4776,6 +4865,16 @@ impl AnalysisState {
             frame.undo_log.push(StateChange::SearchPathSnapshot {
                 previous: self.local.search_path.clone(),
                 previous_template: self.local.search_path_template.clone(),
+                previous_session_template: self.local.session_search_path_template.clone(),
+            });
+        }
+    }
+
+    fn snapshot_timeout_settings(&mut self) {
+        if let Some(frame) = self.local.transactions.last_mut() {
+            frame.undo_log.push(StateChange::TimeoutSettingsSnapshot {
+                lock_timeout: self.local.lock_timeout.clone(),
+                statement_timeout: self.local.statement_timeout.clone(),
             });
         }
     }
@@ -4949,9 +5048,18 @@ impl AnalysisState {
                 StateChange::SearchPathSnapshot {
                     previous,
                     previous_template,
+                    previous_session_template,
                 } => {
                     self.local.search_path = previous;
                     self.local.search_path_template = previous_template;
+                    self.local.session_search_path_template = previous_session_template;
+                }
+                StateChange::TimeoutSettingsSnapshot {
+                    lock_timeout,
+                    statement_timeout,
+                } => {
+                    self.local.lock_timeout = lock_timeout;
+                    self.local.statement_timeout = statement_timeout;
                 }
                 StateChange::GenerationCounterSnapshot { previous } => {
                     self.local.generation_counter = previous;

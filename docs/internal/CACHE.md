@@ -14,25 +14,26 @@ It does contain sensitive metadata: schema, relation, column, constraint,
 index, trigger, function, type, role-grant, dependency, and statistics data.
 Treat the file like a schema inventory, not a safe-to-share build artifact.
 
-V5 cache files store provenance and role context:
+V6 cache files store provenance and session context:
 
 - creation time as Unix seconds;
 - source database name;
 - effective and session role names;
 - the unexpanded search-path setting, including `$user`;
+- effective `lock_timeout` and `statement_timeout` values in milliseconds;
 - requested schema list, when filtering was used.
 
 They also store the non-secret `pg_roles` catalog fields needed by analysis and
 separate ordinary membership from permission to use `SET ROLE`. On PostgreSQL
 16 and newer, that distinction comes from `pg_auth_members.set_option`.
 
-V5 additionally stores authoritative synchronized schema states and sequence
+V6 also stores authoritative synchronized schema states and sequence
 states, including owner, owning table/column, generation, and mutually
 exclusive standalone, owned, serial-like, or identity kind. With scoped sync,
 only requested schemas are authoritative; schemas pulled in solely for
 cross-schema foreign keys remain dependency evidence, not complete catalogs.
 
-V1–V4 caches are unsupported and must be rebuilt. Freshness is calculated from
+V1–V5 caches are unsupported and must be rebuilt. Freshness is calculated from
 recorded provenance, never filesystem modification time.
 
 ## Connection boundary
@@ -72,7 +73,8 @@ retention, and access controls appropriate for a schema/dependency snapshot.
 ## Least-privilege sync role
 
 `sync` only issues read-only `SHOW`, `SELECT`, and catalog/view-function calls.
-It queries server/version, effective/session role, and search-path values plus
+It queries server/version, effective/session role, search-path values, and
+timeout settings from `pg_settings`, plus
 `pg_class`, `pg_namespace`, `pg_attribute`, `pg_attrdef`, `pg_constraint`,
 `pg_depend`, `pg_index`, `pg_proc`, `pg_type`, `pg_trigger`, `pg_policy`,
 `pg_rewrite`, `pg_roles`, `pg_auth_members`, `pg_stats`, and
@@ -97,7 +99,7 @@ replace the destination only after the compressed payload is complete. A sync
 failure must not remove or corrupt a previous cache.
 
 When automatic sync fails, report the underlying failure and load the previous
-readable V5 cache. Its confidence is determined by cache freshness and
+readable V6 cache. Its confidence is determined by cache freshness and
 analysis, not by the refresh failure alone. An unsupported older cache cannot
 be used after a failed refresh. With no readable cache, analysis continues
 against an unavailable baseline and is tainted.

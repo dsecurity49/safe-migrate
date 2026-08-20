@@ -1,6 +1,6 @@
 # CLI and Report Contract
 
-This document defines the user-visible behavior of safe-migrate v0.5.0. A
+This document defines the user-visible behavior of safe-migrate v0.6.0. A
 requirement is not complete until an automated test enforces it.
 
 ## Commands
@@ -8,10 +8,11 @@ requirement is not complete until an automated test enforces it.
 - `safe-migrate lint --file <path>` analyzes one SQL migration.
 - `safe-migrate lint-chain --dir <path>` analyzes `.sql` files in filename
   order while preserving state across files.
-- `safe-migrate sync` reads PostgreSQL catalog metadata and writes a local
-  cache. It requires `DATABASE_URL` and accepts only localhost or Unix-socket
-  connections in this build; remote databases must be reached through an SSH
-  tunnel.
+- `safe-migrate sync` reads PostgreSQL catalog metadata, statistics, role and
+  search-path context, and effective `lock_timeout` and `statement_timeout`
+  values, then writes a local cache. It requires `DATABASE_URL` and accepts
+  only localhost or Unix-socket connections in this build; remote databases
+  must be reached through an SSH tunnel.
 - `safe-migrate cache inspect` reads a local cache without connecting to
   PostgreSQL and prints provenance plus a redacted contents summary. `--json`
   emits that same summary as one JSON document.
@@ -23,9 +24,9 @@ requirement is not complete until an automated test enforces it.
 the cache before analysis. `--no-cache` always bypasses automatic sync.
 
 `cache inspect` never lists object, column, role, membership, or dependency
-names and edges. Its source database, schema scope, versions, and redacted
-counts—including the role count—still describe sensitive infrastructure and
-must not be published automatically.
+names and edges. Its source database, schema scope, versions, observed timeout
+values, and redacted counts—including the role count—still describe sensitive
+infrastructure and must not be published automatically.
 
 ## Output channels
 
@@ -94,14 +95,18 @@ and automatic-sync outcome:
   "created_at_unix_secs": 0,
   "source_database": "app",
   "schemas": ["public"],
-  "auto_sync": "not_requested"
+  "auto_sync": "not_requested",
+  "observed_settings": {
+    "lock_timeout_ms": 5000,
+    "statement_timeout_ms": 900000
+  }
 }
 ```
 
 `status` is `available`, `stale`, or `unavailable`; `auto_sync` is
-`not_requested`, `refreshed`, `failed`, or `bypassed`. Provenance values are
-`null` when no cache is available, and older compatible cache versions can lack
-provenance, which makes the baseline stale.
+`not_requested`, `refreshed`, `failed`, or `bypassed`. Observed timeout values
+are `null` when no cache is available. Missing creation provenance makes an
+otherwise readable baseline stale.
 
 Each JSON violation may include this additive location object:
 
@@ -109,10 +114,12 @@ Each JSON violation may include this additive location object:
 "location": { "file": "migrations/001_add_status.sql", "line": 12, "column": 1 }
 ```
 
-`rules --json` has its own schema version 1 document. Every descriptor exposes
+`rules --json` has its own schema version 2 document. Every descriptor exposes
 its ID, title, summary, impact, default tier, remediation, supported
-configuration fields, and effective enabled/threshold values. Unknown rule IDs
-are operational errors.
+configuration fields, and only the effective values that rule supports. Every
+primary rule supports `disabled`; row thresholds are accepted only where the
+descriptor advertises them. Unknown rule IDs and unsupported configuration
+fields are operational errors.
 
 Fields may be added compatibly. Removing a field, renaming a field, changing its
 type, or changing the meaning of an existing enum value is a report-contract
@@ -166,6 +173,22 @@ visible on standard error, and must not be described as a production guarantee.
 The configured `stale_stats_days` limit is evaluated from provenance recorded
 inside a successful cache, not from file modification time.
 
+## Timeout evidence
+
+`require-lock-timeout` and `require-statement-timeout` are Tier 2 primary rules.
+For statements that Squawk's pinned `possibly_slow_stmt` classifier identifies
+as potentially disruptive, they require known positive effective values. The
+lock-timeout rule also reports a positive `lock_timeout` that is greater than
+or equal to a positive `statement_timeout`, because PostgreSQL reaches the
+statement timeout first in that ordering.
+
+Analysis initializes both settings from Cache V6, or as unknown when no cache
+is available. Ordered `SET`, `SET LOCAL`, `SET ... DEFAULT`, `RESET`, and
+`RESET ALL` statements update modeled values. Transaction commit, rollback,
+and savepoint rollback must match PostgreSQL session-versus-local behavior.
+`SET LOCAL` outside an explicit transaction has no modeled effect. Each timeout
+rule reports at most once per input file.
+
 ## Failure behavior
 
 The following conditions must never produce a successful clean report:
@@ -178,7 +201,7 @@ The following conditions must never produce a successful clean report:
 - internal serialization or analysis failure.
 
 Automatic cache refresh failure is different: it prints the underlying error
-and analysis continues with the old readable V5 cache, or with an unavailable
+and analysis continues with the old readable V6 cache, or with an unavailable
 baseline if none exists. A retained cache that is still within
 `stale_stats_days` keeps its existing confidence; an unavailable or stale
 baseline is reported as `Tainted`. The JSON baseline records the failed refresh
@@ -192,13 +215,14 @@ silently weakening the configured protection. When encryption is disabled,
 encrypted cache files are also rejected; changing modes requires a fresh
 `safe-migrate sync`.
 
-V5 cache payloads carry an explicit format header and record effective/session
-role provenance, the unexpanded search-path setting, PostgreSQL role
-membership, authoritative synchronized schemas, and synchronized sequence
-ownership/kind. They never include password hashes. V1–V4 and unheadered
-payloads are rejected with generic guidance to run `safe-migrate sync`; errors
-do not expose internal cache-version labels. A failed automatic refresh may
-reuse an existing readable V5 cache, but never an unsupported older cache.
+V6 cache payloads carry an explicit format header and record effective/session
+role provenance, the unexpanded search-path setting, effective lock and
+statement timeouts in milliseconds, PostgreSQL role membership, authoritative
+synchronized schemas, and synchronized sequence ownership/kind. They never
+include password hashes. V1–V5 and unheadered payloads are rejected with
+generic guidance to run `safe-migrate sync`; errors do not expose internal
+cache-version labels. A failed automatic refresh may reuse an existing readable
+V6 cache, but never an unsupported older cache.
 
 When analysis is reached, the GitHub Action writes JSON, Markdown, and
 diagnostics. It appends the Markdown report to the job summary, annotates Tier

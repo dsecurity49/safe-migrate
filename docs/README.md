@@ -10,6 +10,8 @@ The repository keeps two kinds of documentation:
   hypotheses and reproducible PostgreSQL differential fixtures.
 - The root [README](../README.md) — installation, quick start, rules, and
   product-level guidance.
+- [v0.6.0 release notes](releases/v0.6.0.md) — the sync-first release contract,
+  compatibility notes, and proof checklist.
 
 ## Maintainer documentation
 

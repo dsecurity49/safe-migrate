@@ -1,12 +1,15 @@
 # safe-migrate
 
-safe-migrate analyzes PostgreSQL migrations before they reach production. It
-parses SQL into a typed AST, simulates schema changes in order, and reports
-operations that may block, rewrite data, destroy objects, or fail against the
-modeled database state.
+safe-migrate is a sync-first PostgreSQL migration linter. `safe-migrate sync`
+records the target database's schema, dependencies, statistics, role context,
+search path, PostgreSQL version, and effective migration timeouts in a local
+cache. `lint` and `lint-chain` then use that evidence to simulate migrations in
+order and report operations that may block, rewrite data, destroy objects, or
+fail against the modeled database state.
 
-A local cache can supply production schema metadata and table statistics for
-database-aware findings. Linting is otherwise offline.
+After synchronization, linting is offline. `--no-cache` is available for a
+parser and state-machine preview, but it has no verified database baseline,
+reports `Tainted` confidence, and cannot know the session's timeout defaults.
 
 safe-migrate is a review aid, not a substitute for testing migrations on a
 representative database or planning application rollouts and backfills.
@@ -56,6 +59,7 @@ migrations:
 export DATABASE_URL='postgres://readonly_user:password@localhost:5432/app'
 
 safe-migrate sync
+safe-migrate cache inspect
 safe-migrate lint --file migrations/001_add_status.sql
 safe-migrate lint-chain --dir migrations/
 ```
@@ -75,6 +79,27 @@ safe-migrate sync
 
 `lint` and `lint-chain` do not connect to PostgreSQL unless `auto_sync = true`
 is configured.
+
+### Why sync is the main workflow
+
+SQL text alone cannot prove what already exists, how large a table is, which
+objects depend on it, which role and search path resolve an unqualified name,
+or which timeout defaults the migration session will inherit. `sync` captures
+that evidence once; subsequent reviews stay local and use the same baseline.
+
+Run sync with the database, role, and role/database defaults intended for the
+migration runner. Sync reads settings but does not change them. If the runner
+does not already enforce timeouts, put them explicitly in the migration:
+
+```sql
+SET lock_timeout = '5s';
+SET statement_timeout = '15min';
+```
+
+`lock_timeout` should be positive and shorter than a positive
+`statement_timeout`; otherwise PostgreSQL can reach the statement timeout
+first. Refresh the cache whenever the database baseline or inherited session
+settings change.
 
 ## Commands
 
@@ -106,6 +131,15 @@ Run `safe-migrate <command> --help` for the complete command reference.
 `lint-chain` analyzes files in filename order and carries modeled schema,
 transaction, search-path, and role state across statements and files. This can
 catch failures caused by interactions between otherwise valid migrations.
+
+### Timeout-aware analysis
+
+The Tier 2 `require-lock-timeout` and `require-statement-timeout` rules apply to
+statements that Squawk classifies as potentially disruptive to normal database
+queries. They use the synchronized values and follow ordered SQL changes from
+`SET`, `SET LOCAL`, `SET ... DEFAULT`, `RESET`, and `RESET ALL`, including
+commit, rollback, and savepoint scope. A missing baseline is reported as
+unknown evidence rather than silently treated as a configured timeout.
 
 ## Findings and exit status
 
@@ -166,9 +200,11 @@ tier2_threshold_rows = 1000
 disabled = true
 ```
 
-Per-rule settings support `disabled`, `tier1_threshold_rows`, and
-`tier2_threshold_rows`. Unknown settings and unknown primary rule IDs are
-rejected, so configuration typos cannot silently change analysis.
+Every primary rule supports `disabled`; only row-sensitive rules support one or
+both threshold fields. `safe-migrate rules --json` is the authority for each
+rule's `supported_configuration_fields`. Unknown settings, unsupported fields,
+and unknown primary rule IDs are rejected, so configuration mistakes cannot
+silently change analysis.
 
 ### Suppressing reviewed findings
 
@@ -191,7 +227,7 @@ its review.
 no command-line flag for it. If refresh fails, safe-migrate prints the cause and
 continues with the previous readable cache; the old cache is replaced only
 after a new cache has been written successfully. `--no-cache` bypasses
-automatic sync. The previous cache must already be V5; an unsupported V1–V4
+automatic sync. The previous cache must already be V6; an unsupported V1–V5
 cache cannot be reused after a failed refresh.
 
 ### Cache encryption
@@ -221,8 +257,8 @@ database:
 safe-migrate sync
 ```
 
-v0.5.0 retains Cache V5. Caches written by v0.4.4 and earlier require this
-resynchronization.
+v0.6.0 introduces Cache V6 for synchronized `lock_timeout` and
+`statement_timeout` provenance. Every V1–V5 cache requires resynchronization.
 
 Use `safe-migrate cache inspect` to view cache provenance and redacted object
 and role counts without connecting to PostgreSQL. It never lists role names or
@@ -233,6 +269,7 @@ membership edges.
 Use the CLI registry instead of a copied documentation table. It is the
 canonical source for every primary rule's ID, title, impact, default tier,
 remediation, supported configuration fields, and effective configuration.
+The discovery document is schema version 2; lint JSON remains schema version 1.
 
 ```bash
 safe-migrate rules
@@ -247,13 +284,14 @@ you need the discovery output to reflect a reviewed non-default configuration.
 
 The reusable Action downloads and verifies the exact release binary, creates
 JSON and Markdown artifacts, appends the Markdown report to the job summary,
-and emits Tier 1 errors and Tier 2 warnings as source annotations. It does not
-connect to a database and defaults to `no-cache: "true"` because files in a
-pull-request checkout are controlled by that pull request.
+and emits Tier 1 errors and Tier 2 warnings as source annotations. It never
+connects to a database. By default it runs an explicit no-cache preview because
+files in a pull-request checkout are controlled by that pull request; the best
+results come from a cache created in a separate trusted sync step.
 
 ```yaml
 - id: safe_migrate
-  uses: dsecurity49/safe-migrate@v0.5.0
+  uses: dsecurity49/safe-migrate@v0.6.0
   with:
     mode: lint-chain
     path: migrations

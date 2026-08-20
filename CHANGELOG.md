@@ -5,6 +5,29 @@ commits and pull requests. Published binaries, checksums, and generated release
 notes are available on the
 [GitHub Releases page](https://github.com/dsecurity49/safe-migrate/releases).
 
+## v0.6.0 — Unreleased
+
+- Made synchronization the primary workflow: Cache V6 records effective
+  `lock_timeout` and `statement_timeout` values alongside schema, dependency,
+  statistics, role, search-path, and PostgreSQL-version evidence. V1–V5 caches
+  now require `safe-migrate sync`.
+- Added the Tier 2 `require-lock-timeout` and `require-statement-timeout` rules
+  for statements selected by Squawk's pinned slow-statement classifier. The
+  lock rule also detects values that cannot fire before a positive
+  `statement_timeout`.
+- Modeled ordered `SET`, `SET LOCAL`, `SET ... DEFAULT`, `RESET`, and
+  `RESET ALL` behavior for both timeouts, including transaction, rollback, and
+  savepoint scope. Corrected the same session-versus-local behavior for
+  `search_path` and preserved a quoted schema named `"default"`.
+- Added timeout provenance to cache inspection and lint JSON/Markdown baseline
+  output. Lint JSON remains schema version 1; rule discovery moves to schema
+  version 2 and now reports only configuration fields each rule supports.
+- Rejected unsupported per-rule threshold settings and made
+  `require-concurrent-index` threshold overrides apply consistently to its
+  non-concurrent drop-index finding.
+- Kept `squawk-linter` pinned at 2.62.0 and used its public
+  `possibly_slow_stmt` API rather than maintaining a separate classifier.
+
 ## v0.5.0 — 2026-08-14
 
 - Upgraded the pinned Squawk parser stack to 2.62.0 and raised the minimum

@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use safe_migrate::analysis::state::Confidence;
-use safe_migrate::db::cache::{CACHE_V5_MAGIC, CacheMetadata, DbCacheVersioned};
+use safe_migrate::db::cache::{CACHE_V6_MAGIC, CacheMetadata, DbCacheVersioned};
 use safe_migrate::db::cache_file::{
     MAX_CACHE_DECODE_BYTES, is_encrypted_cache_bytes, read_cache_bytes, unprotect_cache_bytes,
 };
@@ -178,7 +178,14 @@ struct CacheInspection {
     schemas: Option<Vec<String>>,
     search_path: Vec<String>,
     postgresql_version_num: Option<u32>,
+    observed_settings: ObservedSettings,
     contents: CacheContentsSummary,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct ObservedSettings {
+    lock_timeout_ms: Option<u64>,
+    statement_timeout_ms: Option<u64>,
 }
 
 #[derive(serde::Serialize)]
@@ -270,6 +277,19 @@ fn main() -> Result<()> {
 }
 
 fn rule_descriptor_json(descriptor: &RuleDescriptor, config: &Config) -> serde_json::Value {
+    use safe_migrate::rules::registry::RuleConfigurationField;
+
+    let mut effective = serde_json::json!({
+        "enabled": !config.is_rule_disabled(descriptor.id),
+    });
+    if descriptor.supports(RuleConfigurationField::Tier1ThresholdRows) {
+        effective["tier1_threshold_rows"] =
+            serde_json::json!(config.rule_tier1_threshold(descriptor.id));
+    }
+    if descriptor.supports(RuleConfigurationField::Tier2ThresholdRows) {
+        effective["tier2_threshold_rows"] =
+            serde_json::json!(config.rule_tier2_threshold(descriptor.id));
+    }
     serde_json::json!({
         "id": descriptor.id,
         "title": descriptor.title,
@@ -281,12 +301,12 @@ fn rule_descriptor_json(descriptor: &RuleDescriptor, config: &Config) -> serde_j
             safe_migrate::report::violations::ViolationTier::Tier3 => "Tier3",
         },
         "remediation": descriptor.recipe(),
-        "supported_configuration_fields": ["disabled", "tier1_threshold_rows", "tier2_threshold_rows"],
-        "effective": {
-            "enabled": !config.is_rule_disabled(descriptor.id),
-            "tier1_threshold_rows": config.rule_tier1_threshold(descriptor.id),
-            "tier2_threshold_rows": config.rule_tier2_threshold(descriptor.id),
-        },
+        "supported_configuration_fields": descriptor
+            .supported_configuration_fields
+            .iter()
+            .map(|field| field.as_str())
+            .collect::<Vec<_>>(),
+        "effective": effective,
     })
 }
 
@@ -315,7 +335,7 @@ fn run_rules(rule_id: Option<&str>, json: bool, config_path: &Path) -> Result<()
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
-                "schema_version": 1,
+                "schema_version": 2,
                 "rules": descriptors.iter().map(|descriptor| rule_descriptor_json(descriptor, &config)).collect::<Vec<_>>(),
             }))?
         );
@@ -333,13 +353,33 @@ fn run_rules(rule_id: Option<&str>, json: bool, config_path: &Path) -> Result<()
         println!("  Impact: {}", descriptor.impact);
         println!("  Default tier: {:?}", descriptor.default_tier());
         println!("  Remediation: {}", descriptor.recipe());
-        println!("  Configuration: disabled, tier1_threshold_rows, tier2_threshold_rows");
         println!(
-            "  Effective: enabled={}, tier1_threshold_rows={}, tier2_threshold_rows={}",
-            !config.is_rule_disabled(descriptor.id),
-            config.rule_tier1_threshold(descriptor.id),
-            config.rule_tier2_threshold(descriptor.id)
+            "  Configuration: {}",
+            descriptor
+                .supported_configuration_fields
+                .iter()
+                .map(|field| field.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         );
+        let mut effective = vec![format!(
+            "enabled={}",
+            !config.is_rule_disabled(descriptor.id)
+        )];
+        use safe_migrate::rules::registry::RuleConfigurationField;
+        if descriptor.supports(RuleConfigurationField::Tier1ThresholdRows) {
+            effective.push(format!(
+                "tier1_threshold_rows={}",
+                config.rule_tier1_threshold(descriptor.id)
+            ));
+        }
+        if descriptor.supports(RuleConfigurationField::Tier2ThresholdRows) {
+            effective.push(format!(
+                "tier2_threshold_rows={}",
+                config.rule_tier2_threshold(descriptor.id)
+            ));
+        }
+        println!("  Effective: {}", effective.join(", "));
     }
     Ok(())
 }
@@ -472,6 +512,10 @@ fn run_cache_inspect(cache_path: &Path, config_path: &Path, json: bool) -> Resul
         schemas: cache.metadata.schemas.clone(),
         search_path: cache.search_path.clone(),
         postgresql_version_num: cache.pg_version_num,
+        observed_settings: ObservedSettings {
+            lock_timeout_ms: Some(cache.metadata.source_lock_timeout_ms),
+            statement_timeout_ms: Some(cache.metadata.source_statement_timeout_ms),
+        },
         contents: summarize_cache(&cache),
     };
 
@@ -558,6 +602,20 @@ fn print_cache_inspection(inspection: &CacheInspection) {
             .postgresql_version_num
             .map_or_else(|| "unknown".to_string(), |value| value.to_string())
     );
+    println!(
+        "Observed lock_timeout: {}",
+        inspection
+            .observed_settings
+            .lock_timeout_ms
+            .map_or_else(|| "unknown".to_string(), |value| format!("{value} ms"))
+    );
+    println!(
+        "Observed statement_timeout: {}",
+        inspection
+            .observed_settings
+            .statement_timeout_ms
+            .map_or_else(|| "unknown".to_string(), |value| format!("{value} ms"))
+    );
     let contents = &inspection.contents;
     println!(
         "Contents (counts only): {} schemas, {} sequences, {} relations ({} tables, {} views, {} materialized views), {} columns, {} indexes, {} foreign keys, {} constraints, {} triggers, {} functions, {} types, {} roles, {} dependencies",
@@ -588,6 +646,9 @@ fn load_config(path: &Path) -> Result<Config> {
     let engine = SafeMigrateEngine::new(config.clone());
     config
         .validate_rule_ids(engine.primary_rule_ids())
+        .with_context(|| format!("Failed to validate configuration: {}", path.display()))?;
+    registry::validate_rule_configuration(&config)
+        .map_err(anyhow::Error::msg)
         .with_context(|| format!("Failed to validate configuration: {}", path.display()))?;
     Ok(config)
 }
@@ -713,10 +774,10 @@ fn decode_cache(cache_path: &Path, cache_encryption: bool) -> Result<(DbCache, u
         .with_variable_int_encoding()
         .with_limit::<MAX_CACHE_DECODE_BYTES>();
 
-    let (encoded_payload, header_version) = if let Some(v5_payload) =
-        payload.strip_prefix(CACHE_V5_MAGIC)
+    let (encoded_payload, header_version) = if let Some(v6_payload) =
+        payload.strip_prefix(CACHE_V6_MAGIC)
     {
-        (v5_payload, 5)
+        (v6_payload, 6)
     } else {
         anyhow::bail!(
             "Cache file '{}' uses an unsupported cache format. Run `safe-migrate sync` to rebuild it.",
@@ -794,12 +855,17 @@ fn finish_analysis(
         .map(|finding| finding.violation.clone())
         .collect();
     let should_halt = Reporter::should_halt(&violations);
+    let observed_settings = ObservedSettings {
+        lock_timeout_ms: (!baseline_unknown).then_some(metadata.source_lock_timeout_ms),
+        statement_timeout_ms: (!baseline_unknown).then_some(metadata.source_statement_timeout_ms),
+    };
     let baseline = serde_json::json!({
         "status": if baseline_unknown { "unavailable" } else if baseline_stale { "stale" } else { "available" },
         "created_at_unix_secs": metadata.created_at_unix_secs,
         "source_database": metadata.source_database,
         "schemas": metadata.schemas,
         "auto_sync": auto_sync.label(),
+        "observed_settings": observed_settings,
     });
     match output_mode {
         OutputMode::Human => {
@@ -833,6 +899,15 @@ fn finish_analysis(
                     .join(", ");
                 report.push_str(&format!("- **Schemas:** `{}`\n", schemas.replace('`', "'")));
             }
+            report.push_str(&format!(
+                "- **Observed lock timeout:** `{}`\n- **Observed statement timeout:** `{}`\n",
+                baseline["observed_settings"]["lock_timeout_ms"]
+                    .as_u64()
+                    .map_or_else(|| "unknown".to_string(), |value| format!("{value} ms")),
+                baseline["observed_settings"]["statement_timeout_ms"]
+                    .as_u64()
+                    .map_or_else(|| "unknown".to_string(), |value| format!("{value} ms")),
+            ));
             println!("{report}");
         }
         OutputMode::Interactive => {

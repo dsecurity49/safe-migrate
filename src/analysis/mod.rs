@@ -4,5 +4,6 @@ pub mod facts;
 pub mod graph;
 pub mod mutations;
 pub mod resolver;
+pub mod settings;
 pub mod state;
 pub mod transaction;

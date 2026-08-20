@@ -12,6 +12,7 @@ pub mod partitions;
 pub mod policies;
 pub mod registry;
 pub mod security;
+pub mod timeouts;
 pub mod transactions;
 pub mod triggers;
 pub mod views;

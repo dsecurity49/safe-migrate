@@ -1,7 +1,7 @@
 // FILE: src/sync.rs
 
 use crate::ast::identifiers::ObjectId;
-use crate::db::cache::{CACHE_V5_MAGIC, DbCache, DbCacheVersioned, ForeignKeyCache, IndexCache};
+use crate::db::cache::{CACHE_V6_MAGIC, DbCache, DbCacheVersioned, ForeignKeyCache, IndexCache};
 use crate::db::cache_file::protect_cache_bytes;
 use crate::model::relation::{Persistence, RelationKind, RelationState};
 use anyhow::{Context, Result};
@@ -146,10 +146,10 @@ fn write_cache_with_protection(
         .context("Failed to init zstd compression")?;
 
     encoder
-        .write_all(CACHE_V5_MAGIC)
-        .context("Failed to write cache V5 payload header")?;
+        .write_all(CACHE_V6_MAGIC)
+        .context("Failed to write cache V6 payload header")?;
 
-    let versioned = DbCacheVersioned::V5(Box::new(cache));
+    let versioned = DbCacheVersioned::V6(Box::new(cache));
     let bincode_config = bincode::config::standard().with_variable_int_encoding();
 
     bincode::serde::encode_into_std_write(&versioned, &mut encoder, bincode_config)
@@ -287,7 +287,9 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
     cache.pg_version_num = version_str.parse::<u32>().ok();
 
     let provenance_row = client.query_one(
-        "SELECT current_database(), current_user, session_user, current_setting('search_path');",
+        "SELECT current_database(), current_user, session_user, current_setting('search_path'),
+                (SELECT setting::bigint FROM pg_settings WHERE name = 'lock_timeout'),
+                (SELECT setting::bigint FROM pg_settings WHERE name = 'statement_timeout');",
         &[],
     )?;
     cache.metadata.source_database = Some(provenance_row.get(0));
@@ -295,6 +297,14 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
     cache.metadata.source_session_role = Some(provenance_row.get(2));
     let search_path_setting: String = provenance_row.get(3);
     cache.metadata.source_search_path = Some(parse_search_path_setting(&search_path_setting));
+    let lock_timeout_ms: i64 = provenance_row.get(4);
+    let statement_timeout_ms: i64 = provenance_row.get(5);
+    cache.metadata.source_lock_timeout_ms = lock_timeout_ms
+        .try_into()
+        .context("PostgreSQL returned a negative lock_timeout")?;
+    cache.metadata.source_statement_timeout_ms = statement_timeout_ms
+        .try_into()
+        .context("PostgreSQL returned a negative statement_timeout")?;
 
     // Resolve role/database defaults and special entries such as "$user" exactly
     // as PostgreSQL does, while excluding the implicit pg_catalog lookup. An
@@ -1090,8 +1100,8 @@ mod atomic_write_tests {
         let mut payload = Vec::new();
         decoder.read_to_end(&mut payload).unwrap();
         let payload = payload
-            .strip_prefix(CACHE_V5_MAGIC)
-            .expect("writer must prefix V5 cache payloads");
+            .strip_prefix(CACHE_V6_MAGIC)
+            .expect("writer must prefix V6 cache payloads");
         let config = bincode::config::standard().with_variable_int_encoding();
         let versioned: DbCacheVersioned = bincode::serde::decode_from_slice(payload, config)
             .unwrap()

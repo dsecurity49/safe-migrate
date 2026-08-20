@@ -21,7 +21,7 @@ pub struct SequenceState {
 }
 
 // This mirrors the unboxed relation/type overlay API. SequenceState is larger
-// because V5 keeps ownership identities inline, while boxing every hot-path
+// because the cache keeps ownership identities inline, while boxing every hot-path
 // lookup would add allocation and widespread indirection.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]

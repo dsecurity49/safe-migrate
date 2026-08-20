@@ -3,7 +3,7 @@ use std::io::Write;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use safe_migrate::ast::identifiers::ObjectId;
-use safe_migrate::db::cache::{CACHE_V5_MAGIC, DbCache, DbCacheVersioned};
+use safe_migrate::db::cache::{CACHE_V6_MAGIC, DbCache, DbCacheVersioned};
 use safe_migrate::model::relation::{Persistence, RelationKind, RelationState};
 
 fn parse_json_stdout(output: &std::process::Output) -> serde_json::Value {
@@ -39,9 +39,9 @@ fn write_cache_with_timestamp(path: &std::path::Path, created_at_unix_secs: u64)
     let mut compressed = Vec::new();
     let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3).unwrap();
     let config = bincode::config::standard().with_variable_int_encoding();
-    encoder.write_all(CACHE_V5_MAGIC).unwrap();
+    encoder.write_all(CACHE_V6_MAGIC).unwrap();
     bincode::serde::encode_into_std_write(
-        DbCacheVersioned::V5(Box::new(cache)),
+        DbCacheVersioned::V6(Box::new(cache)),
         &mut encoder,
         config,
     )
@@ -69,9 +69,9 @@ fn rules_command_lists_registry_descriptors_in_json() {
     let output = cmd.arg("rules").arg("--json").output().unwrap();
     assert!(output.status.success());
     let report = parse_json_stdout(&output);
-    assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["schema_version"], 2);
     let rules = report["rules"].as_array().expect("rules array");
-    assert_eq!(rules.len(), 26);
+    assert_eq!(rules.len(), 28);
     assert_eq!(rules[0]["id"], "irreversible-migration");
     assert_eq!(rules[0]["title"], "Irreversible migration");
     assert!(
@@ -82,6 +82,18 @@ fn rules_command_lists_registry_descriptors_in_json() {
             .any(|field| field == "disabled")
     );
     assert_eq!(rules[0]["effective"]["enabled"], true);
+    for rule_id in ["require-lock-timeout", "require-statement-timeout"] {
+        let rule = rules
+            .iter()
+            .find(|rule| rule["id"] == rule_id)
+            .expect("timeout rule descriptor");
+        assert_eq!(rule["default_tier"], "Tier2");
+        assert_eq!(
+            rule["supported_configuration_fields"],
+            serde_json::json!(["disabled"])
+        );
+        assert_eq!(rule["effective"], serde_json::json!({ "enabled": true }));
+    }
 }
 
 #[test]
@@ -97,7 +109,7 @@ fn rules_command_separates_human_descriptors() {
             .lines()
             .filter(|line| line.len() >= 40 && line.bytes().all(|byte| byte == b'-'))
             .count(),
-        25
+        27
     );
 }
 
@@ -117,7 +129,11 @@ fn rules_command_filters_one_rule_and_rejects_unknown_ids() {
     assert_eq!(report["rules"][0]["id"], "require-concurrent-index");
 
     let mut config = tempfile::NamedTempFile::new().unwrap();
-    writeln!(config, "[rules.require-concurrent-index]\ndisabled = true").unwrap();
+    writeln!(
+        config,
+        "[rules.require-concurrent-index]\ndisabled = true\ntier1_threshold_rows = 123\ntier2_threshold_rows = 45"
+    )
+    .unwrap();
     let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
     let output = cmd
         .arg("rules")
@@ -129,9 +145,15 @@ fn rules_command_filters_one_rule_and_rejects_unknown_ids() {
         .output()
         .unwrap();
     assert!(output.status.success());
+    let configured = parse_json_stdout(&output);
+    assert_eq!(configured["rules"][0]["effective"]["enabled"], false);
     assert_eq!(
-        parse_json_stdout(&output)["rules"][0]["effective"]["enabled"],
-        false
+        configured["rules"][0]["effective"]["tier1_threshold_rows"],
+        123
+    );
+    assert_eq!(
+        configured["rules"][0]["effective"]["tier2_threshold_rows"],
+        45
     );
 
     let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
@@ -167,6 +189,27 @@ fn test_cli_rejects_unknown_configured_rule_id() {
     let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
     assert!(stderr.contains("Unknown primary rule ID(s): concurent-index"));
     assert!(stderr.contains("require-concurrent-index"));
+}
+
+#[test]
+fn test_cli_rejects_thresholds_unsupported_by_a_rule() {
+    let mut config_file = tempfile::NamedTempFile::new().unwrap();
+    writeln!(
+        config_file,
+        "[rules.require-lock-timeout]\ntier1_threshold_rows = 1"
+    )
+    .unwrap();
+
+    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let assert = cmd
+        .arg("rules")
+        .arg("--json")
+        .arg("--config")
+        .arg(config_file.path())
+        .assert()
+        .code(1);
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(stderr.contains("Rule 'require-lock-timeout' does not support 'tier1_threshold_rows'"));
 }
 
 #[test]
@@ -219,8 +262,8 @@ fn test_cli_lint_invalid_cache() {
 fn test_cli_rejects_cache_with_oversized_decoded_container() {
     let config = bincode::config::standard().with_variable_int_encoding();
     let encoded =
-        bincode::serde::encode_to_vec(DbCacheVersioned::V5(Box::default()), config).unwrap();
-    assert_eq!(&encoded[..4], &[4, 0, 0, 0]);
+        bincode::serde::encode_to_vec(DbCacheVersioned::V6(Box::default()), config).unwrap();
+    assert_eq!(&encoded[..4], &[5, 0, 0, 0]);
 
     let mut malicious = encoded[..3].to_vec();
     malicious.push(1);
@@ -229,7 +272,7 @@ fn test_cli_rejects_cache_with_oversized_decoded_container() {
 
     let mut compressed = Vec::new();
     let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3).unwrap();
-    encoder.write_all(CACHE_V5_MAGIC).unwrap();
+    encoder.write_all(CACHE_V6_MAGIC).unwrap();
     encoder.write_all(&malicious).unwrap();
     encoder.finish().unwrap();
 
@@ -276,27 +319,33 @@ fn test_cache_inspect_rejects_unsupported_legacy_cache_without_exposing_its_vers
 }
 
 #[test]
-fn test_cache_inspect_rejects_headered_v3_cache() {
-    let mut compressed = Vec::new();
-    let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3).unwrap();
-    encoder.write_all(b"SMCACHE03").unwrap();
-    encoder.write_all(b"legacy v3 payload").unwrap();
-    encoder.finish().unwrap();
-    let cache = tempfile::NamedTempFile::new().unwrap();
-    fs::write(cache.path(), compressed).unwrap();
+fn test_cache_inspect_rejects_headered_legacy_caches() {
+    for (header, internal_label) in [
+        (b"SMCACHE03".as_slice(), "V3"),
+        (b"SMCACHE05".as_slice(), "V5"),
+    ] {
+        let mut compressed = Vec::new();
+        let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3).unwrap();
+        encoder.write_all(header).unwrap();
+        encoder.write_all(b"legacy payload").unwrap();
+        encoder.finish().unwrap();
+        let cache = tempfile::NamedTempFile::new().unwrap();
+        fs::write(cache.path(), compressed).unwrap();
 
-    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
-    let assert = cmd
-        .arg("cache")
-        .arg("inspect")
-        .arg("--cache")
-        .arg(cache.path())
-        .arg("--json")
-        .assert()
-        .failure();
-    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
-    assert!(stderr.contains("unsupported cache format"));
-    assert!(!stderr.contains("V3"));
+        let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+        let assert = cmd
+            .arg("cache")
+            .arg("inspect")
+            .arg("--cache")
+            .arg(cache.path())
+            .arg("--json")
+            .assert()
+            .failure();
+        let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+        assert!(stderr.contains("unsupported cache format"));
+        assert!(stderr.contains("safe-migrate sync"));
+        assert!(!stderr.contains(internal_label));
+    }
 }
 
 #[test]
@@ -320,7 +369,7 @@ fn test_cache_inspect_rejects_unknown_unheadered_cache_generically() {
     let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
     assert!(stderr.contains("unsupported cache format"));
     assert!(stderr.contains("safe-migrate sync"));
-    assert!(!stderr.contains("V5"));
+    assert!(!stderr.contains("V6"));
 }
 
 #[test]
@@ -350,8 +399,10 @@ fn test_cache_inspect_outputs_a_redacted_json_summary() {
     let report = parse_json_stdout(assert.get_output());
 
     assert_eq!(report["path"], cache_path.display().to_string());
-    assert_eq!(report["format_version"], 5);
+    assert_eq!(report["format_version"], 6);
     assert_eq!(report["encrypted"], false);
+    assert_eq!(report["observed_settings"]["lock_timeout_ms"], 0);
+    assert_eq!(report["observed_settings"]["statement_timeout_ms"], 0);
     assert!(report["contents"]["relations"].is_number());
     assert!(report["contents"]["columns"].is_number());
     assert!(report["contents"]["roles"].is_number());
@@ -377,6 +428,8 @@ fn test_cache_inspect_human_summary_discloses_redaction() {
         .success();
     let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
 
+    assert!(stdout.contains("Observed lock_timeout: 0 ms"));
+    assert!(stdout.contains("Observed statement_timeout: 0 ms"));
     assert!(stdout.contains("Contents (counts only):"));
     assert!(stdout.contains("Redaction: this summary intentionally omits"));
 }
@@ -401,6 +454,8 @@ fn test_cli_json_is_machine_clean_and_marks_missing_baseline_tainted() {
     assert_eq!(report["schema_version"], 1);
     assert_eq!(report["confidence"], "Tainted");
     assert_eq!(report["baseline"]["status"], "unavailable");
+    assert!(report["baseline"]["observed_settings"]["lock_timeout_ms"].is_null());
+    assert!(report["baseline"]["observed_settings"]["statement_timeout_ms"].is_null());
     assert!(report["violations"].is_array());
     assert!(!String::from_utf8_lossy(&output.stdout).contains("[ INFO ]"));
     assert!(String::from_utf8_lossy(&output.stderr).contains("--no-cache passed"));
@@ -549,6 +604,14 @@ fn test_cli_auto_sync_failure_keeps_fresh_cache_confidence_exact() {
     assert_eq!(report["confidence"], "Exact");
     assert_eq!(report["baseline"]["status"], "available");
     assert_eq!(report["baseline"]["auto_sync"], "failed");
+    assert_eq!(
+        report["baseline"]["observed_settings"]["lock_timeout_ms"],
+        0
+    );
+    assert_eq!(
+        report["baseline"]["observed_settings"]["statement_timeout_ms"],
+        0
+    );
     assert!(String::from_utf8_lossy(&output.stderr).contains("Continuing with the previous cache"));
 }
 
@@ -585,8 +648,17 @@ fn test_cli_json_halt_is_json_and_uses_blocking_exit_status() {
     assert_eq!(finding["statement_index"], 1);
     assert_eq!(finding["rule_title"], "Drop database");
     assert_eq!(finding["impact"], "data loss");
-    assert_eq!(report["summary"]["total"], 1);
+    let rule_ids = report["violations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|violation| violation["rule_id"].as_str().unwrap())
+        .collect::<std::collections::HashSet<_>>();
+    assert!(rule_ids.contains("require-lock-timeout"));
+    assert!(rule_ids.contains("require-statement-timeout"));
+    assert_eq!(report["summary"]["total"], 3);
     assert_eq!(report["summary"]["tier1"], 1);
+    assert_eq!(report["summary"]["tier2"], 2);
 }
 
 #[test]

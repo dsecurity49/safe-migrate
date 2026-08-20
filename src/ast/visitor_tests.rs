@@ -4,8 +4,8 @@
 mod tests {
     use crate::analysis::expr_ir::ExprIr;
     use crate::analysis::facts::{
-        AlterTableActionFact, AlterTypeActionFact, StatementFact, TableConstraintFact,
-        TypeCreationKind,
+        AlterTableActionFact, AlterTypeActionFact, ResetSettingTarget, SearchPathTarget,
+        StatementFact, TableConstraintFact, TimeoutSetting, TimeoutSettingValue, TypeCreationKind,
     };
     use crate::ast::identifiers::{Ident, QualifiedName};
     use crate::ast::visitor::AstVisitor;
@@ -812,6 +812,7 @@ mod tests {
         match facts.unwrap() {
             StatementFact::SetSearchPath {
                 target: crate::analysis::facts::SearchPathTarget::Default,
+                local: false,
             } => {}
             _ => panic!("Expected SetSearchPath fact"),
         }
@@ -828,7 +829,90 @@ mod tests {
                     "$user".into(),
                     "public".into(),
                 ]),
+                local: false,
             }
+        );
+    }
+
+    #[test]
+    fn set_local_search_path_and_quoted_default_are_distinct() {
+        assert_eq!(
+            parse_and_extract_statement("SET LOCAL search_path TO private, public;"),
+            Some(StatementFact::SetSearchPath {
+                target: SearchPathTarget::Schemas(vec!["private".into(), "public".into()]),
+                local: true,
+            })
+        );
+        assert_eq!(
+            parse_and_extract_statement("SET search_path TO \"default\";"),
+            Some(StatementFact::SetSearchPath {
+                target: SearchPathTarget::Schemas(vec!["default".into()]),
+                local: false,
+            })
+        );
+    }
+
+    #[test]
+    fn timeout_settings_extract_scope_units_defaults_and_invalid_values() {
+        for (sql, expected) in [
+            (
+                "SET lock_timeout = '1500us';",
+                StatementFact::SetTimeout {
+                    setting: TimeoutSetting::Lock,
+                    value: TimeoutSettingValue::Milliseconds(2),
+                    local: false,
+                },
+            ),
+            (
+                "SET LOCAL statement_timeout TO '2min';",
+                StatementFact::SetTimeout {
+                    setting: TimeoutSetting::Statement,
+                    value: TimeoutSettingValue::Milliseconds(120_000),
+                    local: true,
+                },
+            ),
+            (
+                "SET SESSION lock_timeout TO DEFAULT;",
+                StatementFact::SetTimeout {
+                    setting: TimeoutSetting::Lock,
+                    value: TimeoutSettingValue::Default,
+                    local: false,
+                },
+            ),
+        ] {
+            assert_eq!(parse_and_extract_statement(sql), Some(expected), "{sql}");
+        }
+
+        assert!(matches!(
+            parse_and_extract_statement("SET lock_timeout = 'forever';"),
+            Some(StatementFact::SetTimeout {
+                setting: TimeoutSetting::Lock,
+                value: TimeoutSettingValue::Invalid(_),
+                local: false,
+            })
+        ));
+    }
+
+    #[test]
+    fn reset_extracts_only_modeled_settings() {
+        for (sql, target) in [
+            ("RESET ALL;", ResetSettingTarget::All),
+            ("RESET search_path;", ResetSettingTarget::SearchPath),
+            ("RESET lock_timeout;", ResetSettingTarget::LockTimeout),
+            (
+                "RESET statement_timeout;",
+                ResetSettingTarget::StatementTimeout,
+            ),
+        ] {
+            assert_eq!(
+                parse_and_extract_statement(sql),
+                Some(StatementFact::ResetSettings { target }),
+                "{sql}"
+            );
+        }
+        assert_eq!(
+            parse_and_extract_statement("RESET application_name;"),
+            Some(StatementFact::SchemaNeutralNoop)
         );
     }
 

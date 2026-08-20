@@ -24,6 +24,28 @@ pub enum SearchPathTarget {
     Schemas(Vec<String>),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimeoutSetting {
+    Lock,
+    Statement,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TimeoutSettingValue {
+    Default,
+    Milliseconds(u64),
+    Unknown,
+    Invalid(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResetSettingTarget {
+    All,
+    SearchPath,
+    LockTimeout,
+    StatementTimeout,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum TypeCreationKind {
     Enum { variants: Vec<String> },
@@ -217,6 +239,15 @@ pub enum StatementFact {
     },
     SetSearchPath {
         target: SearchPathTarget,
+        local: bool,
+    },
+    SetTimeout {
+        setting: TimeoutSetting,
+        value: TimeoutSettingValue,
+        local: bool,
+    },
+    ResetSettings {
+        target: ResetSettingTarget,
     },
     BeginTransaction,
     CommitTransaction,

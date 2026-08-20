@@ -1,5 +1,5 @@
 name: safe-migrate
-description: Produce JSON and Markdown PostgreSQL migration-review artifacts without synchronizing a database.
+description: Analyze PostgreSQL migrations with a trusted synchronized cache or an explicit no-cache preview.
 author: safe-migrate contributors
 
 inputs:
@@ -11,7 +11,7 @@ inputs:
     description: Migration file for `lint` or directory for `lint-chain`.
     required: true
   cache:
-    description: Reviewed local cache path to read when no-cache is false. The action never refreshes it.
+    description: Reviewed Cache V6 path to read when no-cache is false. The action never refreshes it.
     required: false
     default: .safe-migrate.cache
   config:
@@ -19,7 +19,7 @@ inputs:
     required: false
     default: ""
   no-cache:
-    description: Run with an unavailable baseline instead of reading a cache. Defaults to true because repository caches are PR-controlled unless explicitly supplied from a trusted workflow artifact.
+    description: Run a Tainted preview with unknown database and timeout evidence. Defaults to true because repository caches are PR-controlled unless supplied from a trusted workflow artifact.
     required: false
     default: "true"
   output-dir:

@@ -17,7 +17,7 @@ pub enum TypeKind {
     Domain {
         base_type: String,
         /// Derived from `base_type` when a cache enters analysis. Keeping it
-        /// out of the cache preserves the V5 binary format.
+        /// out of the cache preserves the stable binary representation.
         #[serde(skip)]
         base_type_id: Option<ObjectId>,
     },
