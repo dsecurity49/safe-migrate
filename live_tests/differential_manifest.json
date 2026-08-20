@@ -2087,7 +2087,7 @@
         "safe_004_create_index.sql",
         "013_update.sql",
         "014_delete.sql",
-        "015_comment_on.sql"
+        "safe_015_comment_on.sql"
       ],
       "expected_live_errors": {
         "013_invalid_set_role_current_user.sql": {
