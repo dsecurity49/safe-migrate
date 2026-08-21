@@ -34,7 +34,7 @@ pub enum TimeoutSetting {
 pub enum TimeoutSettingValue {
     Default,
     Milliseconds(u64),
-    Unknown,
+    Current,
     Invalid(String),
 }
 

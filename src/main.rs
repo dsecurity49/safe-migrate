@@ -21,7 +21,7 @@ const EXIT_BLOCKING_FINDINGS: i32 = 2;
 #[command(name = "safe-migrate")]
 #[command(version)]
 #[command(
-    about = "Analyze PostgreSQL migrations for schema and locking risks",
+    about = "Sync PostgreSQL metadata, then lint migrations offline",
     long_about = None
 )]
 struct Cli {

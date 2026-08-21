@@ -258,7 +258,7 @@ pub static PRIMARY_RULES: &[RuleDescriptor] = &[
     descriptor!(
         "alter-type-add-value-txn",
         "Enum value in transaction",
-        "Flags ALTER TYPE ADD VALUE in a transaction.",
+        "Flags enum additions whose new value is unavailable until commit.",
         "correctness",
         AlterTypeAddValueRule
     ),

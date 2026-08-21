@@ -162,6 +162,39 @@ fn transaction_local_timeout_and_search_path_restore_session_values() {
 }
 
 #[test]
+fn set_from_current_copies_the_effective_timeout_at_each_scope() {
+    let engine = SafeMigrateEngine::new(Config::default());
+    let mut state = AnalysisState::new(cache_with_timeouts(500, 5_000));
+
+    engine
+        .analyze(
+            "SET lock_timeout = '1s';
+             BEGIN;
+             SET LOCAL lock_timeout = '2s';
+             SET lock_timeout FROM CURRENT;
+             COMMIT;",
+            &mut state,
+        )
+        .unwrap();
+    assert_eq!(state.local.lock_timeout.session, Some(2_000));
+    assert_eq!(state.local.lock_timeout.effective, Some(2_000));
+    assert_eq!(state.local.confidence, Confidence::Exact);
+
+    engine
+        .analyze(
+            "BEGIN;
+             SET LOCAL lock_timeout = '3s';
+             SET LOCAL lock_timeout FROM CURRENT;
+             COMMIT;",
+            &mut state,
+        )
+        .unwrap();
+    assert_eq!(state.local.lock_timeout.session, Some(2_000));
+    assert_eq!(state.local.lock_timeout.effective, Some(2_000));
+    assert_eq!(state.local.confidence, Confidence::Exact);
+}
+
+#[test]
 fn savepoint_rollback_restores_settings_and_reset_all_is_transactional() {
     let engine = SafeMigrateEngine::new(Config::default());
     let mut state = AnalysisState::new(cache_with_timeouts(500, 5_000));

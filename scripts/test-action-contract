@@ -4,6 +4,7 @@ set -eu
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 resolver="$repo_root/scripts/action-resolve-version"
 gate="$repo_root/scripts/action-final-gate"
+baseline="$repo_root/scripts/action-baseline"
 manifest="$repo_root/action.yml"
 
 test "$(/bin/sh "$resolver" v0.6.0 "$repo_root/Cargo.toml")" = v0.6.0
@@ -29,7 +30,81 @@ set -e
 test "$blocking_status" -eq 2
 test "$operational_status" -eq 1
 
-grep -F 'default: "false"' "$manifest" >/dev/null
+/bin/sh "$baseline" validate false false false false '' '' default
+/bin/sh "$baseline" validate true false true true '' public production
+/bin/sh "$baseline" validate false false false false reviewed.cache '' default
+
+assert_baseline_rejected() {
+  if /bin/sh "$baseline" validate "$@" >/dev/null 2>&1; then
+    printf '%s\n' "invalid Action baseline inputs were accepted: $*" >&2
+    exit 1
+  fi
+}
+
+assert_baseline_rejected maybe false false false '' '' default
+assert_baseline_rejected true true false false '' '' default
+assert_baseline_rejected false false false false '' public default
+assert_baseline_rejected true false true false '' '' default
+assert_baseline_rejected false true false false reviewed.cache '' default
+assert_baseline_rejected false true true false '' '' default
+assert_baseline_rejected false false false false '' '' ''
+assert_baseline_rejected false false false false '' '' .
+assert_baseline_rejected false false false false '' '' ..
+assert_baseline_rejected false false false false '' '' 'invalid key'
+
+tmp_dir=$(mktemp -d)
+trap 'rm -rf "$tmp_dir"' EXIT HUP INT TERM
+plain_config="$tmp_dir/plain.toml"
+encrypted_config="$tmp_dir/encrypted.toml"
+quoted_encrypted_config="$tmp_dir/quoted-encrypted.toml"
+printf '%s\n' 'cache_encryption = false' > "$plain_config"
+printf '%s\n' 'cache_encryption = true # reviewed' > "$encrypted_config"
+printf '%s\n' '"cache_encryption" = true' > "$quoted_encrypted_config"
+/bin/sh "$baseline" validate-config "$plain_config" false
+/bin/sh "$baseline" validate-config "$encrypted_config" true
+/bin/sh "$baseline" validate-config "$quoted_encrypted_config" true
+if /bin/sh "$baseline" validate-config "$plain_config" true >/dev/null 2>&1; then
+  printf '%s\n' 'plaintext config was accepted for encrypted Action mode' >&2
+  exit 1
+fi
+if /bin/sh "$baseline" validate-config "$encrypted_config" false >/dev/null 2>&1; then
+  printf '%s\n' 'encrypted config was accepted for plaintext Action mode' >&2
+  exit 1
+fi
+if /bin/sh "$baseline" validate-config "$tmp_dir/missing.toml" false >/dev/null 2>&1; then
+  printf '%s\n' 'missing explicit Action config was accepted' >&2
+  exit 1
+fi
+
+fake_binary="$tmp_dir/safe-migrate"
+argument_log="$tmp_dir/arguments"
+printf '%s\n' \
+  '#!/bin/sh' \
+  'printf "%s\n" "$@" > "$ARGUMENT_LOG"' \
+  > "$fake_binary"
+chmod +x "$fake_binary"
+ARGUMENT_LOG="$argument_log" /bin/sh "$baseline" sync \
+  "$fake_binary" "$tmp_dir/cache" "$tmp_dir/config" 'public,auth'
+printf '%s\n' \
+  sync --out "$tmp_dir/cache" --config "$tmp_dir/config" \
+  --schemas 'public,auth' > "$tmp_dir/expected-arguments"
+cmp "$tmp_dir/expected-arguments" "$argument_log"
+
+grep -A4 '^  sync:$' "$manifest" | grep -F 'default: "false"' >/dev/null
+grep -A4 '^  baseline:$' "$manifest" | grep -F 'default: default' >/dev/null
+grep -A4 '^  encrypted-cache:$' "$manifest" | grep -F 'default: "false"' >/dev/null
+grep -A4 '^  no-cache:$' "$manifest" | grep -F 'default: "false"' >/dev/null
+grep -F 'cache_dir="$(mktemp -d "${cache_root}/invocation.XXXXXX")"' "$manifest" >/dev/null
+grep -F 'managed_root="../.safe-migrate-action-cache"' "$manifest" >/dev/null
+grep -F 'rm -rf -- "$managed_root"' "$manifest" >/dev/null
+grep -F 'cache_dir="${managed_root}/baselines/${INPUT_BASELINE}"' "$manifest" >/dev/null
+grep -F 'uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9' "$manifest" >/dev/null
+grep -F 'uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9' "$manifest" >/dev/null
+grep -F 'cache_prefix="safe-migrate-v6-${RUNNER_OS}-${cache_mode}-${INPUT_BASELINE}-"' "$manifest" >/dev/null
+grep -F '[[ ! "$SAFE_MIGRATE_CACHE_KEY" =~ ^[0-9A-Fa-f]{64}$ ]]' "$manifest" >/dev/null
+grep -F 'cache-prefix=${cache_prefix}' "$manifest" >/dev/null
+grep -F 'sync-status=${sync_status}' "$manifest" >/dev/null
+grep -F 'baseline-source=${baseline_source}' "$manifest" >/dev/null
 grep -F 'await core.summary.addRaw(markdown).write();' "$manifest" >/dev/null
 grep -F 'core.error(message, properties);' "$manifest" >/dev/null
 grep -F 'core.warning(message, properties);' "$manifest" >/dev/null
@@ -37,3 +112,5 @@ grep -F "finding.rule_title || finding.rule_id" "$manifest" >/dev/null
 grep -F "finding.rule_summary" "$manifest" >/dev/null
 grep -E 'actions/github-script@[0-9a-f]{40}' "$manifest" >/dev/null
 grep -F 'env -u DATABASE_URL' "$manifest" >/dev/null
+grep -F '{ [ -z "$INPUT_CACHE" ] && [ ! -f "$RESOLVED_CACHE" ]; }' "$manifest" >/dev/null
+grep -F 'Explicit cache does not exist or is not a file' "$manifest" >/dev/null

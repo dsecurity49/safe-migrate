@@ -290,7 +290,7 @@ mod tests {
     }
 
     #[test]
-    fn type_identity_links_do_not_change_the_v5_bincode_layout() {
+    fn type_identity_links_do_not_change_the_cache_bincode_layout() {
         #[derive(Serialize)]
         struct LegacyFunctionState {
             id: ObjectId,
@@ -334,7 +334,7 @@ mod tests {
     }
 
     #[test]
-    fn domain_type_identity_link_does_not_change_the_v5_bincode_layout() {
+    fn domain_type_identity_link_does_not_change_the_cache_bincode_layout() {
         #[allow(dead_code)]
         #[derive(Serialize)]
         enum LegacyTypeKind {

@@ -879,6 +879,14 @@ mod tests {
                     local: false,
                 },
             ),
+            (
+                "SET lock_timeout FROM CURRENT;",
+                StatementFact::SetTimeout {
+                    setting: TimeoutSetting::Lock,
+                    value: TimeoutSettingValue::Current,
+                    local: false,
+                },
+            ),
         ] {
             assert_eq!(parse_and_extract_statement(sql), Some(expected), "{sql}");
         }

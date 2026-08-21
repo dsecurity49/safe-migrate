@@ -104,6 +104,17 @@ It uploads a verbose log for each version, including failed runs. Treat that
 matrix as the supported live-differential scope; excluded fixtures remain
 documented in `live_tests/differential_manifest.json` with their reasons.
 
+The Action smoke job separately synchronizes an encrypted baseline through the
+local composite Action, saves it through GitHub's cache service, removes the
+local file, and restores it for a database-free lint invocation. It also proves
+that a cache miss completes with an unavailable, `Tainted` baseline. Contract
+coverage also requires that a managed-cache miss bypass configured automatic
+sync while a missing explicit cache remains an operational failure. Contract
+tests keep the managed transport path stable across runner roots, separate
+plaintext and encrypted cache keys, reject contradictory cache inputs, and
+reject path-like baseline names. The smoke job also rejects a missing explicit
+configuration file and an encryption mode that disagrees with that file.
+
 ## What to assert
 
 - AST work: exact facts and source distinctions.

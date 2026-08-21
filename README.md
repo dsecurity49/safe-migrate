@@ -1,15 +1,8 @@
 # safe-migrate
 
-safe-migrate is a sync-first PostgreSQL migration linter. `safe-migrate sync`
-records the target database's schema, dependencies, statistics, role context,
-search path, PostgreSQL version, and effective migration timeouts in a local
-cache. `lint` and `lint-chain` then use that evidence to simulate migrations in
-order and report operations that may block, rewrite data, destroy objects, or
-fail against the modeled database state.
-
-After synchronization, linting is offline. `--no-cache` is available for a
-parser and state-machine preview, but it has no verified database baseline,
-reports `Tainted` confidence, and cannot know the session's timeout defaults.
+safe-migrate checks PostgreSQL migrations against a synchronized database
+baseline. Run `safe-migrate sync`, then use `lint` or `lint-chain` offline to
+simulate migrations against the captured state.
 
 safe-migrate is a review aid, not a substitute for testing migrations on a
 representative database or planning application rollouts and backfills.
@@ -27,8 +20,8 @@ safe-migrate --version
 
 ### Prebuilt binary
 
-The installer detects supported Linux, macOS, Windows/MSYS, and Termux targets, verifies the
-release checksum, and installs the latest published binary:
+The installer detects supported Linux, macOS, Windows/MSYS, and Termux targets,
+verifies the release checksum, and installs the latest published binary:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/dsecurity49/safe-migrate/main/install.sh | bash
@@ -80,7 +73,11 @@ safe-migrate sync
 `lint` and `lint-chain` do not connect to PostgreSQL unless `auto_sync = true`
 is configured.
 
-### Why sync is the main workflow
+`--no-cache` runs the parser and state machine without a verified database
+baseline. Findings use `Tainted` confidence, and database settings such as
+migration timeouts remain unknown.
+
+### What sync provides
 
 SQL text alone cannot prove what already exists, how large a table is, which
 objects depend on it, which role and search path resolve an unqualified name,
@@ -132,7 +129,7 @@ Run `safe-migrate <command> --help` for the complete command reference.
 transaction, search-path, and role state across statements and files. This can
 catch failures caused by interactions between otherwise valid migrations.
 
-### Timeout-aware analysis
+### Migration timeouts
 
 The Tier 2 `require-lock-timeout` and `require-statement-timeout` rules apply to
 statements that Squawk classifies as potentially disruptive to normal database
@@ -282,46 +279,44 @@ you need the discovery output to reflect a reviewed non-default configuration.
 
 ## GitHub Actions
 
-The reusable Action downloads and verifies the exact release binary, creates
-JSON and Markdown artifacts, appends the Markdown report to the job summary,
-and emits Tier 1 errors and Tier 2 warnings as source annotations. It never
-connects to a database. By default it runs an explicit no-cache preview because
-files in a pull-request checkout are controlled by that pull request; the best
-results come from a cache created in a separate trusted sync step.
+The pull-request job restores the latest `default` synchronized baseline and
+lints without database access. If no baseline is available, it still runs with
+`Tainted` confidence.
 
 ```yaml
-- id: safe_migrate
-  uses: dsecurity49/safe-migrate@v0.6.0
+- uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
   with:
-    mode: lint-chain
+    persist-credentials: false
+- uses: dsecurity49/safe-migrate@v0.6.0
+  with:
     path: migrations
-    output-dir: safe-migrate-artifacts
-    advisory: "false"
-
-- uses: actions/upload-artifact@v4
-  if: always()
-  with:
-    name: safe-migrate-report
-    path: safe-migrate-artifacts/
 ```
 
-To use database-aware findings, prepare a cache in a trusted workflow step and
-set both `cache: <path>` and `no-cache: "false"`.
+Create and refresh the baseline in a trusted default-branch workflow:
 
-Set `config: safe-migrate.toml` to use a reviewed project configuration. When
-`config` is omitted, the Action uses built-in defaults and deliberately does
-not read `safe-migrate.toml` from the pull-request workspace.
+```yaml
+- uses: dsecurity49/safe-migrate@v0.6.0
+  env:
+    DATABASE_URL: ${{ secrets.SAFE_MIGRATE_DATABASE_URL }}
+  with:
+    path: migrations
+    sync: "true"
+    schemas: public
+```
 
-The Action exposes `json-report`, `markdown-report`, `diagnostic-log`, and
-`exit-code`. Set `advisory: "true"` to keep a completed analysis with Tier 1
-findings from failing the job; its `exit-code` output remains `2`. Operational
-errors always fail. Published uses must be pinned to an exact semantic tag or a
-full commit SHA; mutable branch references are rejected. Local `uses: ./`
-testing retains locked source installation.
+Use a self-hosted runner or an SSH tunnel because direct remote database URLs
+are rejected. Cache encryption is recommended: GitHub caches can be read by
+fork pull requests and are not signed. Fork jobs without the encryption secret
+fall back to a `Tainted` preview.
+
+See the [GitHub Action guide](docs/GITHUB_ACTIONS.md) for complete workflows,
+first-run setup, encryption, named baselines, cache lifetime, outputs, and
+failure behavior.
 
 ## Documentation
 
 - [CLI and report contract](docs/CONTRACT.md)
+- [GitHub Action guide](docs/GITHUB_ACTIONS.md)
 - [Contributing](CONTRIBUTING.md)
 - [Maintainer documentation](docs/README.md)
 - [Release history](CHANGELOG.md)

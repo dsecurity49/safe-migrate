@@ -64,10 +64,12 @@ your normal artifact-retention procedure. For encrypted cache-key rotation,
 write a fresh cache with a new `SAFE_MIGRATE_CACHE_KEY`, update the secret
 store, then remove the old cache and key according to local policy.
 
-Keep real database caches out of Git and logs. The tracked
+Keep plaintext real database caches out of Git and logs. The tracked
 `live_tests/.safe-migrate.cache` is a deliberate exception containing only
 synthetic fixture data, and Cargo excludes it from published crate packages.
-Use owner-only filesystem permissions where available, short CI artifact
+An encrypted cache may be tracked only as an explicit repository policy: keep
+its key outside Git and account for permanent binary history and a changed
+ciphertext on every write. Prefer owner-only filesystem permissions, bounded CI
 retention, and access controls appropriate for a schema/dependency snapshot.
 
 ## Least-privilege sync role

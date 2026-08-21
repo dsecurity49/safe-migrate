@@ -760,9 +760,15 @@ mod phase10_bug_fixes_and_sorting_tests {
             )
             .unwrap();
 
+        let finding = v
+            .iter()
+            .find(|v| v.rule_id == "alter-type-add-value-txn")
+            .expect("Expected alter-type-add-value-txn violation inside transaction");
+        assert_eq!(finding.tier, ViolationTier::Tier2);
         assert!(
-            v.iter().any(|v| v.rule_id == "alter-type-add-value-txn"),
-            "Expected alter-type-add-value-txn violation inside transaction"
+            finding
+                .reason
+                .contains("does not allow the new value to be used until commit")
         );
     }
 

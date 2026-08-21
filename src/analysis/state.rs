@@ -3816,11 +3816,10 @@ impl AnalysisState {
                         TimeoutSetting::Statement => self.local.statement_timeout.default,
                     },
                     TimeoutSettingValue::Milliseconds(milliseconds) => Some(*milliseconds),
-                    TimeoutSettingValue::Unknown => {
-                        self.snapshot_confidence();
-                        self.local.confidence = Confidence::Tainted;
-                        None
-                    }
+                    TimeoutSettingValue::Current => match change.setting {
+                        TimeoutSetting::Lock => self.local.lock_timeout.effective,
+                        TimeoutSetting::Statement => self.local.statement_timeout.effective,
+                    },
                     TimeoutSettingValue::Invalid(reason) => {
                         return MutationResult::Conflict {
                             reason: reason.clone(),

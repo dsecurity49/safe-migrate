@@ -57,7 +57,7 @@ fn test_cli_help() {
     let output = cmd.output().unwrap();
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("Analyze PostgreSQL migrations for schema and locking risks"));
+    assert!(stdout.contains("Sync PostgreSQL metadata, then lint migrations offline"));
     assert!(!stdout.contains("prevent blocking locks"));
     assert!(stdout.contains("Sync PostgreSQL schema metadata and statistics into a local cache"));
     assert!(!stdout.contains("Sync database table statistics"));

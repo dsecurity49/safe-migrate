@@ -81,10 +81,10 @@ impl Rule for AlterTypeAddValueRule {
         "alter-type-add-value-txn"
     }
     fn default_tier(&self) -> ViolationTier {
-        ViolationTier::Tier1
+        ViolationTier::Tier2
     }
     fn recipe(&self) -> &'static str {
-        "ALTER TYPE ... ADD VALUE cannot be executed inside a transaction block in PostgreSQL."
+        "Commit before later statements use the new enum value, or put the dependent work in a later migration."
     }
 
     fn evaluate(
@@ -106,7 +106,10 @@ impl Rule for AlterTypeAddValueRule {
                 object_kind: ObjectKind::Type,
                 object_name: alter.id.to_string(),
                 tier: self.default_tier(),
-                reason: format!("ALTER TYPE {} ADD VALUE inside transaction", alter.id),
+                reason: format!(
+                    "ALTER TYPE {} ADD VALUE is inside a transaction; PostgreSQL does not allow the new value to be used until commit",
+                    alter.id
+                ),
                 recipe: self.recipe(),
                 dedup_key: None,
                 sql: None,

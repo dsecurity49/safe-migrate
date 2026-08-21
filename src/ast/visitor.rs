@@ -3058,7 +3058,7 @@ impl AstVisitor {
                 let value = if sc.default_token().is_some() {
                     TimeoutSettingValue::Default
                 } else if sc.current_token().is_some() {
-                    TimeoutSettingValue::Unknown
+                    TimeoutSettingValue::Current
                 } else {
                     let values: Vec<String> = sc
                         .config_values()

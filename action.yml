@@ -1,5 +1,5 @@
 name: safe-migrate
-description: Analyze PostgreSQL migrations with a trusted synchronized cache or an explicit no-cache preview.
+description: Lint PostgreSQL migrations offline against a synchronized database baseline.
 author: safe-migrate contributors
 
 inputs:
@@ -11,17 +11,33 @@ inputs:
     description: Migration file for `lint` or directory for `lint-chain`.
     required: true
   cache:
-    description: Reviewed Cache V6 path to read when no-cache is false. The action never refreshes it.
+    description: Explicit trusted Cache V6 path; disables managed GitHub cache restore and save.
     required: false
-    default: .safe-migrate.cache
+    default: ""
   config:
     description: Explicitly trusted safe-migrate TOML path. Empty uses built-in defaults and never reads workspace configuration.
     required: false
     default: ""
-  no-cache:
-    description: Run a Tainted preview with unknown database and timeout evidence. Defaults to true because repository caches are PR-controlled unless supplied from a trusted workflow artifact.
+  sync:
+    description: Refresh from DATABASE_URL in this trusted job, then remove database access before linting.
     required: false
-    default: "true"
+    default: "false"
+  schemas:
+    description: Optional comma-separated schema scope passed to sync. Requires sync to be true.
+    required: false
+    default: ""
+  baseline:
+    description: Logical managed-cache name; use different names for different target databases.
+    required: false
+    default: default
+  encrypted-cache:
+    description: Require authenticated cache encryption; missing keys fall back to Tainted linting and cannot sync.
+    required: false
+    default: "false"
+  no-cache:
+    description: Bypass every baseline for a Tainted preview; incompatible with cache, sync, schemas, and encryption.
+    required: false
+    default: "false"
   output-dir:
     description: Directory for `safe-migrate-report.json` and `safe-migrate-report.md`.
     required: false
@@ -44,19 +60,112 @@ outputs:
   diagnostic-log:
     description: Path to analyzer diagnostics, including the reason for operational failures.
     value: ${{ steps.analysis.outputs.diagnostic-log }}
+  cache-path:
+    description: Resolved cache path used by the Action.
+    value: ${{ steps.baseline.outputs.cache-path }}
+  sync-status:
+    description: "Synchronization outcome: not-requested, refreshed, or failed."
+    value: ${{ steps.analysis.outputs.sync-status }}
+  baseline-source:
+    description: "Baseline source: synced, github-cache, explicit-file, or unavailable."
+    value: ${{ steps.analysis.outputs.baseline-source }}
 
 runs:
   using: composite
   steps:
+    - name: Resolve baseline inputs
+      id: baseline
+      shell: bash
+      env:
+        DATABASE_URL: ""
+        INPUT_CACHE: ${{ inputs.cache }}
+        INPUT_SYNC: ${{ inputs.sync }}
+        INPUT_SCHEMAS: ${{ inputs.schemas }}
+        INPUT_BASELINE: ${{ inputs.baseline }}
+        INPUT_ENCRYPTED_CACHE: ${{ inputs.encrypted-cache }}
+        INPUT_NO_CACHE: ${{ inputs.no-cache }}
+      run: |
+        set -euo pipefail
+        if [ "$INPUT_ENCRYPTED_CACHE" = true ] && \
+            [ -n "${SAFE_MIGRATE_CACHE_KEY:-}" ] && \
+            [[ ! "$SAFE_MIGRATE_CACHE_KEY" =~ ^[0-9A-Fa-f]{64}$ ]]; then
+          echo "SAFE_MIGRATE_CACHE_KEY must contain exactly 64 hexadecimal characters" >&2
+          exit 1
+        fi
+        if [ -n "${SAFE_MIGRATE_CACHE_KEY:-}" ]; then
+          key_available=true
+        else
+          key_available=false
+        fi
+        /bin/sh "$GITHUB_ACTION_PATH/scripts/action-baseline" validate \
+          "$INPUT_SYNC" "$INPUT_NO_CACHE" "$INPUT_ENCRYPTED_CACHE" \
+          "$key_available" "$INPUT_CACHE" "$INPUT_SCHEMAS" \
+          "$INPUT_BASELINE"
+
+        cd "$GITHUB_WORKSPACE"
+        if [ -n "$INPUT_CACHE" ]; then
+          cache_path="$INPUT_CACHE"
+        elif [ "$INPUT_NO_CACHE" != true ]; then
+          # actions/cache hashes the literal path into its cache version. Keep
+          # this relative path stable across hosted and self-hosted runners,
+          # and clear it so neither checkout files nor runner leftovers can be
+          # mistaken for a restored baseline after a cache miss.
+          managed_root="../.safe-migrate-action-cache"
+          rm -rf -- "$managed_root"
+          cache_dir="${managed_root}/baselines/${INPUT_BASELINE}"
+          mkdir -p "$cache_dir"
+          cache_path="${cache_dir}/baseline-v6.cache"
+        else
+          cache_root="${RUNNER_TEMP}/safe-migrate-action"
+          mkdir -p "$cache_root"
+          cache_dir="$(mktemp -d "${cache_root}/invocation.XXXXXX")"
+          cache_path="${cache_dir}/baseline-v6.cache"
+        fi
+
+        echo "cache-path=${cache_path}" >> "$GITHUB_OUTPUT"
+        if [ "$INPUT_ENCRYPTED_CACHE" != true ] || [ "$key_available" = true ]; then
+          echo "baseline-readable=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "baseline-readable=false" >> "$GITHUB_OUTPUT"
+        fi
+        if [ -z "$INPUT_CACHE" ] && [ "$INPUT_NO_CACHE" != true ]; then
+          if [ "$INPUT_ENCRYPTED_CACHE" = true ]; then
+            cache_mode=encrypted
+          else
+            cache_mode=plaintext
+          fi
+          cache_prefix="safe-migrate-v6-${RUNNER_OS}-${cache_mode}-${INPUT_BASELINE}-"
+          echo "cache-prefix=${cache_prefix}" >> "$GITHUB_OUTPUT"
+          echo "cache-primary-key=${cache_prefix}${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Restore synchronized baseline
+      id: restore-baseline
+      if: ${{ inputs.cache == '' && inputs.no-cache != 'true' && steps.baseline.outputs.baseline-readable == 'true' }}
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      env:
+        DATABASE_URL: ""
+        SAFE_MIGRATE_CACHE_KEY: ""
+      with:
+        path: ${{ steps.baseline.outputs.cache-path }}
+        key: ${{ steps.baseline.outputs.cache-primary-key }}
+        restore-keys: ${{ steps.baseline.outputs.cache-prefix }}
+
     - name: Install Rust
       if: ${{ github.action_ref == '' }}
       uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable 2026-07-16
+      env:
+        DATABASE_URL: ""
+        SAFE_MIGRATE_CACHE_KEY: ""
 
     - name: Install safe-migrate
       id: install
       shell: bash
       env:
         ACTION_REF: ${{ github.action_ref }}
+        DATABASE_URL: ""
+        SAFE_MIGRATE_CACHE_KEY: ""
       run: |
         set -euo pipefail
         install_root="${RUNNER_TEMP}/safe-migrate-action"
@@ -102,12 +211,19 @@ runs:
         INPUT_PATH: ${{ inputs.path }}
         INPUT_CACHE: ${{ inputs.cache }}
         INPUT_CONFIG: ${{ inputs.config }}
+        INPUT_SYNC: ${{ inputs.sync }}
+        INPUT_SCHEMAS: ${{ inputs.schemas }}
+        INPUT_ENCRYPTED_CACHE: ${{ inputs.encrypted-cache }}
         INPUT_NO_CACHE: ${{ inputs.no-cache }}
         INPUT_OUTPUT_DIR: ${{ inputs.output-dir }}
+        RESOLVED_CACHE: ${{ steps.baseline.outputs.cache-path }}
+        RESTORED_CACHE_KEY: ${{ steps.restore-baseline.outputs.cache-matched-key }}
+        BASELINE_READABLE: ${{ steps.baseline.outputs.baseline-readable }}
         SAFE_MIGRATE_BINARY: ${{ steps.install.outputs.binary }}
       run: |
         set -euo pipefail
 
+        cd "$GITHUB_WORKSPACE"
         mkdir -p "$INPUT_OUTPUT_DIR"
         binary="$SAFE_MIGRATE_BINARY"
         json_report="${INPUT_OUTPUT_DIR}/safe-migrate-report.json"
@@ -115,36 +231,96 @@ runs:
         diagnostic_log="${INPUT_OUTPUT_DIR}/safe-migrate-diagnostics.log"
         : > "$diagnostic_log"
 
-        command=()
-        case "$INPUT_MODE" in
-          lint)
-            command=(lint --file "$INPUT_PATH")
-            ;;
-          lint-chain)
-            command=(lint-chain --dir "$INPUT_PATH")
-            ;;
-          *)
-            echo "mode must be lint or lint-chain, got: $INPUT_MODE" \
+        preflight_failed=false
+        if [ -n "$INPUT_CONFIG" ]; then
+          config_path="$INPUT_CONFIG"
+          if ! /bin/sh "$GITHUB_ACTION_PATH/scripts/action-baseline" \
+              validate-config "$config_path" "$INPUT_ENCRYPTED_CACHE" \
+              2> >(tee -a "$diagnostic_log" >&2); then
+            preflight_failed=true
+          fi
+        else
+          config_path="$(mktemp "${RUNNER_TEMP}/safe-migrate-default.XXXXXX")"
+          if [ "$INPUT_ENCRYPTED_CACHE" = true ]; then
+            printf '%s\n' 'cache_encryption = true' > "$config_path"
+          fi
+        fi
+
+        sync_status=not-requested
+        if [ -n "$RESTORED_CACHE_KEY" ] && [ -f "$RESOLVED_CACHE" ]; then
+          baseline_source=github-cache
+        elif [ -n "$RESTORED_CACHE_KEY" ]; then
+          baseline_source=unavailable
+          echo "GitHub reported a cache match, but the baseline file was not restored." \
+            | tee -a "$diagnostic_log" >&2
+        elif [ -n "$INPUT_CACHE" ] && [ -f "$RESOLVED_CACHE" ]; then
+          baseline_source=explicit-file
+        else
+          baseline_source=unavailable
+        fi
+        if [ "$BASELINE_READABLE" != true ]; then
+          baseline_source=unavailable
+          echo "Encrypted baseline key unavailable; running Tainted analysis without the baseline." \
+            | tee -a "$diagnostic_log" >&2
+        fi
+        if [ -n "$INPUT_CACHE" ] && [ ! -f "$RESOLVED_CACHE" ] && \
+            [ "$INPUT_SYNC" != true ]; then
+          echo "Explicit cache does not exist or is not a file: $RESOLVED_CACHE" \
+            | tee -a "$diagnostic_log" >&2
+          preflight_failed=true
+        fi
+
+        operational_failed=false
+        if [ "$preflight_failed" = true ]; then
+          if [ "$INPUT_SYNC" = true ]; then
+            sync_status=failed
+          fi
+          operational_failed=true
+        elif [ "$INPUT_SYNC" = true ]; then
+          mkdir -p "$(dirname -- "$RESOLVED_CACHE")"
+          set +e
+          /bin/sh "$GITHUB_ACTION_PATH/scripts/action-baseline" sync \
+            "$binary" "$RESOLVED_CACHE" "$config_path" "$INPUT_SCHEMAS" \
+            > >(tee -a "$diagnostic_log") \
+            2> >(tee -a "$diagnostic_log" >&2)
+          sync_exit=$?
+          set -e
+          if [ "$sync_exit" -eq 0 ]; then
+            sync_status=refreshed
+            baseline_source=synced
+          else
+            sync_status=failed
+            operational_failed=true
+            echo "safe-migrate sync failed with status ${sync_exit}; no baseline will be published" \
               | tee -a "$diagnostic_log" >&2
-            ;;
-        esac
+          fi
+        fi
+
+        command=()
+        if [ "$preflight_failed" != true ]; then
+          case "$INPUT_MODE" in
+            lint)
+              command=(lint --file "$INPUT_PATH")
+              ;;
+            lint-chain)
+              command=(lint-chain --dir "$INPUT_PATH")
+              ;;
+            *)
+              echo "mode must be lint or lint-chain, got: $INPUT_MODE" \
+                | tee -a "$diagnostic_log" >&2
+              ;;
+          esac
+        fi
 
         if [ "${#command[@]}" -eq 0 ]; then
           final_status=1
         else
-          command+=(--cache "$INPUT_CACHE")
-          if [ -n "$INPUT_CONFIG" ]; then
-            command+=(--config "$INPUT_CONFIG")
-          else
-            default_config="$(mktemp "${RUNNER_TEMP}/safe-migrate-default.XXXXXX")"
-            command+=(--config "$default_config")
-          fi
-          if [ "$INPUT_NO_CACHE" = "true" ]; then
+          command+=(--cache "$RESOLVED_CACHE" --config "$config_path")
+          if [ "$INPUT_NO_CACHE" = "true" ] || [ "$BASELINE_READABLE" != true ] || \
+              { [ -z "$INPUT_CACHE" ] && [ ! -f "$RESOLVED_CACHE" ]; }; then
             command+=(--no-cache)
           fi
 
-          # Database synchronization is intentionally outside the Action's
-          # default path. A separate workflow step can prepare a reviewed cache.
           set +e
           env -u DATABASE_URL "$binary" "${command[@]}" --json \
             > "$json_report" 2> >(tee -a "$diagnostic_log" >&2)
@@ -159,6 +335,9 @@ runs:
             final_status=1
             echo "JSON and Markdown runs returned different statuses: ${json_status} and ${markdown_status}" \
               | tee -a "$diagnostic_log" >&2
+          fi
+          if [ "$operational_failed" = true ]; then
+            final_status=1
           fi
         fi
 
@@ -189,14 +368,28 @@ runs:
         echo "markdown-report=${markdown_report}" >> "$GITHUB_OUTPUT"
         echo "diagnostic-log=${diagnostic_log}" >> "$GITHUB_OUTPUT"
         echo "exit-code=${final_status}" >> "$GITHUB_OUTPUT"
+        echo "sync-status=${sync_status}" >> "$GITHUB_OUTPUT"
+        echo "baseline-source=${baseline_source}" >> "$GITHUB_OUTPUT"
         exit "$final_status"
+
+    - name: Save synchronized baseline
+      if: ${{ always() && inputs.cache == '' && steps.analysis.outputs.sync-status == 'refreshed' }}
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      env:
+        DATABASE_URL: ""
+        SAFE_MIGRATE_CACHE_KEY: ""
+      with:
+        path: ${{ steps.baseline.outputs.cache-path }}
+        key: ${{ steps.baseline.outputs.cache-primary-key }}
 
     - name: Publish summary and annotations
       if: ${{ always() }}
       uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7
       env:
+        DATABASE_URL: ""
         JSON_REPORT: ${{ steps.analysis.outputs.json-report }}
         MARKDOWN_REPORT: ${{ steps.analysis.outputs.markdown-report }}
+        SAFE_MIGRATE_CACHE_KEY: ""
       with:
         script: |
           const fs = require('fs');
@@ -232,6 +425,8 @@ runs:
       env:
         ANALYZER_STATUS: ${{ steps.analysis.outputs.exit-code }}
         ADVISORY: ${{ inputs.advisory }}
+        DATABASE_URL: ""
+        SAFE_MIGRATE_CACHE_KEY: ""
       run: |
         /bin/sh "$GITHUB_ACTION_PATH/scripts/action-final-gate" \
           "${ANALYZER_STATUS:-1}" "$ADVISORY"

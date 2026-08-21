@@ -7,26 +7,21 @@ notes are available on the
 
 ## v0.6.0 — Unreleased
 
-- Made synchronization the primary workflow: Cache V6 records effective
-  `lock_timeout` and `statement_timeout` values alongside schema, dependency,
-  statistics, role, search-path, and PostgreSQL-version evidence. V1–V5 caches
-  now require `safe-migrate sync`.
-- Added the Tier 2 `require-lock-timeout` and `require-statement-timeout` rules
-  for statements selected by Squawk's pinned slow-statement classifier. The
-  lock rule also detects values that cannot fire before a positive
-  `statement_timeout`.
-- Modeled ordered `SET`, `SET LOCAL`, `SET ... DEFAULT`, `RESET`, and
-  `RESET ALL` behavior for both timeouts, including transaction, rollback, and
-  savepoint scope. Corrected the same session-versus-local behavior for
-  `search_path` and preserved a quoted schema named `"default"`.
-- Added timeout provenance to cache inspection and lint JSON/Markdown baseline
-  output. Lint JSON remains schema version 1; rule discovery moves to schema
-  version 2 and now reports only configuration fields each rule supports.
-- Rejected unsupported per-rule threshold settings and made
-  `require-concurrent-index` threshold overrides apply consistently to its
-  non-concurrent drop-index finding.
-- Kept `squawk-linter` pinned at 2.62.0 and used its public
-  `possibly_slow_stmt` API rather than maintaining a separate classifier.
+- `sync` now records the effective `lock_timeout` and `statement_timeout`.
+  New Tier 2 rules report missing, disabled, or ineffective migration
+  timeouts and follow timeout changes made by the migration.
+- Cache V6 stores these values. `cache inspect`, JSON, and Markdown
+  reports expose the observed values; V1–V5 caches must be rebuilt with
+  `safe-migrate sync`.
+- Fixed transaction-local `search_path` handling and tightened rule
+  configuration so unsupported threshold fields are rejected. Corrected the
+  enum-in-transaction rule to describe PostgreSQL's commit-time restriction
+  and report it as a warning instead of claiming the statement cannot run.
+- The GitHub Action can refresh and reuse named synchronized baselines. Trusted
+  scheduled jobs connect once; pull-request lint jobs restore the baseline and
+  remain offline, with a `Tainted` fallback when none is available. Managed
+  paths are portable across runner roots, and plaintext and encrypted entries
+  use separate keys.
 
 ## v0.5.0 — 2026-08-14
 

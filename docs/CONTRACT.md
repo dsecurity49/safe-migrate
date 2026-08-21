@@ -228,6 +228,26 @@ When analysis is reached, the GitHub Action writes JSON, Markdown, and
 diagnostics. It appends the Markdown report to the job summary, annotates Tier
 1 findings as errors and Tier 2 findings as warnings using the rule title,
 summary, reason, and remediation, and leaves Tier 3 in the summary only.
+With no explicit `cache`, the Action clears an isolated managed path and
+restores the latest Cache V6 entry for the selected `baseline` name and
+encryption mode. Clearing the path prevents a checkout file or persistent-runner
+leftover from becoming a baseline after a cache miss. A miss reaches analysis
+as an offline `--no-cache` run with an unavailable baseline and `Tainted`
+confidence, even if an explicit trusted config enables automatic sync. A
+missing explicit cache remains an operational error. `sync: "true"` refreshes
+that path before linting and attempts to save it only after successful
+synchronization; `DATABASE_URL` is cleared from nested helper Actions and
+removed from both lint report processes. GitHub cache-service save failures are
+reported by the cache Action as workflow warnings rather than analyzer status.
+An explicit `cache` path disables GitHub cache transport. `no-cache: "true"`
+bypasses every baseline and cannot be combined with `cache`, synchronization,
+schema filtering, or cache encryption.
+`encrypted-cache: "true"` enables encryption in the Action's generated config.
+An explicit config path must name an existing file, and its encryption setting
+must agree with the Action input. A lint job without `SAFE_MIGRATE_CACHE_KEY`
+skips the encrypted baseline and runs Tainted; a sync job without the key fails
+before connecting. A present key with invalid length or non-hexadecimal
+characters is rejected before cache restore or database access.
 Analyzer status `2` fails normally; `advisory: "true"` makes the Action step
 successful while preserving output `exit-code: 2`. Operational status `1`
 always fails. Published Action accepts only exact semantic tags

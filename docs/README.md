@@ -6,12 +6,14 @@ The repository keeps two kinds of documentation:
 
 - [CLI and report contract](CONTRACT.md) — user-visible behavior that must be
   protected by tests.
+- [GitHub Action](GITHUB_ACTIONS.md) — pull-request linting, synchronized
+  baseline refresh, encryption, cache behavior, and complete workflow examples.
 - [Real-world-inspired cases](REAL_WORLD_CASES.md) — sourced migration
   hypotheses and reproducible PostgreSQL differential fixtures.
 - The root [README](../README.md) — installation, quick start, rules, and
   product-level guidance.
-- [v0.6.0 release notes](releases/v0.6.0.md) — the sync-first release contract,
-  compatibility notes, and proof checklist.
+- [v0.6.0 release notes](releases/v0.6.0.md) — timeout checks and Cache V6
+  compatibility notes.
 
 ## Maintainer documentation
 
