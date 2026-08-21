@@ -24,7 +24,9 @@ The installer detects supported Linux, macOS, Windows/MSYS, and Termux targets,
 verifies the release checksum, and installs the latest published binary:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/dsecurity49/safe-migrate/main/install.sh | bash
+curl -fsSL \
+  https://raw.githubusercontent.com/dsecurity49/safe-migrate/main/install.sh |
+  bash
 safe-migrate --version
 ```
 
@@ -34,7 +36,8 @@ need to pin exactly what runs:
 
 ```bash
 VERSION='<release-tag>'
-curl -fsSL "https://raw.githubusercontent.com/dsecurity49/safe-migrate/${VERSION}/install.sh" |
+BASE_URL='https://raw.githubusercontent.com/dsecurity49/safe-migrate'
+curl -fsSL "${BASE_URL}/${VERSION}/install.sh" |
   bash -s -- --version "${VERSION}"
 ```
 
@@ -123,13 +126,29 @@ Useful options:
 
 Run `safe-migrate <command> --help` for the complete command reference.
 
-### Chain analysis
+## Rule discovery
+
+Use the CLI registry instead of a copied documentation table. It is the
+canonical source for every primary rule's ID, title, impact, default tier,
+remediation, supported configuration fields, and effective configuration.
+The discovery document is schema version 2; lint JSON remains schema version 1.
+
+```bash
+safe-migrate rules
+safe-migrate rules --rule require-concurrent-index
+safe-migrate rules --rule require-concurrent-index --json
+```
+
+Unknown IDs fail without changing analysis configuration. Use `--config` when
+you need the discovery output to reflect a reviewed non-default configuration.
+
+## Chain analysis
 
 `lint-chain` analyzes files in filename order and carries modeled schema,
 transaction, search-path, and role state across statements and files. This can
 catch failures caused by interactions between otherwise valid migrations.
 
-### Migration timeouts
+## Migration timeouts
 
 The Tier 2 `require-lock-timeout` and `require-statement-timeout` rules apply to
 statements that Squawk classifies as potentially disruptive to normal database
@@ -143,17 +162,17 @@ unknown evidence rather than silently treated as a configured timeout.
 Findings use three tiers:
 
 | Tier | Meaning |
-|---|---|
+| --- | --- |
 | Tier 1 — `HALT` | The migration should be corrected before deployment. |
 | Tier 2 — `WARN` | The migration or available evidence needs review. |
-| Tier 3 — `SAFE` | Informational or lower-risk behavior, including irreversible operations that still require normal safeguards. |
+| Tier 3 — `SAFE` | Lower-risk or informational; safeguards still apply. |
 
 Reports also include confidence:
 
 | Confidence | Meaning |
-|---|---|
-| `Exact` | The simulator stayed consistent with the supplied SQL and baseline. |
-| `Tainted` | Some baseline evidence or state transition was unavailable, stale, unsupported, or uncertain. |
+| --- | --- |
+| `Exact` | Analysis stayed consistent with the supplied SQL and baseline. |
+| `Tainted` | Baseline evidence or modeled state is incomplete or uncertain. |
 
 `Exact` means exact relative to the modeled evidence; it is not a production
 deployment guarantee.
@@ -261,22 +280,6 @@ Use `safe-migrate cache inspect` to view cache provenance and redacted object
 and role counts without connecting to PostgreSQL. It never lists role names or
 membership edges.
 
-## Rule discovery
-
-Use the CLI registry instead of a copied documentation table. It is the
-canonical source for every primary rule's ID, title, impact, default tier,
-remediation, supported configuration fields, and effective configuration.
-The discovery document is schema version 2; lint JSON remains schema version 1.
-
-```bash
-safe-migrate rules
-safe-migrate rules --rule require-concurrent-index
-safe-migrate rules --rule require-concurrent-index --json
-```
-
-Unknown IDs fail without changing analysis configuration. Use `--config` when
-you need the discovery output to reflect a reviewed non-default configuration.
-
 ## GitHub Actions
 
 The pull-request job restores the latest `default` synchronized baseline and
@@ -317,8 +320,8 @@ failure behavior.
 
 - [CLI and report contract](docs/CONTRACT.md)
 - [GitHub Action guide](docs/GITHUB_ACTIONS.md)
+- [Evidence behind differential fixtures](docs/REAL_WORLD_CASES.md)
 - [Contributing](CONTRIBUTING.md)
-- [Maintainer documentation](docs/README.md)
 - [Release history](CHANGELOG.md)
 - [Releases and binary downloads](https://github.com/dsecurity49/safe-migrate/releases)
 

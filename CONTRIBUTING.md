@@ -5,10 +5,10 @@ with typed AST extraction, stateful schema simulation, and safety rules.
 
 ## Start here
 
-- [Documentation index](docs/README.md)
-- [Architecture and invariants](docs/internal/ARCHITECTURE.md)
-- [AST development](docs/internal/AST_DEVELOPMENT.md)
+- [README and user guide](README.md)
+- [GitHub Action guide](docs/GITHUB_ACTIONS.md)
 - [CLI and report contract](docs/CONTRACT.md)
+- [Evidence behind differential fixtures](docs/REAL_WORLD_CASES.md)
 
 ## Project structure
 
@@ -22,7 +22,7 @@ src/report/     human, JSON, and interactive reporting
 src/rules/      safety rule implementations
 tests/          integration, state-machine, rule, CLI, and regression tests
 live_tests/     end-to-end SQL fixtures and frozen database cache
-docs/           product contracts and maintainer documentation
+docs/           Action guide, CLI/report contract, and differential evidence
 ```
 
 Prefer this stable directory-level map over a copied inventory of every source
@@ -59,6 +59,33 @@ cd live_tests
 The fixture runner invokes the compiled binary. Most rule directories lint each
 file independently; chain-conflict fixtures use `lint-chain`.
 
+Repository-level contracts:
+
+```bash
+sh scripts/test-install-dry-run
+sh scripts/test-action-contract
+scripts/fuzz
+```
+
+The installer test covers pinned offline installation and checksum failures.
+The Action test covers installation, cache handling, gates, summaries, and
+annotations. The fuzz script generates SQL inputs and rejects crashes,
+timeouts, operational errors, invalid JSON, and inconsistent exit statuses.
+
+Live database contracts require a disposable local PostgreSQL database:
+
+```bash
+export DATABASE_URL='postgres://USER:PASSWORD@localhost:5432/TEST_DATABASE'
+scripts/live-differential
+scripts/live-auto-sync
+scripts/live-cache-encryption
+```
+
+The differential harness mutates and resets its test schemas and fixture
+objects. Never point it at a shared or production database. CI runs the enabled
+differential manifest against PostgreSQL 14 through 18; excluded fixtures and
+their reasons live in `live_tests/differential_manifest.json`.
+
 ## Adding or changing a rule
 
 1. Implement one safety concept under `src/rules/`.
@@ -66,7 +93,7 @@ file independently; chain-conflict fixtures use `lint-chain`.
 3. Add configuration only when the rule needs a user-controlled policy.
 4. Add focused regression tests.
 5. Add or update end-to-end fixtures.
-6. Update the canonical user-facing rule documentation.
+6. Update the canonical rule-registry metadata.
 7. Add a `CHANGELOG.md` entry for user-visible behavior.
 
 Rules must:
@@ -82,8 +109,8 @@ Rules must:
 
 ## Extending AST extraction
 
-Do not use an old AST reference or guess accessors from memory. Follow the
-[source-first AST workflow](docs/internal/AST_DEVELOPMENT.md):
+Do not use an old AST reference or guess accessors from memory. Follow this
+source-first workflow:
 
 1. confirm the exact Squawk versions in `Cargo.toml` and `Cargo.lock`;
 2. inspect the resolved dependency source and grammar;
@@ -107,8 +134,6 @@ When adding modeled state:
 4. add transaction undo state for every mutable component;
 5. test apply, skip, conflict, rollback, rename, drop, and recreate behavior;
 6. update dependency edges and generation metadata where applicable.
-
-See [Architecture and invariants](docs/internal/ARCHITECTURE.md).
 
 ## CLI and report changes
 

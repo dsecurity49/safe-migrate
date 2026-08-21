@@ -50,6 +50,58 @@ an explicit configuration containing `auto_sync = true` cannot make a
 pull-request job attempt database access. A missing explicit `cache` path is
 still an operational error rather than a fallback.
 
+## Using TOML configuration
+
+The `config` input accepts a path to a TOML file; it does not accept inline
+TOML. The Action deliberately does not discover `safe-migrate.toml` by default.
+Without `config`, it uses built-in defaults so a pull request cannot silently
+disable rules by adding or changing a checkout-local configuration file.
+
+In a trusted branch job, pass the checked-out file directly:
+
+```yaml
+      - uses: dsecurity49/safe-migrate@v0.6.0
+        with:
+          path: migrations
+          config: safe-migrate.toml
+```
+
+For a pull-request job that needs a fixed repository configuration, check out
+the base revision into a separate directory and pass that file. The migrations
+still come from the normal pull-request checkout, while the policy comes from
+the reviewed base commit:
+
+```yaml
+      - name: Checkout pull request
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Checkout trusted configuration
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: .safe-migrate-base
+          sparse-checkout: safe-migrate.toml
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - uses: dsecurity49/safe-migrate@v0.6.0
+        with:
+          path: migrations
+          config: .safe-migrate-base/safe-migrate.toml
+```
+
+A team may instead pass the file from the pull-request checkout when changing
+lint policy in the same pull request is intentional. Such a change can alter
+thresholds or disable rules, so review it as executable CI policy rather than
+ordinary documentation.
+
+The file must exist and pass normal safe-migrate configuration validation.
+When it contains `cache_encryption = true`, also set
+`encrypted-cache: "true"` and provide `SAFE_MIGRATE_CACHE_KEY` as shown under
+[Cache encryption](#cache-encryption). A mismatch fails before synchronization.
+
 ## Baseline refresh workflow
 
 Run synchronization from the default branch. The database must be reachable
@@ -197,11 +249,9 @@ The common inputs are:
 - `encrypted-cache`: require encrypted managed or explicit cache data.
 - `advisory`: do not fail the step for completed Tier 1 analysis.
 
-Advanced inputs are `cache`, `config`, `no-cache`, and `output-dir`. Omitting
-`config` is intentional: the Action does not automatically trust
-`safe-migrate.toml` from a pull-request checkout. If a PR workflow opts into an
-explicit config, that file can change the enabled rules and must be reviewed as
-part of the security boundary.
+Advanced inputs are `cache`, `config`, `no-cache`, and `output-dir`. See
+[Using TOML configuration](#using-toml-configuration) before passing a file
+from a pull-request checkout.
 
 The Action exposes:
 
