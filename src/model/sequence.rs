@@ -1,5 +1,3 @@
-// FILE: ./src/model/sequence.rs
-
 use crate::ast::identifiers::ObjectId;
 use serde::{Deserialize, Serialize};
 

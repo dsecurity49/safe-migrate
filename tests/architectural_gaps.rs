@@ -198,18 +198,24 @@ mod architectural_gap_tests {
         }
     }
 
-    // 7. DROP without IF EXISTS must not mutate topology
     #[test]
-    fn test_drop_missing_object_halts_topology_mutation() {
+    fn exact_baseline_treats_missing_unguarded_drop_as_conflict() {
         let engine = setup_engine();
         let mut state = setup_state();
         engine
             .analyze("CREATE TABLE exists_tbl(id int);", &mut state)
             .unwrap();
-        let _ = engine.analyze("DROP TABLE missing_tbl;", &mut state);
+        let violations = engine
+            .analyze("DROP TABLE missing_tbl;", &mut state)
+            .unwrap();
 
         assert!(state.relation_is_present(&object_id("public", "exists_tbl")));
-        assert_eq!(state.local.confidence, Confidence::Tainted);
+        assert_eq!(state.local.confidence, Confidence::Exact);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict")
+        );
     }
 
     // 8. View dependency alias/CTE isolation
@@ -456,7 +462,7 @@ mod architectural_gap_tests {
         }
     }
 
-    // 16. Deep Rename Traversal across Cascade (BUG-004)
+    // Rename traversal across cascade dependencies.
     #[test]
     fn test_deep_rename_traversal_cascade() {
         let engine = setup_engine();
@@ -490,7 +496,7 @@ mod architectural_gap_tests {
         );
     }
 
-    // 17. Partition Cycle Rejection (BUG-012)
+    // Partition cycle rejection.
     #[test]
     fn test_partition_cycle_rejection() {
         let engine = setup_engine();
@@ -561,7 +567,7 @@ mod architectural_gap_tests {
                 .any(|v| v.rule_id == "table-rewrite-storage" && v.tier == ViolationTier::Tier1)
         );
     }
-    // 19. Generation counter rollback (BUG-001/002)
+    // Generation counter rollback.
     #[test]
     fn test_generation_counter_rollback() {
         let engine = setup_engine();
@@ -586,7 +592,7 @@ mod architectural_gap_tests {
         );
     }
 
-    // 20. Partition children cascade (BUG-003)
+    // Partition children in cascade closure.
     #[test]
     fn test_partition_children_cascade_enumeration() {
         let engine = setup_engine();
@@ -613,7 +619,7 @@ mod architectural_gap_tests {
         );
     }
 
-    // 21. Rename updates FK graph edges implicitly via resolver (BUG-004)
+    // Foreign-key graph lookups follow renames.
     #[test]
     fn test_rename_updates_fk_graph_edges() {
         let engine = setup_engine();
@@ -642,7 +648,7 @@ mod architectural_gap_tests {
         assert_eq!(refs[0].0, &object_id("public", "b"));
     }
 
-    // 22. Search path existence check (BUG-005)
+    // Search-path existence checks.
     #[test]
     fn test_search_path_existence_check() {
         let engine = setup_engine();
@@ -673,7 +679,7 @@ mod architectural_gap_tests {
         }
     }
 
-    // 23. Drop without cascade validates dependents (BUG-006)
+    // Non-cascading drops validate dependents.
     #[test]
     fn drop_without_cascade_reports_conflict_and_preserves_dependents() {
         let engine = setup_engine();

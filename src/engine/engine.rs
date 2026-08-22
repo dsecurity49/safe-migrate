@@ -1,4 +1,3 @@
-// FILE: src/engine/engine.rs
 use crate::analysis::mutations::Mutation;
 use crate::analysis::resolver::Resolver;
 use crate::analysis::state::AnalysisState;
@@ -26,8 +25,7 @@ impl SafeMigrateEngine {
         }
     }
 
-    /// Returns the canonical primary rule IDs in evaluation order. This is the
-    /// source of truth for configuration and user-facing rule documentation.
+    /// Returns primary rule IDs in evaluation order.
     pub fn primary_rule_ids(&self) -> Vec<&'static str> {
         registry::primary_rule_ids().collect()
     }
@@ -42,7 +40,7 @@ impl SafeMigrateEngine {
             let violations = self.analyze_single_file(filename, sql, state)?;
             all_violations.extend(violations);
         }
-        // Phase 10.6: Deterministic violation ordering
+        // Stable ordering keeps reports reproducible across files.
         all_violations.sort_by(|a, b| {
             a.tier
                 .cmp(&b.tier)

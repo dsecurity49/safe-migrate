@@ -1,4 +1,3 @@
-// FILE: src/analysis/resolver.rs
 use crate::analysis::facts::{
     AlterIndexActionFact, AlterTableActionFact, PersistenceFact, StatementFact, TypeCreationKind,
 };
@@ -1111,6 +1110,7 @@ impl Resolver {
                 mutations.push(Mutation::CreateRole(CreateRoleMutation {
                     name: r.name.clone(),
                     inherits: r.inherits,
+                    can_login: r.can_login,
                 }));
             }
             StatementFact::AlterRole(r) => {

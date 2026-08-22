@@ -1,5 +1,3 @@
-// FILE: ./src/ast/identifiers.rs
-
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -16,8 +14,8 @@ impl Ident {
         }
     }
 
-    /// Resolves the identifier exactly as PostgreSQL would:
-    /// Quoted identifiers preserve exact casing; unquoted identifiers are case-folded to lowercase.
+    /// Returns the lookup spelling used by the analyzer. Quoted identifiers
+    /// preserve their contents; unquoted identifiers are lowercased.
     pub fn resolve(&self) -> String {
         if self.quoted {
             self.text.clone()
@@ -40,7 +38,7 @@ impl QualifiedName {
 }
 
 /// ObjectId represents a fully resolved, state-machine tracked database object.
-/// By the time an ObjectId is constructed, its schema and name must already be properly case-folded.
+/// Its schema and name must already use their resolved lookup spelling.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObjectId {
     pub schema: String,

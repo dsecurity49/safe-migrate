@@ -1,5 +1,3 @@
-// FILE: src/rules/conflict.rs
-
 use crate::analysis::mutations::Mutation;
 use crate::analysis::state::MutationResult;
 use crate::engine::config::Config;

@@ -32,7 +32,12 @@ pub fn parse_timeout_ms(raw: &str) -> Result<u64, String> {
     }
 
     let bytes = value.as_bytes();
-    let mut number_end = usize::from(bytes.first() == Some(&b'+'));
+    let (mut number_end, sign) = match bytes.first() {
+        Some(b'+') => (1, 1.0),
+        Some(b'-') => (1, -1.0),
+        _ => (0, 1.0),
+    };
+    let has_explicit_sign = number_end == 1;
     let unsigned_start = number_end;
     let hexadecimal = bytes
         .get(number_end..number_end + 2)
@@ -47,11 +52,12 @@ pub fn parse_timeout_ms(raw: &str) -> Result<u64, String> {
             return Err(format!("invalid timeout value '{raw}'"));
         }
     } else {
-        let mut mantissa_digits = 0;
+        let mut integer_digits = 0;
         while bytes.get(number_end).is_some_and(u8::is_ascii_digit) {
             number_end += 1;
-            mantissa_digits += 1;
+            integer_digits += 1;
         }
+        let mut mantissa_digits = integer_digits;
         if bytes.get(number_end) == Some(&b'.') {
             number_end += 1;
             while bytes.get(number_end).is_some_and(u8::is_ascii_digit) {
@@ -60,6 +66,11 @@ pub fn parse_timeout_ms(raw: &str) -> Result<u64, String> {
             }
         }
         if mantissa_digits == 0 {
+            return Err(format!("invalid timeout value '{raw}'"));
+        }
+        // PostgreSQL accepts `.5s`, but its signed-number path requires a
+        // digit before the decimal point.
+        if has_explicit_sign && integer_digits == 0 {
             return Err(format!("invalid timeout value '{raw}'"));
         }
         if matches!(bytes.get(number_end), Some(b'e' | b'E')) {
@@ -100,11 +111,12 @@ pub fn parse_timeout_ms(raw: &str) -> Result<u64, String> {
             .map(|value| value as f64)
             .map_err(|_| format!("invalid timeout value '{raw}'"))?
     } else {
-        number
+        unsigned_number
             .parse::<f64>()
             .map_err(|_| format!("invalid timeout value '{raw}'"))?
     };
-    if !numeric.is_finite() || numeric.is_sign_negative() {
+    let numeric = numeric * sign;
+    if !numeric.is_finite() {
         return Err(format!("invalid timeout value '{raw}'"));
     }
 
@@ -125,13 +137,13 @@ pub fn parse_timeout_ms(raw: &str) -> Result<u64, String> {
     }
     // PostgreSQL's integer GUC parser uses C `rint`, which rounds halfway
     // values to the nearest even integer under its default rounding mode.
-    let rounded = milliseconds.round_ties_even() as u64;
-    if rounded > MAX_TIMEOUT_MS {
+    let rounded = milliseconds.round_ties_even();
+    if rounded < 0.0 || rounded > MAX_TIMEOUT_MS as f64 {
         return Err(format!(
-            "timeout value '{raw}' exceeds PostgreSQL's maximum"
+            "timeout value '{raw}' is outside PostgreSQL's valid range"
         ));
     }
-    Ok(rounded)
+    Ok(rounded as u64)
 }
 
 #[cfg(test)]
@@ -148,7 +160,12 @@ mod tests {
         assert_eq!(parse_timeout_ms("3.5ms").unwrap(), 4);
         assert_eq!(parse_timeout_ms("1e-3s").unwrap(), 1);
         assert_eq!(parse_timeout_ms("0x10ms").unwrap(), 16);
+        assert_eq!(parse_timeout_ms("+0x10ms").unwrap(), 16);
         assert_eq!(parse_timeout_ms("010ms").unwrap(), 8);
+        assert_eq!(parse_timeout_ms(".5s").unwrap(), 500);
+        assert_eq!(parse_timeout_ms("-0.5ms").unwrap(), 0);
+        assert_eq!(parse_timeout_ms("-500us").unwrap(), 0);
+        assert_eq!(parse_timeout_ms("-0x1us").unwrap(), 0);
         assert_eq!(parse_timeout_ms("1.5s").unwrap(), 1_500);
         assert_eq!(parse_timeout_ms("2min").unwrap(), 120_000);
         assert_eq!(parse_timeout_ms("1h").unwrap(), 3_600_000);
@@ -158,6 +175,8 @@ mod tests {
     #[test]
     fn rejects_negative_unknown_and_out_of_range_values() {
         assert!(parse_timeout_ms("-1").is_err());
+        assert!(parse_timeout_ms("-501us").is_err());
+        assert!(parse_timeout_ms("+.5s").is_err());
         assert!(parse_timeout_ms("1sec").is_err());
         assert!(parse_timeout_ms("NaN").is_err());
         assert!(parse_timeout_ms("1e+s").is_err());

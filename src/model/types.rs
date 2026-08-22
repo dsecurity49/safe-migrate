@@ -1,4 +1,3 @@
-// FILE: ./src/model/types.rs
 use crate::ast::identifiers::ObjectId;
 use serde::{Deserialize, Serialize};
 

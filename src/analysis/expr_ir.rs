@@ -1,4 +1,3 @@
-// FILE: src/analysis/expr_ir.rs
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -18,21 +17,14 @@ pub enum ExprIr {
         expr: Box<ExprIr>,
         target_type: String,
     },
-    Omitted, // Added to prevent positional shifting in incomplete expressions (e.g., arr[2:])
+    Omitted,
 }
 
 impl ExprIr {
     pub fn is_volatile(&self) -> bool {
         match self {
             ExprIr::FunctionCall { name, args } => {
-                // Synthetic wrapper functions for nested expressions
-                // e.g. <case>, <array>, <between>, <slice>
-                if name.starts_with('<') && name.ends_with('>') {
-                    return args.iter().any(|a| a.is_volatile());
-                }
-
                 const VOLATILE: &[&str] = &[
-                    // Truly VOLATILE: return different values on every call
                     "clock_timestamp",
                     "timeofday",
                     "random",
@@ -50,13 +42,16 @@ impl ExprIr {
                     "uuid_generate_v1",
                     "uuid_generate_v1mc",
                     "uuid_generate_v4",
-                    // Note: now(), current_timestamp, current_date, current_user,
-                    // transaction_timestamp(), statement_timestamp() are all STABLE —
-                    // they return the transaction start time and are constant within
-                    // a statement. They do NOT require a table rewrite on PG11+.
                 ];
 
-                VOLATILE.contains(&name.to_lowercase().as_str())
+                // The lookup contains only VOLATILE functions; nested calls
+                // are classified recursively below.
+                let normalized = name.to_ascii_lowercase();
+                let known_volatile = VOLATILE.contains(&normalized.as_str())
+                    || normalized
+                        .strip_prefix("pg_catalog.")
+                        .is_some_and(|name| VOLATILE.contains(&name));
+                known_volatile || args.iter().any(ExprIr::is_volatile)
             }
             ExprIr::BinaryOp { left, right, .. } => left.is_volatile() || right.is_volatile(),
             ExprIr::Cast { expr, .. } => expr.is_volatile(),

@@ -32,7 +32,6 @@ impl Rule for OverbroadGrantRule {
         let mut violations = Vec::new();
 
         if let Mutation::Grant(grant) = mutation {
-            // Determine object_name and object_kind if possible
             let (obj_kind, obj_name) = match &grant.target {
                 crate::analysis::mutations::ResolvedGrantTarget::Tables(tables) => (
                     ObjectKind::Table,
@@ -47,7 +46,6 @@ impl Rule for OverbroadGrantRule {
                 }
             };
 
-            // Case 1: GRANT ... TO PUBLIC -> Tier 1
             let is_public = grant.grantees.iter().any(|g| {
                 if let crate::analysis::facts::RoleFact::Named { name, .. } = g {
                     name == "public"
@@ -71,7 +69,6 @@ impl Rule for OverbroadGrantRule {
                 });
             }
 
-            // Case 2: GRANT ALL PRIVILEGES to a non-owner role -> Tier 2
             let is_all_privs = match &grant.privileges {
                 crate::analysis::facts::PrivilegeSpec::All => true,
                 crate::analysis::facts::PrivilegeSpec::List(privs) => privs
@@ -80,28 +77,29 @@ impl Rule for OverbroadGrantRule {
             };
 
             if is_all_privs {
-                let mut is_owner = false;
-                if let crate::analysis::mutations::ResolvedGrantTarget::Tables(tables) =
-                    &grant.target
-                {
-                    for table_id in tables {
-                        if let Some(crate::model::relation::RelationOverlay::Present(rel)) =
-                            state.local.relations.get(table_id)
-                            && grant.grantees.iter().any(|g| {
-                                if let crate::analysis::facts::RoleFact::Named { name, .. } = g {
-                                    // Simple name match for owner check
-                                    rel.owner.name == *name
-                                } else {
-                                    false
-                                }
+                let every_grantee_owns_every_table = match &grant.target {
+                    crate::analysis::mutations::ResolvedGrantTarget::Tables(tables)
+                        if !tables.is_empty() && !grant.grantees.is_empty() =>
+                    {
+                        grant.grantees.iter().all(|grantee| {
+                            let crate::analysis::facts::RoleFact::Named { name, .. } = grantee
+                            else {
+                                return false;
+                            };
+                            // PostgreSQL roles are global, so owner comparison
+                            // uses the role name.
+                            tables.iter().all(|table_id| {
+                                matches!(
+                                    state.local.relations.get(table_id),
+                                    Some(crate::model::relation::RelationOverlay::Present(relation))
+                                        if relation.owner.name == *name
+                                )
                             })
-                        {
-                            is_owner = true;
-                            break;
-                        }
+                        })
                     }
-                }
-                if !is_owner {
+                    _ => false,
+                };
+                if !every_grantee_owns_every_table {
                     violations.push(Violation {
                         source_range: None,
                         rule_id: self.id(),
@@ -118,7 +116,6 @@ impl Rule for OverbroadGrantRule {
                 }
             }
 
-            // Case 3: WITH GRANT OPTION -> Tier 2
             if grant.with_grant_option {
                 violations.push(Violation { source_range: None,
                     rule_id: self.id(),

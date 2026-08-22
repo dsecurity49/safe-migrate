@@ -1,4 +1,3 @@
-// FILE: src/rules/constraints.rs
 use crate::analysis::mutations::{AlterTableActionMutation, Mutation};
 use crate::analysis::state::{AnalysisState, CascadeResult, MutationResult};
 use crate::engine::config::Config;
@@ -35,10 +34,9 @@ impl Rule for BlockingConstraintRule {
         let mut violations = Vec::new();
 
         if let Mutation::AlterTable(alter) = mutation {
-            // Get child table properties
             let (is_temp, mut is_stale, child_rows) = match pre_state.relations.get(&alter.id) {
                 Some(rel) => {
-                    // BUG FIX: Only mark as stale if it actually existed in the baseline database!
+                    // Only cache-backed relations have meaningful statistics age.
                     let stale = rel.is_stale() && state.baseline_relations.contains(&alter.id);
                     (
                         rel.persistence == Persistence::Temporary,
@@ -49,7 +47,7 @@ impl Rule for BlockingConstraintRule {
                 None => (false, true, config.default_rows),
             };
 
-            // If the table being altered is a temp table, schema locks don't block other sessions.
+            // Temporary-table locks do not block other sessions.
             if is_temp {
                 return violations;
             }
@@ -79,11 +77,9 @@ impl Rule for BlockingConstraintRule {
                 return violations;
             }
 
-            // Evaluate max locked rows based on the specific action
             let max_locked_rows = match &alter.action {
                 AlterTableActionMutation::AddForeignKey { to_table, .. } => {
-                    // BUG FIX: Foreign keys lock BOTH the child and the parent table.
-                    // We must escalate the lock tier if the parent table is massive, even if the child is empty.
+                    // Foreign keys can lock both sides; classify by the larger table.
                     let parent_rows = match pre_state.relations.get(to_table) {
                         Some(parent_rel) => {
                             if parent_rel.is_stale() && state.baseline_relations.contains(to_table)
@@ -102,7 +98,6 @@ impl Rule for BlockingConstraintRule {
                 _ => child_rows,
             };
 
-            // FIX: Evaluate the violation tier using granular RuleConfig overrides
             let tier1_threshold = config.rule_tier1_threshold(self.id());
             let tier2_threshold = config.rule_tier2_threshold(self.id());
 

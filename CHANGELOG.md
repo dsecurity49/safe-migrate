@@ -11,17 +11,21 @@ notes are available on the
   New Tier 2 rules report missing, disabled, or ineffective migration
   timeouts and follow timeout changes made by the migration.
 - Cache V6 stores these values. `cache inspect`, JSON, and Markdown
-  reports expose the observed values; V1–V5 caches must be rebuilt with
-  `safe-migrate sync`.
+  reports expose the observed values; V1–V5 caches must be rebuilt. Non-function
+  routines, publications, and subscriptions remain outside the synchronized
+  baseline, so baseline-dependent analysis for them is `Tainted`.
 - Fixed transaction-local `search_path` handling and tightened rule
   configuration so unsupported threshold fields are rejected. Corrected the
   enum-in-transaction rule to describe PostgreSQL's commit-time restriction
   and report it as a warning instead of claiming the statement cannot run.
-- The GitHub Action can refresh and reuse named synchronized baselines. Trusted
-  scheduled jobs connect once; pull-request lint jobs restore the baseline and
-  remain offline, with a `Tainted` fallback when none is available. Managed
-  paths are portable across runner roots, and plaintext and encrypted entries
-  use separate keys.
+- Synchronization now reads one repeatable-read catalog snapshot, rejects blank
+  connection strings, and refuses cache files larger than the reader accepts.
+  Identifier folding, guarded drops, nested volatile expressions, routine
+  lifecycles, and owner checks now follow PostgreSQL more closely.
+- The GitHub Action can refresh and reuse named synchronized baselines. Only
+  Action-controlled sync connects to PostgreSQL; lint stays offline and ignores
+  config-driven `auto_sync`. Cache misses run `Tainted`. Exact tags install
+  release assets, while full commit SHAs build the checked-out source.
 
 ## v0.5.0 — 2026-08-14
 
@@ -58,7 +62,7 @@ notes are available on the
 
 ## v0.4.4 — 2026-08-02
 
-- Added sourced, real-world-inspired differential cases for staged foreign-key
+- Added sourced differential cases for staged foreign-key
   validation, missing foreign-key columns, and index-backed constraints.
 - Corrected constraint fixtures that previously reused CHECK statements under
   UNIQUE, PRIMARY KEY, and exclusion filenames.

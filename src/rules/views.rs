@@ -1,4 +1,3 @@
-// FILE: src/rules/views.rs
 use crate::analysis::mutations::Mutation;
 use crate::analysis::state::{AnalysisState, CascadeResult, MutationResult};
 use crate::engine::config::Config;

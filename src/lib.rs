@@ -1,7 +1,3 @@
-// FILE: ./src/lib.rs
-
-// FILE: src/lib.rs
-
 pub mod analysis;
 pub mod ast;
 pub mod db;

@@ -8,7 +8,7 @@ with typed AST extraction, stateful schema simulation, and safety rules.
 - [README and user guide](README.md)
 - [GitHub Action guide](docs/GITHUB_ACTIONS.md)
 - [CLI and report contract](docs/CONTRACT.md)
-- [Evidence behind differential fixtures](docs/REAL_WORLD_CASES.md)
+- [Live fixtures and sourced cases](live_tests/README.md)
 
 ## Project structure
 
@@ -22,12 +22,10 @@ src/report/     human, JSON, and interactive reporting
 src/rules/      safety rule implementations
 tests/          integration, state-machine, rule, CLI, and regression tests
 live_tests/     end-to-end SQL fixtures and frozen database cache
-docs/           Action guide, CLI/report contract, and differential evidence
+docs/           Action guide and CLI/report contract
 ```
 
-Prefer this stable directory-level map over a copied inventory of every source
-file or rule. Use `rg --files src tests live_tests` when you need the current
-layout.
+`rg --files src tests live_tests` lists the current files.
 
 ## Development commands
 
@@ -59,7 +57,7 @@ cd live_tests
 The fixture runner invokes the compiled binary. Most rule directories lint each
 file independently; chain-conflict fixtures use `lint-chain`.
 
-Repository-level contracts:
+Repository checks:
 
 ```bash
 sh scripts/test-install-dry-run
@@ -72,33 +70,34 @@ The Action test covers installation, cache handling, gates, summaries, and
 annotations. The fuzz script generates SQL inputs and rejects crashes,
 timeouts, operational errors, invalid JSON, and inconsistent exit statuses.
 
-Live database contracts require a disposable local PostgreSQL database:
+Live checks require a disposable local PostgreSQL database:
 
 ```bash
-export DATABASE_URL='postgres://USER:PASSWORD@localhost:5432/TEST_DATABASE'
+export DATABASE_URL='postgres://USER:PASSWORD@localhost:5432/safe_migrate'
 scripts/live-differential
 scripts/live-auto-sync
 scripts/live-cache-encryption
 ```
 
-The differential harness mutates and resets its test schemas and fixture
-objects. Never point it at a shared or production database. CI runs the enabled
-differential manifest against PostgreSQL 14 through 18; excluded fixtures and
-their reasons live in `live_tests/differential_manifest.json`.
+The differential harness requires a local database named `safe_migrate` and
+mutates and resets its test schemas and fixture objects. Never point it at a
+shared or production database. CI runs the enabled differential manifest
+against PostgreSQL 14 through 18; excluded fixtures and their reasons live in
+`live_tests/differential_manifest.json`.
 
 ## Adding or changing a rule
 
 1. Implement one safety concept under `src/rules/`.
-2. Register the rule in the engine's canonical rule list.
+2. Register the rule in the primary rule registry.
 3. Add configuration only when the rule needs a user-controlled policy.
 4. Add focused regression tests.
 5. Add or update end-to-end fixtures.
-6. Update the canonical rule-registry metadata.
+6. Update the rule-registry metadata.
 7. Add a `CHANGELOG.md` entry for user-visible behavior.
 
 Rules must:
 
-- handle `MutationResult::Skipped` deliberately;
+- define behavior for `MutationResult::Skipped`;
 - distinguish conflicts from applied mutations;
 - infer operation and object kinds from the mutation;
 - avoid mutating analysis state;
@@ -109,8 +108,7 @@ Rules must:
 
 ## Extending AST extraction
 
-Do not use an old AST reference or guess accessors from memory. Follow this
-source-first workflow:
+Use the pinned Squawk source and grammar when changing AST extraction:
 
 1. confirm the exact Squawk versions in `Cargo.toml` and `Cargo.lock`;
 2. inspect the resolved dependency source and grammar;
@@ -157,10 +155,9 @@ Add regression coverage with every behavior change:
 - CLI changes: assert standard output, standard error, and exit status.
 - Database metadata changes: use existing cache and live-test helpers.
 
-`safe_*.sql` fixtures are expected not to emit the target rule. Numbered
-fixtures are expected to emit the target rule. A fixture count is not a
-correctness claim by itself; prefer precise assertions in Rust tests for
-object, tier, reason, and source behavior.
+`safe_*.sql` fixtures must not emit the target rule. Numbered fixtures must emit
+the target rule. Use Rust tests for exact object, tier, reason, and source
+assertions. Fixture counts only check suite coverage.
 
 ## Database synchronization
 
@@ -173,6 +170,11 @@ The frozen cache under `live_tests/` belongs to the test corpus. Update it only
 when a fixture requires a changed baseline, and explain the assumption in the
 pull request.
 
+Cache V6 contains ordinary functions but not the other routine kinds in
+PostgreSQL's shared routine namespace. It also omits publications and
+subscriptions. Treat baseline-dependent operations on those objects as unknown
+and taint the analysis; do not infer absence from missing cache data.
+
 ## Code style
 
 - Format with `rustfmt`.
@@ -183,7 +185,8 @@ pull request.
 
 ## Reporting bugs
 
-Include:
+[Open an issue](https://github.com/dsecurity49/safe-migrate/issues/new/choose)
+with:
 
 - minimal SQL;
 - expected and actual output;
@@ -191,16 +194,3 @@ Include:
 - PostgreSQL version or assumed version;
 - whether a cache was used;
 - relevant configuration.
-
-Classify the likely layer:
-
-- AST extraction: add an exact visitor regression and inspect the pinned Squawk
-  source.
-- Resolution/state: test mutations, overlays, dependencies, and rollback.
-- Rule: test false-positive/false-negative behavior and severity.
-- CLI/report: test output channels, JSON, and exit status.
-
-## Questions
-
-Open an issue at <https://github.com/dsecurity49/safe-migrate> with a minimal
-reproduction and the affected layer.

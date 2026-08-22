@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# Run safe-migrate live tests
+# Run cached SQL fixtures.
 set -uo pipefail
+shopt -s nullglob
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(CDPATH='' cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="${SCRIPT_DIR}/../target/debug/safe-migrate"
 
 if [ ! -x "$BIN" ]; then
-    echo "[!] safe-migrate binary not found. Please run 'cargo build' first."
+    echo "[!] safe-migrate binary not found; run 'cargo build' first."
     exit 1
 fi
 
 CACHE_FILE="${SCRIPT_DIR}/.safe-migrate.cache"
 
-# Options
 VERBOSE=0
 OFFLINE=0
 TARGET_DIR=""
@@ -29,10 +29,12 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         -d|--dir)
+            [ "$#" -ge 2 ] || { echo "$1 requires a directory" >&2; exit 1; }
             TARGET_DIR="$2"
             shift 2
             ;;
         -t|--test)
+            [ "$#" -ge 2 ] || { echo "$1 requires a SQL file" >&2; exit 1; }
             TARGET_FILE="$2"
             shift 2
             ;;
@@ -52,29 +54,48 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+command -v python3 >/dev/null 2>&1 || {
+    echo "[!] python3 is required" >&2
+    exit 1
+}
+
+if [ "$OFFLINE" -eq 0 ]; then
+    [ -f "$CACHE_FILE" ] || {
+        echo "[!] frozen cache not found: $CACHE_FILE" >&2
+        exit 1
+    }
+    "$BIN" cache inspect --cache "$CACHE_FILE" --config /dev/null >/dev/null || {
+        echo "[!] frozen cache is invalid: $CACHE_FILE" >&2
+        exit 1
+    }
+fi
+
 total_pass=0
 total_fail=0
 total_skip=0
 failures=""
 
-# Determine which directories to scan
 if [ -n "$TARGET_FILE" ]; then
-    dirs="$(dirname "$TARGET_FILE")"
+    [ -f "$TARGET_FILE" ] || { echo "Test file not found: $TARGET_FILE" >&2; exit 1; }
+    [[ "$TARGET_FILE" == *.sql ]] || { echo "Test file must end in .sql: $TARGET_FILE" >&2; exit 1; }
+    dirs=("$(dirname -- "$TARGET_FILE")")
 elif [ -n "$TARGET_DIR" ]; then
-    dirs="${SCRIPT_DIR}/${TARGET_DIR}"
+    target_path="${SCRIPT_DIR}/${TARGET_DIR}"
+    [ -d "$target_path" ] || { echo "Rule directory not found: $TARGET_DIR" >&2; exit 1; }
+    dirs=("$target_path")
 else
-    dirs="${SCRIPT_DIR}"/rule_*/
+    dirs=("${SCRIPT_DIR}"/rule_*/)
 fi
+
+[ "${#dirs[@]}" -gt 0 ] || { echo "No rule directories found" >&2; exit 1; }
 
 echo "Starting test runner..."
 [ "$OFFLINE" -eq 1 ] && echo "Mode: OFFLINE (--no-cache)"
 [ "$OFFLINE" -eq 0 ] && echo "Mode: CACHED (${CACHE_FILE})"
 
-for dir in $dirs; do
-    [ -d "$dir" ] || continue
+for dir in "${dirs[@]}"; do
     rule_dir=$(basename "$dir")
     
-    # Extract rule_id from dir name: rule_NN_rule-id  →  rule-id
     rule_id="${rule_dir#rule_[0-9][0-9]_}"
     [ -z "$rule_id" ] && rule_id="${rule_dir#rule_[0-9]_}"
 
@@ -82,14 +103,13 @@ for dir in $dirs; do
     dir_fail=0
     dir_skip=0
 
-    # Determine files to scan
     if [ -n "$TARGET_FILE" ]; then
-        files="$TARGET_FILE"
+        files=("$TARGET_FILE")
     else
-        files="$dir"/*.sql
+        files=("$dir"/*.sql)
     fi
 
-    # Handle chain-conflict specially
+    # Chain-conflict fixtures run as one ordered migration.
     if [[ "$rule_dir" == *"chain-conflict"* && -z "$TARGET_FILE" ]]; then
         SM_ARGS=("lint-chain" "-d" "$dir")
         if [ "$OFFLINE" -eq 1 ]; then
@@ -107,7 +127,6 @@ for dir in $dirs; do
             dir_fail=$((dir_fail + 1))
             failures="$failures  [CRASH] $rule_dir\n"
         else
-            # Extract the rule_ids from all violations in the chain
             violation_rules=$(echo "$json" | python3 -c "
 import sys, json
 try:
@@ -130,12 +149,9 @@ except:
             fi
         fi
     else
-        # Standard linting per file
-        for file in $files; do
-            [ -f "$file" ] || continue
+        for file in "${files[@]}"; do
             fname=$(basename "$file")
 
-            # Build safe-migrate args for single file
             SM_ARGS=("lint")
             if [ "$OFFLINE" -eq 1 ]; then
                 SM_ARGS+=("--no-cache")
@@ -144,7 +160,7 @@ except:
             fi
             SM_ARGS+=("--json" "-f" "$file")
 
-            # Run safe-migrate lint, extract JSON (skip the "Analyzing migration:" line)
+            # Reports can follow diagnostics captured from stderr.
             raw_output=$("$BIN" "${SM_ARGS[@]}" 2>&1)
             json=$(echo "$raw_output" | sed -n '/^{/,$ p')
             
@@ -155,7 +171,6 @@ except:
                 continue
             fi
 
-            # Extract the rule_ids from all violations
             violation_rules=$(echo "$json" | python3 -c "
 import sys, json
 try:
@@ -194,7 +209,6 @@ except:
     total_fail=$((total_fail + dir_fail))
     total_skip=$((total_skip + dir_skip))
     
-    # Summary line is always printed unless we are running a single test file
     if [ -z "$TARGET_FILE" ]; then
         if [ "$dir_fail" -gt 0 ] || [ "$dir_skip" -gt 0 ]; then
             echo -e "  ❌ \033[31m$rule_dir:\033[0m $dir_pass pass, $dir_fail fail, $dir_skip skip"
@@ -206,7 +220,11 @@ done
 
 echo ""
 echo "=================================================="
-if [ "$total_fail" -eq 0 ] && [ "$total_skip" -eq 0 ]; then
+total_run=$((total_pass + total_fail))
+if [ "$total_run" -eq 0 ]; then
+    echo -e " \033[31mNO TESTS RAN\033[0m"
+    total_fail=1
+elif [ "$total_fail" -eq 0 ] && [ "$total_skip" -eq 0 ]; then
     echo -e " \033[32mALL TESTS PASSED ($total_pass)\033[0m"
 else
     echo -e " \033[31mTOTAL: $total_pass passed, $total_fail failed, $total_skip skipped\033[0m"
@@ -218,4 +236,7 @@ if [ -n "$failures" ]; then
     echo -e "$failures"
 fi
 
-exit $total_fail
+if [ "$total_fail" -ne 0 ]; then
+    exit 1
+fi
+exit 0

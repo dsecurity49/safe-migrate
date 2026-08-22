@@ -27,7 +27,7 @@ if printf '%s\n' "$action_ref" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
   }
   printf '%s\n' "$action_ref"
 elif printf '%s\n' "$action_ref" | grep -Eq '^[0-9a-f]{40}$'; then
-  printf 'v%s\n' "$package_version"
+  printf '%s\n' source
 else
   printf "Published safe-migrate Action references must be an exact semantic tag or full 40-character commit SHA; mutable reference '%s' is not supported\n" \
     "$action_ref" >&2

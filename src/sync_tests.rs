@@ -42,6 +42,32 @@ mod tests {
         assert_eq!(std::fs::read(tmp.path()).unwrap(), b"known-good-cache");
     }
 
+    fn assert_invalid_database_url_preserves_existing_cache(database_url: &str) {
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(b"known-good-cache").unwrap();
+        tmp.flush().unwrap();
+
+        let _database_url = EnvironmentValueGuard::set("DATABASE_URL", database_url);
+        let error = sync_cache(tmp.path(), None, false).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("DATABASE_URL must not be empty or whitespace")
+        );
+        assert_eq!(std::fs::read(tmp.path()).unwrap(), b"known-good-cache");
+    }
+
+    #[test]
+    fn test_blank_database_url_failure_preserves_existing_cache() {
+        assert_invalid_database_url_preserves_existing_cache("");
+    }
+
+    #[test]
+    fn test_whitespace_database_url_failure_preserves_existing_cache() {
+        assert_invalid_database_url_preserves_existing_cache(" \t\r\n");
+    }
+
     #[test]
     fn test_remote_host_detection_keeps_local_connections_supported() {
         assert!(is_local_host("localhost"));
@@ -171,12 +197,11 @@ mod tests {
             },
         );
 
-        // Serialize to JSON
+        // Cache V6 uses bincode.
         let versioned = crate::db::cache::DbCacheVersioned::V6(Box::new(cache));
         let config = bincode::config::standard().with_variable_int_encoding();
         let encoded = bincode::serde::encode_to_vec(&versioned, config).unwrap();
 
-        // Deserialize back
         let decoded: crate::db::cache::DbCacheVersioned =
             bincode::serde::decode_from_slice(&encoded, config)
                 .unwrap()
@@ -312,6 +337,7 @@ mod tests {
         };
         let current = crate::model::function::FunctionState {
             id,
+            routine_kind: crate::model::function::RoutineKind::Function,
             arg_types: vec!["mood".into()],
             arg_type_ids: vec![Some(ObjectId::new("public", "mood"))],
             return_type: "mood".into(),

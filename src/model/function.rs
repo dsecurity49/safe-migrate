@@ -14,9 +14,20 @@ pub enum SecurityMode {
     Definer,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RoutineKind {
+    #[default]
+    Function,
+    Procedure,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FunctionState {
     pub id: ObjectId,
+    /// Synchronized entries are functions; this distinguishes procedures
+    /// created during the analyzed migration chain.
+    #[serde(skip, default)]
+    pub routine_kind: RoutineKind,
     pub arg_types: Vec<String>,
     /// Derived from `arg_types` when a cache enters analysis. Keeping it out
     /// of the cache preserves the stable binary representation.

@@ -1,4 +1,3 @@
-// FILE: src/model/relation.rs
 use crate::ast::identifiers::ObjectId;
 use crate::model::column::Column;
 use serde::{Deserialize, Serialize};
@@ -75,7 +74,8 @@ pub struct RelationState {
     pub policies: HashSet<String>,
     pub last_analyze: Option<String>,
     pub last_autoanalyze: Option<String>,
-    pub created_at_tx_depth: usize, // Phase 1 FIX: Same-Transaction index tracking
+    /// Transaction depth at creation, used for same-transaction index checks.
+    pub created_at_tx_depth: usize,
     pub privileges: PrivilegeMatrix,
     pub partition_type: Option<String>, // e.g., "RANGE", "LIST", "HASH"
     pub partition_by: Option<String>,   // The partition key expression

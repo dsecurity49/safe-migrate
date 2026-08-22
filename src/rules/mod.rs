@@ -1,4 +1,3 @@
-// FILE: src/rules/mod.rs
 pub mod conflict;
 pub mod constraints;
 pub mod destructive;

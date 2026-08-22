@@ -11,7 +11,7 @@ representative database or planning application rollouts and backfills.
 
 ### With Rust
 
-Cargo is the primary installation method when Rust is already available:
+If Rust is installed:
 
 ```bash
 cargo install safe-migrate --locked
@@ -20,8 +20,8 @@ safe-migrate --version
 
 ### Prebuilt binary
 
-The installer detects supported Linux, macOS, Windows/MSYS, and Termux targets,
-verifies the release checksum, and installs the latest published binary:
+The installer selects a supported Linux, macOS, Windows/MSYS, or Termux target
+and verifies the release checksum:
 
 ```bash
 curl -fsSL \
@@ -30,9 +30,7 @@ curl -fsSL \
 safe-migrate --version
 ```
 
-Piping a script from the default branch is convenient but not reproducible.
-Review [install.sh](install.sh) first or download a tagged installer when you
-need to pin exactly what runs:
+To pin the installer and binary to one release:
 
 ```bash
 VERSION='<release-tag>'
@@ -87,6 +85,12 @@ objects depend on it, which role and search path resolve an unqualified name,
 or which timeout defaults the migration session will inherit. `sync` captures
 that evidence once; subsequent reviews stay local and use the same baseline.
 
+Cache V6 synchronizes ordinary functions, but not other routine kinds that
+share PostgreSQL's routine namespace. It also omits publications and
+subscriptions. Baseline-dependent operations on those objects remain unknown
+and taint the analysis; safe-migrate does not infer that an unsynchronized
+object is absent.
+
 Run sync with the database, role, and role/database defaults intended for the
 migration runner. Sync reads settings but does not change them. If the runner
 does not already enforce timeouts, put them explicitly in the migration:
@@ -114,7 +118,7 @@ safe-migrate rules
 Useful options:
 
 - `lint` and `lint-chain`: `--cache <path>`, `--config <path>`, `--no-cache`,
-  `--json`, and `--markdown`.
+  `--no-auto-sync`, `--json`, and `--markdown`.
 - `sync`: `--out <path>` selects the cache destination, `--config <path>`
   selects configuration, and `--schemas public,auth` limits the synchronized
   schema scope.
@@ -128,10 +132,9 @@ Run `safe-migrate <command> --help` for the complete command reference.
 
 ## Rule discovery
 
-Use the CLI registry instead of a copied documentation table. It is the
-canonical source for every primary rule's ID, title, impact, default tier,
-remediation, supported configuration fields, and effective configuration.
-The discovery document is schema version 2; lint JSON remains schema version 1.
+`safe-migrate rules` lists rule IDs, tiers, remediation, supported
+configuration fields, and effective settings. Rule discovery JSON uses schema
+version 2; lint JSON uses schema version 1.
 
 ```bash
 safe-migrate rules
@@ -139,8 +142,7 @@ safe-migrate rules --rule require-concurrent-index
 safe-migrate rules --rule require-concurrent-index --json
 ```
 
-Unknown IDs fail without changing analysis configuration. Use `--config` when
-you need the discovery output to reflect a reviewed non-default configuration.
+Unknown IDs are errors. Pass `--config` to include settings from a TOML file.
 
 ## Chain analysis
 
@@ -163,9 +165,9 @@ Findings use three tiers:
 
 | Tier | Meaning |
 | --- | --- |
-| Tier 1 — `HALT` | The migration should be corrected before deployment. |
-| Tier 2 — `WARN` | The migration or available evidence needs review. |
-| Tier 3 — `SAFE` | Lower-risk or informational; safeguards still apply. |
+| Tier 1 — `HALT` | Fix before deployment. |
+| Tier 2 — `WARN` | Review required. |
+| Tier 3 — `SAFE` | Informational or lower-risk. |
 
 Reports also include confidence:
 
@@ -186,8 +188,9 @@ output.
 
 ## Configuration
 
-All settings are optional. By default, safe-migrate reads
-`safe-migrate.toml` from the current directory.
+Without `--config`, the CLI reads `safe-migrate.toml` from the current
+directory when it exists and otherwise uses built-in defaults. A path passed
+with `--config` must exist and pass validation.
 
 ```toml
 # Lock-sensitive size thresholds.
@@ -217,12 +220,11 @@ disabled = true
 ```
 
 Every primary rule supports `disabled`; only row-sensitive rules support one or
-both threshold fields. `safe-migrate rules --json` is the authority for each
-rule's `supported_configuration_fields`. Unknown settings, unsupported fields,
-and unknown primary rule IDs are rejected, so configuration mistakes cannot
-silently change analysis.
+both threshold fields. `safe-migrate rules --json` lists the supported fields
+for each rule. Unknown settings, unsupported fields, and unknown primary rule
+IDs are errors.
 
-### Suppressing reviewed findings
+### Suppressions
 
 Use a primary rule ID in a SQL comment to suppress that rule for one statement
 or the whole file:
@@ -240,11 +242,12 @@ its review.
 ### Automatic sync
 
 `auto_sync = true` refreshes the cache before `lint` and `lint-chain`. There is
-no command-line flag for it. If refresh fails, safe-migrate prints the cause and
-continues with the previous readable cache; the old cache is replaced only
-after a new cache has been written successfully. `--no-cache` bypasses
-automatic sync. The previous cache must already be V6; an unsupported V1–V5
-cache cannot be reused after a failed refresh.
+no command-line flag to enable it. Use `--no-auto-sync` to suppress it for one
+lint run. If refresh fails, safe-migrate prints the cause and continues with the
+previous readable cache; the old cache is replaced only after a new cache has
+been written successfully. `--no-cache` also bypasses automatic sync. The
+previous cache must already be V6; an unsupported V1–V5 cache cannot be reused
+after a failed refresh.
 
 ### Cache encryption
 
@@ -261,8 +264,8 @@ plaintext caches, and plaintext mode rejects encrypted caches. Changing modes
 requires a fresh `sync`.
 
 Cache files contain schema and role names, dependencies, privileges, and
-statistics. They do not contain connection credentials or password hashes, but
-should still be treated as sensitive and kept out of public artifacts.
+statistics. They do not contain connection credentials or password hashes.
+Treat cache files as sensitive and do not publish them.
 
 ### Cache compatibility
 
@@ -310,7 +313,12 @@ Create and refresh the baseline in a trusted default-branch workflow:
 Use a self-hosted runner or an SSH tunnel because direct remote database URLs
 are rejected. Cache encryption is recommended: GitHub caches can be read by
 fork pull requests and are not signed. Fork jobs without the encryption secret
-fall back to a `Tainted` preview.
+lint without the baseline and report `Tainted` confidence.
+
+The Action never discovers checkout-local TOML automatically. Pass `config`
+when the workflow should use a reviewed file. The Action suppresses
+configuration-driven `auto_sync` while linting; only `sync: "true"` performs
+the Action-controlled database refresh.
 
 See the [GitHub Action guide](docs/GITHUB_ACTIONS.md) for complete workflows,
 first-run setup, encryption, named baselines, cache lifetime, outputs, and
@@ -320,7 +328,6 @@ failure behavior.
 
 - [CLI and report contract](docs/CONTRACT.md)
 - [GitHub Action guide](docs/GITHUB_ACTIONS.md)
-- [Evidence behind differential fixtures](docs/REAL_WORLD_CASES.md)
 - [Contributing](CONTRIBUTING.md)
 - [Release history](CHANGELOG.md)
 - [Releases and binary downloads](https://github.com/dsecurity49/safe-migrate/releases)

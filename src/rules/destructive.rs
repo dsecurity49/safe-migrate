@@ -1,4 +1,3 @@
-// FILE: src/rules/destructive.rs
 use crate::analysis::mutations::{AlterTableActionMutation, Mutation};
 use crate::analysis::state::{AnalysisState, CascadeResult, MutationResult};
 use crate::engine::config::Config;
@@ -141,8 +140,7 @@ impl Rule for SizeAwareAddColumnRule {
                         let wide = rel.columns.iter().any(|c| {
                             c.avg_width.unwrap_or(0) >= config.toast_width_threshold_bytes
                         });
-                        // BUG FIX: Only mark as stale if it actually existed in the baseline database!
-                        // Tables created in this migration script are 0-rows fresh, not stale.
+                        // Only cache-backed relations have meaningful statistics age.
                         let stale = rel.is_stale() && state.baseline_relations.contains(&alter.id);
                         (
                             wide,
@@ -151,7 +149,7 @@ impl Rule for SizeAwareAddColumnRule {
                         )
                     }
                     None => {
-                        // Table is completely unknown (not in cache, not in migration). We are guessing. Mark as stale.
+                        // Missing relation metadata uses the conservative fallback.
                         (false, true, config.default_rows)
                     }
                 };
@@ -437,10 +435,9 @@ impl Rule for ReversibilityRule {
         }
 
         if let Reversibility::Irreversible = classify(mutation) {
-            // Guard: ReversibilityRule should not fire for DropDatabase,
-            // as DropDatabaseRule handles it specifically.
+            // DropDatabaseRule owns this finding.
             if matches!(mutation, Mutation::DropDatabase(_)) {
-                return violations; // Return early, let DropDatabaseRule handle it
+                return violations;
             }
             let mut rows = if let Mutation::AlterTable(a) = mutation {
                 pre_state
@@ -756,23 +753,23 @@ impl TypeChangeRewriteRule {
     /// Detects whether a type change narrows a VARCHAR(n) column
     /// using type_modifier values from the cache.
     ///
-    /// atttypmod for VARCHAR(n) encodes the length limit:
-    ///   typmod = (limit + 4) for VARCHAR, so limit = typmod - 4
+    /// atttypmod for VARCHAR(n) encodes the character limit:
+    ///   typmod = (limit + VARHDRSZ), where VARHDRSZ is 4
     ///
-    /// A smaller typmod means a smaller limit, which is lossy.
+    /// A smaller typmod means a smaller character limit, which is lossy.
     /// Returns true if the new modifier represents a smaller limit than the old.
     pub fn is_lossy_varchar_narrowing(
         old_modifier: Option<i32>,
         new_modifier: Option<i32>,
     ) -> bool {
         match (old_modifier, new_modifier) {
-            // In Postgres, -1 is unbounded. If we go from unbounded to anything bounded (>= 4), it's lossy.
+            // PostgreSQL uses -1 for an unbounded character limit.
             (Some(-1), Some(new)) if new != -1 => true,
             // If the new one is unbounded, it's never narrowing
             (_, Some(-1)) => false,
-            // Both bounded: narrowing if new limit is smaller
+            // Bounded values narrow when the new character limit is smaller.
             (Some(old), Some(new)) => new < old,
-            // Going from no modifier (often implying unbounded or default) to a bounded modifier is lossy
+            // A missing modifier cannot prove a bounded old limit.
             (None, Some(new)) if new != -1 => true,
             _ => false,
         }
@@ -798,7 +795,7 @@ fn parse_numeric_params(ty: &str) -> Option<(i32, i32)> {
 
 /// Extracts a synthetic type_modifier-like value from a type string.
 /// Used when the new type comes from the migration SQL (not from the cache).
-/// For varchar(N) types, approximates the atttypmod value.
+/// For varchar(N), derives the atttypmod from the character limit.
 pub fn extract_type_modifier_from_type_string(ty: &str) -> Option<i32> {
     let lower = ty.to_lowercase().trim().to_string();
     // Check for varchar(N) or character varying(N)
@@ -807,7 +804,7 @@ pub fn extract_type_modifier_from_type_string(ty: &str) -> Option<i32> {
         let paren_end = lower[paren_start..].find(')')?;
         let num_str = &lower[paren_start + 1..paren_start + paren_end];
         let limit: i32 = num_str.parse().ok()?;
-        // atttypmod = limit + 4 for varchar
+        // VARCHAR atttypmod is the character limit plus VARHDRSZ.
         Some(limit + 4)
     } else {
         None

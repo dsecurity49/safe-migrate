@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  workflow_call:
   push:
     branches: [ "main" ]
   pull_request:
@@ -91,7 +92,6 @@ jobs:
           - 5432:5432
     env:
       DATABASE_URL: postgres://safe_migrate:safe_migrate@localhost:5432/safe_migrate
-      SAFE_MIGRATE_DIFF_VERBOSITY: 2
 
     steps:
       - name: Checkout repository
@@ -128,7 +128,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          scripts/live-differential 2>&1 | tee "live-differential-postgres-${{ matrix.postgres }}.log"
+          scripts/live-differential -vv 2>&1 | tee "live-differential-postgres-${{ matrix.postgres }}.log"
 
       - name: Upload differential log
         if: always()
@@ -170,10 +170,17 @@ jobs:
         run: |
           migration_path="$RUNNER_TEMP/action-smoke.sql"
           auto_sync_config="$RUNNER_TEMP/action-auto-sync.toml"
+          auto_sync_encrypted_config="$RUNNER_TEMP/action-auto-sync-encrypted.toml"
           printf '%s\n' 'CREATE SCHEMA action_smoke;' > "$migration_path"
           printf '%s\n' 'auto_sync = true' > "$auto_sync_config"
-          echo "migration=$migration_path" >> "$GITHUB_OUTPUT"
-          echo "auto-sync-config=$auto_sync_config" >> "$GITHUB_OUTPUT"
+          printf '%s\n' \
+            'auto_sync = true' \
+            'cache_encryption = true' \
+            > "$auto_sync_encrypted_config"
+          printf '%s\n' "migration=$migration_path" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "auto-sync-config=$auto_sync_config" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "auto-sync-encrypted-config=$auto_sync_encrypted_config" \
+            >> "$GITHUB_OUTPUT"
 
       - name: Synchronize and analyze through the Action
         id: synchronized
@@ -184,6 +191,7 @@ jobs:
         with:
           mode: lint
           path: ${{ steps.sync_fixture.outputs.migration }}
+          config: ${{ steps.sync_fixture.outputs.auto-sync-encrypted-config }}
           sync: "true"
           schemas: public
           baseline: action-smoke
@@ -196,10 +204,16 @@ jobs:
           CACHE_PATH: ${{ steps.synchronized.outputs.cache-path }}
           SYNC_STATUS: ${{ steps.synchronized.outputs.sync-status }}
           BASELINE_SOURCE: ${{ steps.synchronized.outputs.baseline-source }}
+          JSON_REPORT: ${{ steps.synchronized.outputs.json-report }}
+          DIAGNOSTIC_LOG: ${{ steps.synchronized.outputs.diagnostic-log }}
         run: |
           test "$SYNC_STATUS" = "refreshed"
           test "$BASELINE_SOURCE" = "synced"
           test "$CACHE_PATH" = "../.safe-migrate-action-cache/baselines/action-smoke/baseline-v6.cache"
+          jq -e '.baseline.auto_sync == "bypassed"' "$JSON_REPORT"
+          grep -q -- '--no-auto-sync bypasses configured automatic cache sync' \
+            "$DIAGNOSTIC_LOG"
+          ! grep -q 'Automatic cache sync enabled' "$DIAGNOSTIC_LOG"
           rm -f -- "$CACHE_PATH"
 
       - name: Restore and analyze without database access
@@ -210,6 +224,7 @@ jobs:
         with:
           mode: lint
           path: ${{ steps.sync_fixture.outputs.migration }}
+          config: ${{ steps.sync_fixture.outputs.auto-sync-encrypted-config }}
           baseline: action-smoke
           encrypted-cache: "true"
           output-dir: action-restored-artifacts
@@ -221,6 +236,7 @@ jobs:
           EXIT_CODE: ${{ steps.restored.outputs.exit-code }}
           SYNC_STATUS: ${{ steps.restored.outputs.sync-status }}
           BASELINE_SOURCE: ${{ steps.restored.outputs.baseline-source }}
+          DIAGNOSTIC_LOG: ${{ steps.restored.outputs.diagnostic-log }}
         run: |
           test "$EXIT_CODE" = "0"
           test "$SYNC_STATUS" = "not-requested"
@@ -232,6 +248,10 @@ jobs:
              and ([.violations[].rule_id] | index("require-lock-timeout") | not)
              and ([.violations[].rule_id] | index("require-statement-timeout") | not)' \
             "$JSON_REPORT"
+          jq -e '.baseline.auto_sync == "bypassed"' "$JSON_REPORT"
+          grep -q -- '--no-auto-sync bypasses configured automatic cache sync' \
+            "$DIAGNOSTIC_LOG"
+          ! grep -q 'Automatic cache sync enabled' "$DIAGNOSTIC_LOG"
 
       - name: Verify encrypted baseline without a key falls back visibly
         id: encrypted_key_missing

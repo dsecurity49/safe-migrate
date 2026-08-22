@@ -1,4 +1,3 @@
-// FILE: src/analysis/state.rs
 use crate::analysis::facts::{
     ResetSettingTarget, SearchPathTarget, TableConstraintFact, TimeoutSetting, TimeoutSettingValue,
 };
@@ -305,7 +304,7 @@ impl AnalysisState {
         }
 
         for idx in cache.indexes {
-            // BUG-008: index ObjectIds go into baseline_indexes, not baseline_relations
+            // Index identities are tracked separately from relation identities.
             baseline_indexes.insert(idx.index_id.clone());
             graph.edges.push(DependencyEdge::new(
                 idx.index_id,
@@ -1651,10 +1650,24 @@ impl AnalysisState {
                 if !self.relation_is_present(&drop_table.id) {
                     if drop_table.if_exists {
                         return MutationResult::Skipped;
-                    } else {
-                        self.local.confidence = Confidence::Tainted;
-                        return MutationResult::Skipped;
                     }
+                    if self.baseline_available && self.baseline_covers_object(&drop_table.id) {
+                        return MutationResult::Conflict {
+                            reason: format!("table '{}' does not exist", drop_table.id),
+                        };
+                    }
+                    self.snapshot_confidence();
+                    self.local.confidence = Confidence::Tainted;
+                    return MutationResult::Skipped;
+                }
+                if !matches!(
+                    self.local.relations.get(&drop_table.id),
+                    Some(RelationOverlay::Present(relation))
+                        if relation.kind == RelationKind::Table
+                ) {
+                    return MutationResult::Conflict {
+                        reason: format!("'{}' is not a table", drop_table.id),
+                    };
                 }
 
                 let renames: Vec<DependencyEdge> = self
@@ -2857,7 +2870,7 @@ impl AnalysisState {
                             }
                         }
                         AlterTableActionMutation::AttachPartition { child, .. } => {
-                            // BUG-012: Reject cycle topologies before inserting the edge.
+                            // Reject attachments that would make partition ancestry cyclic.
                             if self.local.graph.check_partition_cycle(&alter.id, child) {
                                 self.snapshot_confidence();
                                 self.local.confidence = Confidence::Tainted;
@@ -3730,7 +3743,36 @@ impl AnalysisState {
                 MutationResult::Applied
             }
             Mutation::DropView(drop_view) => {
+                let mut present = Vec::new();
                 for id in &drop_view.ids {
+                    match self.local.relations.get(id) {
+                        Some(RelationOverlay::Present(relation))
+                            if relation.kind == RelationKind::View =>
+                        {
+                            present.push(id.clone());
+                        }
+                        Some(RelationOverlay::Present(_)) => {
+                            return MutationResult::Conflict {
+                                reason: format!("'{}' is not a view", id),
+                            };
+                        }
+                        _ if drop_view.if_exists => {}
+                        _ if self.baseline_available && self.baseline_covers_object(id) => {
+                            return MutationResult::Conflict {
+                                reason: format!("view '{}' does not exist", id),
+                            };
+                        }
+                        _ => {
+                            self.snapshot_confidence();
+                            self.local.confidence = Confidence::Tainted;
+                            return MutationResult::Skipped;
+                        }
+                    }
+                }
+                if present.is_empty() {
+                    return MutationResult::Skipped;
+                }
+                for id in &present {
                     self.snapshot_relation(id);
                     self.local
                         .relations
@@ -3739,12 +3781,41 @@ impl AnalysisState {
                 self.snapshot_graph_full();
                 self.local.graph.edges.retain(|e| {
                     !(matches!(e.kind, DependencyKind::ViewDependency { .. })
-                        && drop_view.ids.contains(&e.dependent))
+                        && present.contains(&e.dependent))
                 });
                 MutationResult::Applied
             }
             Mutation::DropMaterializedView(drop_mv) => {
+                let mut present = Vec::new();
                 for id in &drop_mv.ids {
+                    match self.local.relations.get(id) {
+                        Some(RelationOverlay::Present(relation))
+                            if relation.kind == RelationKind::MaterializedView =>
+                        {
+                            present.push(id.clone());
+                        }
+                        Some(RelationOverlay::Present(_)) => {
+                            return MutationResult::Conflict {
+                                reason: format!("'{}' is not a materialized view", id),
+                            };
+                        }
+                        _ if drop_mv.if_exists => {}
+                        _ if self.baseline_available && self.baseline_covers_object(id) => {
+                            return MutationResult::Conflict {
+                                reason: format!("materialized view '{}' does not exist", id),
+                            };
+                        }
+                        _ => {
+                            self.snapshot_confidence();
+                            self.local.confidence = Confidence::Tainted;
+                            return MutationResult::Skipped;
+                        }
+                    }
+                }
+                if present.is_empty() {
+                    return MutationResult::Skipped;
+                }
+                for id in &present {
                     self.snapshot_relation(id);
                     self.local
                         .relations
@@ -3753,13 +3824,30 @@ impl AnalysisState {
                 self.snapshot_graph_full();
                 self.local.graph.edges.retain(|e| {
                     !((matches!(e.kind, DependencyKind::ViewDependency { .. })
-                        && drop_mv.ids.contains(&e.dependent))
+                        && present.contains(&e.dependent))
                         || (matches!(e.kind, DependencyKind::IndexOnRelation { .. })
-                            && drop_mv.ids.contains(&e.referenced)))
+                            && present.contains(&e.referenced)))
                 });
                 MutationResult::Applied
             }
             Mutation::DropIndex(drop_idx) => {
+                let present = self.local.graph.edges.iter().any(|edge| {
+                    matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
+                        && edge.dependent == drop_idx.id
+                });
+                if !present {
+                    if drop_idx.if_exists {
+                        return MutationResult::Skipped;
+                    }
+                    if self.baseline_available && self.baseline_covers_object(&drop_idx.id) {
+                        return MutationResult::Conflict {
+                            reason: format!("index '{}' does not exist", drop_idx.id),
+                        };
+                    }
+                    self.snapshot_confidence();
+                    self.local.confidence = Confidence::Tainted;
+                    return MutationResult::Skipped;
+                }
                 self.snapshot_graph();
                 self.local.graph.edges.retain(|e| {
                     !(matches!(e.kind, DependencyKind::IndexOnRelation { .. })
@@ -4106,14 +4194,23 @@ impl AnalysisState {
                 MutationResult::Applied
             }
             Mutation::CreateFunction(f) => {
-                if matches!(
-                    self.local.functions.get(&f.id),
-                    Some(crate::model::function::FunctionOverlay::Present(_))
-                ) && !f.or_replace
-                {
-                    return MutationResult::Conflict {
-                        reason: format!("routine '{}' already exists", f.id),
-                    };
+                match self.local.functions.get(&f.id) {
+                    Some(crate::model::function::FunctionOverlay::Present(existing))
+                        if existing.routine_kind
+                            != crate::model::function::RoutineKind::Function
+                            || !f.or_replace =>
+                    {
+                        return MutationResult::Conflict {
+                            reason: format!("routine '{}' already exists", f.id),
+                        };
+                    }
+                    // Cache V6 stores ordinary functions but not the other
+                    // routine kinds that share PostgreSQL's pg_proc namespace.
+                    None => {
+                        self.snapshot_confidence();
+                        self.local.confidence = Confidence::Tainted;
+                    }
+                    _ => {}
                 }
                 self.snapshot_function(&f.id);
                 self.snapshot_generation_counter();
@@ -4178,6 +4275,7 @@ impl AnalysisState {
                     crate::model::function::FunctionOverlay::Present(
                         crate::model::function::FunctionState {
                             id: f.id.clone(),
+                            routine_kind: crate::model::function::RoutineKind::Function,
                             arg_types: f.params.iter().map(|p| p.ty.clone()).collect(),
                             arg_type_ids: f
                                 .params
@@ -4220,7 +4318,34 @@ impl AnalysisState {
             }
             Mutation::AlterFunction(f) => {
                 use crate::analysis::facts::{AlterFunctionAction, FuncOptionFact};
-                use crate::model::function::{FunctionOverlay, SecurityMode, Volatility};
+                use crate::model::function::{
+                    FunctionOverlay, RoutineKind, SecurityMode, Volatility,
+                };
+
+                match self.local.functions.get(&f.id) {
+                    Some(FunctionOverlay::Present(function))
+                        if function.routine_kind == RoutineKind::Function => {}
+                    Some(FunctionOverlay::Present(_)) => {
+                        return MutationResult::Conflict {
+                            reason: format!("'{}' is not a function", f.id),
+                        };
+                    }
+                    Some(FunctionOverlay::Dropped) => {
+                        return MutationResult::Conflict {
+                            reason: format!("function '{}' does not exist", f.id),
+                        };
+                    }
+                    _ if self.baseline_available && self.baseline_covers_object(&f.id) => {
+                        return MutationResult::Conflict {
+                            reason: format!("function '{}' does not exist", f.id),
+                        };
+                    }
+                    _ => {
+                        self.snapshot_confidence();
+                        self.local.confidence = Confidence::Tainted;
+                        return MutationResult::Skipped;
+                    }
+                }
 
                 match &f.action {
                     AlterFunctionAction::OptionsChange(options) => {
@@ -4288,10 +4413,13 @@ impl AnalysisState {
                     let sig_str = format!("{}({})", sig.name.name.resolve(), sig.params.join(","));
                     let schema = self.resolve_function_schema(&sig.name, &sig_str);
                     let id = ObjectId::new(schema, sig_str);
-                    if !matches!(
+                    let is_function = matches!(
                         self.local.functions.get(&id),
-                        Some(crate::model::function::FunctionOverlay::Present(_))
-                    ) {
+                        Some(crate::model::function::FunctionOverlay::Present(function))
+                            if function.routine_kind
+                                == crate::model::function::RoutineKind::Function
+                    );
+                    if !is_function {
                         if !f.if_exists {
                             return MutationResult::Conflict {
                                 reason: format!("function '{}' does not exist", id),
@@ -4368,14 +4496,23 @@ impl AnalysisState {
                 }
             }
             Mutation::CreateProcedure(p) => {
-                if matches!(
-                    self.local.functions.get(&p.id),
-                    Some(crate::model::function::FunctionOverlay::Present(_))
-                ) && !p.or_replace
-                {
-                    return MutationResult::Conflict {
-                        reason: format!("routine '{}' already exists", p.id),
-                    };
+                match self.local.functions.get(&p.id) {
+                    Some(crate::model::function::FunctionOverlay::Present(existing))
+                        if existing.routine_kind
+                            == crate::model::function::RoutineKind::Procedure
+                            && p.or_replace => {}
+                    Some(crate::model::function::FunctionOverlay::Present(_)) => {
+                        return MutationResult::Conflict {
+                            reason: format!("routine '{}' already exists", p.id),
+                        };
+                    }
+                    None => {
+                        // Procedure catalogs are not part of Cache V6, so an
+                        // absent entry is not proof that the name is free.
+                        self.snapshot_confidence();
+                        self.local.confidence = Confidence::Tainted;
+                    }
+                    Some(crate::model::function::FunctionOverlay::Dropped) => {}
                 }
                 self.snapshot_function(&p.id);
                 self.snapshot_generation_counter();
@@ -4387,6 +4524,7 @@ impl AnalysisState {
                     crate::model::function::FunctionOverlay::Present(
                         crate::model::function::FunctionState {
                             id: p.id.clone(),
+                            routine_kind: crate::model::function::RoutineKind::Procedure,
                             arg_types: p.params.iter().map(|p| p.ty.clone()).collect(),
                             arg_type_ids: p
                                 .params
@@ -4404,8 +4542,45 @@ impl AnalysisState {
                 MutationResult::Applied
             }
             Mutation::AlterProcedure(p) => {
-                self.snapshot_function(&p.id);
-                // No generation tracking in FunctionState
+                use crate::analysis::facts::AlterFunctionAction;
+                use crate::model::function::{FunctionOverlay, RoutineKind};
+
+                match self.local.functions.get(&p.id) {
+                    Some(FunctionOverlay::Present(function))
+                        if function.routine_kind == RoutineKind::Procedure => {}
+                    Some(FunctionOverlay::Present(_)) => {
+                        return MutationResult::Conflict {
+                            reason: format!("'{}' is not a procedure", p.id),
+                        };
+                    }
+                    Some(FunctionOverlay::Dropped) => {
+                        return MutationResult::Conflict {
+                            reason: format!("procedure '{}' does not exist", p.id),
+                        };
+                    }
+                    None => {
+                        self.snapshot_confidence();
+                        self.local.confidence = Confidence::Tainted;
+                        return MutationResult::Skipped;
+                    }
+                }
+
+                match &p.action {
+                    AlterFunctionAction::Rename { to, .. } => {
+                        let signature =
+                            p.id.name
+                                .find('(')
+                                .map(|index| &p.id.name[index..])
+                                .unwrap_or("");
+                        let new_id = ObjectId::new(p.id.schema.clone(), format!("{to}{signature}"));
+                        self.move_function(&p.id, &new_id);
+                    }
+                    AlterFunctionAction::SchemaChange { new_schema } => {
+                        let new_id = ObjectId::new(new_schema.clone(), p.id.name.clone());
+                        self.move_function(&p.id, &new_id);
+                    }
+                    _ => self.snapshot_function(&p.id),
+                }
                 MutationResult::Applied
             }
             Mutation::DropProcedure(p) => {
@@ -4414,21 +4589,36 @@ impl AnalysisState {
                     let sig_str = format!("{}({})", sig.name.name.resolve(), sig.params.join(","));
                     let schema = self.resolve_function_schema(&sig.name, &sig_str);
                     let id = ObjectId::new(schema, sig_str);
-                    if !matches!(
+                    let is_procedure = matches!(
                         self.local.functions.get(&id),
-                        Some(crate::model::function::FunctionOverlay::Present(_))
-                    ) {
-                        if !p.if_exists {
-                            return MutationResult::Conflict {
-                                reason: format!("procedure '{}' does not exist", id),
-                            };
-                        }
-                    } else {
+                        Some(crate::model::function::FunctionOverlay::Present(function))
+                            if function.routine_kind
+                                == crate::model::function::RoutineKind::Procedure
+                    );
+                    if is_procedure {
                         any_applied = true;
                         self.snapshot_function(&id);
                         self.local
                             .functions
                             .insert(id, crate::model::function::FunctionOverlay::Dropped);
+                    } else if p.if_exists {
+                        if !self.local.functions.contains_key(&id) {
+                            self.snapshot_confidence();
+                            self.local.confidence = Confidence::Tainted;
+                            self.snapshot_function(&id);
+                            self.local
+                                .functions
+                                .insert(id, crate::model::function::FunctionOverlay::Dropped);
+                            any_applied = true;
+                        }
+                    } else if self.local.functions.contains_key(&id) {
+                        return MutationResult::Conflict {
+                            reason: format!("procedure '{}' does not exist", id),
+                        };
+                    } else {
+                        self.snapshot_confidence();
+                        self.local.confidence = Confidence::Tainted;
+                        return MutationResult::Skipped;
                     }
                 }
                 if any_applied {
@@ -4438,6 +4628,19 @@ impl AnalysisState {
                 }
             }
             Mutation::CreatePublication(p) => {
+                match self.local.publications.get(&p.name) {
+                    Some(crate::model::replication::PublicationOverlay::Present(_)) => {
+                        return MutationResult::Conflict {
+                            reason: format!("publication '{}' already exists", p.name),
+                        };
+                    }
+                    None => {
+                        // Cache V6 does not include publication catalogs.
+                        self.snapshot_confidence();
+                        self.local.confidence = Confidence::Tainted;
+                    }
+                    Some(crate::model::replication::PublicationOverlay::Dropped) => {}
+                }
                 self.snapshot_publication(&p.name);
                 self.snapshot_generation_counter();
                 self.local.generation_counter += 1;
@@ -4476,11 +4679,20 @@ impl AnalysisState {
                 MutationResult::Applied
             }
             Mutation::AlterPublication(p) => {
-                self.snapshot_publication(&p.name);
-                if !self.local.publications.contains_key(&p.name) {
-                    self.local.confidence = Confidence::Tainted;
-                    return MutationResult::Skipped;
+                match self.local.publications.get(&p.name) {
+                    Some(crate::model::replication::PublicationOverlay::Present(_)) => {}
+                    Some(crate::model::replication::PublicationOverlay::Dropped) => {
+                        return MutationResult::Conflict {
+                            reason: format!("publication '{}' does not exist", p.name),
+                        };
+                    }
+                    None => {
+                        self.snapshot_confidence();
+                        self.local.confidence = Confidence::Tainted;
+                        return MutationResult::Skipped;
+                    }
                 }
+                self.snapshot_publication(&p.name);
                 self.snapshot_generation_counter();
                 self.local.generation_counter += 1;
                 let new_gen = self.local.generation_counter;
@@ -4494,11 +4706,28 @@ impl AnalysisState {
             }
             Mutation::DropPublication(p) => {
                 for name in &p.names {
-                    self.snapshot_publication(name);
-                    if !p.if_exists && !self.local.publications.contains_key(name) {
-                        self.local.confidence = Confidence::Tainted;
-                        return MutationResult::Skipped;
+                    match self.local.publications.get(name) {
+                        Some(crate::model::replication::PublicationOverlay::Present(_)) => {}
+                        Some(crate::model::replication::PublicationOverlay::Dropped) => {
+                            if !p.if_exists {
+                                return MutationResult::Conflict {
+                                    reason: format!("publication '{}' does not exist", name),
+                                };
+                            }
+                        }
+                        None if p.if_exists => {
+                            self.snapshot_confidence();
+                            self.local.confidence = Confidence::Tainted;
+                        }
+                        None => {
+                            self.snapshot_confidence();
+                            self.local.confidence = Confidence::Tainted;
+                            return MutationResult::Skipped;
+                        }
                     }
+                }
+                for name in &p.names {
+                    self.snapshot_publication(name);
                     self.local.publications.insert(
                         name.clone(),
                         crate::model::replication::PublicationOverlay::Dropped,
@@ -4513,6 +4742,19 @@ impl AnalysisState {
             }
             Mutation::CreateSubscription(s) => {
                 let name = s.name.clone().unwrap_or_else(|| "unnamed_sub".into());
+                match self.local.subscriptions.get(&name) {
+                    Some(crate::model::replication::SubscriptionOverlay::Present(_)) => {
+                        return MutationResult::Conflict {
+                            reason: format!("subscription '{}' already exists", name),
+                        };
+                    }
+                    None => {
+                        // Cache V6 does not include subscription catalogs.
+                        self.snapshot_confidence();
+                        self.local.confidence = Confidence::Tainted;
+                    }
+                    Some(crate::model::replication::SubscriptionOverlay::Dropped) => {}
+                }
                 self.snapshot_subscription(&name);
                 self.snapshot_generation_counter();
                 self.local.generation_counter += 1;
@@ -4533,11 +4775,20 @@ impl AnalysisState {
                 MutationResult::Applied
             }
             Mutation::AlterSubscription(s) => {
-                self.snapshot_subscription(&s.name);
-                if !self.local.subscriptions.contains_key(&s.name) {
-                    self.local.confidence = Confidence::Tainted;
-                    return MutationResult::Skipped;
+                match self.local.subscriptions.get(&s.name) {
+                    Some(crate::model::replication::SubscriptionOverlay::Present(_)) => {}
+                    Some(crate::model::replication::SubscriptionOverlay::Dropped) => {
+                        return MutationResult::Conflict {
+                            reason: format!("subscription '{}' does not exist", s.name),
+                        };
+                    }
+                    None => {
+                        self.snapshot_confidence();
+                        self.local.confidence = Confidence::Tainted;
+                        return MutationResult::Skipped;
+                    }
                 }
+                self.snapshot_subscription(&s.name);
                 self.snapshot_generation_counter();
                 self.local.generation_counter += 1;
                 let new_gen = self.local.generation_counter;
@@ -4550,11 +4801,26 @@ impl AnalysisState {
                 MutationResult::Applied
             }
             Mutation::DropSubscription(s) => {
-                self.snapshot_subscription(&s.name);
-                if !s.if_exists && !self.local.subscriptions.contains_key(&s.name) {
-                    self.local.confidence = Confidence::Tainted;
-                    return MutationResult::Skipped;
+                match self.local.subscriptions.get(&s.name) {
+                    Some(crate::model::replication::SubscriptionOverlay::Present(_)) => {}
+                    Some(crate::model::replication::SubscriptionOverlay::Dropped) => {
+                        if !s.if_exists {
+                            return MutationResult::Conflict {
+                                reason: format!("subscription '{}' does not exist", s.name),
+                            };
+                        }
+                    }
+                    None if s.if_exists => {
+                        self.snapshot_confidence();
+                        self.local.confidence = Confidence::Tainted;
+                    }
+                    None => {
+                        self.snapshot_confidence();
+                        self.local.confidence = Confidence::Tainted;
+                        return MutationResult::Skipped;
+                    }
                 }
+                self.snapshot_subscription(&s.name);
                 self.local.subscriptions.insert(
                     s.name.clone(),
                     crate::model::replication::SubscriptionOverlay::Dropped,
@@ -4580,7 +4846,7 @@ impl AnalysisState {
                     role_id.clone(),
                     crate::model::role::RoleOverlay::Present(crate::model::role::RoleState {
                         id: role_id,
-                        can_login: true,
+                        can_login: r.can_login,
                         is_superuser: false,
                         member_of: Vec::new(),
                         can_set_role_to: Vec::new(),
@@ -4604,11 +4870,6 @@ impl AnalysisState {
                     self.local.generation_counter += 1;
                     let _new_gen = self.local.generation_counter;
 
-                    if let Some(crate::model::role::RoleOverlay::Present(_role)) =
-                        self.local.roles.get_mut(&role_id)
-                    {
-                        // No further action as fields have been simplified
-                    }
                     MutationResult::Applied
                 } else {
                     MutationResult::Skipped

@@ -1,5 +1,3 @@
-// FILE: src/analysis/transaction.rs
-
 use crate::analysis::graph::DependencyEdge;
 use crate::ast::identifiers::ObjectId;
 use crate::model::relation::RelationOverlay;

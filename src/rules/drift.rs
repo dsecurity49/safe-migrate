@@ -59,7 +59,7 @@ impl Rule for DriftDetectionRule {
                 });
             }
             Mutation::DropTable(d) => {
-                if !pre_state.relations.contains_key(&d.id) {
+                if !d.if_exists && !pre_state.relations.contains_key(&d.id) {
                     violations.push(Violation { source_range: None,
                         rule_id: self.id(),
                         operation_kind: OperationKind::DropTable,
@@ -98,7 +98,7 @@ impl Rule for DriftDetectionRule {
             }
             Mutation::DropView(d) => {
                 for id in &d.ids {
-                    if !pre_state.relations.contains_key(id) {
+                    if !d.if_exists && !pre_state.relations.contains_key(id) {
                         violations.push(Violation { source_range: None,
                             rule_id: self.id(),
                             operation_kind: OperationKind::DropView,
@@ -119,7 +119,7 @@ impl Rule for DriftDetectionRule {
             }
             Mutation::DropMaterializedView(d) => {
                 for id in &d.ids {
-                    if !pre_state.relations.contains_key(id) {
+                    if !d.if_exists && !pre_state.relations.contains_key(id) {
                         violations.push(Violation { source_range: None,
                             rule_id: self.id(),
                             operation_kind: OperationKind::DropMaterializedView,
@@ -140,7 +140,7 @@ impl Rule for DriftDetectionRule {
             }
             Mutation::DropSequence(d) => {
                 for id in &d.ids {
-                    if !pre_state.sequences.contains_key(id) {
+                    if !d.if_exists && !pre_state.sequences.contains_key(id) {
                         violations.push(Violation { source_range: None,
                             rule_id: self.id(),
                             operation_kind: OperationKind::DropSequence,
@@ -164,7 +164,7 @@ impl Rule for DriftDetectionRule {
                     let sig_str = format!("{}({})", sig.name.name.resolve(), sig.params.join(","));
                     let schema = state.resolve_function_schema(&sig.name, &sig_str);
                     let id = ObjectId::new(schema, sig_str);
-                    if !pre_state.functions.contains_key(&id) {
+                    if !d.if_exists && !pre_state.functions.contains_key(&id) {
                         violations.push(Violation { source_range: None,
                             rule_id: self.id(),
                             operation_kind: OperationKind::DropFunction,
@@ -183,32 +183,8 @@ impl Rule for DriftDetectionRule {
                     }
                 }
             }
-            Mutation::DropProcedure(d) => {
-                for sig in &d.signatures {
-                    let sig_str = format!("{}({})", sig.name.name.resolve(), sig.params.join(","));
-                    let schema = state.resolve_function_schema(&sig.name, &sig_str);
-                    let id = ObjectId::new(schema, sig_str);
-                    if !pre_state.functions.contains_key(&id) {
-                        violations.push(Violation { source_range: None,
-                            rule_id: self.id(),
-                            operation_kind: OperationKind::DropProcedure,
-                            object_kind: ObjectKind::Procedure,
-                            object_name: id.to_string(),
-                            tier: self.default_tier(),
-                            reason: format!(
-                                "Migration DROPs procedure \"{}\" which does not exist in the production baseline",
-                                id
-                            ),
-                            recipe: self.recipe(),
-                            dedup_key: None,
-                                            sql: None,
-                                            fk_dependency_related: false,
-                        });
-                    }
-                }
-            }
             Mutation::DropIndex(d) => {
-                if !pre_state.indexes.iter().any(|idx| idx.dependent == d.id) {
+                if !d.if_exists && !pre_state.indexes.iter().any(|idx| idx.dependent == d.id) {
                     violations.push(Violation { source_range: None,
                         rule_id: self.id(),
                         operation_kind: OperationKind::DropIndex,
@@ -228,7 +204,7 @@ impl Rule for DriftDetectionRule {
             }
             Mutation::DropDomain(d) => {
                 for id in &d.ids {
-                    if !pre_state.types.contains_key(id) {
+                    if !d.if_exists && !pre_state.types.contains_key(id) {
                         violations.push(Violation { source_range: None,
                             rule_id: self.id(),
                             operation_kind: OperationKind::DropDomain,
@@ -249,7 +225,7 @@ impl Rule for DriftDetectionRule {
             }
             Mutation::DropType(d) => {
                 for id in &d.ids {
-                    if !pre_state.types.contains_key(id) {
+                    if !d.if_exists && !pre_state.types.contains_key(id) {
                         violations.push(Violation { source_range: None,
                             rule_id: self.id(),
                             operation_kind: OperationKind::DropType,
@@ -321,23 +297,6 @@ impl Rule for DriftDetectionRule {
                     reason: format!(
                         "Migration ALTERs function \"{}\" which does not exist in the production baseline",
                         f.id
-                    ),
-                    recipe: self.recipe(),
-                    dedup_key: None,
-                            sql: None,
-                            fk_dependency_related: false,
-                });
-            }
-            Mutation::AlterProcedure(p) if !pre_state.functions.contains_key(&p.id) => {
-                violations.push(Violation { source_range: None,
-                    rule_id: self.id(),
-                    operation_kind: OperationKind::AlterProcedure,
-                    object_kind: ObjectKind::Procedure,
-                    object_name: p.id.to_string(),
-                    tier: self.default_tier(),
-                    reason: format!(
-                        "Migration ALTERs procedure \"{}\" which does not exist in the production baseline",
-                        p.id
                     ),
                     recipe: self.recipe(),
                     dedup_key: None,

@@ -122,6 +122,46 @@ mod state_machine_guards_tests {
     }
 
     #[test]
+    fn missing_unguarded_drop_aborts_following_transaction_statements() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let violations = engine
+            .analyze(
+                "BEGIN; DROP VIEW missing_view; CREATE TABLE should_not_exist(id int); COMMIT;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict")
+        );
+        assert!(!state.relation_is_present(&object_id("public", "should_not_exist")));
+    }
+
+    #[test]
+    fn guarded_drop_still_rejects_the_wrong_relation_kind() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze("CREATE TABLE t(id int);", &mut state)
+            .unwrap();
+
+        let violations = engine
+            .analyze("DROP VIEW IF EXISTS t;", &mut state)
+            .unwrap();
+
+        assert!(state.relation_is_present(&object_id("public", "t")));
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict")
+        );
+    }
+
+    #[test]
     fn test_skip_guard_create_index() {
         let engine = setup_engine();
         let mut state = setup_state();
@@ -203,7 +243,3 @@ mod state_machine_guards_tests {
         );
     }
 }
-
-// ─────────────────────────────────────────────
-// 2. Rule Evaluation Exhaustion
-// ─────────────────────────────────────────────

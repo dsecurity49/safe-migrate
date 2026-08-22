@@ -6,7 +6,6 @@ mod exhaustive_fuzz_tests {
     use safe_migrate::db::cache::DbCache;
     use safe_migrate::report::violations::ObjectKind;
 
-    /// Helper: create a DbCache with a table in the baseline
     fn cache_with_table(schema: &str, name: &str, rows: Option<u64>) -> DbCache {
         let mut cache = DbCache::new();
         let tid = object_id(schema, name);
@@ -25,7 +24,7 @@ mod exhaustive_fuzz_tests {
         cache
     }
 
-    // --- Fuzz Group 1: Each DDL statement in isolation (100 cases) ---
+    // DDL in isolation.
 
     #[test]
     fn fuzz_ddl_001_create_table() {
@@ -378,7 +377,7 @@ mod exhaustive_fuzz_tests {
             .unwrap();
     }
 
-    // --- Fuzz Group 2: Transaction patterns (20 cases) ---
+    // Transaction patterns.
 
     #[test]
     fn fuzz_txn_001_begin_commit() {
@@ -517,7 +516,7 @@ mod exhaustive_fuzz_tests {
         assert!(!state.local.transaction_aborted);
     }
 
-    // --- Fuzz Group 3: Confidence taint + tier downgrade (30 cases) ---
+    // Confidence and tier changes.
 
     #[test]
     fn fuzz_tier_001_do_block_downgrades_tier1() {
@@ -528,8 +527,6 @@ mod exhaustive_fuzz_tests {
         let v = engine
             .analyze("DO $$ BEGIN NULL; END $$; DROP TABLE users;", &mut state)
             .unwrap();
-        // Both opaque-dynamic-sql (Tier2 by default) and irreversible-migration
-        // Should be downgraded from Tier1 to Tier2 due to tainted confidence
         for violation in &v {
             if violation.tier == safe_migrate::report::violations::ViolationTier::Tier1 {
                 panic!(
@@ -593,7 +590,7 @@ mod exhaustive_fuzz_tests {
         );
     }
 
-    // --- Fuzz Group 4: CASCADE + dependencies (20 cases) ---
+    // Cascades and dependencies.
 
     #[test]
     fn fuzz_cascade_001_drop_cascade_with_fk() {
@@ -627,7 +624,6 @@ mod exhaustive_fuzz_tests {
             )
             .unwrap();
         let v = engine.analyze("DROP TABLE parent;", &mut state).unwrap();
-        // Should be skipped (has FK dependents), no irreversible-migration
         assert!(!v.iter().any(|v| v.rule_id == "irreversible-migration"));
     }
 
@@ -645,7 +641,7 @@ mod exhaustive_fuzz_tests {
         // Cascade rule fires when closure affects baseline relations
     }
 
-    // --- Fuzz Group 5: Complex multi-statement patterns (20 cases) ---
+    // Multi-statement migrations.
 
     #[test]
     fn fuzz_complex_001_create_alter_drop_cycle() {
@@ -671,7 +667,6 @@ mod exhaustive_fuzz_tests {
             )
             .unwrap();
         assert!(!v.is_empty());
-        // Confidence should be tainted
         assert_eq!(
             state.local.confidence,
             safe_migrate::analysis::state::Confidence::Tainted
@@ -714,7 +709,7 @@ mod exhaustive_fuzz_tests {
         assert!(!v.is_empty());
     }
 
-    // --- Fuzz Group 6: Parse error resilience (10 cases) ---
+    // Parse errors.
 
     #[test]
     fn fuzz_parse_001_empty_string() {
@@ -767,7 +762,7 @@ mod exhaustive_fuzz_tests {
         assert!(relation.has_column("name"));
     }
 
-    // --- Fuzz Group 7: Schema drift with PG cache (20 cases) ---
+    // Schema drift with a cache.
 
     #[test]
     fn fuzz_drift_001_drop_existing_table() {
@@ -775,7 +770,6 @@ mod exhaustive_fuzz_tests {
         let cache = cache_with_table("public", "users", Some(100));
         let mut state = AnalysisState::new(cache);
         let v = engine.analyze("DROP TABLE users;", &mut state).unwrap();
-        // Should NOT have schema-drift (table is in baseline)
         assert!(!v.iter().any(|v| v.rule_id == "schema-drift"));
     }
 
@@ -786,7 +780,6 @@ mod exhaustive_fuzz_tests {
         let v = engine
             .analyze("DROP TABLE nonexistent;", &mut state)
             .unwrap();
-        // Should have schema-drift (table not in baseline)
         assert!(v.iter().any(|v| v.rule_id == "schema-drift"));
     }
 
@@ -811,7 +804,7 @@ mod exhaustive_fuzz_tests {
         assert!(v.iter().any(|v| v.rule_id == "schema-drift"));
     }
 
-    // --- Fuzz Group 8: Size-aware tier decisions (10 cases) ---
+    // Size-aware tiers.
 
     #[test]
     fn fuzz_size_001_large_table_drop() {
@@ -819,7 +812,6 @@ mod exhaustive_fuzz_tests {
         let cache = cache_with_table("public", "big_table", Some(1_000_000));
         let mut state = AnalysisState::new(cache);
         let v = engine.analyze("DROP TABLE big_table;", &mut state).unwrap();
-        // Should be Tier1 for large table
         assert!(
             v.iter()
                 .any(|v| v.tier == safe_migrate::report::violations::ViolationTier::Tier1)
@@ -834,11 +826,10 @@ mod exhaustive_fuzz_tests {
         let v = engine
             .analyze("DROP TABLE small_table;", &mut state)
             .unwrap();
-        // 0 rows (added in tx) gets Tier3, else Tier1
         assert!(!v.is_empty());
     }
 
-    // --- Fuzz Group 9: Deterministic ordering (10 cases) ---
+    // Deterministic ordering.
 
     #[test]
     fn fuzz_order_001_violations_sorted_by_tier() {
@@ -850,13 +841,12 @@ mod exhaustive_fuzz_tests {
                 &mut state,
             )
             .unwrap();
-        // Verify non-decreasing tier order
         for w in v.windows(2) {
             assert!(w[0].tier <= w[1].tier, "Violations not sorted by tier");
         }
     }
 
-    // --- Fuzz Group 10: State consistency after operations (10 cases) ---
+    // State consistency.
 
     #[test]
     fn fuzz_state_001_rollback_restores_relations() {
@@ -901,7 +891,6 @@ mod exhaustive_fuzz_tests {
                 &mut state,
             )
             .unwrap();
-        // t1 should be restored (rolled back), t2 should exist (committed)
         assert!(
             state.relation_is_present(&object_id("public", "t1")),
             "t1 should exist after ROLLBACK TO savepoint"

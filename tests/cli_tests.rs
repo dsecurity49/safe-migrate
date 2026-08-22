@@ -513,6 +513,95 @@ fn test_cli_no_cache_bypasses_configured_auto_sync() {
 }
 
 #[test]
+fn test_cli_no_auto_sync_uses_cache_without_database_access() {
+    let cache_dir = tempfile::tempdir().unwrap();
+    let cache_path = cache_dir.path().join("baseline.cache");
+    write_fresh_cache(&cache_path);
+    let mut config_file = tempfile::NamedTempFile::new().unwrap();
+    writeln!(config_file, "auto_sync = true").unwrap();
+
+    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let assert = cmd
+        .arg("lint")
+        .arg("--file")
+        .arg("live_tests/rule_01_irreversible-migration/safe_002_add_col.sql")
+        .arg("--config")
+        .arg(config_file.path())
+        .arg("--cache")
+        .arg(&cache_path)
+        .arg("--no-auto-sync")
+        .arg("--json")
+        .env("DATABASE_URL", "postgres://127.0.0.1:1/not-used")
+        .assert()
+        .success();
+
+    let output = assert.get_output();
+    let report = parse_json_stdout(output);
+    assert_eq!(report["baseline"]["auto_sync"], "bypassed");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--no-auto-sync bypasses configured automatic cache sync"));
+    assert!(!stderr.contains("Automatic cache sync enabled"));
+}
+
+#[test]
+fn explicit_missing_config_is_an_error_for_lint_and_rules() {
+    let mut sql_file = tempfile::NamedTempFile::new().unwrap();
+    writeln!(sql_file, "SELECT 1;").unwrap();
+    let missing = sql_file.path().with_extension("missing.toml");
+
+    for command in ["lint", "rules"] {
+        let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+        cmd.arg(command);
+        if command == "lint" {
+            cmd.arg("--file").arg(sql_file.path()).arg("--no-cache");
+        }
+        cmd.arg("--config").arg(&missing);
+        let output = cmd.output().unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("Failed to load configuration"));
+    }
+}
+
+#[test]
+fn lint_chain_rejects_a_directory_without_sql_files() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::write(directory.path().join("README.txt"), "not a migration").unwrap();
+
+    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let output = cmd
+        .arg("lint-chain")
+        .arg("--dir")
+        .arg(directory.path())
+        .arg("--no-cache")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("No .sql migration files found"));
+}
+
+#[test]
+fn empty_configured_schema_scope_fails_before_auto_sync() {
+    let mut sql_file = tempfile::NamedTempFile::new().unwrap();
+    writeln!(sql_file, "SELECT 1;").unwrap();
+    let mut config_file = tempfile::NamedTempFile::new().unwrap();
+    writeln!(config_file, "auto_sync = true\nschemas = []").unwrap();
+
+    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let output = cmd
+        .arg("lint")
+        .arg("--file")
+        .arg(sql_file.path())
+        .arg("--config")
+        .arg(config_file.path())
+        .arg("--no-cache")
+        .env("DATABASE_URL", "postgres://127.0.0.1:1/not-used")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no schema name may be blank"));
+}
+
+#[test]
 fn test_cli_auto_sync_failure_continues_without_a_cache() {
     let mut sql_file = tempfile::NamedTempFile::new().unwrap();
     writeln!(sql_file, "CREATE TABLE widgets (id bigint PRIMARY KEY);").unwrap();

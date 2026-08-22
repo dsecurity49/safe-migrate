@@ -886,6 +886,7 @@ mod state_mutation_tests {
             function_id.clone(),
             FunctionState {
                 id: function_id.clone(),
+                routine_kind: safe_migrate::model::function::RoutineKind::Function,
                 arg_types: vec!["mood".into()],
                 arg_type_ids: Vec::new(),
                 return_type: "mood".into(),
@@ -1465,7 +1466,7 @@ mod state_mutation_tests {
         if let Some(safe_migrate::model::role::RoleOverlay::Present(role)) =
             state.local.roles.get(&role_id)
         {
-            assert!(role.can_login);
+            assert!(!role.can_login);
         } else {
             panic!("role app_user should be present");
         }
@@ -1476,6 +1477,56 @@ mod state_mutation_tests {
             state.local.roles.get(&role_id),
             Some(safe_migrate::model::role::RoleOverlay::Dropped)
         ));
+    }
+
+    #[test]
+    fn create_user_and_role_login_options_are_distinct() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE USER web_user; CREATE ROLE worker LOGIN NOINHERIT;",
+                &mut state,
+            )
+            .unwrap();
+
+        let Some(safe_migrate::model::role::RoleOverlay::Present(user)) =
+            state.local.roles.get(&ObjectId::new("", "web_user"))
+        else {
+            panic!("user missing");
+        };
+        assert!(user.can_login);
+
+        let Some(safe_migrate::model::role::RoleOverlay::Present(role)) =
+            state.local.roles.get(&ObjectId::new("", "worker"))
+        else {
+            panic!("role missing");
+        };
+        assert!(role.can_login);
+    }
+
+    #[test]
+    fn unquoted_role_and_replication_names_are_case_folded() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let violations = engine
+            .analyze(
+                "CREATE ROLE AppUser;
+                 CREATE ROLE appuser;
+                 CREATE PUBLICATION MixedPub FOR ALL TABLES;
+                 CREATE PUBLICATION mixedpub FOR ALL TABLES;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert_eq!(
+            violations
+                .iter()
+                .filter(|violation| violation.rule_id == "chain-conflict")
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -1749,12 +1800,32 @@ mod state_mutation_tests {
         let engine = setup_engine();
         let mut state = setup_state();
 
-        // Should not taint when dropping nonexistent function with IF EXISTS
         assert_eq!(state.local.confidence, Confidence::Exact);
         engine
             .analyze("DROP FUNCTION IF EXISTS missing_func();", &mut state)
             .unwrap();
         assert_eq!(state.local.confidence, Confidence::Exact);
+    }
+
+    #[test]
+    fn creating_a_new_function_taints_when_other_routine_kinds_are_unsynchronized() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE FUNCTION work() RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert_eq!(state.local.confidence, Confidence::Tainted);
+        assert!(matches!(
+            state.local.functions.get(&object_id("public", "work()")),
+            Some(FunctionOverlay::Present(function))
+                if function.routine_kind
+                    == safe_migrate::model::function::RoutineKind::Function
+        ));
     }
 
     #[test]
@@ -1766,7 +1837,73 @@ mod state_mutation_tests {
         engine
             .analyze("DROP PROCEDURE IF EXISTS missing_proc();", &mut state)
             .unwrap();
-        assert_eq!(state.local.confidence, Confidence::Exact);
+        assert_eq!(state.local.confidence, Confidence::Tainted);
+    }
+
+    #[test]
+    fn procedure_kind_and_lifecycle_are_enforced_within_the_chain() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE PROCEDURE work() LANGUAGE sql AS $$ SELECT 1 $$;",
+                &mut state,
+            )
+            .unwrap();
+        let id = object_id("public", "work()");
+        let Some(FunctionOverlay::Present(routine)) = state.local.functions.get(&id) else {
+            panic!("procedure missing");
+        };
+        assert_eq!(
+            routine.routine_kind,
+            safe_migrate::model::function::RoutineKind::Procedure
+        );
+
+        let wrong_kind = engine
+            .analyze("ALTER FUNCTION work() IMMUTABLE;", &mut state)
+            .unwrap();
+        assert!(
+            wrong_kind
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict")
+        );
+
+        engine
+            .analyze("DROP PROCEDURE work();", &mut state)
+            .unwrap();
+        let after_drop = engine
+            .analyze("ALTER PROCEDURE work() RENAME TO renamed_work;", &mut state)
+            .unwrap();
+        assert!(
+            after_drop
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict")
+        );
+    }
+
+    #[test]
+    fn publication_and_subscription_duplicates_conflict() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let violations = engine
+            .analyze(
+                "CREATE PUBLICATION p FOR ALL TABLES;
+                 CREATE PUBLICATION p FOR ALL TABLES;
+                 CREATE SUBSCRIPTION s CONNECTION 'host=localhost' PUBLICATION p;
+                 CREATE SUBSCRIPTION s CONNECTION 'host=localhost' PUBLICATION p;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert_eq!(
+            violations
+                .iter()
+                .filter(|violation| violation.rule_id == "chain-conflict")
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -2018,6 +2155,7 @@ mod state_mutation_tests {
             function_id.clone(),
             FunctionState {
                 id: function_id.clone(),
+                routine_kind: safe_migrate::model::function::RoutineKind::Function,
                 arg_types: vec!["integer[]".to_string()],
                 arg_type_ids: vec![None],
                 return_type: "integer".to_string(),
@@ -2775,7 +2913,3 @@ mod state_mutation_tests {
         assert_eq!(state.local.current_role, "member");
     }
 }
-
-// ─────────────────────────────────────────────
-// 4. Transaction Lifecycle Rollback Exhaustion
-// ─────────────────────────────────────────────

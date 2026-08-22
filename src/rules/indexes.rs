@@ -1,4 +1,3 @@
-// FILE: src/rules/indexes.rs
 use crate::analysis::mutations::Mutation;
 use crate::analysis::state::{AnalysisState, CascadeResult, MutationResult};
 use crate::engine::config::Config;
@@ -106,8 +105,7 @@ impl Rule for ConcurrentIndexRule {
                 let tier1_threshold = config.rule_tier1_threshold(self.id());
                 let tier2_threshold = config.rule_tier2_threshold(self.id());
 
-                // BUG-010: Do not check or push stale statistics warning for DROP INDEX.
-                // We only perform size evaluation for the drop index violation tier.
+                // DROP INDEX classification does not emit a stale-statistics finding.
 
                 if pre_state.relations.is_empty() {
                     let rows = config.default_rows;

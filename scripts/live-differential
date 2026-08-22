@@ -57,10 +57,14 @@ fi
 export SAFE_MIGRATE_DIFF_VERBOSITY=$verbosity
 export SAFE_MIGRATE_REQUIRE_LIVE=1
 if [ -n "$rule_filter" ]; then
-    export SAFE_MIGRATE_DIFF_RULE=$rule_filter
+    export SAFE_MIGRATE_DIFF_RULE="$rule_filter"
+else
+    unset SAFE_MIGRATE_DIFF_RULE
 fi
 if [ -n "$fixture_filter" ]; then
-    export SAFE_MIGRATE_DIFF_FIXTURE=$fixture_filter
+    export SAFE_MIGRATE_DIFF_FIXTURE="$fixture_filter"
+else
+    unset SAFE_MIGRATE_DIFF_FIXTURE
 fi
 
 cargo test --locked --test live_differential_harness \

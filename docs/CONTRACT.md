@@ -1,7 +1,7 @@
 # CLI and Report Contract
 
-This document defines the user-visible behavior of safe-migrate v0.6.0. A
-requirement is not complete until an automated test enforces it.
+This document defines safe-migrate v0.6.0's CLI, report, cache, and GitHub
+Action behavior.
 
 ## Commands
 
@@ -16,17 +16,21 @@ requirement is not complete until an automated test enforces it.
 - `safe-migrate cache inspect` reads a local cache without connecting to
   PostgreSQL and prints provenance plus a redacted contents summary. `--json`
   emits that same summary as one JSON document.
-- `safe-migrate rules` lists canonical primary-rule descriptors. `--rule <id>`
+- `safe-migrate rules` lists primary-rule descriptors. `--rule <id>`
   selects one descriptor and `--json` emits the stable discovery schema.
 
 `lint` and `lint-chain` use an explicit cache, the default cache path, or
 `--no-cache`. When `auto_sync = true` is set in configuration, they may refresh
-the cache before analysis. `--no-cache` always bypasses automatic sync.
+the cache before analysis. `--no-auto-sync` suppresses that refresh for one
+run; `--no-cache` also bypasses it.
 
-`cache inspect` never lists object, column, role, membership, or dependency
-names and edges. Its source database, schema scope, versions, observed timeout
-values, and redacted counts—including the role count—still describe sensitive
-infrastructure and must not be published automatically.
+Without `--config`, CLI commands read `safe-migrate.toml` from the current
+directory when it exists and otherwise use built-in defaults. A path passed
+with `--config` must exist and pass validation.
+
+`cache inspect` omits object, column, role, membership, and dependency names.
+It still includes database and schema provenance, versions, timeout values, and
+object counts. Treat that output as infrastructure metadata.
 
 ## Output channels
 
@@ -49,8 +53,8 @@ When `--markdown` is selected:
   range;
 - JSON and Markdown modes are mutually exclusive.
 
-Interactive output is mutually exclusive with `--json` and `--markdown`. The
-CLI must reject conflicting output selections rather than silently choosing one.
+Interactive output is mutually exclusive with `--json` and `--markdown`.
+Conflicting output modes exit `1`.
 
 ## JSON report
 
@@ -114,12 +118,11 @@ Each JSON violation may include this additive location object:
 "location": { "file": "migrations/001_add_status.sql", "line": 12, "column": 1 }
 ```
 
-`rules --json` has its own schema version 2 document. Every descriptor exposes
-its ID, title, summary, impact, default tier, remediation, supported
-configuration fields, and only the effective values that rule supports. Every
-primary rule supports `disabled`; row thresholds are accepted only where the
-descriptor advertises them. Unknown rule IDs and unsupported configuration
-fields are operational errors.
+`rules --json` uses schema version 2. Descriptors include ID, title, summary,
+impact, default tier, remediation, supported configuration fields, and the
+effective values for those fields. Every primary rule supports `disabled`;
+row thresholds are accepted only when listed by the descriptor. Unknown rule
+IDs and unsupported fields are operational errors.
 
 Fields may be added compatibly. Removing a field, renaming a field, changing its
 type, or changing the meaning of an existing enum value is a report-contract
@@ -164,14 +167,16 @@ does not taint confidence by itself. This applies to both `lint` and
 `lint-chain`; “chain” describes retained migration state, not a restriction to
 the multi-file command.
 
-Analysis without a database cache is reported as `Tainted`, because existing
-production schema and dependency state are unknown. Rule evaluation retains
-its default worst-case assumptions; an absent cache does not downgrade a
-finding solely because the baseline is unavailable. A stale-cache warning does
-not silently change individual findings, but it taints confidence, must be
-visible on standard error, and must not be described as a production guarantee.
-The configured `stale_stats_days` limit is evaluated from provenance recorded
-inside a successful cache, not from file modification time.
+Analysis without a database cache is `Tainted` because existing schema and
+dependency state are unknown. Rules keep their default worst-case assumptions;
+an absent cache does not lower a finding by itself. A stale cache taints
+confidence and emits a warning on standard error. `stale_stats_days` uses the
+timestamp inside the cache, not file modification time.
+
+Cache V6 synchronizes ordinary functions, but not other routine kinds in
+PostgreSQL's shared routine namespace. It also omits publications and
+subscriptions. Baseline-dependent operations on those objects remain unknown
+and taint analysis. Missing cache entries do not establish absence.
 
 ## Timeout evidence
 
@@ -191,7 +196,7 @@ rule reports at most once per input file.
 
 ## Failure behavior
 
-The following conditions must never produce a successful clean report:
+These conditions exit `1` instead of producing a clean report:
 
 - SQL parse failure;
 - unreadable input;
@@ -200,61 +205,41 @@ The following conditions must never produce a successful clean report:
 - unsupported command-line combinations;
 - internal serialization or analysis failure.
 
-Automatic cache refresh failure is different: it prints the underlying error
-and analysis continues with the old readable V6 cache, or with an unavailable
-baseline if none exists. A retained cache that is still within
-`stale_stats_days` keeps its existing confidence; an unavailable or stale
-baseline is reported as `Tainted`. The JSON baseline records the failed refresh
-in either case.
-Sync writes replace an existing cache only after the new payload has been fully
-produced. Encrypted caches require `cache_encryption = true` and a valid
-`SAFE_MIGRATE_CACHE_KEY`; missing or invalid key material is an operational
-failure and is never accepted from TOML or command-line arguments. Conversely,
-when `cache_encryption = true`, plaintext cache files are rejected rather than
-silently weakening the configured protection. When encryption is disabled,
-encrypted cache files are also rejected; changing modes requires a fresh
-`safe-migrate sync`.
+Automatic refresh failure prints the error and continues with the old readable
+V6 cache, or with no baseline if none exists. A fresh retained cache keeps its
+confidence; an unavailable or stale baseline is `Tainted`. JSON records the
+failed refresh.
+
+Sync replaces an existing cache only after the new payload is complete.
+Encrypted caches require `cache_encryption = true` and a valid
+`SAFE_MIGRATE_CACHE_KEY` from the environment. Plaintext mode rejects encrypted
+caches, and encrypted mode rejects plaintext caches. Changing modes requires a
+fresh `safe-migrate sync`.
 
 V6 cache payloads carry an explicit format header and record effective/session
 role provenance, the unexpanded search-path setting, effective lock and
 statement timeouts in milliseconds, PostgreSQL role membership, authoritative
 synchronized schemas, and synchronized sequence ownership/kind. They never
-include password hashes. V1–V5 and unheadered payloads are rejected with
-generic guidance to run `safe-migrate sync`; errors do not expose internal
-cache-version labels. A failed automatic refresh may reuse an existing readable
-V6 cache, but never an unsupported older cache.
+include password hashes. They contain ordinary functions but not other routine
+kinds, publications, or subscriptions. V1–V5 and unheadered payloads are
+rejected with guidance to run `safe-migrate sync`. A failed automatic refresh
+may reuse a readable V6 cache, but never an older format.
 
-When analysis is reached, the GitHub Action writes JSON, Markdown, and
-diagnostics. It appends the Markdown report to the job summary, annotates Tier
-1 findings as errors and Tier 2 findings as warnings using the rule title,
-summary, reason, and remediation, and leaves Tier 3 in the summary only.
-With no explicit `cache`, the Action clears an isolated managed path and
-restores the latest Cache V6 entry for the selected `baseline` name and
-encryption mode. Clearing the path prevents a checkout file or persistent-runner
-leftover from becoming a baseline after a cache miss. A miss reaches analysis
-as an offline `--no-cache` run with an unavailable baseline and `Tainted`
-confidence, even if an explicit trusted config enables automatic sync. A
-missing explicit cache remains an operational error. `sync: "true"` refreshes
-that path before linting and attempts to save it only after successful
-synchronization; `DATABASE_URL` is cleared from nested helper Actions and
-removed from both lint report processes. GitHub cache-service save failures are
-reported by the cache Action as workflow warnings rather than analyzer status.
-An explicit `cache` path disables GitHub cache transport. `no-cache: "true"`
-bypasses every baseline and cannot be combined with `cache`, synchronization,
-schema filtering, or cache encryption.
-`encrypted-cache: "true"` enables encryption in the Action's generated config.
-An explicit config path must name an existing file, and its encryption setting
-must agree with the Action input. A lint job without `SAFE_MIGRATE_CACHE_KEY`
-skips the encrypted baseline and runs Tainted; a sync job without the key fails
-before connecting. A present key with invalid length or non-hexadecimal
-characters is rejected before cache restore or database access.
-Analyzer status `2` fails normally; `advisory: "true"` makes the Action step
-successful while preserving output `exit-code: 2`. Operational status `1`
-always fails. Published Action accepts only exact semantic tags
-matching `Cargo.toml` or full
-40-character commit SHAs; mutable references are rejected. Release downloads
-are exact-version, exact-target, checksum-verified, and never fall back to
-another release, target, or source build after failure.
+### GitHub Action
+
+- A managed-cache miss runs `--no-cache` with `Tainted` confidence. A missing
+  explicit cache is an error.
+- `sync: "true"` refreshes the baseline before linting. Lint always suppresses
+  config-driven `auto_sync`, and database access is removed after the
+  Action-controlled refresh.
+- An explicit config path must exist, and its `cache_encryption` setting must
+  match `encrypted-cache`.
+- An encrypted sync without a valid key fails before database access. A lint
+  job without the key runs without the encrypted baseline.
+- Exit `2` fails unless `advisory: "true"` is set. Exit `1` always fails.
+- Exact release tags install checksum-verified release assets. Full
+  40-character SHAs and local source invocations build the checked-out source.
+  Mutable branch references are rejected.
 
 Errors must identify the failed input or subsystem without printing
 `DATABASE_URL`, credentials, or migration contents not already requested in the

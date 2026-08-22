@@ -1,14 +1,15 @@
 #!/bin/sh
+# shellcheck disable=SC2016
 set -eu
 
-repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+repo_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 resolver="$repo_root/scripts/action-resolve-version"
 gate="$repo_root/scripts/action-final-gate"
 baseline="$repo_root/scripts/action-baseline"
 manifest="$repo_root/action.yml"
 
 test "$(/bin/sh "$resolver" v0.6.0 "$repo_root/Cargo.toml")" = v0.6.0
-test "$(/bin/sh "$resolver" 0123456789abcdef0123456789abcdef01234567 "$repo_root/Cargo.toml")" = v0.6.0
+test "$(/bin/sh "$resolver" 0123456789abcdef0123456789abcdef01234567 "$repo_root/Cargo.toml")" = source
 
 if /bin/sh "$resolver" main "$repo_root/Cargo.toml" >/dev/null 2>&1; then
   printf '%s\n' 'mutable Action branch reference was accepted' >&2
@@ -30,9 +31,20 @@ set -e
 test "$blocking_status" -eq 2
 test "$operational_status" -eq 1
 
-/bin/sh "$baseline" validate false false false false '' '' default
-/bin/sh "$baseline" validate true false true true '' public production
-/bin/sh "$baseline" validate false false false false reviewed.cache '' default
+tmp_dir=$(mktemp -d)
+trap 'rm -rf "$tmp_dir"' EXIT HUP INT TERM
+migration_file="$tmp_dir/migration.sql"
+migration_dir="$tmp_dir/migrations"
+output_dir="$tmp_dir/artifacts"
+printf '%s\n' 'SELECT 1;' > "$migration_file"
+mkdir -p "$migration_dir"
+
+/bin/sh "$baseline" validate false false false false '' '' default \
+  lint false "$migration_file" '' "$output_dir"
+/bin/sh "$baseline" validate true false true true '' public production \
+  lint-chain true "$migration_dir" '' "$output_dir"
+/bin/sh "$baseline" validate false false false false reviewed.cache '' default \
+  lint false "$migration_file" '' '-artifacts'
 
 assert_baseline_rejected() {
   if /bin/sh "$baseline" validate "$@" >/dev/null 2>&1; then
@@ -41,19 +53,45 @@ assert_baseline_rejected() {
   fi
 }
 
-assert_baseline_rejected maybe false false false '' '' default
-assert_baseline_rejected true true false false '' '' default
-assert_baseline_rejected false false false false '' public default
-assert_baseline_rejected true false true false '' '' default
-assert_baseline_rejected false true false false reviewed.cache '' default
-assert_baseline_rejected false true true false '' '' default
-assert_baseline_rejected false false false false '' '' ''
-assert_baseline_rejected false false false false '' '' .
-assert_baseline_rejected false false false false '' '' ..
-assert_baseline_rejected false false false false '' '' 'invalid key'
+assert_baseline_rejected maybe false false false '' '' default \
+  lint false "$migration_file" '' "$output_dir"
+assert_baseline_rejected true true false false '' '' default \
+  lint false "$migration_file" '' "$output_dir"
+assert_baseline_rejected false false false false '' public default \
+  lint false "$migration_file" '' "$output_dir"
+assert_baseline_rejected true false true false '' '' default \
+  lint false "$migration_file" '' "$output_dir"
+assert_baseline_rejected false true false false reviewed.cache '' default \
+  lint false "$migration_file" '' "$output_dir"
+assert_baseline_rejected false true true false '' '' default \
+  lint false "$migration_file" '' "$output_dir"
+assert_baseline_rejected false false false false '' '' '' \
+  lint false "$migration_file" '' "$output_dir"
+assert_baseline_rejected false false false false '' '' . \
+  lint false "$migration_file" '' "$output_dir"
+assert_baseline_rejected false false false false '' '' .. \
+  lint false "$migration_file" '' "$output_dir"
+assert_baseline_rejected false false false false '' '' 'invalid key' \
+  lint false "$migration_file" '' "$output_dir"
+assert_baseline_rejected false false false false '' '' default \
+  invalid false "$migration_file" '' "$output_dir"
+assert_baseline_rejected false false false false '' '' default \
+  lint maybe "$migration_file" '' "$output_dir"
+assert_baseline_rejected false false false false '' '' default \
+  lint false "$tmp_dir/missing.sql" '' "$output_dir"
+assert_baseline_rejected false false false false '' '' default \
+  lint false "$migration_dir" '' "$output_dir"
+assert_baseline_rejected false false false false '' '' default \
+  lint-chain false "$migration_file" '' "$output_dir"
+assert_baseline_rejected false false false false '' '' default \
+  lint false "$migration_file" '' ''
+line_feed_value=$(printf 'first\nsecond')
+carriage_return_value=$(printf 'first\rsecond')
+assert_baseline_rejected false false false false "$line_feed_value" '' default \
+  lint false "$migration_file" '' "$output_dir"
+assert_baseline_rejected false false false false '' '' default \
+  lint false "$migration_file" "$carriage_return_value" "$output_dir"
 
-tmp_dir=$(mktemp -d)
-trap 'rm -rf "$tmp_dir"' EXIT HUP INT TERM
 plain_config="$tmp_dir/plain.toml"
 encrypted_config="$tmp_dir/encrypted.toml"
 quoted_encrypted_config="$tmp_dir/quoted-encrypted.toml"
@@ -96,8 +134,12 @@ grep -A4 '^  encrypted-cache:$' "$manifest" | grep -F 'default: "false"' >/dev/n
 grep -A4 '^  no-cache:$' "$manifest" | grep -F 'default: "false"' >/dev/null
 grep -F 'cache_dir="$(mktemp -d "${cache_root}/invocation.XXXXXX")"' "$manifest" >/dev/null
 grep -F 'managed_root="../.safe-migrate-action-cache"' "$manifest" >/dev/null
-grep -F 'rm -rf -- "$managed_root"' "$manifest" >/dev/null
 grep -F 'cache_dir="${managed_root}/baselines/${INPUT_BASELINE}"' "$manifest" >/dev/null
+grep -F 'rm -rf -- "$cache_dir"' "$manifest" >/dev/null
+if grep -F 'rm -rf -- "$managed_root"' "$manifest" >/dev/null; then
+  printf '%s\n' 'Action still removes every managed baseline' >&2
+  exit 1
+fi
 grep -F 'uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9' "$manifest" >/dev/null
 grep -F 'uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9' "$manifest" >/dev/null
 grep -F 'cache_prefix="safe-migrate-v6-${RUNNER_OS}-${cache_mode}-${INPUT_BASELINE}-"' "$manifest" >/dev/null
@@ -112,5 +154,13 @@ grep -F "finding.rule_title || finding.rule_id" "$manifest" >/dev/null
 grep -F "finding.rule_summary" "$manifest" >/dev/null
 grep -E 'actions/github-script@[0-9a-f]{40}' "$manifest" >/dev/null
 grep -F 'env -u DATABASE_URL' "$manifest" >/dev/null
+grep -F -- 'command+=(--cache "$RESOLVED_CACHE" --config "$config_path" --no-auto-sync)' "$manifest" >/dev/null
+grep -F 'mkdir -p -- "$INPUT_OUTPUT_DIR"' "$manifest" >/dev/null
+grep -F "steps.action-install.outputs.install-mode == 'source'" "$manifest" >/dev/null
+grep -F 'Windows ARM64 runners are not supported' "$manifest" >/dev/null
+if grep -F 'aarch64-pc-windows-msvc' "$manifest" >/dev/null; then
+  printf '%s\n' 'Action still advertises an unpublished Windows ARM64 artifact' >&2
+  exit 1
+fi
 grep -F '{ [ -z "$INPUT_CACHE" ] && [ ! -f "$RESOLVED_CACHE" ]; }' "$manifest" >/dev/null
 grep -F 'Explicit cache does not exist or is not a file' "$manifest" >/dev/null

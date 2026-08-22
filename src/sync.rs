@@ -1,13 +1,11 @@
-// FILE: src/sync.rs
-
 use crate::ast::identifiers::ObjectId;
 use crate::db::cache::{CACHE_V6_MAGIC, DbCache, DbCacheVersioned, ForeignKeyCache, IndexCache};
-use crate::db::cache_file::protect_cache_bytes;
+use crate::db::cache_file::{MAX_CACHE_DECODE_BYTES, MAX_CACHE_FILE_BYTES, protect_cache_bytes};
 use crate::model::relation::{Persistence, RelationKind, RelationState};
 use anyhow::{Context, Result};
 use postgres::config::Host;
-use postgres::{Client, Config as PostgresConfig, NoTls};
-use std::io::Write;
+use postgres::{Client, Config as PostgresConfig, GenericClient, IsolationLevel, NoTls};
+use std::io::{self, Write};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::NamedTempFile;
@@ -23,6 +21,9 @@ pub fn sync_cache(
     // Strict env-only credential enforcement
     let db_url = std::env::var("DATABASE_URL")
         .context("DATABASE_URL environment variable is required to sync PostgreSQL schema metadata and statistics. Do not pass credentials via CLI flags or config files.")?;
+    if db_url.trim().is_empty() {
+        anyhow::bail!("DATABASE_URL must not be empty or whitespace");
+    }
 
     let mut client = connect_database(&db_url)?;
 
@@ -134,6 +135,22 @@ fn write_cache_with_protection(
     cache: DbCache,
     protect: impl FnOnce(Vec<u8>) -> Result<Vec<u8>>,
 ) -> Result<()> {
+    write_cache_with_protection_and_limits(
+        out_path,
+        cache,
+        protect,
+        MAX_CACHE_FILE_BYTES,
+        MAX_CACHE_DECODE_BYTES,
+    )
+}
+
+fn write_cache_with_protection_and_limits(
+    out_path: &Path,
+    cache: DbCache,
+    protect: impl FnOnce(Vec<u8>) -> Result<Vec<u8>>,
+    max_file_bytes: u64,
+    max_decode_bytes: usize,
+) -> Result<()> {
     let parent = out_path.parent().unwrap_or_else(|| Path::new("."));
     let mut temp_file = NamedTempFile::new_in(parent).with_context(|| {
         format!(
@@ -142,24 +159,46 @@ fn write_cache_with_protection(
         )
     })?;
     let mut compressed = Vec::new();
-    let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3)
+    let encoder = zstd::stream::Encoder::new(&mut compressed, 3)
         .context("Failed to init zstd compression")?;
+    let mut encoder = SizeLimitedWriter::new(encoder, max_decode_bytes);
 
-    encoder
-        .write_all(CACHE_V6_MAGIC)
-        .context("Failed to write cache V6 payload header")?;
+    if let Err(error) = encoder.write_all(CACHE_V6_MAGIC) {
+        if encoder.limit_exceeded() {
+            anyhow::bail!(
+                "Cache payload exceeds the {} MiB decoded-size limit",
+                max_decode_bytes / (1024 * 1024)
+            );
+        }
+        return Err(error).context("Failed to write cache V6 payload header");
+    }
 
     let versioned = DbCacheVersioned::V6(Box::new(cache));
     let bincode_config = bincode::config::standard().with_variable_int_encoding();
 
-    bincode::serde::encode_into_std_write(&versioned, &mut encoder, bincode_config)
-        .context("Failed bincode schema compilation and write")?;
+    let encode_result =
+        bincode::serde::encode_into_std_write(&versioned, &mut encoder, bincode_config);
+    if encoder.limit_exceeded() {
+        anyhow::bail!(
+            "Cache payload exceeds the {} MiB decoded-size limit",
+            max_decode_bytes / (1024 * 1024)
+        );
+    }
+    encode_result.context("Failed bincode schema compilation and write")?;
 
+    let encoder = encoder.into_inner();
     encoder
         .finish()
         .context("Failed to flush final zstd stream to disk")?;
 
     let cache_bytes = protect(compressed)?;
+    let cache_file_bytes = u64::try_from(cache_bytes.len()).unwrap_or(u64::MAX);
+    if cache_file_bytes > max_file_bytes {
+        anyhow::bail!(
+            "Cache payload exceeds the {} MiB encoded-size limit",
+            max_file_bytes / (1024 * 1024)
+        );
+    }
     temp_file
         .write_all(&cache_bytes)
         .context("Failed to write cache payload")?;
@@ -168,6 +207,52 @@ fn write_cache_with_protection(
     replace_cache(temp_file, out_path)?;
 
     Ok(())
+}
+
+struct SizeLimitedWriter<W> {
+    inner: W,
+    bytes_written: usize,
+    max_bytes: usize,
+    limit_exceeded: bool,
+}
+
+impl<W> SizeLimitedWriter<W> {
+    fn new(inner: W, max_bytes: usize) -> Self {
+        Self {
+            inner,
+            bytes_written: 0,
+            max_bytes,
+            limit_exceeded: false,
+        }
+    }
+
+    fn limit_exceeded(&self) -> bool {
+        self.limit_exceeded
+    }
+
+    fn into_inner(self) -> W {
+        self.inner
+    }
+}
+
+impl<W: Write> Write for SizeLimitedWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() > self.max_bytes.saturating_sub(self.bytes_written) {
+            self.limit_exceeded = true;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cache decoded-size limit exceeded",
+            ));
+        }
+
+        let written = self.inner.write(bytes)?;
+        self.bytes_written = self.bytes_written.saturating_add(written);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 #[cfg(not(windows))]
@@ -231,6 +316,31 @@ fn replace_cache(temp_file: NamedTempFile, out_path: &Path) -> Result<()> {
 }
 
 pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result<DbCache> {
+    let mut transaction = client
+        .build_transaction()
+        .isolation_level(IsolationLevel::RepeatableRead)
+        .read_only(true)
+        .start()
+        .context("Failed to start read-only cache synchronization transaction")?;
+    let cache = populate_cache_from_client(&mut transaction, schemas)?;
+    transaction
+        .commit()
+        .context("Failed to commit cache synchronization transaction")?;
+    Ok(cache)
+}
+
+#[doc(hidden)]
+pub fn populate_cache_in_current_transaction(
+    client: &mut Client,
+    schemas: Option<&[String]>,
+) -> Result<DbCache> {
+    populate_cache_from_client(client, schemas)
+}
+
+fn populate_cache_from_client(
+    client: &mut impl GenericClient,
+    schemas: Option<&[String]>,
+) -> Result<DbCache> {
     let mut cache = DbCache::new();
     let schema_values = schemas.map(|items| items.to_vec());
     cache.metadata.created_at_unix_secs = Some(
@@ -281,7 +391,7 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
         )
     "#;
 
-    // Query 1: Server Version
+    // Server version and connection provenance.
     let version_row = client.query_one("SHOW server_version_num;", &[])?;
     let version_str: String = version_row.get(0);
     cache.pg_version_num = version_str.parse::<u32>().ok();
@@ -408,7 +518,7 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
         );
     }
 
-    // Query 2: Relations + Staleness
+    // Relations and statistics.
     let table_query = format!(
         "
         SELECT
@@ -496,7 +606,7 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
         cache.insert_baseline(object_id, state);
     }
 
-    // Query 3: Columns + Width
+    // Columns and width statistics.
     let col_query = format!("
         SELECT
             n.nspname AS schema_name,
@@ -544,7 +654,7 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
         }
     }
 
-    // Query 4: Triggers & Policies
+    // Triggers and policies.
     let tp_query = format!("
         SELECT 
             n.nspname AS schema_name,
@@ -574,7 +684,7 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
         }
     }
 
-    // Query 4.25: Explicit non-owner relation privileges.
+    // Explicit non-owner relation privileges.
     let acl_query = format!(
         "
         SELECT
@@ -621,7 +731,7 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
         }
     }
 
-    // Query 4.5: Trigger Functions
+    // Trigger functions.
     let trig_query = format!(
         "
         SELECT 
@@ -661,7 +771,7 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
         });
     }
 
-    // Query 4.75: Table constraints
+    // Table constraints.
     let constraint_query = format!(
         "
         SELECT
@@ -703,7 +813,7 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
             });
     }
 
-    // Query 5: Foreign Keys
+    // Foreign keys.
     let fk_query = format!(
         "
         SELECT 
@@ -754,7 +864,7 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
         });
     }
 
-    // Query 6: Indexes
+    // Indexes.
     let idx_query = format!(
         "
         SELECT 
@@ -790,7 +900,7 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
         });
     }
 
-    // Query 7: Functions
+    // Functions.
     let func_query = format!(
         "
         SELECT
@@ -855,6 +965,7 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
             id.clone(),
             crate::model::function::FunctionState {
                 id,
+                routine_kind: crate::model::function::RoutineKind::Function,
                 arg_types,
                 arg_type_ids: Vec::new(),
                 return_type: return_type.unwrap_or_default(),
@@ -866,7 +977,7 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
         );
     }
 
-    // Query 8: User-defined types, including ordered enum labels and domains.
+    // User-defined types, including ordered enum labels and domains.
     let type_query = format!(
         "
         SELECT
@@ -919,7 +1030,7 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
         );
     }
 
-    // Query 9: Dependencies (pg_depend)
+    // Catalog dependencies.
     let depend_query = r#"
         SELECT
             d.classid, d.objid, d.objsubid,
@@ -1126,6 +1237,47 @@ mod atomic_write_tests {
                 .to_string()
                 .contains("injected payload-protection failure")
         );
+        assert_eq!(fs::read(&cache_path).unwrap(), b"known-good-cache");
+        assert_eq!(fs::read_dir(temp_dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn cache_writer_rejects_oversized_decoded_payload_before_replacement() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cache_path = temp_dir.path().join("baseline.cache");
+        fs::write(&cache_path, b"known-good-cache").unwrap();
+
+        let error = write_cache_with_protection_and_limits(
+            &cache_path,
+            DbCache::new(),
+            Ok,
+            MAX_CACHE_FILE_BYTES,
+            CACHE_V6_MAGIC.len(),
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("decoded-size limit"));
+        assert_eq!(fs::read(&cache_path).unwrap(), b"known-good-cache");
+        assert_eq!(fs::read_dir(temp_dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn cache_writer_rejects_oversized_encoded_payload_before_replacement() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cache_path = temp_dir.path().join("baseline.cache");
+        fs::write(&cache_path, b"known-good-cache").unwrap();
+        let max_file_bytes = 16_u64;
+
+        let error = write_cache_with_protection_and_limits(
+            &cache_path,
+            DbCache::new(),
+            |_| Ok(vec![0; max_file_bytes as usize + 1]),
+            max_file_bytes,
+            MAX_CACHE_DECODE_BYTES,
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("encoded-size limit"));
         assert_eq!(fs::read(&cache_path).unwrap(), b"known-good-cache");
         assert_eq!(fs::read_dir(temp_dir.path()).unwrap().count(), 1);
     }

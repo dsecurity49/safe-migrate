@@ -385,7 +385,7 @@ mod phase10_bug_fixes_and_sorting_tests {
 
         engine
             .analyze(
-                "CREATE FUNCTION notify_func(int, text) RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';",
+                "CREATE FUNCTION notify_func() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';",
                 &mut state,
             )
             .unwrap();
@@ -398,21 +398,19 @@ mod phase10_bug_fixes_and_sorting_tests {
             )
             .unwrap();
 
-        // Dropping the function with hypothetical parameter types to test normalization
         let v = engine
-            .analyze("DROP FUNCTION notify_func(int, text);", &mut state)
+            .analyze("DROP FUNCTION notify_func();", &mut state)
             .unwrap();
-        println!("DEBUG Violations: {:?}", v);
 
         assert!(
             v.iter()
                 .any(|violation| violation.rule_id == "broken-compute"),
-            "Expected broken-compute violation when dropping function used by trigger, even with parameter list"
+            "expected the trigger dependency to explain the rejected drop"
         );
     }
 
     #[test]
-    fn test_bug004_concurrent_in_txn_skips_on_skipped_mutation() {
+    fn concurrent_index_if_not_exists_still_fails_inside_a_transaction() {
         let engine = setup_engine();
         let mut state = setup_state();
 
@@ -434,9 +432,9 @@ mod phase10_bug_fixes_and_sorting_tests {
             .unwrap();
 
         assert!(
-            !v.iter()
+            v.iter()
                 .any(|violation| violation.rule_id == "concurrent-in-transaction"),
-            "Expected no concurrent-in-transaction violation because the index already exists and statement was skipped"
+            "PostgreSQL checks the transaction restriction before IF NOT EXISTS can skip the index"
         );
     }
 
@@ -628,7 +626,7 @@ mod phase10_bug_fixes_and_sorting_tests {
     }
 
     // ─────────────────────────────────────────────
-    // Finding 2 — Untested rule: PartitionStrategyMismatchRule
+    // Partition strategy matching.
     // ─────────────────────────────────────────────
     #[test]
     fn test_finding2_partition_strategy_mismatch_silent_on_regular_child() {
@@ -746,7 +744,7 @@ mod phase10_bug_fixes_and_sorting_tests {
     }
 
     // ─────────────────────────────────────────────
-    // Finding 2 — Untested rule: AlterTypeAddValueRule
+    // Enum additions inside transactions.
     // ─────────────────────────────────────────────
     #[test]
     fn test_finding2_alter_type_add_value_fires_inside_txn() {
@@ -787,8 +785,27 @@ mod phase10_bug_fixes_and_sorting_tests {
         );
     }
 
+    #[test]
+    fn alter_type_rename_value_is_not_reported_as_add_value() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let violations = engine
+            .analyze(
+                "BEGIN; ALTER TYPE public.mood RENAME VALUE 'sad' TO 'blue'; COMMIT;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.rule_id == "alter-type-add-value-txn")
+        );
+    }
+
     // ─────────────────────────────────────────────
-    // Finding 8 — DropColumn IF EXISTS regression
+    // Guarded column drops.
     // ─────────────────────────────────────────────
     #[test]
     fn test_finding8_drop_column_if_exists_noop() {
@@ -990,6 +1007,22 @@ mod phase10_bug_fixes_and_sorting_tests {
             safe_migrate::analysis::state::Confidence::Exact,
             "Confidence should remain Exact when SET TYPE on existing column"
         );
+    }
+
+    #[test]
+    fn alter_quoted_column_resolves_the_created_column() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                r#"CREATE TABLE entries ("Camel" int);
+                   ALTER TABLE entries ALTER COLUMN "Camel" TYPE bigint;"#,
+                &mut state,
+            )
+            .unwrap();
+
+        assert_eq!(state.local.confidence, Confidence::Exact);
     }
     // ─────────────────────────────────────────────
     // Bug 9 — Privilege enum consistency: All variant

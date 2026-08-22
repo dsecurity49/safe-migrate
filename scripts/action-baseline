@@ -3,7 +3,7 @@ set -eu
 
 usage() {
     printf '%s\n' \
-        'usage: action-baseline validate <sync> <no-cache> <encrypted-cache> <key-available> <cache> <schemas> <baseline>' \
+        'usage: action-baseline validate <sync> <no-cache> <encrypted-cache> <key-available> <cache> <schemas> <baseline> <mode> <advisory> <path> <config> <output-dir>' \
         '       action-baseline validate-config <config> <encrypted-cache>' \
         '       action-baseline sync <binary> <cache> <config> <schemas>' >&2
     exit 2
@@ -21,10 +21,24 @@ validate_boolean() {
     esac
 }
 
+validate_single_line() {
+    name=$1
+    value=$2
+    newline='
+'
+    carriage_return=$(printf '\r')
+    case "$value" in
+        *"$newline"*|*"$carriage_return"*)
+            printf '%s must not contain CR or LF characters\n' "$name" >&2
+            exit 1
+            ;;
+    esac
+}
+
 command=${1-}
 case "$command" in
     validate)
-        [ "$#" -eq 8 ] || usage
+        [ "$#" -eq 13 ] || usage
         sync=$2
         no_cache=$3
         encrypted_cache=$4
@@ -32,11 +46,48 @@ case "$command" in
         cache=$6
         schemas=$7
         baseline=$8
+        mode=$9
+        advisory=${10}
+        path=${11}
+        config=${12}
+        output_dir=${13}
 
         validate_boolean sync "$sync"
         validate_boolean no-cache "$no_cache"
         validate_boolean encrypted-cache "$encrypted_cache"
         validate_boolean key-available "$key_available"
+        validate_boolean advisory "$advisory"
+        validate_single_line cache "$cache"
+        validate_single_line schemas "$schemas"
+        validate_single_line baseline "$baseline"
+        validate_single_line mode "$mode"
+        validate_single_line path "$path"
+        validate_single_line config "$config"
+        validate_single_line output-dir "$output_dir"
+
+        case "$mode" in
+            lint)
+                [ -f "$path" ] || {
+                    printf 'lint path does not exist or is not a file: %s\n' "$path" >&2
+                    exit 1
+                }
+                ;;
+            lint-chain)
+                [ -d "$path" ] || {
+                    printf 'lint-chain path does not exist or is not a directory: %s\n' \
+                        "$path" >&2
+                    exit 1
+                }
+                ;;
+            *)
+                printf 'mode must be lint or lint-chain, got: %s\n' "$mode" >&2
+                exit 1
+                ;;
+        esac
+        [ -n "$output_dir" ] || {
+            printf '%s\n' 'output-dir must not be empty' >&2
+            exit 1
+        }
 
         if [ "$no_cache" = true ] && {
             [ "$sync" = true ] || [ "$encrypted_cache" = true ] ||
@@ -83,6 +134,7 @@ case "$command" in
         config=$2
         encrypted_cache=$3
         validate_boolean encrypted-cache "$encrypted_cache"
+        validate_single_line config "$config"
 
         if [ ! -f "$config" ]; then
             printf 'explicit config does not exist or is not a file: %s\n' \
@@ -109,6 +161,10 @@ case "$command" in
         cache=$3
         config=$4
         schemas=$5
+
+        validate_single_line cache "$cache"
+        validate_single_line config "$config"
+        validate_single_line schemas "$schemas"
 
         set -- "$binary" sync --out "$cache" --config "$config"
         if [ -n "$schemas" ]; then

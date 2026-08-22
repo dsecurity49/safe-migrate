@@ -24,9 +24,9 @@ use crate::rules::views::MaterializedViewRefreshRule;
 
 /// Stable user-facing metadata and construction for one primary rule.
 ///
-/// Keep this registry in evaluation order. It is the canonical source for
-/// rule discovery, configuration validation, documentation checks, and engine
-/// construction; auxiliary findings emitted by a primary rule are not entries.
+/// Keep this registry in evaluation order. Discovery, configuration validation,
+/// documentation checks, and engine construction all read it. Auxiliary
+/// findings emitted by a primary rule are not entries.
 pub struct RuleDescriptor {
     pub id: &'static str,
     pub title: &'static str,
@@ -230,7 +230,7 @@ pub static PRIMARY_RULES: &[RuleDescriptor] = &[
     descriptor!(
         "broken-compute",
         "Broken compute dependency",
-        "Flags function changes that break triggers.",
+        "Flags function drops blocked by trigger dependencies.",
         "correctness",
         BrokenComputeRule
     ),
@@ -315,12 +315,18 @@ pub fn find_primary_rule(id: &str) -> Option<&'static RuleDescriptor> {
 }
 
 pub fn validate_rule_configuration(config: &crate::engine::config::Config) -> Result<(), String> {
+    if config.tier1_threshold_rows < config.tier2_threshold_rows {
+        return Err(format!(
+            "tier1_threshold_rows ({}) must be greater than or equal to tier2_threshold_rows ({})",
+            config.tier1_threshold_rows, config.tier2_threshold_rows
+        ));
+    }
+
     let mut rule_ids: Vec<_> = config.rules.keys().map(String::as_str).collect();
     rule_ids.sort_unstable();
     for rule_id in rule_ids {
         let Some(descriptor) = find_primary_rule(rule_id) else {
-            // Unknown IDs are reported by Config::validate_rule_ids with the
-            // complete canonical ID list.
+            // Config::validate_rule_ids reports unknown IDs with the full list.
             continue;
         };
         let rule = &config.rules[rule_id];
@@ -337,6 +343,17 @@ pub fn validate_rule_configuration(config: &crate::engine::config::Config) -> Re
             return Err(format!(
                 "Rule '{rule_id}' does not support 'tier2_threshold_rows'"
             ));
+        }
+        if descriptor.supports(RuleConfigurationField::Tier1ThresholdRows)
+            && descriptor.supports(RuleConfigurationField::Tier2ThresholdRows)
+        {
+            let tier1 = config.rule_tier1_threshold(rule_id);
+            let tier2 = config.rule_tier2_threshold(rule_id);
+            if tier1 < tier2 {
+                return Err(format!(
+                    "Rule '{rule_id}' has tier1_threshold_rows ({tier1}) below tier2_threshold_rows ({tier2})"
+                ));
+            }
         }
     }
     Ok(())
@@ -399,6 +416,35 @@ mod tests {
                 descriptor.id
             );
         }
+    }
+
+    #[test]
+    fn threshold_validation_requires_tier1_at_or_above_tier2() {
+        let globally_reversed = crate::engine::config::Config {
+            tier1_threshold_rows: 9,
+            tier2_threshold_rows: 10,
+            ..crate::engine::config::Config::default()
+        };
+        assert!(
+            validate_rule_configuration(&globally_reversed)
+                .unwrap_err()
+                .contains("tier1_threshold_rows (9)")
+        );
+
+        let mut per_rule_reversed = crate::engine::config::Config::default();
+        per_rule_reversed.rules.insert(
+            "blocking-constraint".into(),
+            crate::engine::config::RuleConfig {
+                tier1_threshold_rows: Some(5),
+                tier2_threshold_rows: Some(6),
+                ..crate::engine::config::RuleConfig::default()
+            },
+        );
+        assert!(
+            validate_rule_configuration(&per_rule_reversed)
+                .unwrap_err()
+                .contains("Rule 'blocking-constraint'")
+        );
     }
 
     #[test]

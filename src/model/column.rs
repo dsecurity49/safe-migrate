@@ -19,7 +19,7 @@ pub struct Column {
     #[serde(default)]
     pub default_expr_text: Option<String>,
     /// Raw type modifier integer from pg_attribute.atttypmod.
-    /// Example: For VARCHAR(50), this stores 54 (50 + 4 length header).
+    /// For VARCHAR(50), PostgreSQL stores the character limit plus VARHDRSZ: 54.
     #[serde(default)]
     pub type_modifier: Option<i32>,
 }

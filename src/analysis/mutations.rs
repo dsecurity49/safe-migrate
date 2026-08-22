@@ -1,4 +1,3 @@
-// FILE: src/analysis/mutations.rs
 use crate::analysis::expr_ir::ExprIr;
 use crate::analysis::facts::{
     ResetSettingTarget, SearchPathTarget, TableConstraintFact, TimeoutSetting, TimeoutSettingValue,
@@ -458,6 +457,7 @@ pub struct DropSubscriptionMutation {
 pub struct CreateRoleMutation {
     pub name: String,
     pub inherits: bool,
+    pub can_login: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]

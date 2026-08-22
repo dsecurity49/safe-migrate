@@ -1,5 +1,4 @@
-// FILE: src/rules/transactions.rs
-use crate::analysis::mutations::Mutation;
+use crate::analysis::mutations::{AlterTypeActionMutation, Mutation};
 use crate::analysis::state::{AnalysisState, CascadeResult, MutationResult};
 use crate::engine::config::Config;
 use crate::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
@@ -21,15 +20,12 @@ impl Rule for ConcurrentInsideTransactionRule {
     fn evaluate(
         &self,
         mutation: &Mutation,
-        result: &MutationResult,
+        _result: &MutationResult,
         _pre_state: &crate::analysis::state::PreState,
         state: &AnalysisState,
         _config: &Config,
         _cascade: Option<&CascadeResult>,
     ) -> Vec<Violation> {
-        if *result == MutationResult::Skipped {
-            return vec![];
-        }
         let mut violations = Vec::new();
 
         if !state.local.transactions.is_empty() {
@@ -98,6 +94,7 @@ impl Rule for AlterTypeAddValueRule {
     ) -> Vec<Violation> {
         if !state.local.transactions.is_empty()
             && let Mutation::AlterType(alter) = mutation
+            && matches!(alter.action, AlterTypeActionMutation::AddValue { .. })
         {
             return vec![Violation {
                 source_range: None,

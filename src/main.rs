@@ -40,8 +40,9 @@ enum Commands {
         #[arg(short, long)]
         file: PathBuf,
 
-        #[arg(long, default_value = "safe-migrate.toml")]
-        config: PathBuf,
+        /// Read configuration from this file; otherwise use safe-migrate.toml when present
+        #[arg(long)]
+        config: Option<PathBuf>,
 
         #[arg(long, default_value = ".safe-migrate.cache")]
         cache: PathBuf,
@@ -49,6 +50,10 @@ enum Commands {
         /// Bypass the local cache file and evaluate with default worst-case assumptions
         #[arg(long)]
         no_cache: bool,
+
+        /// Skip automatic synchronization configured in TOML for this run
+        #[arg(long)]
+        no_auto_sync: bool,
 
         /// Output results in JSON format for CI/CD integration
         #[arg(long, conflicts_with_all = ["interactive", "markdown"])]
@@ -67,8 +72,9 @@ enum Commands {
         #[arg(short, long)]
         dir: PathBuf,
 
-        #[arg(long, default_value = "safe-migrate.toml")]
-        config: PathBuf,
+        /// Read configuration from this file; otherwise use safe-migrate.toml when present
+        #[arg(long)]
+        config: Option<PathBuf>,
 
         #[arg(long, default_value = ".safe-migrate.cache")]
         cache: PathBuf,
@@ -76,6 +82,10 @@ enum Commands {
         /// Bypass the local cache file and evaluate with default worst-case assumptions
         #[arg(long)]
         no_cache: bool,
+
+        /// Skip automatic synchronization configured in TOML for this run
+        #[arg(long)]
+        no_auto_sync: bool,
 
         /// Output results in JSON format for CI/CD integration
         #[arg(long, conflicts_with_all = ["interactive", "markdown"])]
@@ -93,8 +103,9 @@ enum Commands {
     Sync {
         #[arg(long, default_value = ".safe-migrate.cache")]
         out: PathBuf,
-        #[arg(long, default_value = "safe-migrate.toml")]
-        config: PathBuf,
+        /// Read configuration from this file; otherwise use safe-migrate.toml when present
+        #[arg(long)]
+        config: Option<PathBuf>,
         /// Filter sync to specific schemas (comma-separated, e.g., --schemas public,auth)
         #[arg(long, value_delimiter = ',')]
         schemas: Option<Vec<String>>,
@@ -112,9 +123,9 @@ enum Commands {
         /// Output the rule catalog as JSON
         #[arg(long)]
         json: bool,
-        /// Read effective rule settings from this configuration file
-        #[arg(long, default_value = "safe-migrate.toml")]
-        config: PathBuf,
+        /// Read configuration from this file; otherwise use safe-migrate.toml when present
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
 }
 
@@ -124,8 +135,9 @@ enum CacheCommands {
     Inspect {
         #[arg(long, default_value = ".safe-migrate.cache")]
         cache: PathBuf,
-        #[arg(long, default_value = "safe-migrate.toml")]
-        config: PathBuf,
+        /// Read configuration from this file; otherwise use safe-migrate.toml when present
+        #[arg(long)]
+        config: Option<PathBuf>,
         /// Output the redacted summary as JSON
         #[arg(long)]
         json: bool,
@@ -235,14 +247,16 @@ fn main() -> Result<()> {
             config,
             cache,
             no_cache,
+            no_auto_sync,
             json,
             markdown,
             interactive,
         } => run_lint(
             &file,
-            &config,
+            config.as_deref(),
             &cache,
             no_cache,
+            no_auto_sync,
             OutputMode::from_flags(json, markdown, interactive),
         ),
         Commands::LintChain {
@@ -250,29 +264,33 @@ fn main() -> Result<()> {
             config,
             cache,
             no_cache,
+            no_auto_sync,
             json,
             markdown,
             interactive,
         } => run_lint_chain(
             &dir,
-            &config,
+            config.as_deref(),
             &cache,
             no_cache,
+            no_auto_sync,
             OutputMode::from_flags(json, markdown, interactive),
         ),
         Commands::Sync {
             out,
             config,
             schemas,
-        } => run_sync(&out, &config, schemas.as_deref()),
+        } => run_sync(&out, config.as_deref(), schemas.as_deref()),
         Commands::Cache { command } => match command {
             CacheCommands::Inspect {
                 cache,
                 config,
                 json,
-            } => run_cache_inspect(&cache, &config, json),
+            } => run_cache_inspect(&cache, config.as_deref(), json),
         },
-        Commands::Rules { rule, json, config } => run_rules(rule.as_deref(), json, &config),
+        Commands::Rules { rule, json, config } => {
+            run_rules(rule.as_deref(), json, config.as_deref())
+        }
     }
 }
 
@@ -318,7 +336,7 @@ fn rules_separator() -> String {
     "-".repeat((width as f32 * 0.82) as usize)
 }
 
-fn run_rules(rule_id: Option<&str>, json: bool, config_path: &Path) -> Result<()> {
+fn run_rules(rule_id: Option<&str>, json: bool, config_path: Option<&Path>) -> Result<()> {
     let config = load_config(config_path)?;
     let descriptors: Vec<_> = match rule_id {
         Some(id) => vec![registry::find_primary_rule(id).ok_or_else(|| {
@@ -386,9 +404,10 @@ fn run_rules(rule_id: Option<&str>, json: bool, config_path: &Path) -> Result<()
 
 fn run_lint(
     file: &Path,
-    config_path: &Path,
+    config_path: Option<&Path>,
     cache: &Path,
     no_cache: bool,
+    no_auto_sync: bool,
     output_mode: OutputMode,
 ) -> Result<()> {
     let sql = fs::read_to_string(file)
@@ -400,7 +419,7 @@ fn run_lint(
         baseline_stale,
         auto_sync,
         metadata,
-    } = prepare_cache(&config, cache, no_cache)?;
+    } = prepare_cache(&config, cache, no_cache, no_auto_sync)?;
 
     eprintln!("Analyzing migration: {}", file.display());
 
@@ -423,22 +442,31 @@ fn run_lint(
 
 fn run_lint_chain(
     dir: &Path,
-    config_path: &Path,
+    config_path: Option<&Path>,
     cache: &Path,
     no_cache: bool,
+    no_auto_sync: bool,
     output_mode: OutputMode,
 ) -> Result<()> {
-    let mut files: Vec<_> = fs::read_dir(dir)
-        .with_context(|| format!("Failed to read directory: {}", dir.display()))?
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| {
-            entry
-                .path()
-                .extension()
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("sql"))
-        })
-        .collect();
+    let mut files = Vec::new();
+    for entry in
+        fs::read_dir(dir).with_context(|| format!("Failed to read directory: {}", dir.display()))?
+    {
+        let entry = entry
+            .with_context(|| format!("Failed to read an entry in directory: {}", dir.display()))?;
+        if entry
+            .path()
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("sql"))
+        {
+            files.push(entry);
+        }
+    }
     files.sort_by_key(|entry| entry.file_name());
+
+    if files.is_empty() {
+        anyhow::bail!("No .sql migration files found in {}", dir.display());
+    }
 
     let mut migrations = Vec::new();
     for entry in files {
@@ -456,7 +484,7 @@ fn run_lint_chain(
         baseline_stale,
         auto_sync,
         metadata,
-    } = prepare_cache(&config, cache, no_cache)?;
+    } = prepare_cache(&config, cache, no_cache, no_auto_sync)?;
 
     eprintln!("Analyzing migration chain in: {}", dir.display());
 
@@ -477,9 +505,7 @@ fn run_lint_chain(
     )
 }
 
-fn run_sync(out: &Path, config_path: &Path, schemas: Option<&[String]>) -> Result<()> {
-    std::env::var("DATABASE_URL")
-        .context("DATABASE_URL environment variable must be set to run sync.")?;
+fn run_sync(out: &Path, config_path: Option<&Path>, schemas: Option<&[String]>) -> Result<()> {
     let config = load_config(config_path)?;
     let schemas = config.sync_schemas(schemas)?;
 
@@ -492,7 +518,7 @@ fn run_sync(out: &Path, config_path: &Path, schemas: Option<&[String]>) -> Resul
     Ok(())
 }
 
-fn run_cache_inspect(cache_path: &Path, config_path: &Path, json: bool) -> Result<()> {
+fn run_cache_inspect(cache_path: &Path, config_path: Option<&Path>, json: bool) -> Result<()> {
     let config = load_config(config_path)?;
     let (cache, format_version, encrypted) = decode_cache(cache_path, config.cache_encryption)?;
     let now = SystemTime::now()
@@ -640,21 +666,47 @@ fn print_cache_inspection(inspection: &CacheInspection) {
     );
 }
 
-fn load_config(path: &Path) -> Result<Config> {
-    let config = Config::load_from_file(path)
-        .with_context(|| format!("Failed to load configuration: {}", path.display()))?;
+fn load_config(path: Option<&Path>) -> Result<Config> {
+    let default_path = Path::new("safe-migrate.toml");
+    let (config, loaded_path) = match path {
+        Some(path) => (Config::load_required_from_file(path), path),
+        None => (Config::load_from_file(default_path), default_path),
+    };
+    let config = config
+        .with_context(|| format!("Failed to load configuration: {}", loaded_path.display()))?;
     let engine = SafeMigrateEngine::new(config.clone());
     config
         .validate_rule_ids(engine.primary_rule_ids())
-        .with_context(|| format!("Failed to validate configuration: {}", path.display()))?;
+        .with_context(|| {
+            format!(
+                "Failed to validate configuration: {}",
+                loaded_path.display()
+            )
+        })?;
     registry::validate_rule_configuration(&config)
         .map_err(anyhow::Error::msg)
-        .with_context(|| format!("Failed to validate configuration: {}", path.display()))?;
+        .with_context(|| {
+            format!(
+                "Failed to validate configuration: {}",
+                loaded_path.display()
+            )
+        })?;
+    config.sync_schemas(None).with_context(|| {
+        format!(
+            "Failed to validate configuration: {}",
+            loaded_path.display()
+        )
+    })?;
     Ok(config)
 }
 
-fn prepare_cache(config: &Config, cache: &Path, no_cache: bool) -> Result<PreparedCache> {
-    let auto_sync = maybe_auto_sync(config, cache, no_cache);
+fn prepare_cache(
+    config: &Config,
+    cache: &Path,
+    no_cache: bool,
+    no_auto_sync: bool,
+) -> Result<PreparedCache> {
+    let auto_sync = maybe_auto_sync(config, cache, no_cache, no_auto_sync);
     let (cache, baseline_unknown) = load_cache(cache, no_cache, config.cache_encryption)?;
     let baseline_stale =
         warn_if_stale_cache(&cache.metadata, baseline_unknown, config.stale_stats_days);
@@ -668,7 +720,12 @@ fn prepare_cache(config: &Config, cache: &Path, no_cache: bool) -> Result<Prepar
     })
 }
 
-fn maybe_auto_sync(config: &Config, cache: &Path, no_cache: bool) -> AutoSyncOutcome {
+fn maybe_auto_sync(
+    config: &Config,
+    cache: &Path,
+    no_cache: bool,
+    no_auto_sync: bool,
+) -> AutoSyncOutcome {
     if !config.auto_sync {
         return AutoSyncOutcome::NotRequested;
     }
@@ -678,11 +735,19 @@ fn maybe_auto_sync(config: &Config, cache: &Path, no_cache: bool) -> AutoSyncOut
         return AutoSyncOutcome::Bypassed;
     }
 
+    if no_auto_sync {
+        eprintln!("[ INFO ] --no-auto-sync bypasses configured automatic cache sync.");
+        return AutoSyncOutcome::Bypassed;
+    }
+
     eprintln!(
         "[ INFO ] Automatic cache sync enabled. Refreshing {}.",
         cache.display()
     );
-    match sync::sync_cache(cache, config.schemas.as_deref(), config.cache_encryption) {
+    let schemas = config
+        .sync_schemas(None)
+        .expect("configuration was validated before automatic synchronization");
+    match sync::sync_cache(cache, schemas, config.cache_encryption) {
         Ok(()) => AutoSyncOutcome::Refreshed,
         Err(error) => {
             eprintln!("[ WARN ] Automatic cache sync failed: {error}");

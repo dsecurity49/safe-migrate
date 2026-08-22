@@ -1896,7 +1896,7 @@
           "min_pg_version_num": 160000
         }
       ],
-      "notes": "Compares valid multi-statement outcomes and expected PostgreSQL rejections. The real-world-inspired missing-FK-column case must agree on SQLSTATE 42703 and a chain-conflict finding."
+      "notes": "Compares valid multi-statement outcomes and expected PostgreSQL rejections. The sourced missing-FK-column case must agree on SQLSTATE 42703 and a chain-conflict finding."
     },
     {
       "rule_dir": "rule_19_concurrent-in-transaction",

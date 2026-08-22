@@ -1,11 +1,10 @@
-// FILE: src/ast/visitor_tests.rs
-
 #[cfg(test)]
 mod tests {
     use crate::analysis::expr_ir::ExprIr;
     use crate::analysis::facts::{
-        AlterTableActionFact, AlterTypeActionFact, ResetSettingTarget, SearchPathTarget,
-        StatementFact, TableConstraintFact, TimeoutSetting, TimeoutSettingValue, TypeCreationKind,
+        AlterDatabaseAction, AlterTableActionFact, AlterTypeActionFact, PublicationObjectFact,
+        PublicationScope, ResetSettingTarget, SearchPathTarget, StatementFact, TableConstraintFact,
+        TimeoutSetting, TimeoutSettingValue, TypeCreationKind,
     };
     use crate::ast::identifiers::{Ident, QualifiedName};
     use crate::ast::visitor::AstVisitor;
@@ -429,6 +428,21 @@ mod tests {
             }
             _ => panic!("Expected AlterTable fact"),
         }
+    }
+
+    #[test]
+    fn alter_column_preserves_quoted_identifier_case() {
+        let fact =
+            parse_and_extract_statement(r#"ALTER TABLE entries ALTER COLUMN "Camel" TYPE bigint;"#)
+                .expect("alter table fact");
+
+        let StatementFact::AlterTable { actions, .. } = fact else {
+            panic!("expected alter table fact");
+        };
+        let AlterTableActionFact::SetType { column, .. } = &actions[0] else {
+            panic!("expected set type fact");
+        };
+        assert_eq!(column, "Camel");
     }
 
     #[test]
@@ -872,6 +886,14 @@ mod tests {
                 },
             ),
             (
+                "SET lock_timeout = '-0.5ms';",
+                StatementFact::SetTimeout {
+                    setting: TimeoutSetting::Lock,
+                    value: TimeoutSettingValue::Milliseconds(0),
+                    local: false,
+                },
+            ),
+            (
                 "SET SESSION lock_timeout TO DEFAULT;",
                 StatementFact::SetTimeout {
                     setting: TimeoutSetting::Lock,
@@ -898,6 +920,64 @@ mod tests {
                 value: TimeoutSettingValue::Invalid(_),
                 local: false,
             })
+        ));
+    }
+
+    #[test]
+    fn create_role_and_user_apply_postgresql_defaults() {
+        for (sql, expected_name, expected_inherits, expected_login) in [
+            ("CREATE ROLE AppUser;", "appuser", true, false),
+            (r#"CREATE ROLE "AppUser";"#, "AppUser", true, false),
+            ("CREATE USER WebUser;", "webuser", true, true),
+            (
+                "CREATE ROLE service NOINHERIT LOGIN;",
+                "service",
+                false,
+                true,
+            ),
+        ] {
+            let Some(StatementFact::CreateRole(role)) = parse_and_extract_statement(sql) else {
+                panic!("expected create role fact for {sql}");
+            };
+            assert_eq!(role.name, expected_name, "{sql}");
+            assert_eq!(role.inherits, expected_inherits, "{sql}");
+            assert_eq!(role.can_login, expected_login, "{sql}");
+        }
+    }
+
+    #[test]
+    fn global_object_identifiers_follow_postgresql_case_rules() {
+        let Some(StatementFact::CreatePublication(publication)) = parse_and_extract_statement(
+            r#"CREATE PUBLICATION MixedPub FOR TABLE entries ("Camel");"#,
+        ) else {
+            panic!("expected publication fact");
+        };
+        assert_eq!(publication.name, "mixedpub");
+        let PublicationScope::Explicit(objects) = publication.scope else {
+            panic!("expected explicit publication objects");
+        };
+        let PublicationObjectFact::Table { columns, .. } = &objects[0] else {
+            panic!("expected publication table");
+        };
+        assert_eq!(columns.as_deref(), Some(["Camel".to_string()].as_slice()));
+
+        let Some(StatementFact::CreateSubscription(subscription)) = parse_and_extract_statement(
+            "CREATE SUBSCRIPTION MixedSub CONNECTION 'host=localhost' PUBLICATION MixedPub;",
+        ) else {
+            panic!("expected subscription fact");
+        };
+        assert_eq!(subscription.name.as_deref(), Some("mixedsub"));
+        assert_eq!(subscription.publications, vec!["mixedpub".to_string()]);
+
+        let Some(StatementFact::AlterDatabase(database)) =
+            parse_and_extract_statement(r#"ALTER DATABASE "MixedDb" RENAME TO "NewDb";"#)
+        else {
+            panic!("expected alter database fact");
+        };
+        assert_eq!(database.name.name.resolve(), "MixedDb");
+        assert!(matches!(
+            database.action,
+            AlterDatabaseAction::Rename { to } if to == "NewDb"
         ));
     }
 
@@ -1129,6 +1209,27 @@ mod tests {
             args: vec![],
         };
         assert!(expr.is_volatile());
+    }
+
+    #[test]
+    fn nested_function_arguments_preserve_volatility() {
+        let volatile = ExprIr::FunctionCall {
+            name: "coalesce".into(),
+            args: vec![ExprIr::FunctionCall {
+                name: "random".into(),
+                args: vec![],
+            }],
+        };
+        let stable = ExprIr::FunctionCall {
+            name: "coalesce".into(),
+            args: vec![ExprIr::FunctionCall {
+                name: "now".into(),
+                args: vec![],
+            }],
+        };
+
+        assert!(volatile.is_volatile());
+        assert!(!stable.is_volatile());
     }
 
     #[test]

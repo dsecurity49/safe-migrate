@@ -1,4 +1,3 @@
-// FILE: src/analysis/facts.rs
 use crate::analysis::expr_ir::ExprIr;
 use crate::ast::identifiers::{Ident, QualifiedName};
 
@@ -372,6 +371,7 @@ pub enum RoleFact {
 pub struct CreateRoleFact {
     pub name: String,
     pub inherits: bool,
+    pub can_login: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]

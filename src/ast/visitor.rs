@@ -1,4 +1,3 @@
-// FILE: src/ast/visitor.rs
 use crate::analysis::expr_ir::ExprIr;
 use crate::analysis::facts::{
     AlterIndexActionFact, AlterTableActionFact, AlterTypeActionFact, AlterTypeFact, ColumnFact,
@@ -87,6 +86,7 @@ impl AstVisitor {
             Stmt::Reset(node) => return Self::extract_reset(node),
             Stmt::Grant(node) => return Self::extract_grant(node),
             Stmt::Revoke(node) => return Self::extract_revoke(node),
+            Stmt::CreateUser(node) => return Self::extract_create_user(node),
             Stmt::Begin(_) => return Some(StatementFact::BeginTransaction),
             Stmt::Commit(node) => {
                 return Some(
@@ -626,7 +626,7 @@ impl AstVisitor {
                     let col_ident = alter_col
                         .column_name_ref()
                         .and_then(|c| c.ident_token())
-                        .map(|t| t.text().to_string())
+                        .map(|t| Self::resolve_identifier_token(t.text()))
                         .or_else(|| {
                             alter_col
                                 .syntax()
@@ -640,7 +640,7 @@ impl AstVisitor {
                                     .descendants_with_tokens()
                                     .filter_map(|e| e.into_token())
                                     .find(|t| t.kind() != SyntaxKind::WHITESPACE)
-                                    .map(|t| t.text().to_string())
+                                    .map(|t| Self::resolve_identifier_token(t.text()))
                             })
                         });
 
@@ -1571,7 +1571,7 @@ impl AstVisitor {
         let mut local_declarations = Vec::new();
         for cte_name in syntax.descendants().filter_map(CteName::cast) {
             if let Some(tok) = cte_name.ident_token() {
-                local_declarations.push(tok.text().to_string());
+                local_declarations.push(Self::resolve_identifier_token(tok.text()));
             }
         }
 
@@ -1699,7 +1699,10 @@ impl AstVisitor {
 
             while let Some(pr) = current_ref {
                 if let Some(segment) = pr.segment() {
-                    segments.push(Ident::new(segment.text().to_string(), segment.is_quoted()));
+                    segments.push(Self::identifier_from_name(
+                        segment.text(),
+                        segment.is_quoted(),
+                    ));
                 }
                 current_ref = pr.qualifier();
             }
@@ -2038,7 +2041,7 @@ impl AstVisitor {
                 crate::analysis::facts::FuncOptionFact::Language(
                     f.language_ref()
                         .and_then(|lr| lr.ident_token())
-                        .map(|t| t.text().to_string())
+                        .map(|t| Self::resolve_identifier_token(t.text()))
                         .unwrap_or_default(),
                 )
             }
@@ -2158,7 +2161,7 @@ impl AstVisitor {
 
         let action = node.action().and_then(|a| match a {
             ast::AlterFunctionAction::FunctionRenameTo(rt) => {
-                let new_name = rt.function_name()?.path()?.segment()?.text().to_string();
+                let new_name = Self::resolve_name(rt.function_name()?.path()?.segment()?);
                 Some(crate::analysis::facts::AlterFunctionAction::Rename {
                     from: name.name.resolve(),
                     to: new_name,
@@ -2176,7 +2179,7 @@ impl AstVisitor {
                 })
             }
             ast::AlterFunctionAction::DependsOnExtension(de) => {
-                let ext = de.extension_ref()?.ident_token()?.text().to_string();
+                let ext = Self::resolve_identifier_token(de.extension_ref()?.ident_token()?.text());
                 Some(
                     crate::analysis::facts::AlterFunctionAction::DependsOnExtension {
                         extension: ext,
@@ -2184,7 +2187,8 @@ impl AstVisitor {
                 )
             }
             ast::AlterFunctionAction::NoDependsOnExtension(nde) => {
-                let ext = nde.extension_ref()?.ident_token()?.text().to_string();
+                let ext =
+                    Self::resolve_identifier_token(nde.extension_ref()?.ident_token()?.text());
                 Some(
                     crate::analysis::facts::AlterFunctionAction::NoDependsOnExtension {
                         extension: ext,
@@ -2293,7 +2297,7 @@ impl AstVisitor {
 
         let action = node.action().and_then(|a| match a {
             ast::AlterProcedureAction::ProcedureRenameTo(rt) => {
-                let new_name = rt.procedure_name()?.path()?.segment()?.text().to_string();
+                let new_name = Self::resolve_name(rt.procedure_name()?.path()?.segment()?);
                 Some(crate::analysis::facts::AlterFunctionAction::Rename {
                     from: name.name.resolve(),
                     to: new_name,
@@ -2306,7 +2310,9 @@ impl AstVisitor {
             }
             ast::AlterProcedureAction::SetSchema(ss) => {
                 Some(crate::analysis::facts::AlterFunctionAction::SchemaChange {
-                    new_schema: ss.schema_ref()?.ident_token()?.text().to_string(),
+                    new_schema: Self::resolve_identifier_token(
+                        ss.schema_ref()?.ident_token()?.text(),
+                    ),
                 })
             }
             _ => None,
@@ -2365,7 +2371,7 @@ impl AstVisitor {
         let name = node
             .publication()
             .and_then(|p| p.ident_token())
-            .map(|t| t.text().to_string())
+            .map(|t| Self::resolve_identifier_token(t.text()))
             .unwrap_or_default();
         let scope = if let Some(fapo) = node.for_all_publication_objects() {
             crate::analysis::facts::PublicationScope::AllTables {
@@ -2396,7 +2402,7 @@ impl AstVisitor {
                                 columns: obj.column_ref_list().map(|cl| {
                                     cl.column_name_refs()
                                         .filter_map(|n| n.ident_token())
-                                        .map(|n| n.text().to_string())
+                                        .map(|n| Self::resolve_identifier_token(n.text()))
                                         .collect()
                                 }),
                                 row_filter: obj.where_condition_clause().and_then(|w| {
@@ -2413,7 +2419,7 @@ impl AstVisitor {
                             crate::analysis::facts::PublicationObjectFact::SchemaTables {
                                 schema: schema_ref
                                     .ident_token()
-                                    .map(|t| t.text().to_string())
+                                    .map(|t| Self::resolve_identifier_token(t.text()))
                                     .unwrap_or_default(),
                                 row_filter: obj.where_condition_clause().and_then(|w| {
                                     w.expr()
@@ -2469,7 +2475,7 @@ impl AstVisitor {
         let name = node
             .publication_ref()
             .and_then(|pr| pr.ident_token())
-            .map(|t| t.text().to_string())
+            .map(|t| Self::resolve_identifier_token(t.text()))
             .unwrap_or_default();
         Some(StatementFact::AlterPublication(
             crate::analysis::facts::AlterPublicationFact { name },
@@ -2482,7 +2488,7 @@ impl AstVisitor {
         let names = node
             .publication_refs()
             .filter_map(|pr| pr.ident_token())
-            .map(|t| t.text().to_string())
+            .map(|t| Self::resolve_identifier_token(t.text()))
             .collect();
         Some(StatementFact::DropPublication(
             crate::analysis::facts::DropPublicationFact {
@@ -2499,12 +2505,12 @@ impl AstVisitor {
         let name = node
             .subscription()
             .and_then(|s| s.ident_token())
-            .map(|t| t.text().to_string());
+            .map(|t| Self::resolve_identifier_token(t.text()));
         let connection = if node.server_token().is_some() {
             crate::analysis::facts::ConnectionTarget::Server(
                 node.server_ref()
                     .and_then(|sr| sr.ident_token())
-                    .map(|t| t.text().to_string()),
+                    .map(|t| Self::resolve_identifier_token(t.text())),
             )
         } else {
             crate::analysis::facts::ConnectionTarget::Literal(
@@ -2515,7 +2521,7 @@ impl AstVisitor {
         let publications = node
             .publication_refs()
             .filter_map(|pr| pr.ident_token())
-            .map(|t| t.text().to_string())
+            .map(|t| Self::resolve_identifier_token(t.text()))
             .collect();
         let params = node.with_params().map(|wp| {
             wp.attribute_list()
@@ -2555,7 +2561,7 @@ impl AstVisitor {
         let name = node
             .subscription_ref()
             .and_then(|sr| sr.ident_token())
-            .map(|t| t.text().to_string())
+            .map(|t| Self::resolve_identifier_token(t.text()))
             .unwrap_or_default();
         Some(StatementFact::AlterSubscription(
             crate::analysis::facts::AlterSubscriptionFact { name },
@@ -2565,7 +2571,7 @@ impl AstVisitor {
     fn extract_drop_subscription(
         node: &squawk_syntax::ast::DropSubscription,
     ) -> Option<StatementFact> {
-        let name = node.subscription_ref()?.ident_token()?.text().to_string();
+        let name = Self::resolve_identifier_token(node.subscription_ref()?.ident_token()?.text());
         Some(StatementFact::DropSubscription(
             crate::analysis::facts::DropSubscriptionFact {
                 name,
@@ -2627,17 +2633,56 @@ impl AstVisitor {
     }
 
     fn extract_create_role(node: &squawk_syntax::ast::CreateRole) -> Option<StatementFact> {
-        let name = node.role()?.ident_token()?.text().to_string();
-        let inherits = node
-            .role_option_list()
-            .map(|ol| {
-                ol.role_options()
-                    .any(|o| matches!(o, ast::RoleOption::RoleOptionInherit(_)))
-            })
-            .unwrap_or(false);
+        let name = Self::resolve_identifier_token(node.role()?.ident_token()?.text());
+        let (inherits, can_login) =
+            Self::extract_create_role_options(node.role_option_list(), false);
         Some(StatementFact::CreateRole(
-            crate::analysis::facts::CreateRoleFact { name, inherits },
+            crate::analysis::facts::CreateRoleFact {
+                name,
+                inherits,
+                can_login,
+            },
         ))
+    }
+
+    fn extract_create_user(node: &squawk_syntax::ast::CreateUser) -> Option<StatementFact> {
+        let name = Self::resolve_identifier_token(node.role()?.ident_token()?.text());
+        let (inherits, can_login) =
+            Self::extract_create_role_options(node.role_option_list(), true);
+        Some(StatementFact::CreateRole(
+            crate::analysis::facts::CreateRoleFact {
+                name,
+                inherits,
+                can_login,
+            },
+        ))
+    }
+
+    fn extract_create_role_options(
+        options: Option<squawk_syntax::ast::RoleOptionList>,
+        default_login: bool,
+    ) -> (bool, bool) {
+        let mut inherits = true;
+        let mut can_login = default_login;
+        if let Some(options) = options {
+            for option in options.role_options() {
+                match option {
+                    ast::RoleOption::RoleOptionInherit(_) => inherits = true,
+                    ast::RoleOption::RoleOptionGeneric(option) => {
+                        let option = option.syntax().text().to_string().to_ascii_lowercase();
+                        match option.trim() {
+                            "inherit" => inherits = true,
+                            "noinherit" => inherits = false,
+                            "login" => can_login = true,
+                            "nologin" => can_login = false,
+                            _ => {}
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        (inherits, can_login)
     }
 
     fn extract_alter_role(node: &squawk_syntax::ast::AlterRole) -> Option<StatementFact> {
@@ -2664,7 +2709,7 @@ impl AstVisitor {
             .role_refs()
             .map(|r| {
                 r.ident_token()
-                    .map(|t| t.text().to_string())
+                    .map(|t| Self::resolve_identifier_token(t.text()))
                     .unwrap_or_default()
             })
             .collect();
@@ -2755,7 +2800,10 @@ impl AstVisitor {
             PrivilegeObjects::PrivilegeAllTablesInSchema(pais) => {
                 let schemas: Vec<_> = pais
                     .schema_refs()
-                    .filter_map(|sr| sr.ident_token().map(|t| t.text().to_string()))
+                    .filter_map(|sr| {
+                        sr.ident_token()
+                            .map(|t| Self::resolve_identifier_token(t.text()))
+                    })
                     .collect();
                 return if schemas.is_empty() {
                     None
@@ -2917,7 +2965,7 @@ impl AstVisitor {
         let name = node
             .database()
             .and_then(|d| d.ident_token())
-            .map(|t| t.text().to_string())
+            .map(|t| Self::resolve_identifier_token(t.text()))
             .unwrap_or_default();
         let options = node
             .database_option_list()
@@ -2933,9 +2981,9 @@ impl AstVisitor {
         let name = node
             .database_ref()
             .and_then(|dr| dr.ident_token())
-            .map(|t| t.text().to_string())
-            .unwrap_or_default();
-        let name = QualifiedName::new(None, Ident::new(name, false));
+            .map(|t| Self::identifier_from_token(t.text()))
+            .unwrap_or_else(|| Ident::new(String::new(), false));
+        let name = QualifiedName::new(None, name);
 
         let action = match node.action()? {
             AlterDatabaseAction::DatabaseRenameTo(rt) => {
@@ -2943,7 +2991,7 @@ impl AstVisitor {
                     to: rt
                         .database()
                         .and_then(|d| d.ident_token())
-                        .map(|t| t.text().to_string())
+                        .map(|t| Self::resolve_identifier_token(t.text()))
                         .unwrap_or_default(),
                 }
             }
@@ -2957,7 +3005,7 @@ impl AstVisitor {
                     new_tablespace: st
                         .tablespace_ref()
                         .and_then(|tr| tr.ident_token())
-                        .map(|t| t.text().to_string())
+                        .map(|t| Self::resolve_identifier_token(t.text()))
                         .unwrap_or_default(),
                 }
             }
@@ -2999,9 +3047,9 @@ impl AstVisitor {
         let name = node
             .database_ref()
             .and_then(|dr| dr.ident_token())
-            .map(|t| t.text().to_string())
-            .unwrap_or_default();
-        let name = QualifiedName::new(None, Ident::new(name, false));
+            .map(|t| Self::identifier_from_token(t.text()))
+            .unwrap_or_else(|| Ident::new(String::new(), false));
+        let name = QualifiedName::new(None, name);
         Some(StatementFact::DropDatabase(
             crate::analysis::facts::DropDatabaseFact {
                 name,

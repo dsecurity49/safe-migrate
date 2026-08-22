@@ -1,18 +1,17 @@
 # GitHub Action
 
-The safe-migrate Action has two jobs:
+Use the Action in two workflows:
 
-1. a trusted job synchronizes PostgreSQL metadata and saves a named baseline;
-2. pull-request jobs restore that baseline and lint migrations without database
-   access.
+1. Refresh a baseline from a trusted branch with database access.
+2. Restore that baseline in pull requests and lint offline.
 
-Synchronization is optional. If no baseline can be restored, linting still
-runs with `Tainted` confidence and conservative assumptions.
+A baseline is optional. On a cache miss, linting runs with `Tainted`
+confidence.
 
 ## Pull-request workflow
 
-This is the normal lint job. `lint-chain` is the default mode, so only the
-migration directory is required.
+Pull-request jobs use `lint-chain` by default. Set `path` to the migration
+directory.
 
 ```yaml
 name: Migration safety
@@ -38,24 +37,23 @@ jobs:
           path: migrations
 ```
 
-The Action writes JSON and Markdown reports, adds the Markdown report to the
-job summary, and emits Tier 1 and Tier 2 annotations. Blocking Tier 1 findings
-fail the step by default. Set `advisory: "true"` to keep the step successful
-while preserving output `exit-code: 2`.
+The Action writes JSON and Markdown reports, adds Markdown to the job summary,
+and annotates Tier 1 and Tier 2 findings. Tier 1 fails the step unless
+`advisory: "true"` is set; output `exit-code` remains `2`.
 
-Before the first successful refresh, or after GitHub evicts the baseline, the
-same workflow completes with an unavailable baseline and `Tainted` confidence.
-The managed-cache miss is passed to the CLI as an offline `--no-cache` run, so
-an explicit configuration containing `auto_sync = true` cannot make a
-pull-request job attempt database access. A missing explicit `cache` path is
-still an operational error rather than a fallback.
+On a managed-cache miss, the Action runs `--no-cache` and reports `Tainted`
+confidence. A missing explicit `cache` path is an error.
+
+The Action suppresses `auto_sync` during lint, including when an explicit
+config enables it. Only `sync: "true"` performs an Action-controlled refresh.
+After refresh, the Action removes database access before linting.
 
 ## Using TOML configuration
 
-The `config` input accepts a path to a TOML file; it does not accept inline
-TOML. The Action deliberately does not discover `safe-migrate.toml` by default.
-Without `config`, it uses built-in defaults so a pull request cannot silently
-disable rules by adding or changing a checkout-local configuration file.
+`config` is a path to a TOML file, not inline TOML. When omitted, the Action
+uses built-in defaults and does not read `safe-migrate.toml` from the checkout.
+A pull request can change lint policy only when the workflow passes its config
+explicitly.
 
 In a trusted branch job, pass the checked-out file directly:
 
@@ -66,10 +64,8 @@ In a trusted branch job, pass the checked-out file directly:
           config: safe-migrate.toml
 ```
 
-For a pull-request job that needs a fixed repository configuration, check out
-the base revision into a separate directory and pass that file. The migrations
-still come from the normal pull-request checkout, while the policy comes from
-the reviewed base commit:
+To keep pull-request policy fixed to the base commit, check out the config
+separately:
 
 ```yaml
       - name: Checkout pull request
@@ -92,21 +88,17 @@ the reviewed base commit:
           config: .safe-migrate-base/safe-migrate.toml
 ```
 
-A team may instead pass the file from the pull-request checkout when changing
-lint policy in the same pull request is intentional. Such a change can alter
-thresholds or disable rules, so review it as executable CI policy rather than
-ordinary documentation.
+Use the pull request's config only when the policy change is part of the
+review.
 
-The file must exist and pass normal safe-migrate configuration validation.
-When it contains `cache_encryption = true`, also set
-`encrypted-cache: "true"` and provide `SAFE_MIGRATE_CACHE_KEY` as shown under
-[Cache encryption](#cache-encryption). A mismatch fails before synchronization.
+The file must exist and pass config validation. If it sets
+`cache_encryption = true`, also set `encrypted-cache: "true"` and provide
+`SAFE_MIGRATE_CACHE_KEY`. An encryption mismatch fails before synchronization.
 
 ## Baseline refresh workflow
 
-Run synchronization from the default branch. The database must be reachable
-through localhost or a Unix socket, so use a self-hosted runner with suitable
-network access or establish an SSH tunnel before invoking the Action.
+Run synchronization from the default branch. Use a self-hosted runner or an
+SSH tunnel so PostgreSQL is available through localhost or a Unix socket.
 
 ```yaml
 name: Refresh migration baseline
@@ -141,27 +133,23 @@ jobs:
           DATABASE_URL: ${{ secrets.SAFE_MIGRATE_DATABASE_URL }}
         with:
           path: migrations
+          config: safe-migrate.toml
           sync: "true"
           schemas: public
 ```
 
 Add `SAFE_MIGRATE_DATABASE_URL` as a repository or environment secret, then run
-the workflow once with `workflow_dispatch` to create the first baseline. The
-scheduled job refreshes it afterward. GitHub schedules run from the latest
-default-branch commit, can be delayed, and are automatically disabled in a
-public repository after 60 days without repository activity. A push trigger or
-periodic manual check avoids treating the schedule as a delivery guarantee.
+`workflow_dispatch` once to create the baseline. Scheduled workflows use the
+latest default-branch commit, may be delayed, and are disabled in public
+repositories after 60 days without activity.
 
-The managed transport uses `actions/cache` v6.1.0. Self-hosted runners must be
-version 2.327.1 or later because the cache action uses the Node.js 24 action
-runtime.
+The pinned cache Action requires self-hosted runner 2.327.1 or newer.
 
 ## Cache encryption
 
-GitHub caches are not private artifacts: a pull request, including one from a
-fork, can read caches in its base branch. Pull-request runs can also create
-merge-ref caches that their own reruns can restore. Enable authenticated cache
-encryption when baseline confidentiality or integrity matters.
+Pull requests, including forks, can read caches from the base branch. Cache
+contents are not signed. Enable cache encryption when the baseline contains
+sensitive metadata.
 
 Generate a 32-byte key once:
 
@@ -194,14 +182,12 @@ Use the same baseline name, key, and encryption input in the pull-request job:
           encrypted-cache: "true"
 ```
 
-GitHub does not pass Actions secrets to workflows triggered from forks, and
-Dependabot pull requests receive the same restricted treatment. In those runs,
-the Action deliberately skips the encrypted baseline and produces a `Tainted`
-preview instead of attempting decryption.
+Fork and Dependabot jobs do not receive repository secrets. Without the key,
+the Action skips the encrypted baseline and lints with `Tainted` confidence.
 
-If `config` is omitted, the Action creates an internal configuration with the
-requested encryption mode. An explicit config path must exist, and its
-`cache_encryption` value must agree with `encrypted-cache`.
+Without `config`, the Action generates a config that matches
+`encrypted-cache`. With an explicit config, `cache_encryption` must match the
+input.
 
 ## Named baselines
 
@@ -228,11 +214,10 @@ with:
   cache: trusted-input/production.cache
 ```
 
-The Action does not commit, upload, or push an explicit file. A repository file
-is controlled by the checked-out revision, so do not treat a pull-request-owned
-cache or configuration file as trusted. Teams that deliberately track an
-encrypted baseline must keep its key outside Git and accept binary history
-churn from timestamps and fresh encryption nonces.
+The Action never uploads or commits an explicit file. Do not trust a cache or
+config from a pull-request checkout. If an encrypted baseline is tracked in
+Git, keep its key outside the repository; each sync changes the binary because
+it records a timestamp and uses a fresh nonce.
 
 `no-cache: "true"` explicitly bypasses every baseline. It cannot be combined
 with `cache`, `sync`, `schemas`, or `encrypted-cache`.
@@ -243,7 +228,8 @@ The common inputs are:
 
 - `path`: migration file or directory; required.
 - `mode`: `lint` or `lint-chain`; defaults to `lint-chain`.
-- `sync`: refresh before linting; use only in a trusted database-connected job.
+- `sync`: run the Action-controlled refresh before offline linting; use only in
+  a trusted database-connected job.
 - `schemas`: optional comma-separated schema scope; requires `sync: "true"`.
 - `baseline`: managed-cache name; defaults to `default`.
 - `encrypted-cache`: require encrypted managed or explicit cache data.
@@ -262,24 +248,22 @@ The Action exposes:
 - `baseline-source`: `synced`, `github-cache`, `explicit-file`, or
   `unavailable`.
 
-`sync-status: refreshed` proves that local synchronization completed. GitHub's
-cache save action is best-effort and reports service failures as workflow
-warnings, so check the cache step log if later jobs unexpectedly report
+`sync-status: refreshed` means synchronization completed; it does not mean the
+GitHub cache save succeeded. Check cache-step warnings if a later job reports
 `baseline-source: unavailable`.
 
 ## Cache lifetime and pinning
 
-GitHub evicts caches that have not been accessed for more than seven days and
-may evict older entries when repository cache storage is full. The Action is
-therefore designed to lint safely after a miss rather than make the cache a
-required service.
+By default, GitHub removes cache entries that have not been accessed for more
+than seven days. Storage pressure can evict older entries sooner. On a miss,
+the Action lints without a baseline.
 
-Published safe-migrate Action references must use the exact release tag or a
-full 40-character commit SHA; mutable branch references are rejected. A full
-commit SHA gives the strongest workflow supply-chain pinning. Nested Actions in
-safe-migrate itself are also pinned to full commit SHAs.
+Use an exact release tag or a full 40-character commit SHA. Mutable branch
+references are rejected. Exact tags install checksum-verified release assets.
+A full SHA builds the checked-out Action source. Nested Actions are pinned by
+full SHA.
 
-GitHub documentation for the behavior relied on here:
+References:
 
 - [Cache scope, low-trust writes, security, and eviction](https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching)
 - [Scheduled workflow behavior](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule)

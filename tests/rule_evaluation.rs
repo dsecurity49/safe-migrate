@@ -7,7 +7,9 @@ mod rule_evaluation_tests {
     use safe_migrate::engine::config::{Config, RuleConfig};
     use safe_migrate::engine::engine::SafeMigrateEngine;
     use safe_migrate::model::column::Column;
-    use safe_migrate::model::function::FunctionOverlay;
+    use safe_migrate::model::function::{
+        FunctionOverlay, FunctionState, RoutineKind, SecurityMode, Volatility,
+    };
     use safe_migrate::model::relation::{Persistence, RelationKind, RelationState};
     use safe_migrate::report::violations::ViolationTier;
 
@@ -330,16 +332,12 @@ mod rule_evaluation_tests {
         assert_eq!(state.local.confidence, Confidence::Tainted);
     }
 
-    /// This test verifies that when confidence is tainted by an opaque statement,
-    /// only violations that occur AFTER the taint are downgraded. Violations from
-    /// statements before the opaque one retain their original tier.
     #[test]
     fn test_tainted_confidence_downgrades_tier1_to_tier2() {
         let engine = setup_engine();
-        let mut cache = safe_migrate::db::cache::DbCache::new(); // NEW: Create cache
+        let mut cache = safe_migrate::db::cache::DbCache::new();
         let tid = object_id("public", "t");
         cache.insert_baseline(
-            // NEW: Insert table 't' into baseline
             tid.clone(),
             RelationState::new(
                 tid,
@@ -351,7 +349,7 @@ mod rule_evaluation_tests {
                 0,
             ),
         );
-        let mut state = AnalysisState::new(cache); // NEW: Use the cache
+        let mut state = AnalysisState::new(cache);
 
         let v = engine
             .analyze(
@@ -366,7 +364,6 @@ mod rule_evaluation_tests {
             .filter(|v| v.rule_id == "destructive-cascade" || v.rule_id == "irreversible-migration")
             .collect();
 
-        // Both DROP DATABASE and DROP TABLE CASCADE occur after the taint, so both should be Tier2
         assert!(
             db_violations.iter().all(|v| v.tier == ViolationTier::Tier2),
             "DROP DATABASE after taint should be Tier2: {:?}",
@@ -382,15 +379,12 @@ mod rule_evaluation_tests {
         );
     }
 
-    /// Confidence taint does NOT retroactively downgrade violations from before the taint.
-    /// A Tier1 violation from statement 1 should stay Tier1 even if statement 2 taints.
     #[test]
     fn test_confidence_taint_does_not_affect_prior_violations() {
         let engine = setup_engine();
-        let mut cache = safe_migrate::db::cache::DbCache::new(); // NEW: Create cache
+        let mut cache = safe_migrate::db::cache::DbCache::new();
         let tid = object_id("public", "t");
         cache.insert_baseline(
-            // NEW: Insert table 't' into baseline
             tid.clone(),
             RelationState::new(
                 tid,
@@ -402,11 +396,8 @@ mod rule_evaluation_tests {
                 0,
             ),
         );
-        let mut state = AnalysisState::new(cache); // NEW: Use the cache
+        let mut state = AnalysisState::new(cache);
 
-        // First statement: DROP DATABASE (Tier1 violation)
-        // Second statement: Opaque DO block that taints confidence
-        // Third statement: DROP TABLE (would be Tier1 under Exact, Tier2 under Tainted)
         let v = engine
             .analyze(
                 "DROP DATABASE mydb; DO $$ BEGIN END $$; DROP TABLE t CASCADE;",
@@ -514,6 +505,51 @@ mod rule_evaluation_tests {
     }
 
     #[test]
+    fn grant_all_owner_exemption_requires_every_grantee_to_own_every_table() {
+        let engine = setup_engine();
+        let table_id = object_id("public", "owned_table");
+        let mut cache = safe_migrate::db::cache::DbCache::new();
+        cache.insert_baseline(
+            table_id.clone(),
+            RelationState::new(
+                table_id,
+                object_id("", "table_owner"),
+                0,
+                Some(10),
+                RelationKind::Table,
+                Persistence::Permanent,
+                0,
+            ),
+        );
+
+        let mut owner_only_state = AnalysisState::new(cache.clone());
+        let owner_only = engine
+            .analyze(
+                "GRANT ALL ON owned_table TO table_owner;",
+                &mut owner_only_state,
+            )
+            .unwrap();
+        assert!(
+            !owner_only
+                .iter()
+                .any(|violation| violation.rule_id == "overbroad-grant")
+        );
+
+        let mut mixed_state = AnalysisState::new(cache);
+        let mixed = engine
+            .analyze(
+                "GRANT ALL ON owned_table TO table_owner, outsider;",
+                &mut mixed_state,
+            )
+            .unwrap();
+        assert!(
+            mixed
+                .iter()
+                .any(|violation| violation.rule_id == "overbroad-grant")
+        );
+    }
+
+    #[test]
     fn test_rule_volatile_default_create() {
         let engine = setup_engine();
         let mut state = setup_state();
@@ -569,6 +605,14 @@ mod rule_evaluation_tests {
             )
             .unwrap();
         assert!(v2.iter().any(|v| v.rule_id == "volatile-default"));
+
+        let v3 = engine
+            .analyze(
+                "ALTER TABLE t ADD COLUMN nested_default double precision DEFAULT coalesce(random(), 0);",
+                &mut state,
+            )
+            .unwrap();
+        assert!(v3.iter().any(|v| v.rule_id == "volatile-default"));
     }
 
     #[test]
@@ -719,16 +763,22 @@ mod rule_evaluation_tests {
     fn test_rule_broken_compute_drop_function_with_trigger() {
         let engine = setup_engine();
         let mut state = setup_state();
+        let function_id = object_id("public", "notify_func()");
+        state.local.functions.insert(
+            function_id.clone(),
+            FunctionOverlay::Present(FunctionState {
+                id: function_id,
+                routine_kind: RoutineKind::Function,
+                arg_types: Vec::new(),
+                arg_type_ids: Vec::new(),
+                return_type: "trigger".into(),
+                return_type_id: None,
+                volatility: Volatility::Volatile,
+                language: "plpgsql".into(),
+                security: SecurityMode::Invoker,
+            }),
+        );
 
-        // 1. Create a function used by a trigger
-        engine
-            .analyze(
-                "CREATE FUNCTION notify_func() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';",
-                &mut state,
-            )
-            .unwrap();
-
-        // 2. Create a table and a trigger
         engine
             .analyze(
                 "CREATE TABLE events(id int);
@@ -737,7 +787,6 @@ mod rule_evaluation_tests {
             )
             .unwrap();
 
-        // 3. Drop the function and check for violation
         let v = engine
             .analyze("DROP FUNCTION notify_func();", &mut state)
             .unwrap();
@@ -928,5 +977,30 @@ mod rule_evaluation_tests {
         assert_eq!(coverage.tier, ViolationTier::Tier2);
         assert!(coverage.reason.contains("does not cover schema \"public\""));
         assert!(!coverage.reason.contains("does not exist"));
+    }
+
+    #[test]
+    fn guarded_missing_drops_do_not_report_schema_drift() {
+        let engine = setup_engine();
+        for sql in [
+            "DROP TABLE IF EXISTS missing;",
+            "DROP VIEW IF EXISTS missing;",
+            "DROP MATERIALIZED VIEW IF EXISTS missing;",
+            "DROP INDEX IF EXISTS missing;",
+            "DROP SEQUENCE IF EXISTS missing;",
+            "DROP FUNCTION IF EXISTS missing();",
+            "DROP PROCEDURE IF EXISTS missing();",
+            "DROP DOMAIN IF EXISTS missing;",
+            "DROP TYPE IF EXISTS missing;",
+        ] {
+            let mut state = setup_state();
+            let violations = engine.analyze(sql, &mut state).unwrap();
+            assert!(
+                !violations
+                    .iter()
+                    .any(|violation| violation.rule_id == "schema-drift"),
+                "{sql}"
+            );
+        }
     }
 }

@@ -1,5 +1,3 @@
-// FILE: src/rules/idempotency.rs
-
 use crate::analysis::mutations::{AlterTableActionMutation, Mutation};
 use crate::analysis::state::{AnalysisState, CascadeResult, MutationResult};
 use crate::engine::config::Config;
@@ -28,10 +26,7 @@ impl Rule for IdempotencyRule {
         _config: &Config,
         _cascade: Option<&CascadeResult>,
     ) -> Vec<Violation> {
-        // ARCHITECTURAL NOTE:
-        // We INTENTIONALLY ignore `MutationResult::Skipped` here.
-        // This rule is a syntactic policy enforcer. It flags missing IF EXISTS / IF NOT EXISTS
-        // clauses regardless of whether the object actually existed during this specific simulator run.
+        // Idempotency is syntactic, so a skipped mutation still needs an explicit guard.
 
         let mut violations = Vec::new();
 
