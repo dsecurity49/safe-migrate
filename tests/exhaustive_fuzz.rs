@@ -3,26 +3,7 @@ mod common;
 mod exhaustive_fuzz_tests {
     use crate::common::*;
     use safe_migrate::analysis::state::AnalysisState;
-    use safe_migrate::db::cache::DbCache;
     use safe_migrate::report::violations::ObjectKind;
-
-    fn cache_with_table(schema: &str, name: &str, rows: Option<u64>) -> DbCache {
-        let mut cache = DbCache::new();
-        let tid = object_id(schema, name);
-        cache.insert_baseline(
-            tid.clone(),
-            safe_migrate::model::relation::RelationState::new(
-                tid.clone(),
-                object_id(schema, "postgres"),
-                0,
-                rows,
-                safe_migrate::model::relation::RelationKind::Table,
-                safe_migrate::model::relation::Persistence::Permanent,
-                0,
-            ),
-        );
-        cache
-    }
 
     // DDL in isolation.
 

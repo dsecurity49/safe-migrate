@@ -1,3 +1,6 @@
+mod common;
+
+use crate::common::database_hosts_are_local;
 use std::fs;
 use std::io::Read;
 
@@ -14,18 +17,6 @@ const PUBLICATION: &str = "sm_v6_catalog_publication";
 const SCHEMA_PUBLICATION: &str = "sm_v6_schema_publication";
 const SUBSCRIPTION: &str = "sm_v6_catalog_subscription";
 const CONNECTION_SENTINEL: &str = "sm_v6_connection_secret_must_not_enter_cache";
-
-fn database_hosts_are_local(config: &postgres::Config) -> bool {
-    config.get_hosts().iter().all(|host| match host {
-        postgres::config::Host::Unix(_) => true,
-        postgres::config::Host::Tcp(host) if host.eq_ignore_ascii_case("localhost") => true,
-        postgres::config::Host::Tcp(host) => host
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|address| address.is_loopback()),
-    })
-}
 
 fn cleanup(client: &mut postgres::Client) {
     let subscription_exists: bool = client
@@ -116,22 +107,27 @@ fn live_sync_preserves_routine_and_replication_catalogs_without_connection_secre
         database_hosts_are_local(&database_config),
         "live catalog sync accepts only localhost or Unix-socket databases"
     );
-    let mut client = database_config
+    let mut validation_client = database_config
         .connect(postgres::NoTls)
         .expect("connect for live catalog sync");
-    let database: String = client
-        .query_one("SELECT current_database()", &[])
-        .expect("identify live catalog database")
-        .get(0);
+    let identity = validation_client
+        .query_one(
+            "SELECT current_database(), current_user, current_setting('server_version_num')::int",
+            &[],
+        )
+        .expect("identify live catalog database");
+    let database: String = identity.get(0);
+    let expected_owner: String = identity.get(1);
+    let version: i32 = identity.get(2);
     assert_eq!(
         database, "safe_migrate",
         "live catalog sync refuses to modify a database not named safe_migrate"
     );
+    drop(validation_client);
     let _cleanup = CatalogCleanup(database_config.clone());
-    let version: i32 = client
-        .query_one("SELECT current_setting('server_version_num')::int", &[])
-        .expect("identify PostgreSQL version")
-        .get(0);
+    let mut client = database_config
+        .connect(postgres::NoTls)
+        .expect("connect for live catalog sync");
 
     cleanup(&mut client);
     client
@@ -227,7 +223,7 @@ fn live_sync_preserves_routine_and_replication_catalogs_without_connection_secre
         .publications
         .get(PUBLICATION)
         .expect("synchronized publication");
-    assert_eq!(publication.owner.as_deref(), Some("safe_migrate"));
+    assert_eq!(publication.owner.as_deref(), Some(expected_owner.as_str()));
     let PublicationScope::Explicit(objects) = &publication.scope else {
         panic!("seeded publication must have explicit scope");
     };

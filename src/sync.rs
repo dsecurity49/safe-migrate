@@ -209,6 +209,7 @@ fn write_cache_with_protection_and_limits(
     Ok(())
 }
 
+// This bounds decoded bytes entering zstd, not the compressed output size.
 struct SizeLimitedWriter<W> {
     inner: W,
     bytes_written: usize,
@@ -407,8 +408,12 @@ fn populate_cache_from_client(
     cache.metadata.source_session_role = Some(provenance_row.get(2));
     let search_path_setting: String = provenance_row.get(3);
     cache.metadata.source_search_path = Some(parse_search_path_setting(&search_path_setting));
-    let lock_timeout_ms: i64 = provenance_row.get(4);
-    let statement_timeout_ms: i64 = provenance_row.get(5);
+    let lock_timeout_ms = provenance_row
+        .try_get::<_, Option<i64>>(4)?
+        .context("PostgreSQL did not report lock_timeout")?;
+    let statement_timeout_ms = provenance_row
+        .try_get::<_, Option<i64>>(5)?
+        .context("PostgreSQL did not report statement_timeout")?;
     cache.metadata.source_lock_timeout_ms = lock_timeout_ms
         .try_into()
         .context("PostgreSQL returned a negative lock_timeout")?;

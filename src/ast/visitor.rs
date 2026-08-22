@@ -3375,6 +3375,10 @@ impl AstVisitor {
                     });
                 }
 
+                if setting_name == "application_name" {
+                    return Some(StatementFact::SchemaNeutralNoop);
+                }
+
                 let timeout_setting = match setting_name.as_str() {
                     "lock_timeout" => TimeoutSetting::Lock,
                     "statement_timeout" => TimeoutSetting::Statement,

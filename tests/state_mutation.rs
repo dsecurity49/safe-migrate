@@ -1491,7 +1491,7 @@ mod state_mutation_tests {
         let mut state = setup_state();
         engine
             .analyze(
-                "CREATE USER web_user; CREATE ROLE worker LOGIN NOINHERIT;",
+                "CREATE USER web_user; CREATE ROLE worker LOGIN NOINHERIT; CREATE ROLE batch;",
                 &mut state,
             )
             .unwrap();
@@ -1509,6 +1509,13 @@ mod state_mutation_tests {
             panic!("role missing");
         };
         assert!(role.can_login);
+
+        let Some(safe_migrate::model::role::RoleOverlay::Present(batch)) =
+            state.local.roles.get(&ObjectId::new("", "batch"))
+        else {
+            panic!("plain role missing");
+        };
+        assert!(!batch.can_login);
     }
 
     #[test]
@@ -2265,6 +2272,103 @@ mod state_mutation_tests {
     }
 
     #[test]
+    fn subscription_publication_conflicts_do_not_partially_mutate_direct_state() {
+        let mut cache = DbCache::new();
+        cache.subscriptions.insert(
+            "subscriber".into(),
+            safe_migrate::model::replication::SubscriptionState {
+                name: "subscriber".into(),
+                owner: Some("postgres".into()),
+                connection: safe_migrate::analysis::facts::ConnectionTarget::Redacted,
+                publications: vec!["existing".into()],
+                params: Some(Vec::new()),
+                enabled: false,
+                slot_name: None,
+                generation: 0,
+            },
+        );
+        let mut state = safe_migrate::AnalysisState::new(cache);
+        let initial_generation = state.local.generation_counter;
+
+        for (mode, publications) in [
+            (
+                safe_migrate::analysis::facts::SubscriptionPublicationMode::Add,
+                vec!["new".to_string(), "existing".to_string()],
+            ),
+            (
+                safe_migrate::analysis::facts::SubscriptionPublicationMode::Drop,
+                vec!["existing".to_string(), "missing".to_string()],
+            ),
+        ] {
+            let mutation = safe_migrate::analysis::mutations::Mutation::AlterSubscription(
+                safe_migrate::analysis::mutations::AlterSubscriptionMutation {
+                    name: "subscriber".into(),
+                    action:
+                        safe_migrate::analysis::facts::AlterSubscriptionActionFact::Publications {
+                            mode,
+                            publications,
+                            params: Vec::new(),
+                        },
+                },
+            );
+            assert!(matches!(
+                state.apply(&mutation, None),
+                safe_migrate::analysis::state::MutationResult::Conflict { .. }
+            ));
+            let Some(safe_migrate::model::replication::SubscriptionOverlay::Present(subscription)) =
+                state.local.subscriptions.get("subscriber")
+            else {
+                panic!("subscription missing");
+            };
+            assert_eq!(subscription.publications, ["existing"]);
+            assert_eq!(subscription.generation, 0);
+            assert_eq!(state.local.generation_counter, initial_generation);
+        }
+    }
+
+    #[test]
+    fn table_drop_resolves_unqualified_publication_membership_through_search_path() {
+        let engine = setup_engine();
+        let mut cache = cache_with_table("tenant", "entries", None);
+        cache.search_path = vec!["tenant".into()];
+        cache.publications.insert(
+            "changes".into(),
+            safe_migrate::model::replication::PublicationState {
+                name: "changes".into(),
+                owner: Some("postgres".into()),
+                scope: safe_migrate::analysis::facts::PublicationScope::Explicit(vec![
+                    safe_migrate::analysis::facts::PublicationObjectFact::Table {
+                        name: safe_migrate::ast::identifiers::QualifiedName::new(
+                            None,
+                            safe_migrate::ast::identifiers::Ident::new("entries", true),
+                        ),
+                        only: true,
+                        include_partitions: false,
+                        columns: None,
+                        row_filter: None,
+                    },
+                ]),
+                params: Vec::new(),
+                generation: 0,
+            },
+        );
+        let mut state = safe_migrate::AnalysisState::new(cache);
+
+        engine.analyze("DROP TABLE entries;", &mut state).unwrap();
+
+        let Some(safe_migrate::model::replication::PublicationOverlay::Present(publication)) =
+            state.local.publications.get("changes")
+        else {
+            panic!("publication missing");
+        };
+        assert!(matches!(
+            &publication.scope,
+            safe_migrate::analysis::facts::PublicationScope::Explicit(objects)
+                if objects.is_empty()
+        ));
+    }
+
+    #[test]
     fn cached_publication_parent_edits_are_tainted_without_inheritance_catalogs() {
         let engine = setup_engine();
         let mut cache = cache_with_table("public", "parent", None);
@@ -2369,6 +2473,7 @@ mod state_mutation_tests {
             "CREATE SUBSCRIPTION invalid CONNECTION 'host=publisher.invalid' PUBLICATION p WITH (slot_name=NONE);",
             "CREATE SUBSCRIPTION invalid CONNECTION 'host=publisher.invalid' PUBLICATION p, p WITH (connect=false);",
             "CREATE SUBSCRIPTION invalid CONNECTION 'host=publisher.invalid' PUBLICATION p WITH (connect=maybe);",
+            "CREATE SUBSCRIPTION invalid CONNECTION 'host=publisher.invalid' PUBLICATION p WITH (connect=o);",
         ] {
             let mut state = setup_state();
             let violations = engine.analyze(sql, &mut state).unwrap();
@@ -2391,9 +2496,9 @@ mod state_mutation_tests {
                 "CREATE SUBSCRIPTION boolean_options
                    CONNECTION 'host=publisher.invalid'
                    PUBLICATION p
-                   WITH (connect=off, enabled=off, create_slot=off, copy_data=off, slot_name=NONE);
+                   WITH (connect=of, enabled=fals, create_slot=fa, copy_data=f, binary=tru, slot_name=NONE);
                  BEGIN;
-                 ALTER SUBSCRIPTION boolean_options SET PUBLICATION p2 WITH (refresh=off);
+                 ALTER SUBSCRIPTION boolean_options SET PUBLICATION p2 WITH (refresh=of);
                  ROLLBACK;",
                 &mut boolean_state,
             )

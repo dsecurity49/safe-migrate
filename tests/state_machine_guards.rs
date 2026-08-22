@@ -122,6 +122,73 @@ mod state_machine_guards_tests {
     }
 
     #[test]
+    fn schema_neutral_application_name_keeps_exact_confidence() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let violations = engine
+            .analyze("SET application_name = 'migration-check';", &mut state)
+            .unwrap();
+
+        assert!(violations.is_empty());
+        assert_eq!(
+            state.local.confidence,
+            safe_migrate::analysis::state::Confidence::Exact
+        );
+    }
+
+    #[test]
+    fn unknown_view_in_multi_drop_does_not_preserve_known_targets() {
+        let engine = setup_engine();
+        let mut cache = safe_migrate::db::cache::DbCache::new();
+        cache.metadata.schemas = Some(vec!["app".to_string()]);
+        let view_id = object_id("app", "known_view");
+        let materialized_view_id = object_id("app", "known_materialized_view");
+        cache.insert_baseline(
+            view_id.clone(),
+            RelationState::new(
+                view_id.clone(),
+                object_id("", "postgres"),
+                0,
+                None,
+                RelationKind::View,
+                Persistence::Permanent,
+                0,
+            ),
+        );
+        cache.insert_baseline(
+            materialized_view_id.clone(),
+            RelationState::new(
+                materialized_view_id.clone(),
+                object_id("", "postgres"),
+                0,
+                None,
+                RelationKind::MaterializedView,
+                Persistence::Permanent,
+                0,
+            ),
+        );
+        let mut state = AnalysisState::new(cache);
+
+        engine
+            .analyze("DROP VIEW app.known_view, tenant.unknown_view;", &mut state)
+            .unwrap();
+        engine
+            .analyze(
+                "DROP MATERIALIZED VIEW app.known_materialized_view, tenant.unknown_materialized_view;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(!state.relation_is_present(&view_id));
+        assert!(!state.relation_is_present(&materialized_view_id));
+        assert_eq!(
+            state.local.confidence,
+            safe_migrate::analysis::state::Confidence::Tainted
+        );
+    }
+
+    #[test]
     fn missing_unguarded_drop_aborts_following_transaction_statements() {
         let engine = setup_engine();
         let mut state = setup_state();

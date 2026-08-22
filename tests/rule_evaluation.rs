@@ -1003,4 +1003,63 @@ mod rule_evaluation_tests {
             );
         }
     }
+
+    #[test]
+    fn missing_procedure_changes_report_schema_drift() {
+        let engine = setup_engine();
+
+        for sql in [
+            "DROP PROCEDURE missing(integer);",
+            "ALTER PROCEDURE missing(integer) RENAME TO renamed;",
+        ] {
+            let mut state = setup_state();
+            let violations = engine.analyze(sql, &mut state).unwrap();
+            assert!(
+                violations.iter().any(|violation| {
+                    violation.rule_id == "schema-drift"
+                        && violation.object_kind
+                            == safe_migrate::report::violations::ObjectKind::Procedure
+                }),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn procedure_drift_checks_the_cached_routine_kind() {
+        let engine = setup_engine();
+        let routine_id = object_id("public", "work(integer)");
+
+        for routine_kind in [RoutineKind::Function, RoutineKind::Procedure] {
+            let mut cache = safe_migrate::db::cache::DbCache::new();
+            cache.functions.insert(
+                routine_id.clone(),
+                FunctionState {
+                    id: routine_id.clone(),
+                    routine_kind,
+                    arg_types: vec!["integer".into()],
+                    arg_type_ids: Vec::new(),
+                    return_type: "void".into(),
+                    return_type_id: None,
+                    volatility: Volatility::Volatile,
+                    language: "sql".into(),
+                    security: SecurityMode::Invoker,
+                },
+            );
+            let mut state = AnalysisState::new(cache);
+            let violations = engine
+                .analyze(
+                    "ALTER PROCEDURE work(integer) RENAME TO renamed;",
+                    &mut state,
+                )
+                .unwrap();
+            assert_eq!(
+                violations
+                    .iter()
+                    .filter(|violation| violation.rule_id == "schema-drift")
+                    .count(),
+                usize::from(routine_kind == RoutineKind::Function)
+            );
+        }
+    }
 }

@@ -304,6 +304,65 @@ impl Rule for DriftDetectionRule {
                             fk_dependency_related: false,
                 });
             }
+            Mutation::DropProcedure(d) => {
+                for signature in &d.signatures {
+                    let signature_name = format!(
+                        "{}({})",
+                        signature.name.name.resolve(),
+                        signature.params.join(",")
+                    );
+                    let schema = state.resolve_function_schema(&signature.name, &signature_name);
+                    let id = ObjectId::new(schema, signature_name);
+                    let procedure_exists = pre_state.functions.get(&id).is_some_and(|routine| {
+                        routine.routine_kind == crate::model::function::RoutineKind::Procedure
+                    });
+                    if !d.if_exists && !procedure_exists {
+                        violations.push(Violation {
+                            source_range: None,
+                            rule_id: self.id(),
+                            operation_kind: OperationKind::DropProcedure,
+                            object_kind: ObjectKind::Procedure,
+                            object_name: id.to_string(),
+                            tier: self.default_tier(),
+                            reason: format!(
+                                "Migration DROPs procedure \"{}\" which does not exist in the production baseline",
+                                id
+                            ),
+                            recipe: self.recipe(),
+                            dedup_key: None,
+                            sql: None,
+                            fk_dependency_related: false,
+                        });
+                    }
+                }
+            }
+            Mutation::AlterProcedure(procedure) => {
+                let procedure_exists =
+                    pre_state
+                        .functions
+                        .get(&procedure.id)
+                        .is_some_and(|routine| {
+                            routine.routine_kind == crate::model::function::RoutineKind::Procedure
+                        });
+                if !procedure_exists {
+                    violations.push(Violation {
+                        source_range: None,
+                        rule_id: self.id(),
+                        operation_kind: OperationKind::AlterProcedure,
+                        object_kind: ObjectKind::Procedure,
+                        object_name: procedure.id.to_string(),
+                        tier: self.default_tier(),
+                        reason: format!(
+                            "Migration ALTERs procedure \"{}\" which does not exist in the production baseline",
+                            procedure.id
+                        ),
+                        recipe: self.recipe(),
+                        dedup_key: None,
+                        sql: None,
+                        fk_dependency_related: false,
+                    });
+                }
+            }
             Mutation::CreateTable(c) => {
                 // Warn if parent table doesn't exist for partitioned tables
                 if let Some(parent_id) = &c.partition_of

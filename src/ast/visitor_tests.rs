@@ -1236,6 +1236,10 @@ mod tests {
             parse_and_extract_statement("RESET application_name;"),
             Some(StatementFact::SchemaNeutralNoop)
         );
+        assert_eq!(
+            parse_and_extract_statement("SET application_name = 'migration-check';"),
+            Some(StatementFact::SchemaNeutralNoop)
+        );
     }
 
     #[test]

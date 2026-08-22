@@ -77,6 +77,7 @@ export DATABASE_URL='postgres://USER:PASSWORD@localhost:5432/safe_migrate'
 scripts/live-differential
 scripts/live-auto-sync
 scripts/live-cache-encryption
+scripts/live-catalog-sync
 ```
 
 The differential harness requires a local database named `safe_migrate` and

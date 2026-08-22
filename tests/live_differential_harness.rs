@@ -1,4 +1,6 @@
-use postgres::config::Host;
+mod common;
+
+use crate::common::database_hosts_are_local;
 use postgres::{Client, Config as PostgresConfig, NoTls};
 use safe_migrate::analysis::graph::DependencyKind;
 use safe_migrate::analysis::state::AnalysisState;
@@ -268,18 +270,6 @@ struct Mismatch {
     category: MismatchCategory,
     root_cause: RootCauseClassification,
     note: String,
-}
-
-fn database_hosts_are_local(config: &PostgresConfig) -> bool {
-    config.get_hosts().iter().all(|host| match host {
-        Host::Unix(_) => true,
-        Host::Tcp(host) if host.eq_ignore_ascii_case("localhost") => true,
-        Host::Tcp(host) => host
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|address| address.is_loopback()),
-    })
 }
 
 #[test]

@@ -312,11 +312,31 @@ impl AnalysisState {
     }
 
     fn postgres_boolean(value: &str) -> Option<bool> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "true" | "t" | "yes" | "y" | "on" | "1" => Some(true),
-            "false" | "f" | "no" | "n" | "off" | "0" => Some(false),
-            _ => None,
+        let value = value.trim().to_ascii_lowercase();
+        match value.as_str() {
+            "1" => return Some(true),
+            "0" => return Some(false),
+            "" => return None,
+            _ => {}
         }
+
+        let mut matched = None;
+        for (spelling, parsed) in [
+            ("true", true),
+            ("yes", true),
+            ("on", true),
+            ("false", false),
+            ("no", false),
+            ("off", false),
+        ] {
+            if spelling.starts_with(&value) {
+                if matched.is_some() {
+                    return None;
+                }
+                matched = Some(parsed);
+            }
+        }
+        matched
     }
 
     fn subscription_boolean_option(
@@ -2130,7 +2150,7 @@ impl AnalysisState {
                     }
                 });
 
-                let affected_publications: Vec<String> = self
+                let publication_updates: Vec<(String, Vec<_>)> = self
                     .local
                     .publications
                     .iter()
@@ -2145,45 +2165,32 @@ impl AnalysisState {
                         else {
                             return None;
                         };
-                        objects
+                        let retained = objects
                             .iter()
-                            .any(|object| {
+                            .filter(|object| {
                                 let crate::analysis::facts::PublicationObjectFact::Table {
                                     name,
                                     ..
                                 } = object
                                 else {
-                                    return false;
+                                    return true;
                                 };
-                                dropped_relations
+                                !dropped_relations
                                     .contains(&resolve(&self.resolve_relation_id(name)))
                             })
-                            .then(|| name.clone())
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        (retained.len() != objects.len()).then(|| (name.clone(), retained))
                     })
                     .collect();
-                for publication_name in affected_publications {
+                for (publication_name, retained) in publication_updates {
                     self.snapshot_publication(&publication_name);
                     if let Some(crate::model::replication::PublicationOverlay::Present(publication)) =
                         self.local.publications.get_mut(&publication_name)
                         && let crate::analysis::facts::PublicationScope::Explicit(objects) =
                             &mut publication.scope
                     {
-                        objects.retain(|object| {
-                            let crate::analysis::facts::PublicationObjectFact::Table {
-                                name, ..
-                            } = object
-                            else {
-                                return true;
-                            };
-                            let id = ObjectId::new(
-                                name.schema
-                                    .as_ref()
-                                    .map(|schema| schema.resolve())
-                                    .unwrap_or_else(|| "public".to_string()),
-                                name.name.resolve(),
-                            );
-                            !dropped_relations.contains(&resolve(&id))
-                        });
+                        *objects = retained;
                     }
                 }
                 self.snapshot_graph_full();
@@ -4103,7 +4110,7 @@ impl AnalysisState {
                         _ => {
                             self.snapshot_confidence();
                             self.local.confidence = Confidence::Tainted;
-                            return MutationResult::Skipped;
+                            continue;
                         }
                     }
                 }
@@ -4146,7 +4153,7 @@ impl AnalysisState {
                         _ => {
                             self.snapshot_confidence();
                             self.local.confidence = Confidence::Tainted;
-                            return MutationResult::Skipped;
+                            continue;
                         }
                     }
                 }
@@ -5619,18 +5626,72 @@ impl AnalysisState {
                 let in_transaction = !self.local.transactions.is_empty();
                 match &s.action {
                     crate::analysis::facts::AlterSubscriptionActionFact::Publications {
+                        mode,
+                        publications,
                         params,
-                        ..
-                    } if in_transaction
-                        && Self::subscription_boolean_option(Some(params), "refresh")
-                            != Some(false) =>
-                    {
-                        return MutationResult::Conflict {
-                            reason: format!(
-                                "subscription '{}' cannot refresh publications inside a transaction",
-                                s.name
-                            ),
-                        };
+                    } => {
+                        if let Err(reason) = Self::validate_subscription_boolean_options(
+                            Some(params),
+                            &["refresh", "copy_data"],
+                        ) {
+                            return MutationResult::Conflict { reason };
+                        }
+                        if in_transaction
+                            && Self::subscription_boolean_option(Some(params), "refresh")
+                                != Some(false)
+                        {
+                            return MutationResult::Conflict {
+                                reason: format!(
+                                    "subscription '{}' cannot refresh publications inside a transaction",
+                                    s.name
+                                ),
+                            };
+                        }
+
+                        let mut unique = HashSet::new();
+                        match mode {
+                            crate::analysis::facts::SubscriptionPublicationMode::Set => {
+                                if !publications
+                                    .iter()
+                                    .all(|publication| unique.insert(publication))
+                                {
+                                    return MutationResult::Conflict {
+                                        reason: format!(
+                                            "subscription '{}' lists the same publication more than once",
+                                            s.name
+                                        ),
+                                    };
+                                }
+                            }
+                            crate::analysis::facts::SubscriptionPublicationMode::Add => {
+                                for publication in publications {
+                                    if !unique.insert(publication)
+                                        || existing.publications.contains(publication)
+                                    {
+                                        return MutationResult::Conflict {
+                                            reason: format!(
+                                                "subscription '{}' already includes publication '{}'",
+                                                s.name, publication
+                                            ),
+                                        };
+                                    }
+                                }
+                            }
+                            crate::analysis::facts::SubscriptionPublicationMode::Drop => {
+                                for publication in publications {
+                                    if !unique.insert(publication)
+                                        || !existing.publications.contains(publication)
+                                    {
+                                        return MutationResult::Conflict {
+                                            reason: format!(
+                                                "subscription '{}' does not include publication '{}'",
+                                                s.name, publication
+                                            ),
+                                        };
+                                    }
+                                }
+                            }
+                        }
                     }
                     crate::analysis::facts::AlterSubscriptionActionFact::RefreshPublication(_)
                         if in_transaction =>
@@ -5682,8 +5743,8 @@ impl AnalysisState {
                         }
                         let forbidden_in_transaction = options.iter().any(|option| {
                             option.name.eq_ignore_ascii_case("failover")
-                                || option.name.eq_ignore_ascii_case("two_phase")
-                                    && Self::postgres_boolean(&option.value) == Some(false)
+                                || (option.name.eq_ignore_ascii_case("two_phase")
+                                    && Self::postgres_boolean(&option.value) == Some(false))
                         });
                         if in_transaction && forbidden_in_transaction {
                             return MutationResult::Conflict {
@@ -5739,12 +5800,6 @@ impl AnalysisState {
                         publications,
                         params,
                     } => {
-                        if let Err(reason) = Self::validate_subscription_boolean_options(
-                            Some(params),
-                            &["refresh", "copy_data"],
-                        ) {
-                            return MutationResult::Conflict { reason };
-                        }
                         let refreshes = Self::subscription_boolean_option(Some(params), "refresh")
                             != Some(false);
                         if refreshes {
@@ -5757,49 +5812,17 @@ impl AnalysisState {
                         {
                             match mode {
                                 SubscriptionPublicationMode::Set => {
-                                    let mut unique = HashSet::new();
-                                    if !publications
-                                        .iter()
-                                        .all(|publication| unique.insert(publication))
-                                    {
-                                        return MutationResult::Conflict {
-                                            reason: format!(
-                                                "subscription '{}' lists the same publication more than once",
-                                                s.name
-                                            ),
-                                        };
-                                    }
                                     subscription.publications = publications.clone();
                                 }
                                 SubscriptionPublicationMode::Add => {
-                                    for publication in publications {
-                                        if subscription.publications.contains(publication) {
-                                            return MutationResult::Conflict {
-                                                reason: format!(
-                                                    "subscription '{}' already includes publication '{}'",
-                                                    s.name, publication
-                                                ),
-                                            };
-                                        }
-                                        subscription.publications.push(publication.clone());
-                                    }
+                                    subscription
+                                        .publications
+                                        .extend(publications.iter().cloned());
                                 }
                                 SubscriptionPublicationMode::Drop => {
-                                    for publication in publications {
-                                        let Some(position) = subscription
-                                            .publications
-                                            .iter()
-                                            .position(|existing| existing == publication)
-                                        else {
-                                            return MutationResult::Conflict {
-                                                reason: format!(
-                                                    "subscription '{}' does not include publication '{}'",
-                                                    s.name, publication
-                                                ),
-                                            };
-                                        };
-                                        subscription.publications.remove(position);
-                                    }
+                                    subscription
+                                        .publications
+                                        .retain(|existing| !publications.contains(existing));
                                 }
                             }
                         }
