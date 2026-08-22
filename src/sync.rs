@@ -13,6 +13,8 @@ use tempfile::NamedTempFile;
 #[cfg(windows)]
 use std::fs;
 
+const MIN_POSTGRES_VERSION_NUM: u32 = 140_000;
+
 pub fn sync_cache(
     out_path: &Path,
     schemas: Option<&[String]>,
@@ -37,11 +39,7 @@ fn connect_database(db_url: &str) -> Result<Client> {
         .parse()
         .context("DATABASE_URL is not a valid PostgreSQL connection string")?;
 
-    if config
-        .get_hosts()
-        .iter()
-        .any(|host| matches!(host, Host::Tcp(name) if !is_local_host(name)))
-    {
+    if !database_config_is_local(&config) {
         anyhow::bail!(
             "Remote DATABASE_URL connections are not supported by this build. Use an SSH tunnel and connect through localhost or a Unix socket."
         );
@@ -50,6 +48,27 @@ fn connect_database(db_url: &str) -> Result<Client> {
     config
         .connect(NoTls)
         .context("Failed to connect to PostgreSQL")
+}
+
+pub(crate) fn database_config_is_local(config: &PostgresConfig) -> bool {
+    config
+        .get_hostaddrs()
+        .iter()
+        .all(|address| address.is_loopback())
+        && config.get_hosts().iter().all(|host| match host {
+            Host::Unix(_) => true,
+            Host::Tcp(name) => is_local_host(name),
+        })
+}
+
+pub(crate) fn ensure_supported_postgres_version(version: u32) -> Result<()> {
+    if version < MIN_POSTGRES_VERSION_NUM {
+        anyhow::bail!(
+            "PostgreSQL {} is unsupported; safe-migrate sync requires PostgreSQL 14 or newer",
+            version / 10_000
+        );
+    }
+    Ok(())
 }
 
 pub(crate) fn is_local_host(host: &str) -> bool {
@@ -395,7 +414,11 @@ fn populate_cache_from_client(
     // Server version and connection provenance.
     let version_row = client.query_one("SHOW server_version_num;", &[])?;
     let version_str: String = version_row.get(0);
-    cache.pg_version_num = version_str.parse::<u32>().ok();
+    let version = version_str
+        .parse::<u32>()
+        .context("PostgreSQL returned an invalid server_version_num")?;
+    ensure_supported_postgres_version(version)?;
+    cache.pg_version_num = Some(version);
 
     let provenance_row = client.query_one(
         "SELECT current_database(), current_user, session_user, current_setting('search_path'),

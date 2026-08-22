@@ -1099,6 +1099,16 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_replication_alters_do_not_target_an_empty_name() {
+        for sql in [
+            "ALTER PUBLICATION SET (publish = 'insert');",
+            "ALTER SUBSCRIPTION SET (enabled = false);",
+        ] {
+            assert!(parse_and_extract_statement(sql).is_none(), "{sql}");
+        }
+    }
+
+    #[test]
     fn subscription_connection_literals_use_postgresql_string_decoding() {
         let facts = parse_and_extract(
             "CREATE SUBSCRIPTION app_sub CONNECTION 'password=it''s-local' PUBLICATION app_pub WITH (connect = false);

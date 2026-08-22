@@ -2031,6 +2031,48 @@ mod state_mutation_tests {
     }
 
     #[test]
+    fn guarded_routine_drop_still_rejects_the_wrong_routine_kind() {
+        let engine = setup_engine();
+        let routine_id = object_id("public", "work(integer)");
+
+        for (routine_kind, sql) in [
+            (
+                safe_migrate::model::function::RoutineKind::Function,
+                "DROP PROCEDURE IF EXISTS work(int);",
+            ),
+            (
+                safe_migrate::model::function::RoutineKind::Procedure,
+                "DROP FUNCTION IF EXISTS work(int);",
+            ),
+        ] {
+            let mut cache = safe_migrate::db::cache::DbCache::new();
+            cache.functions.insert(
+                routine_id.clone(),
+                FunctionState {
+                    id: routine_id.clone(),
+                    routine_kind,
+                    arg_types: vec!["integer".into()],
+                    arg_type_ids: Vec::new(),
+                    return_type: "void".into(),
+                    return_type_id: None,
+                    volatility: Volatility::Volatile,
+                    language: "sql".into(),
+                    security: SecurityMode::Invoker,
+                },
+            );
+            let mut state = safe_migrate::AnalysisState::new(cache);
+            let violations = engine.analyze(sql, &mut state).unwrap();
+
+            assert!(
+                violations
+                    .iter()
+                    .any(|violation| violation.rule_id == "chain-conflict"),
+                "{sql} should reject the wrong routine kind"
+            );
+        }
+    }
+
+    #[test]
     fn procedure_kind_and_lifecycle_are_enforced_within_the_chain() {
         let engine = setup_engine();
         let mut state = setup_state();

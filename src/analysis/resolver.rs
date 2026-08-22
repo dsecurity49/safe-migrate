@@ -1155,8 +1155,21 @@ impl Resolver {
                 }));
             }
             StatementFact::DropProcedure(p) => {
+                let signatures = p
+                    .signatures
+                    .iter()
+                    .cloned()
+                    .map(|mut signature| {
+                        signature.params = signature
+                            .params
+                            .into_iter()
+                            .map(|param| Self::normalize_function_arg_type(&param))
+                            .collect();
+                        signature
+                    })
+                    .collect();
                 mutations.push(Mutation::DropProcedure(DropProcedureMutation {
-                    signatures: p.signatures.clone(),
+                    signatures,
                     if_exists: p.if_exists,
                     cascade: p.cascade,
                 }));

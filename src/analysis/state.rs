@@ -4785,14 +4785,14 @@ impl AnalysisState {
                             )
                     );
                     if !is_function {
-                        let absence_is_exact = self.baseline_available
-                            && self.baseline_covers_object(&id)
-                            || self.local.functions.contains_key(&id);
-                        if !f.if_exists && absence_is_exact {
+                        let routine_exists = self.local.functions.contains_key(&id);
+                        let absence_is_exact =
+                            self.baseline_available && self.baseline_covers_object(&id);
+                        if routine_exists || (!f.if_exists && absence_is_exact) {
                             return MutationResult::Conflict {
                                 reason: format!("function '{}' does not exist", id),
                             };
-                        } else if !absence_is_exact {
+                        } else if !f.if_exists && !absence_is_exact {
                             self.snapshot_confidence();
                             self.local.confidence = Confidence::Tainted;
                         }
@@ -4987,20 +4987,17 @@ impl AnalysisState {
                             .functions
                             .insert(id, crate::model::function::FunctionOverlay::Dropped);
                     } else if self.local.functions.contains_key(&id)
-                        || self.baseline_available && self.baseline_covers_object(&id)
+                        || !p.if_exists
+                            && self.baseline_available
+                            && self.baseline_covers_object(&id)
                     {
-                        if p.if_exists {
-                            continue;
-                        }
                         return MutationResult::Conflict {
                             reason: format!("procedure '{}' does not exist", id),
                         };
-                    } else {
+                    } else if !p.if_exists {
                         self.snapshot_confidence();
                         self.local.confidence = Confidence::Tainted;
-                        if !p.if_exists {
-                            return MutationResult::Skipped;
-                        }
+                        return MutationResult::Skipped;
                     }
                 }
                 if any_applied {

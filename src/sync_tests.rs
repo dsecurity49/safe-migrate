@@ -6,8 +6,8 @@ use crate::model::relation::{Persistence, RelationKind, RelationState};
 mod tests {
     use super::*;
     use crate::sync::{
-        cache_search_path, is_local_host, is_system_schema, parse_search_path_setting,
-        relation_owner_id, sync_cache,
+        cache_search_path, database_config_is_local, ensure_supported_postgres_version,
+        is_local_host, is_system_schema, parse_search_path_setting, relation_owner_id, sync_cache,
     };
     use crate::test_support::EnvironmentValueGuard;
     use serde::Serialize;
@@ -77,6 +77,30 @@ mod tests {
         assert!(is_local_host("/var/run/postgresql"));
         assert!(!is_local_host("db.internal.example"));
         assert!(!is_local_host("127.0.0.1.attacker.example"));
+    }
+
+    #[test]
+    fn test_database_config_rejects_remote_hostaddr() {
+        let local: postgres::Config = "host=localhost hostaddr=127.0.0.1 dbname=safe_migrate"
+            .parse()
+            .unwrap();
+        let remote: postgres::Config = "host=localhost hostaddr=10.0.0.5 dbname=safe_migrate"
+            .parse()
+            .unwrap();
+
+        assert!(database_config_is_local(&local));
+        assert!(!database_config_is_local(&remote));
+    }
+
+    #[test]
+    fn test_sync_requires_postgresql_14_or_newer() {
+        let error = ensure_supported_postgres_version(130_012).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("requires PostgreSQL 14 or newer")
+        );
+        assert!(ensure_supported_postgres_version(140_000).is_ok());
     }
 
     #[test]

@@ -263,8 +263,15 @@ fn assert_subscription_matches(state: &AnalysisState, cache: &safe_migrate::DbCa
         .unwrap_or_else(|| panic!("PostgreSQL subscription {name} is not present"));
     let mut simulated = simulated.clone();
     simulated.generation = 0;
+    if let Some(params) = &mut simulated.params {
+        params.sort_by(|left, right| left.name.cmp(&right.name));
+    }
+    let mut synchronized = synchronized.clone();
+    if let Some(params) = &mut synchronized.params {
+        params.sort_by(|left, right| left.name.cmp(&right.name));
+    }
     assert_eq!(
-        &simulated, synchronized,
+        simulated, synchronized,
         "subscription state differs for {name}"
     );
 }
@@ -283,6 +290,7 @@ fn live_catalog_database_guard_accepts_only_local_hosts() {
     for value in [
         "host=db.internal.example dbname=safe_migrate",
         "host=127.0.0.1.attacker.example dbname=safe_migrate",
+        "host=localhost hostaddr=10.0.0.5 dbname=safe_migrate",
     ] {
         let config: postgres::Config = value.parse().unwrap();
         assert!(!database_hosts_are_local(&config), "{value}");

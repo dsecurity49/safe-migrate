@@ -26,15 +26,19 @@ pub fn object_id(schema: &str, name: &str) -> ObjectId {
 }
 
 pub fn database_hosts_are_local(config: &postgres::Config) -> bool {
-    config.get_hosts().iter().all(|host| match host {
-        postgres::config::Host::Unix(_) => true,
-        postgres::config::Host::Tcp(host) if host.eq_ignore_ascii_case("localhost") => true,
-        postgres::config::Host::Tcp(host) => host
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|address| address.is_loopback()),
-    })
+    config
+        .get_hostaddrs()
+        .iter()
+        .all(|address| address.is_loopback())
+        && config.get_hosts().iter().all(|host| match host {
+            postgres::config::Host::Unix(_) => true,
+            postgres::config::Host::Tcp(host) if host.eq_ignore_ascii_case("localhost") => true,
+            postgres::config::Host::Tcp(host) => host
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback()),
+        })
 }
 
 pub fn cache_with_table(schema: &str, name: &str, rows: Option<u64>) -> DbCache {

@@ -2166,24 +2166,8 @@ impl AstVisitor {
     fn extract_alter_function(node: &ast::AlterFunction) -> Option<StatementFact> {
         let path = node.function_sig()?.function_name_ref()?.path_ref()?;
         let name = Self::path_ref_to_qualified_name(&path)?;
-        let params = node
-            .function_sig()
-            .and_then(|sig| sig.param_list())
-            .map(|pl| {
-                pl.params()
-                    .filter_map(|p| {
-                        if matches!(p.mode(), Some(ast::ParamMode::ParamOut(_))) {
-                            return None;
-                        }
-                        Some(
-                            p.ty()
-                                .map(|t| t.syntax().text().to_string())
-                                .unwrap_or_else(|| "unknown".into()),
-                        )
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let params =
+            Self::extract_signature_params(node.function_sig().and_then(|sig| sig.param_list()));
 
         let action = node.action().and_then(|a| match a {
             ast::AlterFunctionAction::FunctionRenameTo(rt) => {
@@ -2250,24 +2234,7 @@ impl AstVisitor {
                             name: Self::path_ref_to_qualified_name(&path).unwrap_or_else(|| {
                                 QualifiedName::new(None, Ident::new("unknown".to_string(), false))
                             }),
-                            params: sig
-                                .param_list()
-                                .map(|pl| {
-                                    pl.params()
-                                        .filter_map(|p| {
-                                            if matches!(p.mode(), Some(ast::ParamMode::ParamOut(_)))
-                                            {
-                                                return None;
-                                            }
-                                            Some(
-                                                p.ty()
-                                                    .map(|t| t.syntax().text().to_string())
-                                                    .unwrap_or_else(|| "unknown".into()),
-                                            )
-                                        })
-                                        .collect()
-                                })
-                                .unwrap_or_default(),
+                            params: Self::extract_signature_params(sig.param_list()),
                         })
                     })
                     .collect::<Vec<_>>()
@@ -2315,24 +2282,8 @@ impl AstVisitor {
     fn extract_alter_procedure(node: &ast::AlterProcedure) -> Option<StatementFact> {
         let path = node.procedure_sig()?.procedure_name_ref()?.path_ref()?;
         let name = Self::path_ref_to_qualified_name(&path)?;
-        let params = node
-            .procedure_sig()
-            .and_then(|sig| sig.param_list())
-            .map(|pl| {
-                pl.params()
-                    .filter_map(|p| {
-                        if matches!(p.mode(), Some(ast::ParamMode::ParamOut(_))) {
-                            return None;
-                        }
-                        Some(
-                            p.ty()
-                                .map(|t| t.syntax().text().to_string())
-                                .unwrap_or_else(|| "unknown".into()),
-                        )
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let params =
+            Self::extract_signature_params(node.procedure_sig().and_then(|sig| sig.param_list()));
 
         let action = node.action().and_then(|a| match a {
             ast::AlterProcedureAction::ProcedureRenameTo(rt) => {
@@ -2377,24 +2328,7 @@ impl AstVisitor {
                             name: Self::path_ref_to_qualified_name(&path).unwrap_or_else(|| {
                                 QualifiedName::new(None, Ident::new("unknown".to_string(), false))
                             }),
-                            params: sig
-                                .param_list()
-                                .map(|pl| {
-                                    pl.params()
-                                        .filter_map(|p| {
-                                            if matches!(p.mode(), Some(ast::ParamMode::ParamOut(_)))
-                                            {
-                                                return None;
-                                            }
-                                            Some(
-                                                p.ty()
-                                                    .map(|t| t.syntax().text().to_string())
-                                                    .unwrap_or_else(|| "unknown".into()),
-                                            )
-                                        })
-                                        .collect()
-                                })
-                                .unwrap_or_default(),
+                            params: Self::extract_signature_params(sig.param_list()),
                         })
                     })
                     .collect::<Vec<_>>()
@@ -2410,7 +2344,7 @@ impl AstVisitor {
         ))
     }
 
-    fn extract_aggregate_params(params: Option<ast::ParamList>) -> Vec<String> {
+    fn extract_signature_params(params: Option<ast::ParamList>) -> Vec<String> {
         params
             .map(|params| {
                 params
@@ -2467,7 +2401,7 @@ impl AstVisitor {
     fn extract_alter_aggregate(node: &ast::AlterAggregate) -> Option<StatementFact> {
         let aggregate = node.aggregate()?;
         let name = Self::path_ref_to_qualified_name(&aggregate.path_ref()?)?;
-        let params = Self::extract_aggregate_params(aggregate.param_list());
+        let params = Self::extract_signature_params(aggregate.param_list());
         let action = match node.action()? {
             ast::AlterAggregateAction::AggregateRenameTo(rename) => {
                 let to = Self::path_to_qualified_name(&rename.aggregate_name()?.path()?)?
@@ -2504,7 +2438,7 @@ impl AstVisitor {
             .filter_map(|aggregate| {
                 Some(crate::analysis::facts::FunctionSigFact {
                     name: Self::path_ref_to_qualified_name(&aggregate.path_ref()?)?,
-                    params: Self::extract_aggregate_params(aggregate.param_list()),
+                    params: Self::extract_signature_params(aggregate.param_list()),
                 })
             })
             .collect();
@@ -2633,10 +2567,7 @@ impl AstVisitor {
     fn extract_alter_publication(
         node: &squawk_syntax::ast::AlterPublication,
     ) -> Option<StatementFact> {
-        let name = node
-            .publication_ref()
-            .map(|publication| Self::resolve_ast_identifier(&publication))
-            .unwrap_or_default();
+        let name = Self::resolve_ast_identifier(&node.publication_ref()?);
         let action = match node.action()? {
             ast::AlterPublicationAction::AddPublicationObjects(action) => {
                 crate::analysis::facts::AlterPublicationActionFact::AddObjects(
@@ -2757,10 +2688,7 @@ impl AstVisitor {
     fn extract_alter_subscription(
         node: &squawk_syntax::ast::AlterSubscription,
     ) -> Option<StatementFact> {
-        let name = node
-            .subscription_ref()
-            .map(|subscription| Self::resolve_ast_identifier(&subscription))
-            .unwrap_or_default();
+        let name = Self::resolve_ast_identifier(&node.subscription_ref()?);
         let action = match node.action()? {
             ast::AlterSubscriptionAction::SetConnection(action) => {
                 crate::analysis::facts::AlterSubscriptionActionFact::SetConnection(
