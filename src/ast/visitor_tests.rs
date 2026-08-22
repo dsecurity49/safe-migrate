@@ -1,11 +1,11 @@
-// FILE: src/ast/visitor_tests.rs
-
 #[cfg(test)]
 mod tests {
     use crate::analysis::expr_ir::ExprIr;
     use crate::analysis::facts::{
-        AlterTableActionFact, AlterTypeActionFact, StatementFact, TableConstraintFact,
-        TypeCreationKind,
+        AlterDatabaseAction, AlterPublicationActionFact, AlterSubscriptionActionFact,
+        AlterTableActionFact, AlterTypeActionFact, PublicationObjectFact, PublicationScope,
+        ResetSettingTarget, SearchPathTarget, StatementFact, SubscriptionPublicationMode,
+        TableConstraintFact, TimeoutSetting, TimeoutSettingValue, TypeCreationKind,
     };
     use crate::ast::identifiers::{Ident, QualifiedName};
     use crate::ast::visitor::AstVisitor;
@@ -432,6 +432,21 @@ mod tests {
     }
 
     #[test]
+    fn alter_column_preserves_quoted_identifier_case() {
+        let fact =
+            parse_and_extract_statement(r#"ALTER TABLE entries ALTER COLUMN "Camel" TYPE bigint;"#)
+                .expect("alter table fact");
+
+        let StatementFact::AlterTable { actions, .. } = fact else {
+            panic!("expected alter table fact");
+        };
+        let AlterTableActionFact::SetType { column, .. } = &actions[0] else {
+            panic!("expected set type fact");
+        };
+        assert_eq!(column, "Camel");
+    }
+
+    #[test]
     fn test_alter_table_drop_not_null() {
         let sql = "ALTER TABLE users ALTER COLUMN email DROP NOT NULL;";
         let facts = parse_and_extract_statement(sql);
@@ -812,6 +827,7 @@ mod tests {
         match facts.unwrap() {
             StatementFact::SetSearchPath {
                 target: crate::analysis::facts::SearchPathTarget::Default,
+                local: false,
             } => {}
             _ => panic!("Expected SetSearchPath fact"),
         }
@@ -828,7 +844,411 @@ mod tests {
                     "$user".into(),
                     "public".into(),
                 ]),
+                local: false,
             }
+        );
+    }
+
+    #[test]
+    fn set_local_search_path_and_quoted_default_are_distinct() {
+        assert_eq!(
+            parse_and_extract_statement("SET LOCAL search_path TO private, public;"),
+            Some(StatementFact::SetSearchPath {
+                target: SearchPathTarget::Schemas(vec!["private".into(), "public".into()]),
+                local: true,
+            })
+        );
+        assert_eq!(
+            parse_and_extract_statement("SET search_path TO \"default\";"),
+            Some(StatementFact::SetSearchPath {
+                target: SearchPathTarget::Schemas(vec!["default".into()]),
+                local: false,
+            })
+        );
+    }
+
+    #[test]
+    fn timeout_settings_extract_scope_units_defaults_and_invalid_values() {
+        for (sql, expected) in [
+            (
+                "SET lock_timeout = '1500us';",
+                StatementFact::SetTimeout {
+                    setting: TimeoutSetting::Lock,
+                    value: TimeoutSettingValue::Milliseconds(2),
+                    local: false,
+                },
+            ),
+            (
+                "SET LOCAL statement_timeout TO '2min';",
+                StatementFact::SetTimeout {
+                    setting: TimeoutSetting::Statement,
+                    value: TimeoutSettingValue::Milliseconds(120_000),
+                    local: true,
+                },
+            ),
+            (
+                "SET lock_timeout = '-0.5ms';",
+                StatementFact::SetTimeout {
+                    setting: TimeoutSetting::Lock,
+                    value: TimeoutSettingValue::Milliseconds(0),
+                    local: false,
+                },
+            ),
+            (
+                "SET SESSION lock_timeout TO DEFAULT;",
+                StatementFact::SetTimeout {
+                    setting: TimeoutSetting::Lock,
+                    value: TimeoutSettingValue::Default,
+                    local: false,
+                },
+            ),
+            (
+                "SET lock_timeout FROM CURRENT;",
+                StatementFact::SetTimeout {
+                    setting: TimeoutSetting::Lock,
+                    value: TimeoutSettingValue::Current,
+                    local: false,
+                },
+            ),
+        ] {
+            assert_eq!(parse_and_extract_statement(sql), Some(expected), "{sql}");
+        }
+
+        assert!(matches!(
+            parse_and_extract_statement("SET lock_timeout = 'forever';"),
+            Some(StatementFact::SetTimeout {
+                setting: TimeoutSetting::Lock,
+                value: TimeoutSettingValue::Invalid(_),
+                local: false,
+            })
+        ));
+    }
+
+    #[test]
+    fn create_role_and_user_apply_postgresql_defaults() {
+        for (sql, expected_name, expected_inherits, expected_login) in [
+            ("CREATE ROLE AppUser;", "appuser", true, false),
+            (r#"CREATE ROLE "AppUser";"#, "AppUser", true, false),
+            ("CREATE USER WebUser;", "webuser", true, true),
+            (
+                "CREATE ROLE service NOINHERIT LOGIN;",
+                "service",
+                false,
+                true,
+            ),
+        ] {
+            let Some(StatementFact::CreateRole(role)) = parse_and_extract_statement(sql) else {
+                panic!("expected create role fact for {sql}");
+            };
+            assert_eq!(role.name, expected_name, "{sql}");
+            assert_eq!(role.inherits, expected_inherits, "{sql}");
+            assert_eq!(role.can_login, expected_login, "{sql}");
+        }
+    }
+
+    #[test]
+    fn global_object_identifiers_follow_postgresql_case_rules() {
+        let Some(StatementFact::CreatePublication(publication)) = parse_and_extract_statement(
+            r#"CREATE PUBLICATION MixedPub FOR TABLE entries ("Camel");"#,
+        ) else {
+            panic!("expected publication fact");
+        };
+        assert_eq!(publication.name, "mixedpub");
+        let PublicationScope::Explicit(objects) = publication.scope else {
+            panic!("expected explicit publication objects");
+        };
+        let PublicationObjectFact::Table { columns, .. } = &objects[0] else {
+            panic!("expected publication table");
+        };
+        assert_eq!(columns.as_deref(), Some(["Camel".to_string()].as_slice()));
+
+        let Some(StatementFact::CreateSubscription(subscription)) = parse_and_extract_statement(
+            "CREATE SUBSCRIPTION MixedSub CONNECTION 'host=localhost' PUBLICATION MixedPub;",
+        ) else {
+            panic!("expected subscription fact");
+        };
+        assert_eq!(subscription.name.as_deref(), Some("mixedsub"));
+        assert_eq!(subscription.publications, vec!["mixedpub".to_string()]);
+
+        let Some(StatementFact::AlterDatabase(database)) =
+            parse_and_extract_statement(r#"ALTER DATABASE "MixedDb" RENAME TO "NewDb";"#)
+        else {
+            panic!("expected alter database fact");
+        };
+        assert_eq!(database.name.name.resolve(), "MixedDb");
+        assert!(matches!(
+            database.action,
+            AlterDatabaseAction::Rename { to } if to == "NewDb"
+        ));
+    }
+
+    #[test]
+    fn routine_identity_excludes_out_parameters_in_alter_and_drop_signatures() {
+        let facts = parse_and_extract(
+            "ALTER FUNCTION calculate(IN value integer, OUT label text) RENAME TO calculated;
+             DROP FUNCTION calculate(IN value integer, OUT label text);
+             ALTER PROCEDURE process(IN value integer, OUT label text) RENAME TO processed;
+             DROP PROCEDURE process(IN value integer, OUT label text);",
+        );
+        assert_eq!(facts.len(), 4);
+
+        let params = facts
+            .iter()
+            .map(|fact| match fact {
+                StatementFact::AlterFunction(fact) => fact.params.as_slice(),
+                StatementFact::DropFunction(fact) => fact.signatures[0].params.as_slice(),
+                StatementFact::AlterProcedure(fact) => fact.params.as_slice(),
+                StatementFact::DropProcedure(fact) => fact.signatures[0].params.as_slice(),
+                other => panic!("unexpected routine fact: {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert!(params.iter().all(|params| *params == ["integer"]));
+    }
+
+    #[test]
+    fn publication_and_subscription_alter_actions_are_typed() {
+        let facts = parse_and_extract(
+            r#"
+            ALTER PUBLICATION MixedPub ADD TABLE app.entries ("Camel") WHERE ("Camel" > 0);
+            ALTER PUBLICATION MixedPub SET (publish = 'insert, update');
+            ALTER PUBLICATION MixedPub RENAME TO RenamedPub;
+            ALTER SUBSCRIPTION MixedSub SET PUBLICATION MixedPub, "AuditPub" WITH (refresh = false);
+            ALTER SUBSCRIPTION MixedSub SET (streaming = parallel, slot_name = NONE);
+            ALTER SUBSCRIPTION MixedSub SKIP (lsn = '0/16B6C50');
+            ALTER SUBSCRIPTION MixedSub RENAME TO RenamedSub;
+            "#,
+        );
+        assert_eq!(facts.len(), 7);
+
+        assert!(matches!(
+            &facts[0],
+            StatementFact::AlterPublication(fact)
+                if fact.name == "mixedpub"
+                    && matches!(
+                        &fact.action,
+                        AlterPublicationActionFact::AddObjects(objects)
+                            if matches!(
+                                &objects[0],
+                                PublicationObjectFact::Table {
+                                    columns: Some(columns),
+                                    row_filter: Some(_),
+                                    ..
+                                } if columns == &["Camel"]
+                            )
+                    )
+        ));
+        assert!(matches!(
+            &facts[1],
+            StatementFact::AlterPublication(fact)
+                if matches!(
+                    &fact.action,
+                    AlterPublicationActionFact::SetOptions(options)
+                        if options == &[crate::analysis::facts::AttributeFact {
+                            name: "publish".into(),
+                            value: "insert, update".into(),
+                        }]
+                )
+        ));
+        assert!(matches!(
+            &facts[2],
+            StatementFact::AlterPublication(fact)
+                if matches!(&fact.action, AlterPublicationActionFact::Rename { to } if to == "renamedpub")
+        ));
+        assert!(
+            matches!(
+                &facts[3],
+                StatementFact::AlterSubscription(fact)
+                    if fact.name == "mixedsub"
+                        && matches!(
+                            &fact.action,
+                            AlterSubscriptionActionFact::Publications {
+                                mode: SubscriptionPublicationMode::Set,
+                                publications,
+                                params,
+                            } if publications == &["mixedpub", "AuditPub"]
+                                && params.iter().any(|param| param.name == "refresh" && param.value == "false")
+                        )
+            ),
+            "extracted subscription publication action: {:?}",
+            facts[3]
+        );
+        assert!(matches!(
+            &facts[4],
+            StatementFact::AlterSubscription(fact)
+                if matches!(
+                    &fact.action,
+                    AlterSubscriptionActionFact::SetOptions(options)
+                        if options.iter().any(|option| option.name == "streaming" && option.value == "parallel")
+                            && options.iter().any(|option| option.name == "slot_name" && option.value.eq_ignore_ascii_case("none"))
+                )
+        ));
+        assert!(matches!(
+            &facts[5],
+            StatementFact::AlterSubscription(fact)
+                if matches!(
+                    &fact.action,
+                    AlterSubscriptionActionFact::Skip(options)
+                        if options.iter().any(|option| option.name == "lsn" && option.value == "0/16B6C50")
+                )
+        ));
+        assert!(matches!(
+            &facts[6],
+            StatementFact::AlterSubscription(fact)
+                if matches!(&fact.action, AlterSubscriptionActionFact::Rename { to } if to == "renamedsub")
+        ));
+    }
+
+    #[test]
+    fn incomplete_replication_alters_do_not_target_an_empty_name() {
+        for sql in [
+            "ALTER PUBLICATION SET (publish = 'insert');",
+            "ALTER SUBSCRIPTION SET (enabled = false);",
+        ] {
+            assert!(parse_and_extract_statement(sql).is_none(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn subscription_connection_literals_use_postgresql_string_decoding() {
+        let facts = parse_and_extract(
+            "CREATE SUBSCRIPTION app_sub CONNECTION 'password=it''s-local' PUBLICATION app_pub WITH (connect = false);
+             ALTER SUBSCRIPTION app_sub CONNECTION E'password=line\\nfeed';",
+        );
+        assert!(matches!(
+            &facts[0],
+            StatementFact::CreateSubscription(fact)
+                if fact.connection
+                    == crate::analysis::facts::ConnectionTarget::Literal(
+                        Some("password=it's-local".into())
+                    )
+        ));
+        assert!(matches!(
+            &facts[1],
+            StatementFact::AlterSubscription(fact)
+                if fact.action
+                    == AlterSubscriptionActionFact::SetConnection(
+                        crate::analysis::facts::ConnectionTarget::Literal(
+                            Some("password=line\nfeed".into())
+                        )
+                    )
+        ));
+    }
+
+    #[test]
+    fn aggregate_commands_extract_shared_routine_identities() {
+        let create = parse_and_extract_statement(
+            "CREATE OR REPLACE AGGREGATE \"Analytics\".Total(integer) (
+                SFUNC = int4pl,
+                STYPE = integer
+            );",
+        )
+        .expect("create aggregate fact");
+        let StatementFact::CreateAggregate(create) = create else {
+            panic!("expected create aggregate fact");
+        };
+        assert!(create.or_replace);
+        assert_eq!(create.name.schema.unwrap().resolve(), "Analytics");
+        assert_eq!(create.name.name.resolve(), "total");
+        assert_eq!(create.params.len(), 1);
+        assert_eq!(create.params[0].ty, "integer");
+
+        let alter = parse_and_extract_statement(
+            "ALTER AGGREGATE \"Analytics\".Total(integer) RENAME TO \"Combined\";",
+        )
+        .expect("alter aggregate fact");
+        let StatementFact::AlterAggregate(alter) = alter else {
+            panic!("expected alter aggregate fact");
+        };
+        assert_eq!(alter.name.schema.unwrap().resolve(), "Analytics");
+        assert_eq!(alter.name.name.resolve(), "total");
+        assert_eq!(alter.params, ["integer"]);
+        assert!(matches!(
+            alter.action,
+            crate::analysis::facts::AlterFunctionAction::Rename { ref to, .. }
+                if to == "Combined"
+        ));
+
+        let drop = parse_and_extract_statement(
+            "DROP AGGREGATE IF EXISTS \"Analytics\".\"Combined\"(integer) CASCADE;",
+        )
+        .expect("drop aggregate fact");
+        let StatementFact::DropAggregate(drop) = drop else {
+            panic!("expected drop aggregate fact");
+        };
+        assert!(drop.if_exists);
+        assert!(drop.cascade);
+        assert_eq!(drop.signatures.len(), 1);
+        assert_eq!(drop.signatures[0].name.name.resolve(), "Combined");
+        assert_eq!(drop.signatures[0].params, ["integer"]);
+
+        let ordered = parse_and_extract_statement(
+            "DROP AGGREGATE percentile(double precision ORDER BY numeric, text);",
+        )
+        .expect("ordered-set aggregate fact");
+        let StatementFact::DropAggregate(ordered) = ordered else {
+            panic!("expected ordered-set aggregate fact");
+        };
+        assert_eq!(
+            ordered.signatures[0].params,
+            ["double precision", "numeric", "text"]
+        );
+
+        let legacy = parse_and_extract_statement(
+            "CREATE AGGREGATE legacy_total (
+                BASETYPE = integer,
+                SFUNC = int4pl,
+                STYPE = integer
+            );",
+        )
+        .expect("legacy aggregate fact");
+        let StatementFact::CreateAggregate(legacy) = legacy else {
+            panic!("expected legacy create aggregate fact");
+        };
+        assert_eq!(legacy.params.len(), 1);
+        assert_eq!(legacy.params[0].ty, "integer");
+    }
+
+    #[test]
+    fn create_function_window_option_is_typed() {
+        let fact = parse_and_extract_statement(
+            "CREATE FUNCTION ranked() RETURNS bigint AS 'window_row_number' LANGUAGE internal WINDOW;",
+        )
+        .expect("window function fact");
+        let StatementFact::CreateFunction(function) = fact else {
+            panic!("expected create function fact");
+        };
+        assert!(
+            function
+                .options
+                .iter()
+                .any(|option| matches!(option, crate::analysis::facts::FuncOptionFact::Window))
+        );
+    }
+
+    #[test]
+    fn reset_extracts_only_modeled_settings() {
+        for (sql, target) in [
+            ("RESET ALL;", ResetSettingTarget::All),
+            ("RESET search_path;", ResetSettingTarget::SearchPath),
+            ("RESET lock_timeout;", ResetSettingTarget::LockTimeout),
+            (
+                "RESET statement_timeout;",
+                ResetSettingTarget::StatementTimeout,
+            ),
+        ] {
+            assert_eq!(
+                parse_and_extract_statement(sql),
+                Some(StatementFact::ResetSettings { target }),
+                "{sql}"
+            );
+        }
+        assert_eq!(
+            parse_and_extract_statement("RESET application_name;"),
+            Some(StatementFact::SchemaNeutralNoop)
+        );
+        assert_eq!(
+            parse_and_extract_statement("SET application_name = 'migration-check';"),
+            Some(StatementFact::SchemaNeutralNoop)
         );
     }
 
@@ -1037,6 +1457,27 @@ mod tests {
             args: vec![],
         };
         assert!(expr.is_volatile());
+    }
+
+    #[test]
+    fn nested_function_arguments_preserve_volatility() {
+        let volatile = ExprIr::FunctionCall {
+            name: "coalesce".into(),
+            args: vec![ExprIr::FunctionCall {
+                name: "random".into(),
+                args: vec![],
+            }],
+        };
+        let stable = ExprIr::FunctionCall {
+            name: "coalesce".into(),
+            args: vec![ExprIr::FunctionCall {
+                name: "now".into(),
+                args: vec![],
+            }],
+        };
+
+        assert!(volatile.is_volatile());
+        assert!(!stable.is_volatile());
     }
 
     #[test]

@@ -1,4 +1,3 @@
-// FILE: src/rules/mod.rs
 pub mod conflict;
 pub mod constraints;
 pub mod destructive;
@@ -12,6 +11,7 @@ pub mod partitions;
 pub mod policies;
 pub mod registry;
 pub mod security;
+pub mod timeouts;
 pub mod transactions;
 pub mod triggers;
 pub mod views;

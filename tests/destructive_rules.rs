@@ -67,39 +67,38 @@ mod destructive_rule_tests {
         let engine = setup_engine();
 
         let mut cache = safe_migrate::db::cache::DbCache::new();
-        cache.insert_baseline(
+        let mut relation = safe_migrate::model::relation::RelationState::new(
             object_id("public", "t"),
-            safe_migrate::model::relation::RelationState::new(
-                object_id("public", "t"),
-                ObjectId::new("public", "postgres"),
-                0,
-                Some(500),
-                RelationKind::Table,
-                Persistence::Permanent,
-                0,
-            ),
+            ObjectId::new("public", "postgres"),
+            0,
+            Some(500),
+            RelationKind::Table,
+            Persistence::Permanent,
+            0,
         );
+        relation.columns.push(Column {
+            name: "data".into(),
+            data_type: Some("character varying(100)".into()),
+            type_id: None,
+            is_nullable: false,
+            default: None,
+            avg_width: None,
+            default_expr_text: None,
+            type_modifier: Some(104),
+        });
+        cache.insert_baseline(object_id("public", "t"), relation);
 
         let mut state = AnalysisState::new(cache);
-
-        engine
-            .analyze("CREATE TABLE t(data varchar(100) NOT NULL);", &mut state)
-            .unwrap();
 
         let v = engine
             .analyze("ALTER TABLE t ALTER COLUMN data TYPE text;", &mut state)
             .unwrap();
 
-        // varchar to text is a safe conversion (no rewrite needed)
-        // But the current implementation may not detect this as safe
-        // if the type stored from the parser differs from what the rule expects.
-        // We verify that even if flagged, it's never Tier1.
-        if let Some(viol) = v.iter().find(|v| v.rule_id == "type-change-rewrite") {
-            assert!(
-                viol.tier != ViolationTier::Tier1,
-                "Safe varchar->text conversion should not be Tier1"
-            );
-        }
+        assert!(
+            !v.iter()
+                .any(|violation| violation.rule_id == "type-change-rewrite"),
+            "varchar to text must not be reported as a rewrite"
+        );
     }
 
     #[test]
@@ -456,7 +455,3 @@ mod destructive_rule_tests {
         }
     }
 }
-
-// ─────────────────────────────────────────────
-// 8. ALTER SCHEMA Visitor Test (replaces debug_alter.rs)
-// ─────────────────────────────────────────────

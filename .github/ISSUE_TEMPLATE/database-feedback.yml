@@ -1,0 +1,79 @@
+name: Database-aware analysis feedback
+description: Report a false positive, missed risk, sync problem, or migration-tool integration gap.
+title: "[database feedback] "
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing safe-migrate. Do not attach a real `.safe-migrate.cache`, `DATABASE_URL`, credentials, or a private schema dump. Please reduce SQL and identifiers before posting them.
+
+  - type: input
+    id: version
+    attributes:
+      label: safe-migrate version
+      description: Paste the output of `safe-migrate --version`.
+      placeholder: safe-migrate 0.6.0
+    validations:
+      required: true
+
+  - type: input
+    id: postgres_version
+    attributes:
+      label: PostgreSQL version
+      description: Major version is enough if the full version is sensitive.
+      placeholder: PostgreSQL 17
+    validations:
+      required: true
+
+  - type: dropdown
+    id: baseline_mode
+    attributes:
+      label: Analysis baseline
+      options:
+        - Fresh `safe-migrate sync`
+        - Existing Cache V6
+        - '`auto_sync = true`'
+        - '`--no-cache`'
+    validations:
+      required: true
+
+  - type: input
+    id: migration_tool
+    attributes:
+      label: Migration runner or framework
+      description: Name and version, if one is involved.
+      placeholder: sqlx, Flyway, Rails, Django, custom runner
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal sanitized reproduction
+      description: Include the command, relevant safe-migrate configuration, and reduced SQL. Do not include secrets or a cache file.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: observed
+    attributes:
+      label: Observed result
+      description: Include rule IDs, confidence, and exact diagnostics where possible.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected result and database evidence
+      description: Explain what PostgreSQL or the migration runner did differently. Link public documentation or provide a disposable reproduction when available.
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety check
+      options:
+        - label: I removed credentials, private identifiers, and real cache files from this report.
+          required: true

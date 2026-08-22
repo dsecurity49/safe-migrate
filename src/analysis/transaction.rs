@@ -1,5 +1,3 @@
-// FILE: src/analysis/transaction.rs
-
 use crate::analysis::graph::DependencyEdge;
 use crate::ast::identifiers::ObjectId;
 use crate::model::relation::RelationOverlay;
@@ -49,6 +47,11 @@ pub enum StateChange {
     SearchPathSnapshot {
         previous: Vec<String>,
         previous_template: Vec<String>,
+        previous_session_template: Vec<String>,
+    },
+    TimeoutSettingsSnapshot {
+        lock_timeout: crate::analysis::settings::ScopedSetting<Option<u64>>,
+        statement_timeout: crate::analysis::settings::ScopedSetting<Option<u64>>,
     },
     GenerationCounterSnapshot {
         previous: u64,

@@ -2,12 +2,14 @@ use std::fs;
 use std::io::Read;
 use std::path::Path;
 
-use safe_migrate::db::cache::{CACHE_V5_MAGIC, DbCacheVersioned};
+use safe_migrate::db::cache::{CACHE_V6_MAGIC, DbCacheVersioned};
 
 fn run_auto_sync_case(
     database_url: &str,
     expected_role: &str,
     expected_session_role: &str,
+    expected_lock_timeout_ms: u64,
+    expected_statement_timeout_ms: u64,
     mode: &str,
 ) {
     let temp_dir = tempfile::tempdir().expect("create live auto-sync temp directory");
@@ -62,6 +64,14 @@ fn run_auto_sync_case(
         serde_json::from_slice(&output.stdout).expect("parse auto-sync JSON report");
     assert_eq!(report["baseline"]["auto_sync"], "refreshed");
     assert_eq!(report["baseline"]["status"], "available");
+    assert_eq!(
+        report["baseline"]["observed_settings"]["lock_timeout_ms"],
+        expected_lock_timeout_ms
+    );
+    assert_eq!(
+        report["baseline"]["observed_settings"]["statement_timeout_ms"],
+        expected_statement_timeout_ms
+    );
     assert_eq!(report["confidence"], "Exact");
     assert!(
         Path::new(&cache_path).is_file(),
@@ -73,15 +83,15 @@ fn run_auto_sync_case(
     decoder
         .read_to_end(&mut payload)
         .expect("read decoded cache payload");
-    let v5_payload = payload
-        .strip_prefix(CACHE_V5_MAGIC)
-        .expect("auto-sync must write a V5 cache");
+    let v6_payload = payload
+        .strip_prefix(CACHE_V6_MAGIC)
+        .expect("auto-sync must write a V6 cache");
     let config = bincode::config::standard().with_variable_int_encoding();
     let (versioned, bytes_read): (DbCacheVersioned, usize) =
-        bincode::serde::decode_from_slice(v5_payload, config).expect("decode V5 cache");
-    assert_eq!(bytes_read, v5_payload.len());
-    let DbCacheVersioned::V5(cache) = versioned else {
-        panic!("auto-sync must encode the V5 cache variant");
+        bincode::serde::decode_from_slice(v6_payload, config).expect("decode V6 cache");
+    assert_eq!(bytes_read, v6_payload.len());
+    let DbCacheVersioned::V6(cache) = versioned else {
+        panic!("auto-sync must encode the V6 cache variant");
     };
     assert_eq!(cache.metadata.source_role.as_deref(), Some(expected_role));
     assert_eq!(
@@ -89,6 +99,14 @@ fn run_auto_sync_case(
         Some(expected_session_role)
     );
     assert!(cache.metadata.source_search_path.is_some());
+    assert_eq!(
+        cache.metadata.source_lock_timeout_ms,
+        expected_lock_timeout_ms
+    );
+    assert_eq!(
+        cache.metadata.source_statement_timeout_ms,
+        expected_statement_timeout_ms
+    );
     assert!(!cache.roles.is_empty());
 
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -103,21 +121,32 @@ fn live_auto_sync_refreshes_lint_and_lint_chain() {
         std::env::var("DATABASE_URL").expect("DATABASE_URL is required for live auto-sync proof");
     let mut client = postgres::Client::connect(&database_url, postgres::NoTls)
         .expect("connect for current_user oracle");
-    let role_oracle = client
-        .query_one("SELECT current_user, session_user", &[])
-        .expect("query role oracle");
-    let expected_role: String = role_oracle.get(0);
-    let expected_session_role: String = role_oracle.get(1);
+    let provenance_oracle = client
+        .query_one(
+            "SELECT current_user, session_user,
+                    (SELECT setting::bigint FROM pg_settings WHERE name = 'lock_timeout'),
+                    (SELECT setting::bigint FROM pg_settings WHERE name = 'statement_timeout')",
+            &[],
+        )
+        .expect("query synchronization provenance oracle");
+    let expected_role: String = provenance_oracle.get(0);
+    let expected_session_role: String = provenance_oracle.get(1);
+    let expected_lock_timeout_ms = u64::try_from(provenance_oracle.get::<_, i64>(2)).unwrap();
+    let expected_statement_timeout_ms = u64::try_from(provenance_oracle.get::<_, i64>(3)).unwrap();
     run_auto_sync_case(
         &database_url,
         &expected_role,
         &expected_session_role,
+        expected_lock_timeout_ms,
+        expected_statement_timeout_ms,
         "lint",
     );
     run_auto_sync_case(
         &database_url,
         &expected_role,
         &expected_session_role,
+        expected_lock_timeout_ms,
+        expected_statement_timeout_ms,
         "lint-chain",
     );
 }

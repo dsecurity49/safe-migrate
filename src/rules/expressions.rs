@@ -1,5 +1,3 @@
-// FILE: src/rules/expressions.rs
-
 use crate::analysis::mutations::Mutation;
 use crate::analysis::state::{AnalysisState, CascadeResult, MutationResult};
 use crate::engine::config::Config;
@@ -16,7 +14,7 @@ impl Rule for VolatileDefaultRule {
         ViolationTier::Tier3
     }
     fn recipe(&self) -> &'static str {
-        "Using volatile functions (like random() or now()) as defaults can cause unexpected behavior in logical replication or caching."
+        "Using volatile functions such as random() or gen_random_uuid() as defaults can cause unexpected behavior in logical replication or caching."
     }
 
     fn evaluate(

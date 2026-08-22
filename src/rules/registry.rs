@@ -15,6 +15,7 @@ use crate::rules::opaque::OpaqueDynamicSqlRule;
 use crate::rules::partitions::{PartitionLockRule, PartitionStrategyMismatchRule};
 use crate::rules::policies::RestrictivePolicyRule;
 use crate::rules::security::OverbroadGrantRule;
+use crate::rules::timeouts::{RequireLockTimeoutRule, RequireStatementTimeoutRule};
 use crate::rules::transactions::{
     AlterTypeAddValueRule, ConcurrentInsideTransactionRule, VacuumFullRule,
 };
@@ -23,16 +24,45 @@ use crate::rules::views::MaterializedViewRefreshRule;
 
 /// Stable user-facing metadata and construction for one primary rule.
 ///
-/// Keep this registry in evaluation order. It is the canonical source for
-/// rule discovery, configuration validation, documentation checks, and engine
-/// construction; auxiliary findings emitted by a primary rule are not entries.
+/// Keep this registry in evaluation order. Discovery, configuration validation,
+/// documentation checks, and engine construction all read it. Auxiliary
+/// findings emitted by a primary rule are not entries.
 pub struct RuleDescriptor {
     pub id: &'static str,
     pub title: &'static str,
     pub summary: &'static str,
     pub impact: &'static str,
+    pub supported_configuration_fields: &'static [RuleConfigurationField],
     factory: fn() -> Box<dyn Rule>,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuleConfigurationField {
+    Disabled,
+    Tier1ThresholdRows,
+    Tier2ThresholdRows,
+}
+
+impl RuleConfigurationField {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Tier1ThresholdRows => "tier1_threshold_rows",
+            Self::Tier2ThresholdRows => "tier2_threshold_rows",
+        }
+    }
+}
+
+const DISABLED_ONLY: &[RuleConfigurationField] = &[RuleConfigurationField::Disabled];
+const WITH_TIER1_THRESHOLD: &[RuleConfigurationField] = &[
+    RuleConfigurationField::Disabled,
+    RuleConfigurationField::Tier1ThresholdRows,
+];
+const WITH_ROW_THRESHOLDS: &[RuleConfigurationField] = &[
+    RuleConfigurationField::Disabled,
+    RuleConfigurationField::Tier1ThresholdRows,
+    RuleConfigurationField::Tier2ThresholdRows,
+];
 
 impl RuleDescriptor {
     pub fn build(&self) -> Box<dyn Rule> {
@@ -46,15 +76,23 @@ impl RuleDescriptor {
     pub fn recipe(&self) -> &'static str {
         self.build().recipe()
     }
+
+    pub fn supports(&self, field: RuleConfigurationField) -> bool {
+        self.supported_configuration_fields.contains(&field)
+    }
 }
 
 macro_rules! descriptor {
     ($id:literal, $title:literal, $summary:literal, $impact:literal, $rule:expr) => {
+        descriptor!($id, $title, $summary, $impact, $rule, DISABLED_ONLY)
+    };
+    ($id:literal, $title:literal, $summary:literal, $impact:literal, $rule:expr, $fields:expr) => {
         RuleDescriptor {
             id: $id,
             title: $title,
             summary: $summary,
             impact: $impact,
+            supported_configuration_fields: $fields,
             factory: || Box::new($rule),
         }
     };
@@ -68,7 +106,8 @@ pub static PRIMARY_RULES: &[RuleDescriptor] = &[
         "Irreversible migration",
         "Flags destructive operations that cannot be reversed.",
         "data loss",
-        ReversibilityRule
+        ReversibilityRule,
+        WITH_TIER1_THRESHOLD
     ),
     descriptor!(
         "drop-database",
@@ -110,42 +149,62 @@ pub static PRIMARY_RULES: &[RuleDescriptor] = &[
         "Add column on a large table",
         "Flags column additions that can rewrite large tables.",
         "rewrite",
-        SizeAwareAddColumnRule
+        SizeAwareAddColumnRule,
+        WITH_TIER1_THRESHOLD
     ),
     descriptor!(
         "type-change-rewrite",
         "Type change rewrite",
         "Flags column type changes that rewrite data.",
         "rewrite",
-        TypeChangeRewriteRule
+        TypeChangeRewriteRule,
+        WITH_TIER1_THRESHOLD
     ),
     descriptor!(
         "blocking-constraint",
         "Blocking constraint",
         "Flags constraint changes that lock or scan tables.",
         "locking",
-        BlockingConstraintRule
+        BlockingConstraintRule,
+        WITH_ROW_THRESHOLDS
     ),
     descriptor!(
         "require-concurrent-index",
         "Require concurrent index",
         "Flags index changes that should use CONCURRENTLY.",
         "locking",
-        ConcurrentIndexRule
+        ConcurrentIndexRule,
+        WITH_ROW_THRESHOLDS
+    ),
+    descriptor!(
+        "require-lock-timeout",
+        "Require lock timeout",
+        "Flags potentially slow statements without an effective lock timeout.",
+        "locking",
+        RequireLockTimeoutRule
+    ),
+    descriptor!(
+        "require-statement-timeout",
+        "Require statement timeout",
+        "Flags potentially slow statements without an effective statement timeout.",
+        "operability",
+        RequireStatementTimeoutRule
     ),
     descriptor!(
         "blocking-mat-view-refresh",
         "Blocking materialized-view refresh",
         "Flags refreshes that block readers.",
         "locking",
-        MaterializedViewRefreshRule
+        MaterializedViewRefreshRule,
+        WITH_ROW_THRESHOLDS
     ),
     descriptor!(
         "blocking-partition-mutation",
         "Blocking partition mutation",
         "Flags partition attach and detach locks.",
         "locking",
-        PartitionLockRule
+        PartitionLockRule,
+        WITH_ROW_THRESHOLDS
     ),
     descriptor!(
         "partition-strategy-mismatch",
@@ -171,7 +230,7 @@ pub static PRIMARY_RULES: &[RuleDescriptor] = &[
     descriptor!(
         "broken-compute",
         "Broken compute dependency",
-        "Flags function changes that break triggers.",
+        "Flags function drops blocked by trigger dependencies.",
         "correctness",
         BrokenComputeRule
     ),
@@ -199,7 +258,7 @@ pub static PRIMARY_RULES: &[RuleDescriptor] = &[
     descriptor!(
         "alter-type-add-value-txn",
         "Enum value in transaction",
-        "Flags ALTER TYPE ADD VALUE in a transaction.",
+        "Flags enum additions whose new value is unavailable until commit.",
         "correctness",
         AlterTypeAddValueRule
     ),
@@ -254,6 +313,52 @@ pub fn primary_rule_ids() -> impl Iterator<Item = &'static str> {
 pub fn find_primary_rule(id: &str) -> Option<&'static RuleDescriptor> {
     PRIMARY_RULES.iter().find(|rule| rule.id == id)
 }
+
+pub fn validate_rule_configuration(config: &crate::engine::config::Config) -> Result<(), String> {
+    if config.tier1_threshold_rows < config.tier2_threshold_rows {
+        return Err(format!(
+            "tier1_threshold_rows ({}) must be greater than or equal to tier2_threshold_rows ({})",
+            config.tier1_threshold_rows, config.tier2_threshold_rows
+        ));
+    }
+
+    let mut rule_ids: Vec<_> = config.rules.keys().map(String::as_str).collect();
+    rule_ids.sort_unstable();
+    for rule_id in rule_ids {
+        let Some(descriptor) = find_primary_rule(rule_id) else {
+            // Config::validate_rule_ids reports unknown IDs with the full list.
+            continue;
+        };
+        let rule = &config.rules[rule_id];
+        if rule.tier1_threshold_rows.is_some()
+            && !descriptor.supports(RuleConfigurationField::Tier1ThresholdRows)
+        {
+            return Err(format!(
+                "Rule '{rule_id}' does not support 'tier1_threshold_rows'"
+            ));
+        }
+        if rule.tier2_threshold_rows.is_some()
+            && !descriptor.supports(RuleConfigurationField::Tier2ThresholdRows)
+        {
+            return Err(format!(
+                "Rule '{rule_id}' does not support 'tier2_threshold_rows'"
+            ));
+        }
+        if descriptor.supports(RuleConfigurationField::Tier1ThresholdRows)
+            && descriptor.supports(RuleConfigurationField::Tier2ThresholdRows)
+        {
+            let tier1 = config.rule_tier1_threshold(rule_id);
+            let tier2 = config.rule_tier2_threshold(rule_id);
+            if tier1 < tier2 {
+                return Err(format!(
+                    "Rule '{rule_id}' has tier1_threshold_rows ({tier1}) below tier2_threshold_rows ({tier2})"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn build_primary_rules() -> Vec<Box<dyn Rule>> {
     PRIMARY_RULES.iter().map(RuleDescriptor::build).collect()
 }
@@ -276,5 +381,86 @@ mod tests {
             assert_eq!(descriptor.default_tier(), rule.default_tier());
             assert_eq!(descriptor.recipe(), rule.recipe());
         }
+    }
+
+    #[test]
+    fn descriptors_advertise_only_configuration_the_rules_consume() {
+        let tier1_only: HashSet<_> = [
+            "irreversible-migration",
+            "size-aware-add-column",
+            "type-change-rewrite",
+        ]
+        .into_iter()
+        .collect();
+        let both_thresholds: HashSet<_> = [
+            "blocking-constraint",
+            "require-concurrent-index",
+            "blocking-mat-view-refresh",
+            "blocking-partition-mutation",
+        ]
+        .into_iter()
+        .collect();
+
+        for descriptor in PRIMARY_RULES {
+            assert!(descriptor.supports(RuleConfigurationField::Disabled));
+            assert_eq!(
+                descriptor.supports(RuleConfigurationField::Tier1ThresholdRows),
+                tier1_only.contains(descriptor.id) || both_thresholds.contains(descriptor.id),
+                "unexpected Tier 1 threshold metadata for {}",
+                descriptor.id
+            );
+            assert_eq!(
+                descriptor.supports(RuleConfigurationField::Tier2ThresholdRows),
+                both_thresholds.contains(descriptor.id),
+                "unexpected Tier 2 threshold metadata for {}",
+                descriptor.id
+            );
+        }
+    }
+
+    #[test]
+    fn threshold_validation_requires_tier1_at_or_above_tier2() {
+        let globally_reversed = crate::engine::config::Config {
+            tier1_threshold_rows: 9,
+            tier2_threshold_rows: 10,
+            ..crate::engine::config::Config::default()
+        };
+        assert!(
+            validate_rule_configuration(&globally_reversed)
+                .unwrap_err()
+                .contains("tier1_threshold_rows (9)")
+        );
+
+        let mut per_rule_reversed = crate::engine::config::Config::default();
+        per_rule_reversed.rules.insert(
+            "blocking-constraint".into(),
+            crate::engine::config::RuleConfig {
+                tier1_threshold_rows: Some(5),
+                tier2_threshold_rows: Some(6),
+                ..crate::engine::config::RuleConfig::default()
+            },
+        );
+        assert!(
+            validate_rule_configuration(&per_rule_reversed)
+                .unwrap_err()
+                .contains("Rule 'blocking-constraint'")
+        );
+    }
+
+    #[test]
+    fn unsupported_per_rule_thresholds_are_rejected() {
+        let mut config = crate::engine::config::Config::default();
+        config.rules.insert(
+            "require-lock-timeout".to_string(),
+            crate::engine::config::RuleConfig {
+                tier1_threshold_rows: Some(1),
+                ..crate::engine::config::RuleConfig::default()
+            },
+        );
+
+        assert_eq!(
+            validate_rule_configuration(&config).unwrap_err(),
+            "Rule 'require-lock-timeout' does not support 'tier1_threshold_rows'"
+        );
     }
 }

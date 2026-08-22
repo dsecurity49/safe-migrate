@@ -1,4 +1,3 @@
-// FILE: src/analysis/graph.rs
 use crate::ast::identifiers::ObjectId;
 use std::collections::HashSet;
 
@@ -65,7 +64,7 @@ impl DependencyGraph {
         Self::default()
     }
 
-    // Phase 3 FIX (BUG-004): Traverse rename chains dynamically for accurate topology reads
+    // Dependency lookups follow the current end of a rename chain.
     pub fn is_referenced_by_view(&self, id: &ObjectId) -> Vec<&ObjectId> {
         let target = self.resolve_rename(id);
         self.edges
@@ -142,7 +141,7 @@ impl DependencyGraph {
         }
     }
 
-    // Phase 3 FIX (BUG-012): Reject cycle topologies
+    // Partition ancestry must remain acyclic.
     pub fn check_partition_cycle(&self, parent: &ObjectId, child: &ObjectId) -> bool {
         let resolved_parent = self.resolve_rename(parent);
         let resolved_child = self.resolve_rename(child);

@@ -158,7 +158,7 @@
       "excluded_fixtures": [
         {
           "fixture": "003_drop_seq_cascade.sql",
-          "reason": "Sequence state is not yet hydrated or normalized by the differential harness."
+          "reason": "Cache V6 synchronizes sequences, but this rule does not compare sequence state."
         },
         {
           "fixture": "004_drop_domain_cascade.sql",
@@ -166,35 +166,35 @@
         },
         {
           "fixture": "005_drop_func_cascade.sql",
-          "reason": "Function existence is synchronized but not yet part of normalized differential state."
+          "reason": "Cache V6 synchronizes routine identity and kind, but this rule does not compare routine state."
         },
         {
           "fixture": "006_drop_proc_cascade.sql",
-          "reason": "Procedure existence is not yet part of normalized differential state."
+          "reason": "Cache V6 synchronizes routine identity and kind, but this rule does not compare routine state."
         },
         {
           "fixture": "007_drop_pub_cascade.sql",
-          "reason": "Publication state is not synchronized into the baseline cache."
+          "reason": "Cache V6 synchronizes publications, but the differential harness does not compare publication state."
         },
         {
           "fixture": "010_drop_seq_if_exists_cascade.sql",
-          "reason": "Sequence state is not yet hydrated or normalized by the differential harness."
+          "reason": "Cache V6 synchronizes sequences, but this rule does not compare sequence state."
         },
         {
           "fixture": "safe_003_drop_seq.sql",
-          "reason": "Sequence state is not yet hydrated or normalized by the differential harness."
+          "reason": "Cache V6 synchronizes sequences, but this rule does not compare sequence state."
         },
         {
           "fixture": "safe_004_drop_func.sql",
-          "reason": "Function existence is synchronized but not yet part of normalized differential state."
+          "reason": "Cache V6 synchronizes routine identity and kind, but this rule does not compare routine state."
         },
         {
           "fixture": "safe_005_drop_proc.sql",
-          "reason": "Procedure existence is not yet part of normalized differential state."
+          "reason": "Cache V6 synchronizes routine identity and kind, but this rule does not compare routine state."
         },
         {
           "fixture": "safe_006_drop_pub.sql",
-          "reason": "Publication state is not synchronized into the baseline cache."
+          "reason": "Cache V6 synchronizes publications, but the differential harness does not compare publication state."
         },
         {
           "fixture": "safe_007_drop_domain.sql",
@@ -709,7 +709,7 @@
         },
         {
           "fixture": "005_drop_sequence.sql",
-          "reason": "Sequence state is not yet hydrated or normalized by the differential harness."
+          "reason": "Cache V6 synchronizes sequences, but this rule does not compare sequence state."
         },
         {
           "fixture": "008_add_column.sql",
@@ -733,7 +733,7 @@
         },
         {
           "fixture": "013_create_sequence.sql",
-          "reason": "Sequence state is not yet hydrated or normalized by the differential harness."
+          "reason": "Cache V6 synchronizes sequences, but this rule does not compare sequence state."
         },
         {
           "fixture": "016_create_schema.sql",
@@ -753,7 +753,7 @@
         },
         {
           "fixture": "safe_005_drop_sequence_if_exists.sql",
-          "reason": "Sequence state is not yet hydrated or normalized by the differential harness."
+          "reason": "Cache V6 synchronizes sequences, but this rule does not compare sequence state."
         },
         {
           "fixture": "safe_008_add_column_if_not_exists.sql",
@@ -1330,7 +1330,7 @@
         },
         {
           "fixture": "safe_012_create_sequence.sql",
-          "reason": "Sequence state is not synchronized or normalized by the differential harness."
+          "reason": "Cache V6 synchronizes sequences, but this rule does not compare sequence state."
         }
       ],
       "schemas": [
@@ -1896,7 +1896,7 @@
           "min_pg_version_num": 160000
         }
       ],
-      "notes": "Compares valid multi-statement outcomes and expected PostgreSQL rejections. The real-world-inspired missing-FK-column case must agree on SQLSTATE 42703 and a chain-conflict finding."
+      "notes": "Compares valid multi-statement outcomes and expected PostgreSQL rejections. The sourced missing-FK-column case must agree on SQLSTATE 42703 and a chain-conflict finding."
     },
     {
       "rule_dir": "rule_19_concurrent-in-transaction",
@@ -2087,7 +2087,7 @@
         "safe_004_create_index.sql",
         "013_update.sql",
         "014_delete.sql",
-        "015_comment_on.sql"
+        "safe_015_comment_on.sql"
       ],
       "expected_live_errors": {
         "013_invalid_set_role_current_user.sql": {

@@ -550,21 +550,14 @@ mod transaction_lifecycle_tests {
                 },
             });
 
-        // Assert initial view dependency points to t1
         assert_eq!(state.local.graph.edges[0].referenced, t1_id);
 
-        // Run rename under transaction and rollback
         engine
             .analyze("BEGIN; ALTER TABLE t1 RENAME TO t2; ROLLBACK;", &mut state)
             .unwrap();
 
-        // Check that table name is restored to t1, and the view dependency is restored to t1
         assert!(state.relation_is_present(&t1_id));
         assert!(!state.relation_is_present(&object_id("public", "t2")));
         assert_eq!(state.local.graph.edges[0].referenced, t1_id);
     }
 }
-
-// ─────────────────────────────────────────────
-// 5. AST Expression Parsing Exhaustion
-// ─────────────────────────────────────────────

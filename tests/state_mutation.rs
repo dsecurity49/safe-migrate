@@ -7,7 +7,9 @@ mod state_mutation_tests {
     use safe_migrate::ast::identifiers::ObjectId;
     use safe_migrate::db::cache::{DbCache, DependencyCache};
     use safe_migrate::model::constraint::ConstraintKind;
-    use safe_migrate::model::function::{FunctionOverlay, FunctionState, SecurityMode, Volatility};
+    use safe_migrate::model::function::{
+        FunctionOverlay, FunctionState, RoutineKind, SecurityMode, Volatility,
+    };
     use safe_migrate::model::relation::{
         Persistence, RelationKind, RelationOverlay, RelationState,
     };
@@ -886,6 +888,7 @@ mod state_mutation_tests {
             function_id.clone(),
             FunctionState {
                 id: function_id.clone(),
+                routine_kind: safe_migrate::model::function::RoutineKind::Function,
                 arg_types: vec!["mood".into()],
                 arg_type_ids: Vec::new(),
                 return_type: "mood".into(),
@@ -1418,12 +1421,16 @@ mod state_mutation_tests {
         let mut state = setup_state();
 
         engine
-            .analyze("CREATE PUBLICATION pub FOR TABLE t1, t2;", &mut state)
+            .analyze(
+                "CREATE TABLE t1 (id integer);
+                 CREATE TABLE t2 (id integer);
+                 CREATE PUBLICATION pub FOR TABLE t1, t2;",
+                &mut state,
+            )
             .unwrap();
         assert!(state.local.publications.contains_key("pub"));
 
         let deps = &state.local.graph.edges;
-        assert_eq!(deps.len(), 2);
         assert!(
             deps.iter()
                 .any(|d| matches!(&d.kind, DependencyKind::PublicationIncludes { publication_name } if publication_name == "pub") && d.dependent == object_id("public", "t1"))
@@ -1465,7 +1472,7 @@ mod state_mutation_tests {
         if let Some(safe_migrate::model::role::RoleOverlay::Present(role)) =
             state.local.roles.get(&role_id)
         {
-            assert!(role.can_login);
+            assert!(!role.can_login);
         } else {
             panic!("role app_user should be present");
         }
@@ -1476,6 +1483,63 @@ mod state_mutation_tests {
             state.local.roles.get(&role_id),
             Some(safe_migrate::model::role::RoleOverlay::Dropped)
         ));
+    }
+
+    #[test]
+    fn create_user_and_role_login_options_are_distinct() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE USER web_user; CREATE ROLE worker LOGIN NOINHERIT; CREATE ROLE batch;",
+                &mut state,
+            )
+            .unwrap();
+
+        let Some(safe_migrate::model::role::RoleOverlay::Present(user)) =
+            state.local.roles.get(&ObjectId::new("", "web_user"))
+        else {
+            panic!("user missing");
+        };
+        assert!(user.can_login);
+
+        let Some(safe_migrate::model::role::RoleOverlay::Present(role)) =
+            state.local.roles.get(&ObjectId::new("", "worker"))
+        else {
+            panic!("role missing");
+        };
+        assert!(role.can_login);
+
+        let Some(safe_migrate::model::role::RoleOverlay::Present(batch)) =
+            state.local.roles.get(&ObjectId::new("", "batch"))
+        else {
+            panic!("plain role missing");
+        };
+        assert!(!batch.can_login);
+    }
+
+    #[test]
+    fn unquoted_role_and_replication_names_are_case_folded() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let violations = engine
+            .analyze(
+                "CREATE ROLE AppUser;
+                 CREATE ROLE appuser;
+                 CREATE PUBLICATION MixedPub FOR ALL TABLES;
+                 CREATE PUBLICATION mixedpub FOR ALL TABLES;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert_eq!(
+            violations
+                .iter()
+                .filter(|violation| violation.rule_id == "chain-conflict")
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -1749,12 +1813,209 @@ mod state_mutation_tests {
         let engine = setup_engine();
         let mut state = setup_state();
 
-        // Should not taint when dropping nonexistent function with IF EXISTS
         assert_eq!(state.local.confidence, Confidence::Exact);
         engine
             .analyze("DROP FUNCTION IF EXISTS missing_func();", &mut state)
             .unwrap();
         assert_eq!(state.local.confidence, Confidence::Exact);
+    }
+
+    #[test]
+    fn creating_a_new_function_is_exact_when_v6_proves_the_routine_name_is_free() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE FUNCTION work() RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert_eq!(state.local.confidence, Confidence::Exact);
+        assert!(matches!(
+            state.local.functions.get(&object_id("public", "work()")),
+            Some(FunctionOverlay::Present(function))
+                if function.routine_kind
+                    == RoutineKind::Function
+        ));
+    }
+
+    #[test]
+    fn cached_aggregate_and_window_routines_reserve_the_shared_namespace() {
+        let engine = setup_engine();
+
+        for routine_kind in [RoutineKind::Aggregate, RoutineKind::Window] {
+            let mut cache = DbCache::new();
+            let id = object_id("public", "work(integer)");
+            cache.functions.insert(
+                id.clone(),
+                FunctionState {
+                    id,
+                    routine_kind,
+                    arg_types: vec!["integer".into()],
+                    arg_type_ids: Vec::new(),
+                    return_type: "integer".into(),
+                    return_type_id: None,
+                    volatility: Volatility::Immutable,
+                    language: "internal".into(),
+                    security: SecurityMode::Invoker,
+                },
+            );
+            let mut state = safe_migrate::AnalysisState::new(cache);
+
+            for sql in [
+                "CREATE FUNCTION work(integer) RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$;",
+                "CREATE PROCEDURE work(integer) LANGUAGE sql AS $$ SELECT 1 $$;",
+            ] {
+                let violations = engine.analyze(sql, &mut state).unwrap();
+                assert!(violations.iter().any(|violation| {
+                    violation.rule_id == "chain-conflict"
+                        && violation.reason.contains("already exists")
+                }));
+                assert_eq!(state.local.confidence, Confidence::Exact);
+            }
+        }
+    }
+
+    #[test]
+    fn aggregate_and_window_lifecycles_use_the_shared_routine_state() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE AGGREGATE total(integer) (
+                    SFUNC = int4pl,
+                    STYPE = integer,
+                    INITCOND = '0'
+                );
+                ALTER AGGREGATE total(integer) RENAME TO combined;
+                DROP AGGREGATE combined(integer);",
+                &mut state,
+            )
+            .unwrap();
+        assert!(matches!(
+            state
+                .local
+                .functions
+                .get(&object_id("public", "combined(integer)")),
+            Some(FunctionOverlay::Dropped)
+        ));
+        assert_eq!(state.local.confidence, Confidence::Exact);
+
+        engine
+            .analyze(
+                "CREATE FUNCTION ranked() RETURNS bigint
+                   AS 'window_row_number' LANGUAGE internal WINDOW;
+                 ALTER FUNCTION ranked() IMMUTABLE;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(matches!(
+            state.local.functions.get(&object_id("public", "ranked()")),
+            Some(FunctionOverlay::Present(function))
+                if function.routine_kind == RoutineKind::Window
+                    && function.volatility == Volatility::Immutable
+        ));
+        engine
+            .analyze("DROP FUNCTION ranked();", &mut state)
+            .unwrap();
+        assert!(matches!(
+            state.local.functions.get(&object_id("public", "ranked()")),
+            Some(FunctionOverlay::Dropped)
+        ));
+    }
+
+    #[test]
+    fn replacing_a_routine_cannot_change_function_window_or_aggregate_kind() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE FUNCTION work(integer) RETURNS integer
+                   LANGUAGE sql AS $$ SELECT $1 $$;",
+                &mut state,
+            )
+            .unwrap();
+
+        let window_conflict = engine
+            .analyze(
+                "CREATE OR REPLACE FUNCTION work(integer) RETURNS integer
+                   LANGUAGE sql WINDOW AS $$ SELECT $1 $$;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(window_conflict.iter().any(|violation| {
+            violation.rule_id == "chain-conflict" && violation.reason.contains("already exists")
+        }));
+
+        let aggregate_conflict = engine
+            .analyze(
+                "CREATE OR REPLACE AGGREGATE work(integer) (
+                    SFUNC = int4pl,
+                    STYPE = integer
+                );",
+                &mut state,
+            )
+            .unwrap();
+        assert!(aggregate_conflict.iter().any(|violation| {
+            violation.rule_id == "chain-conflict" && violation.reason.contains("already exists")
+        }));
+    }
+
+    #[test]
+    fn cached_aggregate_and_window_routines_accept_their_postgresql_commands() {
+        let engine = setup_engine();
+        let mut cache = DbCache::new();
+        for (name, routine_kind) in [
+            ("total(integer)", RoutineKind::Aggregate),
+            ("ranked()", RoutineKind::Window),
+        ] {
+            let id = object_id("public", name);
+            cache.functions.insert(
+                id.clone(),
+                FunctionState {
+                    id,
+                    routine_kind,
+                    arg_types: if routine_kind == RoutineKind::Aggregate {
+                        vec!["integer".into()]
+                    } else {
+                        Vec::new()
+                    },
+                    arg_type_ids: Vec::new(),
+                    return_type: "integer".into(),
+                    return_type_id: None,
+                    volatility: Volatility::Volatile,
+                    language: "internal".into(),
+                    security: SecurityMode::Invoker,
+                },
+            );
+        }
+        let mut state = safe_migrate::AnalysisState::new(cache);
+
+        engine
+            .analyze(
+                "ALTER AGGREGATE total(integer) RENAME TO combined;
+                 ALTER FUNCTION ranked() IMMUTABLE;
+                 DROP AGGREGATE combined(integer);
+                 DROP FUNCTION ranked();",
+                &mut state,
+            )
+            .unwrap();
+
+        assert_eq!(state.local.confidence, Confidence::Exact);
+        assert!(matches!(
+            state
+                .local
+                .functions
+                .get(&object_id("public", "combined(integer)")),
+            Some(FunctionOverlay::Dropped)
+        ));
+        assert!(matches!(
+            state.local.functions.get(&object_id("public", "ranked()")),
+            Some(FunctionOverlay::Dropped)
+        ));
     }
 
     #[test]
@@ -1770,12 +2031,118 @@ mod state_mutation_tests {
     }
 
     #[test]
-    fn test_state_alter_publication_non_existent() {
+    fn guarded_routine_drop_still_rejects_the_wrong_routine_kind() {
+        let engine = setup_engine();
+        let routine_id = object_id("public", "work(integer)");
+
+        for (routine_kind, sql) in [
+            (
+                safe_migrate::model::function::RoutineKind::Function,
+                "DROP PROCEDURE IF EXISTS work(int);",
+            ),
+            (
+                safe_migrate::model::function::RoutineKind::Procedure,
+                "DROP FUNCTION IF EXISTS work(int);",
+            ),
+        ] {
+            let mut cache = safe_migrate::db::cache::DbCache::new();
+            cache.functions.insert(
+                routine_id.clone(),
+                FunctionState {
+                    id: routine_id.clone(),
+                    routine_kind,
+                    arg_types: vec!["integer".into()],
+                    arg_type_ids: Vec::new(),
+                    return_type: "void".into(),
+                    return_type_id: None,
+                    volatility: Volatility::Volatile,
+                    language: "sql".into(),
+                    security: SecurityMode::Invoker,
+                },
+            );
+            let mut state = safe_migrate::AnalysisState::new(cache);
+            let violations = engine.analyze(sql, &mut state).unwrap();
+
+            assert!(
+                violations
+                    .iter()
+                    .any(|violation| violation.rule_id == "chain-conflict"),
+                "{sql} should reject the wrong routine kind"
+            );
+        }
+    }
+
+    #[test]
+    fn procedure_kind_and_lifecycle_are_enforced_within_the_chain() {
         let engine = setup_engine();
         let mut state = setup_state();
 
-        // Create the publication first (it needs to exist before we alter it)
-        // Then alter with a non-existent one will taint
+        engine
+            .analyze(
+                "CREATE PROCEDURE work() LANGUAGE sql AS $$ SELECT 1 $$;",
+                &mut state,
+            )
+            .unwrap();
+        let id = object_id("public", "work()");
+        let Some(FunctionOverlay::Present(routine)) = state.local.functions.get(&id) else {
+            panic!("procedure missing");
+        };
+        assert_eq!(
+            routine.routine_kind,
+            safe_migrate::model::function::RoutineKind::Procedure
+        );
+
+        let wrong_kind = engine
+            .analyze("ALTER FUNCTION work() IMMUTABLE;", &mut state)
+            .unwrap();
+        assert!(
+            wrong_kind
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict")
+        );
+
+        engine
+            .analyze("DROP PROCEDURE work();", &mut state)
+            .unwrap();
+        let after_drop = engine
+            .analyze("ALTER PROCEDURE work() RENAME TO renamed_work;", &mut state)
+            .unwrap();
+        assert!(
+            after_drop
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict")
+        );
+    }
+
+    #[test]
+    fn publication_and_subscription_duplicates_conflict() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let violations = engine
+            .analyze(
+                "CREATE PUBLICATION p FOR ALL TABLES;
+                 CREATE PUBLICATION p FOR ALL TABLES;
+                 CREATE SUBSCRIPTION s CONNECTION 'host=localhost' PUBLICATION p;
+                 CREATE SUBSCRIPTION s CONNECTION 'host=localhost' PUBLICATION p;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert_eq!(
+            violations
+                .iter()
+                .filter(|violation| violation.rule_id == "chain-conflict")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn exact_v6_baseline_rejects_an_alter_of_a_missing_publication() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
         engine
             .analyze(
                 "CREATE PUBLICATION existing_pub FOR ALL TABLES;",
@@ -1784,13 +2151,448 @@ mod state_mutation_tests {
             .unwrap();
         assert!(state.local.publications.contains_key("existing_pub"));
 
-        // Alter a non-existent publication should taint
-        // We catch this via the engine's resolve path which returns Opaque
-        // This is already tested in the resolver - here we verify confidence
-        engine
+        let violations = engine
             .analyze("ALTER PUBLICATION missing_pub SET TABLE t;", &mut state)
             .unwrap();
+        assert!(violations.iter().any(|violation| {
+            violation.rule_id == "chain-conflict"
+                && violation.reason.contains("missing_pub")
+                && violation.reason.contains("does not exist")
+        }));
+        assert_eq!(state.local.confidence, Confidence::Exact);
+    }
+
+    #[test]
+    fn publication_targets_use_cache_scope_for_conflicts_and_unknowns() {
+        let engine = setup_engine();
+        let mut exact_state = setup_state();
+        let violations = engine
+            .analyze(
+                "CREATE PUBLICATION invalid_pub FOR TABLE missing_table;",
+                &mut exact_state,
+            )
+            .unwrap();
+        assert!(violations.iter().any(|violation| {
+            violation.rule_id == "chain-conflict"
+                && violation.reason.contains("missing_table")
+                && violation.reason.contains("does not exist")
+        }));
+        assert_eq!(exact_state.local.confidence, Confidence::Exact);
+
+        let mut scoped_cache = DbCache::new();
+        scoped_cache.metadata.schemas = Some(vec!["public".into()]);
+        let mut scoped_state = safe_migrate::AnalysisState::new(scoped_cache);
+        let violations = engine
+            .analyze(
+                "CREATE PUBLICATION external_pub FOR TABLE tenant.entries;",
+                &mut scoped_state,
+            )
+            .unwrap();
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict")
+        );
+        assert_eq!(scoped_state.local.confidence, Confidence::Tainted);
+        assert!(matches!(
+            scoped_state.local.publications.get("external_pub"),
+            Some(safe_migrate::model::replication::PublicationOverlay::Present(_))
+        ));
+    }
+
+    #[test]
+    fn cached_publication_and_subscription_actions_update_exact_state() {
+        let engine = setup_engine();
+        let mut cache = cache_with_table("public", "first", None);
+        let second = object_id("public", "second");
+        cache.insert_baseline(
+            second.clone(),
+            RelationState::new(
+                second,
+                object_id("", "postgres"),
+                0,
+                None,
+                RelationKind::Table,
+                Persistence::Permanent,
+                0,
+            ),
+        );
+        cache.publications.insert(
+            "changes".into(),
+            safe_migrate::model::replication::PublicationState {
+                name: "changes".into(),
+                owner: Some("postgres".into()),
+                scope: safe_migrate::analysis::facts::PublicationScope::Explicit(vec![
+                    safe_migrate::analysis::facts::PublicationObjectFact::Table {
+                        name: safe_migrate::ast::identifiers::QualifiedName::new(
+                            Some(safe_migrate::ast::identifiers::Ident::new("public", true)),
+                            safe_migrate::ast::identifiers::Ident::new("first", true),
+                        ),
+                        only: true,
+                        include_partitions: false,
+                        columns: None,
+                        row_filter: None,
+                    },
+                ]),
+                params: Vec::new(),
+                generation: 0,
+            },
+        );
+        cache.subscriptions.insert(
+            "subscriber".into(),
+            safe_migrate::model::replication::SubscriptionState {
+                name: "subscriber".into(),
+                owner: Some("postgres".into()),
+                connection: safe_migrate::analysis::facts::ConnectionTarget::Redacted,
+                publications: vec!["changes".into()],
+                params: Some(Vec::new()),
+                enabled: false,
+                slot_name: None,
+                generation: 0,
+            },
+        );
+        let mut state = safe_migrate::AnalysisState::new(cache);
+
+        let violations = engine
+            .analyze(
+                "ALTER PUBLICATION changes ADD TABLE ONLY second;
+                 ALTER PUBLICATION changes RENAME TO renamed_changes;
+                 ALTER SUBSCRIPTION subscriber SET PUBLICATION renamed_changes WITH (refresh = false);
+                 ALTER SUBSCRIPTION subscriber SET (streaming = parallel);
+                 ALTER SUBSCRIPTION subscriber RENAME TO renamed_subscriber;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict")
+        );
+        assert_eq!(state.local.confidence, Confidence::Exact);
+        let Some(safe_migrate::model::replication::PublicationOverlay::Present(publication)) =
+            state.local.publications.get("renamed_changes")
+        else {
+            panic!("renamed publication missing");
+        };
+        let safe_migrate::analysis::facts::PublicationScope::Explicit(objects) = &publication.scope
+        else {
+            panic!("expected explicit publication scope");
+        };
+        assert_eq!(objects.len(), 2);
+        assert!(state.local.graph.edges.iter().any(|edge| {
+            matches!(
+                &edge.kind,
+                DependencyKind::PublicationIncludes { publication_name }
+                    if publication_name == "renamed_changes"
+            ) && edge.dependent == object_id("public", "second")
+        }));
+
+        let Some(safe_migrate::model::replication::SubscriptionOverlay::Present(subscription)) =
+            state.local.subscriptions.get("renamed_subscriber")
+        else {
+            panic!("renamed subscription missing");
+        };
+        assert_eq!(subscription.publications, ["renamed_changes"]);
+        assert!(subscription.params.as_ref().is_some_and(|params| {
+            params
+                .iter()
+                .any(|param| param.name == "streaming" && param.value == "parallel")
+        }));
+
+        engine.analyze("DROP TABLE second;", &mut state).unwrap();
+        let Some(safe_migrate::model::replication::PublicationOverlay::Present(publication)) =
+            state.local.publications.get("renamed_changes")
+        else {
+            panic!("publication missing after table drop");
+        };
+        let safe_migrate::analysis::facts::PublicationScope::Explicit(objects) = &publication.scope
+        else {
+            panic!("expected explicit publication scope");
+        };
+        assert_eq!(objects.len(), 1);
+    }
+
+    #[test]
+    fn subscription_publication_conflicts_do_not_partially_mutate_direct_state() {
+        let mut cache = DbCache::new();
+        cache.subscriptions.insert(
+            "subscriber".into(),
+            safe_migrate::model::replication::SubscriptionState {
+                name: "subscriber".into(),
+                owner: Some("postgres".into()),
+                connection: safe_migrate::analysis::facts::ConnectionTarget::Redacted,
+                publications: vec!["existing".into()],
+                params: Some(Vec::new()),
+                enabled: false,
+                slot_name: None,
+                generation: 0,
+            },
+        );
+        let mut state = safe_migrate::AnalysisState::new(cache);
+        let initial_generation = state.local.generation_counter;
+
+        for (mode, publications) in [
+            (
+                safe_migrate::analysis::facts::SubscriptionPublicationMode::Add,
+                vec!["new".to_string(), "existing".to_string()],
+            ),
+            (
+                safe_migrate::analysis::facts::SubscriptionPublicationMode::Drop,
+                vec!["existing".to_string(), "missing".to_string()],
+            ),
+        ] {
+            let mutation = safe_migrate::analysis::mutations::Mutation::AlterSubscription(
+                safe_migrate::analysis::mutations::AlterSubscriptionMutation {
+                    name: "subscriber".into(),
+                    action:
+                        safe_migrate::analysis::facts::AlterSubscriptionActionFact::Publications {
+                            mode,
+                            publications,
+                            params: Vec::new(),
+                        },
+                },
+            );
+            assert!(matches!(
+                state.apply(&mutation, None),
+                safe_migrate::analysis::state::MutationResult::Conflict { .. }
+            ));
+            let Some(safe_migrate::model::replication::SubscriptionOverlay::Present(subscription)) =
+                state.local.subscriptions.get("subscriber")
+            else {
+                panic!("subscription missing");
+            };
+            assert_eq!(subscription.publications, ["existing"]);
+            assert_eq!(subscription.generation, 0);
+            assert_eq!(state.local.generation_counter, initial_generation);
+        }
+    }
+
+    #[test]
+    fn table_drop_resolves_unqualified_publication_membership_through_search_path() {
+        let engine = setup_engine();
+        let mut cache = cache_with_table("tenant", "entries", None);
+        cache.search_path = vec!["tenant".into()];
+        cache.publications.insert(
+            "changes".into(),
+            safe_migrate::model::replication::PublicationState {
+                name: "changes".into(),
+                owner: Some("postgres".into()),
+                scope: safe_migrate::analysis::facts::PublicationScope::Explicit(vec![
+                    safe_migrate::analysis::facts::PublicationObjectFact::Table {
+                        name: safe_migrate::ast::identifiers::QualifiedName::new(
+                            None,
+                            safe_migrate::ast::identifiers::Ident::new("entries", true),
+                        ),
+                        only: true,
+                        include_partitions: false,
+                        columns: None,
+                        row_filter: None,
+                    },
+                ]),
+                params: Vec::new(),
+                generation: 0,
+            },
+        );
+        let mut state = safe_migrate::AnalysisState::new(cache);
+
+        engine.analyze("DROP TABLE entries;", &mut state).unwrap();
+
+        let Some(safe_migrate::model::replication::PublicationOverlay::Present(publication)) =
+            state.local.publications.get("changes")
+        else {
+            panic!("publication missing");
+        };
+        assert!(matches!(
+            &publication.scope,
+            safe_migrate::analysis::facts::PublicationScope::Explicit(objects)
+                if objects.is_empty()
+        ));
+    }
+
+    #[test]
+    fn cached_publication_parent_edits_are_tainted_without_inheritance_catalogs() {
+        let engine = setup_engine();
+        let mut cache = cache_with_table("public", "parent", None);
+        cache.publications.insert(
+            "changes".into(),
+            safe_migrate::model::replication::PublicationState {
+                name: "changes".into(),
+                owner: Some("postgres".into()),
+                scope: safe_migrate::analysis::facts::PublicationScope::Explicit(vec![
+                    safe_migrate::analysis::facts::PublicationObjectFact::Table {
+                        name: safe_migrate::ast::identifiers::QualifiedName::new(
+                            Some(safe_migrate::ast::identifiers::Ident::new("public", true)),
+                            safe_migrate::ast::identifiers::Ident::new("parent", true),
+                        ),
+                        only: true,
+                        include_partitions: false,
+                        columns: None,
+                        row_filter: None,
+                    },
+                ]),
+                params: Vec::new(),
+                generation: 0,
+            },
+        );
+
+        let mut inherited_state = safe_migrate::AnalysisState::new(cache.clone());
+        engine
+            .analyze(
+                "ALTER PUBLICATION changes DROP TABLE parent;",
+                &mut inherited_state,
+            )
+            .unwrap();
+        assert_eq!(inherited_state.local.confidence, Confidence::Tainted);
+
+        let mut only_state = safe_migrate::AnalysisState::new(cache);
+        engine
+            .analyze(
+                "ALTER PUBLICATION changes DROP TABLE ONLY parent;",
+                &mut only_state,
+            )
+            .unwrap();
+        assert_eq!(only_state.local.confidence, Confidence::Exact);
+    }
+
+    #[test]
+    fn subscription_publisher_operations_taint_and_slot_drops_obey_transaction_rules() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let create_violations = engine
+            .analyze(
+                "CREATE SUBSCRIPTION deferred CONNECTION 'host=publisher.invalid' PUBLICATION changes WITH (connect = false);",
+                &mut state,
+            )
+            .unwrap();
+        let Some(safe_migrate::model::replication::SubscriptionOverlay::Present(subscription)) =
+            state.local.subscriptions.get("deferred")
+        else {
+            panic!(
+                "deferred subscription missing: keys={:?} violations={create_violations:?}",
+                state.local.subscriptions.keys().collect::<Vec<_>>()
+            );
+        };
+        assert!(!subscription.enabled);
+        assert_eq!(subscription.slot_name.as_deref(), Some("deferred"));
+        assert_eq!(state.local.confidence, Confidence::Exact);
+
+        let violations = engine
+            .analyze("BEGIN; DROP SUBSCRIPTION deferred; ROLLBACK;", &mut state)
+            .unwrap();
+        assert!(violations.iter().any(|violation| {
+            violation.rule_id == "chain-conflict"
+                && violation
+                    .reason
+                    .contains("cannot be dropped inside a transaction")
+        }));
+        assert!(matches!(
+            state.local.subscriptions.get("deferred"),
+            Some(safe_migrate::model::replication::SubscriptionOverlay::Present(_))
+        ));
+
+        engine
+            .analyze(
+                "ALTER SUBSCRIPTION deferred SET (slot_name = NONE);
+                 DROP SUBSCRIPTION deferred;",
+                &mut state,
+            )
+            .unwrap();
         assert_eq!(state.local.confidence, Confidence::Tainted);
+        assert!(matches!(
+            state.local.subscriptions.get("deferred"),
+            Some(safe_migrate::model::replication::SubscriptionOverlay::Dropped)
+        ));
+    }
+
+    #[test]
+    fn subscription_options_enforce_postgresql_slot_and_publication_invariants() {
+        let engine = setup_engine();
+
+        for sql in [
+            "CREATE SUBSCRIPTION invalid CONNECTION 'host=publisher.invalid' PUBLICATION p WITH (connect=false, enabled=true);",
+            "CREATE SUBSCRIPTION invalid CONNECTION 'host=publisher.invalid' PUBLICATION p WITH (slot_name=NONE);",
+            "CREATE SUBSCRIPTION invalid CONNECTION 'host=publisher.invalid' PUBLICATION p, p WITH (connect=false);",
+            "CREATE SUBSCRIPTION invalid CONNECTION 'host=publisher.invalid' PUBLICATION p WITH (connect=maybe);",
+            "CREATE SUBSCRIPTION invalid CONNECTION 'host=publisher.invalid' PUBLICATION p WITH (connect=o);",
+        ] {
+            let mut state = setup_state();
+            let violations = engine.analyze(sql, &mut state).unwrap();
+            assert!(
+                violations
+                    .iter()
+                    .any(|violation| violation.rule_id == "chain-conflict"),
+                "{sql}"
+            );
+            assert_eq!(state.local.confidence, Confidence::Exact, "{sql}");
+            assert!(!matches!(
+                state.local.subscriptions.get("invalid"),
+                Some(safe_migrate::model::replication::SubscriptionOverlay::Present(_))
+            ));
+        }
+
+        let mut boolean_state = setup_state();
+        let violations = engine
+            .analyze(
+                "CREATE SUBSCRIPTION boolean_options
+                   CONNECTION 'host=publisher.invalid'
+                   PUBLICATION p
+                   WITH (connect=of, enabled=fals, create_slot=fa, copy_data=f, binary=tru, slot_name=NONE);
+                 BEGIN;
+                 ALTER SUBSCRIPTION boolean_options SET PUBLICATION p2 WITH (refresh=of);
+                 ROLLBACK;",
+                &mut boolean_state,
+            )
+            .unwrap();
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict")
+        );
+        assert_eq!(boolean_state.local.confidence, Confidence::Exact);
+        assert!(matches!(
+            boolean_state.local.subscriptions.get("boolean_options"),
+            Some(safe_migrate::model::replication::SubscriptionOverlay::Present(
+                subscription
+            )) if !subscription.enabled && subscription.slot_name.is_none()
+        ));
+
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE SUBSCRIPTION slotless CONNECTION 'host=publisher.invalid' PUBLICATION p WITH (connect=false, slot_name=NONE);",
+                &mut state,
+            )
+            .unwrap();
+        let violations = engine
+            .analyze("ALTER SUBSCRIPTION slotless ENABLE;", &mut state)
+            .unwrap();
+        assert!(violations.iter().any(|violation| {
+            violation.rule_id == "chain-conflict"
+                && violation.reason.contains("without a slot_name")
+        }));
+        assert_eq!(state.local.confidence, Confidence::Exact);
+
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE SUBSCRIPTION enabled_sub CONNECTION 'host=publisher.invalid' PUBLICATION p WITH (create_slot=false);",
+                &mut state,
+            )
+            .unwrap();
+        let violations = engine
+            .analyze(
+                "ALTER SUBSCRIPTION enabled_sub SET (slot_name=NONE);",
+                &mut state,
+            )
+            .unwrap();
+        assert!(violations.iter().any(|violation| {
+            violation.rule_id == "chain-conflict"
+                && violation
+                    .reason
+                    .contains("disabled before changing slot_name")
+        }));
     }
 
     #[test]
@@ -2018,6 +2820,7 @@ mod state_mutation_tests {
             function_id.clone(),
             FunctionState {
                 id: function_id.clone(),
+                routine_kind: safe_migrate::model::function::RoutineKind::Function,
                 arg_types: vec!["integer[]".to_string()],
                 arg_type_ids: vec![None],
                 return_type: "integer".to_string(),
@@ -2775,7 +3578,3 @@ mod state_mutation_tests {
         assert_eq!(state.local.current_role, "member");
     }
 }
-
-// ─────────────────────────────────────────────
-// 4. Transaction Lifecycle Rollback Exhaustion
-// ─────────────────────────────────────────────

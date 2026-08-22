@@ -85,7 +85,7 @@ impl Rule for BrokenComputeRule {
         ViolationTier::Tier1
     }
     fn recipe(&self) -> &'static str {
-        "Dropping a function used by a trigger will cause the trigger to fail at runtime."
+        "Drop or replace the dependent triggers first. Use CASCADE only after reviewing every dependent object."
     }
 
     fn evaluate(
@@ -97,12 +97,13 @@ impl Rule for BrokenComputeRule {
         _config: &Config,
         _cascade_closure: Option<&CascadeResult>,
     ) -> Vec<Violation> {
-        if *result == MutationResult::Skipped {
+        if !matches!(result, MutationResult::Conflict { .. }) {
             return vec![];
         }
-        if let Mutation::DropFunction(drop) = mutation {
+        if let Mutation::DropFunction(drop) = mutation
+            && !drop.cascade
+        {
             for sig in &drop.signatures {
-                // Construct ID in same way as during creation
                 let sig_str = format!("{}({})", sig.name.name.resolve(), sig.params.join(","));
                 let schema = state.resolve_function_schema(&sig.name, &sig_str);
                 let function_id = crate::ast::identifiers::ObjectId::new(schema, sig_str);
@@ -123,7 +124,7 @@ impl Rule for BrokenComputeRule {
                         object_name: function_id.to_string(),
                         tier: self.default_tier(),
                         reason: format!(
-                            "Broken Compute: Dropping Function Used by Trigger: {}",
+                            "PostgreSQL rejects this function drop because it is used by {}",
                             triggers_info.join(", ")
                         ),
                         recipe: self.recipe(),

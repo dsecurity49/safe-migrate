@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use safe_migrate::analysis::state::Confidence;
-use safe_migrate::db::cache::{CACHE_V5_MAGIC, CacheMetadata, DbCacheVersioned};
+use safe_migrate::db::cache::{CACHE_V6_MAGIC, CacheMetadata, DbCacheVersioned};
 use safe_migrate::db::cache_file::{
     MAX_CACHE_DECODE_BYTES, is_encrypted_cache_bytes, read_cache_bytes, unprotect_cache_bytes,
 };
@@ -21,7 +21,7 @@ const EXIT_BLOCKING_FINDINGS: i32 = 2;
 #[command(name = "safe-migrate")]
 #[command(version)]
 #[command(
-    about = "Analyze PostgreSQL migrations for schema and locking risks",
+    about = "Sync PostgreSQL metadata, then lint migrations offline",
     long_about = None
 )]
 struct Cli {
@@ -40,8 +40,9 @@ enum Commands {
         #[arg(short, long)]
         file: PathBuf,
 
-        #[arg(long, default_value = "safe-migrate.toml")]
-        config: PathBuf,
+        /// Read configuration from this file; otherwise use safe-migrate.toml when present
+        #[arg(long)]
+        config: Option<PathBuf>,
 
         #[arg(long, default_value = ".safe-migrate.cache")]
         cache: PathBuf,
@@ -49,6 +50,10 @@ enum Commands {
         /// Bypass the local cache file and evaluate with default worst-case assumptions
         #[arg(long)]
         no_cache: bool,
+
+        /// Skip automatic synchronization configured in TOML for this run
+        #[arg(long)]
+        no_auto_sync: bool,
 
         /// Output results in JSON format for CI/CD integration
         #[arg(long, conflicts_with_all = ["interactive", "markdown"])]
@@ -67,8 +72,9 @@ enum Commands {
         #[arg(short, long)]
         dir: PathBuf,
 
-        #[arg(long, default_value = "safe-migrate.toml")]
-        config: PathBuf,
+        /// Read configuration from this file; otherwise use safe-migrate.toml when present
+        #[arg(long)]
+        config: Option<PathBuf>,
 
         #[arg(long, default_value = ".safe-migrate.cache")]
         cache: PathBuf,
@@ -76,6 +82,10 @@ enum Commands {
         /// Bypass the local cache file and evaluate with default worst-case assumptions
         #[arg(long)]
         no_cache: bool,
+
+        /// Skip automatic synchronization configured in TOML for this run
+        #[arg(long)]
+        no_auto_sync: bool,
 
         /// Output results in JSON format for CI/CD integration
         #[arg(long, conflicts_with_all = ["interactive", "markdown"])]
@@ -93,8 +103,9 @@ enum Commands {
     Sync {
         #[arg(long, default_value = ".safe-migrate.cache")]
         out: PathBuf,
-        #[arg(long, default_value = "safe-migrate.toml")]
-        config: PathBuf,
+        /// Read configuration from this file; otherwise use safe-migrate.toml when present
+        #[arg(long)]
+        config: Option<PathBuf>,
         /// Filter sync to specific schemas (comma-separated, e.g., --schemas public,auth)
         #[arg(long, value_delimiter = ',')]
         schemas: Option<Vec<String>>,
@@ -112,9 +123,9 @@ enum Commands {
         /// Output the rule catalog as JSON
         #[arg(long)]
         json: bool,
-        /// Read effective rule settings from this configuration file
-        #[arg(long, default_value = "safe-migrate.toml")]
-        config: PathBuf,
+        /// Read configuration from this file; otherwise use safe-migrate.toml when present
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
 }
 
@@ -124,8 +135,9 @@ enum CacheCommands {
     Inspect {
         #[arg(long, default_value = ".safe-migrate.cache")]
         cache: PathBuf,
-        #[arg(long, default_value = "safe-migrate.toml")]
-        config: PathBuf,
+        /// Read configuration from this file; otherwise use safe-migrate.toml when present
+        #[arg(long)]
+        config: Option<PathBuf>,
         /// Output the redacted summary as JSON
         #[arg(long)]
         json: bool,
@@ -178,7 +190,14 @@ struct CacheInspection {
     schemas: Option<Vec<String>>,
     search_path: Vec<String>,
     postgresql_version_num: Option<u32>,
+    observed_settings: ObservedSettings,
     contents: CacheContentsSummary,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct ObservedSettings {
+    lock_timeout_ms: Option<u64>,
+    statement_timeout_ms: Option<u64>,
 }
 
 #[derive(serde::Serialize)]
@@ -195,6 +214,11 @@ struct CacheContentsSummary {
     constraints: usize,
     triggers: usize,
     functions: usize,
+    procedures: usize,
+    aggregates: usize,
+    window_functions: usize,
+    publications: usize,
+    subscriptions: usize,
     types: usize,
     roles: usize,
     dependencies: usize,
@@ -228,14 +252,16 @@ fn main() -> Result<()> {
             config,
             cache,
             no_cache,
+            no_auto_sync,
             json,
             markdown,
             interactive,
         } => run_lint(
             &file,
-            &config,
+            config.as_deref(),
             &cache,
             no_cache,
+            no_auto_sync,
             OutputMode::from_flags(json, markdown, interactive),
         ),
         Commands::LintChain {
@@ -243,33 +269,50 @@ fn main() -> Result<()> {
             config,
             cache,
             no_cache,
+            no_auto_sync,
             json,
             markdown,
             interactive,
         } => run_lint_chain(
             &dir,
-            &config,
+            config.as_deref(),
             &cache,
             no_cache,
+            no_auto_sync,
             OutputMode::from_flags(json, markdown, interactive),
         ),
         Commands::Sync {
             out,
             config,
             schemas,
-        } => run_sync(&out, &config, schemas.as_deref()),
+        } => run_sync(&out, config.as_deref(), schemas.as_deref()),
         Commands::Cache { command } => match command {
             CacheCommands::Inspect {
                 cache,
                 config,
                 json,
-            } => run_cache_inspect(&cache, &config, json),
+            } => run_cache_inspect(&cache, config.as_deref(), json),
         },
-        Commands::Rules { rule, json, config } => run_rules(rule.as_deref(), json, &config),
+        Commands::Rules { rule, json, config } => {
+            run_rules(rule.as_deref(), json, config.as_deref())
+        }
     }
 }
 
 fn rule_descriptor_json(descriptor: &RuleDescriptor, config: &Config) -> serde_json::Value {
+    use safe_migrate::rules::registry::RuleConfigurationField;
+
+    let mut effective = serde_json::json!({
+        "enabled": !config.is_rule_disabled(descriptor.id),
+    });
+    if descriptor.supports(RuleConfigurationField::Tier1ThresholdRows) {
+        effective["tier1_threshold_rows"] =
+            serde_json::json!(config.rule_tier1_threshold(descriptor.id));
+    }
+    if descriptor.supports(RuleConfigurationField::Tier2ThresholdRows) {
+        effective["tier2_threshold_rows"] =
+            serde_json::json!(config.rule_tier2_threshold(descriptor.id));
+    }
     serde_json::json!({
         "id": descriptor.id,
         "title": descriptor.title,
@@ -281,12 +324,12 @@ fn rule_descriptor_json(descriptor: &RuleDescriptor, config: &Config) -> serde_j
             safe_migrate::report::violations::ViolationTier::Tier3 => "Tier3",
         },
         "remediation": descriptor.recipe(),
-        "supported_configuration_fields": ["disabled", "tier1_threshold_rows", "tier2_threshold_rows"],
-        "effective": {
-            "enabled": !config.is_rule_disabled(descriptor.id),
-            "tier1_threshold_rows": config.rule_tier1_threshold(descriptor.id),
-            "tier2_threshold_rows": config.rule_tier2_threshold(descriptor.id),
-        },
+        "supported_configuration_fields": descriptor
+            .supported_configuration_fields
+            .iter()
+            .map(|field| field.as_str())
+            .collect::<Vec<_>>(),
+        "effective": effective,
     })
 }
 
@@ -298,7 +341,7 @@ fn rules_separator() -> String {
     "-".repeat((width as f32 * 0.82) as usize)
 }
 
-fn run_rules(rule_id: Option<&str>, json: bool, config_path: &Path) -> Result<()> {
+fn run_rules(rule_id: Option<&str>, json: bool, config_path: Option<&Path>) -> Result<()> {
     let config = load_config(config_path)?;
     let descriptors: Vec<_> = match rule_id {
         Some(id) => vec![registry::find_primary_rule(id).ok_or_else(|| {
@@ -315,7 +358,7 @@ fn run_rules(rule_id: Option<&str>, json: bool, config_path: &Path) -> Result<()
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
-                "schema_version": 1,
+                "schema_version": 2,
                 "rules": descriptors.iter().map(|descriptor| rule_descriptor_json(descriptor, &config)).collect::<Vec<_>>(),
             }))?
         );
@@ -333,22 +376,43 @@ fn run_rules(rule_id: Option<&str>, json: bool, config_path: &Path) -> Result<()
         println!("  Impact: {}", descriptor.impact);
         println!("  Default tier: {:?}", descriptor.default_tier());
         println!("  Remediation: {}", descriptor.recipe());
-        println!("  Configuration: disabled, tier1_threshold_rows, tier2_threshold_rows");
         println!(
-            "  Effective: enabled={}, tier1_threshold_rows={}, tier2_threshold_rows={}",
-            !config.is_rule_disabled(descriptor.id),
-            config.rule_tier1_threshold(descriptor.id),
-            config.rule_tier2_threshold(descriptor.id)
+            "  Configuration: {}",
+            descriptor
+                .supported_configuration_fields
+                .iter()
+                .map(|field| field.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         );
+        let mut effective = vec![format!(
+            "enabled={}",
+            !config.is_rule_disabled(descriptor.id)
+        )];
+        use safe_migrate::rules::registry::RuleConfigurationField;
+        if descriptor.supports(RuleConfigurationField::Tier1ThresholdRows) {
+            effective.push(format!(
+                "tier1_threshold_rows={}",
+                config.rule_tier1_threshold(descriptor.id)
+            ));
+        }
+        if descriptor.supports(RuleConfigurationField::Tier2ThresholdRows) {
+            effective.push(format!(
+                "tier2_threshold_rows={}",
+                config.rule_tier2_threshold(descriptor.id)
+            ));
+        }
+        println!("  Effective: {}", effective.join(", "));
     }
     Ok(())
 }
 
 fn run_lint(
     file: &Path,
-    config_path: &Path,
+    config_path: Option<&Path>,
     cache: &Path,
     no_cache: bool,
+    no_auto_sync: bool,
     output_mode: OutputMode,
 ) -> Result<()> {
     let sql = fs::read_to_string(file)
@@ -360,7 +424,7 @@ fn run_lint(
         baseline_stale,
         auto_sync,
         metadata,
-    } = prepare_cache(&config, cache, no_cache)?;
+    } = prepare_cache(&config, cache, no_cache, no_auto_sync)?;
 
     eprintln!("Analyzing migration: {}", file.display());
 
@@ -383,22 +447,31 @@ fn run_lint(
 
 fn run_lint_chain(
     dir: &Path,
-    config_path: &Path,
+    config_path: Option<&Path>,
     cache: &Path,
     no_cache: bool,
+    no_auto_sync: bool,
     output_mode: OutputMode,
 ) -> Result<()> {
-    let mut files: Vec<_> = fs::read_dir(dir)
-        .with_context(|| format!("Failed to read directory: {}", dir.display()))?
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| {
-            entry
-                .path()
-                .extension()
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("sql"))
-        })
-        .collect();
+    let mut files = Vec::new();
+    for entry in
+        fs::read_dir(dir).with_context(|| format!("Failed to read directory: {}", dir.display()))?
+    {
+        let entry = entry
+            .with_context(|| format!("Failed to read an entry in directory: {}", dir.display()))?;
+        if entry
+            .path()
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("sql"))
+        {
+            files.push(entry);
+        }
+    }
     files.sort_by_key(|entry| entry.file_name());
+
+    if files.is_empty() {
+        anyhow::bail!("No .sql migration files found in {}", dir.display());
+    }
 
     let mut migrations = Vec::new();
     for entry in files {
@@ -416,7 +489,7 @@ fn run_lint_chain(
         baseline_stale,
         auto_sync,
         metadata,
-    } = prepare_cache(&config, cache, no_cache)?;
+    } = prepare_cache(&config, cache, no_cache, no_auto_sync)?;
 
     eprintln!("Analyzing migration chain in: {}", dir.display());
 
@@ -437,9 +510,7 @@ fn run_lint_chain(
     )
 }
 
-fn run_sync(out: &Path, config_path: &Path, schemas: Option<&[String]>) -> Result<()> {
-    std::env::var("DATABASE_URL")
-        .context("DATABASE_URL environment variable must be set to run sync.")?;
+fn run_sync(out: &Path, config_path: Option<&Path>, schemas: Option<&[String]>) -> Result<()> {
     let config = load_config(config_path)?;
     let schemas = config.sync_schemas(schemas)?;
 
@@ -452,7 +523,7 @@ fn run_sync(out: &Path, config_path: &Path, schemas: Option<&[String]>) -> Resul
     Ok(())
 }
 
-fn run_cache_inspect(cache_path: &Path, config_path: &Path, json: bool) -> Result<()> {
+fn run_cache_inspect(cache_path: &Path, config_path: Option<&Path>, json: bool) -> Result<()> {
     let config = load_config(config_path)?;
     let (cache, format_version, encrypted) = decode_cache(cache_path, config.cache_encryption)?;
     let now = SystemTime::now()
@@ -472,6 +543,10 @@ fn run_cache_inspect(cache_path: &Path, config_path: &Path, json: bool) -> Resul
         schemas: cache.metadata.schemas.clone(),
         search_path: cache.search_path.clone(),
         postgresql_version_num: cache.pg_version_num,
+        observed_settings: ObservedSettings {
+            lock_timeout_ms: Some(cache.metadata.source_lock_timeout_ms),
+            statement_timeout_ms: Some(cache.metadata.source_statement_timeout_ms),
+        },
         contents: summarize_cache(&cache),
     };
 
@@ -496,6 +571,18 @@ fn summarize_cache(cache: &DbCache) -> CacheContentsSummary {
             RelationKind::MaterializedView => materialized_views += 1,
         }
     }
+    let mut functions = 0;
+    let mut procedures = 0;
+    let mut aggregates = 0;
+    let mut window_functions = 0;
+    for routine in cache.functions.values() {
+        match routine.routine_kind {
+            safe_migrate::model::function::RoutineKind::Function => functions += 1,
+            safe_migrate::model::function::RoutineKind::Procedure => procedures += 1,
+            safe_migrate::model::function::RoutineKind::Aggregate => aggregates += 1,
+            safe_migrate::model::function::RoutineKind::Window => window_functions += 1,
+        }
+    }
     CacheContentsSummary {
         schemas: cache.schemas.len(),
         sequences: cache.sequences.len(),
@@ -508,7 +595,12 @@ fn summarize_cache(cache: &DbCache) -> CacheContentsSummary {
         foreign_keys: cache.foreign_keys.len(),
         constraints: cache.constraints.len(),
         triggers: cache.triggers.len(),
-        functions: cache.functions.len(),
+        functions,
+        procedures,
+        aggregates,
+        window_functions,
+        publications: cache.publications.len(),
+        subscriptions: cache.subscriptions.len(),
         types: cache.types.len(),
         roles: cache.roles.len(),
         dependencies: cache.dependencies.len(),
@@ -558,42 +650,103 @@ fn print_cache_inspection(inspection: &CacheInspection) {
             .postgresql_version_num
             .map_or_else(|| "unknown".to_string(), |value| value.to_string())
     );
-    let contents = &inspection.contents;
     println!(
-        "Contents (counts only): {} schemas, {} sequences, {} relations ({} tables, {} views, {} materialized views), {} columns, {} indexes, {} foreign keys, {} constraints, {} triggers, {} functions, {} types, {} roles, {} dependencies",
-        contents.schemas,
-        contents.sequences,
-        contents.relations,
-        contents.tables,
-        contents.views,
-        contents.materialized_views,
-        contents.columns,
-        contents.indexes,
-        contents.foreign_keys,
-        contents.constraints,
-        contents.triggers,
-        contents.functions,
-        contents.types,
-        contents.roles,
-        contents.dependencies,
+        "Observed lock_timeout: {}",
+        inspection
+            .observed_settings
+            .lock_timeout_ms
+            .map_or_else(|| "unknown".to_string(), |value| format!("{value} ms"))
     );
+    println!(
+        "Observed statement_timeout: {}",
+        inspection
+            .observed_settings
+            .statement_timeout_ms
+            .map_or_else(|| "unknown".to_string(), |value| format!("{value} ms"))
+    );
+    let contents = &inspection.contents;
+    println!();
+    println!("Contents (counts only):");
+    println!("  Database objects");
+    println!("    {:<22} {}", "Schemas:", contents.schemas);
+    println!("    {:<22} {}", "Sequences:", contents.sequences);
+    println!("    {:<22} {}", "Relations:", contents.relations);
+    println!("      {:<20} {}", "Tables:", contents.tables);
+    println!("      {:<20} {}", "Views:", contents.views);
+    println!(
+        "      {:<20} {}",
+        "Materialized views:", contents.materialized_views
+    );
+    println!("    {:<22} {}", "Columns:", contents.columns);
+    println!("    {:<22} {}", "Indexes:", contents.indexes);
+    println!("    {:<22} {}", "Constraints:", contents.constraints);
+    println!("    {:<22} {}", "Foreign keys:", contents.foreign_keys);
+    println!("    {:<22} {}", "Triggers:", contents.triggers);
+    println!("    {:<22} {}", "Types:", contents.types);
+    println!();
+    println!("  Routines");
+    println!("    {:<22} {}", "Functions:", contents.functions);
+    println!("    {:<22} {}", "Procedures:", contents.procedures);
+    println!("    {:<22} {}", "Aggregates:", contents.aggregates);
+    println!(
+        "    {:<22} {}",
+        "Window functions:", contents.window_functions
+    );
+    println!();
+    println!("  Replication");
+    println!("    {:<22} {}", "Publications:", contents.publications);
+    println!("    {:<22} {}", "Subscriptions:", contents.subscriptions);
+    println!();
+    println!("  Security and graph");
+    println!("    {:<22} {}", "Roles:", contents.roles);
+    println!("    {:<22} {}", "Dependencies:", contents.dependencies);
+    println!();
     println!(
         "Redaction: this summary intentionally omits object, column, role, and dependency names; cache files still contain that metadata and must be handled as sensitive."
     );
 }
 
-fn load_config(path: &Path) -> Result<Config> {
-    let config = Config::load_from_file(path)
-        .with_context(|| format!("Failed to load configuration: {}", path.display()))?;
+fn load_config(path: Option<&Path>) -> Result<Config> {
+    let default_path = Path::new("safe-migrate.toml");
+    let (config, loaded_path) = match path {
+        Some(path) => (Config::load_required_from_file(path), path),
+        None => (Config::load_from_file(default_path), default_path),
+    };
+    let config = config
+        .with_context(|| format!("Failed to load configuration: {}", loaded_path.display()))?;
     let engine = SafeMigrateEngine::new(config.clone());
     config
         .validate_rule_ids(engine.primary_rule_ids())
-        .with_context(|| format!("Failed to validate configuration: {}", path.display()))?;
+        .with_context(|| {
+            format!(
+                "Failed to validate configuration: {}",
+                loaded_path.display()
+            )
+        })?;
+    registry::validate_rule_configuration(&config)
+        .map_err(anyhow::Error::msg)
+        .with_context(|| {
+            format!(
+                "Failed to validate configuration: {}",
+                loaded_path.display()
+            )
+        })?;
+    config.sync_schemas(None).with_context(|| {
+        format!(
+            "Failed to validate configuration: {}",
+            loaded_path.display()
+        )
+    })?;
     Ok(config)
 }
 
-fn prepare_cache(config: &Config, cache: &Path, no_cache: bool) -> Result<PreparedCache> {
-    let auto_sync = maybe_auto_sync(config, cache, no_cache);
+fn prepare_cache(
+    config: &Config,
+    cache: &Path,
+    no_cache: bool,
+    no_auto_sync: bool,
+) -> Result<PreparedCache> {
+    let auto_sync = maybe_auto_sync(config, cache, no_cache, no_auto_sync);
     let (cache, baseline_unknown) = load_cache(cache, no_cache, config.cache_encryption)?;
     let baseline_stale =
         warn_if_stale_cache(&cache.metadata, baseline_unknown, config.stale_stats_days);
@@ -607,7 +760,12 @@ fn prepare_cache(config: &Config, cache: &Path, no_cache: bool) -> Result<Prepar
     })
 }
 
-fn maybe_auto_sync(config: &Config, cache: &Path, no_cache: bool) -> AutoSyncOutcome {
+fn maybe_auto_sync(
+    config: &Config,
+    cache: &Path,
+    no_cache: bool,
+    no_auto_sync: bool,
+) -> AutoSyncOutcome {
     if !config.auto_sync {
         return AutoSyncOutcome::NotRequested;
     }
@@ -617,11 +775,19 @@ fn maybe_auto_sync(config: &Config, cache: &Path, no_cache: bool) -> AutoSyncOut
         return AutoSyncOutcome::Bypassed;
     }
 
+    if no_auto_sync {
+        eprintln!("[ INFO ] --no-auto-sync bypasses configured automatic cache sync.");
+        return AutoSyncOutcome::Bypassed;
+    }
+
     eprintln!(
         "[ INFO ] Automatic cache sync enabled. Refreshing {}.",
         cache.display()
     );
-    match sync::sync_cache(cache, config.schemas.as_deref(), config.cache_encryption) {
+    let schemas = config
+        .sync_schemas(None)
+        .expect("configuration was validated before automatic synchronization");
+    match sync::sync_cache(cache, schemas, config.cache_encryption) {
         Ok(()) => AutoSyncOutcome::Refreshed,
         Err(error) => {
             eprintln!("[ WARN ] Automatic cache sync failed: {error}");
@@ -713,10 +879,10 @@ fn decode_cache(cache_path: &Path, cache_encryption: bool) -> Result<(DbCache, u
         .with_variable_int_encoding()
         .with_limit::<MAX_CACHE_DECODE_BYTES>();
 
-    let (encoded_payload, header_version) = if let Some(v5_payload) =
-        payload.strip_prefix(CACHE_V5_MAGIC)
+    let (encoded_payload, header_version) = if let Some(v6_payload) =
+        payload.strip_prefix(CACHE_V6_MAGIC)
     {
-        (v5_payload, 5)
+        (v6_payload, 6)
     } else {
         anyhow::bail!(
             "Cache file '{}' uses an unsupported cache format. Run `safe-migrate sync` to rebuild it.",
@@ -794,12 +960,17 @@ fn finish_analysis(
         .map(|finding| finding.violation.clone())
         .collect();
     let should_halt = Reporter::should_halt(&violations);
+    let observed_settings = ObservedSettings {
+        lock_timeout_ms: (!baseline_unknown).then_some(metadata.source_lock_timeout_ms),
+        statement_timeout_ms: (!baseline_unknown).then_some(metadata.source_statement_timeout_ms),
+    };
     let baseline = serde_json::json!({
         "status": if baseline_unknown { "unavailable" } else if baseline_stale { "stale" } else { "available" },
         "created_at_unix_secs": metadata.created_at_unix_secs,
         "source_database": metadata.source_database,
         "schemas": metadata.schemas,
         "auto_sync": auto_sync.label(),
+        "observed_settings": observed_settings,
     });
     match output_mode {
         OutputMode::Human => {
@@ -833,6 +1004,15 @@ fn finish_analysis(
                     .join(", ");
                 report.push_str(&format!("- **Schemas:** `{}`\n", schemas.replace('`', "'")));
             }
+            report.push_str(&format!(
+                "- **Observed lock timeout:** `{}`\n- **Observed statement timeout:** `{}`\n",
+                baseline["observed_settings"]["lock_timeout_ms"]
+                    .as_u64()
+                    .map_or_else(|| "unknown".to_string(), |value| format!("{value} ms")),
+                baseline["observed_settings"]["statement_timeout_ms"]
+                    .as_u64()
+                    .map_or_else(|| "unknown".to_string(), |value| format!("{value} ms")),
+            ));
             println!("{report}");
         }
         OutputMode::Interactive => {

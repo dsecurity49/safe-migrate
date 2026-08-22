@@ -169,15 +169,10 @@ mod reversibility_tests {
         cache.insert_baseline(tid, rel);
         let mut state = AnalysisState::new(cache);
 
-        // Run analysis
         let v = engine
             .analyze("ALTER TABLE t ALTER COLUMN val TYPE bigint;", &mut state)
             .unwrap();
 
-        // Widening int -> bigint is safe.
-        // NOTE: We do not check for empty violations because TypeChangeRewriteRule
-        // might still flag it, but the ReversibilityRule (the rule being tested)
-        // MUST NOT flag it.
         assert!(
             v.iter()
                 .all(|viol| viol.rule_id != "irreversible-migration")

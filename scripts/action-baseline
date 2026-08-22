@@ -1,0 +1,178 @@
+#!/bin/sh
+set -eu
+
+usage() {
+    printf '%s\n' \
+        'usage: action-baseline validate <sync> <no-cache> <encrypted-cache> <key-available> <cache> <schemas> <baseline> <mode> <advisory> <path> <config> <output-dir>' \
+        '       action-baseline validate-config <config> <encrypted-cache>' \
+        '       action-baseline sync <binary> <cache> <config> <schemas>' >&2
+    exit 2
+}
+
+validate_boolean() {
+    name=$1
+    value=$2
+    case "$value" in
+        true|false) ;;
+        *)
+            printf '%s must be true or false, got: %s\n' "$name" "$value" >&2
+            exit 1
+            ;;
+    esac
+}
+
+validate_single_line() {
+    name=$1
+    value=$2
+    newline='
+'
+    carriage_return=$(printf '\r')
+    case "$value" in
+        *"$newline"*|*"$carriage_return"*)
+            printf '%s must not contain CR or LF characters\n' "$name" >&2
+            exit 1
+            ;;
+    esac
+}
+
+command=${1-}
+case "$command" in
+    validate)
+        [ "$#" -eq 13 ] || usage
+        sync=$2
+        no_cache=$3
+        encrypted_cache=$4
+        key_available=$5
+        cache=$6
+        schemas=$7
+        baseline=$8
+        mode=$9
+        advisory=${10}
+        path=${11}
+        config=${12}
+        output_dir=${13}
+
+        validate_boolean sync "$sync"
+        validate_boolean no-cache "$no_cache"
+        validate_boolean encrypted-cache "$encrypted_cache"
+        validate_boolean key-available "$key_available"
+        validate_boolean advisory "$advisory"
+        validate_single_line cache "$cache"
+        validate_single_line schemas "$schemas"
+        validate_single_line baseline "$baseline"
+        validate_single_line mode "$mode"
+        validate_single_line path "$path"
+        validate_single_line config "$config"
+        validate_single_line output-dir "$output_dir"
+
+        case "$mode" in
+            lint)
+                [ -f "$path" ] || {
+                    printf 'lint path does not exist or is not a file: %s\n' "$path" >&2
+                    exit 1
+                }
+                ;;
+            lint-chain)
+                [ -d "$path" ] || {
+                    printf 'lint-chain path does not exist or is not a directory: %s\n' \
+                        "$path" >&2
+                    exit 1
+                }
+                ;;
+            *)
+                printf 'mode must be lint or lint-chain, got: %s\n' "$mode" >&2
+                exit 1
+                ;;
+        esac
+        [ -n "$output_dir" ] || {
+            printf '%s\n' 'output-dir must not be empty' >&2
+            exit 1
+        }
+
+        if [ "$no_cache" = true ] && {
+            [ "$sync" = true ] || [ "$encrypted_cache" = true ] ||
+                [ -n "$cache" ] || [ -n "$schemas" ];
+        }; then
+            printf '%s\n' \
+                'no-cache cannot be combined with cache, sync, schemas, or encrypted-cache' >&2
+            exit 1
+        fi
+        if [ -n "$schemas" ] && [ "$sync" != true ]; then
+            printf '%s\n' 'schemas requires sync to be true' >&2
+            exit 1
+        fi
+        if [ "$sync" = true ] && [ "$encrypted_cache" = true ] && \
+            [ "$key_available" != true ]; then
+            printf '%s\n' \
+                'sync with encrypted-cache requires SAFE_MIGRATE_CACHE_KEY' >&2
+            exit 1
+        fi
+        [ -n "$baseline" ] || {
+            printf '%s\n' 'baseline must not be empty' >&2
+            exit 1
+        }
+        case "$baseline" in
+            .|..)
+                printf '%s\n' 'baseline must be a name, not a path segment' >&2
+                exit 1
+                ;;
+        esac
+        case "$baseline" in
+            *[!A-Za-z0-9._-]*)
+                printf '%s\n' \
+                    'baseline may contain only letters, digits, dot, underscore, and hyphen' >&2
+                exit 1
+                ;;
+        esac
+        [ "${#baseline}" -le 100 ] || {
+            printf '%s\n' 'baseline must be at most 100 characters' >&2
+            exit 1
+        }
+        ;;
+    validate-config)
+        [ "$#" -eq 3 ] || usage
+        config=$2
+        encrypted_cache=$3
+        validate_boolean encrypted-cache "$encrypted_cache"
+        validate_single_line config "$config"
+
+        if [ ! -f "$config" ]; then
+            printf 'explicit config does not exist or is not a file: %s\n' \
+                "$config" >&2
+            exit 1
+        fi
+        encryption_true_pattern="^[[:space:]]*(cache_encryption|\"cache_encryption\"|'cache_encryption')[[:space:]]*=[[:space:]]*true([[:space:]]*(#.*)?)?$"
+        if [ "$encrypted_cache" = true ] && \
+            ! grep -Eq -- "$encryption_true_pattern" "$config"; then
+            printf '%s\n' \
+                'encrypted-cache requires cache_encryption = true in the explicit config' >&2
+            exit 1
+        fi
+        if [ "$encrypted_cache" != true ] && \
+            grep -Eq -- "$encryption_true_pattern" "$config"; then
+            printf '%s\n' \
+                'explicit config enables cache encryption; set encrypted-cache to true' >&2
+            exit 1
+        fi
+        ;;
+    sync)
+        [ "$#" -eq 5 ] || usage
+        binary=$2
+        cache=$3
+        config=$4
+        schemas=$5
+
+        validate_single_line cache "$cache"
+        validate_single_line config "$config"
+        validate_single_line schemas "$schemas"
+
+        set -- "$binary" sync --out "$cache" --config "$config"
+        if [ -n "$schemas" ]; then
+            set -- "$@" --schemas "$schemas"
+        fi
+        "$@"
+        ;;
+    *)
+        usage
+        ;;
+esac

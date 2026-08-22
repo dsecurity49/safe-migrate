@@ -1,23 +1,23 @@
-// FILE: src/analysis/resolver.rs
 use crate::analysis::facts::{
     AlterIndexActionFact, AlterTableActionFact, PersistenceFact, StatementFact, TypeCreationKind,
 };
 use crate::analysis::mutations::{
-    AlterDatabaseMutation, AlterDomainMutation, AlterFunctionMutation, AlterProcedureMutation,
-    AlterPublicationMutation, AlterRoleMutation, AlterSchemaMutation, AlterSequenceActionMutation,
-    AlterSequenceMutation, AlterSubscriptionMutation, AlterTable, AlterTableActionMutation,
-    AlterTypeActionMutation, AlterTypeMutation, ColumnMutation, CreateDatabaseMutation,
-    CreateDomainMutation, CreateFunctionMutation, CreateIndex, CreateMaterializedView,
-    CreatePolicyMutation, CreateProcedureMutation, CreatePublicationMutation, CreateRoleMutation,
-    CreateSchemaMutation, CreateSequenceMutation, CreateSubscriptionMutation, CreateTable,
-    CreateTriggerMutation, CreateTypeMutation, CreateView, DropDatabaseMutation,
-    DropDomainMutation, DropFunctionMutation, DropIndex, DropMaterializedViewMutation,
-    DropPolicyMutation, DropProcedureMutation, DropPublicationMutation, DropRoleMutation,
-    DropSchemaMutation, DropSequenceMutation, DropSubscriptionMutation, DropTable,
-    DropTriggerMutation, DropTypeMutation, DropViewMutation, FkMutation, GrantMutation, Mutation,
-    OpaqueMutation, PersistenceMutation, RefreshMaterializedViewMutation, ReleaseSavepointMutation,
-    Rename, RenameTriggerMutation, ResolvedGrantTarget, RevokeMutation,
-    RollbackToSavepointMutation, SavepointMutation, SearchPathChange,
+    AlterAggregateMutation, AlterDatabaseMutation, AlterDomainMutation, AlterFunctionMutation,
+    AlterProcedureMutation, AlterPublicationMutation, AlterRoleMutation, AlterSchemaMutation,
+    AlterSequenceActionMutation, AlterSequenceMutation, AlterSubscriptionMutation, AlterTable,
+    AlterTableActionMutation, AlterTypeActionMutation, AlterTypeMutation, ColumnMutation,
+    CreateAggregateMutation, CreateDatabaseMutation, CreateDomainMutation, CreateFunctionMutation,
+    CreateIndex, CreateMaterializedView, CreatePolicyMutation, CreateProcedureMutation,
+    CreatePublicationMutation, CreateRoleMutation, CreateSchemaMutation, CreateSequenceMutation,
+    CreateSubscriptionMutation, CreateTable, CreateTriggerMutation, CreateTypeMutation, CreateView,
+    DropAggregateMutation, DropDatabaseMutation, DropDomainMutation, DropFunctionMutation,
+    DropIndex, DropMaterializedViewMutation, DropPolicyMutation, DropProcedureMutation,
+    DropPublicationMutation, DropRoleMutation, DropSchemaMutation, DropSequenceMutation,
+    DropSubscriptionMutation, DropTable, DropTriggerMutation, DropTypeMutation, DropViewMutation,
+    FkMutation, GrantMutation, Mutation, OpaqueMutation, PersistenceMutation,
+    RefreshMaterializedViewMutation, ReleaseSavepointMutation, Rename, RenameTriggerMutation,
+    ResolvedGrantTarget, RevokeMutation, RollbackToSavepointMutation, SavepointMutation,
+    SearchPathChange, TimeoutSettingChange,
 };
 use crate::analysis::state::AnalysisState;
 use crate::ast::identifiers::{ObjectId, QualifiedName};
@@ -124,6 +124,7 @@ impl Resolver {
         let base_id = Self::resolve_creation_name(name, state);
         let sig = params
             .iter()
+            .filter(|p| !matches!(&p.mode, crate::analysis::facts::ParamModeFact::Out))
             .map(|p| p.ty.clone())
             .collect::<Vec<_>>()
             .join(",");
@@ -144,6 +145,97 @@ impl Resolver {
         );
         id.inferred_schema = base_id.inferred_schema;
         id
+    }
+
+    fn resolve_publication_object(
+        object: &crate::analysis::facts::PublicationObjectFact,
+        state: &AnalysisState,
+    ) -> crate::analysis::facts::PublicationObjectFact {
+        match object {
+            crate::analysis::facts::PublicationObjectFact::Table {
+                name,
+                only,
+                include_partitions,
+                columns,
+                row_filter,
+            } => {
+                let id = Self::resolve_lookup_name(name, state);
+                crate::analysis::facts::PublicationObjectFact::Table {
+                    name: crate::ast::identifiers::QualifiedName::new(
+                        Some(crate::ast::identifiers::Ident::new(id.schema, true)),
+                        crate::ast::identifiers::Ident::new(id.name, true),
+                    ),
+                    only: *only,
+                    include_partitions: *include_partitions,
+                    columns: columns.clone(),
+                    row_filter: row_filter.clone(),
+                }
+            }
+            crate::analysis::facts::PublicationObjectFact::CurrentSchemaShorthand => {
+                crate::analysis::facts::PublicationObjectFact::SchemaTables {
+                    schema: state
+                        .local
+                        .search_path
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| "public".to_string()),
+                    row_filter: None,
+                }
+            }
+            other => other.clone(),
+        }
+    }
+
+    fn resolve_publication_scope(
+        scope: &crate::analysis::facts::PublicationScope,
+        state: &AnalysisState,
+    ) -> crate::analysis::facts::PublicationScope {
+        match scope {
+            crate::analysis::facts::PublicationScope::AllTables { except } => {
+                crate::analysis::facts::PublicationScope::AllTables {
+                    except: except.clone(),
+                }
+            }
+            crate::analysis::facts::PublicationScope::Explicit(objects) => {
+                crate::analysis::facts::PublicationScope::Explicit(
+                    objects
+                        .iter()
+                        .map(|object| Self::resolve_publication_object(object, state))
+                        .collect(),
+                )
+            }
+        }
+    }
+
+    fn resolve_alter_publication_action(
+        action: &crate::analysis::facts::AlterPublicationActionFact,
+        state: &AnalysisState,
+    ) -> crate::analysis::facts::AlterPublicationActionFact {
+        use crate::analysis::facts::AlterPublicationActionFact;
+        match action {
+            AlterPublicationActionFact::AddObjects(objects) => {
+                AlterPublicationActionFact::AddObjects(
+                    objects
+                        .iter()
+                        .map(|object| Self::resolve_publication_object(object, state))
+                        .collect(),
+                )
+            }
+            AlterPublicationActionFact::DropObjects(objects) => {
+                AlterPublicationActionFact::DropObjects(
+                    objects
+                        .iter()
+                        .map(|object| Self::resolve_publication_object(object, state))
+                        .collect(),
+                )
+            }
+            AlterPublicationActionFact::SetObjects(scope) => {
+                AlterPublicationActionFact::SetObjects(Self::resolve_publication_scope(
+                    scope, state,
+                ))
+            }
+            other => other.clone(),
+        }
     }
 
     pub(crate) fn normalize_function_arg_type(raw: &str) -> String {
@@ -945,10 +1037,23 @@ impl Resolver {
                     }));
                 }
             }
-            StatementFact::SetSearchPath { target } => {
+            StatementFact::SetSearchPath { target, local } => {
                 mutations.push(Mutation::SearchPath(SearchPathChange {
                     target: target.clone(),
+                    local: *local,
                 }))
+            }
+            StatementFact::SetTimeout {
+                setting,
+                value,
+                local,
+            } => mutations.push(Mutation::TimeoutSetting(TimeoutSettingChange {
+                setting: *setting,
+                value: value.clone(),
+                local: *local,
+            })),
+            StatementFact::ResetSettings { target } => {
+                mutations.push(Mutation::ResetSettings(*target))
             }
             StatementFact::BeginTransaction => mutations.push(Mutation::BeginTransaction),
             StatementFact::CommitTransaction => mutations.push(Mutation::CommitTransaction),
@@ -1050,22 +1155,78 @@ impl Resolver {
                 }));
             }
             StatementFact::DropProcedure(p) => {
+                let signatures = p
+                    .signatures
+                    .iter()
+                    .cloned()
+                    .map(|mut signature| {
+                        signature.params = signature
+                            .params
+                            .into_iter()
+                            .map(|param| Self::normalize_function_arg_type(&param))
+                            .collect();
+                        signature
+                    })
+                    .collect();
                 mutations.push(Mutation::DropProcedure(DropProcedureMutation {
-                    signatures: p.signatures.clone(),
+                    signatures,
                     if_exists: p.if_exists,
                     cascade: p.cascade,
+                }));
+            }
+            StatementFact::CreateAggregate(a) => {
+                let id = Self::resolve_function_id(&a.name, &a.params, state);
+                mutations.push(Mutation::CreateAggregate(CreateAggregateMutation {
+                    id,
+                    or_replace: a.or_replace,
+                    params: a.params.clone(),
+                }));
+            }
+            StatementFact::AlterAggregate(a) => {
+                let base_id = Self::resolve_lookup_name(&a.name, state);
+                let signature = a
+                    .params
+                    .iter()
+                    .map(|param| Self::normalize_function_arg_type(param))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let id = Self::resolve_function_id_by_sig(&base_id, &signature);
+                mutations.push(Mutation::AlterAggregate(AlterAggregateMutation {
+                    id,
+                    action: a.action.clone(),
+                }));
+            }
+            StatementFact::DropAggregate(a) => {
+                let signatures = a
+                    .signatures
+                    .iter()
+                    .cloned()
+                    .map(|mut signature| {
+                        signature.params = signature
+                            .params
+                            .into_iter()
+                            .map(|param| Self::normalize_function_arg_type(&param))
+                            .collect();
+                        signature
+                    })
+                    .collect();
+                mutations.push(Mutation::DropAggregate(DropAggregateMutation {
+                    signatures,
+                    if_exists: a.if_exists,
+                    cascade: a.cascade,
                 }));
             }
             StatementFact::CreatePublication(p) => {
                 mutations.push(Mutation::CreatePublication(CreatePublicationMutation {
                     name: p.name.clone(),
-                    scope: p.scope.clone(),
+                    scope: Self::resolve_publication_scope(&p.scope, state),
                     params: p.params.clone(),
                 }));
             }
             StatementFact::AlterPublication(p) => {
                 mutations.push(Mutation::AlterPublication(AlterPublicationMutation {
                     name: p.name.clone(),
+                    action: Self::resolve_alter_publication_action(&p.action, state),
                 }));
             }
             StatementFact::DropPublication(p) => {
@@ -1086,6 +1247,7 @@ impl Resolver {
             StatementFact::AlterSubscription(s) => {
                 mutations.push(Mutation::AlterSubscription(AlterSubscriptionMutation {
                     name: s.name.clone(),
+                    action: s.action.clone(),
                 }));
             }
             StatementFact::DropSubscription(s) => {
@@ -1098,6 +1260,7 @@ impl Resolver {
                 mutations.push(Mutation::CreateRole(CreateRoleMutation {
                     name: r.name.clone(),
                     inherits: r.inherits,
+                    can_login: r.can_login,
                 }));
             }
             StatementFact::AlterRole(r) => {

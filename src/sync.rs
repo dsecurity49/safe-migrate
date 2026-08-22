@@ -1,19 +1,19 @@
-// FILE: src/sync.rs
-
 use crate::ast::identifiers::ObjectId;
-use crate::db::cache::{CACHE_V5_MAGIC, DbCache, DbCacheVersioned, ForeignKeyCache, IndexCache};
-use crate::db::cache_file::protect_cache_bytes;
+use crate::db::cache::{CACHE_V6_MAGIC, DbCache, DbCacheVersioned, ForeignKeyCache, IndexCache};
+use crate::db::cache_file::{MAX_CACHE_DECODE_BYTES, MAX_CACHE_FILE_BYTES, protect_cache_bytes};
 use crate::model::relation::{Persistence, RelationKind, RelationState};
 use anyhow::{Context, Result};
 use postgres::config::Host;
-use postgres::{Client, Config as PostgresConfig, NoTls};
-use std::io::Write;
+use postgres::{Client, Config as PostgresConfig, GenericClient, IsolationLevel, NoTls};
+use std::io::{self, Write};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::NamedTempFile;
 
 #[cfg(windows)]
 use std::fs;
+
+const MIN_POSTGRES_VERSION_NUM: u32 = 140_000;
 
 pub fn sync_cache(
     out_path: &Path,
@@ -23,6 +23,9 @@ pub fn sync_cache(
     // Strict env-only credential enforcement
     let db_url = std::env::var("DATABASE_URL")
         .context("DATABASE_URL environment variable is required to sync PostgreSQL schema metadata and statistics. Do not pass credentials via CLI flags or config files.")?;
+    if db_url.trim().is_empty() {
+        anyhow::bail!("DATABASE_URL must not be empty or whitespace");
+    }
 
     let mut client = connect_database(&db_url)?;
 
@@ -36,11 +39,7 @@ fn connect_database(db_url: &str) -> Result<Client> {
         .parse()
         .context("DATABASE_URL is not a valid PostgreSQL connection string")?;
 
-    if config
-        .get_hosts()
-        .iter()
-        .any(|host| matches!(host, Host::Tcp(name) if !is_local_host(name)))
-    {
+    if !database_config_is_local(&config) {
         anyhow::bail!(
             "Remote DATABASE_URL connections are not supported by this build. Use an SSH tunnel and connect through localhost or a Unix socket."
         );
@@ -49,6 +48,27 @@ fn connect_database(db_url: &str) -> Result<Client> {
     config
         .connect(NoTls)
         .context("Failed to connect to PostgreSQL")
+}
+
+pub(crate) fn database_config_is_local(config: &PostgresConfig) -> bool {
+    config
+        .get_hostaddrs()
+        .iter()
+        .all(|address| address.is_loopback())
+        && config.get_hosts().iter().all(|host| match host {
+            Host::Unix(_) => true,
+            Host::Tcp(name) => is_local_host(name),
+        })
+}
+
+pub(crate) fn ensure_supported_postgres_version(version: u32) -> Result<()> {
+    if version < MIN_POSTGRES_VERSION_NUM {
+        anyhow::bail!(
+            "PostgreSQL {} is unsupported; safe-migrate sync requires PostgreSQL 14 or newer",
+            version / 10_000
+        );
+    }
+    Ok(())
 }
 
 pub(crate) fn is_local_host(host: &str) -> bool {
@@ -134,6 +154,22 @@ fn write_cache_with_protection(
     cache: DbCache,
     protect: impl FnOnce(Vec<u8>) -> Result<Vec<u8>>,
 ) -> Result<()> {
+    write_cache_with_protection_and_limits(
+        out_path,
+        cache,
+        protect,
+        MAX_CACHE_FILE_BYTES,
+        MAX_CACHE_DECODE_BYTES,
+    )
+}
+
+fn write_cache_with_protection_and_limits(
+    out_path: &Path,
+    cache: DbCache,
+    protect: impl FnOnce(Vec<u8>) -> Result<Vec<u8>>,
+    max_file_bytes: u64,
+    max_decode_bytes: usize,
+) -> Result<()> {
     let parent = out_path.parent().unwrap_or_else(|| Path::new("."));
     let mut temp_file = NamedTempFile::new_in(parent).with_context(|| {
         format!(
@@ -142,24 +178,46 @@ fn write_cache_with_protection(
         )
     })?;
     let mut compressed = Vec::new();
-    let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3)
+    let encoder = zstd::stream::Encoder::new(&mut compressed, 3)
         .context("Failed to init zstd compression")?;
+    let mut encoder = SizeLimitedWriter::new(encoder, max_decode_bytes);
 
-    encoder
-        .write_all(CACHE_V5_MAGIC)
-        .context("Failed to write cache V5 payload header")?;
+    if let Err(error) = encoder.write_all(CACHE_V6_MAGIC) {
+        if encoder.limit_exceeded() {
+            anyhow::bail!(
+                "Cache payload exceeds the {} MiB decoded-size limit",
+                max_decode_bytes / (1024 * 1024)
+            );
+        }
+        return Err(error).context("Failed to write cache V6 payload header");
+    }
 
-    let versioned = DbCacheVersioned::V5(Box::new(cache));
+    let versioned = DbCacheVersioned::V6(Box::new(cache));
     let bincode_config = bincode::config::standard().with_variable_int_encoding();
 
-    bincode::serde::encode_into_std_write(&versioned, &mut encoder, bincode_config)
-        .context("Failed bincode schema compilation and write")?;
+    let encode_result =
+        bincode::serde::encode_into_std_write(&versioned, &mut encoder, bincode_config);
+    if encoder.limit_exceeded() {
+        anyhow::bail!(
+            "Cache payload exceeds the {} MiB decoded-size limit",
+            max_decode_bytes / (1024 * 1024)
+        );
+    }
+    encode_result.context("Failed bincode schema compilation and write")?;
 
+    let encoder = encoder.into_inner();
     encoder
         .finish()
         .context("Failed to flush final zstd stream to disk")?;
 
     let cache_bytes = protect(compressed)?;
+    let cache_file_bytes = u64::try_from(cache_bytes.len()).unwrap_or(u64::MAX);
+    if cache_file_bytes > max_file_bytes {
+        anyhow::bail!(
+            "Cache payload exceeds the {} MiB encoded-size limit",
+            max_file_bytes / (1024 * 1024)
+        );
+    }
     temp_file
         .write_all(&cache_bytes)
         .context("Failed to write cache payload")?;
@@ -168,6 +226,53 @@ fn write_cache_with_protection(
     replace_cache(temp_file, out_path)?;
 
     Ok(())
+}
+
+// This bounds decoded bytes entering zstd, not the compressed output size.
+struct SizeLimitedWriter<W> {
+    inner: W,
+    bytes_written: usize,
+    max_bytes: usize,
+    limit_exceeded: bool,
+}
+
+impl<W> SizeLimitedWriter<W> {
+    fn new(inner: W, max_bytes: usize) -> Self {
+        Self {
+            inner,
+            bytes_written: 0,
+            max_bytes,
+            limit_exceeded: false,
+        }
+    }
+
+    fn limit_exceeded(&self) -> bool {
+        self.limit_exceeded
+    }
+
+    fn into_inner(self) -> W {
+        self.inner
+    }
+}
+
+impl<W: Write> Write for SizeLimitedWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() > self.max_bytes.saturating_sub(self.bytes_written) {
+            self.limit_exceeded = true;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cache decoded-size limit exceeded",
+            ));
+        }
+
+        let written = self.inner.write(bytes)?;
+        self.bytes_written = self.bytes_written.saturating_add(written);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 #[cfg(not(windows))]
@@ -231,6 +336,31 @@ fn replace_cache(temp_file: NamedTempFile, out_path: &Path) -> Result<()> {
 }
 
 pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result<DbCache> {
+    let mut transaction = client
+        .build_transaction()
+        .isolation_level(IsolationLevel::RepeatableRead)
+        .read_only(true)
+        .start()
+        .context("Failed to start read-only cache synchronization transaction")?;
+    let cache = populate_cache_from_client(&mut transaction, schemas)?;
+    transaction
+        .commit()
+        .context("Failed to commit cache synchronization transaction")?;
+    Ok(cache)
+}
+
+#[doc(hidden)]
+pub fn populate_cache_in_current_transaction(
+    client: &mut Client,
+    schemas: Option<&[String]>,
+) -> Result<DbCache> {
+    populate_cache_from_client(client, schemas)
+}
+
+fn populate_cache_from_client(
+    client: &mut impl GenericClient,
+    schemas: Option<&[String]>,
+) -> Result<DbCache> {
     let mut cache = DbCache::new();
     let schema_values = schemas.map(|items| items.to_vec());
     cache.metadata.created_at_unix_secs = Some(
@@ -281,13 +411,19 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
         )
     "#;
 
-    // Query 1: Server Version
+    // Server version and connection provenance.
     let version_row = client.query_one("SHOW server_version_num;", &[])?;
     let version_str: String = version_row.get(0);
-    cache.pg_version_num = version_str.parse::<u32>().ok();
+    let version = version_str
+        .parse::<u32>()
+        .context("PostgreSQL returned an invalid server_version_num")?;
+    ensure_supported_postgres_version(version)?;
+    cache.pg_version_num = Some(version);
 
     let provenance_row = client.query_one(
-        "SELECT current_database(), current_user, session_user, current_setting('search_path');",
+        "SELECT current_database(), current_user, session_user, current_setting('search_path'),
+                (SELECT setting::bigint FROM pg_settings WHERE name = 'lock_timeout'),
+                (SELECT setting::bigint FROM pg_settings WHERE name = 'statement_timeout');",
         &[],
     )?;
     cache.metadata.source_database = Some(provenance_row.get(0));
@@ -295,6 +431,18 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
     cache.metadata.source_session_role = Some(provenance_row.get(2));
     let search_path_setting: String = provenance_row.get(3);
     cache.metadata.source_search_path = Some(parse_search_path_setting(&search_path_setting));
+    let lock_timeout_ms = provenance_row
+        .try_get::<_, Option<i64>>(4)?
+        .context("PostgreSQL did not report lock_timeout")?;
+    let statement_timeout_ms = provenance_row
+        .try_get::<_, Option<i64>>(5)?
+        .context("PostgreSQL did not report statement_timeout")?;
+    cache.metadata.source_lock_timeout_ms = lock_timeout_ms
+        .try_into()
+        .context("PostgreSQL returned a negative lock_timeout")?;
+    cache.metadata.source_statement_timeout_ms = statement_timeout_ms
+        .try_into()
+        .context("PostgreSQL returned a negative statement_timeout")?;
 
     // Resolve role/database defaults and special entries such as "$user" exactly
     // as PostgreSQL does, while excluding the implicit pg_catalog lookup. An
@@ -398,7 +546,7 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
         );
     }
 
-    // Query 2: Relations + Staleness
+    // Relations and statistics.
     let table_query = format!(
         "
         SELECT
@@ -486,7 +634,7 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
         cache.insert_baseline(object_id, state);
     }
 
-    // Query 3: Columns + Width
+    // Columns and width statistics.
     let col_query = format!("
         SELECT
             n.nspname AS schema_name,
@@ -534,7 +682,7 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
         }
     }
 
-    // Query 4: Triggers & Policies
+    // Triggers and policies.
     let tp_query = format!("
         SELECT 
             n.nspname AS schema_name,
@@ -564,7 +712,7 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
         }
     }
 
-    // Query 4.25: Explicit non-owner relation privileges.
+    // Explicit non-owner relation privileges.
     let acl_query = format!(
         "
         SELECT
@@ -611,7 +759,7 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
         }
     }
 
-    // Query 4.5: Trigger Functions
+    // Trigger functions.
     let trig_query = format!(
         "
         SELECT 
@@ -651,7 +799,7 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
         });
     }
 
-    // Query 4.75: Table constraints
+    // Table constraints.
     let constraint_query = format!(
         "
         SELECT
@@ -693,7 +841,7 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
             });
     }
 
-    // Query 5: Foreign Keys
+    // Foreign keys.
     let fk_query = format!(
         "
         SELECT 
@@ -744,7 +892,7 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
         });
     }
 
-    // Query 6: Indexes
+    // Indexes.
     let idx_query = format!(
         "
         SELECT 
@@ -780,26 +928,27 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
         });
     }
 
-    // Query 7: Functions
+    // Routines share one PostgreSQL namespace, regardless of kind.
     let func_query = format!(
         "
         SELECT
             n.nspname AS schema_name,
             p.proname AS func_name,
-            COALESCE(
-                (SELECT string_agg(pg_catalog.format_type(t, NULL), ',' ORDER BY n)
-                 FROM unnest(p.proargtypes::int[]) WITH ORDINALITY AS u(t, n)),
-                ''
-            ) AS arg_types,
+            ARRAY(
+                SELECT pg_catalog.format_type(t, NULL)
+                FROM unnest(p.proargtypes::oid[]) WITH ORDINALITY AS u(t, n)
+                ORDER BY n
+            )::text[] AS arg_types,
             pg_catalog.pg_get_function_result(p.oid) AS return_type,
             p.provolatile::text AS volatility,
+            p.prokind::text AS routine_kind,
             l.lanname AS language,
             p.prosecdef AS security_definer
         FROM pg_proc p
         JOIN pg_namespace n ON n.oid = p.pronamespace
         JOIN pg_language l ON l.oid = p.prolang
         WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
-          AND p.prokind = 'f'
+          AND p.prokind IN ('f', 'p', 'a', 'w')
           {schema_filter};
     "
     );
@@ -807,9 +956,10 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
     for row in client.query(&func_query, &[&schema_values])? {
         let schema_name: String = row.get("schema_name");
         let func_name: String = row.get("func_name");
-        let arg_types_str: String = row.get("arg_types");
+        let arg_types: Vec<String> = row.get("arg_types");
         let return_type: Option<String> = row.get("return_type");
         let volatility_char: String = row.get("volatility");
+        let routine_kind_char: String = row.get("routine_kind");
         let language: String = row.get("language");
         let security_definer: bool = row.get("security_definer");
 
@@ -826,25 +976,29 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
             crate::model::function::SecurityMode::Invoker
         };
 
-        // Normalize argument types in sync just like in resolver
-        let arg_types_str = arg_types_str
-            .split(',')
-            .map(crate::analysis::resolver::Resolver::normalize_function_arg_type)
-            .collect::<Vec<_>>()
-            .join(",");
+        let routine_kind = match routine_kind_char.as_str() {
+            "f" => crate::model::function::RoutineKind::Function,
+            "p" => crate::model::function::RoutineKind::Procedure,
+            "a" => crate::model::function::RoutineKind::Aggregate,
+            "w" => crate::model::function::RoutineKind::Window,
+            other => anyhow::bail!("PostgreSQL returned unknown pg_proc.prokind '{other}'"),
+        };
+
+        let arg_types = arg_types
+            .iter()
+            .map(|arg_type| {
+                crate::analysis::resolver::Resolver::normalize_function_arg_type(arg_type)
+            })
+            .collect::<Vec<_>>();
+        let arg_types_str = arg_types.join(",");
 
         let id = ObjectId::new(&schema_name, format!("{}({})", func_name, arg_types_str));
-
-        let arg_types = if arg_types_str.is_empty() {
-            Vec::new()
-        } else {
-            arg_types_str.split(',').map(|s| s.to_string()).collect()
-        };
 
         cache.functions.insert(
             id.clone(),
             crate::model::function::FunctionState {
                 id,
+                routine_kind,
                 arg_types,
                 arg_type_ids: Vec::new(),
                 return_type: return_type.unwrap_or_default(),
@@ -856,7 +1010,337 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
         );
     }
 
-    // Query 8: User-defined types, including ordered enum labels and domains.
+    // Publications are database-level objects. Their catalog is synchronized
+    // in full even when relation synchronization is schema-scoped.
+    let publication_query = if cache.pg_version_num.unwrap_or_default() >= 180_000 {
+        r#"
+            SELECT p.oid, p.pubname::text AS publication_name,
+                   pg_catalog.pg_get_userbyid(p.pubowner) AS owner_name,
+                   p.puballtables, p.pubinsert, p.pubupdate, p.pubdelete,
+                   p.pubtruncate, p.pubviaroot, p.pubgencols::text AS generated_columns
+            FROM pg_publication p
+            ORDER BY p.oid
+        "#
+    } else {
+        r#"
+            SELECT p.oid, p.pubname::text AS publication_name,
+                   pg_catalog.pg_get_userbyid(p.pubowner) AS owner_name,
+                   p.puballtables, p.pubinsert, p.pubupdate, p.pubdelete,
+                   p.pubtruncate, p.pubviaroot, NULL::text AS generated_columns
+            FROM pg_publication p
+            ORDER BY p.oid
+        "#
+    };
+    let mut publication_names = std::collections::HashMap::<u32, String>::new();
+    for row in client.query(publication_query, &[])? {
+        let oid: u32 = row.get("oid");
+        let name: String = row.get("publication_name");
+        let mut operations = Vec::new();
+        if row.get::<_, bool>("pubinsert") {
+            operations.push("insert");
+        }
+        if row.get::<_, bool>("pubupdate") {
+            operations.push("update");
+        }
+        if row.get::<_, bool>("pubdelete") {
+            operations.push("delete");
+        }
+        if row.get::<_, bool>("pubtruncate") {
+            operations.push("truncate");
+        }
+        let mut params = vec![
+            crate::analysis::facts::AttributeFact {
+                name: "publish".to_string(),
+                value: operations.join(", "),
+            },
+            crate::analysis::facts::AttributeFact {
+                name: "publish_via_partition_root".to_string(),
+                value: row.get::<_, bool>("pubviaroot").to_string(),
+            },
+        ];
+        if let Some(generated_columns) = row.get::<_, Option<String>>("generated_columns") {
+            let value = match generated_columns.as_str() {
+                "n" => "none",
+                "s" => "stored",
+                other => other,
+            };
+            params.push(crate::analysis::facts::AttributeFact {
+                name: "publish_generated_columns".to_string(),
+                value: value.to_string(),
+            });
+        }
+        let scope = if row.get::<_, bool>("puballtables") {
+            crate::analysis::facts::PublicationScope::AllTables { except: Vec::new() }
+        } else {
+            crate::analysis::facts::PublicationScope::Explicit(Vec::new())
+        };
+        publication_names.insert(oid, name.clone());
+        cache.publications.insert(
+            name.clone(),
+            crate::model::replication::PublicationState {
+                name,
+                owner: Some(row.get("owner_name")),
+                scope,
+                params,
+                generation: 0,
+            },
+        );
+    }
+
+    let publication_rel_query = if cache.pg_version_num.unwrap_or_default() >= 150_000 {
+        r#"
+            SELECT pr.prpubid, n.nspname::text AS schema_name,
+                   c.relname::text AS relation_name,
+                   pg_catalog.pg_get_expr(pr.prqual, pr.prrelid) AS row_filter,
+                   CASE WHEN pr.prattrs IS NULL THEN NULL ELSE ARRAY(
+                       SELECT a.attname::text
+                       FROM pg_attribute a
+                       WHERE a.attrelid = pr.prrelid
+                         AND a.attnum = ANY(pr.prattrs::smallint[])
+                       ORDER BY array_position(pr.prattrs::smallint[], a.attnum)
+                   ) END AS columns
+            FROM pg_publication_rel pr
+            JOIN pg_class c ON c.oid = pr.prrelid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            ORDER BY pr.prpubid, pr.oid
+        "#
+    } else {
+        r#"
+            SELECT pr.prpubid, n.nspname::text AS schema_name,
+                   c.relname::text AS relation_name,
+                   NULL::text AS row_filter, NULL::text[] AS columns
+            FROM pg_publication_rel pr
+            JOIN pg_class c ON c.oid = pr.prrelid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            ORDER BY pr.prpubid, pr.oid
+        "#
+    };
+    for row in client.query(publication_rel_query, &[])? {
+        let publication_oid: u32 = row.get("prpubid");
+        let Some(publication_name) = publication_names.get(&publication_oid) else {
+            anyhow::bail!(
+                "publication membership references unknown publication OID {publication_oid}"
+            );
+        };
+        let Some(publication) = cache.publications.get_mut(publication_name) else {
+            anyhow::bail!("publication '{publication_name}' disappeared during synchronization");
+        };
+        let crate::analysis::facts::PublicationScope::Explicit(objects) = &mut publication.scope
+        else {
+            continue;
+        };
+        let schema_name: String = row.get("schema_name");
+        let relation_name: String = row.get("relation_name");
+        objects.push(crate::analysis::facts::PublicationObjectFact::Table {
+            name: crate::ast::identifiers::QualifiedName::new(
+                Some(crate::ast::identifiers::Ident::new(schema_name, true)),
+                crate::ast::identifiers::Ident::new(relation_name, true),
+            ),
+            only: true,
+            include_partitions: false,
+            columns: row.get("columns"),
+            row_filter: row
+                .get::<_, Option<String>>("row_filter")
+                .map(crate::analysis::facts::PublicationRowFilter::CatalogSql),
+        });
+    }
+
+    if cache.pg_version_num.unwrap_or_default() >= 150_000 {
+        for row in client.query(
+            r#"
+                SELECT pn.pnpubid, n.nspname::text AS schema_name
+                FROM pg_publication_namespace pn
+                JOIN pg_namespace n ON n.oid = pn.pnnspid
+                ORDER BY pn.pnpubid, pn.oid
+            "#,
+            &[],
+        )? {
+            let publication_oid: u32 = row.get("pnpubid");
+            let Some(publication_name) = publication_names.get(&publication_oid) else {
+                anyhow::bail!(
+                    "publication schema membership references unknown publication OID {publication_oid}"
+                );
+            };
+            let Some(publication) = cache.publications.get_mut(publication_name) else {
+                anyhow::bail!(
+                    "publication '{publication_name}' disappeared during synchronization"
+                );
+            };
+            let crate::analysis::facts::PublicationScope::Explicit(objects) =
+                &mut publication.scope
+            else {
+                continue;
+            };
+            objects.push(
+                crate::analysis::facts::PublicationObjectFact::SchemaTables {
+                    schema: row.get("schema_name"),
+                    row_filter: None,
+                },
+            );
+        }
+    }
+
+    // Connection strings are intentionally excluded. Later PostgreSQL versions
+    // add safe subscription settings, so each query exposes one stable shape.
+    let subscription_query = match cache.pg_version_num.unwrap_or_default() {
+        170_000.. => {
+            r#"
+            SELECT s.subname::text AS subscription_name,
+                   pg_catalog.pg_get_userbyid(s.subowner) AS owner_name,
+                   s.subenabled, s.subbinary, s.subslotname::text,
+                   s.subsynccommit, s.subpublications,
+                   s.substream::text AS streaming,
+                   s.subtwophasestate::text AS two_phase_state,
+                   s.subdisableonerr AS disable_on_error,
+                   s.subpasswordrequired AS password_required,
+                   s.subrunasowner AS run_as_owner,
+                   s.subfailover AS failover,
+                   s.suborigin AS origin,
+                   s.subskiplsn::text AS skip_lsn
+            FROM pg_subscription s
+            WHERE s.subdbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+            ORDER BY s.oid
+        "#
+        }
+        160_000.. => {
+            r#"
+            SELECT s.subname::text AS subscription_name,
+                   pg_catalog.pg_get_userbyid(s.subowner) AS owner_name,
+                   s.subenabled, s.subbinary, s.subslotname::text,
+                   s.subsynccommit, s.subpublications,
+                   s.substream::text AS streaming,
+                   s.subtwophasestate::text AS two_phase_state,
+                   s.subdisableonerr AS disable_on_error,
+                   s.subpasswordrequired AS password_required,
+                   s.subrunasowner AS run_as_owner,
+                   NULL::bool AS failover,
+                   s.suborigin AS origin,
+                   s.subskiplsn::text AS skip_lsn
+            FROM pg_subscription s
+            WHERE s.subdbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+            ORDER BY s.oid
+        "#
+        }
+        150_000.. => {
+            r#"
+            SELECT s.subname::text AS subscription_name,
+                   pg_catalog.pg_get_userbyid(s.subowner) AS owner_name,
+                   s.subenabled, s.subbinary, s.subslotname::text,
+                   s.subsynccommit, s.subpublications,
+                   s.substream::text AS streaming,
+                   s.subtwophasestate::text AS two_phase_state,
+                   s.subdisableonerr AS disable_on_error,
+                   NULL::bool AS password_required,
+                   NULL::bool AS run_as_owner,
+                   NULL::bool AS failover,
+                   NULL::text AS origin,
+                   s.subskiplsn::text AS skip_lsn
+            FROM pg_subscription s
+            WHERE s.subdbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+            ORDER BY s.oid
+        "#
+        }
+        _ => {
+            r#"
+            SELECT s.subname::text AS subscription_name,
+                   pg_catalog.pg_get_userbyid(s.subowner) AS owner_name,
+                   s.subenabled, s.subbinary, s.subslotname::text,
+                   s.subsynccommit, s.subpublications,
+                   s.substream::text AS streaming,
+                   NULL::text AS two_phase_state,
+                   NULL::bool AS disable_on_error,
+                   NULL::bool AS password_required,
+                   NULL::bool AS run_as_owner,
+                   NULL::bool AS failover,
+                   NULL::text AS origin,
+                   NULL::text AS skip_lsn
+            FROM pg_subscription s
+            WHERE s.subdbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+            ORDER BY s.oid
+        "#
+        }
+    };
+    for row in client.query(subscription_query, &[])? {
+        let name: String = row.get("subscription_name");
+        let mut params = vec![
+            crate::analysis::facts::AttributeFact {
+                name: "binary".to_string(),
+                value: row.get::<_, bool>("subbinary").to_string(),
+            },
+            crate::analysis::facts::AttributeFact {
+                name: "streaming".to_string(),
+                value: match row.get::<_, String>("streaming").as_str() {
+                    "t" | "true" => "true".to_string(),
+                    "f" | "false" => "false".to_string(),
+                    "p" => "parallel".to_string(),
+                    other => other.to_string(),
+                },
+            },
+            crate::analysis::facts::AttributeFact {
+                name: "synchronous_commit".to_string(),
+                value: row.get("subsynccommit"),
+            },
+        ];
+        let mut push_param = |name: &str, value: Option<String>| {
+            if let Some(value) = value {
+                params.push(crate::analysis::facts::AttributeFact {
+                    name: name.to_string(),
+                    value,
+                });
+            }
+        };
+        push_param(
+            "two_phase",
+            row.get::<_, Option<String>>("two_phase_state")
+                .map(|state| match state.as_str() {
+                    "d" => "false".to_string(),
+                    "e" => "true".to_string(),
+                    "p" => "pending".to_string(),
+                    other => other.to_string(),
+                }),
+        );
+        push_param(
+            "disable_on_error",
+            row.get::<_, Option<bool>>("disable_on_error")
+                .map(|value| value.to_string()),
+        );
+        push_param(
+            "password_required",
+            row.get::<_, Option<bool>>("password_required")
+                .map(|value| value.to_string()),
+        );
+        push_param(
+            "run_as_owner",
+            row.get::<_, Option<bool>>("run_as_owner")
+                .map(|value| value.to_string()),
+        );
+        push_param(
+            "failover",
+            row.get::<_, Option<bool>>("failover")
+                .map(|value| value.to_string()),
+        );
+        push_param("origin", row.get("origin"));
+        push_param(
+            "skip_lsn",
+            row.get::<_, Option<String>>("skip_lsn")
+                .filter(|lsn| lsn != "0/0"),
+        );
+        cache.subscriptions.insert(
+            name.clone(),
+            crate::model::replication::SubscriptionState {
+                name,
+                owner: Some(row.get("owner_name")),
+                connection: crate::analysis::facts::ConnectionTarget::Redacted,
+                publications: row.get("subpublications"),
+                params: Some(params),
+                enabled: row.get("subenabled"),
+                slot_name: row.get("subslotname"),
+                generation: 0,
+            },
+        );
+    }
+
+    // User-defined types, including ordered enum labels and domains.
     let type_query = format!(
         "
         SELECT
@@ -909,7 +1393,7 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
         );
     }
 
-    // Query 9: Dependencies (pg_depend)
+    // Catalog dependencies.
     let depend_query = r#"
         SELECT
             d.classid, d.objid, d.objsubid,
@@ -1090,8 +1574,8 @@ mod atomic_write_tests {
         let mut payload = Vec::new();
         decoder.read_to_end(&mut payload).unwrap();
         let payload = payload
-            .strip_prefix(CACHE_V5_MAGIC)
-            .expect("writer must prefix V5 cache payloads");
+            .strip_prefix(CACHE_V6_MAGIC)
+            .expect("writer must prefix V6 cache payloads");
         let config = bincode::config::standard().with_variable_int_encoding();
         let versioned: DbCacheVersioned = bincode::serde::decode_from_slice(payload, config)
             .unwrap()
@@ -1116,6 +1600,47 @@ mod atomic_write_tests {
                 .to_string()
                 .contains("injected payload-protection failure")
         );
+        assert_eq!(fs::read(&cache_path).unwrap(), b"known-good-cache");
+        assert_eq!(fs::read_dir(temp_dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn cache_writer_rejects_oversized_decoded_payload_before_replacement() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cache_path = temp_dir.path().join("baseline.cache");
+        fs::write(&cache_path, b"known-good-cache").unwrap();
+
+        let error = write_cache_with_protection_and_limits(
+            &cache_path,
+            DbCache::new(),
+            Ok,
+            MAX_CACHE_FILE_BYTES,
+            CACHE_V6_MAGIC.len(),
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("decoded-size limit"));
+        assert_eq!(fs::read(&cache_path).unwrap(), b"known-good-cache");
+        assert_eq!(fs::read_dir(temp_dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn cache_writer_rejects_oversized_encoded_payload_before_replacement() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cache_path = temp_dir.path().join("baseline.cache");
+        fs::write(&cache_path, b"known-good-cache").unwrap();
+        let max_file_bytes = 16_u64;
+
+        let error = write_cache_with_protection_and_limits(
+            &cache_path,
+            DbCache::new(),
+            |_| Ok(vec![0; max_file_bytes as usize + 1]),
+            max_file_bytes,
+            MAX_CACHE_DECODE_BYTES,
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("encoded-size limit"));
         assert_eq!(fs::read(&cache_path).unwrap(), b"known-good-cache");
         assert_eq!(fs::read_dir(temp_dir.path()).unwrap().count(), 1);
     }

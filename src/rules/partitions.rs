@@ -1,4 +1,3 @@
-// FILE: src/rules/partitions.rs
 use crate::analysis::mutations::{AlterTableActionMutation, Mutation};
 use crate::analysis::state::{AnalysisState, CascadeResult, MutationResult};
 use crate::engine::config::Config;

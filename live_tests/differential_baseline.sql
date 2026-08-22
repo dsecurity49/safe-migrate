@@ -1,5 +1,5 @@
--- Canonical enterprise-scale baseline owned by the live differential harness.
--- Every harness schema is prefixed with sm_ so reset remains narrowly scoped.
+-- Disposable baseline rebuilt before each differential fixture.
+-- The harness refuses nonlocal databases and databases not named safe_migrate.
 DROP SCHEMA IF EXISTS sm_analytics CASCADE;
 DROP SCHEMA IF EXISTS sm_audit CASCADE;
 DROP SCHEMA IF EXISTS sm_fulfillment CASCADE;

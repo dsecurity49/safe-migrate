@@ -1,4 +1,7 @@
-use postgres::{Client, NoTls};
+mod common;
+
+use crate::common::database_hosts_are_local;
+use postgres::{Client, Config as PostgresConfig, NoTls};
 use safe_migrate::analysis::graph::DependencyKind;
 use safe_migrate::analysis::state::AnalysisState;
 use safe_migrate::db::cache::DbCache;
@@ -11,7 +14,7 @@ use safe_migrate::model::schema::SchemaOverlay;
 use safe_migrate::model::sequence::{SequenceKind, SequenceOverlay};
 use safe_migrate::model::trigger::TriggerOverlay;
 use safe_migrate::model::types::{TypeKind, TypeOverlay};
-use safe_migrate::sync::populate_cache;
+use safe_migrate::sync::{populate_cache, populate_cache_in_current_transaction};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -286,7 +289,19 @@ fn live_postgres_differential_harness() {
         }
     };
 
-    let mut client = match Client::connect(&database_url, NoTls) {
+    assert!(
+        !database_url.trim().is_empty(),
+        "live differential harness requires a nonempty DATABASE_URL"
+    );
+    let database_config: PostgresConfig = database_url
+        .parse()
+        .expect("live differential DATABASE_URL is invalid");
+    assert!(
+        database_hosts_are_local(&database_config),
+        "live differential harness accepts only localhost or Unix-socket databases"
+    );
+
+    let mut client = match database_config.connect(NoTls) {
         Ok(client) => client,
         Err(error) => {
             assert!(
@@ -297,6 +312,14 @@ fn live_postgres_differential_harness() {
             return;
         }
     };
+    let connected_database: String = client
+        .query_one("SELECT current_database()", &[])
+        .expect("failed to identify the live differential database")
+        .get(0);
+    assert_eq!(
+        connected_database, "safe_migrate",
+        "live differential harness refuses to modify a database not named safe_migrate"
+    );
     if verbosity >= 1 {
         let row = client
             .query_one(
@@ -634,7 +657,8 @@ fn live_postgres_differential_harness() {
                 format!("case={}/{} phase=postgres-applied", rule.rule_dir, fixture),
             );
 
-            let live_state_result = snapshot_live_state(&mut client, &rule.schemas, scope);
+            let live_state_result =
+                snapshot_live_state(&mut client, &rule.schemas, scope, transactional);
             if transactional {
                 if let Err(error) = client.batch_execute("ROLLBACK") {
                     mismatches.push(Mismatch {
@@ -793,6 +817,22 @@ fn format_duration(duration: Duration) -> String {
 
 fn repo_path(relative: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(relative)
+}
+
+#[test]
+fn differential_database_guard_accepts_only_local_hosts() {
+    for url in [
+        "postgresql://localhost/safe_migrate",
+        "postgresql://127.0.0.1/safe_migrate",
+        "postgresql://[::1]/safe_migrate",
+        "postgresql:///safe_migrate?host=%2Ftmp",
+    ] {
+        let config: PostgresConfig = url.parse().unwrap();
+        assert!(database_hosts_are_local(&config), "{url}");
+    }
+
+    let remote: PostgresConfig = "postgresql://db.example/safe_migrate".parse().unwrap();
+    assert!(!database_hosts_are_local(&remote));
 }
 
 #[test]
@@ -1260,8 +1300,13 @@ fn snapshot_live_state(
     client: &mut Client,
     schemas: &[String],
     scope: &[ComparisonScope],
+    transaction_is_active: bool,
 ) -> anyhow::Result<NormalizedState> {
-    let cache = populate_cache(client, Some(schemas))?;
+    let cache = if transaction_is_active {
+        populate_cache_in_current_transaction(client, Some(schemas))?
+    } else {
+        populate_cache(client, Some(schemas))?
+    };
     let mut state = NormalizedState::default();
 
     if scope.contains(&ComparisonScope::Schemas) {

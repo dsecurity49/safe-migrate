@@ -63,13 +63,10 @@ pub fn run_interactive(violations: &[Violation], confidence: &Confidence) -> Res
             ResetColor,
         )?;
 
-        // Calculate available height for the list dynamically
         let (_w, Height(h)) = terminal_size().unwrap_or((Width(80), Height(24)));
-        // Subtract lines for header (2), footer separator (2), detail text (~5), SQL (~6), and quit instructions (2)
-        // We use 18 as a safe heuristic to prevent the text from wrapping and triggering a terminal scroll.
+        // Reserve space for wrapped details without scrolling the alternate screen.
         let window_size = (h.saturating_sub(18) as usize).max(3);
 
-        // Render list (sliding window)
         let start = selected.saturating_sub(window_size / 2);
         let end = std::cmp::min(start + window_size, violations.len());
 
@@ -118,7 +115,7 @@ pub fn run_interactive(violations: &[Violation], confidence: &Confidence) -> Res
         )?;
 
         if let Some(sql) = &active.sql {
-            // Limit SQL context to max 5 lines to prevent pushing UI off-screen
+            // Bound detail height so navigation remains visible.
             let mut sql_lines: Vec<&str> = sql.lines().collect();
             let mut truncated = false;
             if sql_lines.len() > 5 {
@@ -131,7 +128,7 @@ pub fn run_interactive(violations: &[Violation], confidence: &Confidence) -> Res
                 SetForegroundColor(Color::White),
                 Print("\r\nSQL Context:\r\n"),
                 SetForegroundColor(Color::DarkGrey),
-                // Important: replace all \n inside the SQL with \r\n
+                // Raw terminal output uses CRLF line endings.
                 Print(format!("{}\r\n", sql_lines.join("\r\n"))),
             )?;
 
@@ -145,7 +142,6 @@ pub fn run_interactive(violations: &[Violation], confidence: &Confidence) -> Res
 
         stdout.flush()?;
 
-        // Handle input
         if let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
         {

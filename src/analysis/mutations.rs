@@ -1,6 +1,7 @@
-// FILE: src/analysis/mutations.rs
 use crate::analysis::expr_ir::ExprIr;
-use crate::analysis::facts::{SearchPathTarget, TableConstraintFact};
+use crate::analysis::facts::{
+    ResetSettingTarget, SearchPathTarget, TableConstraintFact, TimeoutSetting, TimeoutSettingValue,
+};
 use crate::ast::identifiers::ObjectId;
 use crate::model::types::TypeKind;
 
@@ -47,6 +48,11 @@ pub enum Mutation {
         new_owner: crate::analysis::facts::RoleFact,
     },
     SearchPath(SearchPathChange),
+    TimeoutSetting(TimeoutSettingChange),
+    ResetSettings(ResetSettingTarget),
+    /// Statement-scoped no-op evaluated after real mutations so timeout
+    /// rules do not report on statements PostgreSQL would not execute.
+    CheckTimeouts,
     BeginTransaction,
     CommitTransaction,
     CommitAndChain,
@@ -61,6 +67,9 @@ pub enum Mutation {
     CreateProcedure(CreateProcedureMutation),
     AlterProcedure(AlterProcedureMutation),
     DropProcedure(DropProcedureMutation),
+    CreateAggregate(CreateAggregateMutation),
+    AlterAggregate(AlterAggregateMutation),
+    DropAggregate(DropAggregateMutation),
     CreatePublication(CreatePublicationMutation),
     AlterPublication(AlterPublicationMutation),
     DropPublication(DropPublicationMutation),
@@ -341,6 +350,14 @@ pub struct DropIndex {
 #[derive(Clone, Debug, PartialEq)]
 pub struct SearchPathChange {
     pub target: SearchPathTarget,
+    pub local: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TimeoutSettingChange {
+    pub setting: TimeoutSetting,
+    pub value: TimeoutSettingValue,
+    pub local: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -402,6 +419,26 @@ pub struct DropProcedureMutation {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct CreateAggregateMutation {
+    pub id: ObjectId,
+    pub or_replace: bool,
+    pub params: Vec<crate::analysis::facts::ParamFact>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AlterAggregateMutation {
+    pub id: ObjectId,
+    pub action: crate::analysis::facts::AlterFunctionAction,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DropAggregateMutation {
+    pub signatures: Vec<crate::analysis::facts::FunctionSigFact>,
+    pub if_exists: bool,
+    pub cascade: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct CreatePublicationMutation {
     pub name: String,
     pub scope: crate::analysis::facts::PublicationScope,
@@ -411,6 +448,7 @@ pub struct CreatePublicationMutation {
 #[derive(Clone, Debug, PartialEq)]
 pub struct AlterPublicationMutation {
     pub name: String,
+    pub action: crate::analysis::facts::AlterPublicationActionFact,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -431,6 +469,7 @@ pub struct CreateSubscriptionMutation {
 #[derive(Clone, Debug, PartialEq)]
 pub struct AlterSubscriptionMutation {
     pub name: String,
+    pub action: crate::analysis::facts::AlterSubscriptionActionFact,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -443,6 +482,7 @@ pub struct DropSubscriptionMutation {
 pub struct CreateRoleMutation {
     pub name: String,
     pub inherits: bool,
+    pub can_login: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]

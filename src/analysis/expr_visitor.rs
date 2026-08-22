@@ -1,4 +1,3 @@
-// FILE: src/analysis/expr_visitor.rs
 use crate::analysis::expr_ir::ExprIr;
 use squawk_syntax::ast::{AstNode, Expr};
 
@@ -64,7 +63,6 @@ impl ExprVisitor {
             })
             .unwrap_or_else(|| "<fn>".into());
 
-        // FIX for squawk_syntax >= 2.58.0: filter_map through the new `Arg` wrapper
         let args = ce
             .arg_list()
             .map(|al| {
@@ -126,7 +124,6 @@ impl ExprVisitor {
                 BinOp::NotSimilarTo(n) => n.syntax().text().to_string(),
                 BinOp::OperatorCall(n) => n.syntax().text().to_string(),
                 BinOp::SimilarTo(n) => n.syntax().text().to_string(),
-                // FIX for squawk_syntax >= 2.58.0: New Escape operator coverage
                 BinOp::Escape(t) => t.text().to_string(),
             })
             .unwrap_or_else(|| "<op>".into());

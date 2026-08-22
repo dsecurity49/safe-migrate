@@ -1,4 +1,3 @@
-// FILE: ./src/model/mod.rs
 pub mod column;
 pub mod constraint;
 pub mod function;

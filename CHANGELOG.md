@@ -5,6 +5,22 @@ commits and pull requests. Published binaries, checksums, and generated release
 notes are available on the
 [GitHub Releases page](https://github.com/dsecurity49/safe-migrate/releases).
 
+## v0.6.0 — 2026-08-22
+
+- Expanded `sync` and Cache V6 to record effective migration timeouts, every
+  PostgreSQL routine kind, publications, and redacted subscription metadata on
+  PostgreSQL 14–18. Connection strings are never read or cached; V1–V5 caches
+  must be rebuilt.
+- Added rules for missing or ineffective `lock_timeout` and
+  `statement_timeout` settings, including changes made within a migration.
+- Fixed catalog snapshot consistency and state handling for `search_path`,
+  routine identity, publication membership, guarded drops, identifier folding,
+  volatile expressions, and ownership. Publication edits with unknown inherited
+  tables remain `Tainted`.
+- Added GitHub Action support for refreshing and reusing named baselines.
+  Pull-request linting stays offline, and cache misses run with `Tainted`
+  confidence.
+
 ## v0.5.0 — 2026-08-14
 
 - Upgraded the pinned Squawk parser stack to 2.62.0 and raised the minimum
@@ -40,7 +56,7 @@ notes are available on the
 
 ## v0.4.4 — 2026-08-02
 
-- Added sourced, real-world-inspired differential cases for staged foreign-key
+- Added sourced differential cases for staged foreign-key
   validation, missing foreign-key columns, and index-backed constraints.
 - Corrected constraint fixtures that previously reused CHECK statements under
   UNIQUE, PRIMARY KEY, and exclusion filenames.

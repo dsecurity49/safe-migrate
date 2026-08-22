@@ -1,4 +1,3 @@
-// FILE: src/engine/config.rs
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
@@ -49,20 +48,22 @@ impl Default for Config {
 
 impl Config {
     pub fn load_from_file(path: &Path) -> Result<Self, anyhow::Error> {
-        if path.exists() {
-            let contents = fs::read_to_string(path)?;
-            match toml::from_str(&contents) {
-                Ok(config) => return Ok(config),
-                Err(e) => {
-                    return Err(anyhow::anyhow!(
-                        "Failed to parse config at {}: {}",
-                        path.display(),
-                        e
-                    ));
-                }
-            }
+        match fs::read_to_string(path) {
+            Ok(contents) => Self::parse_file(path, &contents),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(error) => Err(error.into()),
         }
-        Ok(Self::default())
+    }
+
+    pub fn load_required_from_file(path: &Path) -> Result<Self, anyhow::Error> {
+        let contents = fs::read_to_string(path)?;
+        Self::parse_file(path, &contents)
+    }
+
+    fn parse_file(path: &Path, contents: &str) -> Result<Self, anyhow::Error> {
+        toml::from_str(contents).map_err(|error| {
+            anyhow::anyhow!("Failed to parse config at {}: {}", path.display(), error)
+        })
     }
 
     /// Checks if a rule is completely disabled
@@ -102,14 +103,12 @@ impl Config {
         if schemas.is_some_and(|schemas| {
             schemas.is_empty() || schemas.iter().any(|schema| schema.trim().is_empty())
         }) {
-            bail!("schemas must contain at least one non-empty schema name");
+            bail!("schemas must not be empty and no schema name may be blank");
         }
         Ok(schemas)
     }
 
-    /// Reject misspelled primary rule IDs instead of silently accepting no-op
-    /// configuration. The engine supplies its canonical IDs so this module
-    /// does not maintain a second rule catalog.
+    /// Validates configured rule IDs against the primary rule registry.
     pub fn validate_rule_ids<'a>(
         &self,
         primary_rule_ids: impl IntoIterator<Item = &'a str>,
@@ -160,16 +159,13 @@ mod tests {
 
         let config = Config::load_from_file(file.path()).expect("Failed to load valid config");
 
-        // Assert Global Overrides
         assert_eq!(config.tier1_threshold_rows, 500_000);
 
-        // Assert Granular Fallbacks
         assert_eq!(config.rule_tier1_threshold("blocking-constraint"), 5000);
         assert_eq!(config.rule_tier1_threshold("unspecified-rule"), 500_000);
         assert!(!config.auto_sync);
         assert!(!config.cache_encryption);
 
-        // Assert Rule Disabling
         assert!(config.is_rule_disabled("missing-idempotency"));
         assert!(!config.is_rule_disabled("blocking-constraint"));
     }
@@ -197,6 +193,20 @@ mod tests {
         let config = Config::default();
         assert!(config.sync_schemas(Some(&[])).is_err());
         assert!(config.sync_schemas(Some(&["".to_string()])).is_err());
+    }
+
+    #[test]
+    fn missing_optional_config_uses_defaults_but_required_config_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing.toml");
+
+        assert_eq!(
+            Config::load_from_file(&missing)
+                .unwrap()
+                .tier1_threshold_rows,
+            Config::default().tier1_threshold_rows
+        );
+        assert!(Config::load_required_from_file(&missing).is_err());
     }
 
     #[test]

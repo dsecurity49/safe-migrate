@@ -1,5 +1,4 @@
-// FILE: src/rules/transactions.rs
-use crate::analysis::mutations::Mutation;
+use crate::analysis::mutations::{AlterTypeActionMutation, Mutation};
 use crate::analysis::state::{AnalysisState, CascadeResult, MutationResult};
 use crate::engine::config::Config;
 use crate::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
@@ -21,15 +20,12 @@ impl Rule for ConcurrentInsideTransactionRule {
     fn evaluate(
         &self,
         mutation: &Mutation,
-        result: &MutationResult,
+        _result: &MutationResult,
         _pre_state: &crate::analysis::state::PreState,
         state: &AnalysisState,
         _config: &Config,
         _cascade: Option<&CascadeResult>,
     ) -> Vec<Violation> {
-        if *result == MutationResult::Skipped {
-            return vec![];
-        }
         let mut violations = Vec::new();
 
         if !state.local.transactions.is_empty() {
@@ -81,10 +77,10 @@ impl Rule for AlterTypeAddValueRule {
         "alter-type-add-value-txn"
     }
     fn default_tier(&self) -> ViolationTier {
-        ViolationTier::Tier1
+        ViolationTier::Tier2
     }
     fn recipe(&self) -> &'static str {
-        "ALTER TYPE ... ADD VALUE cannot be executed inside a transaction block in PostgreSQL."
+        "Commit before later statements use the new enum value, or put the dependent work in a later migration."
     }
 
     fn evaluate(
@@ -98,6 +94,7 @@ impl Rule for AlterTypeAddValueRule {
     ) -> Vec<Violation> {
         if !state.local.transactions.is_empty()
             && let Mutation::AlterType(alter) = mutation
+            && matches!(alter.action, AlterTypeActionMutation::AddValue { .. })
         {
             return vec![Violation {
                 source_range: None,
@@ -106,7 +103,10 @@ impl Rule for AlterTypeAddValueRule {
                 object_kind: ObjectKind::Type,
                 object_name: alter.id.to_string(),
                 tier: self.default_tier(),
-                reason: format!("ALTER TYPE {} ADD VALUE inside transaction", alter.id),
+                reason: format!(
+                    "ALTER TYPE {} ADD VALUE is inside a transaction; PostgreSQL does not allow the new value to be used until commit",
+                    alter.id
+                ),
                 recipe: self.recipe(),
                 dedup_key: None,
                 sql: None,

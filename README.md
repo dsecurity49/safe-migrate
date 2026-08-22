@@ -1,12 +1,8 @@
 # safe-migrate
 
-safe-migrate analyzes PostgreSQL migrations before they reach production. It
-parses SQL into a typed AST, simulates schema changes in order, and reports
-operations that may block, rewrite data, destroy objects, or fail against the
-modeled database state.
-
-A local cache can supply production schema metadata and table statistics for
-database-aware findings. Linting is otherwise offline.
+safe-migrate checks PostgreSQL migrations against a synchronized database
+baseline. Run `safe-migrate sync`, then use `lint` or `lint-chain` offline to
+simulate migrations against the captured state.
 
 safe-migrate is a review aid, not a substitute for testing migrations on a
 representative database or planning application rollouts and backfills.
@@ -15,7 +11,7 @@ representative database or planning application rollouts and backfills.
 
 ### With Rust
 
-Cargo is the primary installation method when Rust is already available:
+If Rust is installed:
 
 ```bash
 cargo install safe-migrate --locked
@@ -24,21 +20,20 @@ safe-migrate --version
 
 ### Prebuilt binary
 
-The installer detects supported Linux, macOS, Windows/MSYS, and Termux targets, verifies the
-release checksum, and installs the latest published binary:
+The installer selects a supported Linux, macOS, Windows/MSYS, or Termux target
+and verifies the release checksum:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/dsecurity49/safe-migrate/main/install.sh | bash
 safe-migrate --version
 ```
 
-Piping a script from the default branch is convenient but not reproducible.
-Review [install.sh](install.sh) first or download a tagged installer when you
-need to pin exactly what runs:
+To pin the installer and binary to one release:
 
 ```bash
 VERSION='<release-tag>'
-curl -fsSL "https://raw.githubusercontent.com/dsecurity49/safe-migrate/${VERSION}/install.sh" |
+BASE_URL='https://raw.githubusercontent.com/dsecurity49/safe-migrate'
+curl -fsSL "${BASE_URL}/${VERSION}/install.sh" |
   bash -s -- --version "${VERSION}"
 ```
 
@@ -56,6 +51,7 @@ migrations:
 export DATABASE_URL='postgres://readonly_user:password@localhost:5432/app'
 
 safe-migrate sync
+safe-migrate cache inspect
 safe-migrate lint --file migrations/001_add_status.sql
 safe-migrate lint-chain --dir migrations/
 ```
@@ -76,53 +72,103 @@ safe-migrate sync
 `lint` and `lint-chain` do not connect to PostgreSQL unless `auto_sync = true`
 is configured.
 
-## Commands
+`--no-cache` runs the parser and state machine without a verified database
+baseline. Findings use `Tainted` confidence, meaning some database evidence is
+missing, and settings such as migration timeouts remain unknown.
 
-```text
-safe-migrate lint --file migration.sql
-safe-migrate lint-chain --dir migrations/
-safe-migrate sync
-safe-migrate cache inspect
-safe-migrate rules
+### What sync provides
+
+SQL alone cannot show the existing schema, table statistics, dependencies,
+role and search-path context, or inherited timeout settings. `sync` captures
+that baseline once, so later `lint` runs are offline and review the same state.
+
+Cache V6 includes all routine kinds, publications, and redacted subscription
+metadata as well as ordinary schema state. It never stores subscription
+connection strings. Refresh publisher-side state, or a publication edit that
+does not use `ONLY`, remains `Tainted` when PostgreSQL inheritance or remote
+publisher state would decide the outcome.
+
+Sync with the database, role, and defaults used by the migration runner; it
+only reads them. Refresh the cache when that baseline changes. If the runner
+does not already enforce timeouts, put them explicitly in the migration:
+
+```sql
+SET lock_timeout = '5s';
+SET statement_timeout = '15min';
 ```
 
-Useful options:
+`lock_timeout` should be positive and shorter than a positive
+`statement_timeout`; otherwise PostgreSQL can reach the statement timeout
+first.
 
-- `lint` and `lint-chain`: `--cache <path>`, `--config <path>`, `--no-cache`,
-  `--json`, and `--markdown`.
-- `sync`: `--out <path>` selects the cache destination, `--config <path>`
-  selects configuration, and `--schemas public,auth` limits the synchronized
-  schema scope.
-- `cache inspect`: `--cache <path>`, `--config <path>`, and `--json` for a
-  machine-readable summary.
-- `rules`: `--rule <id>` selects one rule, `--json` emits the stable discovery
-  schema, and `--config <path>` shows effective configuration values.
-- `--no-color` disables colored output for every command.
+## Commands
 
-Run `safe-migrate <command> --help` for the complete command reference.
+| Command | Use it for | Important options |
+| --- | --- | --- |
+| `lint --file migration.sql` | Check one migration. | `--cache`, `--config`, `--no-cache`, `--json`, `--markdown` |
+| `lint-chain --dir migrations/` | Check an ordered migration directory while carrying state forward. | `--cache`, `--config`, `--no-cache`, `--json`, `--markdown` |
+| `sync` | Refresh the database baseline. | `--out`, `--schemas`, `--config` |
+| `cache inspect` | Show cache provenance and redacted object counts. | `--cache`, `--json` |
+| `rules` | Discover rules, remediation, and effective settings. | `--rule`, `--json`, `--config` |
 
-### Chain analysis
+`--no-auto-sync` suppresses configured automatic refresh for one `lint` or
+`lint-chain` run. `--no-color` works with every command.
+
+Use the CLI for less common options and subcommands:
+
+```bash
+safe-migrate --help
+safe-migrate <command> --help
+```
+
+Machine-readable output, confidence values, and exit codes are defined in the
+[CLI and report contract](docs/CONTRACT.md).
+
+## Rule discovery
+
+`safe-migrate rules` lists rule IDs, tiers, remediation, supported
+configuration fields, and effective settings. Rule discovery JSON uses schema
+version 2; lint JSON uses schema version 1.
+
+```bash
+safe-migrate rules
+safe-migrate rules --rule require-concurrent-index
+safe-migrate rules --rule require-concurrent-index --json
+```
+
+Unknown IDs are errors. Pass `--config` to include settings from a TOML file.
+
+## Chain analysis
 
 `lint-chain` analyzes files in filename order and carries modeled schema,
 transaction, search-path, and role state across statements and files. This can
 catch failures caused by interactions between otherwise valid migrations.
+
+## Migration timeouts
+
+The Tier 2 `require-lock-timeout` and `require-statement-timeout` rules apply to
+statements that Squawk classifies as potentially disruptive to normal database
+queries. They use the synchronized values and follow ordered SQL changes from
+`SET`, `SET LOCAL`, `SET ... DEFAULT`, `RESET`, and `RESET ALL`, including
+commit, rollback, and savepoint scope. A missing baseline is reported as
+unknown evidence rather than silently treated as a configured timeout.
 
 ## Findings and exit status
 
 Findings use three tiers:
 
 | Tier | Meaning |
-|---|---|
-| Tier 1 — `HALT` | The migration should be corrected before deployment. |
-| Tier 2 — `WARN` | The migration or available evidence needs review. |
-| Tier 3 — `SAFE` | Informational or lower-risk behavior, including irreversible operations that still require normal safeguards. |
+| --- | --- |
+| Tier 1 — `HALT` | Fix before deployment. |
+| Tier 2 — `WARN` | Review required. |
+| Tier 3 — `SAFE` | Informational or lower-risk. |
 
 Reports also include confidence:
 
 | Confidence | Meaning |
-|---|---|
-| `Exact` | The simulator stayed consistent with the supplied SQL and baseline. |
-| `Tainted` | Some baseline evidence or state transition was unavailable, stale, unsupported, or uncertain. |
+| --- | --- |
+| `Exact` | Analysis stayed consistent with the supplied SQL and baseline. |
+| `Tainted` | Baseline evidence or modeled state is incomplete or uncertain. |
 
 `Exact` means exact relative to the modeled evidence; it is not a production
 deployment guarantee.
@@ -136,8 +182,9 @@ output.
 
 ## Configuration
 
-All settings are optional. By default, safe-migrate reads
-`safe-migrate.toml` from the current directory.
+Without `--config`, the CLI reads `safe-migrate.toml` from the current
+directory when it exists and otherwise uses built-in defaults. A path passed
+with `--config` must exist and pass validation.
 
 ```toml
 # Lock-sensitive size thresholds.
@@ -166,11 +213,12 @@ tier2_threshold_rows = 1000
 disabled = true
 ```
 
-Per-rule settings support `disabled`, `tier1_threshold_rows`, and
-`tier2_threshold_rows`. Unknown settings and unknown primary rule IDs are
-rejected, so configuration typos cannot silently change analysis.
+Every primary rule supports `disabled`; only row-sensitive rules support one or
+both threshold fields. `safe-migrate rules --json` lists the supported fields
+for each rule. Unknown settings, unsupported fields, and unknown primary rule
+IDs are errors.
 
-### Suppressing reviewed findings
+### Suppressions
 
 Use a primary rule ID in a SQL comment to suppress that rule for one statement
 or the whole file:
@@ -188,11 +236,12 @@ its review.
 ### Automatic sync
 
 `auto_sync = true` refreshes the cache before `lint` and `lint-chain`. There is
-no command-line flag for it. If refresh fails, safe-migrate prints the cause and
-continues with the previous readable cache; the old cache is replaced only
-after a new cache has been written successfully. `--no-cache` bypasses
-automatic sync. The previous cache must already be V5; an unsupported V1–V4
-cache cannot be reused after a failed refresh.
+no command-line flag to enable it. Use `--no-auto-sync` to suppress it for one
+lint run. If refresh fails, safe-migrate prints the cause and continues with the
+previous readable cache; the old cache is replaced only after a new cache has
+been written successfully. `--no-cache` also bypasses automatic sync. The
+previous cache must already be V6; an unsupported V1–V5 cache cannot be reused
+after a failed refresh.
 
 ### Cache encryption
 
@@ -209,8 +258,8 @@ plaintext caches, and plaintext mode rejects encrypted caches. Changing modes
 requires a fresh `sync`.
 
 Cache files contain schema and role names, dependencies, privileges, and
-statistics. They do not contain connection credentials or password hashes, but
-should still be treated as sensitive and kept out of public artifacts.
+statistics. They do not contain connection credentials or password hashes.
+Treat cache files as sensitive and do not publish them.
 
 ### Cache compatibility
 
@@ -221,73 +270,80 @@ database:
 safe-migrate sync
 ```
 
-v0.5.0 retains Cache V5. Caches written by v0.4.4 and earlier require this
-resynchronization.
+v0.6.0 introduces Cache V6 for synchronized timeout provenance, the complete
+routine namespace, publications, and redacted subscriptions. Every V1–V5 cache
+requires resynchronization.
 
 Use `safe-migrate cache inspect` to view cache provenance and redacted object
 and role counts without connecting to PostgreSQL. It never lists role names or
 membership edges.
 
-## Rule discovery
-
-Use the CLI registry instead of a copied documentation table. It is the
-canonical source for every primary rule's ID, title, impact, default tier,
-remediation, supported configuration fields, and effective configuration.
-
-```bash
-safe-migrate rules
-safe-migrate rules --rule require-concurrent-index
-safe-migrate rules --rule require-concurrent-index --json
-```
-
-Unknown IDs fail without changing analysis configuration. Use `--config` when
-you need the discovery output to reflect a reviewed non-default configuration.
-
 ## GitHub Actions
 
-The reusable Action downloads and verifies the exact release binary, creates
-JSON and Markdown artifacts, appends the Markdown report to the job summary,
-and emits Tier 1 errors and Tier 2 warnings as source annotations. It does not
-connect to a database and defaults to `no-cache: "true"` because files in a
-pull-request checkout are controlled by that pull request.
+The Action uses a baseline: one cache file containing a snapshot of your
+database metadata. The Action manages that file and its GitHub cache entry for
+you.
 
-```yaml
-- id: safe_migrate
-  uses: dsecurity49/safe-migrate@v0.5.0
-  with:
-    mode: lint-chain
-    path: migrations
-    output-dir: safe-migrate-artifacts
-    advisory: "false"
+```text
+Trusted default-branch job
+PostgreSQL -> sync -> runner baseline file -> GitHub Actions cache
 
-- uses: actions/upload-artifact@v4
-  if: always()
-  with:
-    name: safe-migrate-report
-    path: safe-migrate-artifacts/
+Pull-request job
+GitHub Actions cache -> runner baseline file -> lint-chain -> reports
 ```
 
-To use database-aware findings, prepare a cache in a trusted workflow step and
-set both `cache: <path>` and `no-cache: "false"`.
+The Action uses
+`~/.cache/safe-migrate-action/baselines/<baseline>/baseline-v6.cache` on the
+runner. After a successful sync, it saves that file in GitHub Actions cache
+under the `default` baseline name. A pull-request run restores the file to the
+same managed path, then runs `lint-chain` with it; it does not connect to
+PostgreSQL or run `sync` again. GitHub-hosted runners are discarded after the
+job; on self-hosted runners the Action clears the selected baseline before each
+restore.
 
-Set `config: safe-migrate.toml` to use a reviewed project configuration. When
-`config` is omitted, the Action uses built-in defaults and deliberately does
-not read `safe-migrate.toml` from the pull-request workspace.
+### 1. Refresh the baseline
 
-The Action exposes `json-report`, `markdown-report`, `diagnostic-log`, and
-`exit-code`. Set `advisory: "true"` to keep a completed analysis with Tier 1
-findings from failing the job; its `exit-code` output remains `2`. Operational
-errors always fail. Published uses must be pinned to an exact semantic tag or a
-full commit SHA; mutable branch references are rejected. Local `uses: ./`
-testing retains locked source installation.
+Run this after checkout in a trusted default-branch workflow. PostgreSQL must
+be reachable through localhost or a Unix socket; keep its URL in a secret. We
+recommend encrypting the saved baseline: it contains schema and role metadata,
+and GitHub cache contents are not signed. Store a 64-character hexadecimal key
+as `SAFE_MIGRATE_CACHE_KEY` and pass it to both workflows.
 
-## Documentation
+```yaml
+- uses: dsecurity49/safe-migrate@v0.6.0
+  env:
+    DATABASE_URL: ${{ secrets.SAFE_MIGRATE_DATABASE_URL }}
+    SAFE_MIGRATE_CACHE_KEY: ${{ secrets.SAFE_MIGRATE_CACHE_KEY }}
+  with:
+    path: migrations
+    sync: "true"
+    schemas: public
+    encrypted-cache: "true"
+```
 
-- [CLI and report contract](docs/CONTRACT.md)
-- [Contributing](CONTRIBUTING.md)
-- [Maintainer documentation](docs/README.md)
-- [Release history](CHANGELOG.md)
-- [Releases and binary downloads](https://github.com/dsecurity49/safe-migrate/releases)
+Replace `public` with the schemas that contain your migrations, or omit
+`schemas` to synchronize all non-system schemas.
+
+### 2. Lint pull requests without syncing
+
+Add this after checkout in the pull-request workflow:
+
+```yaml
+- uses: dsecurity49/safe-migrate@v0.6.0
+  env:
+    SAFE_MIGRATE_CACHE_KEY: ${{ secrets.SAFE_MIGRATE_CACHE_KEY }}
+  with:
+    path: migrations
+    encrypted-cache: "true"
+```
+
+Do not set `sync: "true"` here, and do not add `actions/cache`. The Action
+restores the baseline itself, passes it to `lint-chain`, and publishes the
+report. Fork pull requests do not receive the encryption key, so they lint
+without the baseline and report `Tainted` confidence.
+
+For TOML configuration, encrypted caches, named baselines, and complete
+workflows, see the [GitHub Action guide](docs/GITHUB_ACTIONS.md).
 
 ## License
 

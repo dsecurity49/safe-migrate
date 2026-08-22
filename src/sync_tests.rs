@@ -6,8 +6,8 @@ use crate::model::relation::{Persistence, RelationKind, RelationState};
 mod tests {
     use super::*;
     use crate::sync::{
-        cache_search_path, is_local_host, is_system_schema, parse_search_path_setting,
-        relation_owner_id, sync_cache,
+        cache_search_path, database_config_is_local, ensure_supported_postgres_version,
+        is_local_host, is_system_schema, parse_search_path_setting, relation_owner_id, sync_cache,
     };
     use crate::test_support::EnvironmentValueGuard;
     use serde::Serialize;
@@ -42,6 +42,32 @@ mod tests {
         assert_eq!(std::fs::read(tmp.path()).unwrap(), b"known-good-cache");
     }
 
+    fn assert_invalid_database_url_preserves_existing_cache(database_url: &str) {
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(b"known-good-cache").unwrap();
+        tmp.flush().unwrap();
+
+        let _database_url = EnvironmentValueGuard::set("DATABASE_URL", database_url);
+        let error = sync_cache(tmp.path(), None, false).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("DATABASE_URL must not be empty or whitespace")
+        );
+        assert_eq!(std::fs::read(tmp.path()).unwrap(), b"known-good-cache");
+    }
+
+    #[test]
+    fn test_blank_database_url_failure_preserves_existing_cache() {
+        assert_invalid_database_url_preserves_existing_cache("");
+    }
+
+    #[test]
+    fn test_whitespace_database_url_failure_preserves_existing_cache() {
+        assert_invalid_database_url_preserves_existing_cache(" \t\r\n");
+    }
+
     #[test]
     fn test_remote_host_detection_keeps_local_connections_supported() {
         assert!(is_local_host("localhost"));
@@ -51,6 +77,30 @@ mod tests {
         assert!(is_local_host("/var/run/postgresql"));
         assert!(!is_local_host("db.internal.example"));
         assert!(!is_local_host("127.0.0.1.attacker.example"));
+    }
+
+    #[test]
+    fn test_database_config_rejects_remote_hostaddr() {
+        let local: postgres::Config = "host=localhost hostaddr=127.0.0.1 dbname=safe_migrate"
+            .parse()
+            .unwrap();
+        let remote: postgres::Config = "host=localhost hostaddr=10.0.0.5 dbname=safe_migrate"
+            .parse()
+            .unwrap();
+
+        assert!(database_config_is_local(&local));
+        assert!(!database_config_is_local(&remote));
+    }
+
+    #[test]
+    fn test_sync_requires_postgresql_14_or_newer() {
+        let error = ensure_supported_postgres_version(130_012).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("requires PostgreSQL 14 or newer")
+        );
+        assert!(ensure_supported_postgres_version(140_000).is_ok());
     }
 
     #[test]
@@ -119,6 +169,8 @@ mod tests {
         cache.metadata.source_role = Some("app_user".into());
         cache.metadata.source_session_role = Some("login_user".into());
         cache.metadata.source_search_path = Some(vec!["$user".into(), "public".into()]);
+        cache.metadata.source_lock_timeout_ms = 750;
+        cache.metadata.source_statement_timeout_ms = 30_000;
         cache.metadata.schemas = Some(vec!["app".into(), "public".into()]);
         cache.search_path = vec!["app".into(), "public".into()];
 
@@ -168,19 +220,60 @@ mod tests {
                 },
             },
         );
+        cache.publications.insert(
+            "app_changes".into(),
+            crate::model::replication::PublicationState {
+                name: "app_changes".into(),
+                owner: Some("app_user".into()),
+                scope: crate::analysis::facts::PublicationScope::Explicit(vec![
+                    crate::analysis::facts::PublicationObjectFact::Table {
+                        name: crate::ast::identifiers::QualifiedName::new(
+                            Some(crate::ast::identifiers::Ident::new("public", true)),
+                            crate::ast::identifiers::Ident::new("test_table", true),
+                        ),
+                        only: true,
+                        include_partitions: false,
+                        columns: Some(vec!["id".into()]),
+                        row_filter: Some(crate::analysis::facts::PublicationRowFilter::CatalogSql(
+                            "id > 0".into(),
+                        )),
+                    },
+                ]),
+                params: vec![crate::analysis::facts::AttributeFact {
+                    name: "publish".into(),
+                    value: "insert, update".into(),
+                }],
+                generation: 0,
+            },
+        );
+        cache.subscriptions.insert(
+            "app_subscriber".into(),
+            crate::model::replication::SubscriptionState {
+                name: "app_subscriber".into(),
+                owner: Some("app_user".into()),
+                connection: crate::analysis::facts::ConnectionTarget::Redacted,
+                publications: vec!["app_changes".into()],
+                params: Some(vec![crate::analysis::facts::AttributeFact {
+                    name: "streaming".into(),
+                    value: "parallel".into(),
+                }]),
+                enabled: false,
+                slot_name: None,
+                generation: 0,
+            },
+        );
 
-        // Serialize to JSON
-        let versioned = crate::db::cache::DbCacheVersioned::V5(Box::new(cache));
+        // Cache V6 uses bincode.
+        let versioned = crate::db::cache::DbCacheVersioned::V6(Box::new(cache));
         let config = bincode::config::standard().with_variable_int_encoding();
         let encoded = bincode::serde::encode_to_vec(&versioned, config).unwrap();
 
-        // Deserialize back
         let decoded: crate::db::cache::DbCacheVersioned =
             bincode::serde::decode_from_slice(&encoded, config)
                 .unwrap()
                 .0;
-        let crate::db::cache::DbCacheVersioned::V5(deserialized) = decoded else {
-            panic!("Expected V5");
+        let crate::db::cache::DbCacheVersioned::V6(deserialized) = decoded else {
+            panic!("Expected V6");
         };
         assert_eq!(deserialized.pg_version_num, Some(160000));
         assert_eq!(
@@ -203,11 +296,22 @@ mod tests {
             deserialized.metadata.source_search_path.as_deref(),
             Some(["$user".to_string(), "public".to_string()].as_slice())
         );
+        assert_eq!(deserialized.metadata.source_lock_timeout_ms, 750);
+        assert_eq!(deserialized.metadata.source_statement_timeout_ms, 30_000);
         assert_eq!(
             deserialized.metadata.schemas.as_deref(),
             Some(["app".to_string(), "public".to_string()].as_slice())
         );
         assert_eq!(deserialized.search_path, ["app", "public"]);
+        assert!(matches!(
+            deserialized
+                .subscriptions
+                .get("app_subscriber")
+                .map(|subscription| &subscription.connection),
+            Some(crate::analysis::facts::ConnectionTarget::Redacted)
+        ));
+        assert_eq!(deserialized.publications.len(), 1);
+        assert_eq!(deserialized.subscriptions.len(), 1);
         assert!(
             deserialized
                 .relations
@@ -257,15 +361,15 @@ mod tests {
         });
         cache.insert_baseline(id.clone(), rel);
 
-        let versioned = crate::db::cache::DbCacheVersioned::V5(Box::new(cache));
+        let versioned = crate::db::cache::DbCacheVersioned::V6(Box::new(cache));
         let config = bincode::config::standard().with_variable_int_encoding();
         let encoded = bincode::serde::encode_to_vec(&versioned, config).unwrap();
         let decoded: crate::db::cache::DbCacheVersioned =
             bincode::serde::decode_from_slice(&encoded, config)
                 .unwrap()
                 .0;
-        let crate::db::cache::DbCacheVersioned::V5(deserialized) = decoded else {
-            panic!("Expected V5");
+        let crate::db::cache::DbCacheVersioned::V6(deserialized) = decoded else {
+            panic!("Expected V6");
         };
         let rel = deserialized.relations.get(&id).unwrap();
         assert_eq!(rel.columns[0].default_expr_text, Some("now()".into()));
@@ -286,7 +390,7 @@ mod tests {
     }
 
     #[test]
-    fn type_identity_links_do_not_change_the_v5_bincode_layout() {
+    fn routine_kind_is_part_of_the_final_v6_layout() {
         #[derive(Serialize)]
         struct LegacyFunctionState {
             id: ObjectId,
@@ -306,31 +410,49 @@ mod tests {
             language: "sql".into(),
             security: crate::model::function::SecurityMode::Invoker,
         };
-        let current = crate::model::function::FunctionState {
-            id,
-            arg_types: vec!["mood".into()],
-            arg_type_ids: vec![Some(ObjectId::new("public", "mood"))],
-            return_type: "mood".into(),
-            return_type_id: Some(ObjectId::new("public", "mood")),
-            volatility: crate::model::function::Volatility::Volatile,
-            language: "sql".into(),
-            security: crate::model::function::SecurityMode::Invoker,
-        };
         let config = bincode::config::standard().with_variable_int_encoding();
         let legacy_bytes = bincode::serde::encode_to_vec(&legacy, config).unwrap();
-        let current_bytes = bincode::serde::encode_to_vec(&current, config).unwrap();
 
-        assert_eq!(current_bytes, legacy_bytes);
-        let restored: crate::model::function::FunctionState =
-            bincode::serde::decode_from_slice(&legacy_bytes, config)
-                .unwrap()
-                .0;
-        assert!(restored.arg_type_ids.is_empty());
-        assert!(restored.return_type_id.is_none());
+        for routine_kind in [
+            crate::model::function::RoutineKind::Function,
+            crate::model::function::RoutineKind::Procedure,
+            crate::model::function::RoutineKind::Aggregate,
+            crate::model::function::RoutineKind::Window,
+        ] {
+            let current = crate::model::function::FunctionState {
+                id: id.clone(),
+                routine_kind,
+                arg_types: vec!["mood".into()],
+                arg_type_ids: vec![Some(ObjectId::new("public", "mood"))],
+                return_type: "mood".into(),
+                return_type_id: Some(ObjectId::new("public", "mood")),
+                volatility: crate::model::function::Volatility::Volatile,
+                language: "sql".into(),
+                security: crate::model::function::SecurityMode::Invoker,
+            };
+            let current_bytes = bincode::serde::encode_to_vec(&current, config).unwrap();
+            assert_ne!(current_bytes, legacy_bytes);
+            let restored: crate::model::function::FunctionState =
+                bincode::serde::decode_from_slice(&current_bytes, config)
+                    .unwrap()
+                    .0;
+            assert_eq!(restored.routine_kind, routine_kind);
+            assert!(restored.arg_type_ids.is_empty());
+            assert!(restored.return_type_id.is_none());
+        }
+
+        assert!(
+            bincode::serde::decode_from_slice::<crate::model::function::FunctionState, _>(
+                &legacy_bytes,
+                config,
+            )
+            .is_err(),
+            "the pre-release routine layout must require a fresh V6 sync"
+        );
     }
 
     #[test]
-    fn domain_type_identity_link_does_not_change_the_v5_bincode_layout() {
+    fn domain_type_identity_link_does_not_change_the_cache_bincode_layout() {
         #[allow(dead_code)]
         #[derive(Serialize)]
         enum LegacyTypeKind {

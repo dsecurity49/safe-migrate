@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  workflow_call:
   push:
     branches: [ "main" ]
   pull_request:
@@ -91,7 +92,6 @@ jobs:
           - 5432:5432
     env:
       DATABASE_URL: postgres://safe_migrate:safe_migrate@localhost:5432/safe_migrate
-      SAFE_MIGRATE_DIFF_VERBOSITY: 2
 
     steps:
       - name: Checkout repository
@@ -124,11 +124,17 @@ jobs:
       - name: Verify encrypted cache CLI contract
         run: scripts/live-cache-encryption
 
+      - name: Verify routine and replication catalog synchronization
+        run: scripts/live-catalog-sync
+
+      - name: Compare routine and replication state with PostgreSQL
+        run: scripts/live-catalog-differential
+
       - name: Compare simulator state with PostgreSQL
         shell: bash
         run: |
           set -o pipefail
-          scripts/live-differential 2>&1 | tee "live-differential-postgres-${{ matrix.postgres }}.log"
+          scripts/live-differential -vv 2>&1 | tee "live-differential-postgres-${{ matrix.postgres }}.log"
 
       - name: Upload differential log
         if: always()
@@ -141,11 +147,168 @@ jobs:
   action-smoke:
     name: Reusable Action smoke test
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18@sha256:3a82e1f56c8f0f5616a11103ac3d47e632c3938698946a7ad26da0df1334744a
+        env:
+          POSTGRES_DB: safe_migrate
+          POSTGRES_USER: safe_migrate
+          POSTGRES_PASSWORD: safe_migrate
+        options: >-
+          --health-cmd "pg_isready -U safe_migrate -d safe_migrate"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable 2026-07-16
+
+      - name: Create Action smoke fixtures
+        id: sync_fixture
+        shell: bash
+        run: |
+          migration_path="$RUNNER_TEMP/action-smoke.sql"
+          auto_sync_config="$RUNNER_TEMP/action-auto-sync.toml"
+          auto_sync_encrypted_config="$RUNNER_TEMP/action-auto-sync-encrypted.toml"
+          printf '%s\n' 'CREATE SCHEMA action_smoke;' > "$migration_path"
+          printf '%s\n' 'auto_sync = true' > "$auto_sync_config"
+          printf '%s\n' \
+            'auto_sync = true' \
+            'cache_encryption = true' \
+            > "$auto_sync_encrypted_config"
+          printf '%s\n' "migration=$migration_path" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "auto-sync-config=$auto_sync_config" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "auto-sync-encrypted-config=$auto_sync_encrypted_config" \
+            >> "$GITHUB_OUTPUT"
+
+      - name: Synchronize and analyze through the Action
+        id: synchronized
+        uses: ./
+        env:
+          DATABASE_URL: "host=localhost port=5432 user=safe_migrate password=safe_migrate dbname=safe_migrate options='-c lock_timeout=5s -c statement_timeout=15min'"
+          SAFE_MIGRATE_CACHE_KEY: "1111111111111111111111111111111111111111111111111111111111111111"
+        with:
+          mode: lint
+          path: ${{ steps.sync_fixture.outputs.migration }}
+          config: ${{ steps.sync_fixture.outputs.auto-sync-encrypted-config }}
+          sync: "true"
+          schemas: public
+          baseline: action-smoke
+          encrypted-cache: "true"
+          output-dir: action-synchronized-artifacts
+
+      - name: Remove the synchronized local file
+        shell: bash
+        env:
+          CACHE_PATH: ${{ steps.synchronized.outputs.cache-path }}
+          SYNC_STATUS: ${{ steps.synchronized.outputs.sync-status }}
+          BASELINE_SOURCE: ${{ steps.synchronized.outputs.baseline-source }}
+          JSON_REPORT: ${{ steps.synchronized.outputs.json-report }}
+          DIAGNOSTIC_LOG: ${{ steps.synchronized.outputs.diagnostic-log }}
+        run: |
+          test "$SYNC_STATUS" = "refreshed"
+          test "$BASELINE_SOURCE" = "synced"
+          test "$CACHE_PATH" = "$HOME/.cache/safe-migrate-action/baselines/action-smoke/baseline-v6.cache"
+          jq -e '.baseline.auto_sync == "bypassed"' "$JSON_REPORT"
+          grep -q -- '--no-auto-sync bypasses configured automatic cache sync' \
+            "$DIAGNOSTIC_LOG"
+          ! grep -q 'Automatic cache sync enabled' "$DIAGNOSTIC_LOG"
+          rm -f -- "$CACHE_PATH"
+
+      - name: Restore and analyze without database access
+        id: restored
+        uses: ./
+        env:
+          SAFE_MIGRATE_CACHE_KEY: "1111111111111111111111111111111111111111111111111111111111111111"
+        with:
+          mode: lint
+          path: ${{ steps.sync_fixture.outputs.migration }}
+          config: ${{ steps.sync_fixture.outputs.auto-sync-encrypted-config }}
+          baseline: action-smoke
+          encrypted-cache: "true"
+          output-dir: action-restored-artifacts
+
+      - name: Verify synchronized timeout evidence
+        shell: bash
+        env:
+          JSON_REPORT: ${{ steps.restored.outputs.json-report }}
+          EXIT_CODE: ${{ steps.restored.outputs.exit-code }}
+          SYNC_STATUS: ${{ steps.restored.outputs.sync-status }}
+          BASELINE_SOURCE: ${{ steps.restored.outputs.baseline-source }}
+          DIAGNOSTIC_LOG: ${{ steps.restored.outputs.diagnostic-log }}
+        run: |
+          test "$EXIT_CODE" = "0"
+          test "$SYNC_STATUS" = "not-requested"
+          test "$BASELINE_SOURCE" = "github-cache"
+          jq -e \
+            '.baseline.status == "available"
+             and .baseline.observed_settings.lock_timeout_ms == 5000
+             and .baseline.observed_settings.statement_timeout_ms == 900000
+             and ([.violations[].rule_id] | index("require-lock-timeout") | not)
+             and ([.violations[].rule_id] | index("require-statement-timeout") | not)' \
+            "$JSON_REPORT"
+          jq -e '.baseline.auto_sync == "bypassed"' "$JSON_REPORT"
+          grep -q -- '--no-auto-sync bypasses configured automatic cache sync' \
+            "$DIAGNOSTIC_LOG"
+          ! grep -q 'Automatic cache sync enabled' "$DIAGNOSTIC_LOG"
+
+      - name: Verify encrypted baseline without a key falls back visibly
+        id: encrypted_key_missing
+        uses: ./
+        with:
+          mode: lint
+          path: ${{ steps.sync_fixture.outputs.migration }}
+          baseline: action-smoke
+          encrypted-cache: "true"
+          output-dir: action-encrypted-key-missing-artifacts
+
+      - name: Assert encrypted fork-style fallback
+        shell: bash
+        env:
+          JSON_REPORT: ${{ steps.encrypted_key_missing.outputs.json-report }}
+          EXIT_CODE: ${{ steps.encrypted_key_missing.outputs.exit-code }}
+          BASELINE_SOURCE: ${{ steps.encrypted_key_missing.outputs.baseline-source }}
+        run: |
+          test "$EXIT_CODE" = "0"
+          test "$BASELINE_SOURCE" = "unavailable"
+          jq -e \
+            '.baseline.status == "unavailable" and .confidence == "Tainted"' \
+            "$JSON_REPORT"
+
+      - name: Verify a missing synchronized baseline falls back visibly
+        id: missing_baseline
+        uses: ./
+        with:
+          mode: lint
+          path: ${{ steps.sync_fixture.outputs.migration }}
+          config: ${{ steps.sync_fixture.outputs.auto-sync-config }}
+          baseline: action-missing-${{ github.run_id }}-${{ github.run_attempt }}
+          output-dir: action-missing-baseline-artifacts
+
+      - name: Assert missing-baseline report contract
+        shell: bash
+        env:
+          JSON_REPORT: ${{ steps.missing_baseline.outputs.json-report }}
+          DIAGNOSTIC_LOG: ${{ steps.missing_baseline.outputs.diagnostic-log }}
+          EXIT_CODE: ${{ steps.missing_baseline.outputs.exit-code }}
+          BASELINE_SOURCE: ${{ steps.missing_baseline.outputs.baseline-source }}
+        run: |
+          test "$EXIT_CODE" = "0"
+          test "$BASELINE_SOURCE" = "unavailable"
+          jq -e \
+            '.baseline.status == "unavailable"
+             and .baseline.auto_sync == "bypassed"
+             and .confidence == "Tainted"' \
+            "$JSON_REPORT"
+          grep -q -- '--no-cache bypasses configured automatic cache sync' \
+            "$DIAGNOSTIC_LOG"
 
       - name: Generate review artifacts with the local Action
         id: safe_migrate
@@ -155,6 +318,28 @@ jobs:
           path: live_tests/rule_01_irreversible-migration/safe_002_add_col.sql
           no-cache: "true"
           output-dir: action-smoke-artifacts
+
+      - name: Reject a missing explicit cache
+        id: missing_explicit_cache
+        continue-on-error: true
+        uses: ./
+        with:
+          mode: lint
+          path: ${{ steps.sync_fixture.outputs.migration }}
+          cache: ${{ runner.temp }}/missing-explicit.cache
+          output-dir: action-missing-explicit-cache-artifacts
+
+      - name: Assert missing explicit cache is operational
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.missing_explicit_cache.outcome }}
+          EXIT_CODE: ${{ steps.missing_explicit_cache.outputs.exit-code }}
+          DIAGNOSTIC_LOG: ${{ steps.missing_explicit_cache.outputs.diagnostic-log }}
+        run: |
+          test "$OUTCOME" = "failure"
+          test "$EXIT_CODE" = "1"
+          grep -q 'Explicit cache does not exist or is not a file' \
+            "$DIAGNOSTIC_LOG"
 
       - name: Verify generated artifacts
         shell: bash
@@ -194,6 +379,32 @@ jobs:
           grep -q '"rule_id": "drop-database"' \
             "$JSON_REPORT"
 
+      - name: Reject encryption mode that disagrees with explicit config
+        id: encryption_config_mismatch
+        continue-on-error: true
+        uses: ./
+        env:
+          SAFE_MIGRATE_CACHE_KEY: "1111111111111111111111111111111111111111111111111111111111111111"
+        with:
+          mode: lint
+          path: live_tests/rule_01_irreversible-migration/safe_002_add_col.sql
+          config: safe-migrate.toml
+          baseline: action-smoke
+          encrypted-cache: "true"
+          output-dir: action-encryption-config-mismatch-artifacts
+
+      - name: Assert encryption mismatch is operational
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.encryption_config_mismatch.outcome }}
+          EXIT_CODE: ${{ steps.encryption_config_mismatch.outputs.exit-code }}
+          DIAGNOSTIC_LOG: ${{ steps.encryption_config_mismatch.outputs.diagnostic-log }}
+        run: |
+          test "$OUTCOME" = "failure"
+          test "$EXIT_CODE" = "1"
+          grep -q 'encrypted-cache requires cache_encryption = true' \
+            "$DIAGNOSTIC_LOG"
+
       - name: Verify advisory mode preserves the analyzer status
         id: advisory
         uses: ./
@@ -214,13 +425,14 @@ jobs:
           test -s "$JSON_REPORT"
           grep -q '"tier": "Tier1"' "$JSON_REPORT"
 
-      - name: Verify operational failures produce diagnostic artifacts
+      - name: Verify a missing explicit config produces diagnostic artifacts
         id: operational_error
         continue-on-error: true
         uses: ./
         with:
           mode: lint
-          path: missing-migration.sql
+          path: live_tests/rule_01_irreversible-migration/safe_002_add_col.sql
+          config: missing-safe-migrate.toml
           no-cache: "true"
           output-dir: action-operational-error-artifacts
 
@@ -241,5 +453,5 @@ jobs:
           jq -e \
             '.status == "operational_error" and .exit_code == 1' \
             "$JSON_REPORT"
-          grep -q 'missing-migration.sql' \
+          grep -q 'explicit config does not exist or is not a file' \
             "$DIAGNOSTIC_LOG"

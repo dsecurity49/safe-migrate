@@ -1,8 +1,8 @@
-// FILE: src/db/cache.rs
 use crate::ast::identifiers::ObjectId;
 use crate::model::constraint::ConstraintState;
 use crate::model::function::FunctionState;
 use crate::model::relation::RelationState;
+use crate::model::replication::{PublicationState, SubscriptionState};
 use crate::model::role::RoleState;
 use crate::model::schema::SchemaState;
 use crate::model::sequence::SequenceState;
@@ -63,6 +63,14 @@ pub struct CacheMetadata {
     pub source_session_role: Option<String>,
     /// Parsed `search_path` setting before PostgreSQL expands `$user`.
     pub source_search_path: Option<Vec<String>>,
+    /// Effective `lock_timeout` observed on the fresh synchronization
+    /// connection, normalized to milliseconds. PostgreSQL uses zero to mean
+    /// that the timeout is disabled.
+    pub source_lock_timeout_ms: u64,
+    /// Effective `statement_timeout` observed on the fresh synchronization
+    /// connection, normalized to milliseconds. PostgreSQL uses zero to mean
+    /// that the timeout is disabled.
+    pub source_statement_timeout_ms: u64,
     /// Explicit schema scope passed to sync. `None` means all non-system
     /// schemas were requested.
     pub schemas: Option<Vec<String>>,
@@ -84,22 +92,25 @@ pub struct DbCache {
     pub schemas: HashMap<String, SchemaState>,
     pub sequences: HashMap<ObjectId, SequenceState>,
     pub dependencies: Vec<DependencyCache>,
+    pub publications: HashMap<String, PublicationState>,
+    pub subscriptions: HashMap<String, SubscriptionState>,
 }
 
-pub const CACHE_FORMAT_VERSION: u32 = 5;
+pub const CACHE_FORMAT_VERSION: u32 = 6;
 
-pub const CACHE_V5_MAGIC: &[u8] = b"SMCACHE05";
+pub const CACHE_V6_MAGIC: &[u8] = b"SMCACHE06";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DbCacheVersioned {
     // Unit variants reserve the historic bincode discriminants. The reader
-    // rejects non-V5 headers before decoding, so legacy layouts are not part
+    // rejects non-V6 headers before decoding, so legacy layouts are not part
     // of the production model and cannot be converted accidentally.
     V1,
     V2,
     V3,
     V4,
     V5(Box<DbCache>),
+    V6(Box<DbCache>),
 }
 
 impl DbCacheVersioned {
@@ -110,6 +121,7 @@ impl DbCacheVersioned {
             DbCacheVersioned::V3 => 3,
             DbCacheVersioned::V4 => 4,
             DbCacheVersioned::V5(_) => 5,
+            DbCacheVersioned::V6(_) => 6,
         }
     }
 
@@ -118,11 +130,12 @@ impl DbCacheVersioned {
             DbCacheVersioned::V1
             | DbCacheVersioned::V2
             | DbCacheVersioned::V3
-            | DbCacheVersioned::V4 => Err(
+            | DbCacheVersioned::V4
+            | DbCacheVersioned::V5(_) => Err(
                 "This cache format is unsupported. Run `safe-migrate sync` to rebuild it."
                     .to_string(),
             ),
-            DbCacheVersioned::V5(c) => Ok(*c),
+            DbCacheVersioned::V6(c) => Ok(*c),
         }
     }
 }
@@ -150,6 +163,8 @@ impl DbCache {
             schemas: HashMap::new(),
             sequences: HashMap::new(),
             dependencies: Vec::new(),
+            publications: HashMap::new(),
+            subscriptions: HashMap::new(),
         }
     }
 
@@ -180,12 +195,18 @@ mod tests {
                 "This cache format is unsupported. Run `safe-migrate sync` to rebuild it."
             );
         }
+        let v5 = DbCacheVersioned::V5(Box::default());
+        assert_eq!(v5.format_version(), 5);
+        assert_eq!(
+            v5.into_cache().unwrap_err(),
+            "This cache format is unsupported. Run `safe-migrate sync` to rebuild it."
+        );
     }
 
     #[test]
-    fn current_cache_format_is_v5() {
-        assert_eq!(CACHE_FORMAT_VERSION, 5);
-        assert_eq!(DbCacheVersioned::V5(Box::default()).format_version(), 5);
-        assert_eq!(CACHE_V5_MAGIC, b"SMCACHE05");
+    fn current_cache_format_is_v6() {
+        assert_eq!(CACHE_FORMAT_VERSION, 6);
+        assert_eq!(DbCacheVersioned::V6(Box::default()).format_version(), 6);
+        assert_eq!(CACHE_V6_MAGIC, b"SMCACHE06");
     }
 }

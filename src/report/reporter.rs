@@ -1,4 +1,3 @@
-// FILE: src/report/reporter.rs
 use crate::analysis::state::Confidence;
 use crate::report::violations::{ReportFinding, Violation, ViolationTier};
 use crate::rules::destructive::IRREVERSIBLE_MIGRATION_RULE_ID;
@@ -273,7 +272,6 @@ impl Reporter {
 
         let width = terminal_width();
 
-        // Header box using comfy-table
         let mut header_table = Table::new();
         header_table.load_preset(comfy_table::presets::UTF8_BORDERS_ONLY);
         header_table.set_content_arrangement(comfy_table::ContentArrangement::DynamicFullWidth);
@@ -297,11 +295,8 @@ impl Reporter {
 
         println!();
 
-        // Separator width: 80-85% of terminal width
         let sep_width = (width as f32 * 0.82) as usize;
 
-        // Group violations by sql key (same sql text + same object_name = same statement)
-        // Each group is (primary_idx, Vec<secondary_idxs>)
         let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
         let mut sql_to_group_idx: std::collections::HashMap<(&str, &str), usize> =
             std::collections::HashMap::new();
@@ -318,7 +313,6 @@ impl Reporter {
                 groups.push((i, Vec::new()));
                 sql_to_group_idx.insert(key, new_gi);
             } else {
-                // If sql is None, it never groups
                 groups.push((i, Vec::new()));
             }
         }
@@ -363,7 +357,6 @@ impl Reporter {
 
             println!("   reason : {}", v.reason);
 
-            // recipe: clean up multi-line strings
             let clean_recipe = v
                 .recipe
                 .lines()
@@ -380,7 +373,6 @@ impl Reporter {
                 }
             }
 
-            // Print 'also :' for secondary violations on same statement
             for &sec_idx in secondary_idxs {
                 let sv = &violations[sec_idx];
                 println!(
@@ -399,7 +391,6 @@ impl Reporter {
 
         println!();
 
-        // Summary box using comfy-table
         let mut summary_table = Table::new();
         summary_table.load_preset(comfy_table::presets::UTF8_BORDERS_ONLY);
         summary_table.set_content_arrangement(comfy_table::ContentArrangement::DynamicFullWidth);

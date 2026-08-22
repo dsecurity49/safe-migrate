@@ -16,7 +16,8 @@ fi
 
 N=1
 write() {
-    local name=$(printf "%04d_%s" "$N" "$1")
+    local name
+    name=$(printf "%04d_%s" "$N" "$1")
     echo "$2" > "$DIR/$name.sql"
     N=$((N+1))
 }
@@ -304,7 +305,6 @@ write "full_migration_10" "
 REFRESH MATERIALIZED VIEW CONCURRENTLY mv_product_stats;
 "
 
-# More complex patterns
 write "complex_alter_chain" "
 ALTER TABLE users ADD COLUMN col1 int;
 ALTER TABLE users ADD COLUMN col2 text;
@@ -399,7 +399,6 @@ DROP VIEW IF EXISTS mv_product_stats;
 DROP SCHEMA IF EXISTS app CASCADE;
 "
 
-# Generate more to reach 500
 for i in $(seq 1 50); do
     write "gen_create_table_$i" "CREATE TABLE t_$i (id serial PRIMARY KEY, val text DEFAULT 'x$i');"
 done

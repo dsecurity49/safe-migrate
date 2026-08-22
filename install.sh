@@ -35,6 +35,32 @@ normalize_version() {
   esac
 }
 
+validate_version() {
+  version=$1
+  [ "$version" = latest ] && return
+  case "$version" in
+    v*) components=${version#v} ;;
+    *) die "Version must be latest or an exact vMAJOR.MINOR.PATCH tag: $version" ;;
+  esac
+  major=${components%%.*}
+  remainder=${components#*.}
+  [ "$remainder" != "$components" ] || \
+    die "Version must be latest or an exact vMAJOR.MINOR.PATCH tag: $version"
+  minor=${remainder%%.*}
+  patch=${remainder#*.}
+  [ "$patch" != "$remainder" ] || \
+    die "Version must be latest or an exact vMAJOR.MINOR.PATCH tag: $version"
+  case "$patch" in
+    *.*) die "Version must be latest or an exact vMAJOR.MINOR.PATCH tag: $version" ;;
+  esac
+  for component in "$major" "$minor" "$patch"; do
+    case "$component" in
+      0|[1-9]|[1-9][0-9]*) ;;
+      *) die "Version must be latest or an exact vMAJOR.MINOR.PATCH tag: $version" ;;
+    esac
+  done
+}
+
 fetch_latest_version() {
   curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
     | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' \
@@ -42,24 +68,21 @@ fetch_latest_version() {
 }
 
 detect_linux_flavor() {
-  # Check for Termux (Android) — always musl
+  # Termux uses the published musl archive.
   if [ -n "${TERMUX_VERSION:-}" ] || [ -n "${ANDROID_ROOT:-}" ]; then
     printf '%s\n' musl
     return
   fi
 
-  # Check for Termux prefix path
   case "${PREFIX:-}" in
     /data/data/com.termux/*) printf '%s\n' musl; return ;;
   esac
 
-  # Check if musl is detected via ldd
   if command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -qi musl; then
     printf '%s\n' musl
     return
   fi
 
-  # Default to glibc (GNU)
   printf '%s\n' gnu
 }
 
@@ -97,10 +120,13 @@ candidate_targets() {
   case "$TARGET_OVERRIDE" in
     "")
       ;;
-    *)
+    x86_64-unknown-linux-gnu|aarch64-unknown-linux-gnu|\
+    x86_64-unknown-linux-musl|aarch64-unknown-linux-musl|\
+    x86_64-apple-darwin|aarch64-apple-darwin|x86_64-pc-windows-msvc)
       printf '%s\n' "$TARGET_OVERRIDE"
       return
       ;;
+    *) die "Unsupported release target: $TARGET_OVERRIDE" ;;
   esac
 
   case "$os" in
@@ -130,7 +156,7 @@ candidate_targets() {
     MINGW*|MSYS*|CYGWIN*)
       case "$arch" in
         x86_64|amd64) arch="x86_64" ;;
-        aarch64|arm64) arch="aarch64" ;;
+        aarch64|arm64) die "Windows ARM64 release assets are not published" ;;
         *) die "Unsupported architecture: $arch" ;;
       esac
       printf '%s\n' "${arch}-pc-windows-msvc"
@@ -171,7 +197,6 @@ download_asset() {
     if [ "$rc" -eq 22 ]; then
       return 1  # 404 / not found — expected for fallback targets
     fi
-    # Network/SSL error — capture details for final error message
     errmsg=$(tr '\n' ' ' < "${TMP_DIR}/curl_stderr" 2>/dev/null || true)
     printf '%s\n' "network-error:${target}:${rc}:${errmsg}" >&2
     return 2
@@ -184,10 +209,19 @@ download_asset() {
     tar.gz) sha_url="${url%.tar.gz}.sha256" ;;
   esac
   sha_file="${part}.sha256"
-  if ! curl -fsSL -o "$sha_file" "$sha_url" 2>/dev/null; then
+  set +e
+  curl -fsSL -o "$sha_file" "$sha_url" 2>"${TMP_DIR}/checksum_stderr"
+  sha_rc=$?
+  set -e
+  if [ "$sha_rc" -ne 0 ]; then
     rm -f "$part" "$sha_file"
-    printf '%s\n' "integrity-error:${target}:checksum file is unavailable" >&2
-    return 3
+    if [ "$sha_rc" -eq 22 ]; then
+      printf '%s\n' "integrity-error:${target}:checksum file is unavailable" >&2
+      return 3
+    fi
+    errmsg=$(tr '\n' ' ' < "${TMP_DIR}/checksum_stderr" 2>/dev/null || true)
+    printf '%s\n' "network-error:${target}:${sha_rc}:${errmsg}" >&2
+    return 2
   fi
 
   expected=$(cut -d' ' -f1 < "$sha_file" 2>/dev/null || true)
@@ -314,6 +348,7 @@ done
 need uname
 
 REQUESTED_VERSION="$(normalize_version "$REQUESTED_VERSION")"
+validate_version "$REQUESTED_VERSION"
 
 log "Detecting operating system and architecture..."
 
@@ -337,8 +372,9 @@ if [ "$DRY_RUN" -eq 1 ]; then
   fi
 
   log "[dry-run] Version: ${VERSION_LABEL}"
-  log "[dry-run] Candidate targets: $(printf '%s ' $CANDIDATES)"
+  log "[dry-run] Candidate targets:"
   for candidate in $CANDIDATES; do
+    log "[dry-run]   ${candidate}"
     if [ "$REQUESTED_VERSION" = "latest" ]; then
       log "[dry-run] Would download and verify $(build_url '<latest release>' "$candidate") after resolving the release version."
     else
@@ -362,6 +398,10 @@ need chmod
 need mkdir
 need mv
 need rm
+need cut
+need tr
+need cat
+need find
 case "$CANDIDATES" in
   *-pc-windows-*) need unzip ;;
   *) need tar ;;
@@ -371,6 +411,7 @@ if [ "$REQUESTED_VERSION" = "latest" ]; then
   log "Fetching latest release version..."
   RESOLVED_VERSION="$(fetch_latest_version)"
   [ -n "$RESOLVED_VERSION" ] || die "Failed to fetch latest release version"
+  validate_version "$RESOLVED_VERSION"
 else
   RESOLVED_VERSION="$REQUESTED_VERSION"
 fi
@@ -378,7 +419,12 @@ fi
 log "Using version: ${RESOLVED_VERSION}"
 
 TMP_DIR="$(mktemp -d)"
-trap 'rm -rf "$TMP_DIR"' EXIT HUP INT TERM
+TMP_DEST=""
+cleanup() {
+  [ -z "$TMP_DEST" ] || rm -f "$TMP_DEST"
+  rm -rf "$TMP_DIR"
+}
+trap cleanup EXIT HUP INT TERM
 
 ARCHIVE_FILE=""
 SELECTED_TARGET=""
@@ -450,13 +496,13 @@ fi
 run mkdir -p "$INSTALL_DIR"
 [ -w "$INSTALL_DIR" ] || die "No write permission for ${INSTALL_DIR}. Use --install-dir <dir>."
 
-TMP_DEST="${DEST}.tmp.$$"
-rm -f "$TMP_DEST"
+TMP_DEST="$(mktemp "${INSTALL_DIR}/.${BIN_NAME}.tmp.XXXXXX")"
 
 log "Installing to ${INSTALL_DIR}..."
 run cp "$BIN_PATH" "$TMP_DEST"
 run chmod +x "$TMP_DEST"
 run mv "$TMP_DEST" "$DEST"
+TMP_DEST=""
 
 case ":$PATH:" in
   *":$INSTALL_DIR:"*) ;;

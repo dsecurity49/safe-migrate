@@ -1,5 +1,3 @@
-// FILE: ./src/report/violations.rs
-
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum OperationKind {
     DropColumn,

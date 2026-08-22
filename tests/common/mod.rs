@@ -11,15 +11,38 @@ pub fn setup_engine() -> SafeMigrateEngine {
 }
 
 pub fn setup_state() -> safe_migrate::AnalysisState {
-    safe_migrate::AnalysisState::new(DbCache::new())
+    safe_migrate::AnalysisState::new(cache_with_safe_timeouts())
+}
+
+fn cache_with_safe_timeouts() -> DbCache {
+    let mut cache = DbCache::new();
+    cache.metadata.source_lock_timeout_ms = 1_000;
+    cache.metadata.source_statement_timeout_ms = 10_000;
+    cache
 }
 
 pub fn object_id(schema: &str, name: &str) -> ObjectId {
     ObjectId::new(schema, name)
 }
 
+pub fn database_hosts_are_local(config: &postgres::Config) -> bool {
+    config
+        .get_hostaddrs()
+        .iter()
+        .all(|address| address.is_loopback())
+        && config.get_hosts().iter().all(|host| match host {
+            postgres::config::Host::Unix(_) => true,
+            postgres::config::Host::Tcp(host) if host.eq_ignore_ascii_case("localhost") => true,
+            postgres::config::Host::Tcp(host) => host
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback()),
+        })
+}
+
 pub fn cache_with_table(schema: &str, name: &str, rows: Option<u64>) -> DbCache {
-    let mut cache = DbCache::new();
+    let mut cache = cache_with_safe_timeouts();
     let tid = object_id(schema, name);
     cache.insert_baseline(
         tid.clone(),
