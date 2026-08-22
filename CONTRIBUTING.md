@@ -170,10 +170,11 @@ The frozen cache under `live_tests/` belongs to the test corpus. Update it only
 when a fixture requires a changed baseline, and explain the assumption in the
 pull request.
 
-Cache V6 contains ordinary functions but not the other routine kinds in
-PostgreSQL's shared routine namespace. It also omits publications and
-subscriptions. Treat baseline-dependent operations on those objects as unknown
-and taint the analysis; do not infer absence from missing cache data.
+Cache V6 synchronizes every PostgreSQL routine kind, publications, and redacted
+subscription metadata. Never query or store `pg_subscription.subconninfo`.
+Changes to the cache model require serialization and inspection regressions,
+an updated frozen cache, and live catalog coverage across supported PostgreSQL
+versions.
 
 ## Code style
 

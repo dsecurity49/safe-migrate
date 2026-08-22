@@ -327,15 +327,13 @@ Create and refresh the baseline in a trusted default-branch workflow:
     schemas: public
 ```
 
-Use a self-hosted runner or an SSH tunnel because direct remote database URLs
-are rejected. Cache encryption is recommended: GitHub caches can be read by
-fork pull requests and are not signed. Fork jobs without the encryption secret
-lint without the baseline and report `Tainted` confidence.
+Run refreshes only in trusted jobs, with PostgreSQL available through localhost
+or a Unix socket. Encrypt caches that contain sensitive metadata; fork jobs
+without the key lint without the baseline and report `Tainted` confidence.
 
-The Action never discovers checkout-local TOML automatically. Pass `config`
-when the workflow should use a reviewed file. The Action suppresses
-configuration-driven `auto_sync` while linting; only `sync: "true"` performs
-the Action-controlled database refresh.
+Pass `config` explicitly when the workflow should use a reviewed TOML file.
+Lint stays offline and ignores config-driven `auto_sync`; only `sync: "true"`
+performs the Action-controlled refresh.
 
 ## License
 
