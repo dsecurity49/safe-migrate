@@ -78,6 +78,7 @@ scripts/live-differential
 scripts/live-auto-sync
 scripts/live-cache-encryption
 scripts/live-catalog-sync
+scripts/live-catalog-differential
 ```
 
 The differential harness requires a local database named `safe_migrate` and

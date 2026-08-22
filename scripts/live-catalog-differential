@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+
+if [ -z "${DATABASE_URL:-}" ]; then
+    printf '%s\n' "DATABASE_URL is required for the live catalog differential test." >&2
+    exit 2
+fi
+
+cargo test --locked --test live_catalog_sync \
+    live_routine_and_replication_mutations_match_postgresql \
+    -- --ignored --nocapture
