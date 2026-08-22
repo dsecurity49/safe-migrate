@@ -56,6 +56,7 @@ pub(crate) fn database_config_is_local(config: &PostgresConfig) -> bool {
         .iter()
         .all(|address| address.is_loopback())
         && config.get_hosts().iter().all(|host| match host {
+            #[cfg(unix)]
             Host::Unix(_) => true,
             Host::Tcp(name) => is_local_host(name),
         })

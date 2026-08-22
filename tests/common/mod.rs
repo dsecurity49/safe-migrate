@@ -31,6 +31,7 @@ pub fn database_hosts_are_local(config: &postgres::Config) -> bool {
         .iter()
         .all(|address| address.is_loopback())
         && config.get_hosts().iter().all(|host| match host {
+            #[cfg(unix)]
             postgres::config::Host::Unix(_) => true,
             postgres::config::Host::Tcp(host) if host.eq_ignore_ascii_case("localhost") => true,
             postgres::config::Host::Tcp(host) => host
