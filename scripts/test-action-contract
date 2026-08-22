@@ -134,8 +134,17 @@ grep -A4 '^  baseline:$' "$manifest" | grep -F 'default: default' >/dev/null
 grep -A4 '^  encrypted-cache:$' "$manifest" | grep -F 'default: "false"' >/dev/null
 grep -A4 '^  no-cache:$' "$manifest" | grep -F 'default: "false"' >/dev/null
 grep -F 'cache_dir="$(mktemp -d "${cache_root}/invocation.XXXXXX")"' "$manifest" >/dev/null
-grep -F 'managed_root="../.safe-migrate-action-cache"' "$manifest" >/dev/null
-grep -F 'cache_dir="${managed_root}/baselines/${INPUT_BASELINE}"' "$manifest" >/dev/null
+grep -F 'managed_root="${HOME}/.cache/safe-migrate-action"' "$manifest" >/dev/null
+grep -F 'baseline_root="${managed_root}/baselines"' "$manifest" >/dev/null
+grep -F 'cache_dir="${baseline_root}/${INPUT_BASELINE}"' "$manifest" >/dev/null
+grep -F 'cache_transport_path="~/.cache/safe-migrate-action/baselines/${INPUT_BASELINE}/baseline-v6.cache"' "$manifest" >/dev/null
+test "$(grep -Fc 'path: ${{ steps.baseline.outputs.cache-transport-path }}' "$manifest")" -eq 2
+if grep -F '../.safe-migrate-action-cache' "$manifest" >/dev/null; then
+  printf '%s\n' "Action cache paths cannot contain '..'" >&2
+  exit 1
+fi
+grep -F 'Managed cache root must be a directory, not a symlink' "$manifest" >/dev/null
+grep -F 'Managed baseline root must be a directory, not a symlink' "$manifest" >/dev/null
 grep -F 'rm -rf -- "$cache_dir"' "$manifest" >/dev/null
 if grep -F 'rm -rf -- "$managed_root"' "$manifest" >/dev/null; then
   printf '%s\n' 'Action still removes every managed baseline' >&2
