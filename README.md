@@ -139,6 +139,8 @@ Useful options:
 - `--no-color` disables colored output for every command.
 
 Run `safe-migrate <command> --help` for the complete command reference.
+Machine-readable output, confidence values, and exit codes are defined in the
+[CLI and report contract](docs/CONTRACT.md).
 
 ## Rule discovery
 
@@ -296,6 +298,10 @@ membership edges.
 
 ## GitHub Actions
 
+See the [GitHub Action guide](docs/GITHUB_ACTIONS.md) for complete workflows,
+first-run setup, encryption, named baselines, cache lifetime, outputs, and
+failure behavior.
+
 The pull-request job restores the latest `default` synchronized baseline and
 lints without database access. If no baseline is available, it still runs with
 `Tainted` confidence.
@@ -330,18 +336,6 @@ The Action never discovers checkout-local TOML automatically. Pass `config`
 when the workflow should use a reviewed file. The Action suppresses
 configuration-driven `auto_sync` while linting; only `sync: "true"` performs
 the Action-controlled database refresh.
-
-See the [GitHub Action guide](docs/GITHUB_ACTIONS.md) for complete workflows,
-first-run setup, encryption, named baselines, cache lifetime, outputs, and
-failure behavior.
-
-## Documentation
-
-- [CLI and report contract](docs/CONTRACT.md)
-- [GitHub Action guide](docs/GITHUB_ACTIONS.md)
-- [Contributing](CONTRIBUTING.md)
-- [Release history](CHANGELOG.md)
-- [Releases and binary downloads](https://github.com/dsecurity49/safe-migrate/releases)
 
 ## License
 
