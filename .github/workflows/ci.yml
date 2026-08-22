@@ -190,7 +190,7 @@ jobs:
         uses: ./
         env:
           DATABASE_URL: "host=localhost port=5432 user=safe_migrate password=safe_migrate dbname=safe_migrate options='-c lock_timeout=5s -c statement_timeout=15min'"
-          SAFE_MIGRATE_CACHE_KEY: 1111111111111111111111111111111111111111111111111111111111111111
+          SAFE_MIGRATE_CACHE_KEY: "1111111111111111111111111111111111111111111111111111111111111111"
         with:
           mode: lint
           path: ${{ steps.sync_fixture.outputs.migration }}
@@ -223,7 +223,7 @@ jobs:
         id: restored
         uses: ./
         env:
-          SAFE_MIGRATE_CACHE_KEY: 1111111111111111111111111111111111111111111111111111111111111111
+          SAFE_MIGRATE_CACHE_KEY: "1111111111111111111111111111111111111111111111111111111111111111"
         with:
           mode: lint
           path: ${{ steps.sync_fixture.outputs.migration }}
@@ -381,7 +381,7 @@ jobs:
         continue-on-error: true
         uses: ./
         env:
-          SAFE_MIGRATE_CACHE_KEY: 1111111111111111111111111111111111111111111111111111111111111111
+          SAFE_MIGRATE_CACHE_KEY: "1111111111111111111111111111111111111111111111111111111111111111"
         with:
           mode: lint
           path: live_tests/rule_01_irreversible-migration/safe_002_add_col.sql

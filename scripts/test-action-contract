@@ -7,6 +7,7 @@ resolver="$repo_root/scripts/action-resolve-version"
 gate="$repo_root/scripts/action-final-gate"
 baseline="$repo_root/scripts/action-baseline"
 manifest="$repo_root/action.yml"
+workflow="$repo_root/.github/workflows/ci.yml"
 
 test "$(/bin/sh "$resolver" v0.6.0 "$repo_root/Cargo.toml")" = v0.6.0
 test "$(/bin/sh "$resolver" 0123456789abcdef0123456789abcdef01234567 "$repo_root/Cargo.toml")" = source
@@ -144,6 +145,11 @@ grep -F 'uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9' "
 grep -F 'uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9' "$manifest" >/dev/null
 grep -F 'cache_prefix="safe-migrate-v6-${RUNNER_OS}-${cache_mode}-${INPUT_BASELINE}-"' "$manifest" >/dev/null
 grep -F '[[ ! "$SAFE_MIGRATE_CACHE_KEY" =~ ^[0-9A-Fa-f]{64}$ ]]' "$manifest" >/dev/null
+test "$(grep -Ec '^[[:space:]]+SAFE_MIGRATE_CACHE_KEY: "[0-9A-Fa-f]{64}"$' "$workflow")" -eq 3
+if grep -Eq '^[[:space:]]+SAFE_MIGRATE_CACHE_KEY: [0-9A-Fa-f]{64}$' "$workflow"; then
+  printf '%s\n' 'workflow contains an unquoted hexadecimal cache key' >&2
+  exit 1
+fi
 grep -F 'cache-prefix=${cache_prefix}' "$manifest" >/dev/null
 grep -F 'sync-status=${sync_status}' "$manifest" >/dev/null
 grep -F 'baseline-source=${baseline_source}' "$manifest" >/dev/null

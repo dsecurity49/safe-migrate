@@ -5,7 +5,7 @@ commits and pull requests. Published binaries, checksums, and generated release
 notes are available on the
 [GitHub Releases page](https://github.com/dsecurity49/safe-migrate/releases).
 
-## v0.6.0 — Unreleased
+## v0.6.0 — 2026-08-22
 
 - Expanded `sync` and Cache V6 to record effective migration timeouts, every
   PostgreSQL routine kind, publications, and redacted subscription metadata on
