@@ -1,6 +1,6 @@
 # Live Tests
 
-These SQL fixtures feed two suites:
+These SQL fixtures feed three suites:
 
 - `run.sh` lints fixtures against the frozen local cache. It does not execute
   SQL in PostgreSQL.
@@ -10,6 +10,10 @@ These SQL fixtures feed two suites:
 - `scripts/live-catalog-sync` seeds routines, publications, and a disconnected
   subscription, then verifies their Cache V6 representation and connection
   redaction.
+
+In short: `run.sh` checks expected linter findings, `live-differential` compares
+the simulator with real PostgreSQL behavior, and `live-catalog-sync` checks
+that `sync` reads database metadata correctly.
 
 For expected PostgreSQL failures, the manifest records the SQLSTATE and required
 safe-migrate rule. The harness fails if either differs.

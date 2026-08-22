@@ -24,9 +24,7 @@ The installer selects a supported Linux, macOS, Windows/MSYS, or Termux target
 and verifies the release checksum:
 
 ```bash
-curl -fsSL \
-  https://raw.githubusercontent.com/dsecurity49/safe-migrate/main/install.sh |
-  bash
+curl -fsSL https://raw.githubusercontent.com/dsecurity49/safe-migrate/main/install.sh | bash
 safe-migrate --version
 ```
 
@@ -75,34 +73,23 @@ safe-migrate sync
 is configured.
 
 `--no-cache` runs the parser and state machine without a verified database
-baseline. Findings use `Tainted` confidence, and database settings such as
-migration timeouts remain unknown.
+baseline. Findings use `Tainted` confidence, meaning some database evidence is
+missing, and settings such as migration timeouts remain unknown.
 
 ### What sync provides
 
-SQL text alone cannot prove what already exists, how large a table is, which
-objects depend on it, which role and search path resolve an unqualified name,
-or which timeout defaults the migration session will inherit. `sync` captures
-that evidence once; subsequent reviews stay local and use the same baseline.
+SQL alone cannot show the existing schema, table statistics, dependencies,
+role and search-path context, or inherited timeout settings. `sync` captures
+that baseline once, so later `lint` runs are offline and review the same state.
 
-Cache V6 synchronizes every PostgreSQL routine kind: functions, procedures,
-aggregates, and window functions. Their typed DDL uses the synchronized shared
-namespace; unsupported routine DDL remains conservative.
+Cache V6 includes all routine kinds, publications, and redacted subscription
+metadata as well as ordinary schema state. It never stores subscription
+connection strings. Refresh publisher-side state, or a publication edit that
+does not use `ONLY`, remains `Tainted` when PostgreSQL inheritance or remote
+publisher state would decide the outcome.
 
-Publications are synchronized with their owner, table or schema scope, column
-lists, row filters, and version-specific options. Subscriptions include their
-owner, enabled state, slot name, publication list, and non-secret settings.
-`sync` never reads `pg_subscription.subconninfo`, so publisher connection
-strings are not written to the cache. Commands that refresh, create, or remove
-publisher-side state remain `Tainted` because their result depends on the
-publisher.
-
-Publication table membership is read from PostgreSQL's catalog. A later
-publication edit without `ONLY` is `Tainted` for a synchronized table because
-Cache V6 does not store `pg_inherits`; `ONLY` edits remain exact.
-
-Run sync with the database, role, and role/database defaults intended for the
-migration runner. Sync reads settings but does not change them. If the runner
+Sync with the database, role, and defaults used by the migration runner; it
+only reads them. Refresh the cache when that baseline changes. If the runner
 does not already enforce timeouts, put them explicitly in the migration:
 
 ```sql
@@ -112,33 +99,28 @@ SET statement_timeout = '15min';
 
 `lock_timeout` should be positive and shorter than a positive
 `statement_timeout`; otherwise PostgreSQL can reach the statement timeout
-first. Refresh the cache whenever the database baseline or inherited session
-settings change.
+first.
 
 ## Commands
 
-```text
-safe-migrate lint --file migration.sql
-safe-migrate lint-chain --dir migrations/
-safe-migrate sync
-safe-migrate cache inspect
-safe-migrate rules
+| Command | Use it for | Important options |
+| --- | --- | --- |
+| `lint --file migration.sql` | Check one migration. | `--cache`, `--config`, `--no-cache`, `--json`, `--markdown` |
+| `lint-chain --dir migrations/` | Check an ordered migration directory while carrying state forward. | `--cache`, `--config`, `--no-cache`, `--json`, `--markdown` |
+| `sync` | Refresh the database baseline. | `--out`, `--schemas`, `--config` |
+| `cache inspect` | Show cache provenance and redacted object counts. | `--cache`, `--json` |
+| `rules` | Discover rules, remediation, and effective settings. | `--rule`, `--json`, `--config` |
+
+`--no-auto-sync` suppresses configured automatic refresh for one `lint` or
+`lint-chain` run. `--no-color` works with every command.
+
+Use the CLI for less common options and subcommands:
+
+```bash
+safe-migrate --help
+safe-migrate <command> --help
 ```
 
-Useful options:
-
-- `lint` and `lint-chain`: `--cache <path>`, `--config <path>`, `--no-cache`,
-  `--no-auto-sync`, `--json`, and `--markdown`.
-- `sync`: `--out <path>` selects the cache destination, `--config <path>`
-  selects configuration, and `--schemas public,auth` limits the synchronized
-  schema scope.
-- `cache inspect`: `--cache <path>`, `--config <path>`, and `--json` for a
-  machine-readable summary.
-- `rules`: `--rule <id>` selects one rule, `--json` emits the stable discovery
-  schema, and `--config <path>` shows effective configuration values.
-- `--no-color` disables colored output for every command.
-
-Run `safe-migrate <command> --help` for the complete command reference.
 Machine-readable output, confidence values, and exit codes are defined in the
 [CLI and report contract](docs/CONTRACT.md).
 
@@ -298,42 +280,70 @@ membership edges.
 
 ## GitHub Actions
 
-See the [GitHub Action guide](docs/GITHUB_ACTIONS.md) for complete workflows,
-first-run setup, encryption, named baselines, cache lifetime, outputs, and
-failure behavior.
+The Action uses a baseline: one cache file containing a snapshot of your
+database metadata. The Action manages that file and its GitHub cache entry for
+you.
 
-The pull-request job restores the latest `default` synchronized baseline and
-lints without database access. If no baseline is available, it still runs with
-`Tainted` confidence.
+```text
+Trusted default-branch job
+PostgreSQL -> sync -> runner baseline file -> GitHub Actions cache
 
-```yaml
-- uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-  with:
-    persist-credentials: false
-- uses: dsecurity49/safe-migrate@v0.6.0
-  with:
-    path: migrations
+Pull-request job
+GitHub Actions cache -> runner baseline file -> lint-chain -> reports
 ```
 
-Create and refresh the baseline in a trusted default-branch workflow:
+The Action uses
+`~/.cache/safe-migrate-action/baselines/<baseline>/baseline-v6.cache` on the
+runner. After a successful sync, it saves that file in GitHub Actions cache
+under the `default` baseline name. A pull-request run restores the file to the
+same managed path, then runs `lint-chain` with it; it does not connect to
+PostgreSQL or run `sync` again. GitHub-hosted runners are discarded after the
+job; on self-hosted runners the Action clears the selected baseline before each
+restore.
+
+### 1. Refresh the baseline
+
+Run this after checkout in a trusted default-branch workflow. PostgreSQL must
+be reachable through localhost or a Unix socket; keep its URL in a secret. We
+recommend encrypting the saved baseline: it contains schema and role metadata,
+and GitHub cache contents are not signed. Store a 64-character hexadecimal key
+as `SAFE_MIGRATE_CACHE_KEY` and pass it to both workflows.
 
 ```yaml
 - uses: dsecurity49/safe-migrate@v0.6.0
   env:
     DATABASE_URL: ${{ secrets.SAFE_MIGRATE_DATABASE_URL }}
+    SAFE_MIGRATE_CACHE_KEY: ${{ secrets.SAFE_MIGRATE_CACHE_KEY }}
   with:
     path: migrations
     sync: "true"
     schemas: public
+    encrypted-cache: "true"
 ```
 
-Run refreshes only in trusted jobs, with PostgreSQL available through localhost
-or a Unix socket. Encrypt caches that contain sensitive metadata; fork jobs
-without the key lint without the baseline and report `Tainted` confidence.
+Replace `public` with the schemas that contain your migrations, or omit
+`schemas` to synchronize all non-system schemas.
 
-Pass `config` explicitly when the workflow should use a reviewed TOML file.
-Lint stays offline and ignores config-driven `auto_sync`; only `sync: "true"`
-performs the Action-controlled refresh.
+### 2. Lint pull requests without syncing
+
+Add this after checkout in the pull-request workflow:
+
+```yaml
+- uses: dsecurity49/safe-migrate@v0.6.0
+  env:
+    SAFE_MIGRATE_CACHE_KEY: ${{ secrets.SAFE_MIGRATE_CACHE_KEY }}
+  with:
+    path: migrations
+    encrypted-cache: "true"
+```
+
+Do not set `sync: "true"` here, and do not add `actions/cache`. The Action
+restores the baseline itself, passes it to `lint-chain`, and publishes the
+report. Fork pull requests do not receive the encryption key, so they lint
+without the baseline and report `Tainted` confidence.
+
+For TOML configuration, encrypted caches, named baselines, and complete
+workflows, see the [GitHub Action guide](docs/GITHUB_ACTIONS.md).
 
 ## License
 

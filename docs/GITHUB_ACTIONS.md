@@ -5,13 +5,35 @@ Use the Action in two workflows:
 1. Refresh a baseline from a trusted branch with database access.
 2. Restore that baseline in pull requests and lint offline.
 
-A baseline is optional. On a cache miss, linting runs with `Tainted`
-confidence.
+A baseline is one cache file created by `sync`. The Action writes it to its
+managed runner path, saves it with GitHub Actions cache after a successful
+refresh, then restores that file automatically in pull-request jobs. Do not
+add an `actions/cache` step yourself. Pull-request linting uses `lint-chain`
+with the restored baseline; it does not run `sync` or connect to PostgreSQL.
+
+We recommend cache encryption because a baseline contains schema and role
+metadata and GitHub cache contents are not signed. A baseline is optional: on a
+cache miss, linting runs with `Tainted` confidence.
+
+## Setup order
+
+1. Add `SAFE_MIGRATE_DATABASE_URL` as a secret. Generate an encryption key as
+   shown in [Cache encryption](#cache-encryption), then add it as
+   `SAFE_MIGRATE_CACHE_KEY`.
+2. Add the baseline refresh workflow and run it once with `workflow_dispatch`.
+3. Confirm that the refresh job and its `Save synchronized baseline` step
+   succeed.
+4. Add the pull-request workflow. It will find the saved baseline
+   automatically.
+
+To try the Action before setting up database access, add only the pull-request
+workflow. It will lint without a baseline and report `Tainted` confidence.
 
 ## Pull-request workflow
 
 Pull-request jobs use `lint-chain` by default. Set `path` to the migration
-directory.
+directory. This job does not need `DATABASE_URL`, `sync: "true"`, or a separate
+cache step.
 
 ```yaml
 name: Migration safety
@@ -33,8 +55,11 @@ jobs:
           persist-credentials: false
 
       - uses: dsecurity49/safe-migrate@v0.6.0
+        env:
+          SAFE_MIGRATE_CACHE_KEY: ${{ secrets.SAFE_MIGRATE_CACHE_KEY }}
         with:
           path: migrations
+          encrypted-cache: "true"
 ```
 
 The Action writes JSON and Markdown reports, adds Markdown to the job summary,
@@ -131,11 +156,12 @@ jobs:
       - uses: dsecurity49/safe-migrate@v0.6.0
         env:
           DATABASE_URL: ${{ secrets.SAFE_MIGRATE_DATABASE_URL }}
+          SAFE_MIGRATE_CACHE_KEY: ${{ secrets.SAFE_MIGRATE_CACHE_KEY }}
         with:
           path: migrations
-          config: safe-migrate.toml
           sync: "true"
           schemas: public
+          encrypted-cache: "true"
 ```
 
 Add `SAFE_MIGRATE_DATABASE_URL` as a repository or environment secret, then run
@@ -148,39 +174,19 @@ The pinned cache Action requires self-hosted runner 2.327.1 or newer.
 ## Cache encryption
 
 Pull requests, including forks, can read caches from the base branch. Cache
-contents are not signed. Enable cache encryption when the baseline contains
-sensitive metadata.
+contents are not signed, so we recommend encrypting managed baselines.
 
-Generate a 32-byte key once:
+The workflows above use the recommended encrypted setup. Generate a 32-byte
+key once:
 
 ```bash
 openssl rand -hex 32
 ```
 
-Store it as `SAFE_MIGRATE_CACHE_KEY`. Add the key and encryption input to the
-refresh job:
-
-```yaml
-      - uses: dsecurity49/safe-migrate@v0.6.0
-        env:
-          DATABASE_URL: ${{ secrets.SAFE_MIGRATE_DATABASE_URL }}
-          SAFE_MIGRATE_CACHE_KEY: ${{ secrets.SAFE_MIGRATE_CACHE_KEY }}
-        with:
-          path: migrations
-          sync: "true"
-          encrypted-cache: "true"
-```
-
-Use the same baseline name, key, and encryption input in the pull-request job:
-
-```yaml
-      - uses: dsecurity49/safe-migrate@v0.6.0
-        env:
-          SAFE_MIGRATE_CACHE_KEY: ${{ secrets.SAFE_MIGRATE_CACHE_KEY }}
-        with:
-          path: migrations
-          encrypted-cache: "true"
-```
+Store it as the `SAFE_MIGRATE_CACHE_KEY` secret. Both workflows must use the
+same key, baseline name, and `encrypted-cache: "true"` input. To use plaintext
+instead, remove the key and encryption input from both workflows; encryption
+is recommended, not required.
 
 Fork and Dependabot jobs do not receive repository secrets. Without the key,
 the Action skips the encrypted baseline and lints with `Tainted` confidence.

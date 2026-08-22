@@ -3,6 +3,15 @@
 Thanks for contributing. safe-migrate is a Rust PostgreSQL migration analyzer
 with typed AST extraction, stateful schema simulation, and safety rules.
 
+The analysis pipeline is:
+
+```text
+SQL -> Squawk parser -> typed facts -> simulated database state -> rules -> report
+```
+
+Most changes touch one or two stages. Start with a focused test at that stage,
+then add an integration test when behavior crosses into the next stage.
+
 ## Start here
 
 - [README and user guide](README.md)

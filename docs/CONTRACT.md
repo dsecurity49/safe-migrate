@@ -3,6 +3,14 @@
 This document defines safe-migrate v0.6.0's CLI, report, cache, and GitHub
 Action behavior.
 
+If you are learning safe-migrate, start with the [README](../README.md). This
+contract is the exact reference for scripts, CI integrations, exit codes, and
+machine-readable output.
+
+In this document, a *baseline* is the database snapshot stored in a cache file.
+`sync` creates it; `lint` and `lint-chain` read it without contacting the
+database.
+
 ## Commands
 
 - `safe-migrate lint --file <path>` analyzes one SQL migration.
