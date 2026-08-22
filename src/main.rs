@@ -214,6 +214,11 @@ struct CacheContentsSummary {
     constraints: usize,
     triggers: usize,
     functions: usize,
+    procedures: usize,
+    aggregates: usize,
+    window_functions: usize,
+    publications: usize,
+    subscriptions: usize,
     types: usize,
     roles: usize,
     dependencies: usize,
@@ -566,6 +571,18 @@ fn summarize_cache(cache: &DbCache) -> CacheContentsSummary {
             RelationKind::MaterializedView => materialized_views += 1,
         }
     }
+    let mut functions = 0;
+    let mut procedures = 0;
+    let mut aggregates = 0;
+    let mut window_functions = 0;
+    for routine in cache.functions.values() {
+        match routine.routine_kind {
+            safe_migrate::model::function::RoutineKind::Function => functions += 1,
+            safe_migrate::model::function::RoutineKind::Procedure => procedures += 1,
+            safe_migrate::model::function::RoutineKind::Aggregate => aggregates += 1,
+            safe_migrate::model::function::RoutineKind::Window => window_functions += 1,
+        }
+    }
     CacheContentsSummary {
         schemas: cache.schemas.len(),
         sequences: cache.sequences.len(),
@@ -578,7 +595,12 @@ fn summarize_cache(cache: &DbCache) -> CacheContentsSummary {
         foreign_keys: cache.foreign_keys.len(),
         constraints: cache.constraints.len(),
         triggers: cache.triggers.len(),
-        functions: cache.functions.len(),
+        functions,
+        procedures,
+        aggregates,
+        window_functions,
+        publications: cache.publications.len(),
+        subscriptions: cache.subscriptions.len(),
         types: cache.types.len(),
         roles: cache.roles.len(),
         dependencies: cache.dependencies.len(),
@@ -643,24 +665,42 @@ fn print_cache_inspection(inspection: &CacheInspection) {
             .map_or_else(|| "unknown".to_string(), |value| format!("{value} ms"))
     );
     let contents = &inspection.contents;
+    println!();
+    println!("Contents (counts only):");
+    println!("  Database objects");
+    println!("    {:<22} {}", "Schemas:", contents.schemas);
+    println!("    {:<22} {}", "Sequences:", contents.sequences);
+    println!("    {:<22} {}", "Relations:", contents.relations);
+    println!("      {:<20} {}", "Tables:", contents.tables);
+    println!("      {:<20} {}", "Views:", contents.views);
     println!(
-        "Contents (counts only): {} schemas, {} sequences, {} relations ({} tables, {} views, {} materialized views), {} columns, {} indexes, {} foreign keys, {} constraints, {} triggers, {} functions, {} types, {} roles, {} dependencies",
-        contents.schemas,
-        contents.sequences,
-        contents.relations,
-        contents.tables,
-        contents.views,
-        contents.materialized_views,
-        contents.columns,
-        contents.indexes,
-        contents.foreign_keys,
-        contents.constraints,
-        contents.triggers,
-        contents.functions,
-        contents.types,
-        contents.roles,
-        contents.dependencies,
+        "      {:<20} {}",
+        "Materialized views:", contents.materialized_views
     );
+    println!("    {:<22} {}", "Columns:", contents.columns);
+    println!("    {:<22} {}", "Indexes:", contents.indexes);
+    println!("    {:<22} {}", "Constraints:", contents.constraints);
+    println!("    {:<22} {}", "Foreign keys:", contents.foreign_keys);
+    println!("    {:<22} {}", "Triggers:", contents.triggers);
+    println!("    {:<22} {}", "Types:", contents.types);
+    println!();
+    println!("  Routines");
+    println!("    {:<22} {}", "Functions:", contents.functions);
+    println!("    {:<22} {}", "Procedures:", contents.procedures);
+    println!("    {:<22} {}", "Aggregates:", contents.aggregates);
+    println!(
+        "    {:<22} {}",
+        "Window functions:", contents.window_functions
+    );
+    println!();
+    println!("  Replication");
+    println!("    {:<22} {}", "Publications:", contents.publications);
+    println!("    {:<22} {}", "Subscriptions:", contents.subscriptions);
+    println!();
+    println!("  Security and graph");
+    println!("    {:<22} {}", "Roles:", contents.roles);
+    println!("    {:<22} {}", "Dependencies:", contents.dependencies);
+    println!();
     println!(
         "Redaction: this summary intentionally omits object, column, role, and dependency names; cache files still contain that metadata and must be handled as sensitive."
     );

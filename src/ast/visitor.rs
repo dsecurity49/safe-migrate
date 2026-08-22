@@ -66,6 +66,10 @@ impl AstVisitor {
         Self::identifier_from_name(nr.text(), nr.is_quoted()).resolve()
     }
 
+    fn resolve_ast_identifier(node: &impl AstNode) -> String {
+        Self::resolve_identifier_token(node.syntax().text().to_string().trim())
+    }
+
     pub fn extract(stmt: &Stmt) -> Option<StatementFact> {
         let syntax = stmt.syntax();
         match stmt {
@@ -227,6 +231,15 @@ impl AstVisitor {
         }
         if let Some(node) = ast::DropProcedure::cast(syntax.clone()) {
             return Self::extract_drop_procedure(&node);
+        }
+        if let Some(node) = ast::CreateAggregate::cast(syntax.clone()) {
+            return Self::extract_create_aggregate(&node);
+        }
+        if let Some(node) = ast::AlterAggregate::cast(syntax.clone()) {
+            return Self::extract_alter_aggregate(&node);
+        }
+        if let Some(node) = ast::DropAggregate::cast(syntax.clone()) {
+            return Self::extract_drop_aggregate(&node);
         }
         if let Some(node) = ast::CreatePublication::cast(syntax.clone()) {
             return Self::extract_create_publication(&node);
@@ -2156,7 +2169,20 @@ impl AstVisitor {
         let params = node
             .function_sig()
             .and_then(|sig| sig.param_list())
-            .map(|pl| pl.params().map(|p| p.syntax().text().to_string()).collect())
+            .map(|pl| {
+                pl.params()
+                    .filter_map(|p| {
+                        if matches!(p.mode(), Some(ast::ParamMode::ParamOut(_))) {
+                            return None;
+                        }
+                        Some(
+                            p.ty()
+                                .map(|t| t.syntax().text().to_string())
+                                .unwrap_or_else(|| "unknown".into()),
+                        )
+                    })
+                    .collect()
+            })
             .unwrap_or_default();
 
         let action = node.action().and_then(|a| match a {
@@ -2292,7 +2318,20 @@ impl AstVisitor {
         let params = node
             .procedure_sig()
             .and_then(|sig| sig.param_list())
-            .map(|pl| pl.params().map(|p| p.syntax().text().to_string()).collect())
+            .map(|pl| {
+                pl.params()
+                    .filter_map(|p| {
+                        if matches!(p.mode(), Some(ast::ParamMode::ParamOut(_))) {
+                            return None;
+                        }
+                        Some(
+                            p.ty()
+                                .map(|t| t.syntax().text().to_string())
+                                .unwrap_or_else(|| "unknown".into()),
+                        )
+                    })
+                    .collect()
+            })
             .unwrap_or_default();
 
         let action = node.action().and_then(|a| match a {
@@ -2342,10 +2381,16 @@ impl AstVisitor {
                                 .param_list()
                                 .map(|pl| {
                                     pl.params()
-                                        .map(|p| {
-                                            p.ty()
-                                                .map(|t| t.syntax().text().to_string())
-                                                .unwrap_or_else(|| "unknown".into())
+                                        .filter_map(|p| {
+                                            if matches!(p.mode(), Some(ast::ParamMode::ParamOut(_)))
+                                            {
+                                                return None;
+                                            }
+                                            Some(
+                                                p.ty()
+                                                    .map(|t| t.syntax().text().to_string())
+                                                    .unwrap_or_else(|| "unknown".into()),
+                                            )
                                         })
                                         .collect()
                                 })
@@ -2365,13 +2410,191 @@ impl AstVisitor {
         ))
     }
 
+    fn extract_aggregate_params(params: Option<ast::ParamList>) -> Vec<String> {
+        params
+            .map(|params| {
+                params
+                    .params()
+                    .filter_map(|param| {
+                        if matches!(param.mode(), Some(ast::ParamMode::ParamOut(_))) {
+                            return None;
+                        }
+                        Some(
+                            param
+                                .ty()
+                                .map(|ty| ty.syntax().text().to_string())
+                                .unwrap_or_else(|| "unknown".to_string()),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn extract_create_aggregate(node: &ast::CreateAggregate) -> Option<StatementFact> {
+        let name = Self::path_to_qualified_name(&node.aggregate_name()?.path()?)?;
+        let params = if let Some(params) = node.param_list() {
+            params
+                .params()
+                .map(|param| Self::extract_param(&param))
+                .collect()
+        } else {
+            Self::extract_attribute_list(node.attribute_list())
+                .into_iter()
+                .find(|attribute| attribute.name.eq_ignore_ascii_case("basetype"))
+                .filter(|attribute| {
+                    !matches!(attribute.value.to_ascii_lowercase().as_str(), "any" | "*")
+                })
+                .map(|attribute| {
+                    vec![crate::analysis::facts::ParamFact {
+                        mode: crate::analysis::facts::ParamModeFact::In,
+                        name: None,
+                        ty: attribute.value,
+                        default: None,
+                    }]
+                })
+                .unwrap_or_default()
+        };
+        Some(StatementFact::CreateAggregate(
+            crate::analysis::facts::CreateAggregateFact {
+                name,
+                or_replace: node.or_replace().is_some(),
+                params,
+            },
+        ))
+    }
+
+    fn extract_alter_aggregate(node: &ast::AlterAggregate) -> Option<StatementFact> {
+        let aggregate = node.aggregate()?;
+        let name = Self::path_ref_to_qualified_name(&aggregate.path_ref()?)?;
+        let params = Self::extract_aggregate_params(aggregate.param_list());
+        let action = match node.action()? {
+            ast::AlterAggregateAction::AggregateRenameTo(rename) => {
+                let to = Self::path_to_qualified_name(&rename.aggregate_name()?.path()?)?
+                    .name
+                    .resolve();
+                crate::analysis::facts::AlterFunctionAction::Rename {
+                    from: name.name.resolve(),
+                    to,
+                }
+            }
+            ast::AlterAggregateAction::OwnerTo(owner) => {
+                crate::analysis::facts::AlterFunctionAction::OwnerChange(Self::extract_role(
+                    &owner.role_ref()?,
+                ))
+            }
+            ast::AlterAggregateAction::SetSchema(set_schema) => {
+                crate::analysis::facts::AlterFunctionAction::SchemaChange {
+                    new_schema: Self::resolve_ast_identifier(&set_schema.schema_ref()?),
+                }
+            }
+        };
+        Some(StatementFact::AlterAggregate(
+            crate::analysis::facts::AlterAggregateFact {
+                name,
+                params,
+                action,
+            },
+        ))
+    }
+
+    fn extract_drop_aggregate(node: &ast::DropAggregate) -> Option<StatementFact> {
+        let signatures = node
+            .aggregates()
+            .filter_map(|aggregate| {
+                Some(crate::analysis::facts::FunctionSigFact {
+                    name: Self::path_ref_to_qualified_name(&aggregate.path_ref()?)?,
+                    params: Self::extract_aggregate_params(aggregate.param_list()),
+                })
+            })
+            .collect();
+        Some(StatementFact::DropAggregate(
+            crate::analysis::facts::DropAggregateFact {
+                signatures,
+                if_exists: node.if_exists().is_some(),
+                cascade: node.cascade_token().is_some(),
+            },
+        ))
+    }
+
+    fn extract_attribute_list(
+        list: Option<ast::AttributeList>,
+    ) -> Vec<crate::analysis::facts::AttributeFact> {
+        list.map(|list| {
+            list.attribute_options()
+                .map(|option| crate::analysis::facts::AttributeFact {
+                    name: option
+                        .name()
+                        .map(|name| {
+                            Self::resolve_identifier_token(name.syntax().text().to_string().trim())
+                        })
+                        .unwrap_or_default(),
+                    value: option
+                        .attribute_value()
+                        .map(|value| {
+                            value
+                                .literal()
+                                .and_then(|literal| Self::resolve_string_literal(&literal))
+                                .unwrap_or_else(|| {
+                                    value.syntax().text().to_string().trim().to_string()
+                                })
+                        })
+                        .unwrap_or_else(|| "true".to_string()),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+    }
+
+    fn extract_publication_object(
+        object: ast::PublicationObject,
+    ) -> Option<crate::analysis::facts::PublicationObjectFact> {
+        match object {
+            ast::PublicationObject::PublicationObjectTable(object) => {
+                let path = object.table_name_ref()?.path_ref()?;
+                Some(crate::analysis::facts::PublicationObjectFact::Table {
+                    name: Self::path_ref_to_qualified_name(&path)?,
+                    only: object.only_token().is_some(),
+                    include_partitions: object.star_token().is_some(),
+                    columns: object.column_ref_list().map(|columns| {
+                        columns
+                            .column_name_refs()
+                            .map(|name| Self::resolve_ast_identifier(&name))
+                            .collect()
+                    }),
+                    row_filter: object.where_condition_clause().and_then(|where_clause| {
+                        where_clause
+                            .expr()
+                            .map(crate::analysis::expr_visitor::ExprVisitor::convert)
+                            .map(crate::analysis::facts::PublicationRowFilter::Parsed)
+                    }),
+                })
+            }
+            ast::PublicationObject::PublicationObjectTablesInSchema(object) => {
+                object.schema_ref().map(|schema_ref| {
+                    crate::analysis::facts::PublicationObjectFact::SchemaTables {
+                        schema: Self::resolve_ast_identifier(&schema_ref),
+                        row_filter: object.where_condition_clause().and_then(|where_clause| {
+                            where_clause
+                                .expr()
+                                .map(crate::analysis::expr_visitor::ExprVisitor::convert)
+                                .map(crate::analysis::facts::PublicationRowFilter::Parsed)
+                        }),
+                    }
+                })
+            }
+            ast::PublicationObject::PublicationObjectCurrentSchema(_) => {
+                Some(crate::analysis::facts::PublicationObjectFact::CurrentSchemaShorthand)
+            }
+        }
+    }
+
     fn extract_create_publication(
         node: &squawk_syntax::ast::CreatePublication,
     ) -> Option<StatementFact> {
         let name = node
             .publication()
-            .and_then(|p| p.ident_token())
-            .map(|t| Self::resolve_identifier_token(t.text()))
+            .map(|publication| Self::resolve_ast_identifier(&publication))
             .unwrap_or_default();
         let scope = if let Some(fapo) = node.for_all_publication_objects() {
             crate::analysis::facts::PublicationScope::AllTables {
@@ -2391,74 +2614,12 @@ impl AstVisitor {
         } else {
             let objects = node
                 .publication_objects()
-                .flat_map(|obj| match obj {
-                    ast::PublicationObject::PublicationObjectTable(obj) => {
-                        if let Some(table_name_ref) = obj.table_name_ref() {
-                            let path = table_name_ref.path_ref()?;
-                            Some(crate::analysis::facts::PublicationObjectFact::Table {
-                                name: Self::path_ref_to_qualified_name(&path)?,
-                                only: obj.only_token().is_some(),
-                                include_partitions: obj.star_token().is_some(),
-                                columns: obj.column_ref_list().map(|cl| {
-                                    cl.column_name_refs()
-                                        .filter_map(|n| n.ident_token())
-                                        .map(|n| Self::resolve_identifier_token(n.text()))
-                                        .collect()
-                                }),
-                                row_filter: obj.where_condition_clause().and_then(|w| {
-                                    w.expr()
-                                        .map(crate::analysis::expr_visitor::ExprVisitor::convert)
-                                }),
-                            })
-                        } else {
-                            None
-                        }
-                    }
-                    ast::PublicationObject::PublicationObjectTablesInSchema(obj) => {
-                        obj.schema_ref().map(|schema_ref| {
-                            crate::analysis::facts::PublicationObjectFact::SchemaTables {
-                                schema: schema_ref
-                                    .ident_token()
-                                    .map(|t| Self::resolve_identifier_token(t.text()))
-                                    .unwrap_or_default(),
-                                row_filter: obj.where_condition_clause().and_then(|w| {
-                                    w.expr()
-                                        .map(crate::analysis::expr_visitor::ExprVisitor::convert)
-                                }),
-                            }
-                        })
-                    }
-                    ast::PublicationObject::PublicationObjectCurrentSchema(_) => {
-                        Some(crate::analysis::facts::PublicationObjectFact::CurrentSchemaShorthand)
-                    }
-                })
+                .filter_map(Self::extract_publication_object)
                 .collect();
             crate::analysis::facts::PublicationScope::Explicit(objects)
         };
-        let params = node
-            .with_params()
-            .map(|wp| {
-                wp.attribute_list()
-                    .map(|al| {
-                        al.attribute_options()
-                            .map(|p| crate::analysis::facts::AttributeFact {
-                                name: p
-                                    .name()
-                                    .and_then(|n| n.ident_token())
-                                    .map(|t| t.text().to_string())
-                                    .unwrap_or_default(),
-                                value: p
-                                    .syntax()
-                                    .descendants()
-                                    .find_map(ast::Literal::cast)
-                                    .map(|l| l.syntax().text().to_string())
-                                    .unwrap_or_default(),
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            })
-            .unwrap_or_default();
+        let params =
+            Self::extract_attribute_list(node.with_params().and_then(|with| with.attribute_list()));
 
         Some(StatementFact::CreatePublication(
             crate::analysis::facts::CreatePublicationFact {
@@ -2474,11 +2635,71 @@ impl AstVisitor {
     ) -> Option<StatementFact> {
         let name = node
             .publication_ref()
-            .and_then(|pr| pr.ident_token())
-            .map(|t| Self::resolve_identifier_token(t.text()))
+            .map(|publication| Self::resolve_ast_identifier(&publication))
             .unwrap_or_default();
+        let action = match node.action()? {
+            ast::AlterPublicationAction::AddPublicationObjects(action) => {
+                crate::analysis::facts::AlterPublicationActionFact::AddObjects(
+                    action
+                        .publication_objects()
+                        .filter_map(Self::extract_publication_object)
+                        .collect(),
+                )
+            }
+            ast::AlterPublicationAction::DropPublicationObjects(action) => {
+                crate::analysis::facts::AlterPublicationActionFact::DropObjects(
+                    action
+                        .publication_objects()
+                        .filter_map(Self::extract_publication_object)
+                        .collect(),
+                )
+            }
+            ast::AlterPublicationAction::SetPublicationObjects(action) => {
+                crate::analysis::facts::AlterPublicationActionFact::SetObjects(
+                    crate::analysis::facts::PublicationScope::Explicit(
+                        action
+                            .publication_objects()
+                            .filter_map(Self::extract_publication_object)
+                            .collect(),
+                    ),
+                )
+            }
+            ast::AlterPublicationAction::SetAllPublicationObjects(action) => {
+                let except = action
+                    .except_table_clause()
+                    .map(|clause| {
+                        clause
+                            .except_table_names()
+                            .filter_map(|name| name.table_relation_name())
+                            .filter_map(|name| name.table_name_ref())
+                            .filter_map(|name| name.path_ref())
+                            .filter_map(|path| Self::path_ref_to_qualified_name(&path))
+                            .map(|name| name.name.resolve())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                crate::analysis::facts::AlterPublicationActionFact::SetObjects(
+                    crate::analysis::facts::PublicationScope::AllTables { except },
+                )
+            }
+            ast::AlterPublicationAction::SetOptions(action) => {
+                crate::analysis::facts::AlterPublicationActionFact::SetOptions(
+                    Self::extract_attribute_list(action.attribute_list()),
+                )
+            }
+            ast::AlterPublicationAction::OwnerTo(action) => {
+                crate::analysis::facts::AlterPublicationActionFact::OwnerChange(Self::extract_role(
+                    &action.role_ref()?,
+                ))
+            }
+            ast::AlterPublicationAction::PublicationRenameTo(action) => {
+                crate::analysis::facts::AlterPublicationActionFact::Rename {
+                    to: Self::resolve_ast_identifier(&action.publication()?),
+                }
+            }
+        };
         Some(StatementFact::AlterPublication(
-            crate::analysis::facts::AlterPublicationFact { name },
+            crate::analysis::facts::AlterPublicationFact { name, action },
         ))
     }
 
@@ -2487,8 +2708,7 @@ impl AstVisitor {
     ) -> Option<StatementFact> {
         let names = node
             .publication_refs()
-            .filter_map(|pr| pr.ident_token())
-            .map(|t| Self::resolve_identifier_token(t.text()))
+            .map(|publication| Self::resolve_ast_identifier(&publication))
             .collect();
         Some(StatementFact::DropPublication(
             crate::analysis::facts::DropPublicationFact {
@@ -2504,46 +2724,25 @@ impl AstVisitor {
     ) -> Option<StatementFact> {
         let name = node
             .subscription()
-            .and_then(|s| s.ident_token())
-            .map(|t| Self::resolve_identifier_token(t.text()));
+            .map(|subscription| Self::resolve_ast_identifier(&subscription));
         let connection = if node.server_token().is_some() {
             crate::analysis::facts::ConnectionTarget::Server(
                 node.server_ref()
-                    .and_then(|sr| sr.ident_token())
-                    .map(|t| Self::resolve_identifier_token(t.text())),
+                    .map(|server| Self::resolve_ast_identifier(&server)),
             )
         } else {
             crate::analysis::facts::ConnectionTarget::Literal(
                 node.literal()
-                    .map(|l| l.syntax().text().to_string().trim_matches('\'').to_string()),
+                    .and_then(|literal| Self::resolve_string_literal(&literal)),
             )
         };
         let publications = node
             .publication_refs()
-            .filter_map(|pr| pr.ident_token())
-            .map(|t| Self::resolve_identifier_token(t.text()))
+            .map(|publication| Self::resolve_ast_identifier(&publication))
             .collect();
-        let params = node.with_params().map(|wp| {
-            wp.attribute_list()
-                .map(|al| {
-                    al.attribute_options()
-                        .map(|p| crate::analysis::facts::AttributeFact {
-                            name: p
-                                .name()
-                                .and_then(|n| n.ident_token())
-                                .map(|t| t.text().to_string())
-                                .unwrap_or_default(),
-                            value: p
-                                .syntax()
-                                .descendants()
-                                .find_map(ast::Literal::cast)
-                                .map(|l| l.syntax().text().to_string())
-                                .unwrap_or_default(),
-                        })
-                        .collect()
-                })
-                .unwrap_or_default()
-        });
+        let params = node
+            .with_params()
+            .map(|with| Self::extract_attribute_list(with.attribute_list()));
 
         Some(StatementFact::CreateSubscription(
             crate::analysis::facts::CreateSubscriptionFact {
@@ -2560,18 +2759,96 @@ impl AstVisitor {
     ) -> Option<StatementFact> {
         let name = node
             .subscription_ref()
-            .and_then(|sr| sr.ident_token())
-            .map(|t| Self::resolve_identifier_token(t.text()))
+            .map(|subscription| Self::resolve_ast_identifier(&subscription))
             .unwrap_or_default();
+        let action = match node.action()? {
+            ast::AlterSubscriptionAction::SetConnection(action) => {
+                crate::analysis::facts::AlterSubscriptionActionFact::SetConnection(
+                    crate::analysis::facts::ConnectionTarget::Literal(
+                        action
+                            .literal()
+                            .and_then(|literal| Self::resolve_string_literal(&literal)),
+                    ),
+                )
+            }
+            ast::AlterSubscriptionAction::SetServer(action) => {
+                crate::analysis::facts::AlterSubscriptionActionFact::SetServer(
+                    action
+                        .server_ref()
+                        .map(|server| Self::resolve_ast_identifier(&server)),
+                )
+            }
+            ast::AlterSubscriptionAction::SetPublication(action) => {
+                crate::analysis::facts::AlterSubscriptionActionFact::Publications {
+                    mode: crate::analysis::facts::SubscriptionPublicationMode::Set,
+                    publications: action
+                        .publication_refs()
+                        .map(|publication| Self::resolve_ast_identifier(&publication))
+                        .collect(),
+                    params: Self::extract_attribute_list(action.attribute_list()),
+                }
+            }
+            ast::AlterSubscriptionAction::AddPublication(action) => {
+                crate::analysis::facts::AlterSubscriptionActionFact::Publications {
+                    mode: crate::analysis::facts::SubscriptionPublicationMode::Add,
+                    publications: action
+                        .publication_refs()
+                        .map(|publication| Self::resolve_ast_identifier(&publication))
+                        .collect(),
+                    params: Self::extract_attribute_list(action.attribute_list()),
+                }
+            }
+            ast::AlterSubscriptionAction::DropSubscriptionPublication(action) => {
+                crate::analysis::facts::AlterSubscriptionActionFact::Publications {
+                    mode: crate::analysis::facts::SubscriptionPublicationMode::Drop,
+                    publications: action
+                        .publication_refs()
+                        .map(|publication| Self::resolve_ast_identifier(&publication))
+                        .collect(),
+                    params: Self::extract_attribute_list(action.attribute_list()),
+                }
+            }
+            ast::AlterSubscriptionAction::RefreshPublication(action) => {
+                crate::analysis::facts::AlterSubscriptionActionFact::RefreshPublication(
+                    Self::extract_attribute_list(action.attribute_list()),
+                )
+            }
+            ast::AlterSubscriptionAction::EnableSubscription(_) => {
+                crate::analysis::facts::AlterSubscriptionActionFact::SetEnabled(true)
+            }
+            ast::AlterSubscriptionAction::DisableSubscription(_) => {
+                crate::analysis::facts::AlterSubscriptionActionFact::SetEnabled(false)
+            }
+            ast::AlterSubscriptionAction::SetOptions(action) => {
+                crate::analysis::facts::AlterSubscriptionActionFact::SetOptions(
+                    Self::extract_attribute_list(action.attribute_list()),
+                )
+            }
+            ast::AlterSubscriptionAction::SkipSubscription(action) => {
+                crate::analysis::facts::AlterSubscriptionActionFact::Skip(
+                    Self::extract_attribute_list(action.attribute_list()),
+                )
+            }
+            ast::AlterSubscriptionAction::OwnerTo(action) => {
+                crate::analysis::facts::AlterSubscriptionActionFact::OwnerChange(
+                    Self::extract_role(&action.role_ref()?),
+                )
+            }
+            ast::AlterSubscriptionAction::SubscriptionRenameTo(action) => {
+                crate::analysis::facts::AlterSubscriptionActionFact::Rename {
+                    to: Self::resolve_ast_identifier(&action.subscription()?),
+                }
+            }
+        };
         Some(StatementFact::AlterSubscription(
-            crate::analysis::facts::AlterSubscriptionFact { name },
+            crate::analysis::facts::AlterSubscriptionFact { name, action },
         ))
     }
 
     fn extract_drop_subscription(
         node: &squawk_syntax::ast::DropSubscription,
     ) -> Option<StatementFact> {
-        let name = Self::resolve_identifier_token(node.subscription_ref()?.ident_token()?.text());
+        let name = Self::resolve_ast_identifier(&node.subscription_ref()?);
         Some(StatementFact::DropSubscription(
             crate::analysis::facts::DropSubscriptionFact {
                 name,

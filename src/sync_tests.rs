@@ -196,6 +196,48 @@ mod tests {
                 },
             },
         );
+        cache.publications.insert(
+            "app_changes".into(),
+            crate::model::replication::PublicationState {
+                name: "app_changes".into(),
+                owner: Some("app_user".into()),
+                scope: crate::analysis::facts::PublicationScope::Explicit(vec![
+                    crate::analysis::facts::PublicationObjectFact::Table {
+                        name: crate::ast::identifiers::QualifiedName::new(
+                            Some(crate::ast::identifiers::Ident::new("public", true)),
+                            crate::ast::identifiers::Ident::new("test_table", true),
+                        ),
+                        only: true,
+                        include_partitions: false,
+                        columns: Some(vec!["id".into()]),
+                        row_filter: Some(crate::analysis::facts::PublicationRowFilter::CatalogSql(
+                            "id > 0".into(),
+                        )),
+                    },
+                ]),
+                params: vec![crate::analysis::facts::AttributeFact {
+                    name: "publish".into(),
+                    value: "insert, update".into(),
+                }],
+                generation: 0,
+            },
+        );
+        cache.subscriptions.insert(
+            "app_subscriber".into(),
+            crate::model::replication::SubscriptionState {
+                name: "app_subscriber".into(),
+                owner: Some("app_user".into()),
+                connection: crate::analysis::facts::ConnectionTarget::Redacted,
+                publications: vec!["app_changes".into()],
+                params: Some(vec![crate::analysis::facts::AttributeFact {
+                    name: "streaming".into(),
+                    value: "parallel".into(),
+                }]),
+                enabled: false,
+                slot_name: None,
+                generation: 0,
+            },
+        );
 
         // Cache V6 uses bincode.
         let versioned = crate::db::cache::DbCacheVersioned::V6(Box::new(cache));
@@ -237,6 +279,15 @@ mod tests {
             Some(["app".to_string(), "public".to_string()].as_slice())
         );
         assert_eq!(deserialized.search_path, ["app", "public"]);
+        assert!(matches!(
+            deserialized
+                .subscriptions
+                .get("app_subscriber")
+                .map(|subscription| &subscription.connection),
+            Some(crate::analysis::facts::ConnectionTarget::Redacted)
+        ));
+        assert_eq!(deserialized.publications.len(), 1);
+        assert_eq!(deserialized.subscriptions.len(), 1);
         assert!(
             deserialized
                 .relations
@@ -315,7 +366,7 @@ mod tests {
     }
 
     #[test]
-    fn type_identity_links_do_not_change_the_cache_bincode_layout() {
+    fn routine_kind_is_part_of_the_final_v6_layout() {
         #[derive(Serialize)]
         struct LegacyFunctionState {
             id: ObjectId,
@@ -335,28 +386,45 @@ mod tests {
             language: "sql".into(),
             security: crate::model::function::SecurityMode::Invoker,
         };
-        let current = crate::model::function::FunctionState {
-            id,
-            routine_kind: crate::model::function::RoutineKind::Function,
-            arg_types: vec!["mood".into()],
-            arg_type_ids: vec![Some(ObjectId::new("public", "mood"))],
-            return_type: "mood".into(),
-            return_type_id: Some(ObjectId::new("public", "mood")),
-            volatility: crate::model::function::Volatility::Volatile,
-            language: "sql".into(),
-            security: crate::model::function::SecurityMode::Invoker,
-        };
         let config = bincode::config::standard().with_variable_int_encoding();
         let legacy_bytes = bincode::serde::encode_to_vec(&legacy, config).unwrap();
-        let current_bytes = bincode::serde::encode_to_vec(&current, config).unwrap();
 
-        assert_eq!(current_bytes, legacy_bytes);
-        let restored: crate::model::function::FunctionState =
-            bincode::serde::decode_from_slice(&legacy_bytes, config)
-                .unwrap()
-                .0;
-        assert!(restored.arg_type_ids.is_empty());
-        assert!(restored.return_type_id.is_none());
+        for routine_kind in [
+            crate::model::function::RoutineKind::Function,
+            crate::model::function::RoutineKind::Procedure,
+            crate::model::function::RoutineKind::Aggregate,
+            crate::model::function::RoutineKind::Window,
+        ] {
+            let current = crate::model::function::FunctionState {
+                id: id.clone(),
+                routine_kind,
+                arg_types: vec!["mood".into()],
+                arg_type_ids: vec![Some(ObjectId::new("public", "mood"))],
+                return_type: "mood".into(),
+                return_type_id: Some(ObjectId::new("public", "mood")),
+                volatility: crate::model::function::Volatility::Volatile,
+                language: "sql".into(),
+                security: crate::model::function::SecurityMode::Invoker,
+            };
+            let current_bytes = bincode::serde::encode_to_vec(&current, config).unwrap();
+            assert_ne!(current_bytes, legacy_bytes);
+            let restored: crate::model::function::FunctionState =
+                bincode::serde::decode_from_slice(&current_bytes, config)
+                    .unwrap()
+                    .0;
+            assert_eq!(restored.routine_kind, routine_kind);
+            assert!(restored.arg_type_ids.is_empty());
+            assert!(restored.return_type_id.is_none());
+        }
+
+        assert!(
+            bincode::serde::decode_from_slice::<crate::model::function::FunctionState, _>(
+                &legacy_bytes,
+                config,
+            )
+            .is_err(),
+            "the pre-release routine layout must require a fresh V6 sync"
+        );
     }
 
     #[test]

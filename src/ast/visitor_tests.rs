@@ -2,9 +2,10 @@
 mod tests {
     use crate::analysis::expr_ir::ExprIr;
     use crate::analysis::facts::{
-        AlterDatabaseAction, AlterTableActionFact, AlterTypeActionFact, PublicationObjectFact,
-        PublicationScope, ResetSettingTarget, SearchPathTarget, StatementFact, TableConstraintFact,
-        TimeoutSetting, TimeoutSettingValue, TypeCreationKind,
+        AlterDatabaseAction, AlterPublicationActionFact, AlterSubscriptionActionFact,
+        AlterTableActionFact, AlterTypeActionFact, PublicationObjectFact, PublicationScope,
+        ResetSettingTarget, SearchPathTarget, StatementFact, SubscriptionPublicationMode,
+        TableConstraintFact, TimeoutSetting, TimeoutSettingValue, TypeCreationKind,
     };
     use crate::ast::identifiers::{Ident, QualifiedName};
     use crate::ast::visitor::AstVisitor;
@@ -979,6 +980,239 @@ mod tests {
             database.action,
             AlterDatabaseAction::Rename { to } if to == "NewDb"
         ));
+    }
+
+    #[test]
+    fn routine_identity_excludes_out_parameters_in_alter_and_drop_signatures() {
+        let facts = parse_and_extract(
+            "ALTER FUNCTION calculate(IN value integer, OUT label text) RENAME TO calculated;
+             DROP FUNCTION calculate(IN value integer, OUT label text);
+             ALTER PROCEDURE process(IN value integer, OUT label text) RENAME TO processed;
+             DROP PROCEDURE process(IN value integer, OUT label text);",
+        );
+        assert_eq!(facts.len(), 4);
+
+        let params = facts
+            .iter()
+            .map(|fact| match fact {
+                StatementFact::AlterFunction(fact) => fact.params.as_slice(),
+                StatementFact::DropFunction(fact) => fact.signatures[0].params.as_slice(),
+                StatementFact::AlterProcedure(fact) => fact.params.as_slice(),
+                StatementFact::DropProcedure(fact) => fact.signatures[0].params.as_slice(),
+                other => panic!("unexpected routine fact: {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert!(params.iter().all(|params| *params == ["integer"]));
+    }
+
+    #[test]
+    fn publication_and_subscription_alter_actions_are_typed() {
+        let facts = parse_and_extract(
+            r#"
+            ALTER PUBLICATION MixedPub ADD TABLE app.entries ("Camel") WHERE ("Camel" > 0);
+            ALTER PUBLICATION MixedPub SET (publish = 'insert, update');
+            ALTER PUBLICATION MixedPub RENAME TO RenamedPub;
+            ALTER SUBSCRIPTION MixedSub SET PUBLICATION MixedPub, "AuditPub" WITH (refresh = false);
+            ALTER SUBSCRIPTION MixedSub SET (streaming = parallel, slot_name = NONE);
+            ALTER SUBSCRIPTION MixedSub SKIP (lsn = '0/16B6C50');
+            ALTER SUBSCRIPTION MixedSub RENAME TO RenamedSub;
+            "#,
+        );
+        assert_eq!(facts.len(), 7);
+
+        assert!(matches!(
+            &facts[0],
+            StatementFact::AlterPublication(fact)
+                if fact.name == "mixedpub"
+                    && matches!(
+                        &fact.action,
+                        AlterPublicationActionFact::AddObjects(objects)
+                            if matches!(
+                                &objects[0],
+                                PublicationObjectFact::Table {
+                                    columns: Some(columns),
+                                    row_filter: Some(_),
+                                    ..
+                                } if columns == &["Camel"]
+                            )
+                    )
+        ));
+        assert!(matches!(
+            &facts[1],
+            StatementFact::AlterPublication(fact)
+                if matches!(
+                    &fact.action,
+                    AlterPublicationActionFact::SetOptions(options)
+                        if options == &[crate::analysis::facts::AttributeFact {
+                            name: "publish".into(),
+                            value: "insert, update".into(),
+                        }]
+                )
+        ));
+        assert!(matches!(
+            &facts[2],
+            StatementFact::AlterPublication(fact)
+                if matches!(&fact.action, AlterPublicationActionFact::Rename { to } if to == "renamedpub")
+        ));
+        assert!(
+            matches!(
+                &facts[3],
+                StatementFact::AlterSubscription(fact)
+                    if fact.name == "mixedsub"
+                        && matches!(
+                            &fact.action,
+                            AlterSubscriptionActionFact::Publications {
+                                mode: SubscriptionPublicationMode::Set,
+                                publications,
+                                params,
+                            } if publications == &["mixedpub", "AuditPub"]
+                                && params.iter().any(|param| param.name == "refresh" && param.value == "false")
+                        )
+            ),
+            "extracted subscription publication action: {:?}",
+            facts[3]
+        );
+        assert!(matches!(
+            &facts[4],
+            StatementFact::AlterSubscription(fact)
+                if matches!(
+                    &fact.action,
+                    AlterSubscriptionActionFact::SetOptions(options)
+                        if options.iter().any(|option| option.name == "streaming" && option.value == "parallel")
+                            && options.iter().any(|option| option.name == "slot_name" && option.value.eq_ignore_ascii_case("none"))
+                )
+        ));
+        assert!(matches!(
+            &facts[5],
+            StatementFact::AlterSubscription(fact)
+                if matches!(
+                    &fact.action,
+                    AlterSubscriptionActionFact::Skip(options)
+                        if options.iter().any(|option| option.name == "lsn" && option.value == "0/16B6C50")
+                )
+        ));
+        assert!(matches!(
+            &facts[6],
+            StatementFact::AlterSubscription(fact)
+                if matches!(&fact.action, AlterSubscriptionActionFact::Rename { to } if to == "renamedsub")
+        ));
+    }
+
+    #[test]
+    fn subscription_connection_literals_use_postgresql_string_decoding() {
+        let facts = parse_and_extract(
+            "CREATE SUBSCRIPTION app_sub CONNECTION 'password=it''s-local' PUBLICATION app_pub WITH (connect = false);
+             ALTER SUBSCRIPTION app_sub CONNECTION E'password=line\\nfeed';",
+        );
+        assert!(matches!(
+            &facts[0],
+            StatementFact::CreateSubscription(fact)
+                if fact.connection
+                    == crate::analysis::facts::ConnectionTarget::Literal(
+                        Some("password=it's-local".into())
+                    )
+        ));
+        assert!(matches!(
+            &facts[1],
+            StatementFact::AlterSubscription(fact)
+                if fact.action
+                    == AlterSubscriptionActionFact::SetConnection(
+                        crate::analysis::facts::ConnectionTarget::Literal(
+                            Some("password=line\nfeed".into())
+                        )
+                    )
+        ));
+    }
+
+    #[test]
+    fn aggregate_commands_extract_shared_routine_identities() {
+        let create = parse_and_extract_statement(
+            "CREATE OR REPLACE AGGREGATE \"Analytics\".Total(integer) (
+                SFUNC = int4pl,
+                STYPE = integer
+            );",
+        )
+        .expect("create aggregate fact");
+        let StatementFact::CreateAggregate(create) = create else {
+            panic!("expected create aggregate fact");
+        };
+        assert!(create.or_replace);
+        assert_eq!(create.name.schema.unwrap().resolve(), "Analytics");
+        assert_eq!(create.name.name.resolve(), "total");
+        assert_eq!(create.params.len(), 1);
+        assert_eq!(create.params[0].ty, "integer");
+
+        let alter = parse_and_extract_statement(
+            "ALTER AGGREGATE \"Analytics\".Total(integer) RENAME TO \"Combined\";",
+        )
+        .expect("alter aggregate fact");
+        let StatementFact::AlterAggregate(alter) = alter else {
+            panic!("expected alter aggregate fact");
+        };
+        assert_eq!(alter.name.schema.unwrap().resolve(), "Analytics");
+        assert_eq!(alter.name.name.resolve(), "total");
+        assert_eq!(alter.params, ["integer"]);
+        assert!(matches!(
+            alter.action,
+            crate::analysis::facts::AlterFunctionAction::Rename { ref to, .. }
+                if to == "Combined"
+        ));
+
+        let drop = parse_and_extract_statement(
+            "DROP AGGREGATE IF EXISTS \"Analytics\".\"Combined\"(integer) CASCADE;",
+        )
+        .expect("drop aggregate fact");
+        let StatementFact::DropAggregate(drop) = drop else {
+            panic!("expected drop aggregate fact");
+        };
+        assert!(drop.if_exists);
+        assert!(drop.cascade);
+        assert_eq!(drop.signatures.len(), 1);
+        assert_eq!(drop.signatures[0].name.name.resolve(), "Combined");
+        assert_eq!(drop.signatures[0].params, ["integer"]);
+
+        let ordered = parse_and_extract_statement(
+            "DROP AGGREGATE percentile(double precision ORDER BY numeric, text);",
+        )
+        .expect("ordered-set aggregate fact");
+        let StatementFact::DropAggregate(ordered) = ordered else {
+            panic!("expected ordered-set aggregate fact");
+        };
+        assert_eq!(
+            ordered.signatures[0].params,
+            ["double precision", "numeric", "text"]
+        );
+
+        let legacy = parse_and_extract_statement(
+            "CREATE AGGREGATE legacy_total (
+                BASETYPE = integer,
+                SFUNC = int4pl,
+                STYPE = integer
+            );",
+        )
+        .expect("legacy aggregate fact");
+        let StatementFact::CreateAggregate(legacy) = legacy else {
+            panic!("expected legacy create aggregate fact");
+        };
+        assert_eq!(legacy.params.len(), 1);
+        assert_eq!(legacy.params[0].ty, "integer");
+    }
+
+    #[test]
+    fn create_function_window_option_is_typed() {
+        let fact = parse_and_extract_statement(
+            "CREATE FUNCTION ranked() RETURNS bigint AS 'window_row_number' LANGUAGE internal WINDOW;",
+        )
+        .expect("window function fact");
+        let StatementFact::CreateFunction(function) = fact else {
+            panic!("expected create function fact");
+        };
+        assert!(
+            function
+                .options
+                .iter()
+                .any(|option| matches!(option, crate::analysis::facts::FuncOptionFact::Window))
+        );
     }
 
     #[test]

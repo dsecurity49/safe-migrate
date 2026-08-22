@@ -2,6 +2,7 @@ use crate::ast::identifiers::ObjectId;
 use crate::model::constraint::ConstraintState;
 use crate::model::function::FunctionState;
 use crate::model::relation::RelationState;
+use crate::model::replication::{PublicationState, SubscriptionState};
 use crate::model::role::RoleState;
 use crate::model::schema::SchemaState;
 use crate::model::sequence::SequenceState;
@@ -91,6 +92,8 @@ pub struct DbCache {
     pub schemas: HashMap<String, SchemaState>,
     pub sequences: HashMap<ObjectId, SequenceState>,
     pub dependencies: Vec<DependencyCache>,
+    pub publications: HashMap<String, PublicationState>,
+    pub subscriptions: HashMap<String, SubscriptionState>,
 }
 
 pub const CACHE_FORMAT_VERSION: u32 = 6;
@@ -160,6 +163,8 @@ impl DbCache {
             schemas: HashMap::new(),
             sequences: HashMap::new(),
             dependencies: Vec::new(),
+            publications: HashMap::new(),
+            subscriptions: HashMap::new(),
         }
     }
 

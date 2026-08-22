@@ -7,6 +7,9 @@ These SQL fixtures feed two suites:
 - `scripts/live-differential` compares safe-migrate's modeled result with a
   disposable PostgreSQL database for fixtures enabled in
   `differential_manifest.json`.
+- `scripts/live-catalog-sync` seeds routines, publications, and a disconnected
+  subscription, then verifies their Cache V6 representation and connection
+  redaction.
 
 For expected PostgreSQL failures, the manifest records the SQLSTATE and required
 safe-migrate rule. The harness fails if either differs.
@@ -43,11 +46,12 @@ Run from the repository root with a disposable local database:
 ```bash
 export DATABASE_URL='host=/path/to/socket dbname=safe_migrate user=my_user'
 scripts/live-differential -v
+scripts/live-catalog-sync
 ```
 
-The harness accepts only a local database named `safe_migrate`, rebuilds
-`differential_baseline.sql` before each enabled fixture, and executes migration
-SQL. Never point it at a shared or production database.
+Both live suites accept only a local database named `safe_migrate` and execute
+DDL. The differential harness rebuilds `differential_baseline.sql` before each
+enabled fixture. Never point either suite at a shared or production database.
 
 ## Sourced differential cases
 

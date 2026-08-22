@@ -408,6 +408,12 @@ fn test_cache_inspect_outputs_a_redacted_json_summary() {
     assert!(report["contents"]["roles"].is_number());
     assert!(report["contents"]["schemas"].is_number());
     assert!(report["contents"]["sequences"].is_number());
+    assert!(report["contents"]["functions"].is_number());
+    assert!(report["contents"]["procedures"].is_number());
+    assert!(report["contents"]["aggregates"].is_number());
+    assert!(report["contents"]["window_functions"].is_number());
+    assert!(report["contents"]["publications"].is_number());
+    assert!(report["contents"]["subscriptions"].is_number());
     assert!(report.get("relation_names").is_none());
     assert!(report.get("database_url").is_none());
 }
@@ -430,7 +436,15 @@ fn test_cache_inspect_human_summary_discloses_redaction() {
 
     assert!(stdout.contains("Observed lock_timeout: 0 ms"));
     assert!(stdout.contains("Observed statement_timeout: 0 ms"));
-    assert!(stdout.contains("Contents (counts only):"));
+    assert!(stdout.contains("Contents (counts only):\n  Database objects\n"));
+    assert!(stdout.contains("\n  Routines\n"));
+    assert!(stdout.contains("\n  Replication\n"));
+    assert!(stdout.contains("\n  Security and graph\n"));
+    assert!(stdout.contains("    Window functions:"));
+    assert!(stdout.contains(
+        "    Relations:             1\n      Tables:              1\n      Views:               0\n      Materialized views:  0"
+    ));
+    assert!(!stdout.contains("relations ("));
     assert!(stdout.contains("Redaction: this summary intentionally omits"));
 }
 

@@ -282,6 +282,9 @@ pub enum StatementFact {
     CreateProcedure(CreateProcedureFact),
     AlterProcedure(AlterProcedureFact),
     DropProcedure(DropProcedureFact),
+    CreateAggregate(CreateAggregateFact),
+    AlterAggregate(AlterAggregateFact),
+    DropAggregate(DropAggregateFact),
     CreatePublication(CreatePublicationFact),
     AlterPublication(AlterPublicationFact),
     DropPublication(DropPublicationFact),
@@ -510,6 +513,27 @@ pub struct DropProcedureFact {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct CreateAggregateFact {
+    pub name: QualifiedName,
+    pub or_replace: bool,
+    pub params: Vec<ParamFact>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AlterAggregateFact {
+    pub name: QualifiedName,
+    pub params: Vec<String>,
+    pub action: AlterFunctionAction,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DropAggregateFact {
+    pub signatures: Vec<FunctionSigFact>,
+    pub if_exists: bool,
+    pub cascade: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct CreatePublicationFact {
     pub name: String,
     pub scope: PublicationScope,
@@ -529,19 +553,36 @@ pub enum PublicationObjectFact {
         only: bool,
         include_partitions: bool,
         columns: Option<Vec<String>>,
-        row_filter: Option<ExprIr>,
+        row_filter: Option<PublicationRowFilter>,
     },
     SchemaTables {
         schema: String,
-        row_filter: Option<ExprIr>,
+        row_filter: Option<PublicationRowFilter>,
     },
     CurrentSchemaShorthand,
     Unknown,
 }
 
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum PublicationRowFilter {
+    Parsed(ExprIr),
+    CatalogSql(String),
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct AlterPublicationFact {
     pub name: String,
+    pub action: AlterPublicationActionFact,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum AlterPublicationActionFact {
+    AddObjects(Vec<PublicationObjectFact>),
+    SetObjects(PublicationScope),
+    DropObjects(Vec<PublicationObjectFact>),
+    SetOptions(Vec<AttributeFact>),
+    OwnerChange(RoleFact),
+    Rename { to: String },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -563,11 +604,41 @@ pub struct CreateSubscriptionFact {
 pub enum ConnectionTarget {
     Literal(Option<String>),
     Server(Option<String>),
+    /// A synchronized subscription exists, but its connection string is never
+    /// read from PostgreSQL or written to the cache.
+    Redacted,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AlterSubscriptionFact {
     pub name: String,
+    pub action: AlterSubscriptionActionFact,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum SubscriptionPublicationMode {
+    Set,
+    Add,
+    Drop,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum AlterSubscriptionActionFact {
+    SetConnection(ConnectionTarget),
+    Publications {
+        mode: SubscriptionPublicationMode,
+        publications: Vec<String>,
+        params: Vec<AttributeFact>,
+    },
+    RefreshPublication(Vec<AttributeFact>),
+    SetEnabled(bool),
+    SetOptions(Vec<AttributeFact>),
+    SetServer(Option<String>),
+    Skip(Vec<AttributeFact>),
+    OwnerChange(RoleFact),
+    Rename {
+        to: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]

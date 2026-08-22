@@ -85,11 +85,21 @@ objects depend on it, which role and search path resolve an unqualified name,
 or which timeout defaults the migration session will inherit. `sync` captures
 that evidence once; subsequent reviews stay local and use the same baseline.
 
-Cache V6 synchronizes ordinary functions, but not other routine kinds that
-share PostgreSQL's routine namespace. It also omits publications and
-subscriptions. Baseline-dependent operations on those objects remain unknown
-and taint the analysis; safe-migrate does not infer that an unsynchronized
-object is absent.
+Cache V6 synchronizes every PostgreSQL routine kind: functions, procedures,
+aggregates, and window functions. Their typed DDL uses the synchronized shared
+namespace; unsupported routine DDL remains conservative.
+
+Publications are synchronized with their owner, table or schema scope, column
+lists, row filters, and version-specific options. Subscriptions include their
+owner, enabled state, slot name, publication list, and non-secret settings.
+`sync` never reads `pg_subscription.subconninfo`, so publisher connection
+strings are not written to the cache. Commands that refresh, create, or remove
+publisher-side state remain `Tainted` because their result depends on the
+publisher.
+
+Publication table membership is read from PostgreSQL's catalog. A later
+publication edit without `ONLY` is `Tainted` for a synchronized table because
+Cache V6 does not store `pg_inherits`; `ONLY` edits remain exact.
 
 Run sync with the database, role, and role/database defaults intended for the
 migration runner. Sync reads settings but does not change them. If the runner
@@ -276,8 +286,9 @@ database:
 safe-migrate sync
 ```
 
-v0.6.0 introduces Cache V6 for synchronized `lock_timeout` and
-`statement_timeout` provenance. Every V1–V5 cache requires resynchronization.
+v0.6.0 introduces Cache V6 for synchronized timeout provenance, the complete
+routine namespace, publications, and redacted subscriptions. Every V1–V5 cache
+requires resynchronization.
 
 Use `safe-migrate cache inspect` to view cache provenance and redacted object
 and role counts without connecting to PostgreSQL. It never lists role names or

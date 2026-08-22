@@ -67,6 +67,9 @@ pub enum Mutation {
     CreateProcedure(CreateProcedureMutation),
     AlterProcedure(AlterProcedureMutation),
     DropProcedure(DropProcedureMutation),
+    CreateAggregate(CreateAggregateMutation),
+    AlterAggregate(AlterAggregateMutation),
+    DropAggregate(DropAggregateMutation),
     CreatePublication(CreatePublicationMutation),
     AlterPublication(AlterPublicationMutation),
     DropPublication(DropPublicationMutation),
@@ -416,6 +419,26 @@ pub struct DropProcedureMutation {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct CreateAggregateMutation {
+    pub id: ObjectId,
+    pub or_replace: bool,
+    pub params: Vec<crate::analysis::facts::ParamFact>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AlterAggregateMutation {
+    pub id: ObjectId,
+    pub action: crate::analysis::facts::AlterFunctionAction,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DropAggregateMutation {
+    pub signatures: Vec<crate::analysis::facts::FunctionSigFact>,
+    pub if_exists: bool,
+    pub cascade: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct CreatePublicationMutation {
     pub name: String,
     pub scope: crate::analysis::facts::PublicationScope,
@@ -425,6 +448,7 @@ pub struct CreatePublicationMutation {
 #[derive(Clone, Debug, PartialEq)]
 pub struct AlterPublicationMutation {
     pub name: String,
+    pub action: crate::analysis::facts::AlterPublicationActionFact,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -445,6 +469,7 @@ pub struct CreateSubscriptionMutation {
 #[derive(Clone, Debug, PartialEq)]
 pub struct AlterSubscriptionMutation {
     pub name: String,
+    pub action: crate::analysis::facts::AlterSubscriptionActionFact,
 }
 
 #[derive(Clone, Debug, PartialEq)]

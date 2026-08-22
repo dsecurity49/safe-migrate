@@ -124,6 +124,9 @@ jobs:
       - name: Verify encrypted cache CLI contract
         run: scripts/live-cache-encryption
 
+      - name: Verify routine and replication catalog synchronization
+        run: scripts/live-catalog-sync
+
       - name: Compare simulator state with PostgreSQL
         shell: bash
         run: |

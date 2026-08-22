@@ -10,18 +10,22 @@ notes are available on the
 - `sync` now records the effective `lock_timeout` and `statement_timeout`.
   New Tier 2 rules report missing, disabled, or ineffective migration
   timeouts and follow timeout changes made by the migration.
-- Cache V6 stores these values. `cache inspect`, JSON, and Markdown
-  reports expose the observed values; V1–V5 caches must be rebuilt. Non-function
-  routines, publications, and subscriptions remain outside the synchronized
-  baseline, so baseline-dependent analysis for them is `Tainted`.
+- Cache V6 stores these values and synchronizes functions, procedures,
+  aggregates, window functions, publications, and redacted subscription
+  metadata across PostgreSQL 14–18. Publisher connection strings are never
+  read or cached. `cache inspect` reports counts for each catalog class;
+  V1–V5 caches must be rebuilt.
 - Fixed transaction-local `search_path` handling and tightened rule
   configuration so unsupported threshold fields are rejected. Corrected the
   enum-in-transaction rule to describe PostgreSQL's commit-time restriction
   and report it as a warning instead of claiming the statement cannot run.
 - Synchronization now reads one repeatable-read catalog snapshot, rejects blank
   connection strings, and refuses cache files larger than the reader accepts.
-  Identifier folding, guarded drops, nested volatile expressions, routine
-  lifecycles, and owner checks now follow PostgreSQL more closely.
+  Routine identity, publication membership, subscription lifecycle and
+  transaction restrictions, identifier folding, guarded drops, nested
+  volatile expressions, and owner checks now follow PostgreSQL more closely.
+  Aggregate and window-function DDL uses the synchronized routine namespace;
+  inheritance-sensitive publication edits are marked `Tainted`.
 - The GitHub Action can refresh and reuse named synchronized baselines. Only
   Action-controlled sync connects to PostgreSQL; lint stays offline and ignores
   config-driven `auto_sync`. Cache misses run `Tainted`. Exact tags install

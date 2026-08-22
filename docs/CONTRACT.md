@@ -173,10 +173,24 @@ an absent cache does not lower a finding by itself. A stale cache taints
 confidence and emits a warning on standard error. `stale_stats_days` uses the
 timestamp inside the cache, not file modification time.
 
-Cache V6 synchronizes ordinary functions, but not other routine kinds in
-PostgreSQL's shared routine namespace. It also omits publications and
-subscriptions. Baseline-dependent operations on those objects remain unknown
-and taint analysis. Missing cache entries do not establish absence.
+Cache V6 synchronizes all `pg_proc.prokind` values in PostgreSQL's shared
+routine namespace. Function, procedure, aggregate, and window-function
+lifecycle operations use that baseline. Routine DDL without a typed Squawk
+extractor remains opaque.
+
+Publication synchronization is database-wide even when relation sync is
+schema-scoped. It records owners, publication options, explicit tables, schema
+membership, column lists, and row filters where the connected PostgreSQL
+version provides them. Cache V6 does not store `pg_inherits`, so a later
+publication table edit without `ONLY` is `Tainted`; `ONLY` edits do not require
+inheritance evidence.
+
+Subscription synchronization is limited to the current database and selects
+only non-secret catalog fields. It records owner, enabled state, slot name,
+publication names, and supported settings. It never selects or serializes
+`pg_subscription.subconninfo`; the cached connection target is `Redacted`.
+Creating a connected subscription, refreshing publisher metadata, and dropping
+a subscription remain `Tainted` because their outcome depends on remote state.
 
 ## Timeout evidence
 
@@ -219,11 +233,11 @@ fresh `safe-migrate sync`.
 V6 cache payloads carry an explicit format header and record effective/session
 role provenance, the unexpanded search-path setting, effective lock and
 statement timeouts in milliseconds, PostgreSQL role membership, authoritative
-synchronized schemas, and synchronized sequence ownership/kind. They never
-include password hashes. They contain ordinary functions but not other routine
-kinds, publications, or subscriptions. V1–V5 and unheadered payloads are
-rejected with guidance to run `safe-migrate sync`. A failed automatic refresh
-may reuse a readable V6 cache, but never an older format.
+synchronized schemas, sequence ownership/kind, all routine kinds,
+publications, and redacted subscriptions. They never include password hashes
+or subscription connection strings. V1–V5 and unheadered payloads are rejected
+with guidance to run `safe-migrate sync`. A failed automatic refresh may reuse
+a readable V6 cache, but never an older format.
 
 ### GitHub Action
 
