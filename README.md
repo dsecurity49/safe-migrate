@@ -310,7 +310,7 @@ and GitHub cache contents are not signed. Store a 64-character hexadecimal key
 as `SAFE_MIGRATE_CACHE_KEY` and pass it to both workflows.
 
 ```yaml
-- uses: dsecurity49/safe-migrate@v0.6.0
+- uses: dsecurity49/safe-migrate@v0.6.1
   env:
     DATABASE_URL: ${{ secrets.SAFE_MIGRATE_DATABASE_URL }}
     SAFE_MIGRATE_CACHE_KEY: ${{ secrets.SAFE_MIGRATE_CACHE_KEY }}
@@ -329,7 +329,7 @@ Replace `public` with the schemas that contain your migrations, or omit
 Add this after checkout in the pull-request workflow:
 
 ```yaml
-- uses: dsecurity49/safe-migrate@v0.6.0
+- uses: dsecurity49/safe-migrate@v0.6.1
   env:
     SAFE_MIGRATE_CACHE_KEY: ${{ secrets.SAFE_MIGRATE_CACHE_KEY }}
   with:

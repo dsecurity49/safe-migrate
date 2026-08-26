@@ -69,6 +69,24 @@ mod tests {
     }
 
     #[test]
+    fn create_table_identity_column_is_non_null() {
+        let fact = parse_and_extract_statement(
+            "CREATE TABLE events (id bigint GENERATED ALWAYS AS IDENTITY);",
+        )
+        .expect("create table fact");
+
+        let StatementFact::CreateTable { columns, .. } = fact else {
+            panic!("expected create table fact");
+        };
+        assert_eq!(columns.len(), 1);
+        assert_eq!(
+            columns[0].generation,
+            crate::analysis::facts::ColumnGeneration::Identity
+        );
+        assert!(columns[0].not_null);
+    }
+
+    #[test]
     fn test_create_table_preserves_inline_constraint_names() {
         let fact = parse_and_extract_statement(
             "CREATE TABLE users (
@@ -1791,5 +1809,243 @@ mod tests {
             }
         });
         assert_eq!(owner, Some(crate::analysis::facts::RoleFact::SessionUser));
+    }
+
+    #[test]
+    fn squawk_263_typed_alter_table_children_preserve_facts() {
+        let facts = parse_and_extract(
+            "ALTER TABLE events ADD COLUMN generated_id bigint GENERATED ALWAYS AS IDENTITY;
+             ALTER TABLE events ADD CONSTRAINT events_parent_fk
+                 FOREIGN KEY (parent_id) REFERENCES parents(id) NOT VALID;
+             ALTER TABLE events ADD CONSTRAINT events_id_positive
+                 CHECK (generated_id > 0) NOT VALID;
+             ALTER TABLE events DISABLE TRIGGER ALL;
+             ALTER TABLE events ENABLE TRIGGER audit_log;
+             ALTER TABLE events REPLICA IDENTITY USING INDEX events_identity_idx;",
+        );
+        assert_eq!(facts.len(), 6);
+
+        assert!(matches!(
+            &facts[0],
+            StatementFact::AlterTable { actions, .. }
+                if matches!(
+                    actions.as_slice(),
+                    [AlterTableActionFact::AddColumn {
+                        name,
+                        generation: crate::analysis::facts::ColumnGeneration::Identity,
+                        not_null: true,
+                        ..
+                    }] if name == "generated_id"
+                )
+        ));
+        assert!(matches!(
+            &facts[1],
+            StatementFact::AlterTable { actions, .. }
+                if matches!(
+                    actions.as_slice(),
+                    [AlterTableActionFact::AddForeignKey {
+                        constraint_name: Some(name),
+                        not_valid: true,
+                        ..
+                    }] if name == "events_parent_fk"
+                )
+        ));
+        assert!(matches!(
+            &facts[2],
+            StatementFact::AlterTable { actions, .. }
+                if matches!(
+                    actions.as_slice(),
+                    [AlterTableActionFact::AddCheckConstraint {
+                        constraint_name: Some(name),
+                        not_valid: true,
+                    }] if name == "events_id_positive"
+                )
+        ));
+        assert!(matches!(
+            &facts[3],
+            StatementFact::AlterTable { actions, .. }
+                if matches!(
+                    actions.as_slice(),
+                    [AlterTableActionFact::DisableTrigger { trigger_name: Some(name) }]
+                        if name == "ALL"
+                )
+        ));
+        assert!(matches!(
+            &facts[4],
+            StatementFact::AlterTable { actions, .. }
+                if matches!(
+                    actions.as_slice(),
+                    [AlterTableActionFact::EnableTrigger { trigger_name: Some(name) }]
+                        if name == "audit_log"
+                )
+        ));
+        assert!(matches!(
+            &facts[5],
+            StatementFact::AlterTable { actions, .. }
+                if matches!(
+                    actions.as_slice(),
+                    [AlterTableActionFact::ReplicaIdentity { option }]
+                        if option == "events_identity_idx"
+                )
+        ));
+    }
+
+    #[test]
+    fn squawk_263_typed_view_sequence_policy_and_function_children_preserve_facts() {
+        let facts = parse_and_extract(
+            "ALTER VIEW report ALTER COLUMN total SET DEFAULT 0;
+             ALTER VIEW report ALTER COLUMN total DROP DEFAULT;
+             CREATE SEQUENCE event_ids OWNED BY public.events.id;
+             ALTER SEQUENCE event_ids OWNED BY NONE;
+             CREATE POLICY readers ON events FOR SELECT TO PUBLIC USING (true);
+             CREATE FUNCTION stable_owner() RETURNS integer
+                 LANGUAGE sql IMMUTABLE SECURITY DEFINER AS 'SELECT 1';",
+        );
+        assert_eq!(facts.len(), 6);
+
+        assert!(matches!(
+            &facts[0],
+            StatementFact::AlterView {
+                action: crate::analysis::facts::AlterViewAction::SetDefault { column, .. },
+                ..
+            } if column == "total"
+        ));
+        assert!(matches!(
+            &facts[1],
+            StatementFact::AlterView {
+                action: crate::analysis::facts::AlterViewAction::DropDefault { column },
+                ..
+            } if column == "total"
+        ));
+        assert!(matches!(
+            &facts[2],
+            StatementFact::CreateSequence {
+                owned_by: Some((table, column)),
+                ..
+            } if table.schema.as_ref().map(Ident::resolve).as_deref() == Some("public")
+                && table.name.resolve() == "events"
+                && column == "id"
+        ));
+        assert!(matches!(
+            &facts[3],
+            StatementFact::AlterSequence {
+                action: crate::analysis::facts::AlterSequenceActionFact::OwnedBy(None),
+                ..
+            }
+        ));
+        assert!(matches!(
+            &facts[4],
+            StatementFact::CreatePolicy {
+                command: crate::analysis::facts::PolicyCommand::Select,
+                ..
+            }
+        ));
+        let StatementFact::CreateFunction(function) = &facts[5] else {
+            panic!("expected create function fact");
+        };
+        assert!(function.options.iter().any(|option| matches!(
+            option,
+            crate::analysis::facts::FuncOptionFact::Volatility(
+                crate::analysis::facts::VolatilityKind::Immutable
+            )
+        )));
+        assert!(function.options.iter().any(|option| matches!(
+            option,
+            crate::analysis::facts::FuncOptionFact::Security(
+                crate::analysis::facts::SecurityKind::Definer
+            )
+        )));
+    }
+
+    #[test]
+    fn squawk_263_typed_replication_and_privilege_children_preserve_facts() {
+        let facts = parse_and_extract(
+            "CREATE PUBLICATION all_events FOR ALL TABLES EXCEPT TABLE audit_events;
+             CREATE PUBLICATION selected_events FOR TABLE public.events;
+             CREATE SUBSCRIPTION event_sub SERVER event_server
+                 PUBLICATION selected_events WITH (connect = false);
+             ALTER SUBSCRIPTION event_sub SERVER replacement_server;
+             GRANT ALL PRIVILEGES ON TABLE public.events TO app_user GRANTED BY admin;
+             REVOKE GRANT OPTION FOR SELECT ON TABLE public.events
+                 FROM app_user GRANTED BY admin CASCADE;",
+        );
+        assert_eq!(facts.len(), 6);
+
+        assert!(matches!(
+            &facts[0],
+            StatementFact::CreatePublication(publication)
+                if publication.name == "all_events"
+                    && publication.scope
+                        == PublicationScope::AllTables { except: vec!["audit_events".into()] }
+        ));
+        assert!(matches!(
+            &facts[1],
+            StatementFact::CreatePublication(publication)
+                if matches!(&publication.scope, PublicationScope::Explicit(objects) if objects.len() == 1)
+        ));
+        assert!(matches!(
+            &facts[2],
+            StatementFact::CreateSubscription(subscription)
+                if subscription.connection
+                    == crate::analysis::facts::ConnectionTarget::Server(
+                        Some("event_server".into())
+                    )
+        ));
+        assert!(matches!(
+            &facts[3],
+            StatementFact::AlterSubscription(subscription)
+                if subscription.action
+                    == AlterSubscriptionActionFact::SetServer(Some("replacement_server".into()))
+        ));
+        assert!(matches!(
+            &facts[4],
+            StatementFact::Grant(grant)
+                if grant.privileges == crate::analysis::facts::PrivilegeSpec::All
+                    && grant.granted_by
+                        == Some(crate::analysis::facts::RoleFact::Named {
+                            name: "admin".into(),
+                            via_legacy_group_syntax: false,
+                        })
+        ));
+        assert!(matches!(
+            &facts[5],
+            StatementFact::Revoke(revoke)
+                if revoke.grant_option_only
+                    && revoke.cascade
+                    && revoke.privileges
+                        == crate::analysis::facts::PrivilegeSpec::List(vec![
+                            crate::analysis::facts::PrivilegeFact::Select,
+                        ])
+                    && revoke.granted_by
+                        == Some(crate::analysis::facts::RoleFact::Named {
+                            name: "admin".into(),
+                            via_legacy_group_syntax: false,
+                        })
+        ));
+    }
+
+    #[test]
+    fn squawk_263_validation_matrix_rejects_invalid_expression_shapes() {
+        for sql in [
+            "SELECT * FROM t WHERE a NOT IN ();",
+            "SELECT * FROM t WHERE a NOT IN ARRAY[1, 2];",
+            "SELECT 1 OVERLAPS 2;",
+            "CREATE TABLE t (a int, FOREIGN KEY (a WITHOUT OVERLAPS) REFERENCES u (c));",
+        ] {
+            let parsed = SourceFile::parse(sql);
+            assert!(
+                !parsed.errors().is_empty(),
+                "expected validation error: {sql}"
+            );
+        }
+
+        for sql in [
+            "SELECT * FROM t WHERE a NOT IN (1, 2);",
+            "SELECT (1, 2) OVERLAPS (3, 4);",
+            "SELECT 1 UNION SELECT 2 INTERSECT SELECT 3 ORDER BY 1 LIMIT 1;",
+        ] {
+            let parsed = SourceFile::parse(sql);
+            assert!(parsed.errors().is_empty(), "expected valid SQL: {sql}");
+        }
     }
 }

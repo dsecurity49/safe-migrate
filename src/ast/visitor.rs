@@ -70,6 +70,18 @@ impl AstVisitor {
         Self::resolve_identifier_token(node.syntax().text().to_string().trim())
     }
 
+    fn is_and_chain(clause: Option<ast::ChainClause>) -> bool {
+        matches!(clause, Some(ast::ChainClause::AndChain(_)))
+    }
+
+    fn is_cascade(behavior: Option<ast::DropBehavior>) -> bool {
+        matches!(behavior, Some(ast::DropBehavior::Cascade(_)))
+    }
+
+    fn is_local(scope: Option<ast::SetScope>) -> bool {
+        matches!(scope, Some(ast::SetScope::LocalScope(_)))
+    }
+
     pub fn extract(stmt: &Stmt) -> Option<StatementFact> {
         let syntax = stmt.syntax();
         match stmt {
@@ -93,13 +105,11 @@ impl AstVisitor {
             Stmt::CreateUser(node) => return Self::extract_create_user(node),
             Stmt::Begin(_) => return Some(StatementFact::BeginTransaction),
             Stmt::Commit(node) => {
-                return Some(
-                    if node.chain_token().is_some() && node.no_token().is_none() {
-                        StatementFact::CommitAndChain
-                    } else {
-                        StatementFact::CommitTransaction
-                    },
-                );
+                return Some(if Self::is_and_chain(node.chain_clause()) {
+                    StatementFact::CommitAndChain
+                } else {
+                    StatementFact::CommitTransaction
+                });
             }
             Stmt::Rollback(node) => return Self::extract_rollback(node),
             Stmt::SavepointCreate(node) => return Some(Self::extract_savepoint(node)),
@@ -342,7 +352,7 @@ impl AstVisitor {
         Some(StatementFact::DropSchema {
             names,
             if_exists: node.if_exists().is_some(),
-            cascade: node.cascade_token().is_some(),
+            cascade: Self::is_cascade(node.drop_behavior()),
         })
     }
 
@@ -427,7 +437,7 @@ impl AstVisitor {
         Some(StatementFact::DropTable {
             name: path,
             if_exists: node.if_exists().is_some(),
-            cascade: node.cascade_token().is_some(),
+            cascade: Self::is_cascade(node.drop_behavior()),
         })
     }
 
@@ -520,7 +530,10 @@ impl AstVisitor {
                                         .map(crate::analysis::expr_visitor::ExprVisitor::convert)
                                 }
                                 Constraint::GeneratedConstraint(generated)
-                                    if generated.generated_identity().is_some() =>
+                                    if matches!(
+                                        generated.generated_as(),
+                                        Some(ast::GeneratedAs::GeneratedIdentity(_))
+                                    ) =>
                                 {
                                     generation = crate::analysis::facts::ColumnGeneration::Identity;
                                     not_null = true;
@@ -682,43 +695,23 @@ impl AstVisitor {
                     }
                 }
                 AlterTableAction::DisableTrigger(dt) => {
-                    let trigger_name = dt
-                        .trigger_ref()
-                        .and_then(|tr| tr.ident_token())
-                        .map(|n| Self::resolve_identifier_token(n.text()))
-                        .or_else(|| {
-                            if dt.all_token().is_some() {
-                                Some("ALL".to_string())
-                            } else {
-                                None
-                            }
-                        })
-                        .or_else(|| {
-                            dt.syntax()
-                                .descendants()
-                                .find_map(NameRef::cast)
-                                .map(|nr| Self::resolve_name_ref(&nr))
-                        });
+                    let trigger_name = match dt.trigger_target() {
+                        Some(ast::TriggerTarget::TriggerRef(trigger)) => trigger
+                            .ident_token()
+                            .map(|name| Self::resolve_identifier_token(name.text())),
+                        Some(ast::TriggerTarget::All(_)) => Some("ALL".to_string()),
+                        Some(ast::TriggerTarget::User(_)) | None => None,
+                    };
                     actions.push(AlterTableActionFact::DisableTrigger { trigger_name });
                 }
                 AlterTableAction::EnableTrigger(et) => {
-                    let trigger_name = et
-                        .trigger_ref()
-                        .and_then(|tr| tr.ident_token())
-                        .map(|n| Self::resolve_identifier_token(n.text()))
-                        .or_else(|| {
-                            if et.all_token().is_some() {
-                                Some("ALL".to_string())
-                            } else {
-                                None
-                            }
-                        })
-                        .or_else(|| {
-                            et.syntax()
-                                .descendants()
-                                .find_map(NameRef::cast)
-                                .map(|nr| Self::resolve_name_ref(&nr))
-                        });
+                    let trigger_name = match et.trigger_target() {
+                        Some(ast::TriggerTarget::TriggerRef(trigger)) => trigger
+                            .ident_token()
+                            .map(|name| Self::resolve_identifier_token(name.text())),
+                        Some(ast::TriggerTarget::All(_)) => Some("ALL".to_string()),
+                        Some(ast::TriggerTarget::User(_)) | None => None,
+                    };
                     actions.push(AlterTableActionFact::EnableTrigger { trigger_name });
                 }
                 AlterTableAction::SetSchema(ss) => {
@@ -746,26 +739,26 @@ impl AstVisitor {
                     actions.push(AlterTableActionFact::SetUnlogged);
                 }
                 AlterTableAction::ReplicaIdentity(ri) => {
-                    let option = ri
-                        .index_ref()
-                        .and_then(|ir| ir.path_ref())
-                        .and_then(|pr| Self::path_ref_to_qualified_name(&pr))
-                        .map(|qn| qn.name.resolve())
-                        .or_else(|| {
-                            if ri.default_token().is_some() {
-                                Some("DEFAULT".to_string())
-                            } else if ri.full_token().is_some() {
-                                Some("FULL".to_string())
-                            } else if ri.syntax().descendants().find_map(NameRef::cast).is_some() {
-                                ri.syntax()
-                                    .descendants()
-                                    .find_map(NameRef::cast)
-                                    .map(|nr| Self::resolve_name_ref(&nr))
-                            } else {
-                                Some("NOTHING".to_string())
-                            }
-                        })
-                        .unwrap_or_default();
+                    let option = match ri.replica_identity_option() {
+                        Some(ast::ReplicaIdentityOption::ReplicaIdentityDefault(_)) => {
+                            "DEFAULT".to_string()
+                        }
+                        Some(ast::ReplicaIdentityOption::ReplicaIdentityFull(_)) => {
+                            "FULL".to_string()
+                        }
+                        Some(ast::ReplicaIdentityOption::ReplicaIdentityNothing(_)) => {
+                            "NOTHING".to_string()
+                        }
+                        Some(ast::ReplicaIdentityOption::UsingIndexName(using_index)) => {
+                            using_index
+                                .index_ref()
+                                .and_then(|index| index.path_ref())
+                                .and_then(|path| Self::path_ref_to_qualified_name(&path))
+                                .map(|name| name.name.resolve())
+                                .unwrap_or_default()
+                        }
+                        None => String::new(),
+                    };
                     actions.push(AlterTableActionFact::ReplicaIdentity { option });
                 }
                 AlterTableAction::ClusterOn(co) => {
@@ -912,9 +905,14 @@ impl AstVisitor {
         })?;
         let name = Self::resolve_identifier_token(name_token.text());
         let ty = col.ty().map(|t| t.syntax().text().to_string());
-        let not_null = col
-            .constraints()
-            .any(|c| matches!(c, ColumnConstraint::NotNullConstraint(_)));
+        let is_identity = col.constraints().any(|constraint| {
+            matches!(constraint, ColumnConstraint::GeneratedConstraint(generated)
+                if matches!(generated.generated_as(), Some(ast::GeneratedAs::GeneratedIdentity(_))))
+        });
+        let not_null = is_identity
+            || col
+                .constraints()
+                .any(|c| matches!(c, ColumnConstraint::NotNullConstraint(_)));
         let primary_key_constraint_name = col.constraints().find_map(|constraint| {
             let ColumnConstraint::PrimaryKeyConstraint(primary_key) = constraint else {
                 return None;
@@ -954,10 +952,7 @@ impl AstVisitor {
         });
         let generation = if Self::is_serial_type(ty.as_deref()) {
             crate::analysis::facts::ColumnGeneration::Serial
-        } else if col.constraints().any(|constraint| {
-            matches!(constraint, ColumnConstraint::GeneratedConstraint(generated)
-                if generated.generated_identity().is_some())
-        }) {
+        } else if is_identity {
             crate::analysis::facts::ColumnGeneration::Identity
         } else {
             crate::analysis::facts::ColumnGeneration::Ordinary
@@ -1076,13 +1071,14 @@ impl AstVisitor {
     fn extract_add_constraint_fact(
         ac: &squawk_syntax::ast::AddConstraint,
     ) -> Option<AlterTableActionFact> {
-        let not_valid = ac.not_valid().is_some();
-
         if let Some(fkc) = ac
             .syntax()
             .descendants()
             .find_map(ast::ForeignKeyConstraint::cast)
         {
+            let not_valid = fkc
+                .constraint_options()
+                .any(|option| matches!(option, ast::ConstraintOption::NotValid(_)));
             let constraint_name = fkc
                 .constraint_name_clause()
                 .and_then(|cn| cn.constraint_name())
@@ -1112,6 +1108,9 @@ impl AstVisitor {
             .descendants()
             .find_map(ast::CheckConstraint::cast)
         {
+            let not_valid = cc
+                .constraint_options()
+                .any(|option| matches!(option, ast::ConstraintOption::NotValid(_)));
             let constraint_name = cc
                 .constraint_name_clause()
                 .and_then(|cn| cn.constraint_name())
@@ -1436,26 +1435,25 @@ impl AstVisitor {
                 let col_token = avc.name()?.ident_token()?;
                 let col_name = Self::resolve_identifier_token(col_token.text());
 
-                if avc.drop_default().is_some() {
-                    Some(StatementFact::AlterView {
+                match avc.alter_view_column_action()? {
+                    ast::AlterViewColumnAction::DropDefault(_) => Some(StatementFact::AlterView {
                         name,
                         action: crate::analysis::facts::AlterViewAction::DropDefault {
                             column: col_name,
                         },
-                    })
-                } else if let Some(sd) = avc.set_default() {
-                    let expr = sd.expr()?;
-                    Some(StatementFact::AlterView {
-                        name,
-                        action: crate::analysis::facts::AlterViewAction::SetDefault {
-                            column: col_name,
-                            default: Some(crate::analysis::expr_visitor::ExprVisitor::convert(
-                                expr,
-                            )),
-                        },
-                    })
-                } else {
-                    None
+                    }),
+                    ast::AlterViewColumnAction::SetDefault(set_default) => {
+                        let expr = set_default.expr()?;
+                        Some(StatementFact::AlterView {
+                            name,
+                            action: crate::analysis::facts::AlterViewAction::SetDefault {
+                                column: col_name,
+                                default: Some(crate::analysis::expr_visitor::ExprVisitor::convert(
+                                    expr,
+                                )),
+                            },
+                        })
+                    }
                 }
             }
             ast::AlterViewAction::RenameColumn(rc) => {
@@ -1529,7 +1527,7 @@ impl AstVisitor {
         Some(StatementFact::DropView {
             name: path,
             if_exists: node.if_exists().is_some(),
-            cascade: node.cascade_token().is_some(),
+            cascade: Self::is_cascade(node.drop_behavior()),
         })
     }
 
@@ -1545,7 +1543,7 @@ impl AstVisitor {
         Some(StatementFact::DropMaterializedView {
             names,
             if_exists: node.if_exists().is_some(),
-            cascade: node.cascade_token().is_some(),
+            cascade: Self::is_cascade(node.drop_behavior()),
         })
     }
 
@@ -1672,7 +1670,12 @@ impl AstVisitor {
                     .descendants()
                     .find_map(ast::OptionOwnedBy::cast);
                 match owned_option {
-                    Some(option) if option.none_token().is_some() => {
+                    Some(option)
+                        if matches!(
+                            option.owned_by_target(),
+                            Some(ast::OwnedByTarget::OwnedByNone(_))
+                        ) =>
+                    {
                         crate::analysis::facts::AlterSequenceActionFact::OwnedBy(None)
                     }
                     Some(_) => crate::analysis::facts::AlterSequenceActionFact::OwnedBy(
@@ -1700,13 +1703,16 @@ impl AstVisitor {
         Some(StatementFact::DropSequence {
             names,
             if_exists: node.if_exists().is_some(),
-            cascade: node.cascade_token().is_some(),
+            cascade: Self::is_cascade(node.drop_behavior()),
         })
     }
 
     fn extract_owned_by(node: &squawk_syntax::SyntaxNode) -> Option<(QualifiedName, String)> {
         for opt in node.descendants().filter_map(ast::OptionOwnedBy::cast) {
-            let path_ref = opt.name()?.path_ref()?;
+            let ast::OwnedByTarget::QualifiedColumnNameRef(name) = opt.owned_by_target()? else {
+                continue;
+            };
+            let path_ref = name.path_ref()?;
             let mut segments = Vec::new();
             let mut current_ref = Some(path_ref);
 
@@ -1805,7 +1811,7 @@ impl AstVisitor {
         Some(StatementFact::DropType {
             names,
             if_exists: node.if_exists().is_some(),
-            cascade: node.cascade_token().is_some(),
+            cascade: Self::is_cascade(node.drop_behavior()),
         })
     }
     fn extract_drop_domain(node: &DropDomain) -> Option<StatementFact> {
@@ -1818,7 +1824,7 @@ impl AstVisitor {
         Some(StatementFact::DropDomain {
             names,
             if_exists: node.if_exists().is_some(),
-            cascade: node.cascade_token().is_some(),
+            cascade: Self::is_cascade(node.drop_behavior()),
         })
     }
 
@@ -1917,18 +1923,22 @@ impl AstVisitor {
             true
         };
 
-        let command = if node.all_token().is_some() {
-            crate::analysis::facts::PolicyCommand::All
-        } else if node.select_token().is_some() {
-            crate::analysis::facts::PolicyCommand::Select
-        } else if node.insert_token().is_some() {
-            crate::analysis::facts::PolicyCommand::Insert
-        } else if node.update_token().is_some() {
-            crate::analysis::facts::PolicyCommand::Update
-        } else if node.delete_token().is_some() {
-            crate::analysis::facts::PolicyCommand::Delete
-        } else {
-            crate::analysis::facts::PolicyCommand::All
+        let command = match node.policy_command().and_then(|command| command.command()) {
+            Some(ast::PolicyCommandKind::PolicyCommandSelect(_)) => {
+                crate::analysis::facts::PolicyCommand::Select
+            }
+            Some(ast::PolicyCommandKind::PolicyCommandInsert(_)) => {
+                crate::analysis::facts::PolicyCommand::Insert
+            }
+            Some(ast::PolicyCommandKind::PolicyCommandUpdate(_)) => {
+                crate::analysis::facts::PolicyCommand::Update
+            }
+            Some(ast::PolicyCommandKind::PolicyCommandDelete(_)) => {
+                crate::analysis::facts::PolicyCommand::Delete
+            }
+            Some(ast::PolicyCommandKind::PolicyCommandAll(_)) | None => {
+                crate::analysis::facts::PolicyCommand::All
+            }
         };
 
         Some(StatementFact::CreatePolicy {
@@ -2059,22 +2069,28 @@ impl AstVisitor {
                 )
             }
             ast::FuncOption::VolatilityFuncOption(f) => {
-                let vol = if f.immutable_token().is_some() {
-                    crate::analysis::facts::VolatilityKind::Immutable
-                } else if f.stable_token().is_some() {
-                    crate::analysis::facts::VolatilityKind::Stable
-                } else {
-                    crate::analysis::facts::VolatilityKind::Volatile
+                let vol = match f {
+                    ast::VolatilityFuncOption::Immutable(_) => {
+                        crate::analysis::facts::VolatilityKind::Immutable
+                    }
+                    ast::VolatilityFuncOption::Stable(_) => {
+                        crate::analysis::facts::VolatilityKind::Stable
+                    }
+                    ast::VolatilityFuncOption::Volatile(_) => {
+                        crate::analysis::facts::VolatilityKind::Volatile
+                    }
                 };
                 crate::analysis::facts::FuncOptionFact::Volatility(vol)
             }
-            ast::FuncOption::SecurityFuncOption(f) => {
-                let sec = if f.invoker_token().is_some() {
-                    crate::analysis::facts::SecurityKind::Invoker
-                } else {
-                    crate::analysis::facts::SecurityKind::Definer
-                };
-                crate::analysis::facts::FuncOptionFact::Security(sec)
+            ast::FuncOption::SecurityInvokerFuncOption(_) => {
+                crate::analysis::facts::FuncOptionFact::Security(
+                    crate::analysis::facts::SecurityKind::Invoker,
+                )
+            }
+            ast::FuncOption::SecurityDefinerFuncOption(_) => {
+                crate::analysis::facts::FuncOptionFact::Security(
+                    crate::analysis::facts::SecurityKind::Definer,
+                )
             }
             ast::FuncOption::StrictFuncOption(_) => crate::analysis::facts::FuncOptionFact::Strict(
                 crate::analysis::facts::StrictKind::Strict,
@@ -2245,7 +2261,7 @@ impl AstVisitor {
             crate::analysis::facts::DropFunctionFact {
                 signatures: sigs,
                 if_exists: node.if_exists().is_some(),
-                cascade: node.cascade_token().is_some(),
+                cascade: Self::is_cascade(node.drop_behavior()),
             },
         ))
     }
@@ -2339,7 +2355,7 @@ impl AstVisitor {
             crate::analysis::facts::DropProcedureFact {
                 signatures: sigs,
                 if_exists: node.if_exists().is_some(),
-                cascade: node.cascade_token().is_some(),
+                cascade: Self::is_cascade(node.drop_behavior()),
             },
         ))
     }
@@ -2446,7 +2462,7 @@ impl AstVisitor {
             crate::analysis::facts::DropAggregateFact {
                 signatures,
                 if_exists: node.if_exists().is_some(),
-                cascade: node.cascade_token().is_some(),
+                cascade: Self::is_cascade(node.drop_behavior()),
             },
         ))
     }
@@ -2530,27 +2546,33 @@ impl AstVisitor {
             .publication()
             .map(|publication| Self::resolve_ast_identifier(&publication))
             .unwrap_or_default();
-        let scope = if let Some(fapo) = node.for_all_publication_objects() {
-            crate::analysis::facts::PublicationScope::AllTables {
-                except: fapo
-                    .except_table_clause()
-                    .map(|etc| {
-                        etc.except_table_names()
-                            .filter_map(|etn| etn.table_relation_name())
-                            .filter_map(|trn| trn.table_name_ref())
-                            .filter_map(|tnr| tnr.path_ref())
-                            .filter_map(|p| Self::path_ref_to_qualified_name(&p))
-                            .map(|qn| qn.name.resolve())
-                            .collect()
-                    })
-                    .unwrap_or_default(),
+        let scope = match node.publication_for_clause() {
+            Some(ast::PublicationForClause::ForAllPublicationObjects(all_objects)) => {
+                crate::analysis::facts::PublicationScope::AllTables {
+                    except: all_objects
+                        .except_table_clause()
+                        .map(|clause| {
+                            clause
+                                .except_table_names()
+                                .filter_map(|name| name.table_relation_name())
+                                .filter_map(|name| name.table_name_ref())
+                                .filter_map(|name| name.path_ref())
+                                .filter_map(|path| Self::path_ref_to_qualified_name(&path))
+                                .map(|name| name.name.resolve())
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                }
             }
-        } else {
-            let objects = node
-                .publication_objects()
-                .filter_map(Self::extract_publication_object)
-                .collect();
-            crate::analysis::facts::PublicationScope::Explicit(objects)
+            Some(ast::PublicationForClause::ForPublicationObjects(objects)) => {
+                crate::analysis::facts::PublicationScope::Explicit(
+                    objects
+                        .publication_objects()
+                        .filter_map(Self::extract_publication_object)
+                        .collect(),
+                )
+            }
+            None => crate::analysis::facts::PublicationScope::Explicit(Vec::new()),
         };
         let params =
             Self::extract_attribute_list(node.with_params().and_then(|with| with.attribute_list()));
@@ -2595,7 +2617,7 @@ impl AstVisitor {
                     ),
                 )
             }
-            ast::AlterPublicationAction::SetAllPublicationObjects(action) => {
+            ast::AlterPublicationAction::SetAllPublicationObjectList(action) => {
                 let except = action
                     .except_table_clause()
                     .map(|clause| {
@@ -2645,7 +2667,7 @@ impl AstVisitor {
             crate::analysis::facts::DropPublicationFact {
                 names,
                 if_exists: node.if_exists().is_some(),
-                cascade: node.cascade_token().is_some(),
+                cascade: Self::is_cascade(node.drop_behavior()),
             },
         ))
     }
@@ -2656,16 +2678,22 @@ impl AstVisitor {
         let name = node
             .subscription()
             .map(|subscription| Self::resolve_ast_identifier(&subscription));
-        let connection = if node.server_token().is_some() {
-            crate::analysis::facts::ConnectionTarget::Server(
-                node.server_ref()
-                    .map(|server| Self::resolve_ast_identifier(&server)),
-            )
-        } else {
-            crate::analysis::facts::ConnectionTarget::Literal(
-                node.literal()
-                    .and_then(|literal| Self::resolve_string_literal(&literal)),
-            )
+        let connection = match node.source() {
+            Some(ast::SubscriptionSource::ServerClause(server)) => {
+                crate::analysis::facts::ConnectionTarget::Server(
+                    server
+                        .server_ref()
+                        .map(|server| Self::resolve_ast_identifier(&server)),
+                )
+            }
+            Some(ast::SubscriptionSource::ConnectionClause(connection)) => {
+                crate::analysis::facts::ConnectionTarget::Literal(
+                    connection
+                        .literal()
+                        .and_then(|literal| Self::resolve_string_literal(&literal)),
+                )
+            }
+            None => crate::analysis::facts::ConnectionTarget::Literal(None),
         };
         let publications = node
             .publication_refs()
@@ -2690,7 +2718,7 @@ impl AstVisitor {
     ) -> Option<StatementFact> {
         let name = Self::resolve_ast_identifier(&node.subscription_ref()?);
         let action = match node.action()? {
-            ast::AlterSubscriptionAction::SetConnection(action) => {
+            ast::AlterSubscriptionAction::ConnectionClause(action) => {
                 crate::analysis::facts::AlterSubscriptionActionFact::SetConnection(
                     crate::analysis::facts::ConnectionTarget::Literal(
                         action
@@ -2699,7 +2727,7 @@ impl AstVisitor {
                     ),
                 )
             }
-            ast::AlterSubscriptionAction::SetServer(action) => {
+            ast::AlterSubscriptionAction::ServerClause(action) => {
                 crate::analysis::facts::AlterSubscriptionActionFact::SetServer(
                     action
                         .server_ref()
@@ -2713,7 +2741,11 @@ impl AstVisitor {
                         .publication_refs()
                         .map(|publication| Self::resolve_ast_identifier(&publication))
                         .collect(),
-                    params: Self::extract_attribute_list(action.attribute_list()),
+                    params: Self::extract_attribute_list(
+                        action
+                            .with_params()
+                            .and_then(|params| params.attribute_list()),
+                    ),
                 }
             }
             ast::AlterSubscriptionAction::AddPublication(action) => {
@@ -2723,7 +2755,11 @@ impl AstVisitor {
                         .publication_refs()
                         .map(|publication| Self::resolve_ast_identifier(&publication))
                         .collect(),
-                    params: Self::extract_attribute_list(action.attribute_list()),
+                    params: Self::extract_attribute_list(
+                        action
+                            .with_params()
+                            .and_then(|params| params.attribute_list()),
+                    ),
                 }
             }
             ast::AlterSubscriptionAction::DropSubscriptionPublication(action) => {
@@ -2733,12 +2769,20 @@ impl AstVisitor {
                         .publication_refs()
                         .map(|publication| Self::resolve_ast_identifier(&publication))
                         .collect(),
-                    params: Self::extract_attribute_list(action.attribute_list()),
+                    params: Self::extract_attribute_list(
+                        action
+                            .with_params()
+                            .and_then(|params| params.attribute_list()),
+                    ),
                 }
             }
             ast::AlterSubscriptionAction::RefreshPublication(action) => {
                 crate::analysis::facts::AlterSubscriptionActionFact::RefreshPublication(
-                    Self::extract_attribute_list(action.attribute_list()),
+                    Self::extract_attribute_list(
+                        action
+                            .with_params()
+                            .and_then(|params| params.attribute_list()),
+                    ),
                 )
             }
             ast::AlterSubscriptionAction::EnableSubscription(_) => {
@@ -3028,22 +3072,22 @@ impl AstVisitor {
     }
 
     fn extract_grant(node: &Grant) -> Option<StatementFact> {
-        let privileges = if node.all_privileges().is_some() {
-            crate::analysis::facts::PrivilegeSpec::All
-        } else {
-            crate::analysis::facts::PrivilegeSpec::List(
-                node.revoke_command_list()
-                    .map(|rcl| {
-                        rcl.revoke_commands()
-                            .map(|rc| Self::extract_privilege_from_revoke_command(&rc))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-            )
+        let privileges = match node.privileges() {
+            Some(ast::Privileges::AllPrivileges(_)) => crate::analysis::facts::PrivilegeSpec::All,
+            Some(ast::Privileges::RevokeCommandList(commands)) => {
+                crate::analysis::facts::PrivilegeSpec::List(
+                    commands
+                        .revoke_commands()
+                        .map(|command| Self::extract_privilege_from_revoke_command(&command))
+                        .collect(),
+                )
+            }
+            None => crate::analysis::facts::PrivilegeSpec::List(Vec::new()),
         };
 
         let target = Self::extract_grant_target_from_privilege_objects(
-            node.privilege_objects(),
+            node.on_privilege_objects_clause()
+                .and_then(|clause| clause.privilege_objects()),
             node.syntax(),
         )?;
 
@@ -3052,7 +3096,10 @@ impl AstVisitor {
             .map(|rrl| rrl.role_refs().map(|r| Self::extract_role(&r)).collect())
             .unwrap_or_default();
         let with_grant_option = node.grant_with_clause().is_some();
-        let granted_by = node.role_ref().map(|r| Self::extract_role(&r));
+        let granted_by = node
+            .granted_by_clause()
+            .and_then(|clause| clause.role_ref())
+            .map(|role| Self::extract_role(&role));
 
         Some(StatementFact::Grant(crate::analysis::facts::GrantFact {
             privileges,
@@ -3064,30 +3111,27 @@ impl AstVisitor {
     }
 
     fn extract_revoke(node: &Revoke) -> Option<StatementFact> {
-        let grant_option_only = node.for_token().is_some()
-            && node.grant_token().is_some()
-            && node.option_token().is_some();
+        let grant_option_only = matches!(
+            node.revoke_option_for(),
+            Some(ast::RevokeOptionFor::GrantOptionFor(_))
+        );
 
-        let privileges = if let Some(p) = node.privileges() {
-            if p.all_token().is_some() {
-                crate::analysis::facts::PrivilegeSpec::All
-            } else {
+        let privileges = match node.privileges() {
+            Some(ast::Privileges::AllPrivileges(_)) => crate::analysis::facts::PrivilegeSpec::All,
+            Some(ast::Privileges::RevokeCommandList(commands)) => {
                 crate::analysis::facts::PrivilegeSpec::List(
-                    p.revoke_command_list()
-                        .map(|rcl| {
-                            rcl.revoke_commands()
-                                .map(|rc| Self::extract_privilege_from_revoke_command(&rc))
-                                .collect()
-                        })
-                        .unwrap_or_default(),
+                    commands
+                        .revoke_commands()
+                        .map(|command| Self::extract_privilege_from_revoke_command(&command))
+                        .collect(),
                 )
             }
-        } else {
-            crate::analysis::facts::PrivilegeSpec::List(vec![])
+            None => crate::analysis::facts::PrivilegeSpec::List(Vec::new()),
         };
 
         let target = Self::extract_grant_target_from_privilege_objects(
-            node.privilege_objects(),
+            node.on_privilege_objects_clause()
+                .and_then(|clause| clause.privilege_objects()),
             node.syntax(),
         )?;
 
@@ -3095,8 +3139,11 @@ impl AstVisitor {
             .role_ref_list()
             .map(|rrl| rrl.role_refs().map(|r| Self::extract_role(&r)).collect())
             .unwrap_or_default();
-        let granted_by = node.role_ref().map(|r| Self::extract_role(&r));
-        let cascade = node.cascade_token().is_some();
+        let granted_by = node
+            .granted_by_clause()
+            .and_then(|clause| clause.role_ref())
+            .map(|role| Self::extract_role(&role));
+        let cascade = Self::is_cascade(node.drop_behavior());
 
         Some(StatementFact::Revoke(crate::analysis::facts::RevokeFact {
             grant_option_only,
@@ -3276,31 +3323,37 @@ impl AstVisitor {
                     .name
                     .resolve()
                     .to_lowercase();
-                let local = node.local_token().is_some();
+                let local = Self::is_local(node.set_scope());
 
                 if setting_name == "search_path" {
-                    if sc.default_token().is_some() {
-                        return Some(StatementFact::SetSearchPath {
-                            target: SearchPathTarget::Default,
-                            local,
-                        });
-                    }
-
-                    let schemas: Vec<String> = sc
-                        .config_values()
-                        .filter_map(|cv| match cv {
-                            ast::ConfigValue::ConfigValueName(cvn) => cvn
-                                .ident_token()
-                                .map(|t| Self::resolve_identifier_token(t.text())),
-                            ast::ConfigValue::Literal(literal) => {
-                                Self::resolve_string_literal(&literal)
-                            }
-                        })
-                        .collect();
-                    return (!schemas.is_empty()).then_some(StatementFact::SetSearchPath {
-                        target: SearchPathTarget::Schemas(schemas),
-                        local,
-                    });
+                    return match sc.config_assignment() {
+                        Some(ast::ConfigAssignment::ToConfigValue(assignment))
+                            if assignment.default_token().is_some() =>
+                        {
+                            Some(StatementFact::SetSearchPath {
+                                target: SearchPathTarget::Default,
+                                local,
+                            })
+                        }
+                        Some(ast::ConfigAssignment::ToConfigValue(assignment)) => {
+                            let schemas: Vec<String> = assignment
+                                .config_values()
+                                .filter_map(|value| match value {
+                                    ast::ConfigValue::ConfigValueName(name) => name
+                                        .ident_token()
+                                        .map(|token| Self::resolve_identifier_token(token.text())),
+                                    ast::ConfigValue::Literal(literal) => {
+                                        Self::resolve_string_literal(&literal)
+                                    }
+                                })
+                                .collect();
+                            (!schemas.is_empty()).then_some(StatementFact::SetSearchPath {
+                                target: SearchPathTarget::Schemas(schemas),
+                                local,
+                            })
+                        }
+                        Some(ast::ConfigAssignment::FromCurrent(_)) | None => None,
+                    };
                 }
 
                 if setting_name == "application_name" {
@@ -3312,31 +3365,36 @@ impl AstVisitor {
                     "statement_timeout" => TimeoutSetting::Statement,
                     _ => return None,
                 };
-                let value = if sc.default_token().is_some() {
-                    TimeoutSettingValue::Default
-                } else if sc.current_token().is_some() {
-                    TimeoutSettingValue::Current
-                } else {
-                    let values: Vec<String> = sc
-                        .config_values()
-                        .filter_map(|value| match value {
-                            ast::ConfigValue::ConfigValueName(name) => {
-                                name.ident_token().map(|token| token.text().to_string())
+                let value = match sc.config_assignment() {
+                    Some(ast::ConfigAssignment::FromCurrent(_)) => TimeoutSettingValue::Current,
+                    Some(ast::ConfigAssignment::ToConfigValue(assignment))
+                        if assignment.default_token().is_some() =>
+                    {
+                        TimeoutSettingValue::Default
+                    }
+                    Some(ast::ConfigAssignment::ToConfigValue(assignment)) => {
+                        let values: Vec<String> = assignment
+                            .config_values()
+                            .filter_map(|value| match value {
+                                ast::ConfigValue::ConfigValueName(name) => {
+                                    name.ident_token().map(|token| token.text().to_string())
+                                }
+                                ast::ConfigValue::Literal(literal) => {
+                                    Self::resolve_string_literal(&literal)
+                                        .or_else(|| Some(literal.syntax().text().to_string()))
+                                }
+                            })
+                            .collect();
+                        if values.len() != 1 {
+                            TimeoutSettingValue::Invalid(sc.syntax().text().to_string())
+                        } else {
+                            match crate::analysis::settings::parse_timeout_ms(&values[0]) {
+                                Ok(milliseconds) => TimeoutSettingValue::Milliseconds(milliseconds),
+                                Err(error) => TimeoutSettingValue::Invalid(error),
                             }
-                            ast::ConfigValue::Literal(literal) => {
-                                Self::resolve_string_literal(&literal)
-                                    .or_else(|| Some(literal.syntax().text().to_string()))
-                            }
-                        })
-                        .collect();
-                    if values.len() != 1 {
-                        TimeoutSettingValue::Invalid(sc.syntax().text().to_string())
-                    } else {
-                        match crate::analysis::settings::parse_timeout_ms(&values[0]) {
-                            Ok(milliseconds) => TimeoutSettingValue::Milliseconds(milliseconds),
-                            Err(error) => TimeoutSettingValue::Invalid(error),
                         }
                     }
+                    None => TimeoutSettingValue::Invalid(sc.syntax().text().to_string()),
                 };
                 Some(StatementFact::SetTimeout {
                     setting: timeout_setting,
@@ -3377,16 +3435,17 @@ impl AstVisitor {
 
     /// Extract `SET [LOCAL] ROLE { rolename | NONE }`.
     fn extract_set_role(node: &squawk_syntax::ast::SetRole) -> Option<StatementFact> {
-        let local = node.local_token().is_some();
-        // ROLE NONE — restore the session default.
-        if node.none_token().is_some() {
-            return Some(StatementFact::SetRole {
-                role: None,
-                local,
-                is_session_auth: false,
-            });
-        }
-        let role = node.role_ref().map(|r| Self::extract_role(&r));
+        let local = Self::is_local(node.set_scope());
+        let role = match node.set_role_target()? {
+            ast::SetRoleTarget::SetRoleNone(_) => None,
+            ast::SetRoleTarget::RoleRef(role) => Some(Self::extract_role(&role)),
+            ast::SetRoleTarget::Literal(literal) => Self::resolve_string_literal(&literal)
+                .filter(|name| !name.is_empty())
+                .map(|name| crate::analysis::facts::RoleFact::Named {
+                    name,
+                    via_legacy_group_syntax: false,
+                }),
+        };
         if matches!(
             role,
             Some(
@@ -3412,25 +3471,17 @@ impl AstVisitor {
     fn extract_set_session_auth(
         node: &squawk_syntax::ast::SetSessionAuth,
     ) -> Option<StatementFact> {
-        let local = node.local_token().is_some();
-        // DEFAULT — restore the session default.
-        if node.default_token().is_some() {
-            return Some(StatementFact::SetRole {
-                role: None,
-                local,
-                is_session_auth: true,
-            });
-        }
-        // A literal string is also valid: SET SESSION AUTHORIZATION 'rolename'.
-        let role_from_literal = node
-            .literal()
-            .and_then(|literal| Self::resolve_string_literal(&literal))
-            .filter(|name| !name.is_empty())
-            .map(|name| crate::analysis::facts::RoleFact::Named {
-                name,
-                via_legacy_group_syntax: false,
-            });
-        let role = role_from_literal.or_else(|| node.role_ref().map(|r| Self::extract_role(&r)));
+        let local = Self::is_local(node.set_scope());
+        let role = match node.set_session_auth_target()? {
+            ast::SetSessionAuthTarget::SetSessionAuthDefault(_) => None,
+            ast::SetSessionAuthTarget::RoleRef(role) => Some(Self::extract_role(&role)),
+            ast::SetSessionAuthTarget::Literal(literal) => Self::resolve_string_literal(&literal)
+                .filter(|name| !name.is_empty())
+                .map(|name| crate::analysis::facts::RoleFact::Named {
+                    name,
+                    via_legacy_group_syntax: false,
+                }),
+        };
         if matches!(
             role,
             Some(
@@ -3459,7 +3510,7 @@ impl AstVisitor {
             .map(|t| Self::resolve_identifier_token(t.text()))
         {
             Some(name) => Some(StatementFact::RollbackToSavepoint { name }),
-            None if node.chain_token().is_some() && node.no_token().is_none() => {
+            None if Self::is_and_chain(node.chain_clause()) => {
                 Some(StatementFact::RollbackAndChain)
             }
             None => Some(StatementFact::RollbackTransaction),
