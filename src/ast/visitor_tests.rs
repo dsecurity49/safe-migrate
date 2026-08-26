@@ -69,6 +69,24 @@ mod tests {
     }
 
     #[test]
+    fn create_table_identity_column_is_non_null() {
+        let fact = parse_and_extract_statement(
+            "CREATE TABLE events (id bigint GENERATED ALWAYS AS IDENTITY);",
+        )
+        .expect("create table fact");
+
+        let StatementFact::CreateTable { columns, .. } = fact else {
+            panic!("expected create table fact");
+        };
+        assert_eq!(columns.len(), 1);
+        assert_eq!(
+            columns[0].generation,
+            crate::analysis::facts::ColumnGeneration::Identity
+        );
+        assert!(columns[0].not_null);
+    }
+
+    #[test]
     fn test_create_table_preserves_inline_constraint_names() {
         let fact = parse_and_extract_statement(
             "CREATE TABLE users (

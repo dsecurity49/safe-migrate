@@ -905,9 +905,14 @@ impl AstVisitor {
         })?;
         let name = Self::resolve_identifier_token(name_token.text());
         let ty = col.ty().map(|t| t.syntax().text().to_string());
-        let not_null = col
-            .constraints()
-            .any(|c| matches!(c, ColumnConstraint::NotNullConstraint(_)));
+        let is_identity = col.constraints().any(|constraint| {
+            matches!(constraint, ColumnConstraint::GeneratedConstraint(generated)
+                if matches!(generated.generated_as(), Some(ast::GeneratedAs::GeneratedIdentity(_))))
+        });
+        let not_null = is_identity
+            || col
+                .constraints()
+                .any(|c| matches!(c, ColumnConstraint::NotNullConstraint(_)));
         let primary_key_constraint_name = col.constraints().find_map(|constraint| {
             let ColumnConstraint::PrimaryKeyConstraint(primary_key) = constraint else {
                 return None;
@@ -947,10 +952,7 @@ impl AstVisitor {
         });
         let generation = if Self::is_serial_type(ty.as_deref()) {
             crate::analysis::facts::ColumnGeneration::Serial
-        } else if col.constraints().any(|constraint| {
-            matches!(constraint, ColumnConstraint::GeneratedConstraint(generated)
-                if matches!(generated.generated_as(), Some(ast::GeneratedAs::GeneratedIdentity(_))))
-        }) {
+        } else if is_identity {
             crate::analysis::facts::ColumnGeneration::Identity
         } else {
             crate::analysis::facts::ColumnGeneration::Ordinary
