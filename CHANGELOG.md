@@ -5,6 +5,18 @@ commits and pull requests. Published binaries, checksums, and generated release
 notes are available on the
 [GitHub Releases page](https://github.com/dsecurity49/safe-migrate/releases).
 
+## v0.6.1 — 2026-08-25
+
+- Upgraded the exactly pinned Squawk parser stack from 2.62.0 to 2.63.0 and
+  migrated statement extraction to its typed AST children for transaction,
+  schema, table, view, sequence, routine, replication, privilege, and session
+  statements.
+- Adopted Squawk's stricter validation for malformed `IN`/`NOT IN`, empty
+  tuples, and `OVERLAPS` expressions, plus its corrected compound-select
+  precedence and trailing-clause parsing.
+- Added focused regressions for every affected extraction family and the new
+  parser-validation behavior.
+
 ## v0.6.0 — 2026-08-22
 
 - Expanded `sync` and Cache V6 to record effective migration timeouts, every
