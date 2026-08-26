@@ -5,7 +5,7 @@ commits and pull requests. Published binaries, checksums, and generated release
 notes are available on the
 [GitHub Releases page](https://github.com/dsecurity49/safe-migrate/releases).
 
-## v0.6.1 — 2026-08-25
+## v0.6.1 — 2026-08-26
 
 - Upgraded the exactly pinned Squawk parser stack from 2.62.0 to 2.63.0 and
   migrated statement extraction to its typed AST children for transaction,

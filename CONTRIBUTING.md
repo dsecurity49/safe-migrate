@@ -129,7 +129,7 @@ Use the pinned Squawk source and grammar when changing AST extraction:
 5. test resolver, state, and rule effects when behavior crosses layers;
 6. represent unsupported parser behavior explicitly.
 
-A Squawk version upgrade is an AST migration. Update all three pinned Squawk
+A Squawk version upgrade is an AST migration. Update all four pinned Squawk
 crates together and validate the full extraction surface through compilation and
 tests.
 

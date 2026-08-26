@@ -13,7 +13,7 @@ body:
     attributes:
       label: safe-migrate version
       description: Paste the output of `safe-migrate --version`.
-      placeholder: safe-migrate 0.6.0
+      placeholder: safe-migrate 0.6.1
     validations:
       required: true
 
