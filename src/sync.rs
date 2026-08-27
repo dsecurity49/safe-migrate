@@ -1,6 +1,9 @@
 use crate::ast::identifiers::ObjectId;
 use crate::db::cache::{CACHE_V6_MAGIC, DbCache, DbCacheVersioned, ForeignKeyCache, IndexCache};
-use crate::db::cache_file::{MAX_CACHE_DECODE_BYTES, MAX_CACHE_FILE_BYTES, protect_cache_bytes};
+use crate::db::cache_file::{
+    MAX_CACHE_DECODE_BYTES, MAX_CACHE_FILE_BYTES, protect_cache_bytes,
+    validate_cache_encryption_configuration,
+};
 use crate::model::relation::{Persistence, RelationKind, RelationState};
 use anyhow::{Context, Result};
 use postgres::config::Host;
@@ -20,6 +23,8 @@ pub fn sync_cache(
     schemas: Option<&[String]>,
     cache_encryption: bool,
 ) -> Result<()> {
+    validate_cache_encryption_configuration(cache_encryption)
+        .context("Invalid cache encryption configuration")?;
     // Strict env-only credential enforcement
     let db_url = std::env::var("DATABASE_URL")
         .context("DATABASE_URL environment variable is required to sync PostgreSQL schema metadata and statistics. Do not pass credentials via CLI flags or config files.")?;
@@ -171,6 +176,10 @@ fn write_cache_with_protection_and_limits(
     max_file_bytes: u64,
     max_decode_bytes: usize,
 ) -> Result<()> {
+    cache
+        .validate_semantics()
+        .map_err(anyhow::Error::msg)
+        .context("Refusing to write a semantically invalid Cache V6 baseline")?;
     let parent = out_path.parent().unwrap_or_else(|| Path::new("."));
     let mut temp_file = NamedTempFile::new_in(parent).with_context(|| {
         format!(
@@ -223,6 +232,10 @@ fn write_cache_with_protection_and_limits(
         .write_all(&cache_bytes)
         .context("Failed to write cache payload")?;
     temp_file.flush().context("Failed to flush cache payload")?;
+    temp_file
+        .as_file()
+        .sync_all()
+        .context("Failed to synchronize cache payload before installation")?;
 
     replace_cache(temp_file, out_path)?;
 
@@ -285,6 +298,15 @@ fn replace_cache(temp_file: NamedTempFile, out_path: &Path) -> Result<()> {
             format!(
                 "Failed to atomically replace cache file: {}",
                 out_path.display()
+            )
+        })?;
+    let parent = out_path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .with_context(|| {
+            format!(
+                "Installed cache but failed to synchronize its parent directory: {}",
+                parent.display()
             )
         })?;
     Ok(())

@@ -9,7 +9,7 @@ use crate::model::sequence::SequenceState;
 use crate::model::trigger::TriggerEnableMode;
 use crate::model::types::TypeState;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForeignKeyCache {
@@ -135,7 +135,10 @@ impl DbCacheVersioned {
                 "This cache format is unsupported. Run `safe-migrate sync` to rebuild it."
                     .to_string(),
             ),
-            DbCacheVersioned::V6(c) => Ok(*c),
+            DbCacheVersioned::V6(c) => {
+                c.validate_semantics()?;
+                Ok(*c)
+            }
         }
     }
 }
@@ -175,6 +178,141 @@ impl DbCache {
     pub fn baseline_relations(&self) -> impl Iterator<Item = (&ObjectId, &RelationState)> {
         self.relations.iter()
     }
+
+    pub(crate) fn validate_semantics(&self) -> Result<(), String> {
+        for (id, relation) in &self.relations {
+            if id != &relation.id {
+                return Err(format!(
+                    "relation cache key '{}' disagrees with embedded identity '{}'",
+                    id, relation.id
+                ));
+            }
+        }
+        for (id, function) in &self.functions {
+            if id != &function.id {
+                return Err(format!(
+                    "routine cache key '{}' disagrees with embedded identity '{}'",
+                    id, function.id
+                ));
+            }
+        }
+        for (id, ty) in &self.types {
+            if id != &ty.id {
+                return Err(format!(
+                    "type cache key '{}' disagrees with embedded identity '{}'",
+                    id, ty.id
+                ));
+            }
+        }
+        for (id, role) in &self.roles {
+            if id != &role.id {
+                return Err(format!(
+                    "role cache key '{}' disagrees with embedded identity '{}'",
+                    id, role.id
+                ));
+            }
+        }
+        for (name, schema) in &self.schemas {
+            if name != &schema.name {
+                return Err(format!(
+                    "schema cache key '{}' disagrees with embedded identity '{}'",
+                    name, schema.name
+                ));
+            }
+        }
+        for (id, sequence) in &self.sequences {
+            if id != &sequence.id {
+                return Err(format!(
+                    "sequence cache key '{}' disagrees with embedded identity '{}'",
+                    id, sequence.id
+                ));
+            }
+        }
+        for (name, publication) in &self.publications {
+            if name != &publication.name {
+                return Err(format!(
+                    "publication cache key '{}' disagrees with embedded identity '{}'",
+                    name, publication.name
+                ));
+            }
+        }
+        for (name, subscription) in &self.subscriptions {
+            if name != &subscription.name {
+                return Err(format!(
+                    "subscription cache key '{}' disagrees with embedded identity '{}'",
+                    name, subscription.name
+                ));
+            }
+        }
+
+        let mut constraint_keys = HashSet::new();
+        for constraint in &self.constraints {
+            if !self.relations.contains_key(&constraint.table_id) {
+                return Err(format!(
+                    "constraint '{}.{}' references a missing relation",
+                    constraint.table_id, constraint.name
+                ));
+            }
+            if !constraint_keys.insert((constraint.table_id.clone(), constraint.name.clone())) {
+                return Err(format!(
+                    "constraint '{}.{}' appears more than once",
+                    constraint.table_id, constraint.name
+                ));
+            }
+        }
+
+        let mut index_ids = HashSet::new();
+        for index in &self.indexes {
+            if !self.relations.contains_key(&index.table_id) {
+                return Err(format!(
+                    "index '{}' references missing relation '{}'",
+                    index.index_id, index.table_id
+                ));
+            }
+            if !index_ids.insert(index.index_id.clone()) {
+                return Err(format!("index '{}' appears more than once", index.index_id));
+            }
+        }
+
+        let mut trigger_ids = HashSet::new();
+        for trigger in &self.triggers {
+            if !self.relations.contains_key(&trigger.table_id) {
+                return Err(format!(
+                    "trigger '{}' references missing relation '{}'",
+                    trigger.trigger_id, trigger.table_id
+                ));
+            }
+            if !trigger_ids.insert(trigger.trigger_id.clone()) {
+                return Err(format!(
+                    "trigger '{}' appears more than once",
+                    trigger.trigger_id
+                ));
+            }
+        }
+
+        let mut foreign_key_ids = HashSet::new();
+        for foreign_key in &self.foreign_keys {
+            if !self.relations.contains_key(&foreign_key.from_table)
+                || !self.relations.contains_key(&foreign_key.to_table)
+            {
+                return Err(format!(
+                    "foreign key '{}.{}' references a missing relation",
+                    foreign_key.from_table, foreign_key.constraint_name
+                ));
+            }
+            if !foreign_key_ids.insert((
+                foreign_key.from_table.clone(),
+                foreign_key.constraint_name.clone(),
+            )) {
+                return Err(format!(
+                    "foreign key '{}.{}' appears more than once",
+                    foreign_key.from_table, foreign_key.constraint_name
+                ));
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -208,5 +346,37 @@ mod tests {
         assert_eq!(CACHE_FORMAT_VERSION, 6);
         assert_eq!(DbCacheVersioned::V6(Box::default()).format_version(), 6);
         assert_eq!(CACHE_V6_MAGIC, b"SMCACHE06");
+    }
+
+    #[test]
+    fn current_cache_rejects_mismatched_embedded_identity() {
+        let mut cache = DbCache::new();
+        cache.schemas.insert(
+            "app".to_string(),
+            SchemaState {
+                name: "other".to_string(),
+                owner: ObjectId::new("", "postgres"),
+                generation: 0,
+            },
+        );
+
+        let error = DbCacheVersioned::V6(Box::new(cache))
+            .into_cache()
+            .unwrap_err();
+        assert!(error.contains("schema cache key 'app'"));
+    }
+
+    #[test]
+    fn current_cache_rejects_dangling_index_relationship() {
+        let mut cache = DbCache::new();
+        cache.indexes.push(IndexCache {
+            index_id: ObjectId::new("public", "items_idx"),
+            table_id: ObjectId::new("public", "items"),
+        });
+
+        let error = DbCacheVersioned::V6(Box::new(cache))
+            .into_cache()
+            .unwrap_err();
+        assert!(error.contains("references missing relation 'public.items'"));
     }
 }
