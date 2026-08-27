@@ -1729,8 +1729,8 @@ impl AstVisitor {
             segments.reverse();
 
             if segments.len() >= 2 {
-                let col_name = segments.last().unwrap().clone().resolve();
-                let table_len = segments.len() - 1;
+                let col_name = segments.pop()?.resolve();
+                let table_len = segments.len();
                 let table_name = if table_len == 1 {
                     QualifiedName::new(None, segments[0].clone())
                 } else {

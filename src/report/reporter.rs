@@ -139,8 +139,13 @@ impl Reporter {
             findings
                 .iter()
                 .map(|finding| {
-                    let mut value = serde_json::to_value(finding)
-                        .expect("Report findings must always serialize to JSON");
+                    let mut value = serde_json::to_value(finding).unwrap_or_else(|error| {
+                        serde_json::json!({
+                            "rule_id": finding.violation.rule_id,
+                            "message": "Failed to serialize report finding",
+                            "serialization_error": error.to_string(),
+                        })
+                    });
                     if let Some(descriptor) = registry::find_primary_rule(finding.violation.rule_id)
                         && let Some(object) = value.as_object_mut()
                     {

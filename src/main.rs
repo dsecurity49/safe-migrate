@@ -784,9 +784,13 @@ fn maybe_auto_sync(
         "[ INFO ] Automatic cache sync enabled. Refreshing {}.",
         cache.display()
     );
-    let schemas = config
-        .sync_schemas(None)
-        .expect("configuration was validated before automatic synchronization");
+    let schemas = match config.sync_schemas(None) {
+        Ok(schemas) => schemas,
+        Err(error) => {
+            eprintln!("[ WARN ] Automatic cache sync configuration is invalid: {error}");
+            return AutoSyncOutcome::Failed;
+        }
+    };
     match sync::sync_cache(cache, schemas, config.cache_encryption) {
         Ok(()) => AutoSyncOutcome::Refreshed,
         Err(error) => {
