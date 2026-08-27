@@ -380,6 +380,123 @@ pub fn populate_cache_in_current_transaction(
     populate_cache_from_client(client, schemas)
 }
 
+fn load_view_dependencies(
+    client: &mut impl GenericClient,
+    schema_values: &Option<Vec<String>>,
+) -> Result<Vec<crate::db::cache::DependencyCache>> {
+    let query = r#"
+        SELECT DISTINCT
+            'pg_class'::regclass::oid AS classid,
+            vc.oid AS objid,
+            0 AS objsubid,
+            'pg_class'::regclass::oid AS refclassid,
+            tc.oid AS refobjid,
+            0 AS refobjsubid,
+            vn.nspname AS obj_schema,
+            vc.relname AS obj_name,
+            tn.nspname AS ref_schema,
+            tc.relname AS ref_name
+        FROM pg_rewrite rw
+        JOIN pg_class vc ON vc.oid = rw.ev_class
+        JOIN pg_namespace vn ON vn.oid = vc.relnamespace
+        JOIN pg_depend d ON d.objid = rw.oid
+        JOIN pg_class tc ON tc.oid = d.refobjid
+        JOIN pg_namespace tn ON tn.oid = tc.relnamespace
+        WHERE vc.relkind IN ('v', 'm')
+          AND d.deptype = 'n'
+          AND tc.oid <> vc.oid
+          AND (
+              $1::text[] IS NULL
+              OR (vn.nspname = ANY($1) AND tn.nspname = ANY($1))
+          )
+    "#;
+
+    let rows = client
+        .query(query, &[schema_values])
+        .context("Failed to load view dependencies from pg_rewrite/pg_depend")?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(crate::db::cache::DependencyCache {
+                classid: row.try_get(0).context("view dependency classid")?,
+                objid: row.try_get(1).context("view dependency object oid")?,
+                objsubid: row.try_get(2).context("view dependency object sub-id")?,
+                refclassid: row
+                    .try_get(3)
+                    .context("view dependency referenced classid")?,
+                refobjid: row
+                    .try_get(4)
+                    .context("view dependency referenced object oid")?,
+                refobjsubid: row
+                    .try_get(5)
+                    .context("view dependency referenced object sub-id")?,
+                deptype: "view".to_string(),
+                obj_schema: Some(row.try_get(6).context("view dependency schema")?),
+                obj_name: Some(row.try_get(7).context("view dependency name")?),
+                ref_schema: Some(
+                    row.try_get(8)
+                        .context("view dependency referenced schema")?,
+                ),
+                ref_name: Some(row.try_get(9).context("view dependency referenced name")?),
+            })
+        })
+        .collect()
+}
+
+fn load_roles(
+    client: &mut impl GenericClient,
+    pg_version_num: u32,
+) -> Result<std::collections::HashMap<ObjectId, crate::model::role::RoleState>> {
+    let mut roles = std::collections::HashMap::new();
+    let rows = client
+        .query(
+            "SELECT rolname, rolcanlogin, rolsuper FROM pg_roles ORDER BY rolname;",
+            &[],
+        )
+        .context("Failed to load role identities from pg_roles")?;
+    for row in rows {
+        let name: String = row.try_get(0).context("role name")?;
+        let id = ObjectId::new("", &name);
+        roles.insert(
+            id.clone(),
+            crate::model::role::RoleState {
+                id,
+                can_login: row.try_get(1).context("role login capability")?,
+                is_superuser: row.try_get(2).context("role superuser capability")?,
+                member_of: Vec::new(),
+                can_set_role_to: Vec::new(),
+                granted_privileges: Vec::new(),
+            },
+        );
+    }
+
+    let membership_query = if pg_version_num >= 160_000 {
+        "SELECT member.rolname, parent.rolname, membership.set_option
+         FROM pg_auth_members membership
+         JOIN pg_roles member ON member.oid = membership.member
+         JOIN pg_roles parent ON parent.oid = membership.roleid;"
+    } else {
+        "SELECT member.rolname, parent.rolname, true AS set_option
+         FROM pg_auth_members membership
+         JOIN pg_roles member ON member.oid = membership.member
+         JOIN pg_roles parent ON parent.oid = membership.roleid;"
+    };
+    let memberships = client
+        .query(membership_query, &[])
+        .context("Failed to load role memberships from pg_auth_members")?;
+    for row in memberships {
+        let member = ObjectId::new("", row.try_get::<_, String>(0).context("member role")?);
+        let parent = ObjectId::new("", row.try_get::<_, String>(1).context("parent role")?);
+        let set_option: bool = row.try_get(2).context("role membership SET option")?;
+        if let Some(role) = roles.get_mut(&member) {
+            role.member_of.push(parent.clone());
+            if set_option {
+                role.can_set_role_to.push(parent);
+            }
+        }
+    }
+    Ok(roles)
+}
+
 fn populate_cache_from_client(
     client: &mut impl GenericClient,
     schemas: Option<&[String]>,
@@ -1419,96 +1536,12 @@ fn populate_cache_from_client(
     // Only view dependencies are consumed by cache hydration. Generic
     // pg_depend rows use PostgreSQL dependency codes (n/a/i) and were ignored
     // after synchronization, so avoid loading them into Cache V6.
-    let view_depend_query = r#"
-        SELECT DISTINCT
-            'pg_class'::regclass::oid AS classid,
-            vc.oid AS objid,
-            0 AS objsubid,
-            'pg_class'::regclass::oid AS refclassid,
-            tc.oid AS refobjid,
-            0 AS refobjsubid,
-            vn.nspname AS obj_schema,
-            vc.relname AS obj_name,
-            tn.nspname AS ref_schema,
-            tc.relname AS ref_name
-        FROM pg_rewrite rw
-        JOIN pg_class vc ON vc.oid = rw.ev_class
-        JOIN pg_namespace vn ON vn.oid = vc.relnamespace
-        JOIN pg_depend d ON d.objid = rw.oid
-        JOIN pg_class tc ON tc.oid = d.refobjid
-        JOIN pg_namespace tn ON tn.oid = tc.relnamespace
-        WHERE vc.relkind IN ('v', 'm')
-          AND d.deptype = 'n'
-          -- PostgreSQL 14/15 expose an internal rewrite-rule self-edge. It is
-          -- not a dependency of the view definition and must not enter the
-          -- modeled dependency graph.
-          AND tc.oid <> vc.oid
-          AND (
-              $1::text[] IS NULL
-              OR (vn.nspname = ANY($1) AND tn.nspname = ANY($1))
-          )
-    "#;
-
-    for row in client.query(view_depend_query, &[&schema_values])? {
-        cache.dependencies.push(crate::db::cache::DependencyCache {
-            classid: row.get(0),
-            objid: row.get(1),
-            objsubid: row.get(2),
-            refclassid: row.get(3),
-            refobjid: row.get(4),
-            refobjsubid: row.get(5),
-            deptype: "view".to_string(),
-            obj_schema: Some(row.get(6)),
-            obj_name: Some(row.get(7)),
-            ref_schema: Some(row.get(8)),
-            ref_name: Some(row.get(9)),
-        });
-    }
+    cache.dependencies = load_view_dependencies(client, &schema_values)?;
 
     // Role identity and membership are required to distinguish a valid
     // `SET ROLE` from a migration that PostgreSQL would reject. pg_roles does
     // not expose password hashes or other credentials.
-    for row in client.query(
-        "SELECT rolname, rolcanlogin, rolsuper FROM pg_roles ORDER BY rolname;",
-        &[],
-    )? {
-        let name: String = row.get(0);
-        let id = ObjectId::new("", &name);
-        cache.roles.insert(
-            id.clone(),
-            crate::model::role::RoleState {
-                id,
-                can_login: row.get(1),
-                is_superuser: row.get(2),
-                member_of: Vec::new(),
-                can_set_role_to: Vec::new(),
-                granted_privileges: Vec::new(),
-            },
-        );
-    }
-
-    let membership_query = if cache.pg_version_num.unwrap_or_default() >= 160_000 {
-        "SELECT member.rolname, parent.rolname, membership.set_option
-         FROM pg_auth_members membership
-         JOIN pg_roles member ON member.oid = membership.member
-         JOIN pg_roles parent ON parent.oid = membership.roleid;"
-    } else {
-        "SELECT member.rolname, parent.rolname, true AS set_option
-         FROM pg_auth_members membership
-         JOIN pg_roles member ON member.oid = membership.member
-         JOIN pg_roles parent ON parent.oid = membership.roleid;"
-    };
-    for row in client.query(membership_query, &[])? {
-        let member = ObjectId::new("", row.get::<_, String>(0));
-        let parent = ObjectId::new("", row.get::<_, String>(1));
-        let set_option: bool = row.get(2);
-        if let Some(role) = cache.roles.get_mut(&member) {
-            role.member_of.push(parent.clone());
-            if set_option {
-                role.can_set_role_to.push(parent);
-            }
-        }
-    }
+    cache.roles = load_roles(client, cache.pg_version_num.unwrap_or_default())?;
 
     Ok(cache)
 }
