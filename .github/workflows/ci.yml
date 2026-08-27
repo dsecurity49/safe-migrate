@@ -44,8 +44,15 @@ jobs:
       - name: Build (locked)
         run: cargo build --locked --verbose
 
+      - name: Verify frozen-cache fixtures
+        working-directory: live_tests
+        run: ./run.sh
+
       - name: Run tests (locked)
         run: cargo test --locked --verbose
+
+      - name: Verify crate package
+        run: cargo package --locked
 
       - name: Run generated migration fuzz corpus
         run: scripts/fuzz
@@ -58,6 +65,47 @@ jobs:
           cargo install cargo-audit --version 0.22.2 --locked
           test "$(cargo-audit --version)" = "cargo-audit 0.22.2"
           cargo audit
+
+  msrv:
+    name: Rust 1.94 MSRV
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.94
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable 2026-07-16
+        with:
+          toolchain: 1.94.0
+
+      - name: Check all targets with the MSRV
+        run: cargo check --all-targets --locked
+
+  platform-smoke:
+    name: Runtime smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable 2026-07-16
+
+      - name: Build runtime
+        run: cargo build --locked
+
+      - name: Exercise CLI runtime
+        run: cargo test --locked --test cli_tests test_cli_help
 
   live-differential:
     name: PostgreSQL ${{ matrix.postgres }} differential harness
