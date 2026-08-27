@@ -167,7 +167,7 @@ impl AnalysisState {
         scope: &crate::analysis::facts::PublicationScope,
     ) {
         self.snapshot_graph_full();
-        self.local.graph.edges.retain(|edge| {
+        self.local.graph.retain_edges(|edge| {
             !matches!(
                 &edge.kind,
                 DependencyKind::PublicationIncludes { publication_name: name }
@@ -177,7 +177,7 @@ impl AnalysisState {
         if let crate::analysis::facts::PublicationScope::Explicit(objects) = scope {
             for object in objects {
                 if let crate::analysis::facts::PublicationObjectFact::Table { name, .. } = object {
-                    self.local.graph.edges.push(DependencyEdge::new(
+                    self.local.graph.add_edge(DependencyEdge::new(
                         self.resolve_relation_id(name),
                         ObjectId::new("public", publication_name),
                         DependencyKind::PublicationIncludes {
@@ -6026,7 +6026,7 @@ impl AnalysisState {
     fn snapshot_graph(&mut self) {
         if let Some(frame) = self.local.transactions.last_mut() {
             frame.undo_log.push(StateChange::GraphLengthMarker {
-                len: self.local.graph.edges.len(),
+                len: self.local.graph.edge_count(),
             });
         }
     }
@@ -6063,7 +6063,7 @@ impl AnalysisState {
                     self.local.publications = snapshot.publications;
                     self.local.triggers = snapshot.triggers;
                     self.local.constraints = snapshot.constraints;
-                    self.local.graph.edges = snapshot.graph;
+                    self.local.graph.replace_edges(snapshot.graph);
                     self.local.pending_validation = snapshot.pending_validation;
                     self.baseline_relations = snapshot.baseline_relations;
                     self.baseline_indexes = snapshot.baseline_indexes;
@@ -6140,10 +6140,10 @@ impl AnalysisState {
                     }
                 }
                 StateChange::GraphLengthMarker { len } => {
-                    self.local.graph.edges.truncate(len);
+                    self.local.graph.truncate(len);
                 }
                 StateChange::GraphSnapshot { previous } => {
-                    self.local.graph.edges = previous;
+                    self.local.graph.replace_edges(previous);
                 }
                 StateChange::RoleContextSnapshot {
                     current_role,

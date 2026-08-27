@@ -64,6 +64,26 @@ impl DependencyGraph {
         Self::default()
     }
 
+    pub(crate) fn add_edge(&mut self, edge: DependencyEdge) {
+        self.edges.push(edge);
+    }
+
+    pub(crate) fn retain_edges(&mut self, mut keep: impl FnMut(&DependencyEdge) -> bool) {
+        self.edges.retain(|edge| keep(edge));
+    }
+
+    pub(crate) fn edge_count(&self) -> usize {
+        self.edges.len()
+    }
+
+    pub(crate) fn truncate(&mut self, len: usize) {
+        self.edges.truncate(len);
+    }
+
+    pub(crate) fn replace_edges(&mut self, edges: Vec<DependencyEdge>) {
+        self.edges = edges;
+    }
+
     // Dependency lookups follow the current end of a rename chain.
     pub fn is_referenced_by_view(&self, id: &ObjectId) -> Vec<&ObjectId> {
         let target = self.resolve_rename(id);
