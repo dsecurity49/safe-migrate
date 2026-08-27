@@ -36,3 +36,27 @@ intentionally avoid timing thresholds in CI. Allocation, peak-memory,
 checkpoint-capture, and isolated dependency-query measurements require a
 profiler or allocator instrumentation and are deliberately not inferred from
 these wall-clock samples.
+
+## Optimized-profile `v0.7.0` structural baseline
+
+Captured on 2026-08-28 from commit `b639b04` using Rust 1.98.0 on the same
+aarch64 Android Linux environment. This run uses Cargo's optimized `release`
+profile and is the comparison point for evidence-gated `v0.7.0` work; it is not
+comparable to the debug timings above and is not a performance guarantee.
+
+| Scenario | Statements | Elapsed |
+| --- | ---: | ---: |
+| ordered thousand-statement chain | 1,000 | 6,652 ms |
+| large synchronized-baseline hydration | 1,000 relations | 54 ms |
+| cache encode/compress/encrypt/decrypt/decompress/decode | 1,000 relations | 24 ms |
+| long transaction rollback | 503 | 2,673 ms |
+| repeated savepoint rollback | 752 | 308 ms |
+| failed multi-action statement rollback | 3 | 1 ms |
+| rename and cascade dependency graph | 304 | 1,477 ms |
+| location-rich reports with many findings | 250 | 922 ms |
+
+Run future comparisons with the same command and profile:
+
+```sh
+cargo test --release --locked --test performance_scenarios -- --ignored --nocapture
+```
