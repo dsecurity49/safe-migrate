@@ -17,6 +17,7 @@ use crate::model::types::{TypeKind, TypeOverlay, TypeState};
 use std::collections::{HashMap, HashSet};
 
 mod apply_misc;
+mod apply_role;
 mod apply_schema;
 mod apply_settings;
 mod apply_transaction;
@@ -5398,130 +5399,11 @@ impl AnalysisState {
                 );
                 MutationResult::Applied
             }
-            Mutation::CreateRole(r) => {
-                let role_id = ObjectId::new("", &r.name);
-                if matches!(
-                    self.local.roles.get(&role_id),
-                    Some(crate::model::role::RoleOverlay::Present(_))
-                ) {
-                    return MutationResult::Conflict {
-                        reason: format!("role '{}' already exists", r.name),
-                    };
-                }
-                self.snapshot_role(&role_id);
-                self.snapshot_generation_counter();
-                self.local.generation_counter += 1;
-                let _generation = self.local.generation_counter;
-
-                self.local.roles.insert(
-                    role_id.clone(),
-                    crate::model::role::RoleOverlay::Present(crate::model::role::RoleState {
-                        id: role_id,
-                        can_login: r.can_login,
-                        is_superuser: false,
-                        member_of: Vec::new(),
-                        can_set_role_to: Vec::new(),
-                        granted_privileges: Vec::new(),
-                    }),
-                );
-                MutationResult::Applied
-            }
-            Mutation::AlterRole(r) => {
-                if let Some(role_id) = Self::resolve_role_name(
-                    &r.name,
-                    &self.local.current_role,
-                    &self.local.session_role,
-                ) {
-                    self.snapshot_role(&role_id);
-                    if !self.local.roles.contains_key(&role_id) {
-                        self.local.confidence = Confidence::Tainted;
-                        return MutationResult::Skipped;
-                    }
-                    self.snapshot_generation_counter();
-                    self.local.generation_counter += 1;
-                    let _new_gen = self.local.generation_counter;
-
-                    MutationResult::Applied
-                } else {
-                    MutationResult::Skipped
-                }
-            }
-            Mutation::DropRole(r) => {
-                for name in &r.names {
-                    if let Some(role_id) = Self::resolve_role_name(
-                        &crate::analysis::facts::RoleFact::Named {
-                            name: name.clone(),
-                            via_legacy_group_syntax: false,
-                        },
-                        &self.local.current_role,
-                        &self.local.session_role,
-                    ) {
-                        self.snapshot_role(&role_id);
-                        if !r.if_exists
-                            && !matches!(
-                                self.local.roles.get(&role_id),
-                                Some(crate::model::role::RoleOverlay::Present(_))
-                            )
-                        {
-                            return MutationResult::Conflict {
-                                reason: format!("role '{}' does not exist", name),
-                            };
-                        }
-                        self.local
-                            .roles
-                            .insert(role_id, crate::model::role::RoleOverlay::Dropped);
-                    }
-                }
-                MutationResult::Applied
-            }
-            Mutation::Grant(grant) => {
-                let privileges = Self::resolve_grant_privileges(&grant.privileges);
-                let grantees = &grant.grantees;
-                match &grant.target {
-                    crate::analysis::mutations::ResolvedGrantTarget::Tables(ids) => {
-                        for id in ids {
-                            self.apply_grant_to_relation(id, &privileges, grantees);
-                        }
-                    }
-                    crate::analysis::mutations::ResolvedGrantTarget::AllTablesInSchema(schemas) => {
-                        let target_ids: Vec<ObjectId> = self
-                            .local
-                            .relations
-                            .keys()
-                            .filter(|id| schemas.contains(&id.schema))
-                            .cloned()
-                            .collect();
-                        for id in &target_ids {
-                            self.apply_grant_to_relation(id, &privileges, grantees);
-                        }
-                    }
-                }
-                MutationResult::Applied
-            }
-            Mutation::Revoke(revoke) => {
-                let privileges = Self::resolve_grant_privileges(&revoke.privileges);
-                let revokees = &revoke.revokees;
-                match &revoke.target {
-                    crate::analysis::mutations::ResolvedGrantTarget::Tables(ids) => {
-                        for id in ids {
-                            self.apply_revoke_to_relation(id, &privileges, revokees);
-                        }
-                    }
-                    crate::analysis::mutations::ResolvedGrantTarget::AllTablesInSchema(schemas) => {
-                        let target_ids: Vec<ObjectId> = self
-                            .local
-                            .relations
-                            .keys()
-                            .filter(|id| schemas.contains(&id.schema))
-                            .cloned()
-                            .collect();
-                        for id in &target_ids {
-                            self.apply_revoke_to_relation(id, &privileges, revokees);
-                        }
-                    }
-                }
-                MutationResult::Applied
-            }
+            Mutation::CreateRole(role) => self.apply_create_role(role),
+            Mutation::AlterRole(role) => self.apply_alter_role(role),
+            Mutation::DropRole(role) => self.apply_drop_role(role),
+            Mutation::Grant(grant) => self.apply_grant(grant),
+            Mutation::Revoke(revoke) => self.apply_revoke(revoke),
             Mutation::CreateDatabase(create_database) => {
                 self.apply_create_database(create_database)
             }
