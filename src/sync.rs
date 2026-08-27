@@ -1416,69 +1416,9 @@ fn populate_cache_from_client(
         );
     }
 
-    // Catalog dependencies.
-    let depend_query = r#"
-        SELECT
-            d.classid, d.objid, d.objsubid,
-            d.refclassid, d.refobjid, d.refobjsubid,
-            d.deptype::text,
-            COALESCE(n1.nspname, n1p.nspname, n1t.nspname) AS obj_schema,
-            COALESCE(c1.relname, p1.proname, t1.typname) AS obj_name,
-            COALESCE(n2.nspname, n2p.nspname, n2t.nspname) AS ref_schema,
-            COALESCE(c2.relname, p2.proname, t2.typname) AS ref_name
-        FROM pg_depend d
-        LEFT JOIN pg_class c1 ON c1.oid = d.objid AND d.classid = 'pg_class'::regclass
-        LEFT JOIN pg_namespace n1 ON n1.oid = c1.relnamespace
-        LEFT JOIN pg_proc p1 ON p1.oid = d.objid AND d.classid = 'pg_proc'::regclass
-        LEFT JOIN pg_namespace n1p ON n1p.oid = p1.pronamespace
-        LEFT JOIN pg_type t1 ON t1.oid = d.objid AND d.classid = 'pg_type'::regclass
-        LEFT JOIN pg_namespace n1t ON n1t.oid = t1.typnamespace
-        LEFT JOIN pg_class c2 ON c2.oid = d.refobjid AND d.refclassid = 'pg_class'::regclass
-        LEFT JOIN pg_namespace n2 ON n2.oid = c2.relnamespace
-        LEFT JOIN pg_proc p2 ON p2.oid = d.refobjid AND d.refclassid = 'pg_proc'::regclass
-        LEFT JOIN pg_namespace n2p ON n2p.oid = p2.pronamespace
-        LEFT JOIN pg_type t2 ON t2.oid = d.refobjid AND d.refclassid = 'pg_type'::regclass
-        LEFT JOIN pg_namespace n2t ON n2t.oid = t2.typnamespace
-        WHERE d.deptype IN ('n', 'a', 'i')
-          AND COALESCE(n1.nspname, n1p.nspname, n1t.nspname) IS NOT NULL
-          AND COALESCE(n1.nspname, n1p.nspname, n1t.nspname)
-              NOT IN ('pg_catalog', 'information_schema')
-          AND (
-              $1::text[] IS NULL
-              OR COALESCE(n1.nspname, n1p.nspname, n1t.nspname) = ANY($1)
-          )
-    "#;
-
-    for row in client.query(depend_query, &[&schema_values])? {
-        let classid: u32 = row.get(0);
-        let objid: u32 = row.get(1);
-        let objsubid: i32 = row.get(2);
-        let refclassid: u32 = row.get(3);
-        let refobjid: u32 = row.get(4);
-        let refobjsubid: i32 = row.get(5);
-        let deptype: String = row.get(6);
-        let obj_schema: Option<String> = row.get(7);
-        let obj_name: Option<String> = row.get(8);
-        let ref_schema: Option<String> = row.get(9);
-        let ref_name: Option<String> = row.get(10);
-
-        cache.dependencies.push(crate::db::cache::DependencyCache {
-            classid,
-            objid,
-            objsubid,
-            refclassid,
-            refobjid,
-            refobjsubid,
-            deptype,
-            obj_schema,
-            obj_name,
-            ref_schema,
-            ref_name,
-        });
-    }
-
-    // View dependencies are owned by pg_rewrite entries, so the generic pg_depend
-    // query above cannot recover the dependent view's schema-qualified identity.
+    // Only view dependencies are consumed by cache hydration. Generic
+    // pg_depend rows use PostgreSQL dependency codes (n/a/i) and were ignored
+    // after synchronization, so avoid loading them into Cache V6.
     let view_depend_query = r#"
         SELECT DISTINCT
             'pg_class'::regclass::oid AS classid,

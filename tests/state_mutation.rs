@@ -93,6 +93,53 @@ mod state_mutation_tests {
     }
 
     #[test]
+    fn non_view_catalog_dependencies_do_not_enter_the_modeled_graph() {
+        let view_id = object_id("public", "v");
+        let table_id = object_id("public", "t");
+        let mut cache = DbCache::new();
+        for (id, kind) in [
+            (view_id.clone(), RelationKind::View),
+            (table_id.clone(), RelationKind::Table),
+        ] {
+            cache.insert_baseline(
+                id.clone(),
+                RelationState::new(
+                    id,
+                    object_id("public", "owner"),
+                    0,
+                    None,
+                    kind,
+                    Persistence::Permanent,
+                    0,
+                ),
+            );
+        }
+        cache.dependencies.push(DependencyCache {
+            classid: 0,
+            objid: 0,
+            objsubid: 0,
+            refclassid: 0,
+            refobjid: 0,
+            refobjsubid: 0,
+            deptype: "n".to_string(),
+            obj_schema: Some(view_id.schema.clone()),
+            obj_name: Some(view_id.name.clone()),
+            ref_schema: Some(table_id.schema.clone()),
+            ref_name: Some(table_id.name.clone()),
+        });
+
+        let state = safe_migrate::AnalysisState::new(cache);
+        assert!(
+            !state
+                .local
+                .graph
+                .edges
+                .iter()
+                .any(|edge| { edge.dependent == view_id && edge.referenced == table_id })
+        );
+    }
+
+    #[test]
     fn test_topology_drop_table() {
         let engine = setup_engine();
         let mut state = setup_state();
