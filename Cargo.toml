@@ -1,6 +1,6 @@
 [package]
 name = "safe-migrate"
-version = "0.6.1"
+version = "0.6.2"
 edition = "2024"
 rust-version = "1.94"
 description = "Sync PostgreSQL metadata, then lint migrations offline"

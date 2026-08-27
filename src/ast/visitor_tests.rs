@@ -998,6 +998,17 @@ mod tests {
             database.action,
             AlterDatabaseAction::Rename { to } if to == "NewDb"
         ));
+
+        let Some(StatementFact::AlterDatabase(database)) =
+            parse_and_extract_statement("ALTER DATABASE app OWNER TO AppOwner;")
+        else {
+            panic!("expected alter database owner fact");
+        };
+        assert!(matches!(
+            database.action,
+            AlterDatabaseAction::OwnerChange(crate::analysis::facts::RoleFact::Named { name, .. })
+                if name == "appowner"
+        ));
     }
 
     #[test]
