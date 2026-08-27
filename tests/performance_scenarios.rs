@@ -223,10 +223,12 @@ mod performance_scenarios {
                 .any(|finding| finding.rule_id == "chain-conflict"),
             "missing rollback conflict: {findings:?}"
         );
-        assert!(
-            !state.relation_is_present(&object_id("public", "perf_undo_0")),
-            "rollback must remove transaction-local tables"
-        );
+        for index in 0..ROLLBACK_STATEMENTS {
+            assert!(
+                !state.relation_is_present(&object_id("public", &format!("perf_undo_{index}"))),
+                "rollback left perf_undo_{index} present"
+            );
+        }
         report_elapsed(
             "long_transaction_rollback",
             ROLLBACK_STATEMENTS + 3,
