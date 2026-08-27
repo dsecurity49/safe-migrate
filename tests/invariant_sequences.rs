@@ -71,4 +71,44 @@ mod invariant_sequences {
             Some(SchemaOverlay::Present(schema)) if schema.name == "app"
         ));
     }
+
+    #[test]
+    fn deterministic_generated_sequences_restore_every_modeled_family() {
+        let mut state = setup_state();
+
+        for sequence in 0..16 {
+            let schema = format!("generated_{sequence}");
+            for sql in [
+                "BEGIN;".to_string(),
+                format!("CREATE SCHEMA {schema};"),
+                format!("CREATE TABLE {schema}.items (id bigint PRIMARY KEY, value text);"),
+                format!("CREATE INDEX items_value_idx ON {schema}.items(value);"),
+                format!("CREATE VIEW {schema}.item_ids AS SELECT id FROM {schema}.items;"),
+                format!("CREATE TYPE {schema}.item_state AS ENUM ('new', 'ready');"),
+                format!("CREATE SEQUENCE {schema}.item_counter;"),
+                format!(
+                    "CREATE FUNCTION {schema}.item_identity(value integer) RETURNS integer LANGUAGE SQL IMMUTABLE AS $$ SELECT value $$;"
+                ),
+                "SAVEPOINT generated_checkpoint;".to_string(),
+                format!("ALTER TABLE {schema}.items RENAME TO renamed_items;"),
+                format!("DROP VIEW {schema}.item_ids;"),
+                "ROLLBACK TO SAVEPOINT generated_checkpoint;".to_string(),
+                "ROLLBACK;".to_string(),
+            ] {
+                analyze_and_validate(&mut state, &sql);
+            }
+
+            assert!(state.local.transactions.is_empty());
+            assert!(!state.local.transaction_aborted);
+            assert!(!state.local.schemas.contains_key(&schema));
+            assert!(state.local.relations.keys().all(|id| id.schema != schema));
+            assert!(state.local.types.keys().all(|id| id.schema != schema));
+            assert!(state.local.sequences.keys().all(|id| id.schema != schema));
+            assert!(state.local.functions.keys().all(|id| id.schema != schema));
+            assert!(state.local.graph.edges.iter().all(|edge| {
+                edge.dependent.schema != schema && edge.referenced.schema != schema
+            }));
+            assert_state_invariants(&state);
+        }
+    }
 }
