@@ -1,6 +1,4 @@
-use crate::analysis::facts::{
-    ResetSettingTarget, SearchPathTarget, TableConstraintFact, TimeoutSetting, TimeoutSettingValue,
-};
+use crate::analysis::facts::TableConstraintFact;
 use crate::analysis::graph::{DependencyEdge, DependencyGraph, DependencyKind};
 use crate::analysis::mutations::{
     AlterTableActionMutation, AlterTypeActionMutation, Mutation, PersistenceMutation,
@@ -17,6 +15,10 @@ use crate::model::sequence::{SequenceKind, SequenceOverlay, SequenceState};
 use crate::model::trigger::TriggerOverlay;
 use crate::model::types::{TypeKind, TypeOverlay, TypeState};
 use std::collections::{HashMap, HashSet};
+
+mod apply_misc;
+mod apply_settings;
+mod apply_transaction;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Confidence {
@@ -2547,7 +2549,9 @@ impl AnalysisState {
                 }
                 MutationResult::Applied
             }
-            Mutation::RefreshMaterializedView(_) => MutationResult::Applied,
+            Mutation::RefreshMaterializedView(refresh) => {
+                self.apply_refresh_materialized_view(refresh)
+            }
             Mutation::CreateIndex(create_idx) => {
                 let exists = self.index_is_present(&create_idx.id);
                 if create_idx.if_not_exists && exists {
@@ -3594,7 +3598,7 @@ impl AnalysisState {
                 );
                 MutationResult::Applied
             }
-            Mutation::AlterDomain(_) => MutationResult::Applied,
+            Mutation::AlterDomain(alter_domain) => self.apply_alter_domain(alter_domain),
             Mutation::DropDomain(drop_domain) => {
                 for id in &drop_domain.ids {
                     self.snapshot_type(id);
@@ -4220,324 +4224,24 @@ impl AnalysisState {
                     }
                 }
             }
-            Mutation::SearchPath(sp) => {
-                if sp.local && self.local.transactions.is_empty() {
-                    // PostgreSQL warns and leaves SET LOCAL unchanged outside
-                    // an explicit transaction block.
-                    return MutationResult::Skipped;
-                }
-                self.snapshot_search_path();
-                self.snapshot_confidence();
-                let template = match &sp.target {
-                    SearchPathTarget::Default => self.local.default_search_path_template.clone(),
-                    SearchPathTarget::Schemas(schemas) => schemas.clone(),
-                };
-                self.local.search_path_template = template.clone();
-                if !sp.local {
-                    self.local.session_search_path_template = template;
-                }
-                self.refresh_role_sensitive_search_path();
-                MutationResult::Applied
-            }
-            Mutation::TimeoutSetting(change) => {
-                if change.local && self.local.transactions.is_empty() {
-                    return MutationResult::Skipped;
-                }
-                let next = match &change.value {
-                    TimeoutSettingValue::Default => match change.setting {
-                        TimeoutSetting::Lock => self.local.lock_timeout.default,
-                        TimeoutSetting::Statement => self.local.statement_timeout.default,
-                    },
-                    TimeoutSettingValue::Milliseconds(milliseconds) => Some(*milliseconds),
-                    TimeoutSettingValue::Current => match change.setting {
-                        TimeoutSetting::Lock => self.local.lock_timeout.effective,
-                        TimeoutSetting::Statement => self.local.statement_timeout.effective,
-                    },
-                    TimeoutSettingValue::Invalid(reason) => {
-                        return MutationResult::Conflict {
-                            reason: reason.clone(),
-                        };
-                    }
-                };
-                self.snapshot_timeout_settings();
-                let setting = match change.setting {
-                    TimeoutSetting::Lock => &mut self.local.lock_timeout,
-                    TimeoutSetting::Statement => &mut self.local.statement_timeout,
-                };
-                setting.effective = next;
-                if !change.local {
-                    setting.session = next;
-                }
-                MutationResult::Applied
-            }
-            Mutation::ResetSettings(target) => {
-                if matches!(
-                    target,
-                    ResetSettingTarget::All | ResetSettingTarget::SearchPath
-                ) {
-                    self.snapshot_search_path();
-                    self.snapshot_confidence();
-                    let template = self.local.default_search_path_template.clone();
-                    self.local.session_search_path_template = template.clone();
-                    self.local.search_path_template = template;
-                    self.refresh_role_sensitive_search_path();
-                }
-                if matches!(
-                    target,
-                    ResetSettingTarget::All
-                        | ResetSettingTarget::LockTimeout
-                        | ResetSettingTarget::StatementTimeout
-                ) {
-                    self.snapshot_timeout_settings();
-                    if matches!(
-                        target,
-                        ResetSettingTarget::All | ResetSettingTarget::LockTimeout
-                    ) {
-                        self.local.lock_timeout.session = self.local.lock_timeout.default;
-                        self.local.lock_timeout.effective = self.local.lock_timeout.default;
-                    }
-                    if matches!(
-                        target,
-                        ResetSettingTarget::All | ResetSettingTarget::StatementTimeout
-                    ) {
-                        self.local.statement_timeout.session = self.local.statement_timeout.default;
-                        self.local.statement_timeout.effective =
-                            self.local.statement_timeout.default;
-                    }
-                }
-                MutationResult::Applied
-            }
-            Mutation::CheckTimeouts => MutationResult::Applied,
+            Mutation::SearchPath(search_path) => self.apply_search_path(search_path),
+            Mutation::TimeoutSetting(timeout) => self.apply_timeout_setting(timeout),
+            Mutation::ResetSettings(target) => self.apply_reset_settings(target),
+            Mutation::CheckTimeouts => self.apply_check_timeouts(),
             Mutation::SwitchRole {
                 role,
                 local,
                 is_session_auth,
-            } => {
-                if *local && self.local.transactions.is_empty() {
-                    // PostgreSQL warns and leaves the setting unchanged.
-                    return MutationResult::Skipped;
-                }
-
-                let target = if let Some(role) = role {
-                    let Some(identity) = self.role_fact_identity(role) else {
-                        self.snapshot_confidence();
-                        self.local.confidence = Confidence::Tainted;
-                        return MutationResult::Skipped;
-                    };
-                    Some(identity)
-                } else if *is_session_auth {
-                    Some((
-                        self.local.authenticated_role.clone(),
-                        self.local.authenticated_role_known,
-                    ))
-                } else {
-                    Some((
-                        self.local.session_role.clone(),
-                        self.local.session_role_known,
-                    ))
-                };
-                let (target_name, target_known) = target.expect("role reset always has a target");
-                let persistent_role_reset_target = if role.is_none() && !*is_session_auth {
-                    Some((
-                        self.local.persistent_session_role.clone(),
-                        self.local.persistent_session_role_known,
-                    ))
-                } else {
-                    None
-                };
-
-                let authorized = if role.is_none() {
-                    Some(true)
-                } else if *is_session_auth {
-                    self.can_set_session_authorization_to(&target_name)
-                } else {
-                    self.can_set_role_to(&target_name)
-                };
-                match authorized {
-                    Some(false) => {
-                        return MutationResult::Conflict {
-                            reason: if self.present_role(&target_name).is_none() {
-                                format!("role '{}' does not exist", target_name)
-                            } else {
-                                format!("permission denied to set role '{}'", target_name)
-                            },
-                        };
-                    }
-                    None => {
-                        self.snapshot_confidence();
-                        self.local.confidence = Confidence::Tainted;
-                    }
-                    Some(true) => {}
-                }
-
-                self.snapshot_role_context();
-                self.snapshot_search_path();
-                self.snapshot_confidence();
-                if *is_session_auth {
-                    self.local.session_role = target_name.clone();
-                    self.local.session_role_known = target_known;
-                    self.local.current_role = target_name.clone();
-                    self.local.current_role_known = target_known;
-                    if !local {
-                        self.local.persistent_session_role = target_name.clone();
-                        self.local.persistent_session_role_known = target_known;
-                        self.local.persistent_current_role = target_name;
-                        self.local.persistent_current_role_known = target_known;
-                    }
-                } else {
-                    self.local.current_role = target_name.clone();
-                    self.local.current_role_known = target_known;
-                    if !local {
-                        let (persistent_name, persistent_known) =
-                            persistent_role_reset_target.unwrap_or((target_name, target_known));
-                        self.local.persistent_current_role = persistent_name;
-                        self.local.persistent_current_role_known = persistent_known;
-                    }
-                }
-                self.refresh_role_sensitive_search_path();
-                MutationResult::Applied
-            }
-            Mutation::BeginTransaction => {
-                if self.local.transactions.is_empty() {
-                    self.local.transactions.push(TransactionFrame::root());
-                    MutationResult::Applied
-                } else {
-                    // PostgreSQL emits a warning and leaves the current
-                    // transaction active for a nested BEGIN.
-                    MutationResult::Skipped
-                }
-            }
-            Mutation::CommitTransaction => {
-                if self.local.transaction_aborted {
-                    while let Some(frame) = self.local.transactions.pop() {
-                        self.rollback_frame(frame);
-                    }
-                } else {
-                    while self.local.transactions.pop().is_some() {}
-                    self.restore_persistent_role_context();
-                }
-                self.local.transaction_aborted = false;
-                MutationResult::Applied
-            }
-            Mutation::CommitAndChain => {
-                if self.local.transactions.is_empty() {
-                    self.local.confidence = Confidence::Tainted;
-                    return MutationResult::Conflict {
-                        reason: "COMMIT AND CHAIN can only be used in transaction blocks"
-                            .to_string(),
-                    };
-                }
-                if self.local.transaction_aborted {
-                    while let Some(frame) = self.local.transactions.pop() {
-                        self.rollback_frame(frame);
-                    }
-                } else {
-                    while self.local.transactions.pop().is_some() {}
-                    self.restore_persistent_role_context();
-                }
-                self.local.transaction_aborted = false;
-                self.local.transactions.push(TransactionFrame::root());
-                MutationResult::Applied
-            }
-            Mutation::RollbackTransaction => {
-                while let Some(frame) = self.local.transactions.pop() {
-                    self.rollback_frame(frame);
-                }
-                self.local.transaction_aborted = false;
-                MutationResult::Applied
-            }
-            Mutation::RollbackAndChain => {
-                if self.local.transactions.is_empty() {
-                    self.local.confidence = Confidence::Tainted;
-                    return MutationResult::Conflict {
-                        reason: "ROLLBACK AND CHAIN can only be used in transaction blocks"
-                            .to_string(),
-                    };
-                }
-                while let Some(frame) = self.local.transactions.pop() {
-                    self.rollback_frame(frame);
-                }
-                self.local.transaction_aborted = false;
-                self.local.transactions.push(TransactionFrame::root());
-                MutationResult::Applied
-            }
-            Mutation::RollbackToSavepoint(rts) => {
-                let Some(position) = self
-                    .local
-                    .transactions
-                    .iter()
-                    .rposition(|frame| frame.is_named_savepoint(&rts.name))
-                else {
-                    self.local.confidence = Confidence::Tainted;
-                    if !self.local.transactions.is_empty() {
-                        self.local.transaction_aborted = true;
-                    }
-                    return MutationResult::Conflict {
-                        reason: format!("savepoint '{}' does not exist", rts.name),
-                    };
-                };
-                let rolled_back = self.local.transactions.split_off(position + 1);
-                // Frames are popped newest-first. Restore them in that same
-                // order before restoring changes made after the target
-                // savepoint itself; undo logs are chronological.
-                for frame in rolled_back.into_iter().rev() {
-                    self.rollback_frame(frame);
-                }
-                let undo_log = std::mem::take(&mut self.local.transactions[position].undo_log);
-                self.rollback_undo_log(undo_log);
-                self.local.transaction_aborted = false;
-                MutationResult::Applied
-            }
-            Mutation::Savepoint(sp) => {
-                if self.local.transactions.is_empty() {
-                    self.local.confidence = Confidence::Tainted;
-                    return MutationResult::Conflict {
-                        reason: "SAVEPOINT can only be used in transaction blocks".to_string(),
-                    };
-                }
-                self.local
-                    .transactions
-                    .push(TransactionFrame::savepoint(sp.name.clone()));
-                MutationResult::Applied
-            }
-            Mutation::ReleaseSavepoint(rsp) => {
-                let Some(position) = self
-                    .local
-                    .transactions
-                    .iter()
-                    .rposition(|frame| frame.is_named_savepoint(&rsp.name))
-                else {
-                    self.local.confidence = Confidence::Tainted;
-                    if !self.local.transactions.is_empty() {
-                        self.local.transaction_aborted = true;
-                    }
-                    return MutationResult::Conflict {
-                        reason: format!("savepoint '{}' does not exist", rsp.name),
-                    };
-                };
-                if position == 0 {
-                    self.local.confidence = Confidence::Tainted;
-                    return MutationResult::Conflict {
-                        reason: format!("savepoint '{}' is not inside a transaction", rsp.name),
-                    };
-                }
-
-                let released = self.local.transactions.split_off(position);
-                let outer = self
-                    .local
-                    .transactions
-                    .last_mut()
-                    .expect("a released savepoint always has an outer transaction frame");
-                for frame in released {
-                    outer.undo_log.extend(frame.undo_log);
-                }
-                MutationResult::Applied
-            }
-            Mutation::Opaque(_) => {
-                self.snapshot_confidence();
-                self.local.confidence = Confidence::Tainted;
-                MutationResult::Applied
-            }
+            } => self.apply_switch_role(role, *local, *is_session_auth),
+            Mutation::BeginTransaction => self.apply_begin_transaction(),
+            Mutation::CommitTransaction => self.apply_commit_transaction(false),
+            Mutation::CommitAndChain => self.apply_commit_transaction(true),
+            Mutation::RollbackTransaction => self.apply_rollback_transaction(false),
+            Mutation::RollbackAndChain => self.apply_rollback_transaction(true),
+            Mutation::RollbackToSavepoint(rollback) => self.apply_rollback_to_savepoint(rollback),
+            Mutation::Savepoint(savepoint) => self.apply_savepoint(savepoint),
+            Mutation::ReleaseSavepoint(release) => self.apply_release_savepoint(release),
+            Mutation::Opaque(opaque) => self.apply_opaque(opaque),
             Mutation::CreateFunction(f) => {
                 let routine_kind =
                     if f.options.iter().any(|option| {
@@ -6104,10 +5808,12 @@ impl AnalysisState {
                 }
                 MutationResult::Applied
             }
-            Mutation::CreateDatabase(_) => MutationResult::Applied,
-            Mutation::AlterDatabase(_) => MutationResult::Applied,
-            Mutation::DropDatabase(_) => MutationResult::Applied,
-            Mutation::Vacuum { .. } => MutationResult::Applied,
+            Mutation::CreateDatabase(create_database) => {
+                self.apply_create_database(create_database)
+            }
+            Mutation::AlterDatabase(alter_database) => self.apply_alter_database(alter_database),
+            Mutation::DropDatabase(drop_database) => self.apply_drop_database(drop_database),
+            Mutation::Vacuum { table_id, is_full } => self.apply_vacuum(table_id, *is_full),
         }
     }
 
