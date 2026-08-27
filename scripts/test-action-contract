@@ -9,7 +9,7 @@ baseline="$repo_root/scripts/action-baseline"
 manifest="$repo_root/action.yml"
 workflow="$repo_root/.github/workflows/ci.yml"
 
-test "$(/bin/sh "$resolver" v0.6.1 "$repo_root/Cargo.toml")" = v0.6.1
+test "$(/bin/sh "$resolver" v0.6.2 "$repo_root/Cargo.toml")" = v0.6.2
 test "$(/bin/sh "$resolver" 0123456789abcdef0123456789abcdef01234567 "$repo_root/Cargo.toml")" = source
 
 if /bin/sh "$resolver" main "$repo_root/Cargo.toml" >/dev/null 2>&1; then

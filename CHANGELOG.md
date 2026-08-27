@@ -5,6 +5,19 @@ commits and pull requests. Published binaries, checksums, and generated release
 notes are available on the
 [GitHub Releases page](https://github.com/dsecurity49/safe-migrate/releases).
 
+## v0.6.2 — 2026-08-27
+
+- Added reproducible, ignored performance scenarios for large synchronized
+  baselines, ordered chains, transaction and savepoint rollback, compound
+  statements, dependency graphs, reports, and the complete protected-cache
+  round trip, with a recorded local baseline and no timing-sensitive CI gate.
+- Added test-only cache and state invariant validation for modeled identities,
+  cache relationships, dependency edges, constraints, pending validation, and
+  transaction-frame consistency across conflicts and rollbacks.
+- Hardened `ALTER DATABASE ... OWNER TO` extraction so an incomplete typed AST
+  is rejected instead of reaching an unchecked accessor, while preserving the
+  exact fact produced for valid SQL.
+
 ## v0.6.1 — 2026-08-26
 
 - Upgraded the exactly pinned Squawk parser stack from 2.62.0 to 2.63.0 and

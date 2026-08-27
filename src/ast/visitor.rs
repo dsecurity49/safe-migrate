@@ -3249,7 +3249,7 @@ impl AstVisitor {
             }
             AlterDatabaseAction::OwnerTo(ot) => {
                 crate::analysis::facts::AlterDatabaseAction::OwnerChange(Self::extract_role(
-                    &ot.role_ref().unwrap(),
+                    &ot.role_ref()?,
                 ))
             }
             AlterDatabaseAction::SetTablespace(st) => {
