@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use safe_migrate::ast::identifiers::ObjectId;
 use safe_migrate::db::cache::{CACHE_V6_MAGIC, DbCache, DbCacheVersioned};
 use safe_migrate::model::relation::{Persistence, RelationKind, RelationState};
+use safe_migrate::model::schema::SchemaState;
 
 fn parse_json_stdout(output: &std::process::Output) -> serde_json::Value {
     serde_json::from_slice(&output.stdout).expect("stdout must contain exactly one JSON document")
@@ -256,6 +257,43 @@ fn test_cli_lint_invalid_cache() {
         .arg("--cache")
         .arg(corrupted_cache.path());
     cmd.assert().failure();
+}
+
+#[test]
+fn test_cli_rejects_semantically_contradictory_v6_cache() {
+    let mut invalid = DbCache::new();
+    invalid.schemas.insert(
+        "app".to_string(),
+        SchemaState {
+            name: "other".to_string(),
+            owner: ObjectId::new("", "postgres"),
+            generation: 0,
+        },
+    );
+    let config = bincode::config::standard().with_variable_int_encoding();
+    let encoded =
+        bincode::serde::encode_to_vec(DbCacheVersioned::V6(Box::new(invalid)), config).unwrap();
+    let mut compressed = Vec::new();
+    let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3).unwrap();
+    encoder.write_all(CACHE_V6_MAGIC).unwrap();
+    encoder.write_all(&encoded).unwrap();
+    encoder.finish().unwrap();
+    let cache = tempfile::NamedTempFile::new().unwrap();
+    fs::write(cache.path(), compressed).unwrap();
+
+    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let assert = cmd
+        .arg("cache")
+        .arg("inspect")
+        .arg("--cache")
+        .arg(cache.path())
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(
+        stderr.contains("schema cache key 'app' disagrees with embedded identity 'other'"),
+        "unexpected stderr: {stderr}"
+    );
 }
 
 #[test]

@@ -102,6 +102,71 @@ mod tests {
     }
 
     #[test]
+    fn representative_reports_match_complete_goldens() {
+        let finding = ReportFinding {
+            violation: make_violation("test-rule", ViolationTier::Tier2, "needs review"),
+            location: Some(SourceLocation {
+                file: "migrations/001.sql".to_string(),
+                line: 3,
+                column: 5,
+            }),
+            statement_index: Some(1),
+        };
+
+        let json = Reporter::json_report_with_locations(
+            std::slice::from_ref(&finding),
+            &Confidence::Exact,
+        );
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "schema_version": 1,
+                "confidence": "Exact",
+                "verdict": "CAUTIOUS",
+                "summary": {"total": 1, "tier1": 0, "tier2": 1, "tier3": 0},
+                "violations": [{
+                    "rule_id": "test-rule",
+                    "operation_kind": {"Other": "test"},
+                    "object_kind": "Unknown",
+                    "object_name": "test.object",
+                    "tier": "Tier2",
+                    "reason": "needs review",
+                    "recipe": "test recipe",
+                    "dedup_key": null,
+                    "sql": null,
+                    "fk_dependency_related": false,
+                    "location": {
+                        "file": "migrations/001.sql",
+                        "line": 3,
+                        "column": 5
+                    },
+                    "statement_index": 1
+                }]
+            })
+        );
+
+        let markdown = Reporter::markdown_report(&[finding], &Confidence::Exact);
+        assert_eq!(
+            markdown,
+            "# safe-migrate report\n\n\
+**Verdict:** CAUTIOUS  \n\
+**Confidence:** Exact\n\n\
+| Severity | Findings |\n\
+| --- | ---: |\n\
+| HALT (Tier 1) | 0 |\n\
+| WARN (Tier 2) | 1 |\n\
+| SAFE (Tier 3) | 0 |\n\n\
+## Findings\n\n\
+### WARN — test-rule (`test-rule`)\n\n\
+**Location:** `migrations/001.sql:3:5`  \n\
+**Statement:** 1  \n\
+**Object:** object test.object  \n\
+**Reason:** needs review  \n\
+**Recommendation:** test recipe\n"
+        );
+    }
+
+    #[test]
     fn markdown_report_uses_a_safe_fence_for_sql_containing_backticks() {
         let finding = ReportFinding {
             location: None,
