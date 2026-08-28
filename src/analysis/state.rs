@@ -17,6 +17,7 @@ use crate::model::types::{TypeKind, TypeOverlay, TypeState};
 use std::collections::{HashMap, HashSet};
 
 mod apply_misc;
+mod apply_policy_trigger;
 mod apply_role;
 mod apply_schema;
 mod apply_settings;
@@ -2291,183 +2292,11 @@ impl AnalysisState {
                 ));
                 MutationResult::Applied
             }
-            Mutation::CreatePolicy(create_policy) => {
-                self.snapshot_relation(&create_policy.table);
-                if let Some(RelationOverlay::Present(rel)) =
-                    self.local.relations.get_mut(&create_policy.table)
-                {
-                    if rel.policies.contains(&create_policy.name) {
-                        return MutationResult::Conflict {
-                            reason: format!(
-                                "policy '{}' already exists on relation '{}'",
-                                create_policy.name, create_policy.table
-                            ),
-                        };
-                    }
-                    rel.policies.insert(create_policy.name.clone());
-                } else {
-                    return MutationResult::Conflict {
-                        reason: format!("relation '{}' does not exist", create_policy.table),
-                    };
-                }
-                MutationResult::Applied
-            }
-            Mutation::DropPolicy(drop_policy) => {
-                self.snapshot_relation(&drop_policy.table);
-                if let Some(RelationOverlay::Present(rel)) =
-                    self.local.relations.get_mut(&drop_policy.table)
-                {
-                    if !rel.policies.contains(&drop_policy.name) {
-                        return if drop_policy.if_exists {
-                            MutationResult::Skipped
-                        } else {
-                            MutationResult::Conflict {
-                                reason: format!(
-                                    "policy '{}' does not exist on relation '{}'",
-                                    drop_policy.name, drop_policy.table
-                                ),
-                            }
-                        };
-                    }
-                    rel.policies.remove(&drop_policy.name);
-                } else {
-                    return MutationResult::Conflict {
-                        reason: format!("relation '{}' does not exist", drop_policy.table),
-                    };
-                }
-                MutationResult::Applied
-            }
-            Mutation::CreateTrigger(create_trigger) => {
-                let trigger_id = Self::trigger_key(&create_trigger.table, &create_trigger.name);
-                if matches!(
-                    self.local.triggers.get(&trigger_id),
-                    Some(TriggerOverlay::Present(_))
-                ) {
-                    return MutationResult::Conflict {
-                        reason: format!(
-                            "trigger '{}' already exists on relation '{}'",
-                            create_trigger.name, create_trigger.table
-                        ),
-                    };
-                }
-                self.snapshot_trigger(&trigger_id);
-                self.local.triggers.insert(
-                    trigger_id.clone(),
-                    TriggerOverlay::Present(crate::model::trigger::TriggerState {
-                        name: create_trigger.name.clone(),
-                        id: trigger_id.clone(),
-                        table_id: create_trigger.table.clone(),
-                        enabled_mode: crate::model::trigger::TriggerEnableMode::Origin,
-                        generation: self.local.generation_counter,
-                    }),
-                );
-
-                self.snapshot_relation(&create_trigger.table);
-                if let Some(RelationOverlay::Present(rel)) =
-                    self.local.relations.get_mut(&create_trigger.table)
-                {
-                    rel.triggers.insert(create_trigger.name.clone());
-                }
-
-                self.snapshot_graph_full();
-                self.local.graph.edges.push(DependencyEdge::new(
-                    trigger_id.clone(),
-                    create_trigger.table.clone(),
-                    DependencyKind::TriggerOnTable {
-                        trigger_id: trigger_id.clone(),
-                        function_id: create_trigger.function_id.clone(),
-                    },
-                ));
-
-                MutationResult::Applied
-            }
-            Mutation::DropTrigger(drop_trigger) => {
-                let trigger_id = Self::trigger_key(&drop_trigger.table, &drop_trigger.name);
-                if !matches!(
-                    self.local.triggers.get(&trigger_id),
-                    Some(TriggerOverlay::Present(_))
-                ) {
-                    return if drop_trigger.if_exists {
-                        MutationResult::Skipped
-                    } else {
-                        MutationResult::Conflict {
-                            reason: format!(
-                                "trigger '{}' does not exist on relation '{}'",
-                                drop_trigger.name, drop_trigger.table
-                            ),
-                        }
-                    };
-                }
-                self.snapshot_trigger(&trigger_id);
-                self.local
-                    .triggers
-                    .insert(trigger_id.clone(), TriggerOverlay::Dropped);
-
-                self.snapshot_relation(&drop_trigger.table);
-                if let Some(RelationOverlay::Present(rel)) =
-                    self.local.relations.get_mut(&drop_trigger.table)
-                {
-                    rel.triggers.remove(&drop_trigger.name);
-                }
-
-                self.snapshot_graph_full();
-                self.local.graph.edges.retain(|e| {
-                    !(matches!(e.kind, DependencyKind::TriggerOnTable { .. })
-                        && e.dependent == trigger_id)
-                });
-
-                MutationResult::Applied
-            }
-            Mutation::RenameTrigger(rename_trigger) => {
-                let old_id = Self::trigger_key(&rename_trigger.table, &rename_trigger.name);
-                let new_id = Self::trigger_key(&rename_trigger.table, &rename_trigger.new_name);
-                let Some(TriggerOverlay::Present(mut trigger)) =
-                    self.local.triggers.get(&old_id).cloned()
-                else {
-                    return MutationResult::Conflict {
-                        reason: format!(
-                            "trigger '{}' does not exist on relation '{}'",
-                            rename_trigger.name, rename_trigger.table
-                        ),
-                    };
-                };
-                if old_id != new_id
-                    && matches!(
-                        self.local.triggers.get(&new_id),
-                        Some(TriggerOverlay::Present(_))
-                    )
-                {
-                    return MutationResult::Conflict {
-                        reason: format!(
-                            "trigger '{}' already exists on relation '{}'",
-                            rename_trigger.new_name, rename_trigger.table
-                        ),
-                    };
-                }
-                self.snapshot_trigger(&old_id);
-                self.snapshot_trigger(&new_id);
-                self.snapshot_relation(&rename_trigger.table);
-                self.snapshot_graph_full();
-                self.local.triggers.remove(&old_id);
-                trigger.id = new_id.clone();
-                trigger.name = rename_trigger.new_name.clone();
-                self.local
-                    .triggers
-                    .insert(new_id.clone(), TriggerOverlay::Present(trigger));
-                if let Some(RelationOverlay::Present(relation)) =
-                    self.local.relations.get_mut(&rename_trigger.table)
-                {
-                    relation.triggers.remove(&rename_trigger.name);
-                    relation.triggers.insert(rename_trigger.new_name.clone());
-                }
-                self.local.graph.propagate_rename(&old_id, &new_id);
-                self.local.graph.edges.push(DependencyEdge::new(
-                    old_id,
-                    new_id,
-                    DependencyKind::RenameTo,
-                ));
-                MutationResult::Applied
-            }
+            Mutation::CreatePolicy(create_policy) => self.apply_create_policy(create_policy),
+            Mutation::DropPolicy(drop_policy) => self.apply_drop_policy(drop_policy),
+            Mutation::CreateTrigger(create_trigger) => self.apply_create_trigger(create_trigger),
+            Mutation::DropTrigger(drop_trigger) => self.apply_drop_trigger(drop_trigger),
+            Mutation::RenameTrigger(rename_trigger) => self.apply_rename_trigger(rename_trigger),
             Mutation::AlterTable(alter) => {
                 if let AlterTableActionMutation::OwnerTo { new_owner } = &alter.action {
                     let Some((owner, known)) = self.role_fact_identity(new_owner) else {
