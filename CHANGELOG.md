@@ -5,6 +5,21 @@ commits and pull requests. Published binaries, checksums, and generated release
 notes are available on the
 [GitHub Releases page](https://github.com/dsecurity49/safe-migrate/releases).
 
+## v0.7.0 — 2026-08-28
+
+- Made Cache V6 loading and writing reject semantically inconsistent metadata
+  (including mismatched identities and dangling catalog relationships), and
+  made cache installation durable after its atomic replacement.
+- Preserved report locations while reusing the parser result already needed to
+  calculate statement ranges; the local 250-statement location-report scenario
+  improved from 922 ms to a 235 ms median in the optimized profile.
+- Strengthened rollback, savepoint, graph, cache, and serialized-report
+  contracts with deterministic regression coverage. Invalid internal
+  savepoint data, automatic-sync configuration, and report serialization now
+  produce diagnostics rather than unchecked failures.
+- Expanded release readiness checks to cover the frozen fixture suite, package
+  contents, Rust 1.94, and supported operating systems.
+
 ## v0.6.2 — 2026-08-27
 
 - Added reproducible, ignored performance scenarios for large synchronized
