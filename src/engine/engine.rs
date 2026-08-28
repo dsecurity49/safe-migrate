@@ -7,7 +7,7 @@ use crate::report::violations::{ReportFinding, SourceLocation, Violation};
 use crate::rules::Rule;
 use crate::rules::registry;
 use squawk_syntax::{
-    SyntaxKind,
+    Parse, SyntaxKind,
     ast::{AstNode, SourceFile},
 };
 use std::collections::HashSet;
@@ -85,7 +85,7 @@ impl SafeMigrateEngine {
                 .stmts()
                 .map(|statement| statement.syntax().text_range())
                 .collect();
-            let violations = self.analyze_normalized_file(filename, &normalized_sql, state)?;
+            let violations = self.analyze_parsed_file(filename, &normalized_sql, &parsed, state)?;
             findings.extend(
                 violations
                     .into_iter()
@@ -149,11 +149,21 @@ impl SafeMigrateEngine {
 
     fn analyze_normalized_file(
         &self,
-        _filename: &str,
+        filename: &str,
         sql: &str,
         state: &mut AnalysisState,
     ) -> Result<Vec<Violation>, Vec<String>> {
         let parsed = SourceFile::parse(sql);
+        self.analyze_parsed_file(filename, sql, &parsed, state)
+    }
+
+    fn analyze_parsed_file(
+        &self,
+        _filename: &str,
+        sql: &str,
+        parsed: &Parse<SourceFile>,
+        state: &mut AnalysisState,
+    ) -> Result<Vec<Violation>, Vec<String>> {
         let errors: Vec<String> = parsed.errors().iter().map(|e| e.to_string()).collect();
         if !errors.is_empty() {
             return Err(errors);

@@ -55,6 +55,15 @@ comparable to the debug timings above and is not a performance guarantee.
 | rename and cascade dependency graph | 304 | 1,477 ms |
 | location-rich reports with many findings | 250 | 922 ms |
 
+### Location-report parsing improvement
+
+On 2026-08-28, the location-report scenario was sampled five times after
+reusing the parse already required to calculate statement ranges. The samples
+were 250, 231, 238, 235, and 235 ms (median **235 ms**). This is a 74.5%
+reduction from the structural baseline; both the CLI location test and the
+scenario's state assertions remained green. This measurement is specific to
+the same aarch64 Android Linux host and optimized profile described above.
+
 Run future comparisons with the same command and profile:
 
 ```sh
