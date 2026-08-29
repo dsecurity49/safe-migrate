@@ -1308,6 +1308,11 @@ fn snapshot_live_state(
         populate_cache(client, Some(schemas))?
     };
     let mut state = NormalizedState::default();
+    // `format_type` is search_path-sensitive for user-defined types. Resolve
+    // each cached column to its catalog identity before projecting it so a
+    // fixture that changes search_path cannot turn the same type into two
+    // different textual representations.
+    let resolved_cache_state = AnalysisState::with_baseline(cache.clone(), true);
 
     if scope.contains(&ComparisonScope::Schemas) {
         for (name, schema) in &cache.schemas {
@@ -1405,20 +1410,33 @@ fn snapshot_live_state(
     }
 
     if scope.contains(&ComparisonScope::Relations) || scope.contains(&ComparisonScope::Columns) {
-        for (id, relation) in cache.relations {
+        for (id, relation) in &cache.relations {
             let mut normalized = NormalizedRelation {
-                kind: normalize_relation_kind(relation.kind),
-                owner: relation.owner.name,
-                partition_strategy: relation.partition_type,
+                kind: normalize_relation_kind(relation.kind.clone()),
+                owner: relation.owner.name.clone(),
+                partition_strategy: relation.partition_type.clone(),
                 columns: BTreeMap::new(),
             };
             if scope.contains(&ComparisonScope::Columns) {
-                for column in relation.columns {
+                let resolved_relation = resolved_cache_state.local.relations.get(id);
+                for column in &relation.columns {
+                    let type_id = resolved_relation.and_then(|overlay| match overlay {
+                        RelationOverlay::Present(resolved) => resolved
+                            .columns
+                            .iter()
+                            .find(|resolved_column| resolved_column.name == column.name)
+                            .and_then(|resolved_column| resolved_column.type_id.as_ref()),
+                        RelationOverlay::Dropped => None,
+                    });
                     normalized.columns.insert(
-                        column.name,
+                        column.name.clone(),
                         NormalizedColumn {
-                            data_type: normalize_data_type(
-                                &column.data_type.unwrap_or_else(|| "<unknown>".to_string()),
+                            data_type: normalize_data_type_with_identity(
+                                &column
+                                    .data_type
+                                    .clone()
+                                    .unwrap_or_else(|| "<unknown>".to_string()),
+                                type_id,
                             ),
                             is_nullable: column.is_nullable,
                             has_default: column.default.is_some()
@@ -1620,7 +1638,7 @@ fn snapshot_simulator_state(state: &AnalysisState, scope: &[ComparisonScope]) ->
     }
 
     if scope.contains(&ComparisonScope::Triggers) {
-        for edge in &state.local.graph.edges {
+        for edge in state.local.graph.edges() {
             let DependencyKind::TriggerOnTable {
                 trigger_id,
                 function_id,
@@ -1661,11 +1679,12 @@ fn snapshot_simulator_state(state: &AnalysisState, scope: &[ComparisonScope]) ->
                     normalized.columns.insert(
                         column.name.clone(),
                         NormalizedColumn {
-                            data_type: normalize_data_type(
+                            data_type: normalize_data_type_with_identity(
                                 &column
                                     .data_type
                                     .clone()
                                     .unwrap_or_else(|| "<unknown>".to_string()),
+                                column.type_id.as_ref(),
                             ),
                             is_nullable: column.is_nullable,
                             has_default: column.default.is_some()
@@ -1680,7 +1699,7 @@ fn snapshot_simulator_state(state: &AnalysisState, scope: &[ComparisonScope]) ->
         }
     }
 
-    for edge in &state.local.graph.edges {
+    for edge in state.local.graph.edges() {
         match &edge.kind {
             DependencyKind::IndexOnRelation { .. } if scope.contains(&ComparisonScope::Indexes) => {
                 projection.indexes.insert(NormalizedIndex {
@@ -2255,6 +2274,7 @@ fn normalize_privilege(privilege: Privilege) -> String {
         Privilege::References => "references",
         Privilege::Trigger => "trigger",
         Privilege::All => "all",
+        Privilege::Maintain => "maintain",
     }
     .to_string()
 }
@@ -2290,6 +2310,24 @@ fn normalize_data_type(data_type: &str) -> String {
         }
         _ => normalized,
     }
+}
+
+fn normalize_data_type_with_identity(
+    data_type: &str,
+    type_id: Option<&safe_migrate::ast::identifiers::ObjectId>,
+) -> String {
+    let normalized = normalize_data_type(data_type);
+    let Some(type_id) = type_id else {
+        return normalized;
+    };
+
+    // Keep array dimensions from the display string while replacing the
+    // search_path-dependent base name with its stable schema/name identity.
+    let suffix = normalized
+        .find('[')
+        .map(|index| &normalized[index..])
+        .unwrap_or("");
+    format!("{}.{}{}", type_id.schema, type_id.name, suffix)
 }
 
 fn qualified_name(schema: &str, name: &str) -> String {

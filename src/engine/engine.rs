@@ -1,6 +1,6 @@
 use crate::analysis::mutations::Mutation;
 use crate::analysis::resolver::Resolver;
-use crate::analysis::state::AnalysisState;
+use crate::analysis::state::{AnalysisState, PreState};
 use crate::ast::visitor::AstVisitor;
 use crate::engine::config::Config;
 use crate::report::violations::{ReportFinding, SourceLocation, Violation};
@@ -11,6 +11,60 @@ use squawk_syntax::{
     ast::{AstNode, SourceFile},
 };
 use std::collections::HashSet;
+
+enum StatementCheckpoint {
+    Full(Option<Box<AnalysisState>>),
+    TransactionUndo {
+        transaction_depth: usize,
+        undo_len: usize,
+    },
+}
+
+impl StatementCheckpoint {
+    fn capture(state: &AnalysisState, mutations: &[Mutation]) -> Self {
+        let changes_transaction_structure = mutations.iter().any(|mutation| {
+            matches!(
+                mutation,
+                Mutation::BeginTransaction
+                    | Mutation::CommitTransaction
+                    | Mutation::CommitAndChain
+                    | Mutation::RollbackTransaction
+                    | Mutation::RollbackAndChain
+                    | Mutation::RollbackToSavepoint(_)
+                    | Mutation::Savepoint(_)
+                    | Mutation::ReleaseSavepoint(_)
+            )
+        });
+        if !changes_transaction_structure
+            && let Some((transaction_depth, undo_len)) = state.transaction_undo_checkpoint()
+        {
+            Self::TransactionUndo {
+                transaction_depth,
+                undo_len,
+            }
+        } else {
+            Self::Full(Some(Box::new(state.clone())))
+        }
+    }
+
+    fn restore(&mut self, state: &mut AnalysisState) -> Result<(), String> {
+        match self {
+            Self::Full(checkpoint) => {
+                let Some(checkpoint) = checkpoint.take() else {
+                    return Err("statement checkpoint was already restored".to_string());
+                };
+                *state = *checkpoint;
+                Ok(())
+            }
+            Self::TransactionUndo {
+                transaction_depth,
+                undo_len,
+            } => state
+                .rollback_to_transaction_undo_checkpoint(*transaction_depth, *undo_len)
+                .map_err(str::to_string),
+        }
+    }
+}
 
 pub struct SafeMigrateEngine {
     config: Config,
@@ -171,6 +225,7 @@ impl SafeMigrateEngine {
 
         let mut all_violations = Vec::new();
         let mut warned_keys = HashSet::new();
+        let mut pre_state = PreState::default();
 
         let mut file_ignores = HashSet::new();
         for token in parsed
@@ -220,7 +275,6 @@ impl SafeMigrateEngine {
             // state, findings, or deduplication keys. A parsed statement
             // without a typed extractor is explicitly opaque: silently
             // ignoring it would claim exact confidence for later SQL.
-            let statement_checkpoint = state.clone();
             let statement_confidence = state.local.confidence.clone();
             let mut statement_violations = Vec::new();
             let mut statement_warned_keys = HashSet::new();
@@ -233,6 +287,7 @@ impl SafeMigrateEngine {
             if squawk_linter::analyze::possibly_slow_stmt(&stmt) {
                 mutations.push(Mutation::CheckTimeouts);
             }
+            let mut statement_checkpoint = StatementCheckpoint::capture(state, &mutations);
 
             for mutation in mutations {
                 let pre_cascade = match &mutation {
@@ -240,7 +295,7 @@ impl SafeMigrateEngine {
                     _ => None,
                 };
 
-                let pre_state = state.capture_pre_state();
+                state.capture_pre_state_into(&mut pre_state);
                 let result = state.apply(&mutation, pre_cascade.as_ref());
 
                 let statement_failed = matches!(
@@ -249,7 +304,11 @@ impl SafeMigrateEngine {
                 );
                 if statement_failed {
                     let transaction_aborted = state.local.transaction_aborted;
-                    *state = statement_checkpoint.clone();
+                    if let Err(error) = statement_checkpoint.restore(state) {
+                        return Err(vec![format!(
+                            "failed to restore PostgreSQL statement atomicity: {error}"
+                        )]);
+                    }
                     if transaction_aborted && !state.local.transactions.is_empty() {
                         state.local.transaction_aborted = true;
                     }

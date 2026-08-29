@@ -2,6 +2,10 @@ use std::fs;
 use std::io::Write;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use chacha20poly1305::{
+    XChaCha20Poly1305, XNonce,
+    aead::{Aead, KeyInit},
+};
 use safe_migrate::ast::identifiers::ObjectId;
 use safe_migrate::db::cache::{CACHE_V6_MAGIC, DbCache, DbCacheVersioned};
 use safe_migrate::model::relation::{Persistence, RelationKind, RelationState};
@@ -297,6 +301,59 @@ fn test_cli_rejects_semantically_contradictory_v6_cache() {
 }
 
 #[test]
+fn test_cli_rejects_authenticated_semantically_contradictory_v6_cache() {
+    let mut invalid = DbCache::new();
+    invalid.schemas.insert(
+        "app".to_string(),
+        SchemaState {
+            name: "other".to_string(),
+            owner: ObjectId::new("", "postgres"),
+            generation: 0,
+        },
+    );
+    let config = bincode::config::standard().with_variable_int_encoding();
+    let encoded =
+        bincode::serde::encode_to_vec(DbCacheVersioned::V6(Box::new(invalid)), config).unwrap();
+    let mut compressed = Vec::new();
+    let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3).unwrap();
+    encoder.write_all(CACHE_V6_MAGIC).unwrap();
+    encoder.write_all(&encoded).unwrap();
+    encoder.finish().unwrap();
+
+    let key = [0x2au8; 32];
+    let nonce_bytes = [0x17u8; 24];
+    let cipher = XChaCha20Poly1305::new_from_slice(&key).unwrap();
+    let nonce = XNonce::try_from(nonce_bytes.as_slice()).unwrap();
+    let ciphertext = cipher.encrypt(&nonce, compressed.as_ref()).unwrap();
+    let mut envelope = b"SMENC001".to_vec();
+    envelope.extend_from_slice(&nonce_bytes);
+    envelope.extend_from_slice(&ciphertext);
+
+    let cache = tempfile::NamedTempFile::new().unwrap();
+    fs::write(cache.path(), envelope).unwrap();
+    let mut config_file = tempfile::NamedTempFile::new().unwrap();
+    writeln!(config_file, "cache_encryption = true").unwrap();
+
+    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let assert = cmd
+        .env("SAFE_MIGRATE_CACHE_KEY", "2a".repeat(32))
+        .arg("cache")
+        .arg("inspect")
+        .arg("--cache")
+        .arg(cache.path())
+        .arg("--config")
+        .arg(config_file.path())
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(
+        stderr.contains("schema cache key 'app' disagrees with embedded identity 'other'"),
+        "unexpected stderr: {stderr}"
+    );
+    assert!(!stderr.contains(&"2a".repeat(32)));
+}
+
+#[test]
 fn test_cli_rejects_cache_with_oversized_decoded_container() {
     let config = bincode::config::standard().with_variable_int_encoding();
     let encoded =
@@ -327,6 +384,37 @@ fn test_cli_rejects_cache_with_oversized_decoded_container() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("exceeds the 256 MiB decoded-size limit"),
+        "unexpected stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_cli_rejects_trailing_data_after_streamed_cache_decode() {
+    let config = bincode::config::standard().with_variable_int_encoding();
+    let encoded =
+        bincode::serde::encode_to_vec(DbCacheVersioned::V6(Box::default()), config).unwrap();
+
+    let mut compressed = Vec::new();
+    let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3).unwrap();
+    encoder.write_all(CACHE_V6_MAGIC).unwrap();
+    encoder.write_all(&encoded).unwrap();
+    encoder.write_all(b"trailing-data").unwrap();
+    encoder.finish().unwrap();
+
+    let mut cache = tempfile::NamedTempFile::new().unwrap();
+    cache.write_all(&compressed).unwrap();
+
+    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let assert = cmd
+        .arg("cache")
+        .arg("inspect")
+        .arg("--cache")
+        .arg(cache.path())
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(
+        stderr.contains("trailing payload data"),
         "unexpected stderr: {stderr}"
     );
 }

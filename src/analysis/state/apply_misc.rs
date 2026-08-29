@@ -1,25 +1,10 @@
 use super::{AnalysisState, MutationResult};
 use crate::analysis::mutations::{
-    AlterDatabaseMutation, AlterDomainMutation, CreateDatabaseMutation, DropDatabaseMutation,
-    RefreshMaterializedViewMutation,
+    AlterDatabaseMutation, CreateDatabaseMutation, DropDatabaseMutation,
 };
 use crate::ast::identifiers::ObjectId;
 
 impl AnalysisState {
-    pub(super) fn apply_refresh_materialized_view(
-        &mut self,
-        _refresh: &RefreshMaterializedViewMutation,
-    ) -> MutationResult {
-        MutationResult::Applied
-    }
-
-    pub(super) fn apply_alter_domain(
-        &mut self,
-        _alter_domain: &AlterDomainMutation,
-    ) -> MutationResult {
-        MutationResult::Applied
-    }
-
     pub(super) fn apply_check_timeouts(&mut self) -> MutationResult {
         MutationResult::Applied
     }

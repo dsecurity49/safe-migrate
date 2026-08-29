@@ -243,7 +243,7 @@ mod state_machine_guards_tests {
         let edge_count = state
             .local
             .graph
-            .edges
+            .edges()
             .iter()
             .filter(|e| {
                 matches!(
@@ -260,7 +260,7 @@ mod state_machine_guards_tests {
             state
                 .local
                 .graph
-                .edges
+                .edges()
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
@@ -280,7 +280,7 @@ mod state_machine_guards_tests {
         let before = state
             .local
             .graph
-            .edges
+            .edges()
             .iter()
             .filter(|e| {
                 matches!(
@@ -299,7 +299,7 @@ mod state_machine_guards_tests {
             state
                 .local
                 .graph
-                .edges
+                .edges()
                 .iter()
                 .filter(|e| matches!(
                     e.kind,

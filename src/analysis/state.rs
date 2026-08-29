@@ -1,27 +1,32 @@
-use crate::analysis::facts::TableConstraintFact;
 use crate::analysis::graph::{DependencyEdge, DependencyGraph, DependencyKind};
-use crate::analysis::mutations::{
-    AlterTableActionMutation, AlterTypeActionMutation, Mutation, PersistenceMutation,
-};
+use crate::analysis::mutations::Mutation;
 use crate::analysis::settings::ScopedSetting;
 use crate::analysis::transaction::{NamespaceSnapshot, StateChange, TransactionFrame};
 use crate::ast::identifiers::ObjectId;
 use crate::db::cache::DbCache;
-use crate::model::constraint::{ConstraintKind, ConstraintState};
+use crate::model::constraint::ConstraintState;
+use crate::model::function::FunctionOverlay;
 pub use crate::model::relation::RelationOverlay;
-use crate::model::relation::{ColumnAction, Persistence, Privilege, RelationKind, RelationState};
+use crate::model::relation::{Persistence, Privilege, RelationKind};
 use crate::model::schema::SchemaOverlay;
-use crate::model::sequence::{SequenceKind, SequenceOverlay, SequenceState};
+use crate::model::sequence::SequenceOverlay;
 use crate::model::trigger::TriggerOverlay;
 use crate::model::types::{TypeKind, TypeOverlay, TypeState};
 use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
 
 mod apply_misc;
 mod apply_policy_trigger;
+mod apply_relation;
+mod apply_replication;
 mod apply_role;
+mod apply_routine;
 mod apply_schema;
+mod apply_sequence;
 mod apply_settings;
 mod apply_transaction;
+mod apply_type;
+mod apply_view_index;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Confidence {
@@ -39,6 +44,40 @@ pub enum MutationResult {
     Conflict {
         reason: String,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ObjectLookup {
+    Present,
+    WrongKind,
+    Tombstone,
+    AuthoritativelyAbsent,
+    Unknown,
+}
+
+fn sync_present_map<K, V, O, F>(target: &mut HashMap<K, V>, source: &HashMap<K, O>, present: F)
+where
+    K: Clone + Eq + Hash,
+    V: Clone + PartialEq,
+    F: for<'a> Fn(&'a O) -> Option<&'a V> + Copy,
+{
+    target.retain(|key, value| {
+        let Some(current) = source.get(key).and_then(present) else {
+            return false;
+        };
+        if value != current {
+            value.clone_from(current);
+        }
+        true
+    });
+    target.reserve(source.len().saturating_sub(target.len()));
+    for (key, overlay) in source {
+        if !target.contains_key(key)
+            && let Some(value) = present(overlay)
+        {
+            target.insert(key.clone(), value.clone());
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -100,7 +139,7 @@ pub struct LocalState {
     pub generation_counter: u64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct PreState {
     pub relations: HashMap<ObjectId, crate::model::relation::RelationState>,
     pub functions: HashMap<ObjectId, crate::model::function::FunctionState>,
@@ -110,6 +149,65 @@ pub struct PreState {
     pub sequences: HashMap<ObjectId, crate::model::sequence::SequenceState>,
     pub types: HashMap<ObjectId, crate::model::types::TypeState>,
     pub indexes: Vec<crate::analysis::graph::DependencyEdge>,
+}
+
+#[cfg(test)]
+mod pre_state_tests {
+    use super::*;
+
+    #[test]
+    fn incremental_capture_matches_a_fresh_public_pre_state() {
+        let mut state = AnalysisState::new(DbCache::new());
+        let table_id = ObjectId::new("public", "capture_table");
+        state.local.relations.insert(
+            table_id.clone(),
+            RelationOverlay::Present(crate::model::relation::RelationState::new(
+                table_id.clone(),
+                ObjectId::new("", "postgres"),
+                1,
+                Some(1),
+                RelationKind::Table,
+                Persistence::Permanent,
+                0,
+            )),
+        );
+
+        let mut reused = PreState::default();
+        state.capture_pre_state_into(&mut reused);
+        assert_eq!(reused, state.capture_pre_state());
+
+        let Some(RelationOverlay::Present(relation)) = state.local.relations.get_mut(&table_id)
+        else {
+            panic!("test relation must remain present");
+        };
+        relation.estimated_rows = Some(2);
+        let index_id = ObjectId::new("public", "capture_table_idx");
+        state.local.graph.add_edge(DependencyEdge::new(
+            index_id,
+            table_id.clone(),
+            DependencyKind::IndexOnRelation {
+                using_method: Some("btree".into()),
+                has_predicate: false,
+                is_concurrent: false,
+                is_unique: false,
+                eligibility_known: true,
+            },
+        ));
+        state.capture_pre_state_into(&mut reused);
+        assert_eq!(reused, state.capture_pre_state());
+        assert_eq!(reused.relations[&table_id].estimated_rows, Some(2));
+        assert_eq!(reused.indexes.len(), 1);
+
+        state
+            .local
+            .relations
+            .insert(table_id.clone(), RelationOverlay::Dropped);
+        state.local.graph.replace_edges(Vec::new());
+        state.capture_pre_state_into(&mut reused);
+        assert_eq!(reused, state.capture_pre_state());
+        assert!(!reused.relations.contains_key(&table_id));
+        assert!(reused.indexes.is_empty());
+    }
 }
 
 #[derive(Clone)]
@@ -285,7 +383,7 @@ impl AnalysisState {
                 !matches!(
                     self.local.relations.get(&id),
                     Some(RelationOverlay::Present(relation)) if relation.generation > 0
-                ) || self.local.graph.edges.iter().any(|edge| {
+                ) || self.local.graph.edges().iter().any(|edge| {
                     matches!(edge.kind, DependencyKind::PartitionOf)
                         && self.local.graph.resolve_rename(&edge.referenced)
                             == self.local.graph.resolve_rename(&id)
@@ -485,7 +583,7 @@ impl AnalysisState {
         let baseline_sequences = cache.sequences.keys().cloned().collect();
         for sequence in cache.sequences.values() {
             if let Some((table, column)) = &sequence.owned_by {
-                graph.edges.push(DependencyEdge::new(
+                graph.add_edge(DependencyEdge::new(
                     sequence.id.clone(),
                     table.clone(),
                     DependencyKind::SequenceOwnedBy {
@@ -539,7 +637,7 @@ impl AnalysisState {
         }
         for fk in cache.foreign_keys {
             baseline_foreign_keys.insert((fk.from_table.clone(), fk.constraint_name.clone()));
-            graph.edges.push(DependencyEdge::new(
+            graph.add_edge(DependencyEdge::new(
                 fk.from_table,
                 fk.to_table,
                 DependencyKind::ForeignKey {
@@ -554,7 +652,7 @@ impl AnalysisState {
         for idx in cache.indexes {
             // Index identities are tracked separately from relation identities.
             baseline_indexes.insert(idx.index_id.clone());
-            graph.edges.push(DependencyEdge::new(
+            graph.add_edge(DependencyEdge::new(
                 idx.index_id,
                 idx.table_id,
                 DependencyKind::IndexOnRelation {
@@ -600,7 +698,7 @@ impl AnalysisState {
                 )
             });
             if is_view && relations.contains_key(&referenced) {
-                graph.edges.push(DependencyEdge::new(
+                graph.add_edge(DependencyEdge::new(
                     dependent,
                     referenced,
                     DependencyKind::ViewDependency { view_generation: 0 },
@@ -627,7 +725,7 @@ impl AnalysisState {
                     generation: 0,
                 }),
             );
-            graph.edges.push(DependencyEdge::new(
+            graph.add_edge(DependencyEdge::new(
                 trigger_key.clone(),
                 t.table_id,
                 DependencyKind::TriggerOnTable {
@@ -687,7 +785,7 @@ impl AnalysisState {
                                     .unwrap_or_else(|| "public".to_string()),
                                 relation.name.resolve(),
                             );
-                            graph.edges.push(DependencyEdge::new(
+                            graph.add_edge(DependencyEdge::new(
                                 table_id,
                                 ObjectId::new("public", &name),
                                 DependencyKind::PublicationIncludes {
@@ -783,7 +881,7 @@ impl AnalysisState {
         }
         for schema in &self.local.search_path {
             let candidate = ObjectId::new(schema.clone(), sig_str.to_string());
-            if self.local.functions.contains_key(&candidate) {
+            if self.routine_is_present(&candidate) {
                 return schema.clone();
             }
         }
@@ -801,7 +899,7 @@ impl AnalysisState {
         let resolved_name = name.name.resolve();
         for schema in &self.local.search_path {
             let mut candidate = ObjectId::new(schema.clone(), resolved_name.clone());
-            if self.local.relations.contains_key(&candidate) {
+            if self.relation_namespace_object_is_present(&candidate) {
                 candidate.inferred_schema = true;
                 return candidate;
             }
@@ -833,6 +931,39 @@ impl AnalysisState {
             .is_none_or(|schemas| schemas.contains(&id.schema))
     }
 
+    fn relation_lookup(
+        &self,
+        id: &ObjectId,
+        expected: impl FnOnce(&RelationKind) -> bool,
+    ) -> ObjectLookup {
+        match self.local.relations.get(id) {
+            Some(RelationOverlay::Present(relation)) if expected(&relation.kind) => {
+                ObjectLookup::Present
+            }
+            Some(RelationOverlay::Present(_)) => ObjectLookup::WrongKind,
+            Some(RelationOverlay::Dropped) => ObjectLookup::Tombstone,
+            None if self.sequence_is_present(id) || self.index_is_present(id) => {
+                ObjectLookup::WrongKind
+            }
+            None if self.baseline_available && self.baseline_covers_object(id) => {
+                ObjectLookup::AuthoritativelyAbsent
+            }
+            None => ObjectLookup::Unknown,
+        }
+    }
+
+    fn type_lookup(&self, id: &ObjectId, expected: impl FnOnce(&TypeKind) -> bool) -> ObjectLookup {
+        match self.local.types.get(id) {
+            Some(TypeOverlay::Present(state)) if expected(&state.kind) => ObjectLookup::Present,
+            Some(TypeOverlay::Present(_)) => ObjectLookup::WrongKind,
+            Some(TypeOverlay::Dropped) => ObjectLookup::Tombstone,
+            None if self.baseline_available && self.baseline_covers_object(id) => {
+                ObjectLookup::AuthoritativelyAbsent
+            }
+            None => ObjectLookup::Unknown,
+        }
+    }
+
     pub fn baseline_scope_omits_displayed_object<'a>(
         &self,
         object_name: &'a str,
@@ -842,15 +973,22 @@ impl AnalysisState {
         (!schemas.contains(schema)).then_some(schema)
     }
 
-    fn sequence_is_present(&self, id: &ObjectId) -> bool {
+    pub(crate) fn sequence_is_present(&self, id: &ObjectId) -> bool {
         matches!(
             self.local.sequences.get(id),
             Some(SequenceOverlay::Present(_))
         )
     }
 
-    fn type_is_present(&self, id: &ObjectId) -> bool {
+    pub(crate) fn type_is_present(&self, id: &ObjectId) -> bool {
         matches!(self.local.types.get(id), Some(TypeOverlay::Present(_)))
+    }
+
+    pub(crate) fn routine_is_present(&self, id: &ObjectId) -> bool {
+        matches!(
+            self.local.functions.get(id),
+            Some(FunctionOverlay::Present(_))
+        )
     }
 
     fn resolve_type_reference_from_catalog(
@@ -965,10 +1103,14 @@ impl AnalysisState {
         )
     }
 
-    fn index_is_present(&self, id: &ObjectId) -> bool {
-        self.local.graph.edges.iter().any(|edge| {
+    pub(crate) fn index_is_present(&self, id: &ObjectId) -> bool {
+        self.local.graph.edges().iter().any(|edge| {
             matches!(edge.kind, DependencyKind::IndexOnRelation { .. }) && edge.dependent == *id
         })
+    }
+
+    pub(crate) fn relation_namespace_object_is_present(&self, id: &ObjectId) -> bool {
+        self.relation_is_present(id) || self.sequence_is_present(id) || self.index_is_present(id)
     }
 
     fn next_generated_constraint_name(
@@ -1027,10 +1169,7 @@ impl AnalysisState {
     }
 
     fn relation_namespace_is_taken(&self, id: &ObjectId) -> bool {
-        self.relation_is_present(id)
-            || self.sequence_is_present(id)
-            || self.index_is_present(id)
-            || self.type_is_present(id)
+        self.relation_namespace_object_is_present(id) || self.type_is_present(id)
     }
 
     fn next_implicit_sequence_id(
@@ -1094,65 +1233,13 @@ impl AnalysisState {
     }
 
     pub fn capture_pre_state(&self) -> PreState {
-        let mut relations = HashMap::new();
-        for (id, overlay) in &self.local.relations {
-            if let RelationOverlay::Present(s) = overlay {
-                relations.insert(id.clone(), s.clone());
-            }
-        }
+        let mut pre_state = PreState::default();
+        self.capture_pre_state_into(&mut pre_state);
+        pre_state
+    }
 
-        let mut functions = HashMap::new();
-        for (id, overlay) in &self.local.functions {
-            if let crate::model::function::FunctionOverlay::Present(s) = overlay {
-                functions.insert(id.clone(), s.clone());
-            }
-        }
-
-        let mut roles = HashMap::new();
-        for (name, overlay) in &self.local.roles {
-            if let crate::model::role::RoleOverlay::Present(s) = overlay {
-                roles.insert(name.clone(), s.clone());
-            }
-        }
-
-        let mut publications = HashMap::new();
-        for (name, overlay) in &self.local.publications {
-            if let crate::model::replication::PublicationOverlay::Present(s) = overlay {
-                publications.insert(name.clone(), s.clone());
-            }
-        }
-
-        let mut subscriptions = HashMap::new();
-        for (name, overlay) in &self.local.subscriptions {
-            if let crate::model::replication::SubscriptionOverlay::Present(s) = overlay {
-                subscriptions.insert(name.clone(), s.clone());
-            }
-        }
-
-        let mut sequences = HashMap::new();
-        for (id, overlay) in &self.local.sequences {
-            if let SequenceOverlay::Present(s) = overlay {
-                sequences.insert(id.clone(), s.clone());
-            }
-        }
-
-        let mut types = HashMap::new();
-        for (id, overlay) in &self.local.types {
-            if let TypeOverlay::Present(s) = overlay {
-                types.insert(id.clone(), s.clone());
-            }
-        }
-
-        let indexes = self
-            .local
-            .graph
-            .edges
-            .iter()
-            .filter(|e| matches!(e.kind, DependencyKind::IndexOnRelation { .. }))
-            .cloned()
-            .collect();
-
-        PreState {
+    pub(crate) fn capture_pre_state_into(&self, pre_state: &mut PreState) {
+        let PreState {
             relations,
             functions,
             roles,
@@ -1161,7 +1248,63 @@ impl AnalysisState {
             sequences,
             types,
             indexes,
+        } = pre_state;
+
+        sync_present_map(relations, &self.local.relations, |overlay| match overlay {
+            RelationOverlay::Present(state) => Some(state),
+            RelationOverlay::Dropped => None,
+        });
+        sync_present_map(functions, &self.local.functions, |overlay| match overlay {
+            crate::model::function::FunctionOverlay::Present(state) => Some(state),
+            crate::model::function::FunctionOverlay::Dropped => None,
+        });
+        sync_present_map(roles, &self.local.roles, |overlay| match overlay {
+            crate::model::role::RoleOverlay::Present(state) => Some(state),
+            crate::model::role::RoleOverlay::Dropped => None,
+        });
+        sync_present_map(
+            publications,
+            &self.local.publications,
+            |overlay| match overlay {
+                crate::model::replication::PublicationOverlay::Present(state) => Some(state),
+                crate::model::replication::PublicationOverlay::Dropped => None,
+            },
+        );
+        sync_present_map(
+            subscriptions,
+            &self.local.subscriptions,
+            |overlay| match overlay {
+                crate::model::replication::SubscriptionOverlay::Present(state) => Some(state),
+                crate::model::replication::SubscriptionOverlay::Dropped => None,
+            },
+        );
+        sync_present_map(sequences, &self.local.sequences, |overlay| match overlay {
+            SequenceOverlay::Present(state) => Some(state),
+            SequenceOverlay::Dropped => None,
+        });
+        sync_present_map(types, &self.local.types, |overlay| match overlay {
+            TypeOverlay::Present(state) => Some(state),
+            TypeOverlay::Dropped => None,
+        });
+
+        let mut index = 0;
+        for edge in self
+            .local
+            .graph
+            .edges()
+            .iter()
+            .filter(|edge| matches!(edge.kind, DependencyKind::IndexOnRelation { .. }))
+        {
+            if let Some(existing) = indexes.get_mut(index) {
+                if existing != edge {
+                    existing.clone_from(edge);
+                }
+            } else {
+                indexes.push(edge.clone());
+            }
+            index += 1;
         }
+        indexes.truncate(index);
     }
 
     pub fn get_cascade_closure(&self, target_oid: &ObjectId) -> CascadeResult {
@@ -1185,64 +1328,89 @@ impl AnalysisState {
 
         result.dropped_relations.insert(resolved_current.clone());
 
-        for edge in &self.local.graph.edges {
-            match &edge.kind {
-                DependencyKind::ViewDependency { .. } => {
-                    if self.local.graph.resolve_rename(&edge.referenced) == &resolved_current {
-                        let resolved_view_id =
-                            self.local.graph.resolve_rename(&edge.dependent).clone();
-                        if !visited.contains(&resolved_view_id) {
-                            self.walk_cascade(&resolved_view_id, visited, result);
-                        }
-                    }
-                }
-                DependencyKind::IndexOnRelation { .. } => {
-                    if self.local.graph.resolve_rename(&edge.referenced) == &resolved_current {
-                        result
-                            .dropped_indexes
-                            .insert(self.local.graph.resolve_rename(&edge.dependent).clone());
-                    }
-                }
-                DependencyKind::ForeignKey {
-                    constraint_name, ..
-                } => {
-                    if self.local.graph.resolve_rename(&edge.referenced) == &resolved_current
-                        && let Some(cname) = constraint_name
-                    {
-                        result.dropped_constraints.insert((
-                            self.local.graph.resolve_rename(&edge.dependent).clone(),
-                            cname.clone(),
-                        ));
-                    }
-                }
-                DependencyKind::PartitionOf
-                    if self.local.graph.resolve_rename(&edge.referenced) == &resolved_current =>
-                {
-                    let resolved_child = self.local.graph.resolve_rename(&edge.dependent).clone();
-                    if !visited.contains(&resolved_child) {
-                        self.walk_cascade(&resolved_child, visited, result);
-                    }
-                }
-                _ => {}
+        if self.local.graph.cascade_index_is_worthwhile() {
+            for edge in self.local.graph.cascade_edges(&resolved_current) {
+                self.walk_cascade_edge(edge, &resolved_current, visited, result);
+            }
+        } else {
+            for edge in self.local.graph.edges() {
+                self.walk_cascade_edge(edge, &resolved_current, visited, result);
             }
         }
     }
 
+    fn walk_cascade_edge(
+        &self,
+        edge: &DependencyEdge,
+        resolved_current: &ObjectId,
+        visited: &mut HashSet<ObjectId>,
+        result: &mut CascadeResult,
+    ) {
+        match &edge.kind {
+            DependencyKind::ViewDependency { .. } => {
+                if self.local.graph.resolve_rename(&edge.referenced) == resolved_current {
+                    let resolved_view_id = self.local.graph.resolve_rename(&edge.dependent).clone();
+                    if !visited.contains(&resolved_view_id) {
+                        self.walk_cascade(&resolved_view_id, visited, result);
+                    }
+                }
+            }
+            DependencyKind::IndexOnRelation { .. } => {
+                if self.local.graph.resolve_rename(&edge.referenced) == resolved_current {
+                    result
+                        .dropped_indexes
+                        .insert(self.local.graph.resolve_rename(&edge.dependent).clone());
+                }
+            }
+            DependencyKind::ForeignKey {
+                constraint_name, ..
+            } => {
+                if self.local.graph.resolve_rename(&edge.referenced) == resolved_current
+                    && let Some(cname) = constraint_name
+                {
+                    result.dropped_constraints.insert((
+                        self.local.graph.resolve_rename(&edge.dependent).clone(),
+                        cname.clone(),
+                    ));
+                }
+            }
+            DependencyKind::PartitionOf
+                if self.local.graph.resolve_rename(&edge.referenced) == resolved_current =>
+            {
+                let resolved_child = self.local.graph.resolve_rename(&edge.dependent).clone();
+                if !visited.contains(&resolved_child) {
+                    self.walk_cascade(&resolved_child, visited, result);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn resolve_grant_privileges(
+        &self,
         spec: &crate::analysis::facts::PrivilegeSpec,
     ) -> HashSet<Privilege> {
+        let supports_maintain = self
+            .pg_version_num
+            .is_some_and(|version| version >= 180_000);
         match spec {
-            crate::analysis::facts::PrivilegeSpec::All => vec![
-                Privilege::Select,
-                Privilege::Insert,
-                Privilege::Update,
-                Privilege::Delete,
-                Privilege::Truncate,
-                Privilege::References,
-                Privilege::Trigger,
-            ]
-            .into_iter()
-            .collect(),
+            crate::analysis::facts::PrivilegeSpec::All => {
+                let mut privileges = [
+                    Privilege::Select,
+                    Privilege::Insert,
+                    Privilege::Update,
+                    Privilege::Delete,
+                    Privilege::Truncate,
+                    Privilege::References,
+                    Privilege::Trigger,
+                ]
+                .into_iter()
+                .collect::<HashSet<_>>();
+                if supports_maintain {
+                    privileges.insert(Privilege::Maintain);
+                }
+                privileges
+            }
             crate::analysis::facts::PrivilegeSpec::List(list) => list
                 .iter()
                 .filter_map(|p| match p {
@@ -1255,6 +1423,9 @@ impl AnalysisState {
                         Some(Privilege::References)
                     }
                     crate::analysis::facts::PrivilegeFact::Trigger => Some(Privilege::Trigger),
+                    crate::analysis::facts::PrivilegeFact::Maintain if supports_maintain => {
+                        Some(Privilege::Maintain)
+                    }
                     _ => None,
                 })
                 .collect(),
@@ -1354,6 +1525,17 @@ impl AnalysisState {
             self.local.schemas.get(name),
             Some(SchemaOverlay::Present(_))
         )
+    }
+
+    fn schema_lookup(&self, name: &str) -> ObjectLookup {
+        match self.local.schemas.get(name) {
+            Some(SchemaOverlay::Present(_)) => ObjectLookup::Present,
+            Some(SchemaOverlay::Dropped) => ObjectLookup::Tombstone,
+            None if self.schema_absence_is_authoritative(name) => {
+                ObjectLookup::AuthoritativelyAbsent
+            }
+            None => ObjectLookup::Unknown,
+        }
     }
 
     fn schema_absence_is_authoritative(&self, name: &str) -> bool {
@@ -1524,20 +1706,22 @@ impl AnalysisState {
             })
             .collect();
 
-        for edge in &mut self.local.graph.edges {
-            Self::remap_schema_id(&mut edge.dependent, old_name, new_name);
-            Self::remap_schema_id(&mut edge.referenced, old_name, new_name);
-            if let DependencyKind::TriggerOnTable {
-                trigger_id,
-                function_id,
-            } = &mut edge.kind
-            {
-                Self::remap_schema_id(trigger_id, old_name, new_name);
-                Self::remap_schema_id(function_id, old_name, new_name);
+        self.local.graph.mutate_edges(|edges| {
+            for edge in edges {
+                Self::remap_schema_id(&mut edge.dependent, old_name, new_name);
+                Self::remap_schema_id(&mut edge.referenced, old_name, new_name);
+                if let DependencyKind::TriggerOnTable {
+                    trigger_id,
+                    function_id,
+                } = &mut edge.kind
+                {
+                    Self::remap_schema_id(trigger_id, old_name, new_name);
+                    Self::remap_schema_id(function_id, old_name, new_name);
+                }
             }
-        }
+        });
         for (old_id, new_id) in aliases {
-            self.local.graph.edges.push(DependencyEdge::new(
+            self.local.graph.add_edge(DependencyEdge::new(
                 old_id,
                 new_id,
                 DependencyKind::RenameTo,
@@ -1660,2113 +1844,36 @@ impl AnalysisState {
             Mutation::CreateSchema(create_schema) => self.apply_create_schema(create_schema),
             Mutation::AlterSchema(alter_schema) => self.apply_alter_schema(alter_schema),
             Mutation::DropSchema(drop_schema) => self.apply_drop_schema(drop_schema),
-            Mutation::DropTable(drop_table) => {
-                if !self.relation_is_present(&drop_table.id) {
-                    if drop_table.if_exists {
-                        return MutationResult::Skipped;
-                    }
-                    if self.baseline_available && self.baseline_covers_object(&drop_table.id) {
-                        return MutationResult::Conflict {
-                            reason: format!("table '{}' does not exist", drop_table.id),
-                        };
-                    }
-                    self.snapshot_confidence();
-                    self.local.confidence = Confidence::Tainted;
-                    return MutationResult::Skipped;
-                }
-                if !matches!(
-                    self.local.relations.get(&drop_table.id),
-                    Some(RelationOverlay::Present(relation))
-                        if relation.kind == RelationKind::Table
-                ) {
-                    return MutationResult::Conflict {
-                        reason: format!("'{}' is not a table", drop_table.id),
-                    };
-                }
-
-                let renames: Vec<DependencyEdge> = self
-                    .local
-                    .graph
-                    .edges
-                    .iter()
-                    .filter(|e| matches!(e.kind, DependencyKind::RenameTo))
-                    .cloned()
-                    .collect();
-                let resolve = |id: &ObjectId| -> ObjectId {
-                    let mut current = id;
-                    let mut visited = HashSet::new();
-                    loop {
-                        if !visited.insert(current.clone()) {
-                            return id.clone();
-                        }
-                        match renames.iter().find(|r| &r.dependent == current) {
-                            Some(edge) => current = &edge.referenced,
-                            None => return current.clone(),
-                        }
-                    }
-                };
-
-                let resolved_drop = resolve(&drop_table.id);
-                let mut dropped_relations = HashSet::from([resolved_drop.clone()]);
-
-                if drop_table.cascade {
-                    let local_closure;
-                    let closure = match precomputed_cascade {
-                        Some(c) => c,
-                        None => {
-                            local_closure = self.get_cascade_closure(&drop_table.id);
-                            &local_closure
-                        }
-                    };
-                    dropped_relations = closure.dropped_relations.clone();
-
-                    for dropped_rel_id in &closure.dropped_relations {
-                        self.snapshot_relation(dropped_rel_id);
-                        self.local
-                            .relations
-                            .insert(dropped_rel_id.clone(), RelationOverlay::Dropped);
-                    }
-
-                    self.snapshot_graph_full();
-                    self.local.graph.edges.retain(|e| match &e.kind {
-                        DependencyKind::IndexOnRelation { .. } => {
-                            !closure.dropped_indexes.contains(&resolve(&e.dependent))
-                        }
-                        DependencyKind::ForeignKey {
-                            constraint_name, ..
-                        } => {
-                            let from_dropped =
-                                closure.dropped_relations.contains(&resolve(&e.dependent));
-                            let to_dropped =
-                                closure.dropped_relations.contains(&resolve(&e.referenced));
-                            let constraint_explicitly_dropped = if let Some(cname) = constraint_name
-                            {
-                                closure
-                                    .dropped_constraints
-                                    .contains(&(resolve(&e.dependent), cname.clone()))
-                            } else {
-                                false
-                            };
-                            !(from_dropped || to_dropped || constraint_explicitly_dropped)
-                        }
-                        DependencyKind::ViewDependency { .. } => {
-                            !closure.dropped_relations.contains(&resolve(&e.dependent))
-                        }
-                        DependencyKind::SequenceOwnedBy { .. } => {
-                            !closure.dropped_relations.contains(&resolve(&e.referenced))
-                        }
-                        _ => true,
-                    });
-                } else {
-                    let has_view_deps = self.local.graph.edges.iter().any(|e| {
-                        matches!(e.kind, DependencyKind::ViewDependency { .. })
-                            && resolve(&e.referenced) == resolved_drop
-                    });
-                    let has_fk_deps = self.local.graph.edges.iter().any(|e| {
-                        matches!(e.kind, DependencyKind::ForeignKey { .. })
-                            && resolve(&e.referenced) == resolved_drop
-                            && resolve(&e.dependent) != resolved_drop
-                    });
-                    let has_partition_deps = self.local.graph.edges.iter().any(|e| {
-                        matches!(e.kind, DependencyKind::PartitionOf)
-                            && resolve(&e.referenced) == resolved_drop
-                    });
-
-                    if has_view_deps || has_fk_deps || has_partition_deps {
-                        return MutationResult::Conflict {
-                            reason: format!(
-                                "relation '{}' still has dependent objects; use CASCADE",
-                                drop_table.id
-                            ),
-                        };
-                    }
-
-                    self.snapshot_relation(&drop_table.id);
-                    self.local
-                        .relations
-                        .insert(drop_table.id.clone(), RelationOverlay::Dropped);
-
-                    self.snapshot_graph_full();
-                    self.local.graph.edges.retain(|e| {
-                        !(matches!(e.kind, DependencyKind::SequenceOwnedBy { .. })
-                            && resolve(&e.referenced) == resolved_drop)
-                    });
-                }
-
-                let owned_sequences_to_drop: Vec<ObjectId> = self
-                    .local
-                    .sequences
-                    .iter()
-                    .filter_map(|(id, overlay)| match overlay {
-                        SequenceOverlay::Present(sequence)
-                            if sequence.owned_by.as_ref().is_some_and(|(table, _)| {
-                                dropped_relations.contains(&resolve(table))
-                            }) =>
-                        {
-                            Some(id.clone())
-                        }
-                        _ => None,
-                    })
-                    .collect();
-                for sequence_id in owned_sequences_to_drop {
-                    self.snapshot_sequence(&sequence_id);
-                    self.local
-                        .sequences
-                        .insert(sequence_id, SequenceOverlay::Dropped);
-                }
-
-                let constraints_to_drop: Vec<(ObjectId, String)> = self
-                    .local
-                    .constraints
-                    .keys()
-                    .filter(|(table_id, _)| dropped_relations.contains(&resolve(table_id)))
-                    .cloned()
-                    .collect();
-                for (table_id, name) in constraints_to_drop {
-                    self.snapshot_constraint(&table_id, &name);
-                    self.local.constraints.remove(&(table_id, name));
-                }
-
-                let triggers_to_drop: Vec<ObjectId> = self
-                    .local
-                    .triggers
-                    .iter()
-                    .filter_map(|(id, overlay)| {
-                        let TriggerOverlay::Present(trigger) = overlay else {
-                            return None;
-                        };
-                        let graph_matches = self.local.graph.edges.iter().any(|edge| {
-                            matches!(edge.kind, DependencyKind::TriggerOnTable { .. })
-                                && edge.dependent == *id
-                                && dropped_relations.contains(&resolve(&edge.referenced))
-                        });
-                        (dropped_relations.contains(&resolve(&trigger.table_id)) || graph_matches)
-                            .then(|| id.clone())
-                    })
-                    .collect();
-                for trigger_id in triggers_to_drop {
-                    self.snapshot_trigger(&trigger_id);
-                    self.local
-                        .triggers
-                        .insert(trigger_id, TriggerOverlay::Dropped);
-                }
-
-                // PostgreSQL drops triggers only after the table drop succeeds.
-                self.snapshot_graph_full();
-                self.local.graph.edges.retain(|e| {
-                    !(matches!(e.kind, DependencyKind::TriggerOnTable { .. })
-                        && dropped_relations.contains(&resolve(&e.referenced)))
-                });
-
-                self.snapshot_graph_full();
-                self.local.graph.edges.retain(|e| {
-                    if let DependencyKind::PartitionOf = e.kind {
-                        resolve(&e.referenced) != resolved_drop
-                            && resolve(&e.dependent) != resolved_drop
-                    } else {
-                        true
-                    }
-                });
-
-                let publication_updates: Vec<(String, Vec<_>)> = self
-                    .local
-                    .publications
-                    .iter()
-                    .filter_map(|(name, overlay)| {
-                        let crate::model::replication::PublicationOverlay::Present(publication) =
-                            overlay
-                        else {
-                            return None;
-                        };
-                        let crate::analysis::facts::PublicationScope::Explicit(objects) =
-                            &publication.scope
-                        else {
-                            return None;
-                        };
-                        let retained = objects
-                            .iter()
-                            .filter(|object| {
-                                let crate::analysis::facts::PublicationObjectFact::Table {
-                                    name,
-                                    ..
-                                } = object
-                                else {
-                                    return true;
-                                };
-                                !dropped_relations
-                                    .contains(&resolve(&self.resolve_relation_id(name)))
-                            })
-                            .cloned()
-                            .collect::<Vec<_>>();
-                        (retained.len() != objects.len()).then(|| (name.clone(), retained))
-                    })
-                    .collect();
-                for (publication_name, retained) in publication_updates {
-                    self.snapshot_publication(&publication_name);
-                    if let Some(crate::model::replication::PublicationOverlay::Present(publication)) =
-                        self.local.publications.get_mut(&publication_name)
-                        && let crate::analysis::facts::PublicationScope::Explicit(objects) =
-                            &mut publication.scope
-                    {
-                        *objects = retained;
-                    }
-                }
-                self.snapshot_graph_full();
-                self.local.graph.edges.retain(|edge| {
-                    !matches!(edge.kind, DependencyKind::PublicationIncludes { .. })
-                        || !dropped_relations.contains(&resolve(&edge.dependent))
-                });
-
-                MutationResult::Applied
-            }
-            Mutation::CreateTable(create) => {
-                if create.if_not_exists && self.relation_namespace_is_taken(&create.id) {
-                    return MutationResult::Skipped;
-                }
-                if self.relation_namespace_is_taken(&create.id) {
-                    return MutationResult::Conflict {
-                        reason: format!("relation '{}' already exists", create.id),
-                    };
-                }
-
-                // PostgreSQL chooses all implicit sequence names before the
-                // table becomes visible. Reserve them up front so a collision
-                // or malformed statement cannot leave partial local state.
-                let mut reserved_sequences = HashSet::new();
-                let mut implicit_sequences = Vec::new();
-                for column in &create.columns {
-                    let kind = match column.generation {
-                        crate::analysis::facts::ColumnGeneration::Serial => {
-                            Some(SequenceKind::SerialLike)
-                        }
-                        crate::analysis::facts::ColumnGeneration::Identity => {
-                            Some(SequenceKind::Identity)
-                        }
-                        crate::analysis::facts::ColumnGeneration::Ordinary => None,
-                    };
-                    if let Some(kind) = kind {
-                        let sequence_id = self.next_implicit_sequence_id(
-                            &create.id,
-                            &column.name,
-                            &reserved_sequences,
-                        );
-                        reserved_sequences.insert(sequence_id.clone());
-                        implicit_sequences.push((sequence_id, column.name.clone(), kind));
-                    }
-                }
-
-                self.snapshot_relation(&create.id);
-
-                self.snapshot_generation_counter();
-                self.local.generation_counter += 1;
-                let generation = self.local.generation_counter;
-
-                let resolved_persistence = match create.persistence {
-                    PersistenceMutation::Permanent => {
-                        crate::model::relation::Persistence::Permanent
-                    }
-                    PersistenceMutation::Temporary => {
-                        crate::model::relation::Persistence::Temporary
-                    }
-                    PersistenceMutation::Unlogged => crate::model::relation::Persistence::Unlogged,
-                };
-
-                let mut rel_state = RelationState::new(
-                    create.id.clone(),
-                    ObjectId::new("", &self.local.current_role),
-                    generation,
-                    if create.as_select { None } else { Some(0) },
-                    RelationKind::Table,
-                    resolved_persistence,
-                    self.local.transactions.len(),
-                );
-
-                // Store partition strategy information
-                rel_state.partition_type = create
-                    .partition_by
-                    .as_ref()
-                    .and_then(|pb| pb.split_whitespace().nth(2).map(|s| s.to_uppercase()))
-                    .or_else(|| {
-                        create.partition_of.as_ref().and_then(|parent_id| {
-                            self.local.relations.get(parent_id).and_then(|r| {
-                                if let RelationOverlay::Present(rel) = r {
-                                    rel.partition_type.clone()
-                                } else {
-                                    None
-                                }
-                            })
-                        })
-                    });
-                rel_state.partition_by = create.partition_by.clone();
-
-                let pk_columns: HashSet<&str> = create
-                    .table_constraints
-                    .iter()
-                    .filter_map(|tc| {
-                        if let TableConstraintFact::PrimaryKey { columns, .. } = tc {
-                            Some(columns.iter().map(|s| s.as_str()))
-                        } else {
-                            None
-                        }
-                    })
-                    .flatten()
-                    .collect();
-
-                for col in &create.columns {
-                    let is_pk = col.is_primary_key || pk_columns.contains(col.name.as_str());
-                    rel_state.apply_column_action(&ColumnAction::Add {
-                        name: col.name.clone(),
-                        data_type: col.ty.clone(),
-                        not_null: col.not_null || is_pk,
-                        default: col.default.clone(),
-                    });
-                    if let Some(column) = rel_state
-                        .columns
-                        .iter_mut()
-                        .find(|column| column.name == col.name)
-                    {
-                        column.type_id = column
-                            .data_type
-                            .as_deref()
-                            .and_then(|raw| self.resolve_type_reference(raw));
-                    }
-                }
-
-                for (sequence_id, column_name, _) in &implicit_sequences {
-                    if let Some(column) = rel_state
-                        .columns
-                        .iter_mut()
-                        .find(|column| column.name == *column_name)
-                    {
-                        column.default = Some(Self::sequence_nextval_default(sequence_id));
-                        column.default_expr_text = Some(format!(
-                            "nextval('{}.{}'::regclass)",
-                            sequence_id.schema, sequence_id.name
-                        ));
-                        column.is_nullable = false;
-                    }
-                }
-
-                self.local
-                    .relations
-                    .insert(create.id.clone(), RelationOverlay::Present(rel_state));
-
-                for (sequence_id, column_name, kind) in implicit_sequences {
-                    self.snapshot_sequence(&sequence_id);
-                    self.snapshot_generation_counter();
-                    self.local.generation_counter += 1;
-                    self.local.sequences.insert(
-                        sequence_id.clone(),
-                        SequenceOverlay::Present(SequenceState {
-                            id: sequence_id.clone(),
-                            owner: ObjectId::new("", &self.local.current_role),
-                            owned_by: Some((create.id.clone(), column_name.clone())),
-                            kind,
-                            generation: self.local.generation_counter,
-                        }),
-                    );
-                    self.snapshot_graph();
-                    self.local.graph.edges.push(DependencyEdge::new(
-                        sequence_id,
-                        create.id.clone(),
-                        DependencyKind::SequenceOwnedBy {
-                            column: column_name,
-                        },
-                    ));
-                }
-
-                let primary_key_name = create
-                    .columns
-                    .iter()
-                    .find(|column| column.is_primary_key)
-                    .map(|column| column.primary_key_constraint_name.clone())
-                    .or_else(|| {
-                        create.table_constraints.iter().find_map(|constraint| {
-                            if let TableConstraintFact::PrimaryKey {
-                                constraint_name, ..
-                            } = constraint
-                            {
-                                Some(constraint_name.clone())
-                            } else {
-                                None
-                            }
-                        })
-                    });
-                if let Some(explicit_name) = primary_key_name {
-                    let name = explicit_name.unwrap_or_else(|| {
-                        self.next_generated_constraint_name(
-                            &create.id,
-                            &create.id.name,
-                            None,
-                            "pkey",
-                        )
-                    });
-                    self.snapshot_constraint(&create.id, &name);
-                    self.local.constraints.insert(
-                        (create.id.clone(), name.clone()),
-                        ConstraintState {
-                            table_id: create.id.clone(),
-                            name,
-                            kind: ConstraintKind::PrimaryKey,
-                            validated: true,
-                        },
-                    );
-                }
-
-                let unique_constraints = create
-                    .columns
-                    .iter()
-                    .filter(|column| column.is_unique)
-                    .map(|column| {
-                        (
-                            column.unique_constraint_name.as_ref(),
-                            vec![column.name.as_str()],
-                        )
-                    })
-                    .chain(create.table_constraints.iter().filter_map(|constraint| {
-                        if let TableConstraintFact::Unique {
-                            constraint_name,
-                            columns,
-                        } = constraint
-                        {
-                            Some((
-                                constraint_name.as_ref(),
-                                columns.iter().map(String::as_str).collect(),
-                            ))
-                        } else {
-                            None
-                        }
-                    }))
-                    .collect::<Vec<_>>();
-                for (explicit_name, columns) in unique_constraints {
-                    let name = explicit_name.cloned().unwrap_or_else(|| {
-                        self.next_generated_constraint_name(
-                            &create.id,
-                            &create.id.name,
-                            Some(&columns.join("_")),
-                            "key",
-                        )
-                    });
-                    self.snapshot_constraint(&create.id, &name);
-                    self.local.constraints.insert(
-                        (create.id.clone(), name.clone()),
-                        ConstraintState {
-                            table_id: create.id.clone(),
-                            name,
-                            kind: ConstraintKind::Unique,
-                            validated: true,
-                        },
-                    );
-                }
-
-                if let Some(parent_id) = &create.partition_of {
-                    self.snapshot_graph();
-                    self.local.graph.edges.push(DependencyEdge::new(
-                        create.id.clone(),
-                        parent_id.clone(),
-                        DependencyKind::PartitionOf,
-                    ));
-                }
-
-                if !create.foreign_keys.is_empty() {
-                    self.snapshot_graph();
-                }
-
-                for fk in &create.foreign_keys {
-                    self.local.graph.edges.push(DependencyEdge::new(
-                        create.id.clone(),
-                        fk.to_table.clone(),
-                        DependencyKind::ForeignKey {
-                            constraint_name: fk.constraint_name.clone(),
-                            from_columns: fk.from_columns.clone(),
-                            to_columns: fk.to_columns.clone(),
-                            from_generation: generation,
-                        },
-                    ));
-                }
-                MutationResult::Applied
-            }
-            Mutation::CreateView(create_view) => {
-                if self.relation_namespace_is_taken(&create_view.id) {
-                    let is_replaceable_view = matches!(
-                        self.local.relations.get(&create_view.id),
-                        Some(RelationOverlay::Present(relation))
-                            if relation.kind == RelationKind::View
-                    );
-                    if !create_view.or_replace || !is_replaceable_view {
-                        return MutationResult::Conflict {
-                            reason: format!("relation '{}' already exists", create_view.id),
-                        };
-                    }
-                }
-                self.snapshot_relation(&create_view.id);
-                self.snapshot_generation_counter();
-                self.local.generation_counter += 1;
-                let generation = self.local.generation_counter;
-
-                self.local.relations.insert(
-                    create_view.id.clone(),
-                    RelationOverlay::Present(RelationState::new(
-                        create_view.id.clone(),
-                        ObjectId::new("", &self.local.current_role),
-                        generation,
-                        None,
-                        RelationKind::View,
-                        Persistence::Permanent,
-                        self.local.transactions.len(),
-                    )),
-                );
-
-                self.snapshot_graph();
-                for dep in &create_view.depends_on {
-                    self.local.graph.edges.push(DependencyEdge::new(
-                        create_view.id.clone(),
-                        dep.clone(),
-                        DependencyKind::ViewDependency {
-                            view_generation: generation,
-                        },
-                    ));
-                }
-                MutationResult::Applied
-            }
-            Mutation::CreateMaterializedView(create_mv) => {
-                if self.relation_namespace_is_taken(&create_mv.id) {
-                    return MutationResult::Conflict {
-                        reason: format!("relation '{}' already exists", create_mv.id),
-                    };
-                }
-                self.snapshot_relation(&create_mv.id);
-                self.snapshot_generation_counter();
-                self.local.generation_counter += 1;
-                let generation = self.local.generation_counter;
-
-                self.local.relations.insert(
-                    create_mv.id.clone(),
-                    RelationOverlay::Present(RelationState::new(
-                        create_mv.id.clone(),
-                        ObjectId::new("", &self.local.current_role),
-                        generation,
-                        None,
-                        RelationKind::MaterializedView,
-                        Persistence::Permanent,
-                        self.local.transactions.len(),
-                    )),
-                );
-
-                self.snapshot_graph();
-                for dep in &create_mv.depends_on {
-                    self.local.graph.edges.push(DependencyEdge::new(
-                        create_mv.id.clone(),
-                        dep.clone(),
-                        DependencyKind::ViewDependency {
-                            view_generation: generation,
-                        },
-                    ));
-                }
-                MutationResult::Applied
-            }
+            Mutation::DropTable(drop) => self.apply_drop_table(drop, precomputed_cascade),
+            Mutation::CreateTable(create) => self.apply_create_table(create),
+            Mutation::CreateView(create) => self.apply_create_view(create),
+            Mutation::CreateMaterializedView(create) => self.apply_create_materialized_view(create),
             Mutation::RefreshMaterializedView(refresh) => {
                 self.apply_refresh_materialized_view(refresh)
             }
-            Mutation::CreateIndex(create_idx) => {
-                let exists = self.index_is_present(&create_idx.id);
-                if create_idx.if_not_exists && exists {
-                    return MutationResult::Skipped;
-                }
-                if self.relation_namespace_is_taken(&create_idx.id) {
-                    return MutationResult::Conflict {
-                        reason: format!("relation '{}' already exists", create_idx.id),
-                    };
-                }
-                self.snapshot_graph();
-                self.local.graph.edges.push(DependencyEdge::new(
-                    create_idx.id.clone(),
-                    create_idx.table.clone(),
-                    DependencyKind::IndexOnRelation {
-                        using_method: create_idx.using_method.clone(),
-                        has_predicate: create_idx.has_predicate,
-                        is_concurrent: create_idx.concurrently,
-                        is_unique: create_idx.unique,
-                        eligibility_known: true,
-                    },
-                ));
-                MutationResult::Applied
-            }
+            Mutation::CreateIndex(create) => self.apply_create_index(create),
             Mutation::CreatePolicy(create_policy) => self.apply_create_policy(create_policy),
             Mutation::DropPolicy(drop_policy) => self.apply_drop_policy(drop_policy),
             Mutation::CreateTrigger(create_trigger) => self.apply_create_trigger(create_trigger),
             Mutation::DropTrigger(drop_trigger) => self.apply_drop_trigger(drop_trigger),
             Mutation::RenameTrigger(rename_trigger) => self.apply_rename_trigger(rename_trigger),
-            Mutation::AlterTable(alter) => {
-                if let AlterTableActionMutation::OwnerTo { new_owner } = &alter.action {
-                    let Some((owner, known)) = self.role_fact_identity(new_owner) else {
-                        self.snapshot_confidence();
-                        self.local.confidence = Confidence::Tainted;
-                        return MutationResult::Skipped;
-                    };
-                    if !known {
-                        self.snapshot_confidence();
-                        self.local.confidence = Confidence::Tainted;
-                    }
-                    self.snapshot_relation(&alter.id);
-                    return match self.local.relations.get_mut(&alter.id) {
-                        Some(RelationOverlay::Present(relation)) => {
-                            relation.owner = ObjectId::new("", owner);
-                            MutationResult::Applied
-                        }
-                        _ => MutationResult::Conflict {
-                            reason: format!("relation '{}' does not exist", alter.id),
-                        },
-                    };
-                }
-
-                let trigger_mode = match &alter.action {
-                    AlterTableActionMutation::DisableTrigger { trigger_name } => Some((
-                        trigger_name.as_deref(),
-                        crate::model::trigger::TriggerEnableMode::Disabled,
-                    )),
-                    AlterTableActionMutation::EnableTrigger { trigger_name } => Some((
-                        trigger_name.as_deref(),
-                        crate::model::trigger::TriggerEnableMode::Origin,
-                    )),
-                    _ => None,
-                };
-                if let Some((trigger_name, enabled_mode)) = trigger_mode {
-                    let all = trigger_name.is_none_or(|name| name.eq_ignore_ascii_case("all"));
-                    let trigger_ids: Vec<ObjectId> = self
-                        .local
-                        .triggers
-                        .iter()
-                        .filter_map(|(id, overlay)| {
-                            let TriggerOverlay::Present(trigger) = overlay else {
-                                return None;
-                            };
-                            (trigger.table_id == alter.id
-                                && (all || trigger_name == Some(trigger.name.as_str())))
-                            .then(|| id.clone())
-                        })
-                        .collect();
-                    for trigger_id in trigger_ids {
-                        self.snapshot_trigger(&trigger_id);
-                        if let Some(TriggerOverlay::Present(trigger)) =
-                            self.local.triggers.get_mut(&trigger_id)
-                        {
-                            trigger.enabled_mode = enabled_mode;
-                        }
-                    }
-                    return MutationResult::Applied;
-                }
-
-                if let AlterTableActionMutation::AddForeignKey {
-                    to_table,
-                    from_columns,
-                    to_columns,
-                    ..
-                } = &alter.action
-                {
-                    if let Some(RelationOverlay::Present(child)) =
-                        self.local.relations.get(&alter.id)
-                        && let Some(column) =
-                            from_columns.iter().find(|column| !child.has_column(column))
-                    {
-                        return MutationResult::Conflict {
-                            reason: format!(
-                                "foreign key column '{}' does not exist on relation '{}'",
-                                column, alter.id
-                            ),
-                        };
-                    }
-
-                    let Some(RelationOverlay::Present(parent)) = self.local.relations.get(to_table)
-                    else {
-                        return MutationResult::Conflict {
-                            reason: format!(
-                                "foreign key references relation '{}' which does not exist",
-                                to_table
-                            ),
-                        };
-                    };
-                    if let Some(column) =
-                        to_columns.iter().find(|column| !parent.has_column(column))
-                    {
-                        return MutationResult::Conflict {
-                            reason: format!(
-                                "foreign key references column '{}.{}' which does not exist",
-                                to_table, column
-                            ),
-                        };
-                    }
-                }
-
-                let implicit_add = match &alter.action {
-                    AlterTableActionMutation::AddColumn {
-                        name, generation, ..
-                    } => match generation {
-                        crate::analysis::facts::ColumnGeneration::Serial => Some((
-                            self.next_implicit_sequence_id(&alter.id, name, &HashSet::new()),
-                            name.clone(),
-                            SequenceKind::SerialLike,
-                        )),
-                        crate::analysis::facts::ColumnGeneration::Identity => Some((
-                            self.next_implicit_sequence_id(&alter.id, name, &HashSet::new()),
-                            name.clone(),
-                            SequenceKind::Identity,
-                        )),
-                        crate::analysis::facts::ColumnGeneration::Ordinary => None,
-                    },
-                    _ => None,
-                };
-                let owned_sequences_for_column: Vec<ObjectId> = match &alter.action {
-                    AlterTableActionMutation::DropColumn { name, .. }
-                    | AlterTableActionMutation::RenameColumn { from: name, .. } => self
-                        .local
-                        .sequences
-                        .iter()
-                        .filter_map(|(id, overlay)| match overlay {
-                            SequenceOverlay::Present(sequence)
-                                if sequence.owned_by.as_ref()
-                                    == Some(&(alter.id.clone(), name.clone())) =>
-                            {
-                                Some(id.clone())
-                            }
-                            _ => None,
-                        })
-                        .collect(),
-                    _ => Vec::new(),
-                };
-
-                let using_index = match &alter.action {
-                    AlterTableActionMutation::AddUniqueConstraint { using_index, .. }
-                    | AlterTableActionMutation::AddPrimaryKeyConstraint { using_index, .. } => {
-                        using_index.as_ref()
-                    }
-                    _ => None,
-                };
-                if let Some(index) = using_index {
-                    let Some(edge) = self.local.graph.edges.iter().find(|edge| {
-                        matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
-                            && edge.dependent == *index
-                    }) else {
-                        return MutationResult::Conflict {
-                            reason: format!(
-                                "constraint references index '{}' which does not exist",
-                                index
-                            ),
-                        };
-                    };
-                    if edge.referenced != alter.id {
-                        return MutationResult::Conflict {
-                            reason: format!(
-                                "constraint index '{}' belongs to relation '{}', not '{}'",
-                                index, edge.referenced, alter.id
-                            ),
-                        };
-                    }
-                    if let DependencyKind::IndexOnRelation {
-                        has_predicate,
-                        is_unique,
-                        eligibility_known,
-                        ..
-                    } = &edge.kind
-                        && *eligibility_known
-                        && (!is_unique || *has_predicate)
-                    {
-                        return MutationResult::Conflict {
-                            reason: format!(
-                                "constraint index '{}' must be unique and non-partial",
-                                index
-                            ),
-                        };
-                    }
-                }
-
-                self.snapshot_relation(&alter.id);
-                let action_type_id = match &alter.action {
-                    AlterTableActionMutation::AddColumn { ty, .. } => ty
-                        .as_deref()
-                        .and_then(|raw| self.resolve_type_reference(raw)),
-                    AlterTableActionMutation::SetType { ty, .. } => self.resolve_type_reference(ty),
-                    _ => None,
-                };
-                let rel_overlay = self.local.relations.get_mut(&alter.id);
-                if let Some(RelationOverlay::Present(rel)) = rel_overlay {
-                    let generation = rel.generation;
-                    match &alter.action {
-                        AlterTableActionMutation::AddColumn {
-                            name,
-                            ty,
-                            if_not_exists,
-                            not_null,
-                            default,
-                            depends_on,
-                            generation: _,
-                        } => {
-                            if let Some(existing_col) = rel.columns.iter().find(|c| c.name == *name)
-                            {
-                                if *if_not_exists {
-                                    return MutationResult::Skipped;
-                                }
-                                return MutationResult::Conflict {
-                                    reason: format!(
-                                        "column '{}' already exists with type {}; this statement adds it again with type {}",
-                                        name,
-                                        existing_col.data_type.as_deref().unwrap_or("unknown"),
-                                        ty.as_deref().unwrap_or("unknown")
-                                    ),
-                                };
-                            }
-                            rel.apply_column_action(&ColumnAction::Add {
-                                name: name.clone(),
-                                data_type: ty.clone(),
-                                not_null: *not_null,
-                                default: default.clone(),
-                            });
-                            if let Some(column) =
-                                rel.columns.iter_mut().find(|column| column.name == *name)
-                            {
-                                column.type_id = action_type_id.clone();
-                            }
-
-                            if let Some((sequence_id, column_name, _)) = &implicit_add
-                                && column_name == name
-                                && let Some(column) =
-                                    rel.columns.iter_mut().find(|column| column.name == *name)
-                            {
-                                column.default = Some(Self::sequence_nextval_default(sequence_id));
-                                column.default_expr_text = Some(format!(
-                                    "nextval('{}.{}'::regclass)",
-                                    sequence_id.schema, sequence_id.name
-                                ));
-                                column.is_nullable = false;
-                            }
-
-                            if let Some((source_table, source_col)) = depends_on {
-                                self.snapshot_graph();
-                                self.local.graph.edges.push(DependencyEdge::new(
-                                    alter.id.clone(),
-                                    source_table.clone(),
-                                    DependencyKind::ColumnGeneratedFrom {
-                                        column: name.clone(),
-                                        depends_on_column: source_col.clone(),
-                                    },
-                                ));
-                            }
-                        }
-                        AlterTableActionMutation::DropColumn { name, if_exists } => {
-                            if !rel.has_column(name) {
-                                if *if_exists {
-                                    // Column doesn't exist and IF EXISTS was specified: no-op
-                                    return MutationResult::Skipped;
-                                }
-                                return MutationResult::Conflict {
-                                    reason: format!(
-                                        "column '{}' does not exist on relation '{}'",
-                                        name, alter.id
-                                    ),
-                                };
-                            }
-                            rel.apply_column_action(&ColumnAction::Drop { name: name.clone() });
-                        }
-                        AlterTableActionMutation::RenameColumn { from, to } => {
-                            rel.apply_column_action(&ColumnAction::Rename {
-                                from: from.clone(),
-                                to: to.clone(),
-                            });
-                        }
-                        AlterTableActionMutation::SetNotNull { column } => {
-                            rel.apply_column_action(&ColumnAction::SetNotNull {
-                                name: column.clone(),
-                            });
-                        }
-                        AlterTableActionMutation::DropNotNull { column } => {
-                            rel.apply_column_action(&ColumnAction::DropNotNull {
-                                name: column.clone(),
-                            });
-                        }
-                        AlterTableActionMutation::SetType { column, ty, .. } => {
-                            if !rel.has_column(column) {
-                                self.local.confidence = Confidence::Tainted;
-                            }
-                            rel.apply_column_action(&ColumnAction::SetType {
-                                name: column.clone(),
-                                data_type: ty.clone(),
-                            });
-                            if let Some(column) =
-                                rel.columns.iter_mut().find(|entry| entry.name == *column)
-                            {
-                                column.type_id = action_type_id.clone();
-                            }
-                        }
-                        AlterTableActionMutation::SetDefault { column, default } => {
-                            if !rel.has_column(column) {
-                                self.local.confidence = Confidence::Tainted;
-                            }
-                            rel.apply_column_action(&ColumnAction::SetDefault {
-                                name: column.clone(),
-                                default: default.clone(),
-                            });
-                        }
-                        AlterTableActionMutation::AddForeignKey {
-                            constraint_name,
-                            to_table,
-                            from_columns,
-                            to_columns,
-                            not_valid,
-                        } => {
-                            let constraint_name = constraint_name.clone().unwrap_or_else(|| {
-                                format!("{}_{}_fkey", alter.id.name, from_columns.join("_"))
-                            });
-                            self.snapshot_constraint(&alter.id, &constraint_name);
-                            self.local.constraints.insert(
-                                (alter.id.clone(), constraint_name.clone()),
-                                ConstraintState {
-                                    table_id: alter.id.clone(),
-                                    name: constraint_name.clone(),
-                                    kind: ConstraintKind::ForeignKey,
-                                    validated: !not_valid,
-                                },
-                            );
-                            self.snapshot_graph();
-                            self.local.graph.edges.push(DependencyEdge::new(
-                                alter.id.clone(),
-                                to_table.clone(),
-                                DependencyKind::ForeignKey {
-                                    constraint_name: Some(constraint_name),
-                                    from_columns: from_columns.clone(),
-                                    to_columns: to_columns.clone(),
-                                    from_generation: generation,
-                                },
-                            ));
-                        }
-                        AlterTableActionMutation::DropConstraint { name } => {
-                            self.snapshot_constraint(&alter.id, name);
-                            self.local
-                                .constraints
-                                .remove(&(alter.id.clone(), name.clone()));
-                            self.snapshot_graph();
-                            self.local.graph.edges.retain(|e| {
-                                if let DependencyKind::ForeignKey {
-                                    constraint_name, ..
-                                } = &e.kind
-                                {
-                                    !(e.dependent == alter.id
-                                        && constraint_name.as_ref() == Some(name))
-                                } else {
-                                    true
-                                }
-                            });
-                        }
-                        AlterTableActionMutation::RenameConstraint { old_name, new_name } => {
-                            self.snapshot_constraint(&alter.id, old_name);
-                            self.snapshot_constraint(&alter.id, new_name);
-                            if let Some(mut constraint) = self
-                                .local
-                                .constraints
-                                .remove(&(alter.id.clone(), old_name.clone()))
-                            {
-                                constraint.name = new_name.clone();
-                                self.local
-                                    .constraints
-                                    .insert((alter.id.clone(), new_name.clone()), constraint);
-                            }
-                            self.snapshot_graph_full();
-                            for edge in &mut self.local.graph.edges {
-                                if edge.dependent == alter.id
-                                    && let DependencyKind::ForeignKey {
-                                        constraint_name, ..
-                                    } = &mut edge.kind
-                                    && constraint_name.as_deref() == Some(old_name)
-                                {
-                                    *constraint_name = Some(new_name.clone());
-                                }
-                            }
-                        }
-                        AlterTableActionMutation::AddCheckConstraint {
-                            constraint_name,
-                            not_valid,
-                        } => {
-                            let constraint_name = constraint_name
-                                .clone()
-                                .unwrap_or_else(|| format!("{}_check", alter.id.name));
-                            self.snapshot_constraint(&alter.id, &constraint_name);
-                            self.local.constraints.insert(
-                                (alter.id.clone(), constraint_name.clone()),
-                                ConstraintState {
-                                    table_id: alter.id.clone(),
-                                    name: constraint_name,
-                                    kind: ConstraintKind::Check,
-                                    validated: !not_valid,
-                                },
-                            );
-                        }
-                        AlterTableActionMutation::AddUniqueConstraint {
-                            constraint_name,
-                            using_index,
-                        } => {
-                            let constraint_name = constraint_name
-                                .clone()
-                                .or_else(|| using_index.as_ref().map(|index| index.name.clone()))
-                                .unwrap_or_else(|| format!("{}_key", alter.id.name));
-                            self.snapshot_constraint(&alter.id, &constraint_name);
-                            self.local.constraints.insert(
-                                (alter.id.clone(), constraint_name.clone()),
-                                ConstraintState {
-                                    table_id: alter.id.clone(),
-                                    name: constraint_name,
-                                    kind: ConstraintKind::Unique,
-                                    validated: true,
-                                },
-                            );
-                        }
-                        AlterTableActionMutation::AddPrimaryKeyConstraint {
-                            constraint_name,
-                            using_index,
-                        } => {
-                            let constraint_name = constraint_name
-                                .clone()
-                                .or_else(|| using_index.as_ref().map(|index| index.name.clone()))
-                                .unwrap_or_else(|| format!("{}_pkey", alter.id.name));
-                            self.snapshot_constraint(&alter.id, &constraint_name);
-                            self.local.constraints.insert(
-                                (alter.id.clone(), constraint_name.clone()),
-                                ConstraintState {
-                                    table_id: alter.id.clone(),
-                                    name: constraint_name,
-                                    kind: ConstraintKind::PrimaryKey,
-                                    validated: true,
-                                },
-                            );
-                        }
-                        AlterTableActionMutation::AddExcludeConstraint { constraint_name } => {
-                            let constraint_name = constraint_name
-                                .clone()
-                                .unwrap_or_else(|| format!("{}_excl", alter.id.name));
-                            self.snapshot_constraint(&alter.id, &constraint_name);
-                            self.local.constraints.insert(
-                                (alter.id.clone(), constraint_name.clone()),
-                                ConstraintState {
-                                    table_id: alter.id.clone(),
-                                    name: constraint_name,
-                                    kind: ConstraintKind::Exclusion,
-                                    validated: true,
-                                },
-                            );
-                        }
-                        AlterTableActionMutation::ValidateConstraint { constraint_name } => {
-                            self.snapshot_constraint(&alter.id, constraint_name);
-                            if let Some(constraint) = self
-                                .local
-                                .constraints
-                                .get_mut(&(alter.id.clone(), constraint_name.clone()))
-                            {
-                                constraint.validated = true;
-                            }
-                        }
-                        AlterTableActionMutation::AttachPartition { child, .. } => {
-                            // Reject attachments that would make partition ancestry cyclic.
-                            if self.local.graph.check_partition_cycle(&alter.id, child) {
-                                self.snapshot_confidence();
-                                self.local.confidence = Confidence::Tainted;
-                            } else {
-                                self.snapshot_graph();
-                                self.local.graph.edges.push(DependencyEdge::new(
-                                    child.clone(),
-                                    alter.id.clone(),
-                                    DependencyKind::PartitionOf,
-                                ));
-                            }
-                        }
-                        AlterTableActionMutation::DetachPartition { child } => {
-                            self.snapshot_graph();
-                            self.local.graph.edges.retain(|e| {
-                                !(matches!(e.kind, DependencyKind::PartitionOf)
-                                    && e.dependent == *child
-                                    && e.referenced == alter.id)
-                            });
-                        }
-                        _ => {}
-                    }
-                }
-                if let Some((sequence_id, column_name, kind)) = implicit_add {
-                    self.snapshot_sequence(&sequence_id);
-                    self.snapshot_generation_counter();
-                    self.local.generation_counter += 1;
-                    self.local.sequences.insert(
-                        sequence_id.clone(),
-                        SequenceOverlay::Present(SequenceState {
-                            id: sequence_id.clone(),
-                            owner: self
-                                .local
-                                .relations
-                                .get(&alter.id)
-                                .and_then(|overlay| match overlay {
-                                    RelationOverlay::Present(table) => Some(table.owner.clone()),
-                                    RelationOverlay::Dropped => None,
-                                })
-                                .unwrap_or_else(|| ObjectId::new("", &self.local.current_role)),
-                            owned_by: Some((alter.id.clone(), column_name.clone())),
-                            kind,
-                            generation: self.local.generation_counter,
-                        }),
-                    );
-                    self.snapshot_graph();
-                    self.local.graph.edges.push(DependencyEdge::new(
-                        sequence_id,
-                        alter.id.clone(),
-                        DependencyKind::SequenceOwnedBy {
-                            column: column_name,
-                        },
-                    ));
-                }
-                match &alter.action {
-                    AlterTableActionMutation::DropColumn { .. } => {
-                        for sequence_id in owned_sequences_for_column {
-                            self.snapshot_sequence(&sequence_id);
-                            self.local
-                                .sequences
-                                .insert(sequence_id.clone(), SequenceOverlay::Dropped);
-                            self.snapshot_graph_full();
-                            self.local.graph.edges.retain(|edge| {
-                                !(matches!(edge.kind, DependencyKind::SequenceOwnedBy { .. })
-                                    && edge.dependent == sequence_id)
-                            });
-                        }
-                    }
-                    AlterTableActionMutation::RenameColumn { to, .. } => {
-                        for sequence_id in owned_sequences_for_column {
-                            self.snapshot_sequence(&sequence_id);
-                            if let Some(SequenceOverlay::Present(sequence)) =
-                                self.local.sequences.get_mut(&sequence_id)
-                                && let Some((_, column)) = &mut sequence.owned_by
-                            {
-                                *column = to.clone();
-                            }
-                            self.snapshot_graph_full();
-                            for edge in &mut self.local.graph.edges {
-                                if edge.dependent == sequence_id
-                                    && let DependencyKind::SequenceOwnedBy { column } =
-                                        &mut edge.kind
-                                {
-                                    *column = to.clone();
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-                MutationResult::Applied
-            }
-            Mutation::CreateType(create_type) => {
-                if self.relation_namespace_is_taken(&create_type.id) {
-                    return MutationResult::Conflict {
-                        reason: format!("type '{}' already exists", create_type.id),
-                    };
-                }
-                self.snapshot_type(&create_type.id);
-                self.snapshot_generation_counter();
-                self.local.generation_counter += 1;
-                let generation = self.local.generation_counter;
-
-                self.local.types.insert(
-                    create_type.id.clone(),
-                    TypeOverlay::Present(TypeState {
-                        id: create_type.id.clone(),
-                        generation,
-                        kind: create_type.kind.clone(),
-                    }),
-                );
-                MutationResult::Applied
-            }
-            Mutation::RenameType(rename) => {
-                if !self.type_is_present(&rename.old_id) {
-                    if self.baseline_covers_object(&rename.old_id) {
-                        return MutationResult::Conflict {
-                            reason: format!("type '{}' does not exist", rename.old_id),
-                        };
-                    }
-                    self.snapshot_confidence();
-                    self.local.confidence = Confidence::Tainted;
-                    return MutationResult::Skipped;
-                }
-                if rename.old_id != rename.new_id
-                    && self.relation_namespace_is_taken(&rename.new_id)
-                {
-                    return MutationResult::Conflict {
-                        reason: format!("type '{}' already exists", rename.new_id),
-                    };
-                }
-                if rename.old_id.schema != rename.new_id.schema
-                    && !self.schema_is_present(&rename.new_id.schema)
-                {
-                    if self.schema_absence_is_authoritative(&rename.new_id.schema) {
-                        return MutationResult::Conflict {
-                            reason: format!("schema '{}' does not exist", rename.new_id.schema),
-                        };
-                    }
-                    self.snapshot_confidence();
-                    self.local.confidence = Confidence::Tainted;
-                    return MutationResult::Skipped;
-                }
-
-                let mut remapped_functions = Vec::new();
-                for (function_id, overlay) in &self.local.functions {
-                    let crate::model::function::FunctionOverlay::Present(function) = overlay else {
-                        continue;
-                    };
-                    let new_arg_types = function
-                        .arg_types
-                        .iter()
-                        .enumerate()
-                        .map(|(index, raw)| {
-                            if function.arg_type_ids.get(index)
-                                == Some(&Some(rename.old_id.clone()))
-                            {
-                                Self::remapped_type_display(
-                                    raw,
-                                    &rename.new_id,
-                                    rename.old_id.schema != rename.new_id.schema,
-                                )
-                            } else {
-                                raw.clone()
-                            }
-                        })
-                        .collect::<Vec<_>>();
-                    let new_return_type = if function.return_type_id == Some(rename.old_id.clone())
-                    {
-                        Self::remapped_type_display(
-                            &function.return_type,
-                            &rename.new_id,
-                            rename.old_id.schema != rename.new_id.schema,
-                        )
-                    } else {
-                        function.return_type.clone()
-                    };
-                    let base_name = function_id
-                        .name
-                        .split_once('(')
-                        .map(|(name, _)| name)
-                        .unwrap_or(&function_id.name);
-                    let mut new_function_id = ObjectId::new(
-                        &function_id.schema,
-                        format!("{}({})", base_name, new_arg_types.join(",")),
-                    );
-                    new_function_id.inferred_schema = function_id.inferred_schema;
-                    if new_function_id != *function_id
-                        || new_arg_types != function.arg_types
-                        || new_return_type != function.return_type
-                    {
-                        remapped_functions.push((
-                            function_id.clone(),
-                            new_function_id,
-                            new_arg_types,
-                            new_return_type,
-                        ));
-                    }
-                }
-                let moved_function_ids = remapped_functions
-                    .iter()
-                    .map(|(old_id, _, _, _)| old_id)
-                    .collect::<HashSet<_>>();
-                let mut destinations = HashSet::new();
-                for (_, new_id, _, _) in &remapped_functions {
-                    if !destinations.insert(new_id)
-                        || (self.local.functions.contains_key(new_id)
-                            && !moved_function_ids.contains(new_id))
-                    {
-                        return MutationResult::Conflict {
-                            reason: format!(
-                                "routine '{}' already exists after renaming type '{}'",
-                                new_id, rename.old_id
-                            ),
-                        };
-                    }
-                }
-
-                self.snapshot_namespace();
-                if let Some(TypeOverlay::Present(mut state)) =
-                    self.local.types.remove(&rename.old_id)
-                {
-                    state.id = rename.new_id.clone();
-                    self.local
-                        .types
-                        .insert(rename.new_id.clone(), TypeOverlay::Present(state));
-                }
-                for overlay in self.local.relations.values_mut() {
-                    if let RelationOverlay::Present(relation) = overlay {
-                        for column in &mut relation.columns {
-                            if column.type_id == Some(rename.old_id.clone()) {
-                                column.data_type = Some(Self::remapped_type_display(
-                                    column.data_type.as_deref().unwrap_or_default(),
-                                    &rename.new_id,
-                                    rename.old_id.schema != rename.new_id.schema,
-                                ));
-                                column.type_id = Some(rename.new_id.clone());
-                            }
-                        }
-                    }
-                }
-                for overlay in self.local.types.values_mut() {
-                    if let TypeOverlay::Present(TypeState {
-                        kind:
-                            TypeKind::Domain {
-                                base_type,
-                                base_type_id,
-                            },
-                        ..
-                    }) = overlay
-                        && *base_type_id == Some(rename.old_id.clone())
-                    {
-                        *base_type = Self::remapped_type_display(
-                            base_type,
-                            &rename.new_id,
-                            rename.old_id.schema != rename.new_id.schema,
-                        );
-                        *base_type_id = Some(rename.new_id.clone());
-                    }
-                }
-                for (old_id, new_id, arg_types, return_type) in remapped_functions {
-                    if let Some(crate::model::function::FunctionOverlay::Present(mut function)) =
-                        self.local.functions.remove(&old_id)
-                    {
-                        function.id = new_id.clone();
-                        function.arg_types = arg_types;
-                        for type_id in &mut function.arg_type_ids {
-                            if *type_id == Some(rename.old_id.clone()) {
-                                *type_id = Some(rename.new_id.clone());
-                            }
-                        }
-                        function.return_type = return_type;
-                        if function.return_type_id == Some(rename.old_id.clone()) {
-                            function.return_type_id = Some(rename.new_id.clone());
-                        }
-                        self.local.functions.insert(
-                            new_id.clone(),
-                            crate::model::function::FunctionOverlay::Present(function),
-                        );
-                        if old_id != new_id {
-                            self.local.graph.propagate_rename(&old_id, &new_id);
-                            self.local.graph.edges.push(DependencyEdge::new(
-                                old_id,
-                                new_id,
-                                DependencyKind::RenameTo,
-                            ));
-                        }
-                    }
-                }
-                MutationResult::Applied
-            }
-            Mutation::AlterType(alter_type) => {
-                self.snapshot_type(&alter_type.id);
-                if let Some(TypeOverlay::Present(t)) = self.local.types.get_mut(&alter_type.id) {
-                    match &alter_type.action {
-                        AlterTypeActionMutation::AddValue {
-                            new_value,
-                            neighbor,
-                            before,
-                        } => {
-                            if let TypeKind::Enum { variants } = &mut t.kind {
-                                if variants.contains(new_value) {
-                                    return MutationResult::Skipped;
-                                }
-                                let insertion_index = neighbor
-                                    .as_ref()
-                                    .and_then(|neighbor| {
-                                        variants.iter().position(|value| value == neighbor)
-                                    })
-                                    .map(|index| if *before { index } else { index + 1 })
-                                    .unwrap_or(variants.len());
-                                variants.insert(insertion_index, new_value.clone());
-                            }
-                        }
-                        AlterTypeActionMutation::RenameValue {
-                            old_value,
-                            new_value,
-                        } => {
-                            let TypeKind::Enum { variants } = &mut t.kind else {
-                                return MutationResult::Conflict {
-                                    reason: format!("type '{}' is not an enum", alter_type.id),
-                                };
-                            };
-                            let Some(old_index) =
-                                variants.iter().position(|value| value == old_value)
-                            else {
-                                return MutationResult::Conflict {
-                                    reason: format!(
-                                        "'{}' is not an existing label of enum '{}'",
-                                        old_value, alter_type.id
-                                    ),
-                                };
-                            };
-                            if variants.iter().any(|value| value == new_value) {
-                                return MutationResult::Conflict {
-                                    reason: format!(
-                                        "enum label '{}' already exists on type '{}'",
-                                        new_value, alter_type.id
-                                    ),
-                                };
-                            }
-                            variants[old_index] = new_value.clone();
-                        }
-                    }
-                } else if matches!(
-                    alter_type.action,
-                    AlterTypeActionMutation::RenameValue { .. }
-                ) {
-                    return MutationResult::Conflict {
-                        reason: format!("type '{}' does not exist", alter_type.id),
-                    };
-                }
-                MutationResult::Applied
-            }
-            Mutation::CreateDomain(create_domain) => {
-                if self.relation_namespace_is_taken(&create_domain.id) {
-                    return MutationResult::Conflict {
-                        reason: format!("type '{}' already exists", create_domain.id),
-                    };
-                }
-                self.snapshot_type(&create_domain.id);
-                self.snapshot_generation_counter();
-                self.local.generation_counter += 1;
-                let generation = self.local.generation_counter;
-
-                self.local.types.insert(
-                    create_domain.id.clone(),
-                    TypeOverlay::Present(TypeState {
-                        id: create_domain.id.clone(),
-                        generation,
-                        kind: TypeKind::Domain {
-                            base_type: create_domain.base_type.clone(),
-                            base_type_id: self.resolve_type_reference(&create_domain.base_type),
-                        },
-                    }),
-                );
-                MutationResult::Applied
-            }
-            Mutation::AlterDomain(alter_domain) => self.apply_alter_domain(alter_domain),
-            Mutation::DropDomain(drop_domain) => {
-                for id in &drop_domain.ids {
-                    self.snapshot_type(id);
-                    self.local.types.insert(id.clone(), TypeOverlay::Dropped);
-                }
-                MutationResult::Applied
-            }
-            Mutation::DropType(drop_type) => {
-                for id in &drop_type.ids {
-                    self.snapshot_type(id);
-                    self.local.types.insert(id.clone(), TypeOverlay::Dropped);
-                }
-                MutationResult::Applied
-            }
-            Mutation::CreateSequence(create_seq) => {
-                if create_seq.if_not_exists && self.relation_namespace_is_taken(&create_seq.id) {
-                    return MutationResult::Skipped;
-                }
-                if self.relation_namespace_is_taken(&create_seq.id) {
-                    return MutationResult::Conflict {
-                        reason: format!("relation '{}' already exists", create_seq.id),
-                    };
-                }
-                if let Some((table_id, column)) = &create_seq.owned_by {
-                    if table_id.schema != create_seq.id.schema {
-                        return MutationResult::Conflict {
-                            reason: "sequence must be in the same schema as its owning table"
-                                .to_string(),
-                        };
-                    }
-                    match self.local.relations.get(table_id) {
-                        Some(RelationOverlay::Present(table)) => {
-                            if !table.has_column(column) {
-                                return MutationResult::Conflict {
-                                    reason: format!(
-                                        "column '{}.{}' does not exist",
-                                        table_id, column
-                                    ),
-                                };
-                            }
-                            if self.local.current_role_known
-                                && table.owner.name != self.local.current_role
-                            {
-                                return MutationResult::Conflict {
-                                    reason: "sequence and table must have the same owner"
-                                        .to_string(),
-                                };
-                            }
-                        }
-                        _ if self.baseline_covers_object(table_id) && self.baseline_available => {
-                            return MutationResult::Conflict {
-                                reason: format!("relation '{}' does not exist", table_id),
-                            };
-                        }
-                        _ => {
-                            self.snapshot_confidence();
-                            self.local.confidence = Confidence::Tainted;
-                        }
-                    }
-                }
-                self.snapshot_sequence(&create_seq.id);
-                self.snapshot_generation_counter();
-                self.local.generation_counter += 1;
-                let generation = self.local.generation_counter;
-
-                self.local.sequences.insert(
-                    create_seq.id.clone(),
-                    SequenceOverlay::Present(SequenceState {
-                        id: create_seq.id.clone(),
-                        owner: ObjectId::new("", self.local.current_role.clone()),
-                        owned_by: create_seq.owned_by.clone(),
-                        kind: if create_seq.owned_by.is_some() {
-                            SequenceKind::Owned
-                        } else {
-                            SequenceKind::Standalone
-                        },
-                        generation,
-                    }),
-                );
-
-                if let Some((table_id, col)) = &create_seq.owned_by {
-                    self.snapshot_graph();
-                    self.local.graph.edges.push(DependencyEdge::new(
-                        create_seq.id.clone(),
-                        table_id.clone(),
-                        DependencyKind::SequenceOwnedBy {
-                            column: col.clone(),
-                        },
-                    ));
-                }
-                MutationResult::Applied
-            }
-            Mutation::AlterSequence(alter_seq) => {
-                if !self.sequence_is_present(&alter_seq.id) {
-                    if alter_seq.if_exists {
-                        return MutationResult::Skipped;
-                    }
-                    if self.baseline_covers_object(&alter_seq.id) && self.baseline_available {
-                        return MutationResult::Conflict {
-                            reason: format!("sequence '{}' does not exist", alter_seq.id),
-                        };
-                    }
-                    self.snapshot_confidence();
-                    self.local.confidence = Confidence::Tainted;
-                    return MutationResult::Skipped;
-                }
-                let current = match self.local.sequences.get(&alter_seq.id) {
-                    Some(SequenceOverlay::Present(sequence)) => sequence.clone(),
-                    _ => unreachable!("presence checked above"),
-                };
-                match &alter_seq.action {
-                    crate::analysis::mutations::AlterSequenceActionMutation::OwnedBy(owned_by) => {
-                        if current.kind == SequenceKind::Identity {
-                            return MutationResult::Conflict {
-                                reason: "cannot change ownership of an identity sequence"
-                                    .to_string(),
-                            };
-                        }
-                        if let Some((table_id, column)) = owned_by {
-                            if table_id.schema != alter_seq.id.schema {
-                                return MutationResult::Conflict {
-                                    reason:
-                                        "sequence must be in the same schema as its owning table"
-                                            .to_string(),
-                                };
-                            }
-                            let Some(RelationOverlay::Present(table)) =
-                                self.local.relations.get(table_id)
-                            else {
-                                return MutationResult::Conflict {
-                                    reason: format!("relation '{}' does not exist", table_id),
-                                };
-                            };
-                            if !table.has_column(column) {
-                                return MutationResult::Conflict {
-                                    reason: format!(
-                                        "column '{}.{}' does not exist",
-                                        table_id, column
-                                    ),
-                                };
-                            }
-                            if table.owner != current.owner {
-                                return MutationResult::Conflict {
-                                    reason: "sequence and table must have the same owner"
-                                        .to_string(),
-                                };
-                            }
-                        }
-                        self.snapshot_sequence(&alter_seq.id);
-                        self.snapshot_graph();
-                        self.local.graph.edges.retain(|edge| {
-                            !(matches!(edge.kind, DependencyKind::SequenceOwnedBy { .. })
-                                && edge.dependent == alter_seq.id)
-                        });
-                        if let Some(SequenceOverlay::Present(sequence)) =
-                            self.local.sequences.get_mut(&alter_seq.id)
-                        {
-                            sequence.owned_by = owned_by.clone();
-                            sequence.kind = if owned_by.is_some() {
-                                SequenceKind::Owned
-                            } else {
-                                SequenceKind::Standalone
-                            };
-                        }
-                        if let Some((table_id, column)) = owned_by {
-                            self.local.graph.edges.push(DependencyEdge::new(
-                                alter_seq.id.clone(),
-                                table_id.clone(),
-                                DependencyKind::SequenceOwnedBy {
-                                    column: column.clone(),
-                                },
-                            ));
-                        }
-                        MutationResult::Applied
-                    }
-                    crate::analysis::mutations::AlterSequenceActionMutation::OwnerTo(owner) => {
-                        if current.kind == SequenceKind::Identity {
-                            return MutationResult::Conflict {
-                                reason: "cannot alter an identity sequence independently"
-                                    .to_string(),
-                            };
-                        }
-                        let Some((owner_name, known)) = self.role_fact_identity(owner) else {
-                            self.snapshot_confidence();
-                            self.local.confidence = Confidence::Tainted;
-                            return MutationResult::Skipped;
-                        };
-                        if known
-                            && self.local.roles_known
-                            && self.present_role(&owner_name).is_none()
-                        {
-                            return MutationResult::Conflict {
-                                reason: format!("role '{}' does not exist", owner_name),
-                            };
-                        }
-                        if let Some((table_id, _)) = &current.owned_by
-                            && let Some(RelationOverlay::Present(table)) =
-                                self.local.relations.get(table_id)
-                            && table.owner.name != owner_name
-                        {
-                            return MutationResult::Conflict {
-                                reason: "sequence and table must have the same owner".to_string(),
-                            };
-                        }
-                        self.snapshot_sequence(&alter_seq.id);
-                        if let Some(SequenceOverlay::Present(sequence)) =
-                            self.local.sequences.get_mut(&alter_seq.id)
-                        {
-                            sequence.owner = ObjectId::new("", owner_name);
-                        }
-                        MutationResult::Applied
-                    }
-                    crate::analysis::mutations::AlterSequenceActionMutation::RenameTo(new_id)
-                    | crate::analysis::mutations::AlterSequenceActionMutation::SetSchema(new_id) => {
-                        if current.kind == SequenceKind::Identity {
-                            return MutationResult::Conflict {
-                                reason: "cannot alter an identity sequence independently"
-                                    .to_string(),
-                            };
-                        }
-                        if self.relation_namespace_is_taken(new_id) {
-                            return MutationResult::Conflict {
-                                reason: format!("relation '{}' already exists", new_id),
-                            };
-                        }
-                        if let Some((table_id, _)) = &current.owned_by
-                            && table_id.schema != new_id.schema
-                        {
-                            return MutationResult::Conflict {
-                                reason: "sequence must be in the same schema as its owning table"
-                                    .to_string(),
-                            };
-                        }
-                        self.snapshot_namespace();
-                        let mut moved = current;
-                        moved.id = new_id.clone();
-                        self.local.sequences.remove(&alter_seq.id);
-                        self.local
-                            .sequences
-                            .insert(new_id.clone(), SequenceOverlay::Present(moved));
-                        self.local.graph.propagate_rename(&alter_seq.id, new_id);
-                        self.local.graph.edges.push(DependencyEdge::new(
-                            alter_seq.id.clone(),
-                            new_id.clone(),
-                            DependencyKind::RenameTo,
-                        ));
-                        if self.baseline_sequences.remove(&alter_seq.id) {
-                            self.baseline_sequences.insert(new_id.clone());
-                        }
-                        MutationResult::Applied
-                    }
-                    crate::analysis::mutations::AlterSequenceActionMutation::Other => {
-                        MutationResult::Applied
-                    }
-                }
-            }
-            Mutation::DropSequence(drop_seq) => {
-                if !drop_seq.if_exists {
-                    let missing: Vec<ObjectId> = drop_seq
-                        .ids
-                        .iter()
-                        .filter(|id| !self.sequence_is_present(id))
-                        .cloned()
-                        .collect();
-                    for id in &missing {
-                        if self.baseline_covers_object(id) && self.baseline_available {
-                            return MutationResult::Conflict {
-                                reason: format!("sequence '{}' does not exist", id),
-                            };
-                        }
-                        self.snapshot_confidence();
-                        self.local.confidence = Confidence::Tainted;
-                    }
-                }
-                let present: Vec<ObjectId> = drop_seq
-                    .ids
-                    .iter()
-                    .filter(|id| self.sequence_is_present(id))
-                    .cloned()
-                    .collect();
-                if present.is_empty() {
-                    return MutationResult::Skipped;
-                }
-                for id in &present {
-                    let Some(SequenceOverlay::Present(sequence)) = self.local.sequences.get(id)
-                    else {
-                        continue;
-                    };
-                    if sequence.kind == SequenceKind::Identity {
-                        return MutationResult::Conflict {
-                            reason: format!("cannot drop identity sequence '{}' independently", id),
-                        };
-                    }
-                    if sequence.kind == SequenceKind::SerialLike && !drop_seq.cascade {
-                        return MutationResult::Conflict {
-                            reason: format!("sequence '{}' still has dependent defaults", id),
-                        };
-                    }
-                }
-                if drop_seq.cascade {
-                    let serial_owners: Vec<(ObjectId, String)> = present
-                        .iter()
-                        .filter_map(|id| match self.local.sequences.get(id) {
-                            Some(SequenceOverlay::Present(sequence))
-                                if sequence.kind == SequenceKind::SerialLike =>
-                            {
-                                sequence.owned_by.clone()
-                            }
-                            _ => None,
-                        })
-                        .collect();
-                    for (table_id, column) in serial_owners {
-                        self.snapshot_relation(&table_id);
-                        if let Some(RelationOverlay::Present(table)) =
-                            self.local.relations.get_mut(&table_id)
-                            && let Some(column) =
-                                table.columns.iter_mut().find(|item| item.name == column)
-                        {
-                            column.default = None;
-                            column.default_expr_text = None;
-                        }
-                    }
-                }
-                for id in &present {
-                    self.snapshot_sequence(id);
-                    self.local
-                        .sequences
-                        .insert(id.clone(), SequenceOverlay::Dropped);
-                }
-                self.snapshot_graph_full();
-                self.local.graph.edges.retain(|e| {
-                    !(matches!(e.kind, DependencyKind::SequenceOwnedBy { .. })
-                        && present.contains(&e.dependent))
-                });
-                MutationResult::Applied
-            }
-            Mutation::Rename(rename) => {
-                let renames_relation = self.relation_is_present(&rename.old_id);
-                let renames_index = self.index_is_present(&rename.old_id);
-                if !renames_relation && !renames_index {
-                    if self.baseline_covers_object(&rename.old_id) {
-                        return MutationResult::Conflict {
-                            reason: format!("relation '{}' does not exist", rename.old_id),
-                        };
-                    }
-                    self.snapshot_confidence();
-                    self.local.confidence = Confidence::Tainted;
-                    return MutationResult::Skipped;
-                }
-                if rename.old_id != rename.new_id
-                    && self.relation_namespace_is_taken(&rename.new_id)
-                {
-                    return MutationResult::Conflict {
-                        reason: format!("relation '{}' already exists", rename.new_id),
-                    };
-                }
-                if rename.old_id.schema != rename.new_id.schema
-                    && !self.schema_is_present(&rename.new_id.schema)
-                {
-                    if self.schema_absence_is_authoritative(&rename.new_id.schema) {
-                        return MutationResult::Conflict {
-                            reason: format!("schema '{}' does not exist", rename.new_id.schema),
-                        };
-                    }
-                    self.snapshot_confidence();
-                    self.local.confidence = Confidence::Tainted;
-                    return MutationResult::Skipped;
-                }
-
-                self.snapshot_namespace();
-                if let Some(RelationOverlay::Present(mut state)) =
-                    self.local.relations.remove(&rename.old_id)
-                {
-                    state.id = rename.new_id.clone();
-                    self.local
-                        .relations
-                        .insert(rename.new_id.clone(), RelationOverlay::Present(state));
-                }
-                let owned_sequence_ids: Vec<ObjectId> = self
-                    .local
-                    .sequences
-                    .iter()
-                    .filter_map(|(id, overlay)| match overlay {
-                        SequenceOverlay::Present(sequence)
-                            if sequence
-                                .owned_by
-                                .as_ref()
-                                .is_some_and(|(table, _)| table == &rename.old_id) =>
-                        {
-                            Some(id.clone())
-                        }
-                        _ => None,
-                    })
-                    .collect();
-                for sequence_id in owned_sequence_ids {
-                    self.snapshot_sequence(&sequence_id);
-                    if let Some(SequenceOverlay::Present(sequence)) =
-                        self.local.sequences.get_mut(&sequence_id)
-                        && let Some((table, _)) = &mut sequence.owned_by
-                    {
-                        *table = rename.new_id.clone();
-                    }
-                }
-                let triggers_to_move: Vec<(ObjectId, crate::model::trigger::TriggerState)> = self
-                    .local
-                    .triggers
-                    .iter()
-                    .filter_map(|(id, overlay)| match overlay {
-                        TriggerOverlay::Present(trigger) if trigger.table_id == rename.old_id => {
-                            Some((id.clone(), trigger.clone()))
-                        }
-                        _ => None,
-                    })
-                    .collect();
-                for (old_trigger_id, mut trigger) in triggers_to_move {
-                    let new_trigger_id = Self::trigger_key(&rename.new_id, &trigger.name);
-                    self.local.triggers.remove(&old_trigger_id);
-                    trigger.id = new_trigger_id.clone();
-                    trigger.table_id = rename.new_id.clone();
-                    self.local
-                        .triggers
-                        .insert(new_trigger_id.clone(), TriggerOverlay::Present(trigger));
-                    self.local
-                        .graph
-                        .propagate_rename(&old_trigger_id, &new_trigger_id);
-                    self.local.graph.edges.push(DependencyEdge::new(
-                        old_trigger_id,
-                        new_trigger_id,
-                        DependencyKind::RenameTo,
-                    ));
-                }
-                let constraints_to_move: Vec<(String, ConstraintState)> = self
-                    .local
-                    .constraints
-                    .iter()
-                    .filter(|((table_id, _), _)| table_id == &rename.old_id)
-                    .map(|((_, name), constraint)| (name.clone(), constraint.clone()))
-                    .collect();
-                for (name, mut constraint) in constraints_to_move {
-                    self.snapshot_constraint(&rename.old_id, &name);
-                    self.snapshot_constraint(&rename.new_id, &name);
-                    self.local
-                        .constraints
-                        .remove(&(rename.old_id.clone(), name.clone()));
-                    constraint.table_id = rename.new_id.clone();
-                    self.local
-                        .constraints
-                        .insert((rename.new_id.clone(), name), constraint);
-                }
-                self.local.pending_validation = std::mem::take(&mut self.local.pending_validation)
-                    .into_iter()
-                    .map(|(table, name)| {
-                        if table == rename.old_id {
-                            (rename.new_id.clone(), name)
-                        } else {
-                            (table, name)
-                        }
-                    })
-                    .collect();
-                self.local.graph.edges.push(DependencyEdge::new(
-                    rename.old_id.clone(),
-                    rename.new_id.clone(),
-                    DependencyKind::RenameTo,
-                ));
-                self.local
-                    .graph
-                    .propagate_rename(&rename.old_id, &rename.new_id);
-
-                if renames_relation {
-                    if self.baseline_relations.remove(&rename.old_id) {
-                        self.baseline_relations.insert(rename.new_id.clone());
-                    }
-                    if self.baseline_fk_dependencies.remove(&rename.old_id) {
-                        self.baseline_fk_dependencies.insert(rename.new_id.clone());
-                    }
-                    self.baseline_foreign_keys = std::mem::take(&mut self.baseline_foreign_keys)
-                        .into_iter()
-                        .map(|(table, name)| {
-                            if table == rename.old_id {
-                                (rename.new_id.clone(), name)
-                            } else {
-                                (table, name)
-                            }
-                        })
-                        .collect();
-                }
-                if renames_index && self.baseline_indexes.remove(&rename.old_id) {
-                    self.baseline_indexes.insert(rename.new_id.clone());
-                }
-
-                MutationResult::Applied
-            }
-            Mutation::DropView(drop_view) => {
-                let mut present = Vec::new();
-                for id in &drop_view.ids {
-                    match self.local.relations.get(id) {
-                        Some(RelationOverlay::Present(relation))
-                            if relation.kind == RelationKind::View =>
-                        {
-                            present.push(id.clone());
-                        }
-                        Some(RelationOverlay::Present(_)) => {
-                            return MutationResult::Conflict {
-                                reason: format!("'{}' is not a view", id),
-                            };
-                        }
-                        _ if drop_view.if_exists => {}
-                        _ if self.baseline_available && self.baseline_covers_object(id) => {
-                            return MutationResult::Conflict {
-                                reason: format!("view '{}' does not exist", id),
-                            };
-                        }
-                        _ => {
-                            self.snapshot_confidence();
-                            self.local.confidence = Confidence::Tainted;
-                            continue;
-                        }
-                    }
-                }
-                if present.is_empty() {
-                    return MutationResult::Skipped;
-                }
-                for id in &present {
-                    self.snapshot_relation(id);
-                    self.local
-                        .relations
-                        .insert(id.clone(), RelationOverlay::Dropped);
-                }
-                self.snapshot_graph_full();
-                self.local.graph.edges.retain(|e| {
-                    !(matches!(e.kind, DependencyKind::ViewDependency { .. })
-                        && present.contains(&e.dependent))
-                });
-                MutationResult::Applied
-            }
-            Mutation::DropMaterializedView(drop_mv) => {
-                let mut present = Vec::new();
-                for id in &drop_mv.ids {
-                    match self.local.relations.get(id) {
-                        Some(RelationOverlay::Present(relation))
-                            if relation.kind == RelationKind::MaterializedView =>
-                        {
-                            present.push(id.clone());
-                        }
-                        Some(RelationOverlay::Present(_)) => {
-                            return MutationResult::Conflict {
-                                reason: format!("'{}' is not a materialized view", id),
-                            };
-                        }
-                        _ if drop_mv.if_exists => {}
-                        _ if self.baseline_available && self.baseline_covers_object(id) => {
-                            return MutationResult::Conflict {
-                                reason: format!("materialized view '{}' does not exist", id),
-                            };
-                        }
-                        _ => {
-                            self.snapshot_confidence();
-                            self.local.confidence = Confidence::Tainted;
-                            continue;
-                        }
-                    }
-                }
-                if present.is_empty() {
-                    return MutationResult::Skipped;
-                }
-                for id in &present {
-                    self.snapshot_relation(id);
-                    self.local
-                        .relations
-                        .insert(id.clone(), RelationOverlay::Dropped);
-                }
-                self.snapshot_graph_full();
-                self.local.graph.edges.retain(|e| {
-                    !((matches!(e.kind, DependencyKind::ViewDependency { .. })
-                        && present.contains(&e.dependent))
-                        || (matches!(e.kind, DependencyKind::IndexOnRelation { .. })
-                            && present.contains(&e.referenced)))
-                });
-                MutationResult::Applied
-            }
-            Mutation::DropIndex(drop_idx) => {
-                let present = self.local.graph.edges.iter().any(|edge| {
-                    matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
-                        && edge.dependent == drop_idx.id
-                });
-                if !present {
-                    if drop_idx.if_exists {
-                        return MutationResult::Skipped;
-                    }
-                    if self.baseline_available && self.baseline_covers_object(&drop_idx.id) {
-                        return MutationResult::Conflict {
-                            reason: format!("index '{}' does not exist", drop_idx.id),
-                        };
-                    }
-                    self.snapshot_confidence();
-                    self.local.confidence = Confidence::Tainted;
-                    return MutationResult::Skipped;
-                }
-                self.snapshot_graph();
-                self.local.graph.edges.retain(|e| {
-                    !(matches!(e.kind, DependencyKind::IndexOnRelation { .. })
-                        && e.dependent == drop_idx.id)
-                });
-                MutationResult::Applied
-            }
+            Mutation::AlterTable(alter) => self.apply_alter_table(alter),
+            Mutation::CreateType(create) => self.apply_create_type(create),
+            Mutation::RenameType(rename) => self.apply_rename_type(rename),
+            Mutation::AlterType(alter) => self.apply_alter_type(alter),
+            Mutation::CreateDomain(create) => self.apply_create_domain(create),
+            Mutation::AlterDomain(alter) => self.apply_alter_domain(alter),
+            Mutation::DropDomain(drop) => self.apply_drop_domain(drop),
+            Mutation::DropType(drop) => self.apply_drop_type(drop),
+            Mutation::CreateSequence(create) => self.apply_create_sequence(create),
+            Mutation::AlterSequence(alter) => self.apply_alter_sequence(alter),
+            Mutation::DropSequence(drop) => self.apply_drop_sequence(drop),
+            Mutation::Rename(rename) => self.apply_rename_relation(rename),
+            Mutation::DropView(drop) => self.apply_drop_view(drop),
+            Mutation::DropMaterializedView(drop) => self.apply_drop_materialized_view(drop),
+            Mutation::DropIndex(drop) => self.apply_drop_index(drop),
             Mutation::ChangeRelationOwner { id, new_owner } => {
-                let Some((owner, known)) = self.role_fact_identity(new_owner) else {
-                    self.snapshot_confidence();
-                    self.local.confidence = Confidence::Tainted;
-                    return MutationResult::Skipped;
-                };
-                if !known {
-                    self.snapshot_confidence();
-                    self.local.confidence = Confidence::Tainted;
-                }
-                self.snapshot_relation(id);
-                if let Some(RelationOverlay::Present(relation)) = self.local.relations.get_mut(id) {
-                    relation.owner = ObjectId::new("", owner);
-                    MutationResult::Applied
-                } else {
-                    MutationResult::Conflict {
-                        reason: format!("relation '{}' does not exist", id),
-                    }
-                }
+                self.apply_change_relation_owner(id, new_owner)
             }
             Mutation::SearchPath(search_path) => self.apply_search_path(search_path),
             Mutation::TimeoutSetting(timeout) => self.apply_timeout_setting(timeout),
@@ -3786,1448 +1893,25 @@ impl AnalysisState {
             Mutation::Savepoint(savepoint) => self.apply_savepoint(savepoint),
             Mutation::ReleaseSavepoint(release) => self.apply_release_savepoint(release),
             Mutation::Opaque(opaque) => self.apply_opaque(opaque),
-            Mutation::CreateFunction(f) => {
-                let routine_kind =
-                    if f.options.iter().any(|option| {
-                        matches!(option, crate::analysis::facts::FuncOptionFact::Window)
-                    }) {
-                        crate::model::function::RoutineKind::Window
-                    } else {
-                        crate::model::function::RoutineKind::Function
-                    };
-                match self.local.functions.get(&f.id) {
-                    Some(crate::model::function::FunctionOverlay::Present(existing))
-                        if existing.routine_kind != routine_kind || !f.or_replace =>
-                    {
-                        return MutationResult::Conflict {
-                            reason: format!("routine '{}' already exists", f.id),
-                        };
-                    }
-                    None if !self.baseline_available || !self.baseline_covers_object(&f.id) => {
-                        self.snapshot_confidence();
-                        self.local.confidence = Confidence::Tainted;
-                    }
-                    _ => {}
-                }
-                self.snapshot_function(&f.id);
-                self.snapshot_generation_counter();
-                self.local.generation_counter += 1;
-                let _generation = self.local.generation_counter;
-
-                let volatility = f
-                    .options
-                    .iter()
-                    .find_map(|opt| {
-                        if let crate::analysis::facts::FuncOptionFact::Volatility(v) = opt {
-                            Some(match v {
-                                crate::analysis::facts::VolatilityKind::Volatile => {
-                                    crate::model::function::Volatility::Volatile
-                                }
-                                crate::analysis::facts::VolatilityKind::Stable => {
-                                    crate::model::function::Volatility::Stable
-                                }
-                                crate::analysis::facts::VolatilityKind::Immutable => {
-                                    crate::model::function::Volatility::Immutable
-                                }
-                            })
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or(crate::model::function::Volatility::Volatile);
-
-                let security = f
-                    .options
-                    .iter()
-                    .find_map(|opt| {
-                        if let crate::analysis::facts::FuncOptionFact::Security(s) = opt {
-                            Some(match s {
-                                crate::analysis::facts::SecurityKind::Invoker => {
-                                    crate::model::function::SecurityMode::Invoker
-                                }
-                                crate::analysis::facts::SecurityKind::Definer => {
-                                    crate::model::function::SecurityMode::Definer
-                                }
-                            })
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or(crate::model::function::SecurityMode::Invoker);
-
-                let language = f
-                    .options
-                    .iter()
-                    .find_map(|opt| {
-                        if let crate::analysis::facts::FuncOptionFact::Language(l) = opt {
-                            Some(l.clone())
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or_else(|| "sql".to_string());
-
-                self.local.functions.insert(
-                    f.id.clone(),
-                    crate::model::function::FunctionOverlay::Present(
-                        crate::model::function::FunctionState {
-                            id: f.id.clone(),
-                            routine_kind,
-                            arg_types: f
-                                .params
-                                .iter()
-                                .filter(|p| {
-                                    !matches!(&p.mode, crate::analysis::facts::ParamModeFact::Out)
-                                })
-                                .map(|p| p.ty.clone())
-                                .collect(),
-                            arg_type_ids: f
-                                .params
-                                .iter()
-                                .filter(|p| {
-                                    !matches!(&p.mode, crate::analysis::facts::ParamModeFact::Out)
-                                })
-                                .map(|parameter| self.resolve_type_reference(&parameter.ty))
-                                .collect(),
-                            return_type: f
-                                .return_type
-                                .as_ref()
-                                .map(|rt| match rt {
-                                    crate::analysis::facts::RetTypeFact::Scalar(ty) => ty.clone(),
-                                    crate::analysis::facts::RetTypeFact::Table(columns) => columns
-                                        .iter()
-                                        .map(|column| {
-                                            format!(
-                                                "{} {}",
-                                                column.name,
-                                                column.ty.as_deref().unwrap_or("unknown")
-                                            )
-                                        })
-                                        .collect::<Vec<_>>()
-                                        .join(", "),
-                                })
-                                .unwrap_or_default(),
-                            return_type_id: f.return_type.as_ref().and_then(|return_type| {
-                                match return_type {
-                                    crate::analysis::facts::RetTypeFact::Scalar(ty) => {
-                                        self.resolve_type_reference(ty)
-                                    }
-                                    crate::analysis::facts::RetTypeFact::Table(_) => None,
-                                }
-                            }),
-                            volatility,
-                            language,
-                            security,
-                        },
-                    ),
-                );
-                MutationResult::Applied
+            Mutation::CreateFunction(function) => self.apply_create_function(function),
+            Mutation::AlterFunction(function) => self.apply_alter_function(function),
+            Mutation::DropFunction(function) => self.apply_drop_function(function),
+            Mutation::CreateProcedure(procedure) => self.apply_create_procedure(procedure),
+            Mutation::AlterProcedure(procedure) => self.apply_alter_procedure(procedure),
+            Mutation::DropProcedure(procedure) => self.apply_drop_procedure(procedure),
+            Mutation::CreateAggregate(aggregate) => self.apply_create_aggregate(aggregate),
+            Mutation::AlterAggregate(aggregate) => self.apply_alter_aggregate(aggregate),
+            Mutation::DropAggregate(aggregate) => self.apply_drop_aggregate(aggregate),
+            Mutation::CreatePublication(publication) => self.apply_create_publication(publication),
+            Mutation::AlterPublication(publication) => self.apply_alter_publication(publication),
+            Mutation::DropPublication(publication) => self.apply_drop_publication(publication),
+            Mutation::CreateSubscription(subscription) => {
+                self.apply_create_subscription(subscription)
             }
-            Mutation::AlterFunction(f) => {
-                use crate::analysis::facts::{AlterFunctionAction, FuncOptionFact};
-                use crate::model::function::{
-                    FunctionOverlay, RoutineKind, SecurityMode, Volatility,
-                };
-
-                match self.local.functions.get(&f.id) {
-                    Some(FunctionOverlay::Present(function))
-                        if matches!(
-                            function.routine_kind,
-                            RoutineKind::Function | RoutineKind::Window
-                        ) => {}
-                    Some(FunctionOverlay::Present(_)) => {
-                        return MutationResult::Conflict {
-                            reason: format!("'{}' is not a function", f.id),
-                        };
-                    }
-                    Some(FunctionOverlay::Dropped) => {
-                        return MutationResult::Conflict {
-                            reason: format!("function '{}' does not exist", f.id),
-                        };
-                    }
-                    _ if self.baseline_available && self.baseline_covers_object(&f.id) => {
-                        return MutationResult::Conflict {
-                            reason: format!("function '{}' does not exist", f.id),
-                        };
-                    }
-                    _ => {
-                        self.snapshot_confidence();
-                        self.local.confidence = Confidence::Tainted;
-                        return MutationResult::Skipped;
-                    }
-                }
-
-                match &f.action {
-                    AlterFunctionAction::OptionsChange(options) => {
-                        self.snapshot_function(&f.id);
-                        if let Some(FunctionOverlay::Present(function)) =
-                            self.local.functions.get_mut(&f.id)
-                        {
-                            for option in options {
-                                match option {
-                                    FuncOptionFact::Volatility(volatility) => {
-                                        function.volatility = match volatility {
-                                            crate::analysis::facts::VolatilityKind::Volatile => {
-                                                Volatility::Volatile
-                                            }
-                                            crate::analysis::facts::VolatilityKind::Stable => {
-                                                Volatility::Stable
-                                            }
-                                            crate::analysis::facts::VolatilityKind::Immutable => {
-                                                Volatility::Immutable
-                                            }
-                                        };
-                                    }
-                                    FuncOptionFact::Security(security) => {
-                                        function.security = match security {
-                                            crate::analysis::facts::SecurityKind::Invoker => {
-                                                SecurityMode::Invoker
-                                            }
-                                            crate::analysis::facts::SecurityKind::Definer => {
-                                                SecurityMode::Definer
-                                            }
-                                        };
-                                    }
-                                    FuncOptionFact::Language(language) => {
-                                        function.language = language.clone();
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                    }
-                    AlterFunctionAction::Rename { to, .. } => {
-                        let signature =
-                            f.id.name
-                                .find('(')
-                                .map(|index| &f.id.name[index..])
-                                .unwrap_or("");
-                        let new_id = ObjectId::new(f.id.schema.clone(), format!("{to}{signature}"));
-                        self.move_function(&f.id, &new_id);
-                    }
-                    AlterFunctionAction::SchemaChange { new_schema } => {
-                        let new_id = ObjectId::new(new_schema.clone(), f.id.name.clone());
-                        self.move_function(&f.id, &new_id);
-                    }
-                    AlterFunctionAction::OwnerChange(_)
-                    | AlterFunctionAction::DependsOnExtension { .. }
-                    | AlterFunctionAction::NoDependsOnExtension { .. } => {
-                        self.snapshot_function(&f.id);
-                    }
-                }
-                MutationResult::Applied
+            Mutation::AlterSubscription(subscription) => {
+                self.apply_alter_subscription(subscription)
             }
-            Mutation::DropFunction(f) => {
-                let mut any_applied = false;
-                for sig in &f.signatures {
-                    let sig_str = format!("{}({})", sig.name.name.resolve(), sig.params.join(","));
-                    let schema = self.resolve_function_schema(&sig.name, &sig_str);
-                    let id = ObjectId::new(schema, sig_str);
-                    let is_function = matches!(
-                        self.local.functions.get(&id),
-                        Some(crate::model::function::FunctionOverlay::Present(function))
-                            if matches!(
-                                function.routine_kind,
-                                crate::model::function::RoutineKind::Function
-                                    | crate::model::function::RoutineKind::Window
-                            )
-                    );
-                    if !is_function {
-                        let routine_exists = self.local.functions.contains_key(&id);
-                        let absence_is_exact =
-                            self.baseline_available && self.baseline_covers_object(&id);
-                        if routine_exists || (!f.if_exists && absence_is_exact) {
-                            return MutationResult::Conflict {
-                                reason: format!("function '{}' does not exist", id),
-                            };
-                        } else if !f.if_exists && !absence_is_exact {
-                            self.snapshot_confidence();
-                            self.local.confidence = Confidence::Tainted;
-                        }
-                    } else {
-                        let dependent_triggers: Vec<(ObjectId, ObjectId)> = self
-                            .local
-                            .graph
-                            .edges
-                            .iter()
-                            .filter_map(|edge| {
-                                let DependencyKind::TriggerOnTable { function_id, .. } = &edge.kind
-                                else {
-                                    return None;
-                                };
-                                (function_id == &id)
-                                    .then(|| (edge.dependent.clone(), edge.referenced.clone()))
-                            })
-                            .collect();
-                        if !dependent_triggers.is_empty() && !f.cascade {
-                            return MutationResult::Conflict {
-                                reason: format!(
-                                    "function '{}' still has dependent triggers; use CASCADE",
-                                    id
-                                ),
-                            };
-                        }
-
-                        any_applied = true;
-                        self.snapshot_function(&id);
-                        self.local
-                            .functions
-                            .insert(id.clone(), crate::model::function::FunctionOverlay::Dropped);
-
-                        if f.cascade {
-                            for (trigger_id, table_id) in &dependent_triggers {
-                                let trigger_name =
-                                    self.local.triggers.get(trigger_id).and_then(|overlay| {
-                                        match overlay {
-                                            TriggerOverlay::Present(trigger) => {
-                                                Some(trigger.name.clone())
-                                            }
-                                            TriggerOverlay::Dropped => None,
-                                        }
-                                    });
-                                self.snapshot_trigger(trigger_id);
-                                self.local
-                                    .triggers
-                                    .insert(trigger_id.clone(), TriggerOverlay::Dropped);
-                                self.snapshot_relation(table_id);
-                                if let Some(RelationOverlay::Present(relation)) =
-                                    self.local.relations.get_mut(table_id)
-                                    && let Some(trigger_name) = trigger_name
-                                {
-                                    relation.triggers.remove(&trigger_name);
-                                }
-                            }
-                            if !dependent_triggers.is_empty() {
-                                self.snapshot_graph_full();
-                                self.local.graph.edges.retain(|edge| {
-                                    !dependent_triggers
-                                        .iter()
-                                        .any(|(trigger_id, _)| edge.dependent == *trigger_id)
-                                });
-                            }
-                        }
-                    }
-                }
-                if any_applied {
-                    MutationResult::Applied
-                } else {
-                    MutationResult::Skipped
-                }
-            }
-            Mutation::CreateProcedure(p) => {
-                match self.local.functions.get(&p.id) {
-                    Some(crate::model::function::FunctionOverlay::Present(existing))
-                        if existing.routine_kind
-                            == crate::model::function::RoutineKind::Procedure
-                            && p.or_replace => {}
-                    Some(crate::model::function::FunctionOverlay::Present(_)) => {
-                        return MutationResult::Conflict {
-                            reason: format!("routine '{}' already exists", p.id),
-                        };
-                    }
-                    None if !self.baseline_available || !self.baseline_covers_object(&p.id) => {
-                        self.snapshot_confidence();
-                        self.local.confidence = Confidence::Tainted;
-                    }
-                    None => {}
-                    Some(crate::model::function::FunctionOverlay::Dropped) => {}
-                }
-                self.snapshot_function(&p.id);
-                self.snapshot_generation_counter();
-                self.local.generation_counter += 1;
-                let _generation = self.local.generation_counter;
-
-                self.local.functions.insert(
-                    p.id.clone(),
-                    crate::model::function::FunctionOverlay::Present(
-                        crate::model::function::FunctionState {
-                            id: p.id.clone(),
-                            routine_kind: crate::model::function::RoutineKind::Procedure,
-                            arg_types: p
-                                .params
-                                .iter()
-                                .filter(|p| {
-                                    !matches!(&p.mode, crate::analysis::facts::ParamModeFact::Out)
-                                })
-                                .map(|p| p.ty.clone())
-                                .collect(),
-                            arg_type_ids: p
-                                .params
-                                .iter()
-                                .filter(|p| {
-                                    !matches!(&p.mode, crate::analysis::facts::ParamModeFact::Out)
-                                })
-                                .map(|parameter| self.resolve_type_reference(&parameter.ty))
-                                .collect(),
-                            return_type: "void".to_string(),
-                            return_type_id: None,
-                            volatility: crate::model::function::Volatility::Volatile,
-                            language: "sql".to_string(),
-                            security: crate::model::function::SecurityMode::Invoker,
-                        },
-                    ),
-                );
-                MutationResult::Applied
-            }
-            Mutation::AlterProcedure(p) => {
-                use crate::analysis::facts::AlterFunctionAction;
-                use crate::model::function::{FunctionOverlay, RoutineKind};
-
-                match self.local.functions.get(&p.id) {
-                    Some(FunctionOverlay::Present(function))
-                        if function.routine_kind == RoutineKind::Procedure => {}
-                    Some(FunctionOverlay::Present(_)) => {
-                        return MutationResult::Conflict {
-                            reason: format!("'{}' is not a procedure", p.id),
-                        };
-                    }
-                    Some(FunctionOverlay::Dropped) => {
-                        return MutationResult::Conflict {
-                            reason: format!("procedure '{}' does not exist", p.id),
-                        };
-                    }
-                    None if self.baseline_available && self.baseline_covers_object(&p.id) => {
-                        return MutationResult::Conflict {
-                            reason: format!("procedure '{}' does not exist", p.id),
-                        };
-                    }
-                    None => {
-                        self.snapshot_confidence();
-                        self.local.confidence = Confidence::Tainted;
-                        return MutationResult::Skipped;
-                    }
-                }
-
-                match &p.action {
-                    AlterFunctionAction::Rename { to, .. } => {
-                        let signature =
-                            p.id.name
-                                .find('(')
-                                .map(|index| &p.id.name[index..])
-                                .unwrap_or("");
-                        let new_id = ObjectId::new(p.id.schema.clone(), format!("{to}{signature}"));
-                        self.move_function(&p.id, &new_id);
-                    }
-                    AlterFunctionAction::SchemaChange { new_schema } => {
-                        let new_id = ObjectId::new(new_schema.clone(), p.id.name.clone());
-                        self.move_function(&p.id, &new_id);
-                    }
-                    _ => self.snapshot_function(&p.id),
-                }
-                MutationResult::Applied
-            }
-            Mutation::DropProcedure(p) => {
-                let mut any_applied = false;
-                for sig in &p.signatures {
-                    let sig_str = format!("{}({})", sig.name.name.resolve(), sig.params.join(","));
-                    let schema = self.resolve_function_schema(&sig.name, &sig_str);
-                    let id = ObjectId::new(schema, sig_str);
-                    let is_procedure = matches!(
-                        self.local.functions.get(&id),
-                        Some(crate::model::function::FunctionOverlay::Present(function))
-                            if function.routine_kind
-                                == crate::model::function::RoutineKind::Procedure
-                    );
-                    if is_procedure {
-                        any_applied = true;
-                        self.snapshot_function(&id);
-                        self.local
-                            .functions
-                            .insert(id, crate::model::function::FunctionOverlay::Dropped);
-                    } else if self.local.functions.contains_key(&id)
-                        || !p.if_exists
-                            && self.baseline_available
-                            && self.baseline_covers_object(&id)
-                    {
-                        return MutationResult::Conflict {
-                            reason: format!("procedure '{}' does not exist", id),
-                        };
-                    } else if !p.if_exists {
-                        self.snapshot_confidence();
-                        self.local.confidence = Confidence::Tainted;
-                        return MutationResult::Skipped;
-                    }
-                }
-                if any_applied {
-                    MutationResult::Applied
-                } else {
-                    MutationResult::Skipped
-                }
-            }
-            Mutation::CreateAggregate(a) => {
-                match self.local.functions.get(&a.id) {
-                    Some(crate::model::function::FunctionOverlay::Present(existing))
-                        if existing.routine_kind
-                            == crate::model::function::RoutineKind::Aggregate
-                            && a.or_replace => {}
-                    Some(crate::model::function::FunctionOverlay::Present(_)) => {
-                        return MutationResult::Conflict {
-                            reason: format!("routine '{}' already exists", a.id),
-                        };
-                    }
-                    None if !self.baseline_available || !self.baseline_covers_object(&a.id) => {
-                        self.snapshot_confidence();
-                        self.local.confidence = Confidence::Tainted;
-                    }
-                    None | Some(crate::model::function::FunctionOverlay::Dropped) => {}
-                }
-
-                self.snapshot_function(&a.id);
-                self.local.functions.insert(
-                    a.id.clone(),
-                    crate::model::function::FunctionOverlay::Present(
-                        crate::model::function::FunctionState {
-                            id: a.id.clone(),
-                            routine_kind: crate::model::function::RoutineKind::Aggregate,
-                            arg_types: a
-                                .params
-                                .iter()
-                                .filter(|parameter| {
-                                    !matches!(
-                                        parameter.mode,
-                                        crate::analysis::facts::ParamModeFact::Out
-                                    )
-                                })
-                                .map(|parameter| parameter.ty.clone())
-                                .collect(),
-                            arg_type_ids: a
-                                .params
-                                .iter()
-                                .filter(|parameter| {
-                                    !matches!(
-                                        parameter.mode,
-                                        crate::analysis::facts::ParamModeFact::Out
-                                    )
-                                })
-                                .map(|parameter| self.resolve_type_reference(&parameter.ty))
-                                .collect(),
-                            return_type: String::new(),
-                            return_type_id: None,
-                            volatility: crate::model::function::Volatility::Volatile,
-                            language: "internal".to_string(),
-                            security: crate::model::function::SecurityMode::Invoker,
-                        },
-                    ),
-                );
-                MutationResult::Applied
-            }
-            Mutation::AlterAggregate(a) => {
-                use crate::analysis::facts::AlterFunctionAction;
-                use crate::model::function::{FunctionOverlay, RoutineKind};
-
-                match self.local.functions.get(&a.id) {
-                    Some(FunctionOverlay::Present(aggregate))
-                        if aggregate.routine_kind == RoutineKind::Aggregate => {}
-                    Some(FunctionOverlay::Present(_)) => {
-                        return MutationResult::Conflict {
-                            reason: format!("'{}' is not an aggregate", a.id),
-                        };
-                    }
-                    Some(FunctionOverlay::Dropped) => {
-                        return MutationResult::Conflict {
-                            reason: format!("aggregate '{}' does not exist", a.id),
-                        };
-                    }
-                    None if self.baseline_available && self.baseline_covers_object(&a.id) => {
-                        return MutationResult::Conflict {
-                            reason: format!("aggregate '{}' does not exist", a.id),
-                        };
-                    }
-                    None => {
-                        self.snapshot_confidence();
-                        self.local.confidence = Confidence::Tainted;
-                        return MutationResult::Skipped;
-                    }
-                }
-
-                match &a.action {
-                    AlterFunctionAction::Rename { to, .. } => {
-                        let signature =
-                            a.id.name
-                                .find('(')
-                                .map(|index| &a.id.name[index..])
-                                .unwrap_or("");
-                        let new_id = ObjectId::new(a.id.schema.clone(), format!("{to}{signature}"));
-                        self.move_function(&a.id, &new_id);
-                    }
-                    AlterFunctionAction::SchemaChange { new_schema } => {
-                        let new_id = ObjectId::new(new_schema.clone(), a.id.name.clone());
-                        self.move_function(&a.id, &new_id);
-                    }
-                    AlterFunctionAction::OwnerChange(_) => self.snapshot_function(&a.id),
-                    _ => unreachable!("aggregate extraction only emits rename, owner, or schema"),
-                }
-                MutationResult::Applied
-            }
-            Mutation::DropAggregate(a) => {
-                let mut any_applied = false;
-                for signature in &a.signatures {
-                    let signature_name = format!(
-                        "{}({})",
-                        signature.name.name.resolve(),
-                        signature.params.join(",")
-                    );
-                    let schema = self.resolve_function_schema(&signature.name, &signature_name);
-                    let id = ObjectId::new(schema, signature_name);
-                    let is_aggregate = matches!(
-                        self.local.functions.get(&id),
-                        Some(crate::model::function::FunctionOverlay::Present(routine))
-                            if routine.routine_kind
-                                == crate::model::function::RoutineKind::Aggregate
-                    );
-                    if is_aggregate {
-                        any_applied = true;
-                        self.snapshot_function(&id);
-                        self.local
-                            .functions
-                            .insert(id, crate::model::function::FunctionOverlay::Dropped);
-                    } else if self.local.functions.contains_key(&id)
-                        || self.baseline_available && self.baseline_covers_object(&id)
-                    {
-                        if a.if_exists {
-                            continue;
-                        }
-                        return MutationResult::Conflict {
-                            reason: format!("aggregate '{}' does not exist", id),
-                        };
-                    } else {
-                        self.snapshot_confidence();
-                        self.local.confidence = Confidence::Tainted;
-                        if !a.if_exists {
-                            return MutationResult::Skipped;
-                        }
-                    }
-                }
-                if a.cascade && any_applied {
-                    self.snapshot_confidence();
-                    self.local.confidence = Confidence::Tainted;
-                }
-                if any_applied {
-                    MutationResult::Applied
-                } else {
-                    MutationResult::Skipped
-                }
-            }
-            Mutation::CreatePublication(p) => {
-                match self.local.publications.get(&p.name) {
-                    Some(crate::model::replication::PublicationOverlay::Present(_)) => {
-                        return MutationResult::Conflict {
-                            reason: format!("publication '{}' already exists", p.name),
-                        };
-                    }
-                    None => {
-                        if !self.baseline_available {
-                            self.snapshot_confidence();
-                            self.local.confidence = Confidence::Tainted;
-                        }
-                    }
-                    Some(crate::model::replication::PublicationOverlay::Dropped) => {}
-                }
-                if let Err(reason) = self.validate_publication_scope(&p.scope) {
-                    return MutationResult::Conflict { reason };
-                }
-                self.taint_inheritance_sensitive_publication_scope(&p.scope);
-                self.snapshot_publication(&p.name);
-                self.snapshot_generation_counter();
-                self.local.generation_counter += 1;
-                let generation = self.local.generation_counter;
-
-                let owner = self
-                    .local
-                    .current_role_known
-                    .then(|| self.local.current_role.clone());
-                self.local.publications.insert(
-                    p.name.clone(),
-                    crate::model::replication::PublicationOverlay::Present(
-                        crate::model::replication::PublicationState {
-                            name: p.name.clone(),
-                            owner,
-                            scope: p.scope.clone(),
-                            params: p.params.clone(),
-                            generation,
-                        },
-                    ),
-                );
-
-                if let crate::analysis::facts::PublicationScope::Explicit(objects) = &p.scope {
-                    self.snapshot_graph_full();
-                    for obj in objects {
-                        if let crate::analysis::facts::PublicationObjectFact::Table {
-                            name, ..
-                        } = obj
-                        {
-                            let table_id = self.resolve_relation_id(name);
-                            self.local.graph.edges.push(DependencyEdge::new(
-                                table_id,
-                                ObjectId::new("public", &p.name),
-                                DependencyKind::PublicationIncludes {
-                                    publication_name: p.name.clone(),
-                                },
-                            ));
-                        }
-                    }
-                }
-                MutationResult::Applied
-            }
-            Mutation::AlterPublication(p) => {
-                match self.local.publications.get(&p.name) {
-                    Some(crate::model::replication::PublicationOverlay::Present(_)) => {}
-                    Some(crate::model::replication::PublicationOverlay::Dropped) => {
-                        return MutationResult::Conflict {
-                            reason: format!("publication '{}' does not exist", p.name),
-                        };
-                    }
-                    None => {
-                        if self.baseline_available {
-                            return MutationResult::Conflict {
-                                reason: format!("publication '{}' does not exist", p.name),
-                            };
-                        }
-                        self.snapshot_confidence();
-                        self.local.confidence = Confidence::Tainted;
-                        return MutationResult::Skipped;
-                    }
-                }
-                self.snapshot_publication(&p.name);
-                self.snapshot_generation_counter();
-                self.local.generation_counter += 1;
-                let new_gen = self.local.generation_counter;
-                use crate::analysis::facts::AlterPublicationActionFact;
-
-                let current_scope = match self.local.publications.get(&p.name) {
-                    Some(crate::model::replication::PublicationOverlay::Present(publication)) => {
-                        publication.scope.clone()
-                    }
-                    _ => unreachable!("publication existence checked above"),
-                };
-                let mut replacement_scope = None;
-                let mut rename_to = None;
-                match &p.action {
-                    AlterPublicationActionFact::AddObjects(additions) => {
-                        let additions_scope =
-                            crate::analysis::facts::PublicationScope::Explicit(additions.clone());
-                        if let Err(reason) = self.validate_publication_scope(&additions_scope) {
-                            return MutationResult::Conflict { reason };
-                        }
-                        self.taint_inheritance_sensitive_publication_scope(&additions_scope);
-                        let crate::analysis::facts::PublicationScope::Explicit(mut objects) =
-                            current_scope
-                        else {
-                            return MutationResult::Conflict {
-                                reason: format!(
-                                    "publication '{}' already includes all tables",
-                                    p.name
-                                ),
-                            };
-                        };
-                        let mut keys: HashSet<String> = objects
-                            .iter()
-                            .map(|object| self.publication_object_key(object))
-                            .collect();
-                        for addition in additions {
-                            let key = self.publication_object_key(addition);
-                            if !keys.insert(key) {
-                                return MutationResult::Conflict {
-                                    reason: format!(
-                                        "publication '{}' already contains the requested object",
-                                        p.name
-                                    ),
-                                };
-                            }
-                            objects.push(addition.clone());
-                        }
-                        replacement_scope =
-                            Some(crate::analysis::facts::PublicationScope::Explicit(objects));
-                    }
-                    AlterPublicationActionFact::SetObjects(scope) => {
-                        if let Err(reason) = self.validate_publication_scope(scope) {
-                            return MutationResult::Conflict { reason };
-                        }
-                        self.taint_inheritance_sensitive_publication_scope(scope);
-                        replacement_scope = Some(scope.clone());
-                    }
-                    AlterPublicationActionFact::DropObjects(removals) => {
-                        self.taint_inheritance_sensitive_publication_scope(
-                            &crate::analysis::facts::PublicationScope::Explicit(removals.clone()),
-                        );
-                        let crate::analysis::facts::PublicationScope::Explicit(mut objects) =
-                            current_scope
-                        else {
-                            return MutationResult::Conflict {
-                                reason: format!("publication '{}' includes all tables", p.name),
-                            };
-                        };
-                        for removal in removals {
-                            let key = self.publication_object_key(removal);
-                            let Some(position) = objects
-                                .iter()
-                                .position(|object| self.publication_object_key(object) == key)
-                            else {
-                                return MutationResult::Conflict {
-                                    reason: format!(
-                                        "publication '{}' does not contain the requested object",
-                                        p.name
-                                    ),
-                                };
-                            };
-                            objects.remove(position);
-                        }
-                        replacement_scope =
-                            Some(crate::analysis::facts::PublicationScope::Explicit(objects));
-                    }
-                    AlterPublicationActionFact::SetOptions(options) => {
-                        if let Some(crate::model::replication::PublicationOverlay::Present(
-                            publication,
-                        )) = self.local.publications.get_mut(&p.name)
-                        {
-                            for option in options {
-                                publication
-                                    .params
-                                    .retain(|existing| existing.name != option.name);
-                                publication.params.push(option.clone());
-                            }
-                        }
-                    }
-                    AlterPublicationActionFact::OwnerChange(role) => {
-                        if let Some((owner, known)) = self.role_fact_identity(role) {
-                            if known {
-                                if let Some(
-                                    crate::model::replication::PublicationOverlay::Present(
-                                        publication,
-                                    ),
-                                ) = self.local.publications.get_mut(&p.name)
-                                {
-                                    publication.owner = Some(owner);
-                                }
-                            } else {
-                                self.snapshot_confidence();
-                                self.local.confidence = Confidence::Tainted;
-                                if let Some(
-                                    crate::model::replication::PublicationOverlay::Present(
-                                        publication,
-                                    ),
-                                ) = self.local.publications.get_mut(&p.name)
-                                {
-                                    publication.owner = None;
-                                }
-                            }
-                        } else {
-                            self.snapshot_confidence();
-                            self.local.confidence = Confidence::Tainted;
-                            if let Some(crate::model::replication::PublicationOverlay::Present(
-                                publication,
-                            )) = self.local.publications.get_mut(&p.name)
-                            {
-                                publication.owner = None;
-                            }
-                        }
-                    }
-                    AlterPublicationActionFact::Rename { to } => {
-                        if matches!(
-                            self.local.publications.get(to),
-                            Some(crate::model::replication::PublicationOverlay::Present(_))
-                        ) {
-                            return MutationResult::Conflict {
-                                reason: format!("publication '{}' already exists", to),
-                            };
-                        }
-                        rename_to = Some(to.clone());
-                    }
-                }
-
-                if let Some(scope) = replacement_scope {
-                    if let Some(crate::model::replication::PublicationOverlay::Present(
-                        publication,
-                    )) = self.local.publications.get_mut(&p.name)
-                    {
-                        publication.scope = scope.clone();
-                    }
-                    self.replace_publication_edges(&p.name, &scope);
-                }
-                if let Some(crate::model::replication::PublicationOverlay::Present(publication)) =
-                    self.local.publications.get_mut(&p.name)
-                {
-                    publication.generation = new_gen;
-                }
-                if let Some(to) = rename_to {
-                    self.snapshot_publication(&to);
-                    let Some(crate::model::replication::PublicationOverlay::Present(
-                        mut publication,
-                    )) = self.local.publications.remove(&p.name)
-                    else {
-                        unreachable!("publication existence checked above");
-                    };
-                    publication.name = to.clone();
-                    self.local.publications.insert(
-                        to.clone(),
-                        crate::model::replication::PublicationOverlay::Present(publication),
-                    );
-                    self.snapshot_graph_full();
-                    for edge in &mut self.local.graph.edges {
-                        if let DependencyKind::PublicationIncludes { publication_name } =
-                            &mut edge.kind
-                            && publication_name == &p.name
-                        {
-                            *publication_name = to.clone();
-                            edge.referenced = ObjectId::new("public", &to);
-                        }
-                    }
-                }
-                MutationResult::Applied
-            }
-            Mutation::DropPublication(p) => {
-                let mut present_names = Vec::new();
-                for name in &p.names {
-                    match self.local.publications.get(name) {
-                        Some(crate::model::replication::PublicationOverlay::Present(_)) => {
-                            present_names.push(name.clone());
-                        }
-                        Some(crate::model::replication::PublicationOverlay::Dropped) => {
-                            if !p.if_exists {
-                                return MutationResult::Conflict {
-                                    reason: format!("publication '{}' does not exist", name),
-                                };
-                            }
-                        }
-                        None if p.if_exists && self.baseline_available => {}
-                        None if p.if_exists => {
-                            self.snapshot_confidence();
-                            self.local.confidence = Confidence::Tainted;
-                        }
-                        None => {
-                            if self.baseline_available {
-                                return MutationResult::Conflict {
-                                    reason: format!("publication '{}' does not exist", name),
-                                };
-                            }
-                            self.snapshot_confidence();
-                            self.local.confidence = Confidence::Tainted;
-                            return MutationResult::Skipped;
-                        }
-                    }
-                }
-                for name in &present_names {
-                    self.snapshot_publication(name);
-                    self.local.publications.insert(
-                        name.clone(),
-                        crate::model::replication::PublicationOverlay::Dropped,
-                    );
-                }
-                self.snapshot_graph_full();
-                self.local.graph.edges.retain(|e| {
-                    !(matches!(e.kind, DependencyKind::PublicationIncludes { .. })
-                        && present_names.contains(&e.referenced.name))
-                });
-                if present_names.is_empty() {
-                    MutationResult::Skipped
-                } else {
-                    MutationResult::Applied
-                }
-            }
-            Mutation::CreateSubscription(s) => {
-                let name = s.name.clone().unwrap_or_else(|| "unnamed_sub".into());
-                match self.local.subscriptions.get(&name) {
-                    Some(crate::model::replication::SubscriptionOverlay::Present(_)) => {
-                        return MutationResult::Conflict {
-                            reason: format!("subscription '{}' already exists", name),
-                        };
-                    }
-                    None => {
-                        if !self.baseline_available {
-                            self.snapshot_confidence();
-                            self.local.confidence = Confidence::Tainted;
-                        }
-                    }
-                    Some(crate::model::replication::SubscriptionOverlay::Dropped) => {}
-                }
-
-                let params = s.params.as_deref();
-                if let Err(reason) = Self::validate_subscription_boolean_options(
-                    params,
-                    &[
-                        "connect",
-                        "create_slot",
-                        "enabled",
-                        "copy_data",
-                        "binary",
-                        "disable_on_error",
-                        "password_required",
-                        "run_as_owner",
-                        "failover",
-                        "two_phase",
-                    ],
-                ) {
-                    return MutationResult::Conflict { reason };
-                }
-                let connects_to_publisher =
-                    Self::subscription_boolean_option(params, "connect") != Some(false);
-                if !connects_to_publisher
-                    && ["create_slot", "enabled", "copy_data"]
-                        .iter()
-                        .any(|name| Self::subscription_boolean_option(params, name) == Some(true))
-                {
-                    return MutationResult::Conflict {
-                        reason: format!(
-                            "subscription '{}' cannot enable connection-dependent options when connect is false",
-                            name
-                        ),
-                    };
-                }
-                let creates_slot = connects_to_publisher
-                    && Self::subscription_boolean_option(params, "create_slot") != Some(false);
-                if !self.local.transactions.is_empty() && connects_to_publisher && creates_slot {
-                    return MutationResult::Conflict {
-                        reason: format!(
-                            "subscription '{}' cannot create a replication slot inside a transaction",
-                            name
-                        ),
-                    };
-                }
-                self.snapshot_subscription(&name);
-                self.snapshot_generation_counter();
-                self.local.generation_counter += 1;
-                let generation = self.local.generation_counter;
-
-                if connects_to_publisher {
-                    self.snapshot_confidence();
-                    self.local.confidence = Confidence::Tainted;
-                }
-
-                let enabled = connects_to_publisher
-                    && Self::subscription_boolean_option(params, "enabled") != Some(false);
-                let slot_name = match Self::subscription_option(params, "slot_name") {
-                    Some(value) if value.eq_ignore_ascii_case("none") => None,
-                    Some(value) => Some(value.to_string()),
-                    None => Some(name.clone()),
-                };
-                if slot_name.is_none() && (enabled || creates_slot) {
-                    return MutationResult::Conflict {
-                        reason: format!(
-                            "subscription '{}' with slot_name NONE must disable enabled and create_slot",
-                            name
-                        ),
-                    };
-                }
-                let mut unique_publications = HashSet::new();
-                if !s
-                    .publications
-                    .iter()
-                    .all(|publication| unique_publications.insert(publication))
-                {
-                    return MutationResult::Conflict {
-                        reason: format!(
-                            "subscription '{}' lists the same publication more than once",
-                            name
-                        ),
-                    };
-                }
-
-                let owner = self
-                    .local
-                    .current_role_known
-                    .then(|| self.local.current_role.clone());
-                self.local.subscriptions.insert(
-                    name.clone(),
-                    crate::model::replication::SubscriptionOverlay::Present(
-                        crate::model::replication::SubscriptionState {
-                            name,
-                            owner,
-                            connection: s.connection.clone(),
-                            publications: s.publications.clone(),
-                            params: s.params.clone(),
-                            enabled,
-                            slot_name,
-                            generation,
-                        },
-                    ),
-                );
-                MutationResult::Applied
-            }
-            Mutation::AlterSubscription(s) => {
-                match self.local.subscriptions.get(&s.name) {
-                    Some(crate::model::replication::SubscriptionOverlay::Present(_)) => {}
-                    Some(crate::model::replication::SubscriptionOverlay::Dropped) => {
-                        return MutationResult::Conflict {
-                            reason: format!("subscription '{}' does not exist", s.name),
-                        };
-                    }
-                    None => {
-                        if self.baseline_available {
-                            return MutationResult::Conflict {
-                                reason: format!("subscription '{}' does not exist", s.name),
-                            };
-                        }
-                        self.snapshot_confidence();
-                        self.local.confidence = Confidence::Tainted;
-                        return MutationResult::Skipped;
-                    }
-                }
-                let existing = match self.local.subscriptions.get(&s.name) {
-                    Some(crate::model::replication::SubscriptionOverlay::Present(subscription)) => {
-                        subscription
-                    }
-                    _ => unreachable!("subscription existence checked above"),
-                };
-                let in_transaction = !self.local.transactions.is_empty();
-                match &s.action {
-                    crate::analysis::facts::AlterSubscriptionActionFact::Publications {
-                        mode,
-                        publications,
-                        params,
-                    } => {
-                        if let Err(reason) = Self::validate_subscription_boolean_options(
-                            Some(params),
-                            &["refresh", "copy_data"],
-                        ) {
-                            return MutationResult::Conflict { reason };
-                        }
-                        if in_transaction
-                            && Self::subscription_boolean_option(Some(params), "refresh")
-                                != Some(false)
-                        {
-                            return MutationResult::Conflict {
-                                reason: format!(
-                                    "subscription '{}' cannot refresh publications inside a transaction",
-                                    s.name
-                                ),
-                            };
-                        }
-
-                        let mut unique = HashSet::new();
-                        match mode {
-                            crate::analysis::facts::SubscriptionPublicationMode::Set => {
-                                if !publications
-                                    .iter()
-                                    .all(|publication| unique.insert(publication))
-                                {
-                                    return MutationResult::Conflict {
-                                        reason: format!(
-                                            "subscription '{}' lists the same publication more than once",
-                                            s.name
-                                        ),
-                                    };
-                                }
-                            }
-                            crate::analysis::facts::SubscriptionPublicationMode::Add => {
-                                for publication in publications {
-                                    if !unique.insert(publication)
-                                        || existing.publications.contains(publication)
-                                    {
-                                        return MutationResult::Conflict {
-                                            reason: format!(
-                                                "subscription '{}' already includes publication '{}'",
-                                                s.name, publication
-                                            ),
-                                        };
-                                    }
-                                }
-                            }
-                            crate::analysis::facts::SubscriptionPublicationMode::Drop => {
-                                for publication in publications {
-                                    if !unique.insert(publication)
-                                        || !existing.publications.contains(publication)
-                                    {
-                                        return MutationResult::Conflict {
-                                            reason: format!(
-                                                "subscription '{}' does not include publication '{}'",
-                                                s.name, publication
-                                            ),
-                                        };
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    crate::analysis::facts::AlterSubscriptionActionFact::RefreshPublication(_)
-                        if in_transaction =>
-                    {
-                        return MutationResult::Conflict {
-                            reason: format!(
-                                "subscription '{}' cannot refresh publications inside a transaction",
-                                s.name
-                            ),
-                        };
-                    }
-                    crate::analysis::facts::AlterSubscriptionActionFact::SetOptions(options) => {
-                        if let Err(reason) = Self::validate_subscription_boolean_options(
-                            Some(options),
-                            &[
-                                "binary",
-                                "disable_on_error",
-                                "password_required",
-                                "run_as_owner",
-                                "failover",
-                                "two_phase",
-                            ],
-                        ) {
-                            return MutationResult::Conflict { reason };
-                        }
-                        if existing.enabled
-                            && options
-                                .iter()
-                                .any(|option| option.name.eq_ignore_ascii_case("slot_name"))
-                        {
-                            return MutationResult::Conflict {
-                                reason: format!(
-                                    "subscription '{}' must be disabled before changing slot_name",
-                                    s.name
-                                ),
-                            };
-                        }
-                        let changes_failover_or_two_phase = options.iter().any(|option| {
-                            option.name.eq_ignore_ascii_case("failover")
-                                || option.name.eq_ignore_ascii_case("two_phase")
-                        });
-                        if changes_failover_or_two_phase && existing.enabled {
-                            return MutationResult::Conflict {
-                                reason: format!(
-                                    "subscription '{}' must be disabled before changing failover or two_phase",
-                                    s.name
-                                ),
-                            };
-                        }
-                        let forbidden_in_transaction = options.iter().any(|option| {
-                            option.name.eq_ignore_ascii_case("failover")
-                                || (option.name.eq_ignore_ascii_case("two_phase")
-                                    && Self::postgres_boolean(&option.value) == Some(false))
-                        });
-                        if in_transaction && forbidden_in_transaction {
-                            return MutationResult::Conflict {
-                                reason: format!(
-                                    "subscription '{}' cannot change this setting inside a transaction",
-                                    s.name
-                                ),
-                            };
-                        }
-                    }
-                    crate::analysis::facts::AlterSubscriptionActionFact::SetEnabled(true)
-                        if existing.slot_name.is_none() =>
-                    {
-                        return MutationResult::Conflict {
-                            reason: format!(
-                                "subscription '{}' cannot be enabled without a slot_name",
-                                s.name
-                            ),
-                        };
-                    }
-                    _ => {}
-                }
-                self.snapshot_subscription(&s.name);
-                self.snapshot_generation_counter();
-                self.local.generation_counter += 1;
-                let new_gen = self.local.generation_counter;
-                use crate::analysis::facts::{
-                    AlterSubscriptionActionFact, SubscriptionPublicationMode,
-                };
-                let mut rename_to = None;
-                match &s.action {
-                    AlterSubscriptionActionFact::SetConnection(connection) => {
-                        if let Some(crate::model::replication::SubscriptionOverlay::Present(
-                            subscription,
-                        )) = self.local.subscriptions.get_mut(&s.name)
-                        {
-                            subscription.connection = connection.clone();
-                        }
-                    }
-                    AlterSubscriptionActionFact::SetServer(server) => {
-                        if let Some(crate::model::replication::SubscriptionOverlay::Present(
-                            subscription,
-                        )) = self.local.subscriptions.get_mut(&s.name)
-                        {
-                            subscription.connection =
-                                crate::analysis::facts::ConnectionTarget::Server(server.clone());
-                        }
-                        self.snapshot_confidence();
-                        self.local.confidence = Confidence::Tainted;
-                    }
-                    AlterSubscriptionActionFact::Publications {
-                        mode,
-                        publications,
-                        params,
-                    } => {
-                        let refreshes = Self::subscription_boolean_option(Some(params), "refresh")
-                            != Some(false);
-                        if refreshes {
-                            self.snapshot_confidence();
-                            self.local.confidence = Confidence::Tainted;
-                        }
-                        if let Some(crate::model::replication::SubscriptionOverlay::Present(
-                            subscription,
-                        )) = self.local.subscriptions.get_mut(&s.name)
-                        {
-                            match mode {
-                                SubscriptionPublicationMode::Set => {
-                                    subscription.publications = publications.clone();
-                                }
-                                SubscriptionPublicationMode::Add => {
-                                    subscription
-                                        .publications
-                                        .extend(publications.iter().cloned());
-                                }
-                                SubscriptionPublicationMode::Drop => {
-                                    subscription
-                                        .publications
-                                        .retain(|existing| !publications.contains(existing));
-                                }
-                            }
-                        }
-                    }
-                    AlterSubscriptionActionFact::RefreshPublication(_) => {
-                        self.snapshot_confidence();
-                        self.local.confidence = Confidence::Tainted;
-                    }
-                    AlterSubscriptionActionFact::SetEnabled(enabled) => {
-                        if let Some(crate::model::replication::SubscriptionOverlay::Present(
-                            subscription,
-                        )) = self.local.subscriptions.get_mut(&s.name)
-                        {
-                            subscription.enabled = *enabled;
-                        }
-                    }
-                    AlterSubscriptionActionFact::SetOptions(options) => {
-                        if let Some(crate::model::replication::SubscriptionOverlay::Present(
-                            subscription,
-                        )) = self.local.subscriptions.get_mut(&s.name)
-                        {
-                            for option in options {
-                                Self::set_subscription_option(subscription, option);
-                                if option.name.eq_ignore_ascii_case("slot_name") {
-                                    subscription.slot_name =
-                                        (!option.value.eq_ignore_ascii_case("none"))
-                                            .then(|| option.value.clone());
-                                }
-                            }
-                        }
-                    }
-                    AlterSubscriptionActionFact::Skip(options) => {
-                        if let Some(crate::model::replication::SubscriptionOverlay::Present(
-                            subscription,
-                        )) = self.local.subscriptions.get_mut(&s.name)
-                        {
-                            for option in options {
-                                let mut normalized = option.clone();
-                                normalized.name = "skip_lsn".to_string();
-                                Self::set_subscription_option(subscription, &normalized);
-                            }
-                        }
-                    }
-                    AlterSubscriptionActionFact::OwnerChange(role) => {
-                        if let Some((owner, known)) = self.role_fact_identity(role) {
-                            if known {
-                                if let Some(
-                                    crate::model::replication::SubscriptionOverlay::Present(
-                                        subscription,
-                                    ),
-                                ) = self.local.subscriptions.get_mut(&s.name)
-                                {
-                                    subscription.owner = Some(owner);
-                                }
-                            } else {
-                                self.snapshot_confidence();
-                                self.local.confidence = Confidence::Tainted;
-                                if let Some(
-                                    crate::model::replication::SubscriptionOverlay::Present(
-                                        subscription,
-                                    ),
-                                ) = self.local.subscriptions.get_mut(&s.name)
-                                {
-                                    subscription.owner = None;
-                                }
-                            }
-                        } else {
-                            self.snapshot_confidence();
-                            self.local.confidence = Confidence::Tainted;
-                            if let Some(crate::model::replication::SubscriptionOverlay::Present(
-                                subscription,
-                            )) = self.local.subscriptions.get_mut(&s.name)
-                            {
-                                subscription.owner = None;
-                            }
-                        }
-                    }
-                    AlterSubscriptionActionFact::Rename { to } => {
-                        if matches!(
-                            self.local.subscriptions.get(to),
-                            Some(crate::model::replication::SubscriptionOverlay::Present(_))
-                        ) {
-                            return MutationResult::Conflict {
-                                reason: format!("subscription '{}' already exists", to),
-                            };
-                        }
-                        rename_to = Some(to.clone());
-                    }
-                }
-
-                if let Some(crate::model::replication::SubscriptionOverlay::Present(subscription)) =
-                    self.local.subscriptions.get_mut(&s.name)
-                {
-                    subscription.generation = new_gen;
-                }
-                if let Some(to) = rename_to {
-                    self.snapshot_subscription(&to);
-                    let Some(crate::model::replication::SubscriptionOverlay::Present(
-                        mut subscription,
-                    )) = self.local.subscriptions.remove(&s.name)
-                    else {
-                        unreachable!("subscription existence checked above");
-                    };
-                    subscription.name = to.clone();
-                    self.local.subscriptions.insert(
-                        to,
-                        crate::model::replication::SubscriptionOverlay::Present(subscription),
-                    );
-                }
-                MutationResult::Applied
-            }
-            Mutation::DropSubscription(s) => {
-                let has_slot = match self.local.subscriptions.get(&s.name) {
-                    Some(crate::model::replication::SubscriptionOverlay::Present(subscription)) => {
-                        subscription.slot_name.is_some()
-                    }
-                    Some(crate::model::replication::SubscriptionOverlay::Dropped) => {
-                        if !s.if_exists {
-                            return MutationResult::Conflict {
-                                reason: format!("subscription '{}' does not exist", s.name),
-                            };
-                        }
-                        return MutationResult::Skipped;
-                    }
-                    None if s.if_exists && self.baseline_available => {
-                        return MutationResult::Skipped;
-                    }
-                    None if s.if_exists => {
-                        self.snapshot_confidence();
-                        self.local.confidence = Confidence::Tainted;
-                        return MutationResult::Skipped;
-                    }
-                    None => {
-                        if self.baseline_available {
-                            return MutationResult::Conflict {
-                                reason: format!("subscription '{}' does not exist", s.name),
-                            };
-                        }
-                        self.snapshot_confidence();
-                        self.local.confidence = Confidence::Tainted;
-                        return MutationResult::Skipped;
-                    }
-                };
-                if has_slot && !self.local.transactions.is_empty() {
-                    return MutationResult::Conflict {
-                        reason: format!(
-                            "subscription '{}' has a replication slot and cannot be dropped inside a transaction",
-                            s.name
-                        ),
-                    };
-                }
-                self.snapshot_confidence();
-                self.local.confidence = Confidence::Tainted;
-                self.snapshot_subscription(&s.name);
-                self.local.subscriptions.insert(
-                    s.name.clone(),
-                    crate::model::replication::SubscriptionOverlay::Dropped,
-                );
-                MutationResult::Applied
-            }
+            Mutation::DropSubscription(subscription) => self.apply_drop_subscription(subscription),
             Mutation::CreateRole(role) => self.apply_create_role(role),
             Mutation::AlterRole(role) => self.apply_alter_role(role),
             Mutation::DropRole(role) => self.apply_drop_role(role),
@@ -5273,7 +1957,7 @@ impl AnalysisState {
                     publications: self.local.publications.clone(),
                     triggers: self.local.triggers.clone(),
                     constraints: self.local.constraints.clone(),
-                    graph: self.local.graph.edges.clone(),
+                    graph: self.local.graph.edges().to_vec(),
                     pending_validation: self.local.pending_validation.clone(),
                     baseline_relations: self.baseline_relations.clone(),
                     baseline_indexes: self.baseline_indexes.clone(),
@@ -5320,7 +2004,7 @@ impl AnalysisState {
 
         self.snapshot_graph_full();
         self.local.graph.propagate_rename(old_id, new_id);
-        self.local.graph.edges.push(DependencyEdge::new(
+        self.local.graph.add_edge(DependencyEdge::new(
             old_id.clone(),
             new_id.clone(),
             DependencyKind::RenameTo,
@@ -5459,7 +2143,7 @@ impl AnalysisState {
     fn snapshot_graph_full(&mut self) {
         if let Some(frame) = self.local.transactions.last_mut() {
             frame.undo_log.push(StateChange::GraphSnapshot {
-                previous: self.local.graph.edges.clone(),
+                previous: self.local.graph.edges().to_vec(),
             });
         }
     }
@@ -5616,5 +2300,31 @@ impl AnalysisState {
                 }
             }
         }
+    }
+
+    pub(crate) fn transaction_undo_checkpoint(&self) -> Option<(usize, usize)> {
+        self.local
+            .transactions
+            .last()
+            .map(|frame| (self.local.transactions.len(), frame.undo_log.len()))
+    }
+
+    pub(crate) fn rollback_to_transaction_undo_checkpoint(
+        &mut self,
+        transaction_depth: usize,
+        undo_len: usize,
+    ) -> Result<(), &'static str> {
+        if self.local.transactions.len() != transaction_depth {
+            return Err("statement changed transaction depth while using an undo checkpoint");
+        }
+        let Some(frame) = self.local.transactions.last_mut() else {
+            return Err("statement undo checkpoint lost its transaction frame");
+        };
+        if frame.undo_log.len() < undo_len {
+            return Err("statement shortened the transaction undo log unexpectedly");
+        }
+        let statement_undo = frame.undo_log.split_off(undo_len);
+        self.rollback_undo_log(statement_undo);
+        Ok(())
     }
 }

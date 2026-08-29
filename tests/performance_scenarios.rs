@@ -1,11 +1,57 @@
 mod common;
 
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+struct CountingAllocator;
+
+static ALLOCATION_COUNT: AtomicUsize = AtomicUsize::new(0);
+static ALLOCATED_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+unsafe impl GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let pointer = unsafe { System.alloc(layout) };
+        if !pointer.is_null() {
+            ALLOCATION_COUNT.fetch_add(1, Ordering::Relaxed);
+            ALLOCATED_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
+        }
+        pointer
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        let pointer = unsafe { System.alloc_zeroed(layout) };
+        if !pointer.is_null() {
+            ALLOCATION_COUNT.fetch_add(1, Ordering::Relaxed);
+            ALLOCATED_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
+        }
+        pointer
+    }
+
+    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(pointer, layout) };
+    }
+
+    unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let pointer = unsafe { System.realloc(pointer, layout, new_size) };
+        if !pointer.is_null() {
+            ALLOCATION_COUNT.fetch_add(1, Ordering::Relaxed);
+            ALLOCATED_BYTES.fetch_add(new_size, Ordering::Relaxed);
+        }
+        pointer
+    }
+}
+
+#[global_allocator]
+static GLOBAL_ALLOCATOR: CountingAllocator = CountingAllocator;
+
 mod performance_scenarios {
+    use super::{ALLOCATED_BYTES, ALLOCATION_COUNT};
     use crate::common::{object_id, setup_engine, setup_state};
     use safe_migrate::db::cache::{DbCache, DbCacheVersioned};
     use safe_migrate::db::cache_file::{CACHE_KEY_ENV, protect_cache_bytes, unprotect_cache_bytes};
     use safe_migrate::model::relation::{Persistence, RelationKind, RelationState};
     use std::io::Cursor;
+    use std::sync::atomic::Ordering;
     use std::time::Instant;
 
     const LARGE_BASELINE_RELATIONS: usize = 1_000;
@@ -41,6 +87,94 @@ mod performance_scenarios {
             );
         }
         cache
+    }
+
+    fn allocation_snapshot() -> (usize, usize) {
+        (
+            ALLOCATION_COUNT.load(Ordering::Relaxed),
+            ALLOCATED_BYTES.load(Ordering::Relaxed),
+        )
+    }
+
+    fn allocation_delta(before: (usize, usize)) -> (usize, usize) {
+        let after = allocation_snapshot();
+        (after.0 - before.0, after.1 - before.1)
+    }
+
+    #[test]
+    #[ignore = "manual allocation scenario; run alone with --ignored --nocapture"]
+    fn large_state_checkpoint_and_prestate_capture() {
+        let state = safe_migrate::AnalysisState::with_baseline(large_baseline(), true);
+
+        let started = Instant::now();
+        let before = allocation_snapshot();
+        let checkpoint = std::hint::black_box(state.clone());
+        let checkpoint_allocations = allocation_delta(before);
+        let checkpoint_elapsed = started.elapsed();
+        assert_eq!(checkpoint.local.relations.len(), LARGE_BASELINE_RELATIONS);
+
+        let started = Instant::now();
+        let before = allocation_snapshot();
+        let pre_state = std::hint::black_box(state.capture_pre_state());
+        let pre_state_allocations = allocation_delta(before);
+        let pre_state_elapsed = started.elapsed();
+        assert_eq!(pre_state.relations.len(), LARGE_BASELINE_RELATIONS);
+
+        eprintln!(
+            "scenario=large_state_checkpoint relations={LARGE_BASELINE_RELATIONS} allocations={} allocated_bytes={} elapsed_us={}",
+            checkpoint_allocations.0,
+            checkpoint_allocations.1,
+            checkpoint_elapsed.as_micros()
+        );
+        eprintln!(
+            "scenario=large_prestate_capture relations={LARGE_BASELINE_RELATIONS} allocations={} allocated_bytes={} elapsed_us={}",
+            pre_state_allocations.0,
+            pre_state_allocations.1,
+            pre_state_elapsed.as_micros()
+        );
+    }
+
+    #[test]
+    #[ignore = "manual allocation scenario; run alone with --ignored --nocapture"]
+    fn large_baseline_short_chain_allocations() {
+        let engine = setup_engine();
+        let mut state = safe_migrate::AnalysisState::with_baseline(large_baseline(), true);
+        let files = (0..50)
+            .map(|index| {
+                (
+                    format!("V{index:04}__alter.sql"),
+                    format!("ALTER TABLE perf_baseline_{index} ADD COLUMN measured_value integer;"),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let started = Instant::now();
+        let before = allocation_snapshot();
+        let findings = engine
+            .analyze_chain(&files, &mut state)
+            .expect("large-baseline allocation chain should analyze");
+        let allocations = allocation_delta(before);
+        let elapsed = started.elapsed();
+
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding.rule_id != "chain-conflict"),
+            "unexpected state conflict: {findings:?}"
+        );
+        let relation = state
+            .get_relation(&object_id("public", "perf_baseline_49"))
+            .expect("last baseline relation should remain present");
+        let safe_migrate::model::relation::RelationOverlay::Present(relation) = relation else {
+            panic!("last baseline relation was dropped");
+        };
+        assert!(relation.has_column("measured_value"));
+        eprintln!(
+            "scenario=large_baseline_short_chain statements=50 relations={LARGE_BASELINE_RELATIONS} allocations={} allocated_bytes={} elapsed_ms={}",
+            allocations.0,
+            allocations.1,
+            elapsed.as_millis()
+        );
     }
 
     #[test]
@@ -166,6 +300,63 @@ mod performance_scenarios {
             "rename_and_cascade_dependency_graph",
             GRAPH_OBJECTS * 3 + 4,
             elapsed,
+        );
+    }
+
+    #[test]
+    #[ignore = "manual graph-index scenario; run alone with --ignored --nocapture"]
+    fn large_dependency_graph_lookup_index() {
+        use safe_migrate::analysis::graph::{DependencyEdge, DependencyGraph, DependencyKind};
+
+        const EDGES: usize = 10_000;
+        const TARGETS: usize = 100;
+        const ROUNDS: usize = 10;
+
+        let mut graph = DependencyGraph::new();
+        for index in 0..EDGES {
+            graph.add_edge(DependencyEdge::new(
+                object_id("public", &format!("perf_view_{index}")),
+                object_id("public", &format!("perf_target_{}", index % TARGETS)),
+                DependencyKind::ViewDependency { view_generation: 1 },
+            ));
+        }
+        let targets = (0..TARGETS)
+            .map(|index| object_id("public", &format!("perf_target_{index}")))
+            .collect::<Vec<_>>();
+
+        let indexed_started = Instant::now();
+        let mut indexed_count = 0;
+        for _ in 0..ROUNDS {
+            for target in &targets {
+                indexed_count += graph.cascade_edges(target).len();
+            }
+        }
+        let indexed_elapsed = indexed_started.elapsed();
+
+        let scan_started = Instant::now();
+        let mut scan_count = 0;
+        for _ in 0..ROUNDS {
+            for target in &targets {
+                scan_count += graph
+                    .edges()
+                    .iter()
+                    .filter(|edge| {
+                        matches!(edge.kind, DependencyKind::ViewDependency { .. })
+                            && edge.referenced == *target
+                    })
+                    .count();
+            }
+        }
+        let scan_elapsed = scan_started.elapsed();
+
+        assert_eq!(indexed_count, EDGES * ROUNDS);
+        assert_eq!(scan_count, indexed_count);
+        assert!(graph.indexes_are_valid());
+        eprintln!(
+            "scenario=large_dependency_graph_lookup_index edges={EDGES} lookups={} indexed_us={} canonical_scan_us={}",
+            TARGETS * ROUNDS,
+            indexed_elapsed.as_micros(),
+            scan_elapsed.as_micros()
         );
     }
 

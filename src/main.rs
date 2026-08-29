@@ -863,42 +863,33 @@ fn decode_cache(cache_path: &Path, cache_encryption: bool) -> Result<(DbCache, u
         )
     })?;
     let mut decoder = decoder.take(MAX_CACHE_DECODE_BYTES as u64 + 1);
-    let mut payload = Vec::new();
-    decoder.read_to_end(&mut payload).map_err(|error| {
-        anyhow!(
-            "Cache file '{}' is corrupted while decompressing: {}",
-            cache_path.display(),
-            error
-        )
-    })?;
-    if payload.len() > MAX_CACHE_DECODE_BYTES {
+    let mut header = vec![0; CACHE_V6_MAGIC.len()];
+    let mut header_len = 0;
+    while header_len < header.len() {
+        let read = decoder.read(&mut header[header_len..]).map_err(|error| {
+            anyhow!(
+                "Cache file '{}' is corrupted while decompressing: {}",
+                cache_path.display(),
+                error
+            )
+        })?;
+        if read == 0 {
+            break;
+        }
+        header_len += read;
+    }
+    if header_len != CACHE_V6_MAGIC.len() || header != CACHE_V6_MAGIC {
         anyhow::bail!(
-            "Cache file '{}' exceeds the {} MiB decoded-size limit",
-            cache_path.display(),
-            MAX_CACHE_DECODE_BYTES / (1024 * 1024)
+            "Cache file '{}' uses an unsupported cache format. Run `safe-migrate sync` to rebuild it.",
+            cache_path.display()
         );
     }
 
     let config = bincode::config::standard()
         .with_variable_int_encoding()
         .with_limit::<MAX_CACHE_DECODE_BYTES>();
-
-    let (encoded_payload, header_version) = if let Some(v6_payload) =
-        payload.strip_prefix(CACHE_V6_MAGIC)
-    {
-        (v6_payload, 6)
-    } else {
-        anyhow::bail!(
-            "Cache file '{}' uses an unsupported cache format. Run `safe-migrate sync` to rebuild it.",
-            cache_path.display()
-        );
-    };
-
-    let (versioned, bytes_read): (DbCacheVersioned, usize) = bincode::serde::decode_from_slice(
-        encoded_payload,
-        config,
-    )
-    .map_err(|error| {
+    let versioned: DbCacheVersioned =
+        bincode::serde::decode_from_std_read(&mut decoder, config).map_err(|error| {
         if matches!(&error, bincode::error::DecodeError::LimitExceeded) {
             return anyhow!(
                 "Cache file '{}' exceeds the {} MiB decoded-size limit",
@@ -912,12 +903,29 @@ fn decode_cache(cache_path: &Path, cache_encryption: bool) -> Result<(DbCache, u
             error
         )
     })?;
-    if bytes_read != encoded_payload.len() {
+    let remaining_before_trailing = decoder.limit();
+    std::io::copy(&mut decoder, &mut std::io::sink()).map_err(|error| {
+        anyhow!(
+            "Cache file '{}' is corrupted while decompressing: {}",
+            cache_path.display(),
+            error
+        )
+    })?;
+    let decompressed_bytes = (MAX_CACHE_DECODE_BYTES as u64 + 1) - decoder.limit();
+    if decompressed_bytes > MAX_CACHE_DECODE_BYTES as u64 {
+        anyhow::bail!(
+            "Cache file '{}' exceeds the {} MiB decoded-size limit",
+            cache_path.display(),
+            MAX_CACHE_DECODE_BYTES / (1024 * 1024)
+        );
+    }
+    if decoder.limit() != remaining_before_trailing {
         anyhow::bail!(
             "Cache file '{}' is corrupted (trailing payload data). Run `safe-migrate sync` to rebuild it.",
             cache_path.display()
         );
     }
+    let header_version = 6;
     let format_version = versioned.format_version();
     if format_version != header_version {
         anyhow::bail!(

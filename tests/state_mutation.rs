@@ -2,9 +2,13 @@ mod common;
 
 mod state_mutation_tests {
     use crate::common::*;
+    use safe_migrate::analysis::facts::FunctionSigFact;
     use safe_migrate::analysis::graph::{DependencyEdge, DependencyGraph, DependencyKind};
-    use safe_migrate::analysis::state::Confidence;
-    use safe_migrate::ast::identifiers::ObjectId;
+    use safe_migrate::analysis::mutations::{
+        DropAggregateMutation, DropFunctionMutation, DropProcedureMutation, Mutation,
+    };
+    use safe_migrate::analysis::state::{Confidence, MutationResult};
+    use safe_migrate::ast::identifiers::{Ident, ObjectId, QualifiedName};
     use safe_migrate::db::cache::{DbCache, DependencyCache};
     use safe_migrate::model::constraint::ConstraintKind;
     use safe_migrate::model::function::{
@@ -80,12 +84,12 @@ mod state_mutation_tests {
         cache.dependencies.push(dependency(&table_id));
 
         let state = safe_migrate::AnalysisState::new(cache);
-        assert!(!state.local.graph.edges.iter().any(|edge| {
+        assert!(!state.local.graph.edges().iter().any(|edge| {
             matches!(edge.kind, DependencyKind::ViewDependency { .. })
                 && edge.dependent == view_id
                 && edge.referenced == view_id
         }));
-        assert!(state.local.graph.edges.iter().any(|edge| {
+        assert!(state.local.graph.edges().iter().any(|edge| {
             matches!(edge.kind, DependencyKind::ViewDependency { .. })
                 && edge.dependent == view_id
                 && edge.referenced == table_id
@@ -133,7 +137,7 @@ mod state_mutation_tests {
             !state
                 .local
                 .graph
-                .edges
+                .edges()
                 .iter()
                 .any(|edge| { edge.dependent == view_id && edge.referenced == table_id })
         );
@@ -318,7 +322,7 @@ mod state_mutation_tests {
             state
                 .local
                 .graph
-                .edges
+                .edges()
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
@@ -350,12 +354,12 @@ mod state_mutation_tests {
         let b = object_id("public", "b");
         let child = object_id("public", "new_child");
         let mut graph = DependencyGraph::new();
-        graph.edges.push(DependencyEdge::new(
+        graph.add_edge(DependencyEdge::new(
             a.clone(),
             b.clone(),
             DependencyKind::PartitionOf,
         ));
-        graph.edges.push(DependencyEdge::new(
+        graph.add_edge(DependencyEdge::new(
             b,
             a.clone(),
             DependencyKind::PartitionOf,
@@ -380,7 +384,7 @@ mod state_mutation_tests {
             state
                 .local
                 .graph
-                .edges
+                .edges()
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
@@ -392,7 +396,7 @@ mod state_mutation_tests {
             !state
                 .local
                 .graph
-                .edges
+                .edges()
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
@@ -418,7 +422,7 @@ mod state_mutation_tests {
             state
                 .local
                 .graph
-                .edges
+                .edges()
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
@@ -435,7 +439,7 @@ mod state_mutation_tests {
             state
                 .local
                 .graph
-                .edges
+                .edges()
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
@@ -462,7 +466,7 @@ mod state_mutation_tests {
             state
                 .local
                 .graph
-                .edges
+                .edges()
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
@@ -477,7 +481,7 @@ mod state_mutation_tests {
             state
                 .local
                 .graph
-                .edges
+                .edges()
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
@@ -504,7 +508,7 @@ mod state_mutation_tests {
             state
                 .local
                 .graph
-                .edges
+                .edges()
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
@@ -531,7 +535,7 @@ mod state_mutation_tests {
             state
                 .local
                 .graph
-                .edges
+                .edges()
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
@@ -550,7 +554,7 @@ mod state_mutation_tests {
             state
                 .local
                 .graph
-                .edges
+                .edges()
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
@@ -1477,7 +1481,7 @@ mod state_mutation_tests {
             .unwrap();
         assert!(state.local.publications.contains_key("pub"));
 
-        let deps = &state.local.graph.edges;
+        let deps = &state.local.graph.edges();
         assert!(
             deps.iter()
                 .any(|d| matches!(&d.kind, DependencyKind::PublicationIncludes { publication_name } if publication_name == "pub") && d.dependent == object_id("public", "t1"))
@@ -1687,7 +1691,7 @@ mod state_mutation_tests {
             )
             .unwrap();
 
-        assert!(state.local.graph.edges.iter().any(|edge| {
+        assert!(state.local.graph.edges().iter().any(|edge| {
             edge.dependent == object_id("public", "indexed_table_id_idx")
                 && edge.referenced == object_id("public", "indexed_table")
                 && matches!(
@@ -1821,7 +1825,7 @@ mod state_mutation_tests {
             state
                 .local
                 .graph
-                .edges
+                .edges()
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
@@ -1849,7 +1853,7 @@ mod state_mutation_tests {
             )
             .unwrap();
 
-        assert!(!state.local.graph.edges.iter().any(|edge| {
+        assert!(!state.local.graph.edges().iter().any(|edge| {
             matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
                 && edge.referenced == object_id("public", "mv")
         }));
@@ -2120,6 +2124,120 @@ mod state_mutation_tests {
     }
 
     #[test]
+    fn routine_drop_lookup_outcomes_preserve_guarded_and_unknown_semantics() {
+        fn signature(schema: &str) -> FunctionSigFact {
+            FunctionSigFact {
+                name: QualifiedName::new(
+                    Some(Ident::new(schema, false)),
+                    Ident::new("work", false),
+                ),
+                params: vec!["integer".into()],
+            }
+        }
+
+        fn routine(kind: RoutineKind) -> FunctionState {
+            let id = object_id("public", "work(integer)");
+            FunctionState {
+                id,
+                routine_kind: kind,
+                arg_types: vec!["integer".into()],
+                arg_type_ids: Vec::new(),
+                return_type: "void".into(),
+                return_type_id: None,
+                volatility: Volatility::Volatile,
+                language: "sql".into(),
+                security: SecurityMode::Invoker,
+            }
+        }
+
+        let function_drop = |schema: &str, if_exists| {
+            Mutation::DropFunction(DropFunctionMutation {
+                signatures: vec![signature(schema)],
+                if_exists,
+                cascade: false,
+            })
+        };
+        let procedure_drop = |schema: &str, if_exists| {
+            Mutation::DropProcedure(DropProcedureMutation {
+                signatures: vec![signature(schema)],
+                if_exists,
+                cascade: false,
+            })
+        };
+        let aggregate_drop = |schema: &str, if_exists| {
+            Mutation::DropAggregate(DropAggregateMutation {
+                signatures: vec![signature(schema)],
+                if_exists,
+                cascade: false,
+            })
+        };
+
+        for (kind, drop) in [
+            (RoutineKind::Procedure, function_drop("public", true)),
+            (RoutineKind::Function, procedure_drop("public", true)),
+        ] {
+            let mut cache = DbCache::new();
+            cache
+                .functions
+                .insert(object_id("public", "work(integer)"), routine(kind));
+            let mut state = safe_migrate::AnalysisState::new(cache);
+            assert!(matches!(
+                state.apply(&drop, None),
+                MutationResult::Conflict { .. }
+            ));
+            assert_eq!(state.local.confidence, Confidence::Exact);
+        }
+
+        let mut wrong_kind_cache = DbCache::new();
+        wrong_kind_cache.functions.insert(
+            object_id("public", "work(integer)"),
+            routine(RoutineKind::Function),
+        );
+        let mut wrong_kind_state = safe_migrate::AnalysisState::new(wrong_kind_cache);
+        assert_eq!(
+            wrong_kind_state.apply(&aggregate_drop("public", true), None),
+            MutationResult::Skipped
+        );
+        assert_eq!(wrong_kind_state.local.confidence, Confidence::Exact);
+
+        for drop in [
+            function_drop("public", true),
+            procedure_drop("public", true),
+            aggregate_drop("public", true),
+        ] {
+            let mut state = setup_state();
+            assert_eq!(state.apply(&drop, None), MutationResult::Skipped);
+            assert_eq!(state.local.confidence, Confidence::Exact);
+        }
+
+        for drop in [
+            function_drop("tenant", false),
+            procedure_drop("tenant", false),
+            aggregate_drop("tenant", false),
+        ] {
+            let mut cache = DbCache::new();
+            cache.metadata.schemas = Some(vec!["public".into()]);
+            let mut state = safe_migrate::AnalysisState::new(cache);
+            assert_eq!(state.apply(&drop, None), MutationResult::Skipped);
+            assert_eq!(state.local.confidence, Confidence::Tainted);
+        }
+
+        let mut cache = DbCache::new();
+        cache.metadata.schemas = Some(vec!["public".into()]);
+        let mut state = safe_migrate::AnalysisState::new(cache);
+        assert_eq!(
+            state.apply(&function_drop("tenant", true), None),
+            MutationResult::Skipped
+        );
+        assert_eq!(state.local.confidence, Confidence::Exact);
+        assert_eq!(
+            state.apply(&aggregate_drop("tenant", true), None),
+            MutationResult::Skipped
+        );
+        assert_eq!(state.local.confidence, Confidence::Tainted);
+    }
+
+    #[test]
     fn procedure_kind_and_lifecycle_are_enforced_within_the_chain() {
         let engine = setup_engine();
         let mut state = setup_state();
@@ -2327,7 +2445,7 @@ mod state_mutation_tests {
             panic!("expected explicit publication scope");
         };
         assert_eq!(objects.len(), 2);
-        assert!(state.local.graph.edges.iter().any(|edge| {
+        assert!(state.local.graph.edges().iter().any(|edge| {
             matches!(
                 &edge.kind,
                 DependencyKind::PublicationIncludes { publication_name }

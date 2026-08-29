@@ -1,4 +1,4 @@
-use super::{AnalysisState, Confidence, MutationResult};
+use super::{AnalysisState, Confidence, MutationResult, ObjectLookup};
 use crate::analysis::facts::RoleFact;
 use crate::analysis::mutations::{
     AlterRoleMutation, CreateRoleMutation, DropRoleMutation, GrantMutation, ResolvedGrantTarget,
@@ -7,13 +7,21 @@ use crate::analysis::mutations::{
 use crate::ast::identifiers::ObjectId;
 use crate::model::role::{RoleOverlay, RoleState};
 
+type RoleLookup = ObjectLookup;
+
 impl AnalysisState {
+    fn role_lookup(&self, id: &ObjectId) -> RoleLookup {
+        match self.local.roles.get(id) {
+            Some(RoleOverlay::Present(_)) => RoleLookup::Present,
+            Some(RoleOverlay::Dropped) => RoleLookup::Tombstone,
+            None if self.local.roles_known => RoleLookup::AuthoritativelyAbsent,
+            None => RoleLookup::Unknown,
+        }
+    }
+
     pub(super) fn apply_create_role(&mut self, role: &CreateRoleMutation) -> MutationResult {
         let role_id = ObjectId::new("", &role.name);
-        if matches!(
-            self.local.roles.get(&role_id),
-            Some(RoleOverlay::Present(_))
-        ) {
+        if self.role_lookup(&role_id) == RoleLookup::Present {
             return MutationResult::Conflict {
                 reason: format!("role '{}' already exists", role.name),
             };
@@ -44,9 +52,13 @@ impl AnalysisState {
             return MutationResult::Skipped;
         };
         self.snapshot_role(&role_id);
-        if !self.local.roles.contains_key(&role_id) {
-            self.local.confidence = Confidence::Tainted;
-            return MutationResult::Skipped;
+        match self.role_lookup(&role_id) {
+            RoleLookup::Present | RoleLookup::Tombstone => {}
+            RoleLookup::AuthoritativelyAbsent | RoleLookup::Unknown => {
+                self.local.confidence = Confidence::Tainted;
+                return MutationResult::Skipped;
+            }
+            RoleLookup::WrongKind => unreachable!("roles have a dedicated namespace"),
         }
         self.snapshot_generation_counter();
         self.local.generation_counter += 1;
@@ -64,12 +76,7 @@ impl AnalysisState {
                 &self.local.session_role,
             ) {
                 self.snapshot_role(&role_id);
-                if !role.if_exists
-                    && !matches!(
-                        self.local.roles.get(&role_id),
-                        Some(RoleOverlay::Present(_))
-                    )
-                {
+                if !role.if_exists && self.role_lookup(&role_id) != RoleLookup::Present {
                     return MutationResult::Conflict {
                         reason: format!("role '{}' does not exist", name),
                     };
@@ -81,7 +88,7 @@ impl AnalysisState {
     }
 
     pub(super) fn apply_grant(&mut self, grant: &GrantMutation) -> MutationResult {
-        let privileges = Self::resolve_grant_privileges(&grant.privileges);
+        let privileges = self.resolve_grant_privileges(&grant.privileges);
         match &grant.target {
             ResolvedGrantTarget::Tables(ids) => {
                 for id in ids {
@@ -105,7 +112,7 @@ impl AnalysisState {
     }
 
     pub(super) fn apply_revoke(&mut self, revoke: &RevokeMutation) -> MutationResult {
-        let privileges = Self::resolve_grant_privileges(&revoke.privileges);
+        let privileges = self.resolve_grant_privileges(&revoke.privileges);
         match &revoke.target {
             ResolvedGrantTarget::Tables(ids) => {
                 for id in ids {

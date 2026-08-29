@@ -11,6 +11,8 @@ pub enum Privilege {
     References,
     Trigger,
     All,
+    /// PostgreSQL 18's table-maintenance privilege.
+    Maintain,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -120,7 +120,7 @@ mod architectural_gap_tests {
             state
                 .local
                 .graph
-                .edges
+                .edges()
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
@@ -137,7 +137,7 @@ mod architectural_gap_tests {
             state
                 .local
                 .graph
-                .edges
+                .edges()
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
@@ -233,13 +233,13 @@ mod architectural_gap_tests {
             )
             .unwrap();
 
-        assert!(state.local.graph.edges.iter().any(|e| matches!(
+        assert!(state.local.graph.edges().iter().any(|e| matches!(
             e.kind,
             safe_migrate::analysis::graph::DependencyKind::ViewDependency { .. }
         ) && e.dependent
             == object_id("public", "v")
             && e.referenced == object_id("public", "base_table")));
-        assert!(!state.local.graph.edges.iter().any(|e| matches!(
+        assert!(!state.local.graph.edges().iter().any(|e| matches!(
             e.kind,
             safe_migrate::analysis::graph::DependencyKind::ViewDependency { .. }
         ) && e.dependent
@@ -258,7 +258,7 @@ mod architectural_gap_tests {
             .analyze("CREATE VIEW v AS SELECT * FROM app_sessions;", &mut state)
             .unwrap();
 
-        assert!(state.local.graph.edges.iter().any(|e| matches!(
+        assert!(state.local.graph.edges().iter().any(|e| matches!(
             e.kind,
             safe_migrate::analysis::graph::DependencyKind::ViewDependency { .. }
         ) && e.dependent
@@ -278,7 +278,7 @@ mod architectural_gap_tests {
             .unwrap();
 
         assert!(
-            state.local.graph.edges.iter().any(|e| matches!(
+            state.local.graph.edges().iter().any(|e| matches!(
                 e.kind,
                 safe_migrate::analysis::graph::DependencyKind::ViewDependency { .. }
             ) && e.dependent == object_id("public", "v")
@@ -287,7 +287,7 @@ mod architectural_gap_tests {
         );
 
         assert!(
-            !state.local.graph.edges.iter().any(|e| matches!(
+            !state.local.graph.edges().iter().any(|e| matches!(
                 e.kind,
                 safe_migrate::analysis::graph::DependencyKind::ViewDependency { .. }
             ) && e.dependent == object_id("public", "v")
@@ -307,7 +307,7 @@ mod architectural_gap_tests {
             state
                 .local
                 .graph
-                .edges
+                .edges()
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
@@ -337,7 +337,7 @@ mod architectural_gap_tests {
             state
                 .local
                 .graph
-                .edges
+                .edges()
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
@@ -416,7 +416,7 @@ mod architectural_gap_tests {
             state
                 .local
                 .graph
-                .edges
+                .edges()
                 .iter()
                 .filter(|e| matches!(
                     e.kind,

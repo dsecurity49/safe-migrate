@@ -69,7 +69,8 @@ mod tests {
             statement_index: Some(1),
         };
 
-        let markdown = Reporter::markdown_report(&[finding], &Confidence::Exact);
+        let markdown =
+            Reporter::markdown_report(std::slice::from_ref(&finding), &Confidence::Exact);
         assert!(markdown.starts_with("# safe-migrate report\n"));
         assert!(markdown.contains("**Verdict:** CAUTIOUS"));
         assert!(markdown.contains("### WARN — test-rule (`test-rule`)"));
@@ -117,53 +118,36 @@ mod tests {
             std::slice::from_ref(&finding),
             &Confidence::Exact,
         );
-        assert_eq!(
-            json,
-            serde_json::json!({
-                "schema_version": 1,
-                "confidence": "Exact",
-                "verdict": "CAUTIOUS",
-                "summary": {"total": 1, "tier1": 0, "tier2": 1, "tier3": 0},
-                "violations": [{
-                    "rule_id": "test-rule",
-                    "operation_kind": {"Other": "test"},
-                    "object_kind": "Unknown",
-                    "object_name": "test.object",
-                    "tier": "Tier2",
-                    "reason": "needs review",
-                    "recipe": "test recipe",
-                    "dedup_key": null,
-                    "sql": null,
-                    "fk_dependency_related": false,
-                    "location": {
-                        "file": "migrations/001.sql",
-                        "line": 3,
-                        "column": 5
-                    },
-                    "statement_index": 1
-                }]
-            })
-        );
+        let expected_json: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/golden/representative-report.json"
+        ))
+        .expect("JSON golden must be valid");
+        assert_eq!(json, expected_json);
 
-        let markdown = Reporter::markdown_report(&[finding], &Confidence::Exact);
+        let markdown =
+            Reporter::markdown_report(std::slice::from_ref(&finding), &Confidence::Exact);
         assert_eq!(
             markdown,
-            "# safe-migrate report\n\n\
-**Verdict:** CAUTIOUS  \n\
-**Confidence:** Exact\n\n\
-| Severity | Findings |\n\
-| --- | ---: |\n\
-| HALT (Tier 1) | 0 |\n\
-| WARN (Tier 2) | 1 |\n\
-| SAFE (Tier 3) | 0 |\n\n\
-## Findings\n\n\
-### WARN — test-rule (`test-rule`)\n\n\
-**Location:** `migrations/001.sql:3:5`  \n\
-**Statement:** 1  \n\
-**Object:** object test.object  \n\
-**Reason:** needs review  \n\
-**Recommendation:** test recipe\n"
+            include_str!("../../tests/golden/representative-report.md")
         );
+
+        let canonical_json = serde_json::to_string_pretty(&json).expect("serialize report");
+        for _ in 0..32 {
+            assert_eq!(
+                serde_json::to_string_pretty(&Reporter::json_report_with_locations(
+                    std::slice::from_ref(&finding),
+                    &Confidence::Exact,
+                ))
+                .expect("serialize repeated report"),
+                canonical_json,
+                "JSON output must be byte-stable across repeated runs"
+            );
+            assert_eq!(
+                Reporter::markdown_report(std::slice::from_ref(&finding), &Confidence::Exact),
+                markdown,
+                "Markdown output must be byte-stable across repeated runs"
+            );
+        }
     }
 
     #[test]

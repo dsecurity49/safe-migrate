@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "confidence": "Exact",
+  "verdict": "CAUTIOUS",
+  "summary": {
+    "total": 1,
+    "tier1": 0,
+    "tier2": 1,
+    "tier3": 0
+  },
+  "violations": [
+    {
+      "rule_id": "test-rule",
+      "operation_kind": {
+        "Other": "test"
+      },
+      "object_kind": "Unknown",
+      "object_name": "test.object",
+      "tier": "Tier2",
+      "reason": "needs review",
+      "recipe": "test recipe",
+      "dedup_key": null,
+      "sql": null,
+      "fk_dependency_related": false,
+      "location": {
+        "file": "migrations/001.sql",
+        "line": 3,
+        "column": 5
+      },
+      "statement_index": 1
+    }
+  ]
+}

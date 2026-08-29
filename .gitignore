@@ -20,6 +20,7 @@ graph.json
 AGENTS.md
 .git/
 *.json
+!tests/golden/*.json
 !live_tests/differential_baseline.sql
 !live_tests/differential_manifest.json
 !live_tests/**/*.sql

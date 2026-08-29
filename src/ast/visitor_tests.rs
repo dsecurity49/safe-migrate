@@ -55,6 +55,28 @@ mod tests {
     }
 
     #[test]
+    fn postgres18_maintain_privilege_is_extracted_from_grant_and_revoke() {
+        for sql in [
+            "GRANT MAINTAIN ON TABLE test_table TO app_user;",
+            "REVOKE MAINTAIN ON TABLE test_table FROM app_user;",
+        ] {
+            let fact = parse_and_extract_statement(sql).expect("privilege fact");
+            let privileges = match fact {
+                StatementFact::Grant(grant) => grant.privileges,
+                StatementFact::Revoke(revoke) => revoke.privileges,
+                other => panic!("expected grant or revoke fact, got {other:?}"),
+            };
+            assert_eq!(
+                privileges,
+                crate::analysis::facts::PrivilegeSpec::List(vec![
+                    crate::analysis::facts::PrivilegeFact::Maintain,
+                ]),
+                "MAINTAIN must remain a typed relation privilege: {sql}"
+            );
+        }
+    }
+
+    #[test]
     fn test_create_table_with_columns() {
         let sql = "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255) NOT NULL);";
         let facts = parse_and_extract_statement(sql);

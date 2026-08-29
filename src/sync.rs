@@ -10,13 +10,14 @@ use postgres::config::Host;
 use postgres::{Client, Config as PostgresConfig, GenericClient, IsolationLevel, NoTls};
 use std::io::{self, Write};
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tempfile::NamedTempFile;
 
 #[cfg(windows)]
 use std::fs;
 
 const MIN_POSTGRES_VERSION_NUM: u32 = 140_000;
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub fn sync_cache(
     out_path: &Path,
@@ -40,7 +41,7 @@ pub fn sync_cache(
 }
 
 fn connect_database(db_url: &str) -> Result<Client> {
-    let config: PostgresConfig = db_url
+    let mut config: PostgresConfig = db_url
         .parse()
         .context("DATABASE_URL is not a valid PostgreSQL connection string")?;
 
@@ -50,9 +51,17 @@ fn connect_database(db_url: &str) -> Result<Client> {
         );
     }
 
+    apply_connection_safety_defaults(&mut config);
+
     config
         .connect(NoTls)
         .context("Failed to connect to PostgreSQL")
+}
+
+fn apply_connection_safety_defaults(config: &mut PostgresConfig) {
+    if config.get_connect_timeout().is_none() {
+        config.connect_timeout(DEFAULT_CONNECT_TIMEOUT);
+    }
 }
 
 pub(crate) fn database_config_is_local(config: &PostgresConfig) -> bool {
@@ -147,6 +156,84 @@ pub(crate) fn relation_owner_id(owner_name: impl Into<String>) -> ObjectId {
 
 pub(crate) fn is_system_schema(schema: &str) -> bool {
     schema == "information_schema" || schema.starts_with("pg_")
+}
+
+fn sequence_kind_from_pg(
+    dependency_type: Option<&str>,
+    has_nextval_default: bool,
+) -> Result<crate::model::sequence::SequenceKind> {
+    match dependency_type {
+        Some("i") => Ok(crate::model::sequence::SequenceKind::Identity),
+        Some("a") if has_nextval_default => Ok(crate::model::sequence::SequenceKind::SerialLike),
+        Some("a") => Ok(crate::model::sequence::SequenceKind::Owned),
+        None => Ok(crate::model::sequence::SequenceKind::Standalone),
+        Some(other) => anyhow::bail!("unsupported pg_depend type '{other}'"),
+    }
+}
+
+fn relation_kind_from_pg(code: u8) -> Result<RelationKind> {
+    match code {
+        b'r' | b'p' => Ok(RelationKind::Table),
+        b'v' => Ok(RelationKind::View),
+        b'm' => Ok(RelationKind::MaterializedView),
+        other => anyhow::bail!("unsupported pg_class.relkind byte {other}"),
+    }
+}
+
+fn persistence_from_pg(code: u8) -> Result<Persistence> {
+    match code {
+        b'p' => Ok(Persistence::Permanent),
+        b't' => Ok(Persistence::Temporary),
+        b'u' => Ok(Persistence::Unlogged),
+        other => anyhow::bail!("unsupported pg_class.relpersistence byte {other}"),
+    }
+}
+
+fn partition_strategy_from_pg(code: Option<&str>) -> Result<Option<String>> {
+    match code {
+        None => Ok(None),
+        Some("r") => Ok(Some("RANGE".to_string())),
+        Some("l") => Ok(Some("LIST".to_string())),
+        Some("h") => Ok(Some("HASH".to_string())),
+        Some(other) => anyhow::bail!("unsupported partition strategy '{other}'"),
+    }
+}
+
+fn routine_volatility_from_pg(code: &str) -> Result<crate::model::function::Volatility> {
+    match code {
+        "v" => Ok(crate::model::function::Volatility::Volatile),
+        "s" => Ok(crate::model::function::Volatility::Stable),
+        "i" => Ok(crate::model::function::Volatility::Immutable),
+        other => anyhow::bail!("unknown pg_proc.provolatile value '{other}'"),
+    }
+}
+
+fn routine_kind_from_pg(code: &str) -> Result<crate::model::function::RoutineKind> {
+    match code {
+        "f" => Ok(crate::model::function::RoutineKind::Function),
+        "p" => Ok(crate::model::function::RoutineKind::Procedure),
+        "a" => Ok(crate::model::function::RoutineKind::Aggregate),
+        "w" => Ok(crate::model::function::RoutineKind::Window),
+        other => anyhow::bail!("unknown pg_proc.prokind value '{other}'"),
+    }
+}
+
+fn subscription_streaming_from_pg(code: &str) -> Result<&'static str> {
+    match code {
+        "t" | "true" => Ok("true"),
+        "f" | "false" => Ok("false"),
+        "p" => Ok("parallel"),
+        other => anyhow::bail!("unknown subscription streaming mode '{other}'"),
+    }
+}
+
+fn subscription_two_phase_from_pg(code: &str) -> Result<&'static str> {
+    match code {
+        "d" => Ok("false"),
+        "e" => Ok("true"),
+        "p" => Ok("pending"),
+        other => anyhow::bail!("unknown subscription two-phase state '{other}'"),
+    }
 }
 
 fn write_cache(out_path: &Path, cache: DbCache, cache_encryption: bool) -> Result<()> {
@@ -314,6 +401,25 @@ fn replace_cache(temp_file: NamedTempFile, out_path: &Path) -> Result<()> {
 
 #[cfg(windows)]
 fn replace_cache(temp_file: NamedTempFile, out_path: &Path) -> Result<()> {
+    let backup = out_path.with_extension("safe-migrate.backup");
+    if backup.exists() {
+        if out_path.exists() {
+            fs::remove_file(&backup).with_context(|| {
+                format!(
+                    "Failed to remove stale cache backup before replacement: {}",
+                    backup.display()
+                )
+            })?;
+        } else {
+            fs::rename(&backup, out_path).with_context(|| {
+                format!(
+                    "Failed to restore interrupted cache replacement from backup: {}",
+                    backup.display()
+                )
+            })?;
+        }
+    }
+
     if !out_path.exists() {
         temp_file
             .persist(out_path)
@@ -322,7 +428,6 @@ fn replace_cache(temp_file: NamedTempFile, out_path: &Path) -> Result<()> {
         return Ok(());
     }
 
-    let backup = out_path.with_extension("safe-migrate.backup");
     fs::rename(out_path, &backup).with_context(|| {
         format!(
             "Failed to stage existing cache for replacement: {}",
@@ -402,10 +507,14 @@ fn load_view_dependencies(
         JOIN pg_depend d ON d.objid = rw.oid
         JOIN pg_class tc ON tc.oid = d.refobjid
         JOIN pg_namespace tn ON tn.oid = tc.relnamespace
-        WHERE vc.relkind IN ('v', 'm')
-          AND d.deptype = 'n'
-          AND tc.oid <> vc.oid
-          AND (
+            WHERE vc.relkind IN ('v', 'm')
+              AND d.deptype = 'n'
+              AND tc.oid <> vc.oid
+              AND vn.nspname NOT LIKE 'pg\_%' ESCAPE '\'
+              AND vn.nspname <> 'information_schema'
+              AND tn.nspname NOT LIKE 'pg\_%' ESCAPE '\'
+              AND tn.nspname <> 'information_schema'
+              AND (
               $1::text[] IS NULL
               OR (vn.nspname = ANY($1) AND tn.nspname = ANY($1))
           )
@@ -497,103 +606,94 @@ fn load_roles(
     Ok(roles)
 }
 
-fn populate_cache_from_client(
+struct ProvenanceCatalog {
+    pg_version_num: u32,
+    metadata: crate::db::cache::CacheMetadata,
+    search_path: Vec<String>,
+}
+
+fn load_provenance(
     client: &mut impl GenericClient,
     schemas: Option<&[String]>,
-) -> Result<DbCache> {
-    let mut cache = DbCache::new();
-    let schema_values = schemas.map(|items| items.to_vec());
-    cache.metadata.created_at_unix_secs = Some(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs(),
-    );
-    cache.metadata.schemas = schema_values.clone();
-
-    let schema_filter = "AND ($1::text[] IS NULL OR n.nspname = ANY($1))";
-    let schema_filter_with_fk = r#"
-        AND (
-            $1::text[] IS NULL
-            OR n.nspname = ANY($1)
-            OR c.oid IN (
-                SELECT conrelid FROM pg_constraint cst
-                JOIN pg_class c2 ON c2.oid = cst.confrelid
-                JOIN pg_namespace n2 ON n2.oid = c2.relnamespace
-                WHERE n2.nspname = ANY($1)
-            )
-            OR c.oid IN (
-                SELECT confrelid FROM pg_constraint cst
-                JOIN pg_class c2 ON c2.oid = cst.conrelid
-                JOIN pg_namespace n2 ON n2.oid = c2.relnamespace
-                WHERE n2.nspname = ANY($1)
-            )
-        )
-    "#;
-    let schema_filter_n1_or_n2 =
-        "AND ($1::text[] IS NULL OR n1.nspname = ANY($1) OR n2.nspname = ANY($1))";
-    let schema_filter_nt = r#"
-        AND (
-            $1::text[] IS NULL
-            OR n_t.nspname = ANY($1)
-            OR t.oid IN (
-                SELECT conrelid FROM pg_constraint cst
-                JOIN pg_class c2 ON c2.oid = cst.confrelid
-                JOIN pg_namespace n2 ON n2.oid = c2.relnamespace
-                WHERE n2.nspname = ANY($1)
-            )
-            OR t.oid IN (
-                SELECT confrelid FROM pg_constraint cst
-                JOIN pg_class c2 ON c2.oid = cst.conrelid
-                JOIN pg_namespace n2 ON n2.oid = c2.relnamespace
-                WHERE n2.nspname = ANY($1)
-            )
-        )
-    "#;
-
-    // Server version and connection provenance.
-    let version_row = client.query_one("SHOW server_version_num;", &[])?;
-    let version_str: String = version_row.get(0);
-    let version = version_str
+) -> Result<ProvenanceCatalog> {
+    let version_row = client
+        .query_one("SHOW server_version_num;", &[])
+        .context("Failed to load PostgreSQL server version")?;
+    let version_str: String = version_row
+        .try_get(0)
+        .context("PostgreSQL server version field")?;
+    let pg_version_num = version_str
         .parse::<u32>()
         .context("PostgreSQL returned an invalid server_version_num")?;
-    ensure_supported_postgres_version(version)?;
-    cache.pg_version_num = Some(version);
+    ensure_supported_postgres_version(pg_version_num)?;
 
-    let provenance_row = client.query_one(
-        "SELECT current_database(), current_user, session_user, current_setting('search_path'),
-                (SELECT setting::bigint FROM pg_settings WHERE name = 'lock_timeout'),
-                (SELECT setting::bigint FROM pg_settings WHERE name = 'statement_timeout');",
-        &[],
-    )?;
-    cache.metadata.source_database = Some(provenance_row.get(0));
-    cache.metadata.source_role = Some(provenance_row.get(1));
-    cache.metadata.source_session_role = Some(provenance_row.get(2));
-    let search_path_setting: String = provenance_row.get(3);
-    cache.metadata.source_search_path = Some(parse_search_path_setting(&search_path_setting));
-    let lock_timeout_ms = provenance_row
-        .try_get::<_, Option<i64>>(4)?
+    let row = client
+        .query_one(
+            "SELECT current_database(), current_user, session_user, current_setting('search_path'),
+                    (SELECT setting::bigint FROM pg_settings WHERE name = 'lock_timeout'),
+                    (SELECT setting::bigint FROM pg_settings WHERE name = 'statement_timeout');",
+            &[],
+        )
+        .context("Failed to load synchronization provenance and timeout settings")?;
+    let search_path_setting: String = row
+        .try_get(3)
+        .context("synchronization provenance search_path")?;
+    let lock_timeout_ms = row
+        .try_get::<_, Option<i64>>(4)
+        .context("synchronization provenance lock_timeout field")?
         .context("PostgreSQL did not report lock_timeout")?;
-    let statement_timeout_ms = provenance_row
-        .try_get::<_, Option<i64>>(5)?
+    let statement_timeout_ms = row
+        .try_get::<_, Option<i64>>(5)
+        .context("synchronization provenance statement_timeout field")?
         .context("PostgreSQL did not report statement_timeout")?;
-    cache.metadata.source_lock_timeout_ms = lock_timeout_ms
-        .try_into()
-        .context("PostgreSQL returned a negative lock_timeout")?;
-    cache.metadata.source_statement_timeout_ms = statement_timeout_ms
-        .try_into()
-        .context("PostgreSQL returned a negative statement_timeout")?;
 
-    // Resolve role/database defaults and special entries such as "$user" exactly
-    // as PostgreSQL does, while excluding the implicit pg_catalog lookup. An
-    // explicit schema scope remains the resolution boundary, but selected
-    // schemas retain their live PostgreSQL priority.
-    let search_path_row = client.query_one("SELECT current_schemas(false);", &[])?;
-    cache.search_path = cache_search_path(search_path_row.get(0), schemas);
+    let search_path_row = client
+        .query_one("SELECT current_schemas(false);", &[])
+        .context("Failed to load the effective PostgreSQL search path")?;
+    let effective_search_path = search_path_row
+        .try_get(0)
+        .context("effective PostgreSQL search path field")?;
 
-    // Schemas are an authoritative catalog only for the requested sync scope.
-    // FK-only external schemas pulled in below deliberately do not enter it.
-    let schema_query = format!(
+    Ok(ProvenanceCatalog {
+        pg_version_num,
+        metadata: crate::db::cache::CacheMetadata {
+            created_at_unix_secs: Some(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            ),
+            source_database: Some(
+                row.try_get(0)
+                    .context("synchronization provenance database field")?,
+            ),
+            source_role: Some(
+                row.try_get(1)
+                    .context("synchronization provenance current-role field")?,
+            ),
+            source_session_role: Some(
+                row.try_get(2)
+                    .context("synchronization provenance session-role field")?,
+            ),
+            source_search_path: Some(parse_search_path_setting(&search_path_setting)),
+            source_lock_timeout_ms: lock_timeout_ms
+                .try_into()
+                .context("PostgreSQL returned a negative lock_timeout")?,
+            source_statement_timeout_ms: statement_timeout_ms
+                .try_into()
+                .context("PostgreSQL returned a negative statement_timeout")?,
+            schemas: schemas.map(<[String]>::to_vec),
+        },
+        search_path: cache_search_path(effective_search_path, schemas),
+    })
+}
+
+fn load_schemas(
+    client: &mut impl GenericClient,
+    schema_values: &Option<Vec<String>>,
+    schema_filter: &str,
+) -> Result<std::collections::HashMap<String, crate::model::schema::SchemaState>> {
+    let query = format!(
         "SELECT n.nspname, pg_catalog.pg_get_userbyid(n.nspowner)
          FROM pg_namespace n
          WHERE n.nspname NOT LIKE 'pg\\_%' ESCAPE '\\'
@@ -601,30 +701,31 @@ fn populate_cache_from_client(
            {schema_filter}
          ORDER BY n.nspname;"
     );
-    for row in client.query(&schema_query, &[&schema_values])? {
-        let name: String = row.get(0);
-        let owner: String = row.get(1);
-        cache.schemas.insert(
-            name.clone(),
-            crate::model::schema::SchemaState {
-                name,
-                owner: relation_owner_id(owner),
-                generation: 0,
-            },
-        );
-    }
-    // A scoped request can name schemas that do not exist yet. PostgreSQL's
-    // effective search path skips those entries, so do not let them become
-    // inferred-present namespaces when the cache is hydrated.
-    cache
-        .search_path
-        .retain(|schema| cache.schemas.contains_key(schema));
+    let rows = client
+        .query(&query, &[schema_values])
+        .context("Failed to load schemas from pg_namespace")?;
+    rows.into_iter()
+        .map(|row| {
+            let name: String = row.try_get(0).context("schema name")?;
+            let owner: String = row.try_get(1).context("schema owner")?;
+            Ok((
+                name.clone(),
+                crate::model::schema::SchemaState {
+                    name,
+                    owner: relation_owner_id(owner),
+                    generation: 0,
+                },
+            ))
+        })
+        .collect()
+}
 
-    // A sequence can have at most one pg_depend ownership relationship. The
-    // dependency flavor distinguishes identity's internal dependency from an
-    // ordinary OWNED BY relationship. An auto dependency is serial-like only
-    // when the owning column also has the sequence-backed nextval default.
-    let sequence_query = format!(
+fn load_sequences(
+    client: &mut impl GenericClient,
+    schema_values: &Option<Vec<String>>,
+    schema_filter: &str,
+) -> Result<std::collections::HashMap<ObjectId, crate::model::sequence::SequenceState>> {
+    let query = format!(
         "SELECT
              n.nspname AS sequence_schema,
              s.relname AS sequence_name,
@@ -656,38 +757,52 @@ fn populate_cache_from_client(
            {schema_filter}
          ORDER BY n.nspname, s.relname;"
     );
-    for row in client.query(&sequence_query, &[&schema_values])? {
-        let id = ObjectId::new(row.get::<_, String>(0), row.get::<_, String>(1));
-        let owner = relation_owner_id(row.get::<_, String>(2));
-        let table_schema: Option<String> = row.get(3);
-        let table_name: Option<String> = row.get(4);
-        let column_name: Option<String> = row.get(5);
-        let dependency_type: Option<String> = row.get(6);
-        let has_nextval_default: bool = row.get(7);
-        let owned_by = table_schema
-            .zip(table_name)
-            .zip(column_name)
-            .map(|((schema, table), column)| (ObjectId::new(schema, table), column));
-        let kind = match dependency_type.as_deref() {
-            Some("i") => crate::model::sequence::SequenceKind::Identity,
-            Some("a") if has_nextval_default => crate::model::sequence::SequenceKind::SerialLike,
-            Some("a") => crate::model::sequence::SequenceKind::Owned,
-            _ => crate::model::sequence::SequenceKind::Standalone,
-        };
-        cache.sequences.insert(
-            id.clone(),
-            crate::model::sequence::SequenceState {
-                id,
-                owner,
-                owned_by,
-                kind,
-                generation: 0,
-            },
-        );
-    }
+    let rows = client
+        .query(&query, &[schema_values])
+        .context("Failed to load sequences and ownership from pg_class/pg_depend")?;
+    rows.into_iter()
+        .map(|row| {
+            let id = ObjectId::new(
+                row.try_get::<_, String>(0).context("sequence schema")?,
+                row.try_get::<_, String>(1).context("sequence name")?,
+            );
+            let owner = relation_owner_id(row.try_get::<_, String>(2).context("sequence owner")?);
+            let table_schema: Option<String> =
+                row.try_get(3).context("sequence owner table schema")?;
+            let table_name: Option<String> = row.try_get(4).context("sequence owner table name")?;
+            let column_name: Option<String> =
+                row.try_get(5).context("sequence owner column name")?;
+            let dependency_type: Option<String> =
+                row.try_get(6).context("sequence dependency type")?;
+            let has_nextval_default: bool =
+                row.try_get(7).context("sequence-backed default marker")?;
+            let owned_by = table_schema
+                .zip(table_name)
+                .zip(column_name)
+                .map(|((schema, table), column)| (ObjectId::new(schema, table), column));
+            let kind = sequence_kind_from_pg(dependency_type.as_deref(), has_nextval_default)
+                .with_context(|| format!("sequence '{}' dependency kind", id))?;
+            Ok((
+                id.clone(),
+                crate::model::sequence::SequenceState {
+                    id,
+                    owner,
+                    owned_by,
+                    kind,
+                    generation: 0,
+                },
+            ))
+        })
+        .collect()
+}
 
-    // Relations and statistics.
-    let table_query = format!(
+fn load_relations_and_columns(
+    client: &mut impl GenericClient,
+    schemas: Option<&[String]>,
+    schema_values: &Option<Vec<String>>,
+    schema_filter_with_fk: &str,
+) -> Result<std::collections::HashMap<ObjectId, RelationState>> {
+    let relation_query = format!(
         "
         SELECT
             n.nspname AS schema_name,
@@ -709,39 +824,37 @@ fn populate_cache_from_client(
           {schema_filter_with_fk};
     "
     );
-
-    for row in client.query(&table_query, &[&schema_values])? {
-        let schema_name: String = row.get("schema_name");
-        let relation_name: String = row.get("relation_name");
-        let relkind: i8 = row.get("relation_kind");
-        let persistence_char: i8 = row.get("persistence");
-        let owner_name: String = row.get("owner_name");
-        let raw_rows: i64 = row.get("estimated_rows");
-        let relpages: i64 = row.get("relpages");
-
-        let last_analyze: Option<String> = row.get("last_analyze");
-        let last_autoanalyze: Option<String> = row.get("last_autoanalyze");
+    let rows = client
+        .query(&relation_query, &[schema_values])
+        .context("Failed to load relations and statistics from pg_class")?;
+    let mut relations = std::collections::HashMap::new();
+    for row in rows {
+        let schema_name: String = row.try_get("schema_name").context("relation schema")?;
+        let relation_name: String = row.try_get("relation_name").context("relation name")?;
+        let relkind: i8 = row.try_get("relation_kind").context("relation kind")?;
+        let persistence_char: i8 = row.try_get("persistence").context("relation persistence")?;
+        let owner_name: String = row.try_get("owner_name").context("relation owner")?;
+        let raw_rows: i64 = row
+            .try_get("estimated_rows")
+            .context("relation estimated row count")?;
+        let relpages: i64 = row.try_get("relpages").context("relation page count")?;
+        let last_analyze: Option<String> = row
+            .try_get("last_analyze")
+            .context("relation last-analyze timestamp")?;
+        let last_autoanalyze: Option<String> = row
+            .try_get("last_autoanalyze")
+            .context("relation last-autoanalyze timestamp")?;
 
         let object_id = ObjectId::new(&schema_name, &relation_name);
-
-        let kind = match relkind as u8 {
-            b'v' => RelationKind::View,
-            b'm' => RelationKind::MaterializedView,
-            _ => RelationKind::Table,
-        };
-
-        let persistence = match persistence_char as u8 {
-            b't' => Persistence::Temporary,
-            b'u' => Persistence::Unlogged,
-            _ => Persistence::Permanent,
-        };
-
+        let kind = relation_kind_from_pg(relkind as u8)
+            .with_context(|| format!("relation '{}' kind", object_id))?;
+        let persistence = persistence_from_pg(persistence_char as u8)
+            .with_context(|| format!("relation '{}' persistence", object_id))?;
         let estimated_rows = if raw_rows < 0 {
             None
         } else {
             Some(raw_rows as u64)
         };
-
         let mut state = RelationState::new(
             object_id.clone(),
             relation_owner_id(owner_name),
@@ -751,31 +864,28 @@ fn populate_cache_from_client(
             persistence,
             0,
         );
-        state.relpages = Some(relpages as u64);
+        state.relpages = Some(
+            relpages
+                .try_into()
+                .with_context(|| format!("relation '{}' has a negative page count", object_id))?,
+        );
         state.last_analyze = last_analyze;
         state.last_autoanalyze = last_autoanalyze;
-
-        let partition_strategy: Option<String> = row.get("partition_strategy");
-        if let Some(ref strat) = partition_strategy {
-            state.partition_type = Some(match strat.as_str() {
-                "r" => "RANGE".to_string(),
-                "l" => "LIST".to_string(),
-                "h" => "HASH".to_string(),
-                _ => strat.to_uppercase(),
-            });
-        }
-
-        if let Some(s) = schemas
-            && !s.contains(&schema_name)
+        let partition_strategy: Option<String> = row
+            .try_get("partition_strategy")
+            .context("relation partition strategy")?;
+        state.partition_type = partition_strategy_from_pg(partition_strategy.as_deref())
+            .with_context(|| format!("relation '{}' partition strategy", object_id))?;
+        if let Some(scoped_schemas) = schemas
+            && !scoped_schemas.contains(&schema_name)
         {
             state.mark_fk_dependency();
         }
-
-        cache.insert_baseline(object_id, state);
+        relations.insert(object_id, state);
     }
 
-    // Columns and width statistics.
-    let col_query = format!("
+    let column_query = format!(
+        "
         SELECT
             n.nspname AS schema_name,
             c.relname AS relation_name,
@@ -795,36 +905,64 @@ fn populate_cache_from_client(
           AND n.nspname NOT IN ('pg_catalog', 'information_schema')
           {schema_filter_with_fk}
         ORDER BY n.nspname, c.relname;
-    ");
-
-    for row in client.query(&col_query, &[&schema_values])? {
-        let schema_name: String = row.get("schema_name");
-        let relation_name: String = row.get("relation_name");
-        let column_name: String = row.get("column_name");
-        let type_name: String = row.get("type_name");
-        let not_null: bool = row.get("not_null");
-        let avg_width: Option<i32> = row.get("avg_width");
-        let default_expr_text: Option<String> = row.get("default_expr_text");
-        let type_modifier: Option<i32> = row.get("type_modifier");
-
-        let relation_id = ObjectId::new(&schema_name, &relation_name);
-        if let Some(rel) = cache.relations.get_mut(&relation_id) {
-            rel.columns.push(crate::model::column::Column {
-                name: column_name,
-                data_type: Some(type_name),
-                type_id: None,
-                is_nullable: !not_null,
-                default: None,
-                avg_width,
-                default_expr_text,
-                type_modifier,
-            });
-        }
+    "
+    );
+    let rows = client
+        .query(&column_query, &[schema_values])
+        .context("Failed to load relation columns from pg_attribute")?;
+    for row in rows {
+        let relation_id = ObjectId::new(
+            row.try_get::<_, String>("schema_name")
+                .context("column relation schema")?,
+            row.try_get::<_, String>("relation_name")
+                .context("column relation name")?,
+        );
+        let relation = relations.get_mut(&relation_id).with_context(|| {
+            format!(
+                "column catalog row references relation '{}' omitted by the relation loader",
+                relation_id
+            )
+        })?;
+        relation.columns.push(crate::model::column::Column {
+            name: row.try_get("column_name").context("column name")?,
+            data_type: Some(row.try_get("type_name").context("column type")?),
+            type_id: None,
+            is_nullable: !row
+                .try_get::<_, bool>("not_null")
+                .context("column nullability")?,
+            default: None,
+            avg_width: row.try_get("avg_width").context("column average width")?,
+            default_expr_text: row
+                .try_get("default_expr_text")
+                .context("column default expression")?,
+            type_modifier: row
+                .try_get("type_modifier")
+                .context("column type modifier")?,
+        });
     }
+    Ok(relations)
+}
 
-    // Triggers and policies.
-    let tp_query = format!("
-        SELECT 
+struct RelationDecoration {
+    relation_id: ObjectId,
+    triggers: Vec<String>,
+    policies: Vec<String>,
+}
+
+struct RelationGrant {
+    relation_id: ObjectId,
+    grantee: ObjectId,
+    privilege: crate::model::relation::Privilege,
+}
+
+fn load_relation_decorations(
+    client: &mut impl GenericClient,
+    schema_values: &Option<Vec<String>>,
+    schema_filter_with_fk: &str,
+) -> Result<(Vec<RelationDecoration>, Vec<RelationGrant>)> {
+    let topology_query = format!(
+        "
+        SELECT
             n.nspname AS schema_name,
             c.relname AS relation_name,
             COALESCE(array_agg(DISTINCT t.tgname) FILTER (WHERE t.tgname IS NOT NULL AND t.tgisinternal = false), '{{}}') as triggers,
@@ -836,23 +974,26 @@ fn populate_cache_from_client(
         WHERE c.relkind IN ('r', 'p', 'v', 'm') AND n.nspname NOT IN ('pg_catalog', 'information_schema')
         {schema_filter_with_fk}
         GROUP BY n.nspname, c.relname;
-    ");
+    "
+    );
+    let decorations = client
+        .query(&topology_query, &[schema_values])
+        .context("Failed to load relation triggers and policies")?
+        .into_iter()
+        .map(|row| {
+            Ok(RelationDecoration {
+                relation_id: ObjectId::new(
+                    row.try_get::<_, String>("schema_name")
+                        .context("decorated relation schema")?,
+                    row.try_get::<_, String>("relation_name")
+                        .context("decorated relation name")?,
+                ),
+                triggers: row.try_get("triggers").context("relation trigger names")?,
+                policies: row.try_get("policies").context("relation policy names")?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
 
-    for row in client.query(&tp_query, &[&schema_values])? {
-        let schema_name: String = row.get("schema_name");
-        let relation_name: String = row.get("relation_name");
-        let triggers: Vec<String> = row.get("triggers");
-        let policies: Vec<String> = row.get("policies");
-
-        let object_id = ObjectId::new(&schema_name, &relation_name);
-
-        if let Some(rel) = cache.relations.get_mut(&object_id) {
-            rel.triggers.extend(triggers);
-            rel.policies.extend(policies);
-        }
-    }
-
-    // Explicit non-owner relation privileges.
     let acl_query = format!(
         "
         SELECT
@@ -872,37 +1013,52 @@ fn populate_cache_from_client(
           {schema_filter_with_fk};
         "
     );
+    let grants = client
+        .query(&acl_query, &[schema_values])
+        .context("Failed to load explicit relation privileges")?
+        .into_iter()
+        .map(|row| {
+            let privilege_type: String = row
+                .try_get("privilege_type")
+                .context("relation privilege type")?;
+            let privilege = match privilege_type.as_str() {
+                "SELECT" => crate::model::relation::Privilege::Select,
+                "INSERT" => crate::model::relation::Privilege::Insert,
+                "UPDATE" => crate::model::relation::Privilege::Update,
+                "DELETE" => crate::model::relation::Privilege::Delete,
+                "TRUNCATE" => crate::model::relation::Privilege::Truncate,
+                "REFERENCES" => crate::model::relation::Privilege::References,
+                "TRIGGER" => crate::model::relation::Privilege::Trigger,
+                "MAINTAIN" => crate::model::relation::Privilege::Maintain,
+                other => anyhow::bail!("unsupported relation privilege type '{other}'"),
+            };
+            Ok(RelationGrant {
+                relation_id: ObjectId::new(
+                    row.try_get::<_, String>("schema_name")
+                        .context("privileged relation schema")?,
+                    row.try_get::<_, String>("relation_name")
+                        .context("privileged relation name")?,
+                ),
+                grantee: ObjectId::new(
+                    "",
+                    row.try_get::<_, String>("grantee")
+                        .context("relation privilege grantee")?,
+                ),
+                privilege,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((decorations, grants))
+}
 
-    for row in client.query(&acl_query, &[&schema_values])? {
-        let schema_name: String = row.get("schema_name");
-        let relation_name: String = row.get("relation_name");
-        let grantee: String = row.get("grantee");
-        let privilege_type: String = row.get("privilege_type");
-        let privilege = match privilege_type.as_str() {
-            "SELECT" => crate::model::relation::Privilege::Select,
-            "INSERT" => crate::model::relation::Privilege::Insert,
-            "UPDATE" => crate::model::relation::Privilege::Update,
-            "DELETE" => crate::model::relation::Privilege::Delete,
-            "TRUNCATE" => crate::model::relation::Privilege::Truncate,
-            "REFERENCES" => crate::model::relation::Privilege::References,
-            "TRIGGER" => crate::model::relation::Privilege::Trigger,
-            _ => continue,
-        };
-        if let Some(relation) = cache
-            .relations
-            .get_mut(&ObjectId::new(&schema_name, &relation_name))
-        {
-            relation.privileges.grant(
-                ObjectId::new("", grantee),
-                [privilege].into_iter().collect(),
-            );
-        }
-    }
-
-    // Trigger functions.
-    let trig_query = format!(
+fn load_triggers(
+    client: &mut impl GenericClient,
+    schema_values: &Option<Vec<String>>,
+    schema_filter_with_fk: &str,
+) -> Result<Vec<crate::db::cache::TriggerCache>> {
+    let query = format!(
         "
-        SELECT 
+        SELECT
             n.nspname AS table_schema,
             c.relname AS table_name,
             t.tgname AS trigger_name,
@@ -919,28 +1075,47 @@ fn populate_cache_from_client(
           {schema_filter_with_fk};
     "
     );
+    client
+        .query(&query, &[schema_values])
+        .context("Failed to load triggers and trigger functions")?
+        .into_iter()
+        .map(|row| {
+            let table_schema: String = row.try_get("table_schema").context("trigger schema")?;
+            let enabled_mode: String = row
+                .try_get("enabled_mode")
+                .context("trigger enabled mode")?;
+            Ok(crate::db::cache::TriggerCache {
+                trigger_id: ObjectId::new(
+                    &table_schema,
+                    row.try_get::<_, String>("trigger_name")
+                        .context("trigger name")?,
+                ),
+                table_id: ObjectId::new(
+                    &table_schema,
+                    row.try_get::<_, String>("table_name")
+                        .context("trigger table name")?,
+                ),
+                function_id: ObjectId::new(
+                    row.try_get::<_, String>("function_schema")
+                        .context("trigger function schema")?,
+                    row.try_get::<_, String>("function_name")
+                        .context("trigger function name")?,
+                ),
+                enabled_mode: crate::model::trigger::TriggerEnableMode::from_pg_code(&enabled_mode)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("unknown pg_trigger.tgenabled value {enabled_mode}")
+                    })?,
+            })
+        })
+        .collect()
+}
 
-    for row in client.query(&trig_query, &[&schema_values])? {
-        let table_schema: String = row.get("table_schema");
-        let table_name: String = row.get("table_name");
-        let trigger_name: String = row.get("trigger_name");
-        let enabled_mode: String = row.get("enabled_mode");
-        let function_schema: String = row.get("function_schema");
-        let function_name: String = row.get("function_name");
-
-        cache.triggers.push(crate::db::cache::TriggerCache {
-            trigger_id: ObjectId::new(&table_schema, &trigger_name),
-            table_id: ObjectId::new(&table_schema, &table_name),
-            function_id: ObjectId::new(&function_schema, &function_name),
-            enabled_mode: crate::model::trigger::TriggerEnableMode::from_pg_code(&enabled_mode)
-                .ok_or_else(|| {
-                    anyhow::anyhow!("unknown pg_trigger.tgenabled value {enabled_mode}")
-                })?,
-        });
-    }
-
-    // Table constraints.
-    let constraint_query = format!(
+fn load_constraints(
+    client: &mut impl GenericClient,
+    schema_values: &Option<Vec<String>>,
+    schema_filter_with_fk: &str,
+) -> Result<Vec<crate::model::constraint::ConstraintState>> {
+    let query = format!(
         "
         SELECT
             n.nspname AS table_schema,
@@ -953,38 +1128,50 @@ fn populate_cache_from_client(
         JOIN pg_namespace n ON n.oid = c.relnamespace
         WHERE con.contype IN ('c', 'f', 'p', 'u', 'x')
           AND n.nspname NOT IN ('pg_catalog', 'information_schema')
-          {schema_filter};
+          {schema_filter_with_fk};
         "
     );
-
-    for row in client.query(&constraint_query, &[&schema_values])? {
-        let table_schema: String = row.get("table_schema");
-        let table_name: String = row.get("table_name");
-        let constraint_name: String = row.get("constraint_name");
-        let constraint_type: String = row.get("constraint_type");
-        let validated: bool = row.get("validated");
-        let kind = match constraint_type.as_str() {
-            "c" => crate::model::constraint::ConstraintKind::Check,
-            "f" => crate::model::constraint::ConstraintKind::ForeignKey,
-            "p" => crate::model::constraint::ConstraintKind::PrimaryKey,
-            "u" => crate::model::constraint::ConstraintKind::Unique,
-            "x" => crate::model::constraint::ConstraintKind::Exclusion,
-            _ => continue,
-        };
-        cache
-            .constraints
-            .push(crate::model::constraint::ConstraintState {
-                table_id: ObjectId::new(&table_schema, &table_name),
-                name: constraint_name,
+    client
+        .query(&query, &[schema_values])
+        .context("Failed to load table constraints from pg_constraint")?
+        .into_iter()
+        .map(|row| {
+            let constraint_type: String =
+                row.try_get("constraint_type").context("constraint type")?;
+            let kind = match constraint_type.as_str() {
+                "c" => crate::model::constraint::ConstraintKind::Check,
+                "f" => crate::model::constraint::ConstraintKind::ForeignKey,
+                "p" => crate::model::constraint::ConstraintKind::PrimaryKey,
+                "u" => crate::model::constraint::ConstraintKind::Unique,
+                "x" => crate::model::constraint::ConstraintKind::Exclusion,
+                other => anyhow::bail!("unsupported pg_constraint.contype '{other}'"),
+            };
+            Ok(crate::model::constraint::ConstraintState {
+                table_id: ObjectId::new(
+                    row.try_get::<_, String>("table_schema")
+                        .context("constraint table schema")?,
+                    row.try_get::<_, String>("table_name")
+                        .context("constraint table name")?,
+                ),
+                name: row.try_get("constraint_name").context("constraint name")?,
                 kind,
-                validated,
-            });
-    }
+                validated: row
+                    .try_get("validated")
+                    .context("constraint validation state")?,
+            })
+        })
+        .collect()
+}
 
-    // Foreign keys.
-    let fk_query = format!(
+fn load_foreign_keys(
+    client: &mut impl GenericClient,
+    schemas: Option<&[String]>,
+    schema_values: &Option<Vec<String>>,
+    schema_filter_n1_or_n2: &str,
+) -> Result<Vec<ForeignKeyCache>> {
+    let query = format!(
         "
-        SELECT 
+        SELECT
             c.conname AS constraint_name,
             n1.nspname AS from_schema, t1.relname AS from_table,
             n2.nspname AS to_schema, t2.relname AS to_table
@@ -997,45 +1184,58 @@ fn populate_cache_from_client(
         {schema_filter_n1_or_n2};
     "
     );
+    client
+        .query(&query, &[schema_values])
+        .context("Failed to load foreign keys from pg_constraint")?
+        .into_iter()
+        .map(|row| {
+            let constraint_name: String = row
+                .try_get("constraint_name")
+                .context("foreign-key constraint name")?;
+            let from_schema: String = row
+                .try_get("from_schema")
+                .context("foreign-key source schema")?;
+            let from_table: String = row
+                .try_get("from_table")
+                .context("foreign-key source table")?;
+            let to_schema: String = row
+                .try_get("to_schema")
+                .context("foreign-key target schema")?;
+            let to_table: String = row
+                .try_get("to_table")
+                .context("foreign-key target table")?;
+            if let Some(scoped_schemas) = schemas
+                && (!scoped_schemas.contains(&from_schema)
+                    || !scoped_schemas.contains(&to_schema))
+            {
+                let (out_of_scope_schema, out_of_scope_table) =
+                    if !scoped_schemas.contains(&from_schema) {
+                        (&from_schema, &from_table)
+                    } else {
+                        (&to_schema, &to_table)
+                    };
+                eprintln!(
+                    "[WARN] Foreign key '{}' crosses schema boundary. Table '{}.{}' was pulled into cache as a dependency to evaluate cross-team locks.",
+                    constraint_name, out_of_scope_schema, out_of_scope_table
+                );
+            }
+            Ok(ForeignKeyCache {
+                constraint_name,
+                from_table: ObjectId::new(from_schema, from_table),
+                to_table: ObjectId::new(to_schema, to_table),
+            })
+        })
+        .collect()
+}
 
-    for row in client.query(&fk_query, &[&schema_values])? {
-        let constraint_name: String = row.get("constraint_name");
-        let from_schema: String = row.get("from_schema");
-        let from_table: String = row.get("from_table");
-        let to_schema: String = row.get("to_schema");
-        let to_table: String = row.get("to_table");
-
-        if let Some(s) = schemas
-            && (!s.contains(&from_schema) || !s.contains(&to_schema))
-        {
-            // Determine which one is out of scope to print a helpful warning
-            let out_of_scope_schema = if !s.contains(&from_schema) {
-                &from_schema
-            } else {
-                &to_schema
-            };
-            let out_of_scope_table = if !s.contains(&from_schema) {
-                &from_table
-            } else {
-                &to_table
-            };
-            eprintln!(
-                "[WARN] Foreign key '{}' crosses schema boundary. Table '{}.{}' was pulled into cache as a dependency to evaluate cross-team locks.",
-                constraint_name, out_of_scope_schema, out_of_scope_table
-            );
-        }
-
-        cache.foreign_keys.push(ForeignKeyCache {
-            constraint_name,
-            from_table: ObjectId::new(&from_schema, &from_table),
-            to_table: ObjectId::new(&to_schema, &to_table),
-        });
-    }
-
-    // Indexes.
-    let idx_query = format!(
+fn load_indexes(
+    client: &mut impl GenericClient,
+    schema_values: &Option<Vec<String>>,
+    schema_filter_nt: &str,
+) -> Result<Vec<IndexCache>> {
+    let query = format!(
         "
-        SELECT 
+        SELECT
             n_i.nspname AS index_schema, i.relname AS index_name,
             n_t.nspname AS table_schema, t.relname AS table_name
         FROM pg_index x
@@ -1051,25 +1251,40 @@ fn populate_cache_from_client(
         {schema_filter_nt};
     "
     );
-
-    for row in client.query(&idx_query, &[&schema_values])? {
-        let index_schema: String = row.get("index_schema");
-        let index_name: String = row.get("index_name");
-        let table_schema: String = row.get("table_schema");
-        let table_name: String = row.get("table_name");
-
+    let rows = client
+        .query(&query, &[schema_values])
+        .context("Failed to load valid indexes from pg_index")?;
+    let mut indexes = Vec::with_capacity(rows.len());
+    for row in rows {
+        let index_schema: String = row.try_get("index_schema").context("index schema")?;
+        let table_schema: String = row
+            .try_get("table_schema")
+            .context("indexed table schema")?;
         if is_system_schema(&index_schema) || is_system_schema(&table_schema) {
             continue;
         }
-
-        cache.indexes.push(IndexCache {
-            index_id: ObjectId::new(&index_schema, &index_name),
-            table_id: ObjectId::new(&table_schema, &table_name),
+        indexes.push(IndexCache {
+            index_id: ObjectId::new(
+                index_schema,
+                row.try_get::<_, String>("index_name")
+                    .context("index name")?,
+            ),
+            table_id: ObjectId::new(
+                table_schema,
+                row.try_get::<_, String>("table_name")
+                    .context("indexed table name")?,
+            ),
         });
     }
+    Ok(indexes)
+}
 
-    // Routines share one PostgreSQL namespace, regardless of kind.
-    let func_query = format!(
+fn load_routines(
+    client: &mut impl GenericClient,
+    schema_values: &Option<Vec<String>>,
+    schema_filter: &str,
+) -> Result<std::collections::HashMap<ObjectId, crate::model::function::FunctionState>> {
+    let query = format!(
         "
         SELECT
             n.nspname AS schema_name,
@@ -1092,67 +1307,128 @@ fn populate_cache_from_client(
           {schema_filter};
     "
     );
+    client
+        .query(&query, &[schema_values])
+        .context("Failed to load routines from pg_proc")?
+        .into_iter()
+        .map(|row| {
+            let schema_name: String = row.try_get("schema_name").context("routine schema")?;
+            let function_name: String = row.try_get("func_name").context("routine name")?;
+            let raw_arg_types: Vec<String> =
+                row.try_get("arg_types").context("routine argument types")?;
+            let volatility_code: String =
+                row.try_get("volatility").context("routine volatility")?;
+            let volatility = routine_volatility_from_pg(&volatility_code)?;
+            let routine_kind_code: String = row.try_get("routine_kind").context("routine kind")?;
+            let routine_kind = routine_kind_from_pg(&routine_kind_code)?;
+            let arg_types = raw_arg_types
+                .iter()
+                .map(|arg_type| {
+                    crate::analysis::resolver::Resolver::normalize_function_arg_type(arg_type)
+                })
+                .collect::<Vec<_>>();
+            let id = ObjectId::new(
+                schema_name,
+                format!("{}({})", function_name, arg_types.join(",")),
+            );
+            let security_definer: bool = row
+                .try_get("security_definer")
+                .context("routine security mode")?;
+            Ok((
+                id.clone(),
+                crate::model::function::FunctionState {
+                    id,
+                    routine_kind,
+                    arg_types,
+                    arg_type_ids: Vec::new(),
+                    return_type: row
+                        .try_get::<_, Option<String>>("return_type")
+                        .context("routine return type")?
+                        .unwrap_or_default(),
+                    return_type_id: None,
+                    volatility,
+                    language: row.try_get("language").context("routine language")?,
+                    security: if security_definer {
+                        crate::model::function::SecurityMode::Definer
+                    } else {
+                        crate::model::function::SecurityMode::Invoker
+                    },
+                },
+            ))
+        })
+        .collect()
+}
 
-    for row in client.query(&func_query, &[&schema_values])? {
-        let schema_name: String = row.get("schema_name");
-        let func_name: String = row.get("func_name");
-        let arg_types: Vec<String> = row.get("arg_types");
-        let return_type: Option<String> = row.get("return_type");
-        let volatility_char: String = row.get("volatility");
-        let routine_kind_char: String = row.get("routine_kind");
-        let language: String = row.get("language");
-        let security_definer: bool = row.get("security_definer");
+fn load_types(
+    client: &mut impl GenericClient,
+    schema_values: &Option<Vec<String>>,
+    schema_filter: &str,
+) -> Result<std::collections::HashMap<ObjectId, crate::model::types::TypeState>> {
+    let query = format!(
+        "
+        SELECT
+            n.nspname AS schema_name,
+            t.typname AS type_name,
+            t.typtype::text AS type_kind,
+            CASE WHEN t.typtype = 'd'
+                THEN pg_catalog.format_type(t.typbasetype, t.typtypmod)
+                ELSE NULL
+            END AS domain_base_type,
+            COALESCE(
+                array_agg(e.enumlabel ORDER BY e.enumsortorder)
+                    FILTER (WHERE e.enumlabel IS NOT NULL),
+                ARRAY[]::text[]
+            ) AS enum_labels
+        FROM pg_type t
+        JOIN pg_namespace n ON n.oid = t.typnamespace
+        LEFT JOIN pg_enum e ON e.enumtypid = t.oid
+        WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
+          AND t.typtype IN ('e', 'd')
+          {schema_filter}
+        GROUP BY n.nspname, t.typname, t.typtype, t.typbasetype, t.typtypmod;
+        "
+    );
+    client
+        .query(&query, &[schema_values])
+        .context("Failed to load user-defined enum and domain types")?
+        .into_iter()
+        .map(|row| {
+            let type_kind: String = row.try_get("type_kind").context("type kind")?;
+            let kind = match type_kind.as_str() {
+                "e" => crate::model::types::TypeKind::Enum {
+                    variants: row.try_get("enum_labels").context("enum labels")?,
+                },
+                "d" => crate::model::types::TypeKind::Domain {
+                    base_type: row
+                        .try_get::<_, Option<String>>("domain_base_type")
+                        .context("domain base type")?
+                        .context("PostgreSQL omitted the base type for a domain")?,
+                    base_type_id: None,
+                },
+                other => anyhow::bail!("unsupported pg_type.typtype '{other}'"),
+            };
+            let id = ObjectId::new(
+                row.try_get::<_, String>("schema_name")
+                    .context("type schema")?,
+                row.try_get::<_, String>("type_name").context("type name")?,
+            );
+            Ok((
+                id.clone(),
+                crate::model::types::TypeState {
+                    id,
+                    generation: 0,
+                    kind,
+                },
+            ))
+        })
+        .collect()
+}
 
-        let volatility = match volatility_char.as_str() {
-            "v" => crate::model::function::Volatility::Volatile,
-            "s" => crate::model::function::Volatility::Stable,
-            "i" => crate::model::function::Volatility::Immutable,
-            _ => crate::model::function::Volatility::Volatile,
-        };
-
-        let security = if security_definer {
-            crate::model::function::SecurityMode::Definer
-        } else {
-            crate::model::function::SecurityMode::Invoker
-        };
-
-        let routine_kind = match routine_kind_char.as_str() {
-            "f" => crate::model::function::RoutineKind::Function,
-            "p" => crate::model::function::RoutineKind::Procedure,
-            "a" => crate::model::function::RoutineKind::Aggregate,
-            "w" => crate::model::function::RoutineKind::Window,
-            other => anyhow::bail!("PostgreSQL returned unknown pg_proc.prokind '{other}'"),
-        };
-
-        let arg_types = arg_types
-            .iter()
-            .map(|arg_type| {
-                crate::analysis::resolver::Resolver::normalize_function_arg_type(arg_type)
-            })
-            .collect::<Vec<_>>();
-        let arg_types_str = arg_types.join(",");
-
-        let id = ObjectId::new(&schema_name, format!("{}({})", func_name, arg_types_str));
-
-        cache.functions.insert(
-            id.clone(),
-            crate::model::function::FunctionState {
-                id,
-                routine_kind,
-                arg_types,
-                arg_type_ids: Vec::new(),
-                return_type: return_type.unwrap_or_default(),
-                return_type_id: None,
-                volatility,
-                language,
-                security,
-            },
-        );
-    }
-
-    // Publications are database-level objects. Their catalog is synchronized
-    // in full even when relation synchronization is schema-scoped.
-    let publication_query = if cache.pg_version_num.unwrap_or_default() >= 180_000 {
+fn load_publications(
+    client: &mut impl GenericClient,
+    pg_version_num: u32,
+) -> Result<std::collections::HashMap<String, crate::model::replication::PublicationState>> {
+    let publication_query = if pg_version_num >= 180_000 {
         r#"
             SELECT p.oid, p.pubname::text AS publication_name,
                    pg_catalog.pg_get_userbyid(p.pubowner) AS owner_name,
@@ -1171,22 +1447,29 @@ fn populate_cache_from_client(
             ORDER BY p.oid
         "#
     };
-    let mut publication_names = std::collections::HashMap::<u32, String>::new();
-    for row in client.query(publication_query, &[])? {
-        let oid: u32 = row.get("oid");
-        let name: String = row.get("publication_name");
+    let rows = client
+        .query(publication_query, &[])
+        .context("Failed to load publications from pg_publication")?;
+    let mut names_by_oid = std::collections::HashMap::<u32, String>::new();
+    let mut publications = std::collections::HashMap::new();
+    for row in rows {
+        let oid: u32 = row.try_get("oid").context("publication OID")?;
+        let name: String = row
+            .try_get("publication_name")
+            .context("publication name")?;
         let mut operations = Vec::new();
-        if row.get::<_, bool>("pubinsert") {
-            operations.push("insert");
-        }
-        if row.get::<_, bool>("pubupdate") {
-            operations.push("update");
-        }
-        if row.get::<_, bool>("pubdelete") {
-            operations.push("delete");
-        }
-        if row.get::<_, bool>("pubtruncate") {
-            operations.push("truncate");
+        for (field, operation) in [
+            ("pubinsert", "insert"),
+            ("pubupdate", "update"),
+            ("pubdelete", "delete"),
+            ("pubtruncate", "truncate"),
+        ] {
+            if row
+                .try_get::<_, bool>(field)
+                .with_context(|| format!("publication '{name}' {field}"))?
+            {
+                operations.push(operation);
+            }
         }
         let mut params = vec![
             crate::analysis::facts::AttributeFact {
@@ -1195,31 +1478,42 @@ fn populate_cache_from_client(
             },
             crate::analysis::facts::AttributeFact {
                 name: "publish_via_partition_root".to_string(),
-                value: row.get::<_, bool>("pubviaroot").to_string(),
+                value: row
+                    .try_get::<_, bool>("pubviaroot")
+                    .context("publication partition-root mode")?
+                    .to_string(),
             },
         ];
-        if let Some(generated_columns) = row.get::<_, Option<String>>("generated_columns") {
+        if let Some(generated_columns) = row
+            .try_get::<_, Option<String>>("generated_columns")
+            .context("publication generated-column mode")?
+        {
             let value = match generated_columns.as_str() {
                 "n" => "none",
                 "s" => "stored",
-                other => other,
+                other => anyhow::bail!(
+                    "publication '{name}' has unknown generated-column mode '{other}'"
+                ),
             };
             params.push(crate::analysis::facts::AttributeFact {
                 name: "publish_generated_columns".to_string(),
                 value: value.to_string(),
             });
         }
-        let scope = if row.get::<_, bool>("puballtables") {
+        let scope = if row
+            .try_get::<_, bool>("puballtables")
+            .context("publication all-tables mode")?
+        {
             crate::analysis::facts::PublicationScope::AllTables { except: Vec::new() }
         } else {
             crate::analysis::facts::PublicationScope::Explicit(Vec::new())
         };
-        publication_names.insert(oid, name.clone());
-        cache.publications.insert(
+        names_by_oid.insert(oid, name.clone());
+        publications.insert(
             name.clone(),
             crate::model::replication::PublicationState {
                 name,
-                owner: Some(row.get("owner_name")),
+                owner: Some(row.try_get("owner_name").context("publication owner")?),
                 scope,
                 params,
                 generation: 0,
@@ -1227,7 +1521,7 @@ fn populate_cache_from_client(
         );
     }
 
-    let publication_rel_query = if cache.pg_version_num.unwrap_or_default() >= 150_000 {
+    let relation_query = if pg_version_num >= 150_000 {
         r#"
             SELECT pr.prpubid, n.nspname::text AS schema_name,
                    c.relname::text AS relation_name,
@@ -1255,57 +1549,66 @@ fn populate_cache_from_client(
             ORDER BY pr.prpubid, pr.oid
         "#
     };
-    for row in client.query(publication_rel_query, &[])? {
-        let publication_oid: u32 = row.get("prpubid");
-        let Some(publication_name) = publication_names.get(&publication_oid) else {
-            anyhow::bail!(
-                "publication membership references unknown publication OID {publication_oid}"
-            );
-        };
-        let Some(publication) = cache.publications.get_mut(publication_name) else {
-            anyhow::bail!("publication '{publication_name}' disappeared during synchronization");
-        };
+    for row in client
+        .query(relation_query, &[])
+        .context("Failed to load publication relation membership")?
+    {
+        let oid: u32 = row.try_get("prpubid").context("publication relation OID")?;
+        let name = names_by_oid.get(&oid).with_context(|| {
+            format!("publication relation membership references unknown publication OID {oid}")
+        })?;
+        let publication = publications
+            .get_mut(name)
+            .with_context(|| format!("publication '{name}' disappeared during assembly"))?;
         let crate::analysis::facts::PublicationScope::Explicit(objects) = &mut publication.scope
         else {
             continue;
         };
-        let schema_name: String = row.get("schema_name");
-        let relation_name: String = row.get("relation_name");
         objects.push(crate::analysis::facts::PublicationObjectFact::Table {
             name: crate::ast::identifiers::QualifiedName::new(
-                Some(crate::ast::identifiers::Ident::new(schema_name, true)),
-                crate::ast::identifiers::Ident::new(relation_name, true),
+                Some(crate::ast::identifiers::Ident::new(
+                    row.try_get::<_, String>("schema_name")
+                        .context("publication relation schema")?,
+                    true,
+                )),
+                crate::ast::identifiers::Ident::new(
+                    row.try_get::<_, String>("relation_name")
+                        .context("publication relation name")?,
+                    true,
+                ),
             ),
             only: true,
             include_partitions: false,
-            columns: row.get("columns"),
+            columns: row
+                .try_get("columns")
+                .context("publication relation column list")?,
             row_filter: row
-                .get::<_, Option<String>>("row_filter")
+                .try_get::<_, Option<String>>("row_filter")
+                .context("publication relation row filter")?
                 .map(crate::analysis::facts::PublicationRowFilter::CatalogSql),
         });
     }
 
-    if cache.pg_version_num.unwrap_or_default() >= 150_000 {
-        for row in client.query(
-            r#"
-                SELECT pn.pnpubid, n.nspname::text AS schema_name
-                FROM pg_publication_namespace pn
-                JOIN pg_namespace n ON n.oid = pn.pnnspid
-                ORDER BY pn.pnpubid, pn.oid
-            "#,
-            &[],
-        )? {
-            let publication_oid: u32 = row.get("pnpubid");
-            let Some(publication_name) = publication_names.get(&publication_oid) else {
-                anyhow::bail!(
-                    "publication schema membership references unknown publication OID {publication_oid}"
-                );
-            };
-            let Some(publication) = cache.publications.get_mut(publication_name) else {
-                anyhow::bail!(
-                    "publication '{publication_name}' disappeared during synchronization"
-                );
-            };
+    if pg_version_num >= 150_000 {
+        for row in client
+            .query(
+                r#"
+                    SELECT pn.pnpubid, n.nspname::text AS schema_name
+                    FROM pg_publication_namespace pn
+                    JOIN pg_namespace n ON n.oid = pn.pnnspid
+                    ORDER BY pn.pnpubid, pn.oid
+                "#,
+                &[],
+            )
+            .context("Failed to load publication schema membership")?
+        {
+            let oid: u32 = row.try_get("pnpubid").context("publication schema OID")?;
+            let name = names_by_oid.get(&oid).with_context(|| {
+                format!("publication schema membership references unknown publication OID {oid}")
+            })?;
+            let publication = publications
+                .get_mut(name)
+                .with_context(|| format!("publication '{name}' disappeared during assembly"))?;
             let crate::analysis::facts::PublicationScope::Explicit(objects) =
                 &mut publication.scope
             else {
@@ -1313,16 +1616,23 @@ fn populate_cache_from_client(
             };
             objects.push(
                 crate::analysis::facts::PublicationObjectFact::SchemaTables {
-                    schema: row.get("schema_name"),
+                    schema: row
+                        .try_get("schema_name")
+                        .context("publication member schema name")?,
                     row_filter: None,
                 },
             );
         }
     }
+    Ok(publications)
+}
 
-    // Connection strings are intentionally excluded. Later PostgreSQL versions
-    // add safe subscription settings, so each query exposes one stable shape.
-    let subscription_query = match cache.pg_version_num.unwrap_or_default() {
+fn load_subscriptions(
+    client: &mut impl GenericClient,
+    pg_version_num: u32,
+) -> Result<std::collections::HashMap<String, crate::model::replication::SubscriptionState>> {
+    // Every version-specific query deliberately omits pg_subscription.subconninfo.
+    let query = match pg_version_num {
         170_000.. => {
             r#"
             SELECT s.subname::text AS subscription_name,
@@ -1400,138 +1710,211 @@ fn populate_cache_from_client(
         "#
         }
     };
-    for row in client.query(subscription_query, &[])? {
-        let name: String = row.get("subscription_name");
-        let mut params = vec![
-            crate::analysis::facts::AttributeFact {
-                name: "binary".to_string(),
-                value: row.get::<_, bool>("subbinary").to_string(),
-            },
-            crate::analysis::facts::AttributeFact {
-                name: "streaming".to_string(),
-                value: match row.get::<_, String>("streaming").as_str() {
-                    "t" | "true" => "true".to_string(),
-                    "f" | "false" => "false".to_string(),
-                    "p" => "parallel".to_string(),
-                    other => other.to_string(),
+    client
+        .query(query, &[])
+        .context("Failed to load non-secret subscription metadata")?
+        .into_iter()
+        .map(|row| {
+            let name: String = row
+                .try_get("subscription_name")
+                .context("subscription name")?;
+            let streaming_code: String = row
+                .try_get("streaming")
+                .with_context(|| format!("subscription '{name}' streaming mode"))?;
+            let streaming = subscription_streaming_from_pg(&streaming_code)
+                .with_context(|| format!("subscription '{name}' streaming mode"))?;
+            let mut params = vec![
+                crate::analysis::facts::AttributeFact {
+                    name: "binary".to_string(),
+                    value: row
+                        .try_get::<_, bool>("subbinary")
+                        .with_context(|| format!("subscription '{name}' binary mode"))?
+                        .to_string(),
                 },
-            },
-            crate::analysis::facts::AttributeFact {
-                name: "synchronous_commit".to_string(),
-                value: row.get("subsynccommit"),
-            },
-        ];
-        let mut push_param = |name: &str, value: Option<String>| {
-            if let Some(value) = value {
-                params.push(crate::analysis::facts::AttributeFact {
-                    name: name.to_string(),
-                    value,
-                });
+                crate::analysis::facts::AttributeFact {
+                    name: "streaming".to_string(),
+                    value: streaming.to_string(),
+                },
+                crate::analysis::facts::AttributeFact {
+                    name: "synchronous_commit".to_string(),
+                    value: row
+                        .try_get("subsynccommit")
+                        .with_context(|| format!("subscription '{name}' synchronous_commit"))?,
+                },
+            ];
+            let two_phase = row
+                .try_get::<_, Option<String>>("two_phase_state")
+                .with_context(|| format!("subscription '{name}' two-phase state"))?
+                .map(|state| subscription_two_phase_from_pg(&state).map(str::to_string))
+                .transpose()?;
+            let mut push_param = |param_name: &str, value: Option<String>| {
+                if let Some(value) = value {
+                    params.push(crate::analysis::facts::AttributeFact {
+                        name: param_name.to_string(),
+                        value,
+                    });
+                }
+            };
+            push_param("two_phase", two_phase);
+            for (field, param_name) in [
+                ("disable_on_error", "disable_on_error"),
+                ("password_required", "password_required"),
+                ("run_as_owner", "run_as_owner"),
+                ("failover", "failover"),
+            ] {
+                push_param(
+                    param_name,
+                    row.try_get::<_, Option<bool>>(field)
+                        .with_context(|| format!("subscription '{name}' {field}"))?
+                        .map(|value| value.to_string()),
+                );
             }
-        };
-        push_param(
-            "two_phase",
-            row.get::<_, Option<String>>("two_phase_state")
-                .map(|state| match state.as_str() {
-                    "d" => "false".to_string(),
-                    "e" => "true".to_string(),
-                    "p" => "pending".to_string(),
-                    other => other.to_string(),
-                }),
-        );
-        push_param(
-            "disable_on_error",
-            row.get::<_, Option<bool>>("disable_on_error")
-                .map(|value| value.to_string()),
-        );
-        push_param(
-            "password_required",
-            row.get::<_, Option<bool>>("password_required")
-                .map(|value| value.to_string()),
-        );
-        push_param(
-            "run_as_owner",
-            row.get::<_, Option<bool>>("run_as_owner")
-                .map(|value| value.to_string()),
-        );
-        push_param(
-            "failover",
-            row.get::<_, Option<bool>>("failover")
-                .map(|value| value.to_string()),
-        );
-        push_param("origin", row.get("origin"));
-        push_param(
-            "skip_lsn",
-            row.get::<_, Option<String>>("skip_lsn")
-                .filter(|lsn| lsn != "0/0"),
-        );
-        cache.subscriptions.insert(
-            name.clone(),
-            crate::model::replication::SubscriptionState {
-                name,
-                owner: Some(row.get("owner_name")),
-                connection: crate::analysis::facts::ConnectionTarget::Redacted,
-                publications: row.get("subpublications"),
-                params: Some(params),
-                enabled: row.get("subenabled"),
-                slot_name: row.get("subslotname"),
-                generation: 0,
-            },
-        );
+            push_param(
+                "origin",
+                row.try_get("origin")
+                    .with_context(|| format!("subscription '{name}' origin"))?,
+            );
+            push_param(
+                "skip_lsn",
+                row.try_get::<_, Option<String>>("skip_lsn")
+                    .with_context(|| format!("subscription '{name}' skip LSN"))?
+                    .filter(|lsn| lsn != "0/0"),
+            );
+            Ok((
+                name.clone(),
+                crate::model::replication::SubscriptionState {
+                    name,
+                    owner: Some(row.try_get("owner_name").context("subscription owner")?),
+                    connection: crate::analysis::facts::ConnectionTarget::Redacted,
+                    publications: row
+                        .try_get("subpublications")
+                        .context("subscription publication names")?,
+                    params: Some(params),
+                    enabled: row
+                        .try_get("subenabled")
+                        .context("subscription enabled state")?,
+                    slot_name: row
+                        .try_get("subslotname")
+                        .context("subscription slot name")?,
+                    generation: 0,
+                },
+            ))
+        })
+        .collect()
+}
+
+fn populate_cache_from_client(
+    client: &mut impl GenericClient,
+    schemas: Option<&[String]>,
+) -> Result<DbCache> {
+    let mut cache = DbCache::new();
+    let schema_values = schemas.map(|items| items.to_vec());
+    let provenance = load_provenance(client, schemas)?;
+    cache.pg_version_num = Some(provenance.pg_version_num);
+    cache.metadata = provenance.metadata;
+    cache.search_path = provenance.search_path;
+
+    let schema_filter = "AND ($1::text[] IS NULL OR n.nspname = ANY($1))";
+    let schema_filter_with_fk = r#"
+        AND (
+            $1::text[] IS NULL
+            OR n.nspname = ANY($1)
+            OR c.oid IN (
+                SELECT conrelid FROM pg_constraint cst
+                JOIN pg_class c2 ON c2.oid = cst.confrelid
+                JOIN pg_namespace n2 ON n2.oid = c2.relnamespace
+                WHERE n2.nspname = ANY($1)
+            )
+            OR c.oid IN (
+                SELECT confrelid FROM pg_constraint cst
+                JOIN pg_class c2 ON c2.oid = cst.conrelid
+                JOIN pg_namespace n2 ON n2.oid = c2.relnamespace
+                WHERE n2.nspname = ANY($1)
+            )
+        )
+    "#;
+    let schema_filter_n1_or_n2 =
+        "AND ($1::text[] IS NULL OR n1.nspname = ANY($1) OR n2.nspname = ANY($1))";
+    let schema_filter_nt = r#"
+        AND (
+            $1::text[] IS NULL
+            OR n_t.nspname = ANY($1)
+            OR t.oid IN (
+                SELECT conrelid FROM pg_constraint cst
+                JOIN pg_class c2 ON c2.oid = cst.confrelid
+                JOIN pg_namespace n2 ON n2.oid = c2.relnamespace
+                WHERE n2.nspname = ANY($1)
+            )
+            OR t.oid IN (
+                SELECT confrelid FROM pg_constraint cst
+                JOIN pg_class c2 ON c2.oid = cst.conrelid
+                JOIN pg_namespace n2 ON n2.oid = c2.relnamespace
+                WHERE n2.nspname = ANY($1)
+            )
+        )
+    "#;
+
+    // Schemas are an authoritative catalog only for the requested sync scope.
+    // FK-only external schemas pulled in below deliberately do not enter it.
+    cache.schemas = load_schemas(client, &schema_values, schema_filter)?;
+    // A scoped request can name schemas that do not exist yet. PostgreSQL's
+    // effective search path skips those entries, so do not let them become
+    // inferred-present namespaces when the cache is hydrated.
+    cache
+        .search_path
+        .retain(|schema| cache.schemas.contains_key(schema));
+
+    cache.sequences = load_sequences(client, &schema_values, schema_filter)?;
+
+    cache.relations =
+        load_relations_and_columns(client, schemas, &schema_values, schema_filter_with_fk)?;
+
+    let (relation_decorations, relation_grants) =
+        load_relation_decorations(client, &schema_values, schema_filter_with_fk)?;
+    for decoration in relation_decorations {
+        let relation = cache
+            .relations
+            .get_mut(&decoration.relation_id)
+            .with_context(|| {
+                format!(
+                    "relation decoration references omitted relation '{}'",
+                    decoration.relation_id
+                )
+            })?;
+        relation.triggers.extend(decoration.triggers);
+        relation.policies.extend(decoration.policies);
+    }
+    for grant in relation_grants {
+        let relation = cache
+            .relations
+            .get_mut(&grant.relation_id)
+            .with_context(|| {
+                format!(
+                    "relation privilege references omitted relation '{}'",
+                    grant.relation_id
+                )
+            })?;
+        relation
+            .privileges
+            .grant(grant.grantee, [grant.privilege].into_iter().collect());
     }
 
-    // User-defined types, including ordered enum labels and domains.
-    let type_query = format!(
-        "
-        SELECT
-            n.nspname AS schema_name,
-            t.typname AS type_name,
-            t.typtype::text AS type_kind,
-            CASE WHEN t.typtype = 'd'
-                THEN pg_catalog.format_type(t.typbasetype, t.typtypmod)
-                ELSE NULL
-            END AS domain_base_type,
-            COALESCE(
-                array_agg(e.enumlabel ORDER BY e.enumsortorder)
-                    FILTER (WHERE e.enumlabel IS NOT NULL),
-                ARRAY[]::text[]
-            ) AS enum_labels
-        FROM pg_type t
-        JOIN pg_namespace n ON n.oid = t.typnamespace
-        LEFT JOIN pg_enum e ON e.enumtypid = t.oid
-        WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
-          AND t.typtype IN ('e', 'd')
-          {schema_filter}
-        GROUP BY n.nspname, t.typname, t.typtype, t.typbasetype, t.typtypmod;
-        "
-    );
+    cache.triggers = load_triggers(client, &schema_values, schema_filter_with_fk)?;
 
-    for row in client.query(&type_query, &[&schema_values])? {
-        let schema_name: String = row.get("schema_name");
-        let type_name: String = row.get("type_name");
-        let type_kind: String = row.get("type_kind");
-        let domain_base_type: Option<String> = row.get("domain_base_type");
-        let enum_labels: Vec<String> = row.get("enum_labels");
-        let kind = match type_kind.as_str() {
-            "e" => crate::model::types::TypeKind::Enum {
-                variants: enum_labels,
-            },
-            "d" => crate::model::types::TypeKind::Domain {
-                base_type: domain_base_type.unwrap_or_default(),
-                base_type_id: None,
-            },
-            _ => continue,
-        };
-        let id = ObjectId::new(&schema_name, &type_name);
-        cache.types.insert(
-            id.clone(),
-            crate::model::types::TypeState {
-                id,
-                generation: 0,
-                kind,
-            },
-        );
-    }
+    cache.constraints = load_constraints(client, &schema_values, schema_filter_with_fk)?;
+
+    cache.foreign_keys =
+        load_foreign_keys(client, schemas, &schema_values, schema_filter_n1_or_n2)?;
+
+    cache.indexes = load_indexes(client, &schema_values, schema_filter_nt)?;
+
+    cache.functions = load_routines(client, &schema_values, schema_filter)?;
+
+    cache.publications = load_publications(client, cache.pg_version_num.unwrap_or_default())?;
+
+    cache.subscriptions = load_subscriptions(client, cache.pg_version_num.unwrap_or_default())?;
+
+    cache.types = load_types(client, &schema_values, schema_filter)?;
 
     // Only view dependencies are consumed by cache hydration. Generic
     // pg_depend rows use PostgreSQL dependency codes (n/a/i) and were ignored
@@ -1543,7 +1926,82 @@ fn populate_cache_from_client(
     // not expose password hashes or other credentials.
     cache.roles = load_roles(client, cache.pg_version_num.unwrap_or_default())?;
 
+    cache
+        .validate_semantics()
+        .map_err(anyhow::Error::msg)
+        .context("PostgreSQL catalogs produced a semantically invalid Cache V6 baseline")?;
     Ok(cache)
+}
+
+#[cfg(test)]
+mod catalog_conversion_tests {
+    use super::*;
+
+    #[test]
+    fn known_catalog_codes_convert_without_fallbacks() {
+        assert!(matches!(
+            sequence_kind_from_pg(Some("i"), false).unwrap(),
+            crate::model::sequence::SequenceKind::Identity
+        ));
+        assert!(matches!(
+            sequence_kind_from_pg(Some("a"), true).unwrap(),
+            crate::model::sequence::SequenceKind::SerialLike
+        ));
+        assert!(matches!(
+            relation_kind_from_pg(b'm').unwrap(),
+            RelationKind::MaterializedView
+        ));
+        assert!(matches!(
+            persistence_from_pg(b'u').unwrap(),
+            Persistence::Unlogged
+        ));
+        assert_eq!(
+            partition_strategy_from_pg(Some("h")).unwrap(),
+            Some("HASH".to_string())
+        );
+        assert!(matches!(
+            routine_volatility_from_pg("i").unwrap(),
+            crate::model::function::Volatility::Immutable
+        ));
+        assert!(matches!(
+            routine_kind_from_pg("a").unwrap(),
+            crate::model::function::RoutineKind::Aggregate
+        ));
+        assert_eq!(subscription_streaming_from_pg("p").unwrap(), "parallel");
+        assert_eq!(subscription_two_phase_from_pg("e").unwrap(), "true");
+    }
+
+    #[test]
+    fn unknown_catalog_codes_are_actionable_errors() {
+        for error in [
+            sequence_kind_from_pg(Some("x"), false).unwrap_err(),
+            relation_kind_from_pg(b'x').unwrap_err(),
+            persistence_from_pg(b'x').unwrap_err(),
+            partition_strategy_from_pg(Some("x")).unwrap_err(),
+            routine_volatility_from_pg("x").unwrap_err(),
+            routine_kind_from_pg("x").unwrap_err(),
+            subscription_streaming_from_pg("x").unwrap_err(),
+            subscription_two_phase_from_pg("x").unwrap_err(),
+        ] {
+            assert!(!error.to_string().is_empty());
+        }
+    }
+
+    #[test]
+    fn connection_timeout_default_preserves_an_explicit_value() {
+        let mut defaulted = PostgresConfig::new();
+        apply_connection_safety_defaults(&mut defaulted);
+        assert_eq!(
+            defaulted.get_connect_timeout(),
+            Some(&DEFAULT_CONNECT_TIMEOUT)
+        );
+
+        let explicit = Duration::from_secs(3);
+        let mut configured = PostgresConfig::new();
+        configured.connect_timeout(explicit);
+        apply_connection_safety_defaults(&mut configured);
+        assert_eq!(configured.get_connect_timeout(), Some(&explicit));
+    }
 }
 
 #[cfg(test)]
@@ -1553,18 +2011,8 @@ mod atomic_write_tests {
     use std::fs;
     use std::io::Read;
 
-    #[test]
-    fn production_cache_writer_atomically_replaces_and_decodes() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let cache_path = temp_dir.path().join("baseline.cache");
-        fs::write(&cache_path, b"old-cache").unwrap();
-
-        let mut cache = DbCache::new();
-        cache.pg_version_num = Some(180002);
-        write_cache(&cache_path, cache, false).unwrap();
-
-        let encoded = fs::read(&cache_path).unwrap();
-        assert_ne!(encoded, b"old-cache");
+    fn decode_written_cache(path: &Path) -> DbCache {
+        let encoded = fs::read(path).unwrap();
         let reader = std::io::Cursor::new(encoded);
         let mut decoder = zstd::stream::Decoder::new(reader).unwrap();
         let mut payload = Vec::new();
@@ -1576,7 +2024,53 @@ mod atomic_write_tests {
         let versioned: DbCacheVersioned = bincode::serde::decode_from_slice(payload, config)
             .unwrap()
             .0;
-        assert_eq!(versioned.into_cache().unwrap().pg_version_num, Some(180002));
+        versioned.into_cache().unwrap()
+    }
+
+    #[test]
+    fn production_cache_writer_atomically_replaces_and_decodes() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cache_path = temp_dir.path().join("baseline.cache");
+        fs::write(&cache_path, b"old-cache").unwrap();
+
+        let mut cache = DbCache::new();
+        cache.pg_version_num = Some(180002);
+        write_cache(&cache_path, cache, false).unwrap();
+
+        assert_eq!(
+            decode_written_cache(&cache_path).pg_version_num,
+            Some(180002)
+        );
+        assert_eq!(fs::read_dir(temp_dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn concurrent_cache_writers_leave_one_complete_decodable_payload() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cache_path = temp_dir.path().join("baseline.cache");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut writers = Vec::new();
+        for version in [170_007, 180_002] {
+            let cache_path = cache_path.clone();
+            let barrier = barrier.clone();
+            writers.push(std::thread::spawn(move || {
+                let mut cache = DbCache::new();
+                cache.pg_version_num = Some(version);
+                barrier.wait();
+                write_cache(&cache_path, cache, false)
+            }));
+        }
+        barrier.wait();
+        let results = writers
+            .into_iter()
+            .map(|writer| writer.join().unwrap())
+            .collect::<Vec<_>>();
+
+        assert!(results.iter().any(Result::is_ok));
+        assert!(matches!(
+            decode_written_cache(&cache_path).pg_version_num,
+            Some(170_007 | 180_002)
+        ));
         assert_eq!(fs::read_dir(temp_dir.path()).unwrap().count(), 1);
     }
 

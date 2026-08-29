@@ -1,4 +1,4 @@
-use super::{AnalysisState, Confidence, MutationResult};
+use super::{AnalysisState, Confidence, MutationResult, ObjectLookup};
 use crate::analysis::facts::{PublicationObjectFact, PublicationScope};
 use crate::analysis::graph::DependencyKind;
 use crate::analysis::mutations::{AlterSchemaMutation, CreateSchemaMutation, DropSchemaMutation};
@@ -10,6 +10,8 @@ use crate::model::schema::{SchemaOverlay, SchemaState};
 use crate::model::sequence::SequenceOverlay;
 use crate::model::trigger::TriggerOverlay;
 use crate::model::types::TypeOverlay;
+
+type SchemaLookup = ObjectLookup;
 
 impl AnalysisState {
     pub(super) fn apply_create_schema(
@@ -71,15 +73,21 @@ impl AnalysisState {
     ) -> MutationResult {
         match alter_schema {
             AlterSchemaMutation::OwnerTo { name, new_owner } => {
-                if !self.schema_is_present(name) {
-                    if self.schema_absence_is_authoritative(name) {
+                match self.schema_lookup(name) {
+                    SchemaLookup::Present => {}
+                    SchemaLookup::Tombstone | SchemaLookup::AuthoritativelyAbsent => {
                         return MutationResult::Conflict {
                             reason: format!("schema '{}' does not exist", name),
                         };
                     }
-                    self.snapshot_confidence();
-                    self.local.confidence = Confidence::Tainted;
-                    return MutationResult::Skipped;
+                    SchemaLookup::Unknown => {
+                        self.snapshot_confidence();
+                        self.local.confidence = Confidence::Tainted;
+                        return MutationResult::Skipped;
+                    }
+                    SchemaLookup::WrongKind => {
+                        unreachable!("schemas do not share an overlay with other object kinds")
+                    }
                 }
                 let Some((owner_name, owner_known)) = self.role_fact_identity(new_owner) else {
                     self.snapshot_confidence();
@@ -103,24 +111,36 @@ impl AnalysisState {
                 MutationResult::Applied
             }
             AlterSchemaMutation::Rename { old_name, new_name } => {
-                if !self.schema_is_present(old_name) {
-                    if !self.schema_absence_is_authoritative(old_name) {
+                match self.schema_lookup(old_name) {
+                    SchemaLookup::Present => {}
+                    SchemaLookup::Unknown => {
                         self.snapshot_confidence();
                         self.local.confidence = Confidence::Tainted;
                         return MutationResult::Skipped;
                     }
-                    return MutationResult::Conflict {
-                        reason: format!("schema '{}' does not exist", old_name),
-                    };
+                    SchemaLookup::Tombstone | SchemaLookup::AuthoritativelyAbsent => {
+                        return MutationResult::Conflict {
+                            reason: format!("schema '{}' does not exist", old_name),
+                        };
+                    }
+                    SchemaLookup::WrongKind => {
+                        unreachable!("schemas do not share an overlay with other object kinds")
+                    }
                 }
-                if self.schema_is_present(new_name) {
-                    return MutationResult::Conflict {
-                        reason: format!("schema '{}' already exists", new_name),
-                    };
-                }
-                if !self.schema_absence_is_authoritative(new_name) {
-                    self.snapshot_confidence();
-                    self.local.confidence = Confidence::Tainted;
+                match self.schema_lookup(new_name) {
+                    SchemaLookup::Present => {
+                        return MutationResult::Conflict {
+                            reason: format!("schema '{}' already exists", new_name),
+                        };
+                    }
+                    SchemaLookup::Unknown => {
+                        self.snapshot_confidence();
+                        self.local.confidence = Confidence::Tainted;
+                    }
+                    SchemaLookup::Tombstone | SchemaLookup::AuthoritativelyAbsent => {}
+                    SchemaLookup::WrongKind => {
+                        unreachable!("schemas do not share an overlay with other object kinds")
+                    }
                 }
                 self.snapshot_search_path();
                 self.rename_schema_namespace(old_name, new_name);
@@ -131,15 +151,22 @@ impl AnalysisState {
 
     pub(super) fn apply_drop_schema(&mut self, drop_schema: &DropSchemaMutation) -> MutationResult {
         for name in &drop_schema.names {
-            if !self.schema_is_present(name) && self.schema_absence_is_authoritative(name) {
-                if !drop_schema.if_exists {
-                    return MutationResult::Conflict {
-                        reason: format!("schema '{}' does not exist", name),
-                    };
+            match self.schema_lookup(name) {
+                SchemaLookup::Present => {}
+                SchemaLookup::Tombstone | SchemaLookup::AuthoritativelyAbsent => {
+                    if !drop_schema.if_exists {
+                        return MutationResult::Conflict {
+                            reason: format!("schema '{}' does not exist", name),
+                        };
+                    }
                 }
-            } else if !self.schema_is_present(name) {
-                self.snapshot_confidence();
-                self.local.confidence = Confidence::Tainted;
+                SchemaLookup::Unknown => {
+                    self.snapshot_confidence();
+                    self.local.confidence = Confidence::Tainted;
+                }
+                SchemaLookup::WrongKind => {
+                    unreachable!("schemas do not share an overlay with other object kinds")
+                }
             }
         }
         let present_names: Vec<String> = drop_schema

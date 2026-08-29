@@ -1702,6 +1702,7 @@
         "015_rename_value_missing_type.sql",
         "016_missing_set_role.sql",
         "017_unauthorized_set_role.sql",
+        "018_identifier_truncation_collision.sql",
         "safe_001_chain.sql",
         "safe_001_create_table.sql",
         "safe_002_create_index.sql",
@@ -1716,7 +1717,12 @@
         "safe_013_quoted_session_authorization.sql",
         "safe_014_session_authorization_rollback.sql",
         "safe_015_session_authorization_default.sql",
-        "safe_016_transitive_set_role_membership.sql"
+        "safe_016_transitive_set_role_membership.sql",
+        "safe_017_relation_namespace_resolution.sql",
+        "safe_018_type_namespace_resolution.sql",
+        "safe_019_routine_namespace_resolution.sql",
+        "safe_020_generated_name_truncation.sql",
+        "safe_021_routine_type_aliases.sql"
       ],
       "fixture_transactional": {
         "safe_010_role_transaction_semantics.sql": false,
@@ -1754,6 +1760,10 @@
         },
         "017_unauthorized_set_role.sql": {
           "sqlstate": "42501",
+          "simulator_rule": "chain-conflict"
+        },
+        "018_identifier_truncation_collision.sql": {
+          "sqlstate": "42P07",
           "simulator_rule": "chain-conflict"
         }
       },
@@ -1821,7 +1831,13 @@
         "sm_audit",
         "sm_analytics",
         "app_user",
-        "sm_role_quote"
+        "sm_role_quote",
+        "sm_ns_early",
+        "sm_ns_late",
+        "sm_type_early",
+        "sm_type_late",
+        "sm_routine_early",
+        "sm_routine_late"
       ],
       "scope": [
         "relations",
@@ -1873,6 +1889,30 @@
         ],
         "safe_016_transitive_set_role_membership.sql": [
           "relations"
+        ],
+        "safe_017_relation_namespace_resolution.sql": [
+          "schemas",
+          "relations",
+          "columns",
+          "types"
+        ],
+        "safe_018_type_namespace_resolution.sql": [
+          "schemas",
+          "relations",
+          "columns",
+          "types"
+        ],
+        "safe_019_routine_namespace_resolution.sql": [
+          "schemas",
+          "functions"
+        ],
+        "safe_020_generated_name_truncation.sql": [
+          "relations",
+          "columns",
+          "constraints"
+        ],
+        "safe_021_routine_type_aliases.sql": [
+          "functions"
         ]
       },
       "required_relations": [

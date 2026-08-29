@@ -153,7 +153,7 @@ jobs:
         with:
           persist-credentials: false
 
-- uses: dsecurity49/safe-migrate@v0.7.0
+      - uses: dsecurity49/safe-migrate@v0.7.0
         env:
           DATABASE_URL: ${{ secrets.SAFE_MIGRATE_DATABASE_URL }}
           SAFE_MIGRATE_CACHE_KEY: ${{ secrets.SAFE_MIGRATE_CACHE_KEY }}

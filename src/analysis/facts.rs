@@ -681,6 +681,7 @@ pub enum PrivilegeFact {
     Truncate,
     References,
     Trigger,
+    Maintain,
     Execute,
     Create,
     Temporary,

@@ -245,6 +245,43 @@ impl DbCache {
             }
         }
 
+        for schema in &self.search_path {
+            if !self.schemas.is_empty() && !self.schemas.contains_key(schema) {
+                return Err(format!(
+                    "effective search path references missing schema '{}'",
+                    schema
+                ));
+            }
+        }
+
+        for (id, sequence) in &self.sequences {
+            if let Some((table_id, column_name)) = &sequence.owned_by {
+                let relation = self.relations.get(table_id).ok_or_else(|| {
+                    format!(
+                        "sequence '{}' ownership references missing relation '{}'",
+                        id, table_id
+                    )
+                })?;
+                if !relation.has_column(column_name) {
+                    return Err(format!(
+                        "sequence '{}' ownership references missing column '{}.{}'",
+                        id, table_id, column_name
+                    ));
+                }
+            }
+        }
+
+        for (id, role) in &self.roles {
+            for target in role.member_of.iter().chain(&role.can_set_role_to) {
+                if !self.roles.contains_key(target) {
+                    return Err(format!(
+                        "role '{}' membership references missing role '{}'",
+                        id, target
+                    ));
+                }
+            }
+        }
+
         let mut constraint_keys = HashSet::new();
         for constraint in &self.constraints {
             if !self.relations.contains_key(&constraint.table_id) {
@@ -307,6 +344,65 @@ impl DbCache {
                 return Err(format!(
                     "foreign key '{}.{}' appears more than once",
                     foreign_key.from_table, foreign_key.constraint_name
+                ));
+            }
+            if !self.constraints.iter().any(|constraint| {
+                constraint.table_id == foreign_key.from_table
+                    && constraint.name == foreign_key.constraint_name
+                    && matches!(
+                        constraint.kind,
+                        crate::model::constraint::ConstraintKind::ForeignKey
+                    )
+            }) {
+                return Err(format!(
+                    "foreign key '{}.{}' has no matching constraint",
+                    foreign_key.from_table, foreign_key.constraint_name
+                ));
+            }
+        }
+
+        for dependency in &self.dependencies {
+            if dependency.deptype != "view" {
+                // Early Cache V6 writers included generic pg_depend rows.
+                // Hydration never consumed them, but retaining readability
+                // is part of the V6 byte-compatibility contract.
+                continue;
+            }
+            if dependency
+                .obj_schema
+                .as_deref()
+                .is_some_and(|schema| schema == "information_schema" || schema.starts_with("pg_"))
+                || dependency.ref_schema.as_deref().is_some_and(|schema| {
+                    schema == "information_schema" || schema.starts_with("pg_")
+                })
+            {
+                // Early V6 writers also retained system-catalog view
+                // dependencies while deliberately omitting those relations.
+                continue;
+            }
+            let object_id = dependency
+                .obj_schema
+                .as_deref()
+                .zip(dependency.obj_name.as_deref())
+                .map(|(schema, name)| ObjectId::new(schema, name))
+                .ok_or_else(|| "view dependency is missing its object identity".to_string())?;
+            let referenced_id = dependency
+                .ref_schema
+                .as_deref()
+                .zip(dependency.ref_name.as_deref())
+                .map(|(schema, name)| ObjectId::new(schema, name))
+                .ok_or_else(|| {
+                    format!(
+                        "view dependency for '{}' is missing its referenced identity",
+                        object_id
+                    )
+                })?;
+            if !self.relations.contains_key(&object_id)
+                || !self.relations.contains_key(&referenced_id)
+            {
+                return Err(format!(
+                    "view dependency '{} -> {}' references a missing relation",
+                    object_id, referenced_id
                 ));
             }
         }
@@ -378,5 +474,86 @@ mod tests {
             .into_cache()
             .unwrap_err();
         assert!(error.contains("references missing relation 'public.items'"));
+    }
+
+    #[test]
+    fn current_cache_rejects_cross_catalog_contradictions() {
+        let mut missing_search_schema = DbCache::new();
+        missing_search_schema.schemas.insert(
+            "app".to_string(),
+            SchemaState {
+                name: "app".to_string(),
+                owner: ObjectId::new("", "postgres"),
+                generation: 0,
+            },
+        );
+        assert!(
+            missing_search_schema
+                .validate_semantics()
+                .unwrap_err()
+                .contains("search path references missing schema 'public'")
+        );
+
+        let mut missing_sequence_owner = DbCache::new();
+        let sequence_id = ObjectId::new("public", "items_id_seq");
+        missing_sequence_owner.sequences.insert(
+            sequence_id.clone(),
+            SequenceState {
+                id: sequence_id,
+                owner: ObjectId::new("", "postgres"),
+                owned_by: Some((ObjectId::new("public", "items"), "id".to_string())),
+                kind: crate::model::sequence::SequenceKind::Owned,
+                generation: 0,
+            },
+        );
+        assert!(
+            missing_sequence_owner
+                .validate_semantics()
+                .unwrap_err()
+                .contains("ownership references missing relation 'public.items'")
+        );
+
+        let mut missing_membership_role = DbCache::new();
+        let role_id = ObjectId::new("", "member");
+        missing_membership_role.roles.insert(
+            role_id.clone(),
+            RoleState {
+                id: role_id,
+                can_login: true,
+                is_superuser: false,
+                member_of: vec![ObjectId::new("", "missing")],
+                can_set_role_to: Vec::new(),
+                granted_privileges: Vec::new(),
+            },
+        );
+        assert!(
+            missing_membership_role
+                .validate_semantics()
+                .unwrap_err()
+                .contains("membership references missing role")
+        );
+
+        let mut incomplete_view_dependency = DbCache::new();
+        incomplete_view_dependency
+            .dependencies
+            .push(DependencyCache {
+                classid: 0,
+                objid: 0,
+                objsubid: 0,
+                refclassid: 0,
+                refobjid: 0,
+                refobjsubid: 0,
+                deptype: "view".to_string(),
+                obj_schema: None,
+                obj_name: None,
+                ref_schema: None,
+                ref_name: None,
+            });
+        assert!(
+            incomplete_view_dependency
+                .validate_semantics()
+                .unwrap_err()
+                .contains("view dependency is missing its object identity")
+        );
     }
 }

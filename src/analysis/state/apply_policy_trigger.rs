@@ -1,12 +1,26 @@
-use super::{AnalysisState, MutationResult, RelationOverlay};
+use super::{AnalysisState, MutationResult, ObjectLookup, RelationOverlay};
 use crate::analysis::graph::{DependencyEdge, DependencyKind};
 use crate::analysis::mutations::{
     CreatePolicyMutation, CreateTriggerMutation, DropPolicyMutation, DropTriggerMutation,
     RenameTriggerMutation,
 };
+use crate::ast::identifiers::ObjectId;
 use crate::model::trigger::{TriggerEnableMode, TriggerOverlay, TriggerState};
 
+type TriggerLookup = ObjectLookup;
+
 impl AnalysisState {
+    fn trigger_lookup(&self, id: &ObjectId) -> TriggerLookup {
+        match self.local.triggers.get(id) {
+            Some(TriggerOverlay::Present(_)) => TriggerLookup::Present,
+            Some(TriggerOverlay::Dropped) => TriggerLookup::Tombstone,
+            None if self.baseline_available && self.baseline_covers_object(id) => {
+                TriggerLookup::AuthoritativelyAbsent
+            }
+            None => TriggerLookup::Unknown,
+        }
+    }
+
     pub(super) fn apply_create_policy(
         &mut self,
         create_policy: &CreatePolicyMutation,
@@ -63,10 +77,7 @@ impl AnalysisState {
         create_trigger: &CreateTriggerMutation,
     ) -> MutationResult {
         let trigger_id = Self::trigger_key(&create_trigger.table, &create_trigger.name);
-        if matches!(
-            self.local.triggers.get(&trigger_id),
-            Some(TriggerOverlay::Present(_))
-        ) {
+        if self.trigger_lookup(&trigger_id) == TriggerLookup::Present {
             return MutationResult::Conflict {
                 reason: format!(
                     "trigger '{}' already exists on relation '{}'",
@@ -108,10 +119,7 @@ impl AnalysisState {
         drop_trigger: &DropTriggerMutation,
     ) -> MutationResult {
         let trigger_id = Self::trigger_key(&drop_trigger.table, &drop_trigger.name);
-        if !matches!(
-            self.local.triggers.get(&trigger_id),
-            Some(TriggerOverlay::Present(_))
-        ) {
+        if self.trigger_lookup(&trigger_id) != TriggerLookup::Present {
             return if drop_trigger.if_exists {
                 MutationResult::Skipped
             } else {
@@ -156,12 +164,7 @@ impl AnalysisState {
                 ),
             };
         };
-        if old_id != new_id
-            && matches!(
-                self.local.triggers.get(&new_id),
-                Some(TriggerOverlay::Present(_))
-            )
-        {
+        if old_id != new_id && self.trigger_lookup(&new_id) == TriggerLookup::Present {
             return MutationResult::Conflict {
                 reason: format!(
                     "trigger '{}' already exists on relation '{}'",

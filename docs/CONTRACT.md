@@ -200,6 +200,11 @@ publication names, and supported settings. It never selects or serializes
 Creating a connected subscription, refreshing publisher metadata, and dropping
 a subscription remain `Tainted` because their outcome depends on remote state.
 
+On PostgreSQL 18 and newer, relation ACL synchronization and grant/revoke
+analysis recognize the table `MAINTAIN` privilege. `GRANT ALL` expands to that
+privilege only when the cache identifies PostgreSQL 18 or newer; older or
+version-unknown baselines retain the pre-18 expansion conservatively.
+
 ## Timeout evidence
 
 `require-lock-timeout` and `require-statement-timeout` are Tier 2 primary rules.

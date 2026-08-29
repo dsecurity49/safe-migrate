@@ -93,6 +93,21 @@ mod tests {
     }
 
     #[test]
+    fn remote_database_rejection_does_not_echo_credentials() {
+        let tmp = NamedTempFile::new().unwrap();
+        let secret = "phase5-password-must-not-leak";
+        let database_url =
+            format!("postgres://migration_user:{secret}@db.internal.example/safe_migrate");
+        let _database_url = EnvironmentValueGuard::set("DATABASE_URL", &database_url);
+
+        let error = sync_cache(tmp.path(), None, false).unwrap_err();
+        let diagnostic = format!("{error:#}");
+        assert!(diagnostic.contains("Remote DATABASE_URL connections are not supported"));
+        assert!(!diagnostic.contains(secret));
+        assert!(!diagnostic.contains(&database_url));
+    }
+
+    #[test]
     fn test_sync_requires_postgresql_14_or_newer() {
         let error = ensure_supported_postgres_version(130_012).unwrap_err();
         assert!(

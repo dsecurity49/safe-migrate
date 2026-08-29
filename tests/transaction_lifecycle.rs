@@ -71,6 +71,50 @@ mod transaction_lifecycle_tests {
     }
 
     #[test]
+    fn statement_journal_restores_replication_state_after_late_conflict() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TABLE journal_table(id integer);
+                 CREATE PUBLICATION journal_publication FOR TABLE journal_table;",
+                &mut state,
+            )
+            .unwrap();
+
+        engine.analyze("BEGIN;", &mut state).unwrap();
+        let publication_before = state.local.publications.get("journal_publication").cloned();
+        let graph_before = state.local.graph.edges().to_vec();
+        let generation_before = state.local.generation_counter;
+        let confidence_before = state.local.confidence.clone();
+
+        let findings = engine
+            .analyze(
+                "ALTER PUBLICATION journal_publication ADD TABLE journal_table;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict")
+        );
+        assert_eq!(
+            state.local.publications.get("journal_publication").cloned(),
+            publication_before
+        );
+        assert_eq!(state.local.graph.edges(), graph_before);
+        assert_eq!(state.local.generation_counter, generation_before);
+        assert_eq!(state.local.confidence, confidence_before);
+        assert!(state.local.transaction_aborted);
+
+        engine.analyze("ROLLBACK;", &mut state).unwrap();
+        assert!(state.local.transactions.is_empty());
+        assert!(!state.local.transaction_aborted);
+    }
+
+    #[test]
     fn missing_savepoint_aborts_the_transaction_and_skips_later_statements() {
         let engine = setup_engine();
         let mut state = setup_state();
@@ -541,8 +585,7 @@ mod transaction_lifecycle_tests {
         state
             .local
             .graph
-            .edges
-            .push(safe_migrate::analysis::graph::DependencyEdge {
+            .add_edge(safe_migrate::analysis::graph::DependencyEdge {
                 dependent: v1_id.clone(),
                 referenced: t1_id.clone(),
                 kind: safe_migrate::analysis::graph::DependencyKind::ViewDependency {
@@ -550,7 +593,7 @@ mod transaction_lifecycle_tests {
                 },
             });
 
-        assert_eq!(state.local.graph.edges[0].referenced, t1_id);
+        assert_eq!(state.local.graph.edges()[0].referenced, t1_id);
 
         engine
             .analyze("BEGIN; ALTER TABLE t1 RENAME TO t2; ROLLBACK;", &mut state)
@@ -558,6 +601,6 @@ mod transaction_lifecycle_tests {
 
         assert!(state.relation_is_present(&t1_id));
         assert!(!state.relation_is_present(&object_id("public", "t2")));
-        assert_eq!(state.local.graph.edges[0].referenced, t1_id);
+        assert_eq!(state.local.graph.edges()[0].referenced, t1_id);
     }
 }

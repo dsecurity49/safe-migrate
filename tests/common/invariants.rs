@@ -96,6 +96,10 @@ pub fn assert_cache_invariants(cache: &DbCache) {
 
 pub fn assert_state_invariants(state: &AnalysisState) {
     let local = &state.local;
+    assert!(
+        local.graph.indexes_are_valid(),
+        "dependency-graph indexes disagree with canonical edges"
+    );
 
     for (name, schema) in &local.schemas {
         if let SchemaOverlay::Present(schema) = schema {
@@ -183,7 +187,7 @@ pub fn assert_state_invariants(state: &AnalysisState) {
         );
     }
 
-    for edge in &local.graph.edges {
+    for edge in local.graph.edges() {
         match &edge.kind {
             DependencyKind::ForeignKey {
                 constraint_name: Some(name),

@@ -535,7 +535,7 @@ mod phase10_bug_fixes_and_sorting_tests {
             state
                 .local
                 .graph
-                .edges
+                .edges()
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
@@ -548,7 +548,7 @@ mod phase10_bug_fixes_and_sorting_tests {
             state
                 .local
                 .graph
-                .edges
+                .edges()
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
@@ -568,7 +568,7 @@ mod phase10_bug_fixes_and_sorting_tests {
             state
                 .local
                 .graph
-                .edges
+                .edges()
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
@@ -581,7 +581,7 @@ mod phase10_bug_fixes_and_sorting_tests {
             state
                 .local
                 .graph
-                .edges
+                .edges()
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
@@ -1050,6 +1050,7 @@ mod phase10_bug_fixes_and_sorting_tests {
         assert!(matrix.has_privilege(&role, Privilege::Truncate));
         assert!(matrix.has_privilege(&role, Privilege::References));
         assert!(matrix.has_privilege(&role, Privilege::Trigger));
+        assert!(matrix.has_privilege(&role, Privilege::Maintain));
 
         // 3. has_privilege for All itself should also work
         assert!(matrix.has_privilege(&role, Privilege::All));
@@ -1060,6 +1061,40 @@ mod phase10_bug_fixes_and_sorting_tests {
         matrix.revoke(&role, &revoke_all);
         assert!(!matrix.has_privilege(&role, Privilege::Select));
         assert!(!matrix.has_privilege(&role, Privilege::All));
+    }
+
+    #[test]
+    fn postgres18_all_grant_tracks_maintain_without_leaking_to_older_versions() {
+        use safe_migrate::model::relation::{Privilege, RelationOverlay};
+
+        let engine = setup_engine();
+        for (version, expected) in [(180_000, true), (170_000, false)] {
+            let mut cache = cache_with_table("public", "t_large", None);
+            cache.pg_version_num = Some(version);
+            let mut state = AnalysisState::new(cache);
+            engine
+                .analyze(
+                    "GRANT ALL ON TABLE t_large TO app_user; GRANT MAINTAIN ON TABLE t_large TO app_user;",
+                    &mut state,
+                )
+                .expect("GRANT ALL should analyze");
+
+            let Some(RelationOverlay::Present(relation)) =
+                state.local.relations.get(&object_id("public", "t_large"))
+            else {
+                panic!("baseline relation should remain present");
+            };
+            let grantee = object_id("", "app_user");
+            assert_eq!(
+                relation
+                    .privileges
+                    .grants
+                    .get(&grantee)
+                    .is_some_and(|privileges| privileges.contains(&Privilege::Maintain)),
+                expected,
+                "PG {version} GRANT ALL MAINTAIN expansion mismatch"
+            );
+        }
     }
     // ─────────────────────────────────────────────
     // Bug 14 — Directive parsing tolerates whitespace

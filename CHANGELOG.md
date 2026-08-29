@@ -5,7 +5,7 @@ commits and pull requests. Published binaries, checksums, and generated release
 notes are available on the
 [GitHub Releases page](https://github.com/dsecurity49/safe-migrate/releases).
 
-## v0.7.0 — 2026-08-28
+## v0.7.0 — 2026-08-29
 
 - Made Cache V6 loading and writing reject semantically inconsistent metadata
   (including mismatched identities and dangling catalog relationships), and
@@ -19,6 +19,11 @@ notes are available on the
   produce diagnostics rather than unchecked failures.
 - Expanded release readiness checks to cover the frozen fixture suite, package
   contents, Rust 1.94, and supported operating systems.
+- Matched PostgreSQL's 63-byte identifier truncation for quoted and unquoted
+  names, including UTF-8-safe clipping, namespace conflicts, routine aliases,
+  and generated-name differential coverage.
+- Added PostgreSQL 18 relation-ACL support for `MAINTAIN`, including
+  version-aware `GRANT ALL` expansion and typed grant/revoke extraction.
 
 ## v0.6.2 — 2026-08-27
 

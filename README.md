@@ -41,6 +41,8 @@ Run `bash install.sh --help` after downloading the installer for pinning and
 destination options. Archives, checksums, and manual downloads are available on
 the
 [GitHub Releases page](https://github.com/dsecurity49/safe-migrate/releases).
+Maintainers should use the checked-in [release checklist](docs/RELEASING.md)
+before tagging or publishing a version.
 
 ## Quick start
 
