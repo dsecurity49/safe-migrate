@@ -7,6 +7,8 @@ notes are available on the
 
 ## v0.7.0 — 2026-08-30
 
+- Fixed `sync --out <filename>` for bare relative cache filenames and made the
+  interactive-mode terminal requirement explicit.
 - Added semantic Cache V6 validation and durable cache replacement; invalid
   cache, configuration, rollback, and report state now produces diagnostics.
 - Matched PostgreSQL's 63-byte identifier behavior, including UTF-8-safe

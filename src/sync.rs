@@ -267,7 +267,7 @@ fn write_cache_with_protection_and_limits(
         .validate_semantics()
         .map_err(anyhow::Error::msg)
         .context("Refusing to write a semantically invalid Cache V6 baseline")?;
-    let parent = out_path.parent().unwrap_or_else(|| Path::new("."));
+    let parent = cache_parent(out_path);
     let mut temp_file = NamedTempFile::new_in(parent).with_context(|| {
         format!(
             "Failed to create temporary cache file beside {}",
@@ -329,6 +329,13 @@ fn write_cache_with_protection_and_limits(
     Ok(())
 }
 
+fn cache_parent(out_path: &Path) -> &Path {
+    out_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
 // This bounds decoded bytes entering zstd, not the compressed output size.
 struct SizeLimitedWriter<W> {
     inner: W,
@@ -387,7 +394,7 @@ fn replace_cache(temp_file: NamedTempFile, out_path: &Path) -> Result<()> {
                 out_path.display()
             )
         })?;
-    let parent = out_path.parent().unwrap_or_else(|| Path::new("."));
+    let parent = cache_parent(out_path);
     std::fs::File::open(parent)
         .and_then(|directory| directory.sync_all())
         .with_context(|| {
@@ -2035,6 +2042,15 @@ mod atomic_write_tests {
             .unwrap()
             .0;
         versioned.into_cache().unwrap()
+    }
+
+    #[test]
+    fn bare_cache_filenames_use_the_current_directory_as_parent() {
+        assert_eq!(cache_parent(Path::new("baseline.cache")), Path::new("."));
+        assert_eq!(
+            cache_parent(Path::new("cache/baseline.cache")),
+            Path::new("cache")
+        );
     }
 
     #[test]

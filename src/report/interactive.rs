@@ -11,7 +11,7 @@ use crossterm::{
         enable_raw_mode,
     },
 };
-use std::io::{Write, stdout};
+use std::io::{IsTerminal, Write, stdin, stdout};
 use terminal_size::{Height, Width, terminal_size};
 
 struct TerminalGuard;
@@ -34,6 +34,12 @@ pub fn run_interactive(violations: &[Violation], confidence: &Confidence) -> Res
     if violations.is_empty() {
         println!("No violations found!");
         return Ok(());
+    }
+
+    if !stdin().is_terminal() || !stdout().is_terminal() {
+        anyhow::bail!(
+            "Interactive mode requires a terminal connected to standard input and output"
+        );
     }
 
     enable_raw_mode()?;
@@ -158,4 +164,34 @@ pub fn run_interactive(violations: &[Violation], confidence: &Confidence) -> Res
     println!("Exited interactive mode.");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
+
+    #[test]
+    fn interactive_mode_explains_when_no_terminal_is_available() {
+        let violation = Violation {
+            source_range: None,
+            rule_id: "test-rule",
+            operation_kind: OperationKind::Other("test".to_string()),
+            object_kind: ObjectKind::Unknown,
+            object_name: "test".to_string(),
+            tier: ViolationTier::Tier3,
+            reason: "test".to_string(),
+            recipe: "test",
+            dedup_key: None,
+            sql: None,
+            fk_dependency_related: false,
+        };
+
+        let error = run_interactive(&[violation], &Confidence::Exact).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("requires a terminal connected to standard input and output")
+        );
+    }
 }
