@@ -291,12 +291,14 @@ impl Resolver {
                 table,
                 permissive,
                 command,
+                semantics_complete,
             } => {
                 mutations.push(Self::resolve_create_policy(
                     name,
                     table,
                     *permissive,
                     command,
+                    *semantics_complete,
                     state,
                 ));
             }
@@ -391,18 +393,18 @@ impl Resolver {
                 mutations.extend(Self::resolve_alter_table(name, actions, state));
             }
             StatementFact::DropTable {
-                name,
+                names,
                 if_exists,
                 cascade,
             } => {
-                mutations.push(Self::resolve_drop_table(name, *if_exists, *cascade, state));
+                mutations.push(Self::resolve_drop_table(names, *if_exists, *cascade, state));
             }
             StatementFact::DropView {
-                name,
+                names,
                 if_exists,
                 cascade,
             } => {
-                mutations.push(Self::resolve_drop_view(name, *if_exists, *cascade, state));
+                mutations.push(Self::resolve_drop_view(names, *if_exists, *cascade, state));
             }
             StatementFact::DropMaterializedView {
                 names,
@@ -417,11 +419,13 @@ impl Resolver {
                 names,
                 if_exists,
                 concurrently,
+                cascade,
             } => {
-                mutations.extend(Self::resolve_drop_indexes(
+                mutations.push(Self::resolve_drop_indexes(
                     names,
                     *if_exists,
                     *concurrently,
+                    *cascade,
                     state,
                 ));
             }

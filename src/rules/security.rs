@@ -26,7 +26,16 @@ impl Rule for OverbroadGrantRule {
         _config: &Config,
         _cascade_closure: Option<&CascadeResult>,
     ) -> Vec<Violation> {
-        if *result == MutationResult::Skipped {
+        // `WITH GRANT OPTION` is itself the security-sensitive operation. The
+        // state matrix intentionally skips it because grant chains are not
+        // modeled, but that uncertainty must not suppress the syntax-level
+        // warning for a statement PostgreSQL will execute.
+        let skipped_grant_option = *result == MutationResult::Skipped
+            && matches!(
+                mutation,
+                Mutation::Grant(grant) if grant.with_grant_option
+            );
+        if *result == MutationResult::Skipped && !skipped_grant_option {
             return vec![];
         }
         let mut violations = Vec::new();

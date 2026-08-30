@@ -181,6 +181,37 @@ an absent cache does not lower a finding by itself. A stale cache taints
 confidence and emits a warning on standard error. `stale_stats_days` uses the
 timestamp inside the cache, not file modification time.
 
+Cache V6 does not carry foreign-key column-number lists or index eligibility
+metadata. A transition whose correctness depends on either fact is skipped and
+taints confidence rather than inventing state; syntax-level findings that are
+independent of the skipped state update (for example `DROP COLUMN` being
+irreversible or `WITH GRANT OPTION`) remain reportable. Multi-target view drops
+with an unresolved target are likewise treated atomically, preserving known
+targets in the simulated state.
+
+Parser-valid DDL whose semantics are not represented by the state model is
+handled as opaque and taints confidence. This includes copied or inherited
+tables, CTAS transaction-lifecycle actions, unsupported role attributes, and
+unmodeled type or materialized-view alterations; these statements are never
+silently recorded as exact no-ops.
+The same rule applies to view options/check options, unpopulated materialized
+views, and domain constraints or collations. CTAS `WITH NO DATA` and expression
+indexes remain typed so their dedicated safety rules can report them; expression
+index key/dependency metadata is not used to claim exact later constraint
+adoption. Policy mutations remain available to security rules, but
+policy role lists and expressions taint confidence because relation state does
+not store them.
+Aggregate creation retains its routine identity but is tainted because
+transition-function and implementation-option dependencies are not modeled.
+Composite, range, and base type creation is opaque because their attributes,
+subtypes, and implementation dependencies are not represented.
+Database create/alter/drop mutations remain available to their syntax rules but
+taint confidence because database-level state is outside the current-database
+schema model.
+Unknown `RESET` parameters are opaque; only modeled timeout/search-path values
+are exact, and explicitly schema-neutral settings such as `application_name`
+remain no-ops.
+
 Cache V6 synchronizes all `pg_proc.prokind` values in PostgreSQL's shared
 routine namespace. Function, procedure, aggregate, and window-function
 lifecycle operations use that baseline. Routine DDL without a typed Squawk

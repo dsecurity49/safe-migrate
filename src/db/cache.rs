@@ -1,7 +1,7 @@
 use crate::ast::identifiers::ObjectId;
 use crate::model::constraint::ConstraintState;
 use crate::model::function::FunctionState;
-use crate::model::relation::RelationState;
+use crate::model::relation::{RelationKind, RelationState};
 use crate::model::replication::{PublicationState, SubscriptionState};
 use crate::model::role::RoleState;
 use crate::model::schema::SchemaState;
@@ -256,12 +256,25 @@ impl DbCache {
 
         for (id, sequence) in &self.sequences {
             if let Some((table_id, column_name)) = &sequence.owned_by {
-                let relation = self.relations.get(table_id).ok_or_else(|| {
-                    format!(
+                let Some(relation) = self.relations.get(table_id) else {
+                    let omitted_owner_schema =
+                        self.metadata.schemas.as_ref().is_some_and(|schemas| {
+                            !schemas.iter().any(|schema| schema == &table_id.schema)
+                        });
+                    if omitted_owner_schema {
+                        continue;
+                    }
+                    return Err(format!(
                         "sequence '{}' ownership references missing relation '{}'",
                         id, table_id
-                    )
-                })?;
+                    ));
+                };
+                if !matches!(relation.kind, RelationKind::Table) {
+                    return Err(format!(
+                        "sequence '{}' ownership target '{}' is not a table",
+                        id, table_id
+                    ));
+                }
                 if !relation.has_column(column_name) {
                     return Err(format!(
                         "sequence '{}' ownership references missing column '{}.{}'",
@@ -284,9 +297,15 @@ impl DbCache {
 
         let mut constraint_keys = HashSet::new();
         for constraint in &self.constraints {
-            if !self.relations.contains_key(&constraint.table_id) {
+            let Some(relation) = self.relations.get(&constraint.table_id) else {
                 return Err(format!(
                     "constraint '{}.{}' references a missing relation",
+                    constraint.table_id, constraint.name
+                ));
+            };
+            if !matches!(relation.kind, RelationKind::Table) {
+                return Err(format!(
+                    "constraint '{}.{}' targets a non-table relation",
                     constraint.table_id, constraint.name
                 ));
             }
@@ -300,9 +319,18 @@ impl DbCache {
 
         let mut index_ids = HashSet::new();
         for index in &self.indexes {
-            if !self.relations.contains_key(&index.table_id) {
+            let Some(relation) = self.relations.get(&index.table_id) else {
                 return Err(format!(
                     "index '{}' references missing relation '{}'",
+                    index.index_id, index.table_id
+                ));
+            };
+            if !matches!(
+                relation.kind,
+                RelationKind::Table | RelationKind::MaterializedView
+            ) {
+                return Err(format!(
+                    "index '{}' targets a non-indexable relation '{}'",
                     index.index_id, index.table_id
                 ));
             }
@@ -313,10 +341,16 @@ impl DbCache {
 
         let mut trigger_ids = HashSet::new();
         for trigger in &self.triggers {
-            if !self.relations.contains_key(&trigger.table_id) {
+            let Some(relation) = self.relations.get(&trigger.table_id) else {
                 return Err(format!(
                     "trigger '{}' references missing relation '{}'",
                     trigger.trigger_id, trigger.table_id
+                ));
+            };
+            if !matches!(relation.kind, RelationKind::Table | RelationKind::View) {
+                return Err(format!(
+                    "trigger '{}' targets a relation kind that cannot have triggers",
+                    trigger.trigger_id
                 ));
             }
             if !trigger_ids.insert(trigger.trigger_id.clone()) {
@@ -329,11 +363,23 @@ impl DbCache {
 
         let mut foreign_key_ids = HashSet::new();
         for foreign_key in &self.foreign_keys {
-            if !self.relations.contains_key(&foreign_key.from_table)
-                || !self.relations.contains_key(&foreign_key.to_table)
-            {
+            let Some(from_relation) = self.relations.get(&foreign_key.from_table) else {
                 return Err(format!(
                     "foreign key '{}.{}' references a missing relation",
+                    foreign_key.from_table, foreign_key.constraint_name
+                ));
+            };
+            let Some(to_relation) = self.relations.get(&foreign_key.to_table) else {
+                return Err(format!(
+                    "foreign key '{}.{}' references a missing relation",
+                    foreign_key.from_table, foreign_key.constraint_name
+                ));
+            };
+            if !matches!(from_relation.kind, RelationKind::Table)
+                || !matches!(to_relation.kind, RelationKind::Table)
+            {
+                return Err(format!(
+                    "foreign key '{}.{}' must reference tables",
                     foreign_key.from_table, foreign_key.constraint_name
                 ));
             }
@@ -397,8 +443,17 @@ impl DbCache {
                         object_id
                     )
                 })?;
-            if !self.relations.contains_key(&object_id)
-                || !self.relations.contains_key(&referenced_id)
+            let omitted_schema = |schema: Option<&str>| {
+                self.metadata
+                    .schemas
+                    .as_ref()
+                    .zip(schema)
+                    .is_some_and(|(schemas, schema)| !schemas.iter().any(|known| known == schema))
+            };
+            let object_missing = !self.relations.contains_key(&object_id);
+            let referenced_missing = !self.relations.contains_key(&referenced_id);
+            if (object_missing && !omitted_schema(dependency.obj_schema.as_deref()))
+                || (referenced_missing && !omitted_schema(dependency.ref_schema.as_deref()))
             {
                 return Err(format!(
                     "view dependency '{} -> {}' references a missing relation",
@@ -460,6 +515,40 @@ mod tests {
             .into_cache()
             .unwrap_err();
         assert!(error.contains("schema cache key 'app'"));
+    }
+
+    #[test]
+    fn scoped_cache_accepts_a_dependency_to_an_omitted_schema() {
+        let view_id = ObjectId::new("app", "v");
+        let mut cache = DbCache::new();
+        cache.metadata.schemas = Some(vec!["app".to_string()]);
+        cache.insert_baseline(
+            view_id.clone(),
+            RelationState::new(
+                view_id.clone(),
+                ObjectId::new("", "postgres"),
+                0,
+                None,
+                crate::model::relation::RelationKind::View,
+                crate::model::relation::Persistence::Permanent,
+                0,
+            ),
+        );
+        cache.dependencies.push(DependencyCache {
+            classid: 0,
+            objid: 0,
+            objsubid: 0,
+            refclassid: 0,
+            refobjid: 0,
+            refobjsubid: 0,
+            deptype: "view".to_string(),
+            obj_schema: Some("app".to_string()),
+            obj_name: Some("v".to_string()),
+            ref_schema: Some("tenant".to_string()),
+            ref_name: Some("base".to_string()),
+        });
+
+        assert!(cache.validate_semantics().is_ok());
     }
 
     #[test]

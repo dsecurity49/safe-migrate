@@ -90,6 +90,9 @@ pub enum StateChange {
         name: String,
         previous: Option<crate::model::constraint::ConstraintState>,
     },
+    BaselineForeignKeysSnapshot {
+        previous: HashSet<(ObjectId, String)>,
+    },
     RoleContextSnapshot {
         current_role: String,
         current_role_known: bool,

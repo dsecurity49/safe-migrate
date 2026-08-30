@@ -20,6 +20,15 @@ pub enum DependencyKind {
         is_unique: bool,
         eligibility_known: bool,
     },
+    /// A local primary-key/unique constraint whose key columns are known.
+    /// This edge is intentionally state-only (not a cache row): V6 caches
+    /// retain constraint identity but historically did not retain key
+    /// columns, so baseline callers must remain conservative.
+    ConstraintOnRelation {
+        constraint_name: String,
+        columns: Vec<String>,
+        is_primary: bool,
+    },
     RenameTo,
     PartitionOf,
     SequenceOwnedBy {
@@ -325,31 +334,112 @@ impl DependencyGraph {
         false
     }
 
-    pub fn propagate_rename(&mut self, old_id: &ObjectId, new_id: &ObjectId) {
+    /// Propagate a relation rename through relation-to-relation edges.
+    ///
+    /// Dependency endpoints are intentionally updated by edge kind rather than
+    /// by blindly comparing `ObjectId`s.  `ObjectId` carries no catalog kind,
+    /// and publications are represented by a synthetic `public/<name>` ID, so
+    /// a generic endpoint rewrite can otherwise corrupt an unrelated edge when
+    /// two namespaces happen to share a name.
+    pub fn propagate_relation_rename(&mut self, old_id: &ObjectId, new_id: &ObjectId) {
         for edge in &mut self.edges {
-            if matches!(edge.kind, DependencyKind::RenameTo) {
-                continue;
-            }
-            if edge.dependent == *old_id {
-                edge.dependent = new_id.clone();
-            }
-            if edge.referenced == *old_id {
-                edge.referenced = new_id.clone();
-            }
-            if let DependencyKind::TriggerOnTable {
-                trigger_id,
-                function_id,
-            } = &mut edge.kind
-            {
-                if *trigger_id == *old_id {
-                    *trigger_id = new_id.clone();
+            match &mut edge.kind {
+                DependencyKind::RenameTo => {}
+                DependencyKind::ForeignKey { .. }
+                | DependencyKind::ViewDependency { .. }
+                | DependencyKind::PartitionOf
+                | DependencyKind::ColumnGeneratedFrom { .. } => {
+                    if edge.dependent == *old_id {
+                        edge.dependent = new_id.clone();
+                    }
+                    if edge.referenced == *old_id {
+                        edge.referenced = new_id.clone();
+                    }
                 }
-                if *function_id == *old_id {
-                    *function_id = new_id.clone();
+                DependencyKind::IndexOnRelation { .. }
+                | DependencyKind::SequenceOwnedBy { .. }
+                | DependencyKind::TriggerOnTable { .. } => {
+                    if edge.referenced == *old_id {
+                        edge.referenced = new_id.clone();
+                    }
+                }
+                DependencyKind::ConstraintOnRelation { .. } => {
+                    if edge.dependent == *old_id {
+                        edge.dependent = new_id.clone();
+                    }
+                    if edge.referenced == *old_id {
+                        edge.referenced = new_id.clone();
+                    }
+                }
+                DependencyKind::PublicationIncludes { .. } => {
+                    if edge.dependent == *old_id {
+                        edge.dependent = new_id.clone();
+                    }
                 }
             }
         }
         self.invalidate_indexes();
+    }
+
+    /// Propagate an index rename.  Indexes are dependent endpoints of their
+    /// `IndexOnRelation` edges; they are not relation references.
+    pub fn propagate_index_rename(&mut self, old_id: &ObjectId, new_id: &ObjectId) {
+        for edge in &mut self.edges {
+            if matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
+                && edge.dependent == *old_id
+            {
+                edge.dependent = new_id.clone();
+            }
+        }
+        self.invalidate_indexes();
+    }
+
+    /// Propagate a sequence rename only through sequence ownership edges.
+    pub fn propagate_sequence_rename(&mut self, old_id: &ObjectId, new_id: &ObjectId) {
+        for edge in &mut self.edges {
+            if matches!(edge.kind, DependencyKind::SequenceOwnedBy { .. })
+                && edge.dependent == *old_id
+            {
+                edge.dependent = new_id.clone();
+            }
+        }
+        self.invalidate_indexes();
+    }
+
+    /// Propagate a trigger rename through its trigger edge and payload.
+    pub fn propagate_trigger_rename(&mut self, old_id: &ObjectId, new_id: &ObjectId) {
+        for edge in &mut self.edges {
+            if let DependencyKind::TriggerOnTable { trigger_id, .. } = &mut edge.kind
+                && *trigger_id == *old_id
+            {
+                *trigger_id = new_id.clone();
+                if edge.dependent == *old_id {
+                    edge.dependent = new_id.clone();
+                }
+            }
+        }
+        self.invalidate_indexes();
+    }
+
+    /// Propagate a function rename through trigger dependency payloads.
+    pub fn propagate_function_rename(&mut self, old_id: &ObjectId, new_id: &ObjectId) {
+        for edge in &mut self.edges {
+            if let DependencyKind::TriggerOnTable { function_id, .. } = &mut edge.kind
+                && *function_id == *old_id
+            {
+                *function_id = new_id.clone();
+            }
+        }
+        self.invalidate_indexes();
+    }
+
+    /// Backwards-compatible relation rename entry point.
+    ///
+    /// New callers should use the typed helpers above.  Keeping this method
+    /// relation-scoped prevents the old all-endpoints behavior from silently
+    /// rewriting sequence, trigger, function, or publication identity data.
+    pub fn propagate_rename(&mut self, old_id: &ObjectId, new_id: &ObjectId) {
+        self.propagate_relation_rename(old_id, new_id);
     }
 
     pub fn triggers_on(&self, table_id: &ObjectId) -> Vec<&DependencyEdge> {

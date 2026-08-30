@@ -940,7 +940,7 @@ mod phase10_bug_fixes_and_sorting_tests {
     // Bug 17 — SetType/SetDefault on nonexistent column
     // ─────────────────────────────────────────────
     #[test]
-    fn test_bug017_set_type_on_nonexistent_column_taints_confidence() {
+    fn test_bug017_set_type_on_nonexistent_column_is_a_conflict() {
         let engine = setup_engine();
         let mut state = setup_state();
 
@@ -948,22 +948,21 @@ mod phase10_bug_fixes_and_sorting_tests {
             .analyze("CREATE TABLE t(id int);", &mut state)
             .unwrap();
 
-        let _v = engine
+        let violations = engine
             .analyze(
                 "ALTER TABLE t ALTER COLUMN nonexistent_col SET DATA TYPE text;",
                 &mut state,
             )
             .unwrap();
 
-        assert_eq!(
-            state.local.confidence,
-            safe_migrate::analysis::state::Confidence::Tainted,
-            "Confidence should be Tainted when SET TYPE on a nonexistent column"
-        );
+        assert!(violations.iter().any(|violation| {
+            violation.rule_id == "chain-conflict" && violation.reason.contains("nonexistent_col")
+        }));
+        assert_eq!(state.local.confidence, Confidence::Exact);
     }
 
     #[test]
-    fn test_bug017_set_default_on_nonexistent_column_taints_confidence() {
+    fn test_bug017_set_default_on_nonexistent_column_is_a_conflict() {
         let engine = setup_engine();
         let mut state = setup_state();
 
@@ -971,18 +970,17 @@ mod phase10_bug_fixes_and_sorting_tests {
             .analyze("CREATE TABLE t(id int);", &mut state)
             .unwrap();
 
-        let _v = engine
+        let violations = engine
             .analyze(
                 "ALTER TABLE t ALTER COLUMN nonexistent_col SET DEFAULT 42;",
                 &mut state,
             )
             .unwrap();
 
-        assert_eq!(
-            state.local.confidence,
-            safe_migrate::analysis::state::Confidence::Tainted,
-            "Confidence should be Tainted when SET DEFAULT on a nonexistent column"
-        );
+        assert!(violations.iter().any(|violation| {
+            violation.rule_id == "chain-conflict" && violation.reason.contains("nonexistent_col")
+        }));
+        assert_eq!(state.local.confidence, Confidence::Exact);
     }
 
     #[test]

@@ -39,6 +39,9 @@ impl AnalysisState {
         &mut self,
         function: &CreateFunctionMutation,
     ) -> MutationResult {
+        if let Err(result) = self.ensure_schema_target(&function.id.schema) {
+            return result;
+        }
         let routine_kind = if function
             .options
             .iter()
@@ -100,6 +103,15 @@ impl AnalysisState {
                 _ => None,
             })
             .unwrap_or_else(|| "sql".to_string());
+
+        if function.options.iter().any(Self::function_option_unmodeled) {
+            // FunctionState intentionally stores only the attributes used by
+            // current rules.  Keep the useful identity/volatility fields, but
+            // taint the state when PostgreSQL attributes such as STRICT,
+            // PARALLEL, COST, or SUPPORT cannot be represented.
+            self.snapshot_confidence();
+            self.local.confidence = Confidence::Tainted;
+        }
 
         self.local.functions.insert(
             function.id.clone(),
@@ -203,6 +215,10 @@ impl AnalysisState {
                         }
                     }
                 }
+                if options.iter().any(Self::function_option_unmodeled) {
+                    self.snapshot_confidence();
+                    self.local.confidence = Confidence::Tainted;
+                }
             }
             AlterFunctionAction::Rename { to, .. } => {
                 let signature = function
@@ -212,16 +228,27 @@ impl AnalysisState {
                     .map(|index| &function.id.name[index..])
                     .unwrap_or("");
                 let new_id = ObjectId::new(function.id.schema.clone(), format!("{to}{signature}"));
+                if let Err(result) = self.validate_function_move(&function.id, &new_id) {
+                    return result;
+                }
                 self.move_function(&function.id, &new_id);
             }
             AlterFunctionAction::SchemaChange { new_schema } => {
                 let new_id = ObjectId::new(new_schema.clone(), function.id.name.clone());
+                if let Err(result) = self.validate_function_move(&function.id, &new_id) {
+                    return result;
+                }
                 self.move_function(&function.id, &new_id);
             }
             AlterFunctionAction::OwnerChange(_)
             | AlterFunctionAction::DependsOnExtension { .. }
             | AlterFunctionAction::NoDependsOnExtension { .. } => {
-                self.snapshot_function(&function.id);
+                // Ownership and extension dependencies are not represented
+                // by FunctionState, so retaining Applied would overstate the
+                // precision of subsequent dependency checks.
+                self.snapshot_confidence();
+                self.local.confidence = Confidence::Tainted;
+                return MutationResult::Skipped;
             }
         }
         MutationResult::Applied
@@ -231,7 +258,11 @@ impl AnalysisState {
         &mut self,
         function: &DropFunctionMutation,
     ) -> MutationResult {
-        let mut any_applied = false;
+        // PostgreSQL resolves every target before applying a multi-target
+        // DROP.  Preflight the complete set first so an unknown or invalid
+        // later signature cannot leave an earlier function dropped in the
+        // simulator when the statement itself would fail.
+        let mut targets: Vec<(ObjectId, Vec<(ObjectId, ObjectId)>)> = Vec::new();
         for signature in &function.signatures {
             let signature_name = format!(
                 "{}({})",
@@ -243,7 +274,13 @@ impl AnalysisState {
             match self.routine_lookup(&id, |kind| {
                 matches!(kind, RoutineKind::Function | RoutineKind::Window)
             }) {
-                RoutineLookup::WrongKind | RoutineLookup::Tombstone => {
+                RoutineLookup::WrongKind => {
+                    return MutationResult::Conflict {
+                        reason: format!("function '{}' does not exist", id),
+                    };
+                }
+                RoutineLookup::Tombstone if function.if_exists => {}
+                RoutineLookup::Tombstone => {
                     return MutationResult::Conflict {
                         reason: format!("function '{}' does not exist", id),
                     };
@@ -253,9 +290,10 @@ impl AnalysisState {
                         reason: format!("function '{}' does not exist", id),
                     };
                 }
-                RoutineLookup::Unknown if !function.if_exists => {
+                RoutineLookup::Unknown => {
                     self.snapshot_confidence();
                     self.local.confidence = Confidence::Tainted;
+                    return MutationResult::Skipped;
                 }
                 RoutineLookup::Present => {
                     let dependent_triggers: Vec<(ObjectId, ObjectId)> = self
@@ -280,44 +318,55 @@ impl AnalysisState {
                             ),
                         };
                     }
-
-                    any_applied = true;
-                    self.snapshot_function(&id);
-                    self.local
-                        .functions
-                        .insert(id.clone(), FunctionOverlay::Dropped);
-
-                    if function.cascade {
-                        for (trigger_id, table_id) in &dependent_triggers {
-                            let trigger_name = self.local.triggers.get(trigger_id).and_then(
-                                |overlay| match overlay {
-                                    TriggerOverlay::Present(trigger) => Some(trigger.name.clone()),
-                                    TriggerOverlay::Dropped => None,
-                                },
-                            );
-                            self.snapshot_trigger(trigger_id);
-                            self.local
-                                .triggers
-                                .insert(trigger_id.clone(), TriggerOverlay::Dropped);
-                            self.snapshot_relation(table_id);
-                            if let Some(RelationOverlay::Present(relation)) =
-                                self.local.relations.get_mut(table_id)
-                                && let Some(trigger_name) = trigger_name
-                            {
-                                relation.triggers.remove(&trigger_name);
-                            }
-                        }
-                        if !dependent_triggers.is_empty() {
-                            self.snapshot_graph_full();
-                            self.local.graph.retain_edges(|edge| {
-                                !dependent_triggers
-                                    .iter()
-                                    .any(|(trigger_id, _)| edge.dependent == *trigger_id)
-                            });
-                        }
+                    if !targets.iter().any(|(existing, _)| existing == &id) {
+                        targets.push((id, dependent_triggers));
                     }
                 }
-                RoutineLookup::AuthoritativelyAbsent | RoutineLookup::Unknown => {}
+                RoutineLookup::AuthoritativelyAbsent => {}
+            }
+        }
+
+        if targets.is_empty() {
+            return MutationResult::Skipped;
+        }
+
+        let any_applied = !targets.is_empty();
+        for (id, dependent_triggers) in &targets {
+            self.snapshot_function(id);
+            self.local
+                .functions
+                .insert(id.clone(), FunctionOverlay::Dropped);
+
+            if function.cascade {
+                for (trigger_id, table_id) in dependent_triggers.iter() {
+                    let trigger_name =
+                        self.local
+                            .triggers
+                            .get(trigger_id)
+                            .and_then(|overlay| match overlay {
+                                TriggerOverlay::Present(trigger) => Some(trigger.name.clone()),
+                                TriggerOverlay::Dropped => None,
+                            });
+                    self.snapshot_trigger(trigger_id);
+                    self.local
+                        .triggers
+                        .insert(trigger_id.clone(), TriggerOverlay::Dropped);
+                    self.snapshot_relation(table_id);
+                    if let Some(RelationOverlay::Present(relation)) =
+                        self.local.relations.get_mut(table_id)
+                        && let Some(trigger_name) = trigger_name
+                    {
+                        relation.triggers.remove(&trigger_name);
+                    }
+                }
+                if !dependent_triggers.is_empty() {
+                    self.snapshot_graph_full();
+                    self.local.graph.retain_edges(|edge| {
+                        !dependent_triggers
+                            .iter()
+                            .any(|(trigger_id, _)| edge.dependent == *trigger_id)
+                    });
+                }
             }
         }
         if any_applied {
@@ -331,6 +380,9 @@ impl AnalysisState {
         &mut self,
         procedure: &CreateProcedureMutation,
     ) -> MutationResult {
+        if let Err(result) = self.ensure_schema_target(&procedure.id.schema) {
+            return result;
+        }
         match self.routine_lookup(&procedure.id, |kind| kind == RoutineKind::Procedure) {
             RoutineLookup::Present if procedure.or_replace => {}
             RoutineLookup::Present | RoutineLookup::WrongKind => {
@@ -347,6 +399,50 @@ impl AnalysisState {
         self.snapshot_function(&procedure.id);
         self.snapshot_generation_counter();
         self.local.generation_counter += 1;
+
+        let volatility = procedure
+            .options
+            .iter()
+            .find_map(|option| match option {
+                FuncOptionFact::Volatility(volatility) => Some(match volatility {
+                    VolatilityKind::Volatile => Volatility::Volatile,
+                    VolatilityKind::Stable => Volatility::Stable,
+                    VolatilityKind::Immutable => Volatility::Immutable,
+                }),
+                _ => None,
+            })
+            .unwrap_or(Volatility::Volatile);
+        let security = procedure
+            .options
+            .iter()
+            .find_map(|option| match option {
+                FuncOptionFact::Security(security) => Some(match security {
+                    SecurityKind::Invoker => SecurityMode::Invoker,
+                    SecurityKind::Definer => SecurityMode::Definer,
+                }),
+                _ => None,
+            })
+            .unwrap_or(SecurityMode::Invoker);
+        let language = procedure
+            .options
+            .iter()
+            .find_map(|option| match option {
+                FuncOptionFact::Language(language) => Some(language.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| "sql".to_string());
+        if procedure
+            .options
+            .iter()
+            .any(Self::function_option_unmodeled)
+        {
+            // Procedures share the catalog fields modeled by FunctionState,
+            // but their AS body and other function options are not retained.
+            // Preserve the useful attributes while making the uncertainty
+            // visible to downstream verdicts.
+            self.snapshot_confidence();
+            self.local.confidence = Confidence::Tainted;
+        }
 
         self.local.functions.insert(
             procedure.id.clone(),
@@ -367,9 +463,9 @@ impl AnalysisState {
                     .collect(),
                 return_type: "void".to_string(),
                 return_type_id: None,
-                volatility: Volatility::Volatile,
-                language: "sql".to_string(),
-                security: SecurityMode::Invoker,
+                volatility,
+                language,
+                security,
             }),
         );
         MutationResult::Applied
@@ -407,13 +503,23 @@ impl AnalysisState {
                     .map(|index| &procedure.id.name[index..])
                     .unwrap_or("");
                 let new_id = ObjectId::new(procedure.id.schema.clone(), format!("{to}{signature}"));
+                if let Err(result) = self.validate_function_move(&procedure.id, &new_id) {
+                    return result;
+                }
                 self.move_function(&procedure.id, &new_id);
             }
             AlterFunctionAction::SchemaChange { new_schema } => {
                 let new_id = ObjectId::new(new_schema.clone(), procedure.id.name.clone());
+                if let Err(result) = self.validate_function_move(&procedure.id, &new_id) {
+                    return result;
+                }
                 self.move_function(&procedure.id, &new_id);
             }
-            _ => self.snapshot_function(&procedure.id),
+            _ => {
+                self.snapshot_confidence();
+                self.local.confidence = Confidence::Tainted;
+                return MutationResult::Skipped;
+            }
         }
         MutationResult::Applied
     }
@@ -422,7 +528,7 @@ impl AnalysisState {
         &mut self,
         procedure: &DropProcedureMutation,
     ) -> MutationResult {
-        let mut any_applied = false;
+        let mut targets = Vec::new();
         for signature in &procedure.signatures {
             let signature_name = format!(
                 "{}({})",
@@ -433,11 +539,17 @@ impl AnalysisState {
             let id = ObjectId::new(schema, signature_name);
             match self.routine_lookup(&id, |kind| kind == RoutineKind::Procedure) {
                 RoutineLookup::Present => {
-                    any_applied = true;
-                    self.snapshot_function(&id);
-                    self.local.functions.insert(id, FunctionOverlay::Dropped);
+                    if !targets.contains(&id) {
+                        targets.push(id);
+                    }
                 }
-                RoutineLookup::WrongKind | RoutineLookup::Tombstone => {
+                RoutineLookup::WrongKind => {
+                    return MutationResult::Conflict {
+                        reason: format!("procedure '{}' does not exist", id),
+                    };
+                }
+                RoutineLookup::Tombstone if procedure.if_exists => {}
+                RoutineLookup::Tombstone => {
                     return MutationResult::Conflict {
                         reason: format!("procedure '{}' does not exist", id),
                     };
@@ -447,15 +559,21 @@ impl AnalysisState {
                         reason: format!("procedure '{}' does not exist", id),
                     };
                 }
-                RoutineLookup::Unknown if !procedure.if_exists => {
+                RoutineLookup::Unknown => {
                     self.snapshot_confidence();
                     self.local.confidence = Confidence::Tainted;
                     return MutationResult::Skipped;
                 }
-                RoutineLookup::AuthoritativelyAbsent | RoutineLookup::Unknown => {}
+                RoutineLookup::AuthoritativelyAbsent => {}
             }
         }
-        if any_applied {
+        for id in &targets {
+            self.snapshot_function(id);
+            self.local
+                .functions
+                .insert(id.clone(), FunctionOverlay::Dropped);
+        }
+        if !targets.is_empty() {
             MutationResult::Applied
         } else {
             MutationResult::Skipped
@@ -466,6 +584,9 @@ impl AnalysisState {
         &mut self,
         aggregate: &CreateAggregateMutation,
     ) -> MutationResult {
+        if let Err(result) = self.ensure_schema_target(&aggregate.id.schema) {
+            return result;
+        }
         match self.routine_lookup(&aggregate.id, |kind| kind == RoutineKind::Aggregate) {
             RoutineLookup::Present if aggregate.or_replace => {}
             RoutineLookup::Present | RoutineLookup::WrongKind => {
@@ -479,6 +600,12 @@ impl AnalysisState {
             }
             RoutineLookup::Tombstone | RoutineLookup::AuthoritativelyAbsent => {}
         }
+        // Aggregate transition options (SFUNC/STYPE/final/combine state and
+        // related catalog dependencies) are not carried by this mutation.
+        // Keep the routine identity for conservative lookup, but never claim
+        // the resulting aggregate state is exact.
+        self.snapshot_confidence();
+        self.local.confidence = Confidence::Tainted;
         self.snapshot_function(&aggregate.id);
         self.local.functions.insert(
             aggregate.id.clone(),
@@ -538,13 +665,23 @@ impl AnalysisState {
                     .map(|index| &aggregate.id.name[index..])
                     .unwrap_or("");
                 let new_id = ObjectId::new(aggregate.id.schema.clone(), format!("{to}{signature}"));
+                if let Err(result) = self.validate_function_move(&aggregate.id, &new_id) {
+                    return result;
+                }
                 self.move_function(&aggregate.id, &new_id);
             }
             AlterFunctionAction::SchemaChange { new_schema } => {
                 let new_id = ObjectId::new(new_schema.clone(), aggregate.id.name.clone());
+                if let Err(result) = self.validate_function_move(&aggregate.id, &new_id) {
+                    return result;
+                }
                 self.move_function(&aggregate.id, &new_id);
             }
-            AlterFunctionAction::OwnerChange(_) => self.snapshot_function(&aggregate.id),
+            AlterFunctionAction::OwnerChange(_) => {
+                self.snapshot_confidence();
+                self.local.confidence = Confidence::Tainted;
+                return MutationResult::Skipped;
+            }
             _ => unreachable!("aggregate extraction only emits rename, owner, or schema"),
         }
         MutationResult::Applied
@@ -554,7 +691,7 @@ impl AnalysisState {
         &mut self,
         aggregate: &DropAggregateMutation,
     ) -> MutationResult {
-        let mut any_applied = false;
+        let mut targets = Vec::new();
         for signature in &aggregate.signatures {
             let signature_name = format!(
                 "{}({})",
@@ -565,36 +702,53 @@ impl AnalysisState {
             let id = ObjectId::new(schema, signature_name);
             match self.routine_lookup(&id, |kind| kind == RoutineKind::Aggregate) {
                 RoutineLookup::Present => {
-                    any_applied = true;
-                    self.snapshot_function(&id);
-                    self.local.functions.insert(id, FunctionOverlay::Dropped);
-                }
-                RoutineLookup::WrongKind
-                | RoutineLookup::Tombstone
-                | RoutineLookup::AuthoritativelyAbsent => {
-                    if !aggregate.if_exists {
-                        return MutationResult::Conflict {
-                            reason: format!("aggregate '{}' does not exist", id),
-                        };
+                    if !targets.contains(&id) {
+                        targets.push(id);
                     }
+                }
+                RoutineLookup::WrongKind => {
+                    return MutationResult::Conflict {
+                        reason: format!("aggregate '{}' does not exist", id),
+                    };
+                }
+                RoutineLookup::Tombstone | RoutineLookup::AuthoritativelyAbsent
+                    if aggregate.if_exists => {}
+                RoutineLookup::Tombstone | RoutineLookup::AuthoritativelyAbsent => {
+                    return MutationResult::Conflict {
+                        reason: format!("aggregate '{}' does not exist", id),
+                    };
                 }
                 RoutineLookup::Unknown => {
                     self.snapshot_confidence();
                     self.local.confidence = Confidence::Tainted;
-                    if !aggregate.if_exists {
-                        return MutationResult::Skipped;
-                    }
+                    return MutationResult::Skipped;
                 }
             }
         }
-        if aggregate.cascade && any_applied {
+        for id in &targets {
+            self.snapshot_function(id);
+            self.local
+                .functions
+                .insert(id.clone(), FunctionOverlay::Dropped);
+        }
+        if aggregate.cascade && !targets.is_empty() {
             self.snapshot_confidence();
             self.local.confidence = Confidence::Tainted;
         }
-        if any_applied {
+        if !targets.is_empty() {
             MutationResult::Applied
         } else {
             MutationResult::Skipped
         }
+    }
+
+    fn function_option_unmodeled(option: &FuncOptionFact) -> bool {
+        !matches!(
+            option,
+            FuncOptionFact::Language(_)
+                | FuncOptionFact::Volatility(_)
+                | FuncOptionFact::Security(_)
+                | FuncOptionFact::Window
+        )
     }
 }

@@ -5,11 +5,10 @@ use crate::analysis::facts::{
 use crate::analysis::mutations::{
     AlterTable, AlterTableActionMutation, ColumnMutation, CreateTable, DropIndex,
     DropMaterializedViewMutation, DropTable, DropViewMutation, FkMutation, Mutation,
-    OpaqueMutation, PersistenceMutation, Rename,
+    PersistenceMutation, Rename,
 };
 use crate::analysis::state::AnalysisState;
 use crate::ast::identifiers::{ObjectId, QualifiedName};
-use crate::report::violations::ObjectKind;
 
 impl Resolver {
     #[allow(clippy::too_many_arguments)]
@@ -95,12 +94,15 @@ impl Resolver {
                     depends_on: None,
                     generation: *generation,
                 },
-                AlterTableActionFact::DropColumn { name, if_exists } => {
-                    AlterTableActionMutation::DropColumn {
-                        name: name.clone(),
-                        if_exists: *if_exists,
-                    }
-                }
+                AlterTableActionFact::DropColumn {
+                    name,
+                    if_exists,
+                    cascade,
+                } => AlterTableActionMutation::DropColumn {
+                    name: name.clone(),
+                    if_exists: *if_exists,
+                    cascade: *cascade,
+                },
                 AlterTableActionFact::RenameColumn { from, to } => {
                     AlterTableActionMutation::RenameColumn {
                         from: from.resolve(),
@@ -131,12 +133,6 @@ impl Resolver {
                     not_valid,
                 } => {
                     let to_table = Self::resolve_relation_lookup_name(references, state);
-                    if !state.relation_is_present(&to_table) {
-                        return vec![Mutation::Opaque(OpaqueMutation::UnresolvedReference {
-                            object_kind: ObjectKind::Table,
-                            object_name: to_table.to_string(),
-                        })];
-                    }
                     AlterTableActionMutation::AddForeignKey {
                         constraint_name: constraint_name.clone(),
                         to_table,
@@ -157,9 +153,15 @@ impl Resolver {
                         new_name: new_name.clone(),
                     }
                 }
-                AlterTableActionFact::DropConstraint { name } => {
-                    AlterTableActionMutation::DropConstraint { name: name.clone() }
-                }
+                AlterTableActionFact::DropConstraint {
+                    name,
+                    if_exists,
+                    cascade,
+                } => AlterTableActionMutation::DropConstraint {
+                    name: name.clone(),
+                    if_exists: *if_exists,
+                    cascade: *cascade,
+                },
                 AlterTableActionFact::AddCheckConstraint {
                     constraint_name,
                     not_valid,
@@ -169,18 +171,22 @@ impl Resolver {
                 },
                 AlterTableActionFact::AddUniqueConstraint {
                     constraint_name,
+                    columns,
                     using_index,
                 } => AlterTableActionMutation::AddUniqueConstraint {
                     constraint_name: constraint_name.clone(),
+                    columns: columns.clone(),
                     using_index: using_index
                         .as_ref()
                         .map(|name| Self::resolve_constraint_index_name(name, &id)),
                 },
                 AlterTableActionFact::AddPrimaryKeyConstraint {
                     constraint_name,
+                    columns,
                     using_index,
                 } => AlterTableActionMutation::AddPrimaryKeyConstraint {
                     constraint_name: constraint_name.clone(),
+                    columns: columns.clone(),
                     using_index: using_index
                         .as_ref()
                         .map(|name| Self::resolve_constraint_index_name(name, &id)),
@@ -280,26 +286,32 @@ impl Resolver {
     }
 
     pub(super) fn resolve_drop_table(
-        name: &QualifiedName,
+        names: &[QualifiedName],
         if_exists: bool,
         cascade: bool,
         state: &AnalysisState,
     ) -> Mutation {
         Mutation::DropTable(DropTable {
-            id: Self::resolve_relation_lookup_name(name, state),
+            ids: names
+                .iter()
+                .map(|name| Self::resolve_relation_lookup_name(name, state))
+                .collect(),
             if_exists,
             cascade,
         })
     }
 
     pub(super) fn resolve_drop_view(
-        name: &QualifiedName,
+        names: &[QualifiedName],
         if_exists: bool,
         cascade: bool,
         state: &AnalysisState,
     ) -> Mutation {
         Mutation::DropView(DropViewMutation {
-            ids: vec![Self::resolve_relation_lookup_name(name, state)],
+            ids: names
+                .iter()
+                .map(|name| Self::resolve_relation_lookup_name(name, state))
+                .collect(),
             if_exists,
             cascade,
         })
@@ -325,17 +337,17 @@ impl Resolver {
         names: &[QualifiedName],
         if_exists: bool,
         concurrently: bool,
+        cascade: bool,
         state: &AnalysisState,
-    ) -> Vec<Mutation> {
-        names
-            .iter()
-            .map(|name| {
-                Mutation::DropIndex(DropIndex {
-                    id: Self::resolve_relation_lookup_name(name, state),
-                    if_exists,
-                    concurrently,
-                })
-            })
-            .collect()
+    ) -> Mutation {
+        Mutation::DropIndex(DropIndex {
+            ids: names
+                .iter()
+                .map(|name| Self::resolve_relation_lookup_name(name, state))
+                .collect(),
+            if_exists,
+            concurrently,
+            cascade,
+        })
     }
 }

@@ -5,7 +5,7 @@ commits and pull requests. Published binaries, checksums, and generated release
 notes are available on the
 [GitHub Releases page](https://github.com/dsecurity49/safe-migrate/releases).
 
-## v0.7.0 — 2026-08-29
+## v0.7.0 — 2026-08-30
 
 - Made Cache V6 loading and writing reject semantically inconsistent metadata
   (including mismatched identities and dangling catalog relationships), and
@@ -24,6 +24,71 @@ notes are available on the
   and generated-name differential coverage.
 - Added PostgreSQL 18 relation-ACL support for `MAINTAIN`, including
   version-aware `GRANT ALL` expansion and typed grant/revoke extraction.
+- Hardened migration-state validation for dependent relation, routine, foreign
+  key, partition, index, trigger, policy, view, and privilege targets, with
+  conservative tainting for incomplete scoped baselines.
+- Corrected view replacement metadata and `DROP VIEW`/`DROP MATERIALIZED VIEW`
+  dependency cleanup, removed stale relation edges after table drops, and
+  stopped unsupported domain, sequence, and role transitions from claiming
+  exact state.
+- Tightened sequence ownership and trigger target validation, and tainted
+  cascades that remove relations omitted from a scoped baseline.
+- Restricted view dependency discovery to relation-name AST nodes, avoiding
+  false conflicts for casts and function expressions inside view definitions.
+- Limited synchronized view edges to relation kinds currently modeled by the
+  dependency graph.
+- Made view-dependency synchronization require PostgreSQL rewrite-to-relation
+  dependency classes, preventing unrelated catalog dependencies from entering
+  the modeled graph.
+- Removed foreign-key metadata from surviving tables during cascades, including
+  cross-schema view and foreign-key cleanup for `DROP SCHEMA ... CASCADE`.
+- Record inline foreign-key, CHECK, and exclusion constraints; reserve all
+  generated constraint names before creating a table; and track `NOT VALID`
+  constraints until validation completes.
+- Validate partition parent, strategy, attachment, and detach state before
+  applying partition changes. Publication scopes that imply all or inherited
+  tables now conservatively taint confidence when those catalogs are absent.
+- Match PostgreSQL statement atomicity for multi-target view drops when a
+  scoped baseline cannot resolve one target, and retain conservative rewrite
+  findings for type changes whose column evidence is incomplete.
+- Keep irreversible-drop and `WITH GRANT OPTION` findings visible when the
+  state matrix conservatively skips an operation because Cache V6 evidence is
+  incomplete; guarded drops of absent columns remain no-ops.
+- Match PostgreSQL `CASCADE` cleanup for `DROP SEQUENCE` and `DROP SCHEMA` by
+  removing modeled `nextval(...)` column defaults that depend on dropped
+  sequences, including cross-schema defaults.
+- Route parser-accepted but unmodeled `ALTER TABLE` actions through the
+  explicit opaque/tainted path instead of silently treating them as no-ops.
+- Treat `CREATE TABLE` inheritance, typed-table, `LIKE`, and `ON COMMIT` forms
+  as opaque until their copied metadata is modeled; CTAS now taints column
+  completeness so later column edits remain conservative.
+- Route parser-accepted `ALTER TYPE` owner, option, and attribute actions to
+  the opaque path, and reject CTAS `ON COMMIT` lifecycle forms rather than
+  recording a relation with the wrong transaction lifetime.
+- Route unsupported `ALTER MATERIALIZED VIEW` actions to the opaque path
+  instead of producing a fact that resolves to no mutation.
+- Route unsupported `ALTER VIEW` column-default and option changes to the
+  opaque path instead of producing facts that the resolver discards.
+- Route unmodeled `CREATE ROLE`/`CREATE USER` options (such as `SUPERUSER`,
+  `CREATEDB`, passwords, and memberships) to the opaque path rather than
+  recording incomplete role state as exact.
+- Route view options, `WITH CHECK OPTION`, unpopulated materialized views, and
+  constrained/collated domains to the opaque path until
+  their state semantics are modeled.
+- Preserve policy mutations for restrictive-policy findings while tainting
+  state when policy roles or `USING`/`WITH CHECK` expressions are unmodeled.
+- Preserve expression indexes for their concurrency, uniqueness, and predicate
+  checks; their unmodeled key/dependency metadata remains conservative during
+  later constraint adoption.
+- Keep aggregate identities for lookup while tainting their unmodeled
+  transition functions and implementation options.
+- Route composite, range, and base `CREATE TYPE` forms to the opaque path;
+  only enum metadata is currently modeled completely.
+- Keep database DDL available to database-specific rules while tainting
+  confidence because database catalogs are outside the current schema model.
+- Route unknown `RESET` settings through the opaque path; only the modeled
+  timeout/search-path resets remain exact, while unrelated known settings stay
+  explicit schema-neutral no-ops.
 
 ## v0.6.2 — 2026-08-27
 

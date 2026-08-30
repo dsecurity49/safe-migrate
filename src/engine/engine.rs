@@ -291,7 +291,9 @@ impl SafeMigrateEngine {
 
             for mutation in mutations {
                 let pre_cascade = match &mutation {
-                    Mutation::DropTable(d) if d.cascade => Some(state.get_cascade_closure(&d.id)),
+                    Mutation::DropTable(d) if d.cascade => {
+                        Some(state.cascade_for_relations(&d.ids))
+                    }
                     _ => None,
                 };
 

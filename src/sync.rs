@@ -508,15 +508,19 @@ fn load_view_dependencies(
         JOIN pg_class tc ON tc.oid = d.refobjid
         JOIN pg_namespace tn ON tn.oid = tc.relnamespace
             WHERE vc.relkind IN ('v', 'm')
+              AND d.classid = 'pg_rewrite'::regclass
+              AND d.refclassid = 'pg_class'::regclass
               AND d.deptype = 'n'
               AND tc.oid <> vc.oid
+              AND tc.relkind IN ('r', 'p', 'v', 'm')
               AND vn.nspname NOT LIKE 'pg\_%' ESCAPE '\'
               AND vn.nspname <> 'information_schema'
               AND tn.nspname NOT LIKE 'pg\_%' ESCAPE '\'
               AND tn.nspname <> 'information_schema'
               AND (
               $1::text[] IS NULL
-              OR (vn.nspname = ANY($1) AND tn.nspname = ANY($1))
+              OR vn.nspname = ANY($1)
+              OR tn.nspname = ANY($1)
           )
     "#;
 
@@ -723,8 +727,13 @@ fn load_schemas(
 fn load_sequences(
     client: &mut impl GenericClient,
     schema_values: &Option<Vec<String>>,
-    schema_filter: &str,
+    _schema_filter: &str,
 ) -> Result<std::collections::HashMap<ObjectId, crate::model::sequence::SequenceState>> {
+    // Keep a sequence when either side of OWNED BY is in the requested
+    // scope. A sequence can live in a different schema from its owning
+    // table, and dropping it without that edge would make a later migration
+    // look exact while missing PostgreSQL's ownership dependency.
+    let schema_filter = "AND ($1::text[] IS NULL OR n.nspname = ANY($1) OR tn.nspname = ANY($1))";
     let query = format!(
         "SELECT
              n.nspname AS sequence_schema,

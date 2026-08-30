@@ -28,7 +28,16 @@ impl Rule for ConcurrentIndexRule {
         _cascade: Option<&CascadeResult>,
     ) -> Vec<Violation> {
         if *result == MutationResult::Skipped {
-            return vec![];
+            // An index that is present in the pre-state still incurs the
+            // synchronous DROP INDEX risk even when V6 metadata is too
+            // incomplete to mutate it exactly (for example, eligibility for
+            // a backing constraint is not serialized).  A truly absent,
+            // guarded drop remains a no-op and is correctly suppressed.
+            let known_drop_target = matches!(mutation, Mutation::DropIndex(drop)
+                if drop.ids.iter().any(|id| pre_state.indexes.iter().any(|edge| edge.dependent == *id)));
+            if !known_drop_target {
+                return vec![];
+            }
         }
 
         let mut violations = Vec::new();
@@ -107,40 +116,8 @@ impl Rule for ConcurrentIndexRule {
 
                 // DROP INDEX classification does not emit a stale-statistics finding.
 
-                if pre_state.relations.is_empty() {
-                    let rows = config.default_rows;
-                    let tier = if rows >= tier1_threshold {
-                        ViolationTier::Tier1
-                    } else if rows >= tier2_threshold {
-                        ViolationTier::Tier2
-                    } else {
-                        ViolationTier::Tier3
-                    };
-
-                    violations.push(Violation {
-                        source_range: None,
-                        rule_id,
-                        operation_kind: OperationKind::DropIndex,
-                        object_kind: ObjectKind::Index,
-                        object_name: drop.id.to_string(),
-                        tier,
-                        reason: format!("Synchronous index drop for {}", drop.id),
-                        recipe: self.recipe(),
-                        dedup_key: None,
-                        sql: None,
-                        fk_dependency_related: false,
-                    });
-                } else {
-                    let mut target_relations = Vec::new();
-                    for idx in &pre_state.indexes {
-                        if idx.dependent == drop.id
-                            && let Some(rel) = pre_state.relations.get(&idx.referenced)
-                        {
-                            target_relations.push(rel);
-                        }
-                    }
-
-                    if target_relations.is_empty() {
+                for id in &drop.ids {
+                    if pre_state.relations.is_empty() {
                         let rows = config.default_rows;
                         let tier = if rows >= tier1_threshold {
                             ViolationTier::Tier1
@@ -155,15 +132,47 @@ impl Rule for ConcurrentIndexRule {
                             rule_id,
                             operation_kind: OperationKind::DropIndex,
                             object_kind: ObjectKind::Index,
-                            object_name: drop.id.to_string(),
+                            object_name: id.to_string(),
                             tier,
-                            reason: format!("Synchronous index drop for {}", drop.id),
+                            reason: format!("Synchronous index drop for {}", id),
                             recipe: self.recipe(),
                             dedup_key: None,
                             sql: None,
                             fk_dependency_related: false,
                         });
                     } else {
+                        let target_relations = pre_state
+                            .indexes
+                            .iter()
+                            .filter_map(|idx| {
+                                (idx.dependent == *id)
+                                    .then(|| pre_state.relations.get(&idx.referenced))
+                                    .flatten()
+                            })
+                            .collect::<Vec<_>>();
+                        if target_relations.is_empty() {
+                            let rows = config.default_rows;
+                            let tier = if rows >= tier1_threshold {
+                                ViolationTier::Tier1
+                            } else if rows >= tier2_threshold {
+                                ViolationTier::Tier2
+                            } else {
+                                ViolationTier::Tier3
+                            };
+                            violations.push(Violation {
+                                source_range: None,
+                                rule_id,
+                                operation_kind: OperationKind::DropIndex,
+                                object_kind: ObjectKind::Index,
+                                object_name: id.to_string(),
+                                tier,
+                                reason: format!("Synchronous index drop for {}", id),
+                                recipe: self.recipe(),
+                                dedup_key: None,
+                                sql: None,
+                                fk_dependency_related: false,
+                            });
+                        }
                         for rel in target_relations {
                             if rel.persistence == Persistence::Temporary {
                                 continue;
@@ -178,15 +187,14 @@ impl Rule for ConcurrentIndexRule {
                                 ViolationTier::Tier3
                             };
 
-                            let reason =
-                                format!("Synchronous index drop for {} on {}", drop.id, rel.id);
+                            let reason = format!("Synchronous index drop for {} on {}", id, rel.id);
 
                             violations.push(Violation {
                                 source_range: None,
                                 rule_id,
                                 operation_kind: OperationKind::DropIndex,
                                 object_kind: ObjectKind::Index,
-                                object_name: drop.id.to_string(),
+                                object_name: id.to_string(),
                                 tier,
                                 reason,
                                 recipe: self.recipe(),

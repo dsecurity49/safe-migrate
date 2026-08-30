@@ -25,6 +25,14 @@ impl AnalysisState {
         &mut self,
         create_policy: &CreatePolicyMutation,
     ) -> MutationResult {
+        if let Err(result) = self.ensure_relation_target(
+            &create_policy.table,
+            |kind| *kind == crate::model::relation::RelationKind::Table,
+            format!("policy relation '{}' does not exist", create_policy.table),
+            format!("policy relation '{}' is not a table", create_policy.table),
+        ) {
+            return result;
+        }
         self.snapshot_relation(&create_policy.table);
         if let Some(RelationOverlay::Present(rel)) =
             self.local.relations.get_mut(&create_policy.table)
@@ -43,10 +51,24 @@ impl AnalysisState {
                 reason: format!("relation '{}' does not exist", create_policy.table),
             };
         }
+        if !create_policy.semantics_complete {
+            // Keep the policy identity for rule evaluation and DROP POLICY
+            // lookup, but do not claim authorization state is complete.
+            self.snapshot_confidence();
+            self.local.confidence = super::Confidence::Tainted;
+        }
         MutationResult::Applied
     }
 
     pub(super) fn apply_drop_policy(&mut self, drop_policy: &DropPolicyMutation) -> MutationResult {
+        if let Err(result) = self.ensure_relation_target(
+            &drop_policy.table,
+            |kind| *kind == crate::model::relation::RelationKind::Table,
+            format!("policy relation '{}' does not exist", drop_policy.table),
+            format!("policy relation '{}' is not a table", drop_policy.table),
+        ) {
+            return result;
+        }
         self.snapshot_relation(&drop_policy.table);
         if let Some(RelationOverlay::Present(rel)) =
             self.local.relations.get_mut(&drop_policy.table)
@@ -85,6 +107,70 @@ impl AnalysisState {
                 ),
             };
         }
+        if let Err(result) = self.ensure_relation_target(
+            &create_trigger.table,
+            |kind| {
+                matches!(
+                    kind,
+                    crate::model::relation::RelationKind::Table
+                        | crate::model::relation::RelationKind::View
+                )
+            },
+            format!(
+                "trigger target relation '{}' does not exist",
+                create_trigger.table
+            ),
+            format!(
+                "trigger target '{}' is not a table or view",
+                create_trigger.table
+            ),
+        ) {
+            return result;
+        }
+        if let Err(result) = self.ensure_routine_target(
+            &create_trigger.function_id,
+            crate::model::function::RoutineKind::Function,
+            format!(
+                "trigger function '{}' does not exist",
+                create_trigger.function_id
+            ),
+            format!(
+                "trigger target '{}' is not a function",
+                create_trigger.function_id
+            ),
+        ) {
+            return result;
+        }
+        // PostgreSQL only accepts trigger-returning functions for a regular
+        // CREATE TRIGGER.  The routine-kind check above is not sufficient:
+        // ordinary scalar functions share the same catalog namespace.  A
+        // missing return type can occur in an incomplete/scoped cache, so do
+        // not guess in that case.
+        let Some(crate::model::function::FunctionOverlay::Present(function)) =
+            self.local.functions.get(&create_trigger.function_id)
+        else {
+            self.snapshot_confidence();
+            self.local.confidence = super::Confidence::Tainted;
+            return MutationResult::Skipped;
+        };
+        let return_type = function.return_type.trim();
+        if return_type.is_empty() || return_type.eq_ignore_ascii_case("unknown") {
+            self.snapshot_confidence();
+            self.local.confidence = super::Confidence::Tainted;
+            return MutationResult::Skipped;
+        }
+        let return_type = return_type
+            .strip_prefix("pg_catalog.")
+            .or_else(|| return_type.strip_prefix("PG_CATALOG."))
+            .unwrap_or(return_type);
+        if !return_type.eq_ignore_ascii_case("trigger") {
+            return MutationResult::Conflict {
+                reason: format!(
+                    "trigger function '{}' must return type trigger",
+                    create_trigger.function_id
+                ),
+            };
+        }
         self.snapshot_trigger(&trigger_id);
         self.local.triggers.insert(
             trigger_id.clone(),
@@ -118,6 +204,26 @@ impl AnalysisState {
         &mut self,
         drop_trigger: &DropTriggerMutation,
     ) -> MutationResult {
+        if let Err(result) = self.ensure_relation_target(
+            &drop_trigger.table,
+            |kind| {
+                matches!(
+                    kind,
+                    crate::model::relation::RelationKind::Table
+                        | crate::model::relation::RelationKind::View
+                )
+            },
+            format!(
+                "trigger target relation '{}' does not exist",
+                drop_trigger.table
+            ),
+            format!(
+                "trigger target '{}' is not a table or view",
+                drop_trigger.table
+            ),
+        ) {
+            return result;
+        }
         let trigger_id = Self::trigger_key(&drop_trigger.table, &drop_trigger.name);
         if self.trigger_lookup(&trigger_id) != TriggerLookup::Present {
             return if drop_trigger.if_exists {
@@ -153,6 +259,26 @@ impl AnalysisState {
         &mut self,
         rename_trigger: &RenameTriggerMutation,
     ) -> MutationResult {
+        if let Err(result) = self.ensure_relation_target(
+            &rename_trigger.table,
+            |kind| {
+                matches!(
+                    kind,
+                    crate::model::relation::RelationKind::Table
+                        | crate::model::relation::RelationKind::View
+                )
+            },
+            format!(
+                "trigger target relation '{}' does not exist",
+                rename_trigger.table
+            ),
+            format!(
+                "trigger target '{}' is not a table or view",
+                rename_trigger.table
+            ),
+        ) {
+            return result;
+        }
         let old_id = Self::trigger_key(&rename_trigger.table, &rename_trigger.name);
         let new_id = Self::trigger_key(&rename_trigger.table, &rename_trigger.new_name);
         let Some(TriggerOverlay::Present(mut trigger)) = self.local.triggers.get(&old_id).cloned()
@@ -188,7 +314,7 @@ impl AnalysisState {
             relation.triggers.remove(&rename_trigger.name);
             relation.triggers.insert(rename_trigger.new_name.clone());
         }
-        self.local.graph.propagate_rename(&old_id, &new_id);
+        self.local.graph.propagate_trigger_rename(&old_id, &new_id);
         self.local.graph.add_edge(DependencyEdge::new(
             old_id,
             new_id,

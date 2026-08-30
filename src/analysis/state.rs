@@ -149,6 +149,7 @@ pub struct PreState {
     pub sequences: HashMap<ObjectId, crate::model::sequence::SequenceState>,
     pub types: HashMap<ObjectId, crate::model::types::TypeState>,
     pub indexes: Vec<crate::analysis::graph::DependencyEdge>,
+    pub baseline_foreign_keys: HashSet<(ObjectId, String)>,
 }
 
 #[cfg(test)]
@@ -369,28 +370,37 @@ impl AnalysisState {
         &self,
         scope: &crate::analysis::facts::PublicationScope,
     ) -> bool {
-        let crate::analysis::facts::PublicationScope::Explicit(objects) = scope else {
-            return false;
-        };
-        objects.iter().any(|object| match object {
-            crate::analysis::facts::PublicationObjectFact::Table {
-                name,
-                only,
-                include_partitions,
-                ..
-            } if !only || *include_partitions => {
-                let id = self.resolve_relation_id(name);
-                !matches!(
-                    self.local.relations.get(&id),
-                    Some(RelationOverlay::Present(relation)) if relation.generation > 0
-                ) || self.local.graph.edges().iter().any(|edge| {
-                    matches!(edge.kind, DependencyKind::PartitionOf)
-                        && self.local.graph.resolve_rename(&edge.referenced)
-                            == self.local.graph.resolve_rename(&id)
+        match scope {
+            // FOR ALL TABLES necessarily depends on the complete catalog and
+            // future table/inheritance state, neither of which Cache V6 stores.
+            crate::analysis::facts::PublicationScope::AllTables { .. } => true,
+            crate::analysis::facts::PublicationScope::Explicit(objects) => {
+                objects.iter().any(|object| match object {
+                    crate::analysis::facts::PublicationObjectFact::Table {
+                        name,
+                        only,
+                        include_partitions,
+                        ..
+                    } if !only || *include_partitions => {
+                        let id = self.resolve_relation_id(name);
+                        !matches!(
+                            self.local.relations.get(&id),
+                            Some(RelationOverlay::Present(relation)) if relation.generation > 0
+                        ) || self.local.graph.edges().iter().any(|edge| {
+                            matches!(edge.kind, DependencyKind::PartitionOf)
+                                && self.local.graph.resolve_rename(&edge.referenced)
+                                    == self.local.graph.resolve_rename(&id)
+                        })
+                    }
+                    // Schema-wide and current-schema shorthand scopes also
+                    // include inherited/partitioned descendants.
+                    crate::analysis::facts::PublicationObjectFact::SchemaTables { .. }
+                    | crate::analysis::facts::PublicationObjectFact::CurrentSchemaShorthand => true,
+                    crate::analysis::facts::PublicationObjectFact::Unknown => false,
+                    _ => false,
                 })
             }
-            _ => false,
-        })
+        }
     }
 
     fn taint_inheritance_sensitive_publication_scope(
@@ -518,7 +528,7 @@ impl AnalysisState {
         let persistent_session_role = session_role.clone();
         let persistent_session_role_known = session_role_known;
         let roles_known = cache.metadata.source_session_role.is_some();
-        let baseline_schemas = cache
+        let baseline_schemas: Option<HashSet<String>> = cache
             .metadata
             .schemas
             .as_ref()
@@ -694,10 +704,19 @@ impl AnalysisState {
                             state.kind,
                             crate::model::relation::RelationKind::View
                                 | crate::model::relation::RelationKind::MaterializedView
-                        )
+                    )
                 )
             });
-            if is_view && relations.contains_key(&referenced) {
+            let dependent_schema_is_omitted = baseline_schemas
+                .as_ref()
+                .is_some_and(|schemas| !schemas.contains(&dependent.schema));
+            if is_view || dependent_schema_is_omitted {
+                // Scoped caches may intentionally omit the referenced schema.
+                // The dependency query can also return a view outside the
+                // selected scope when it depends on an in-scope relation.
+                // Preserve either direction so a later migration cannot
+                // mistake an omitted dependent or referenced object for a
+                // safe drop target.
                 graph.add_edge(DependencyEdge::new(
                     dependent,
                     referenced,
@@ -952,6 +971,37 @@ impl AnalysisState {
         }
     }
 
+    /// Validate a relation reference before a mutation creates a dependent
+    /// object.  A scoped baseline cannot prove anything about an omitted
+    /// schema, so leave the state conservative instead of inventing an edge.
+    pub(super) fn ensure_relation_target<F>(
+        &mut self,
+        id: &ObjectId,
+        expected: F,
+        missing_reason: String,
+        wrong_kind_reason: String,
+    ) -> Result<(), MutationResult>
+    where
+        F: FnOnce(&RelationKind) -> bool,
+    {
+        match self.relation_lookup(id, expected) {
+            ObjectLookup::Present => Ok(()),
+            ObjectLookup::WrongKind => Err(MutationResult::Conflict {
+                reason: wrong_kind_reason,
+            }),
+            ObjectLookup::AuthoritativelyAbsent | ObjectLookup::Tombstone => {
+                Err(MutationResult::Conflict {
+                    reason: missing_reason,
+                })
+            }
+            ObjectLookup::Unknown => {
+                self.snapshot_confidence();
+                self.local.confidence = Confidence::Tainted;
+                Err(MutationResult::Skipped)
+            }
+        }
+    }
+
     fn type_lookup(&self, id: &ObjectId, expected: impl FnOnce(&TypeKind) -> bool) -> ObjectLookup {
         match self.local.types.get(id) {
             Some(TypeOverlay::Present(state)) if expected(&state.kind) => ObjectLookup::Present,
@@ -961,6 +1011,117 @@ impl AnalysisState {
                 ObjectLookup::AuthoritativelyAbsent
             }
             None => ObjectLookup::Unknown,
+        }
+    }
+
+    pub(super) fn ensure_routine_target(
+        &mut self,
+        id: &ObjectId,
+        expected: crate::model::function::RoutineKind,
+        missing_reason: String,
+        wrong_kind_reason: String,
+    ) -> Result<(), MutationResult> {
+        match self.local.functions.get(id) {
+            Some(FunctionOverlay::Present(function)) if function.routine_kind == expected => Ok(()),
+            Some(FunctionOverlay::Present(_)) => Err(MutationResult::Conflict {
+                reason: wrong_kind_reason,
+            }),
+            Some(FunctionOverlay::Dropped) => Err(MutationResult::Conflict {
+                reason: missing_reason,
+            }),
+            None if self.baseline_available && self.baseline_covers_object(id) => {
+                Err(MutationResult::Conflict {
+                    reason: missing_reason,
+                })
+            }
+            None => {
+                self.snapshot_confidence();
+                self.local.confidence = Confidence::Tainted;
+                Err(MutationResult::Skipped)
+            }
+        }
+    }
+
+    /// Validate the namespace in which a newly-created object will live.
+    ///
+    /// A full baseline (or an explicit schema creation earlier in the chain)
+    /// can prove that a schema exists.  An omitted scoped schema is unknown;
+    /// do not manufacture an object there while claiming an exact result.
+    pub(super) fn ensure_schema_target(&mut self, schema: &str) -> Result<(), MutationResult> {
+        match self.schema_lookup(schema) {
+            ObjectLookup::Present => Ok(()),
+            ObjectLookup::Tombstone | ObjectLookup::AuthoritativelyAbsent => {
+                Err(MutationResult::Conflict {
+                    reason: format!("schema '{}' does not exist", schema),
+                })
+            }
+            ObjectLookup::Unknown => {
+                self.snapshot_confidence();
+                self.local.confidence = Confidence::Tainted;
+                Err(MutationResult::Skipped)
+            }
+            ObjectLookup::WrongKind => {
+                unreachable!("schemas do not share an overlay with other object kinds")
+            }
+        }
+    }
+
+    fn snapshot_baseline_foreign_keys(&mut self) {
+        if let Some(frame) = self.local.transactions.last_mut() {
+            frame
+                .undo_log
+                .push(StateChange::BaselineForeignKeysSnapshot {
+                    previous: self.baseline_foreign_keys.clone(),
+                });
+        }
+    }
+
+    /// Remove constraint metadata and baseline FK identities for objects that
+    /// PostgreSQL drops as part of a relation dependency operation.
+    pub(super) fn remove_dropped_constraints(
+        &mut self,
+        dropped_relations: &HashSet<ObjectId>,
+        dropped_constraints: &HashSet<(ObjectId, String)>,
+    ) {
+        let resolution_graph = self.local.graph.clone();
+        let should_remove = |table_id: &ObjectId, name: &str| {
+            let resolved_table = resolution_graph.resolve_rename(table_id);
+            dropped_relations.contains(resolved_table)
+                || dropped_constraints.contains(&(resolved_table.clone(), name.to_string()))
+        };
+
+        let constraint_keys: Vec<(ObjectId, String)> = self
+            .local
+            .constraints
+            .keys()
+            .filter(|(table_id, name)| should_remove(table_id, name))
+            .cloned()
+            .collect();
+        for (table_id, name) in constraint_keys {
+            self.snapshot_constraint(&table_id, &name);
+            self.local.constraints.remove(&(table_id, name));
+        }
+
+        let pending_changed = self
+            .local
+            .pending_validation
+            .iter()
+            .any(|(table_id, name)| should_remove(table_id, name));
+        if pending_changed {
+            self.snapshot_pending_validation();
+            self.local
+                .pending_validation
+                .retain(|(table_id, name)| !should_remove(table_id, name));
+        }
+
+        if self
+            .baseline_foreign_keys
+            .iter()
+            .any(|(table_id, name)| should_remove(table_id, name))
+        {
+            self.snapshot_baseline_foreign_keys();
+            self.baseline_foreign_keys
+                .retain(|(table_id, name)| !should_remove(table_id, name));
         }
     }
 
@@ -1113,12 +1274,17 @@ impl AnalysisState {
         self.relation_is_present(id) || self.sequence_is_present(id) || self.index_is_present(id)
     }
 
-    fn next_generated_constraint_name(
+    /// Pick a generated name while also avoiding names reserved by other
+    /// constraints in the same CREATE TABLE statement. The ordinary helper
+    /// only sees already-applied state, which is not enough for a batch of
+    /// inline constraints that becomes visible at the end of the statement.
+    pub(super) fn next_generated_constraint_name_avoiding(
         &self,
         table: &ObjectId,
         name1: &str,
         name2: Option<&str>,
         label: &str,
+        reserved: &HashSet<String>,
     ) -> String {
         (0..)
             .map(|suffix| {
@@ -1130,10 +1296,11 @@ impl AnalysisState {
                 Self::postgres_object_name(name1, name2, &label)
             })
             .find(|candidate| {
-                !self
-                    .local
-                    .constraints
-                    .contains_key(&(table.clone(), candidate.clone()))
+                !reserved.contains(candidate)
+                    && !self
+                        .local
+                        .constraints
+                        .contains_key(&(table.clone(), candidate.clone()))
             })
             .expect("constraint suffix space is unbounded")
     }
@@ -1248,6 +1415,7 @@ impl AnalysisState {
             sequences,
             types,
             indexes,
+            baseline_foreign_keys,
         } = pre_state;
 
         sync_present_map(relations, &self.local.relations, |overlay| match overlay {
@@ -1305,6 +1473,7 @@ impl AnalysisState {
             index += 1;
         }
         indexes.truncate(index);
+        baseline_foreign_keys.clone_from(&self.baseline_foreign_keys);
     }
 
     pub fn get_cascade_closure(&self, target_oid: &ObjectId) -> CascadeResult {
@@ -1708,15 +1877,25 @@ impl AnalysisState {
 
         self.local.graph.mutate_edges(|edges| {
             for edge in edges {
-                Self::remap_schema_id(&mut edge.dependent, old_name, new_name);
-                Self::remap_schema_id(&mut edge.referenced, old_name, new_name);
-                if let DependencyKind::TriggerOnTable {
-                    trigger_id,
-                    function_id,
-                } = &mut edge.kind
-                {
-                    Self::remap_schema_id(trigger_id, old_name, new_name);
-                    Self::remap_schema_id(function_id, old_name, new_name);
+                match &mut edge.kind {
+                    // Publication nodes are synthetic `public/<name>` IDs;
+                    // only the included relation is schema-qualified.
+                    DependencyKind::PublicationIncludes { .. } => {
+                        Self::remap_schema_id(&mut edge.dependent, old_name, new_name);
+                    }
+                    DependencyKind::TriggerOnTable {
+                        trigger_id,
+                        function_id,
+                    } => {
+                        Self::remap_schema_id(&mut edge.dependent, old_name, new_name);
+                        Self::remap_schema_id(&mut edge.referenced, old_name, new_name);
+                        Self::remap_schema_id(trigger_id, old_name, new_name);
+                        Self::remap_schema_id(function_id, old_name, new_name);
+                    }
+                    _ => {
+                        Self::remap_schema_id(&mut edge.dependent, old_name, new_name);
+                        Self::remap_schema_id(&mut edge.referenced, old_name, new_name);
+                    }
                 }
             }
         });
@@ -1748,6 +1927,11 @@ impl AnalysisState {
                 (table, name)
             })
             .collect();
+        if let Some(schemas) = &mut self.baseline_schemas
+            && schemas.remove(old_name)
+        {
+            schemas.insert(new_name.to_string());
+        }
 
         if let Some(SchemaOverlay::Present(mut schema)) = self.local.schemas.remove(old_name) {
             schema.name = new_name.to_string();
@@ -1773,18 +1957,12 @@ impl AnalysisState {
         &mut self,
         id: &ObjectId,
         privileges: &HashSet<Privilege>,
-        grantees: &[crate::analysis::facts::RoleFact],
+        grantees: &[ObjectId],
     ) {
         self.snapshot_relation(id);
         if let Some(RelationOverlay::Present(rel)) = self.local.relations.get_mut(id) {
             for grantee in grantees {
-                if let Some(role_id) = Self::resolve_role_name(
-                    grantee,
-                    &self.local.current_role,
-                    &self.local.session_role,
-                ) {
-                    rel.privileges.grant(role_id, privileges.clone());
-                }
+                rel.privileges.grant(grantee.clone(), privileges.clone());
             }
         }
     }
@@ -1793,18 +1971,12 @@ impl AnalysisState {
         &mut self,
         id: &ObjectId,
         privileges: &HashSet<Privilege>,
-        revokees: &[crate::analysis::facts::RoleFact],
+        revokees: &[ObjectId],
     ) {
         self.snapshot_relation(id);
         if let Some(RelationOverlay::Present(rel)) = self.local.relations.get_mut(id) {
             for revokee in revokees {
-                if let Some(role_id) = Self::resolve_role_name(
-                    revokee,
-                    &self.local.current_role,
-                    &self.local.session_role,
-                ) {
-                    rel.privileges.revoke(&role_id, privileges);
-                }
+                rel.privileges.revoke(revokee, privileges);
             }
         }
     }
@@ -2003,12 +2175,34 @@ impl AnalysisState {
         }
 
         self.snapshot_graph_full();
-        self.local.graph.propagate_rename(old_id, new_id);
+        self.local.graph.propagate_function_rename(old_id, new_id);
         self.local.graph.add_edge(DependencyEdge::new(
             old_id.clone(),
             new_id.clone(),
             DependencyKind::RenameTo,
         ));
+    }
+
+    pub(super) fn validate_function_move(
+        &mut self,
+        old_id: &ObjectId,
+        new_id: &ObjectId,
+    ) -> Result<(), MutationResult> {
+        if old_id == new_id {
+            return Ok(());
+        }
+        self.ensure_schema_target(&new_id.schema)?;
+        match self.local.functions.get(new_id) {
+            Some(crate::model::function::FunctionOverlay::Present(_)) => {
+                Err(MutationResult::Conflict {
+                    reason: format!("routine '{}' already exists", new_id),
+                })
+            }
+            // A prior DROP in this migration leaves a tombstone but the
+            // namespace is available again, just as it is in PostgreSQL.
+            Some(crate::model::function::FunctionOverlay::Dropped) => Ok(()),
+            None => Ok(()),
+        }
     }
 
     fn snapshot_function(&mut self, id: &ObjectId) {
@@ -2247,6 +2441,9 @@ impl AnalysisState {
                     } else {
                         self.local.constraints.remove(&key);
                     }
+                }
+                StateChange::BaselineForeignKeysSnapshot { previous } => {
+                    self.baseline_foreign_keys = previous;
                 }
                 StateChange::GraphLengthMarker { len } => {
                     self.local.graph.truncate(len);

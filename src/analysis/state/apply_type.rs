@@ -13,6 +13,9 @@ type TypeLookup = ObjectLookup;
 
 impl AnalysisState {
     pub(super) fn apply_create_type(&mut self, create: &CreateTypeMutation) -> MutationResult {
+        if let Err(result) = self.ensure_schema_target(&create.id.schema) {
+            return result;
+        }
         if self.relation_namespace_is_taken(&create.id) {
             return MutationResult::Conflict {
                 reason: format!("type '{}' already exists", create.id),
@@ -196,7 +199,7 @@ impl AnalysisState {
                     .functions
                     .insert(new_id.clone(), FunctionOverlay::Present(function));
                 if old_id != new_id {
-                    self.local.graph.propagate_rename(&old_id, &new_id);
+                    self.local.graph.propagate_function_rename(&old_id, &new_id);
                     self.local.graph.add_edge(DependencyEdge::new(
                         old_id,
                         new_id,
@@ -209,6 +212,33 @@ impl AnalysisState {
     }
 
     pub(super) fn apply_alter_type(&mut self, alter: &AlterTypeMutation) -> MutationResult {
+        match self.type_lookup(&alter.id, |_| true) {
+            TypeLookup::Present => {}
+            TypeLookup::WrongKind => unreachable!("all present type kinds are accepted"),
+            TypeLookup::AuthoritativelyAbsent | TypeLookup::Tombstone => {
+                return MutationResult::Conflict {
+                    reason: format!("type '{}' does not exist", alter.id),
+                };
+            }
+            TypeLookup::Unknown => {
+                self.snapshot_confidence();
+                self.local.confidence = Confidence::Tainted;
+                return MutationResult::Skipped;
+            }
+        }
+        if matches!(&alter.action, AlterTypeActionMutation::AddValue { .. })
+            && !matches!(
+                self.local.types.get(&alter.id),
+                Some(TypeOverlay::Present(TypeState {
+                    kind: TypeKind::Enum { .. },
+                    ..
+                }))
+            )
+        {
+            return MutationResult::Conflict {
+                reason: format!("type '{}' is not an enum", alter.id),
+            };
+        }
         self.snapshot_type(&alter.id);
         if let Some(TypeOverlay::Present(existing)) = self.local.types.get_mut(&alter.id) {
             match &alter.action {
@@ -221,13 +251,20 @@ impl AnalysisState {
                         if variants.contains(new_value) {
                             return MutationResult::Skipped;
                         }
-                        let insertion_index = neighbor
-                            .as_ref()
-                            .and_then(|neighbor| {
-                                variants.iter().position(|value| value == neighbor)
-                            })
-                            .map(|index| if *before { index } else { index + 1 })
-                            .unwrap_or(variants.len());
+                        let insertion_index = if let Some(neighbor) = neighbor {
+                            let Some(index) = variants.iter().position(|value| value == neighbor)
+                            else {
+                                return MutationResult::Conflict {
+                                    reason: format!(
+                                        "enum label '{}' does not exist on type '{}'",
+                                        neighbor, alter.id
+                                    ),
+                                };
+                            };
+                            if *before { index } else { index + 1 }
+                        } else {
+                            variants.len()
+                        };
                         variants.insert(insertion_index, new_value.clone());
                     }
                 }
@@ -260,15 +297,14 @@ impl AnalysisState {
                     variants[old_index] = new_value.clone();
                 }
             }
-        } else if matches!(alter.action, AlterTypeActionMutation::RenameValue { .. }) {
-            return MutationResult::Conflict {
-                reason: format!("type '{}' does not exist", alter.id),
-            };
         }
         MutationResult::Applied
     }
 
     pub(super) fn apply_create_domain(&mut self, create: &CreateDomainMutation) -> MutationResult {
+        if let Err(result) = self.ensure_schema_target(&create.id.schema) {
+            return result;
+        }
         if self.relation_namespace_is_taken(&create.id) {
             return MutationResult::Conflict {
                 reason: format!("type '{}' already exists", create.id),
@@ -292,12 +328,64 @@ impl AnalysisState {
         MutationResult::Applied
     }
 
-    pub(super) fn apply_alter_domain(&mut self, _alter: &AlterDomainMutation) -> MutationResult {
-        MutationResult::Applied
+    pub(super) fn apply_alter_domain(&mut self, alter: &AlterDomainMutation) -> MutationResult {
+        match self.type_lookup(&alter.id, |kind| matches!(kind, TypeKind::Domain { .. })) {
+            TypeLookup::Present => {
+                self.snapshot_confidence();
+                self.local.confidence = Confidence::Tainted;
+                MutationResult::Skipped
+            }
+            TypeLookup::WrongKind => MutationResult::Conflict {
+                reason: format!("type '{}' is not a domain", alter.id),
+            },
+            TypeLookup::AuthoritativelyAbsent | TypeLookup::Tombstone => MutationResult::Conflict {
+                reason: format!("domain '{}' does not exist", alter.id),
+            },
+            TypeLookup::Unknown => {
+                self.snapshot_confidence();
+                self.local.confidence = Confidence::Tainted;
+                MutationResult::Skipped
+            }
+        }
     }
 
     pub(super) fn apply_drop_domain(&mut self, drop: &DropDomainMutation) -> MutationResult {
+        let mut present = Vec::new();
         for id in &drop.ids {
+            match self.type_lookup(id, |kind| matches!(kind, TypeKind::Domain { .. })) {
+                TypeLookup::Present => present.push(id.clone()),
+                TypeLookup::WrongKind => {
+                    return MutationResult::Conflict {
+                        reason: format!("type '{}' is not a domain", id),
+                    };
+                }
+                TypeLookup::AuthoritativelyAbsent | TypeLookup::Tombstone if drop.if_exists => {}
+                TypeLookup::AuthoritativelyAbsent | TypeLookup::Tombstone => {
+                    return MutationResult::Conflict {
+                        reason: format!("domain '{}' does not exist", id),
+                    };
+                }
+                TypeLookup::Unknown => {
+                    self.snapshot_confidence();
+                    self.local.confidence = Confidence::Tainted;
+                    return MutationResult::Skipped;
+                }
+            }
+        }
+        if present.is_empty() {
+            return MutationResult::Skipped;
+        }
+        if let Some(dependent) = present.iter().find(|id| self.has_type_dependents(id)) {
+            if !drop.cascade {
+                return MutationResult::Conflict {
+                    reason: format!("domain '{}' has dependent objects; use CASCADE", dependent),
+                };
+            }
+            self.snapshot_confidence();
+            self.local.confidence = Confidence::Tainted;
+            return MutationResult::Skipped;
+        }
+        for id in &present {
             self.snapshot_type(id);
             self.local.types.insert(id.clone(), TypeOverlay::Dropped);
         }
@@ -305,10 +393,61 @@ impl AnalysisState {
     }
 
     pub(super) fn apply_drop_type(&mut self, drop: &DropTypeMutation) -> MutationResult {
+        let mut present = Vec::new();
         for id in &drop.ids {
+            match self.type_lookup(id, |kind| !matches!(kind, TypeKind::Domain { .. })) {
+                TypeLookup::Present => present.push(id.clone()),
+                TypeLookup::WrongKind => {
+                    return MutationResult::Conflict {
+                        reason: format!("type '{}' is a domain; use DROP DOMAIN", id),
+                    };
+                }
+                TypeLookup::AuthoritativelyAbsent | TypeLookup::Tombstone if drop.if_exists => {}
+                TypeLookup::AuthoritativelyAbsent | TypeLookup::Tombstone => {
+                    return MutationResult::Conflict {
+                        reason: format!("type '{}' does not exist", id),
+                    };
+                }
+                TypeLookup::Unknown => {
+                    self.snapshot_confidence();
+                    self.local.confidence = Confidence::Tainted;
+                    return MutationResult::Skipped;
+                }
+            }
+        }
+        if present.is_empty() {
+            return MutationResult::Skipped;
+        }
+        if let Some(dependent) = present.iter().find(|id| self.has_type_dependents(id)) {
+            if !drop.cascade {
+                return MutationResult::Conflict {
+                    reason: format!("type '{}' has dependent objects; use CASCADE", dependent),
+                };
+            }
+            self.snapshot_confidence();
+            self.local.confidence = Confidence::Tainted;
+            return MutationResult::Skipped;
+        }
+        for id in &present {
             self.snapshot_type(id);
             self.local.types.insert(id.clone(), TypeOverlay::Dropped);
         }
         MutationResult::Applied
+    }
+
+    fn has_type_dependents(&self, id: &ObjectId) -> bool {
+        self.local.relations.values().any(|overlay| {
+            matches!(overlay, RelationOverlay::Present(relation)
+                if relation.columns.iter().any(|column| column.type_id.as_ref() == Some(id)))
+        }) || self.local.functions.values().any(|overlay| {
+            matches!(overlay, FunctionOverlay::Present(function)
+                if function.arg_type_ids.iter().flatten().any(|type_id| type_id == id)
+                    || function.return_type_id.as_ref() == Some(id))
+        }) || self.local.types.values().any(|overlay| {
+            matches!(overlay, TypeOverlay::Present(TypeState {
+                kind: TypeKind::Domain { base_type_id: Some(base), .. },
+                ..
+            }) if base == id)
+        })
     }
 }

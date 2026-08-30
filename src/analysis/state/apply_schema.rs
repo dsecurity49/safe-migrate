@@ -7,25 +7,35 @@ use crate::model::function::FunctionOverlay;
 use crate::model::relation::RelationOverlay;
 use crate::model::replication::PublicationOverlay;
 use crate::model::schema::{SchemaOverlay, SchemaState};
-use crate::model::sequence::SequenceOverlay;
+use crate::model::sequence::{SequenceKind, SequenceOverlay};
 use crate::model::trigger::TriggerOverlay;
 use crate::model::types::TypeOverlay;
 
 type SchemaLookup = ObjectLookup;
+type SequenceDrop = (ObjectId, SequenceKind, Option<(ObjectId, String)>);
 
 impl AnalysisState {
     pub(super) fn apply_create_schema(
         &mut self,
         create_schema: &CreateSchemaMutation,
     ) -> MutationResult {
-        if self.schema_is_present(&create_schema.name) {
-            return if create_schema.if_not_exists {
-                MutationResult::Skipped
-            } else {
-                MutationResult::Conflict {
-                    reason: format!("schema '{}' already exists", create_schema.name),
-                }
-            };
+        match self.schema_lookup(&create_schema.name) {
+            SchemaLookup::Present => {
+                return if create_schema.if_not_exists {
+                    MutationResult::Skipped
+                } else {
+                    MutationResult::Conflict {
+                        reason: format!("schema '{}' already exists", create_schema.name),
+                    }
+                };
+            }
+            SchemaLookup::AuthoritativelyAbsent | SchemaLookup::Tombstone => {}
+            SchemaLookup::Unknown => {
+                self.snapshot_confidence();
+                self.local.confidence = Confidence::Tainted;
+                return MutationResult::Skipped;
+            }
+            SchemaLookup::WrongKind => unreachable!("schemas have a dedicated namespace"),
         }
         let (owner_name, owner_known) = match &create_schema.authorization {
             Some(role) => match self.role_fact_identity(role) {
@@ -136,6 +146,7 @@ impl AnalysisState {
                     SchemaLookup::Unknown => {
                         self.snapshot_confidence();
                         self.local.confidence = Confidence::Tainted;
+                        return MutationResult::Skipped;
                     }
                     SchemaLookup::Tombstone | SchemaLookup::AuthoritativelyAbsent => {}
                     SchemaLookup::WrongKind => {
@@ -150,6 +161,7 @@ impl AnalysisState {
     }
 
     pub(super) fn apply_drop_schema(&mut self, drop_schema: &DropSchemaMutation) -> MutationResult {
+        let mut unknown_target = false;
         for name in &drop_schema.names {
             match self.schema_lookup(name) {
                 SchemaLookup::Present => {}
@@ -163,11 +175,18 @@ impl AnalysisState {
                 SchemaLookup::Unknown => {
                     self.snapshot_confidence();
                     self.local.confidence = Confidence::Tainted;
+                    unknown_target = true;
                 }
                 SchemaLookup::WrongKind => {
                     unreachable!("schemas do not share an overlay with other object kinds")
                 }
             }
+        }
+        // PostgreSQL resolves the complete object list before applying the
+        // DROP. A scoped cache cannot prove an unknown schema is absent even
+        // with IF EXISTS, so it cannot safely remove the known siblings.
+        if unknown_target {
+            return MutationResult::Skipped;
         }
         let present_names: Vec<String> = drop_schema
             .names
@@ -180,85 +199,135 @@ impl AnalysisState {
         }
         if drop_schema.cascade {
             self.snapshot_namespace();
-            let relations_to_drop: Vec<ObjectId> = self
+            let dropped_schema_names: std::collections::HashSet<String> =
+                present_names.iter().cloned().collect();
+            let relation_roots: Vec<ObjectId> = self
                 .local
                 .relations
-                .keys()
-                .filter(|id| drop_schema.names.contains(&id.schema))
-                .cloned()
+                .iter()
+                .filter_map(|(id, overlay)| {
+                    (dropped_schema_names.contains(&id.schema)
+                        && matches!(overlay, RelationOverlay::Present(_)))
+                    .then_some(id.clone())
+                })
                 .collect();
-            for id in relations_to_drop {
-                self.snapshot_relation(&id);
-                self.local.relations.insert(id, RelationOverlay::Dropped);
+            let mut cascade = super::CascadeResult::default();
+            for root in &relation_roots {
+                let closure = self.get_cascade_closure(root);
+                cascade.dropped_relations.extend(closure.dropped_relations);
+                cascade.dropped_indexes.extend(closure.dropped_indexes);
+                cascade
+                    .dropped_constraints
+                    .extend(closure.dropped_constraints);
             }
-
-            let constraints_to_drop: Vec<(ObjectId, String)> = self
-                .local
-                .constraints
-                .keys()
-                .filter(|(table_id, _)| drop_schema.names.contains(&table_id.schema))
+            let all_dropped_relations = cascade.dropped_relations;
+            let dropped_relations: std::collections::HashSet<ObjectId> = all_dropped_relations
+                .iter()
+                .filter(|id| self.relation_is_present(id))
                 .cloned()
                 .collect();
-            for (table_id, name) in constraints_to_drop {
-                self.snapshot_constraint(&table_id, &name);
-                self.local.constraints.remove(&(table_id, name));
+            if all_dropped_relations
+                .iter()
+                .any(|id| !self.relation_is_present(id))
+            {
+                // A scoped cache may retain a dependency edge without the
+                // dependent relation's catalog row. PostgreSQL would drop it,
+                // but the simulator cannot reproduce its full state exactly.
+                self.snapshot_confidence();
+                self.local.confidence = Confidence::Tainted;
+            }
+            for id in &dropped_relations {
+                self.local
+                    .relations
+                    .insert(id.clone(), RelationOverlay::Dropped);
             }
 
             let types_to_drop: Vec<ObjectId> = self
                 .local
                 .types
                 .keys()
-                .filter(|id| drop_schema.names.contains(&id.schema))
+                .filter(|id| dropped_schema_names.contains(&id.schema))
                 .cloned()
                 .collect();
             for id in types_to_drop {
-                self.snapshot_type(&id);
                 self.local.types.insert(id, TypeOverlay::Dropped);
             }
 
-            let sequences_to_drop: Vec<ObjectId> = self
-                .local
-                .sequences
-                .keys()
-                .filter(|id| drop_schema.names.contains(&id.schema))
-                .cloned()
-                .collect();
-            for id in sequences_to_drop {
-                self.snapshot_sequence(&id);
+            let sequences_to_drop: Vec<SequenceDrop> =
+                self.local
+                    .sequences
+                    .iter()
+                    .filter_map(|(id, overlay)| {
+                        let owned_by_dropped_relation = matches!(
+                            overlay,
+                            SequenceOverlay::Present(sequence)
+                                if sequence.owned_by.as_ref().is_some_and(|(table, _)| {
+                                    all_dropped_relations
+                                        .contains(self.local.graph.resolve_rename(table))
+                                })
+                        );
+                        (dropped_schema_names.contains(&id.schema) || owned_by_dropped_relation)
+                            .then(|| match overlay {
+                                SequenceOverlay::Present(sequence) => {
+                                    (id.clone(), sequence.kind.clone(), sequence.owned_by.clone())
+                                }
+                                SequenceOverlay::Dropped => unreachable!(
+                                    "dropped sequence cannot be selected for schema cascade"
+                                ),
+                            })
+                    })
+                    .collect();
+            for (id, kind, owned_by) in sequences_to_drop {
+                self.clear_sequence_defaults_on_cascade(&id, kind, owned_by);
                 self.local.sequences.insert(id, SequenceOverlay::Dropped);
             }
 
-            let functions_to_drop: Vec<ObjectId> = self
+            let functions_to_drop: std::collections::HashSet<ObjectId> = self
                 .local
                 .functions
                 .keys()
-                .filter(|id| drop_schema.names.contains(&id.schema))
+                .filter(|id| dropped_schema_names.contains(&id.schema))
                 .cloned()
                 .collect();
-            for id in functions_to_drop {
-                self.snapshot_function(&id);
-                self.local.functions.insert(id, FunctionOverlay::Dropped);
+            for id in &functions_to_drop {
+                self.local
+                    .functions
+                    .insert(id.clone(), FunctionOverlay::Dropped);
             }
 
             let triggers_to_drop: Vec<ObjectId> = self
                 .local
                 .triggers
-                .keys()
-                .filter(|id| drop_schema.names.contains(&id.schema))
-                .cloned()
+                .iter()
+                .filter_map(|(id, overlay)| {
+                    let TriggerOverlay::Present(trigger) = overlay else {
+                        return None;
+                    };
+                    let function_is_dropped = self.local.graph.edges().iter().any(|edge| {
+                        matches!(
+                            &edge.kind,
+                            DependencyKind::TriggerOnTable { trigger_id, function_id }
+                                if trigger_id == id && functions_to_drop.contains(function_id)
+                        )
+                    });
+                    (dropped_schema_names.contains(&id.schema)
+                        || all_dropped_relations
+                            .contains(self.local.graph.resolve_rename(&trigger.table_id))
+                        || function_is_dropped)
+                        .then_some(id.clone())
+                })
                 .collect();
+            let dropped_trigger_ids: std::collections::HashSet<ObjectId> =
+                triggers_to_drop.iter().cloned().collect();
             for id in triggers_to_drop {
-                self.snapshot_trigger(&id);
                 self.local.triggers.insert(id, TriggerOverlay::Dropped);
             }
 
+            self.remove_dropped_constraints(&all_dropped_relations, &cascade.dropped_constraints);
+
             self.local
                 .pending_validation
-                .retain(|(table, _)| !drop_schema.names.contains(&table.schema));
-            let publication_names: Vec<String> = self.local.publications.keys().cloned().collect();
-            for publication_name in publication_names {
-                self.snapshot_publication(&publication_name);
-            }
+                .retain(|(table, _)| !dropped_schema_names.contains(&table.schema));
             for overlay in self.local.publications.values_mut() {
                 let PublicationOverlay::Present(publication) = overlay else {
                     continue;
@@ -270,26 +339,58 @@ impl AnalysisState {
                     PublicationObjectFact::Table { name, .. } => name
                         .schema
                         .as_ref()
-                        .is_none_or(|schema| !drop_schema.names.contains(&schema.resolve())),
+                        .is_none_or(|schema| !dropped_schema_names.contains(&schema.resolve())),
                     PublicationObjectFact::SchemaTables { schema, .. } => {
-                        !drop_schema.names.contains(schema)
+                        !dropped_schema_names.contains(schema)
                     }
                     _ => true,
                 });
             }
 
             self.snapshot_graph_full();
+            let resolution_graph = self.local.graph.clone();
             self.local.graph.retain_edges(|edge| {
-                !drop_schema.names.contains(&edge.dependent.schema)
-                    && !drop_schema.names.contains(&edge.referenced.schema)
-                    && match &edge.kind {
-                        DependencyKind::TriggerOnTable { function_id, .. } => {
-                            !drop_schema.names.contains(&function_id.schema)
-                        }
-                        _ => true,
+                let dependent = resolution_graph.resolve_rename(&edge.dependent);
+                let referenced = resolution_graph.resolve_rename(&edge.referenced);
+                if all_dropped_relations.contains(dependent)
+                    || all_dropped_relations.contains(referenced)
+                    || cascade.dropped_indexes.contains(dependent)
+                    || dropped_schema_names.contains(&edge.dependent.schema)
+                    || dropped_schema_names.contains(&edge.referenced.schema)
+                {
+                    return false;
+                }
+                match &edge.kind {
+                    DependencyKind::ForeignKey {
+                        constraint_name: Some(name),
+                        ..
+                    } => !cascade
+                        .dropped_constraints
+                        .contains(&(dependent.clone(), name.clone())),
+                    DependencyKind::TriggerOnTable {
+                        trigger_id,
+                        function_id,
+                    } => {
+                        !dropped_trigger_ids.contains(trigger_id)
+                            && !functions_to_drop.contains(function_id)
                     }
+                    _ => true,
+                }
             });
         } else {
+            let has_external_dependents = self.local.graph.edges().iter().any(|edge| {
+                !matches!(&edge.kind, DependencyKind::RenameTo)
+                    && drop_schema.names.contains(&edge.referenced.schema)
+                    && !drop_schema.names.contains(&edge.dependent.schema)
+            });
+            if has_external_dependents {
+                return MutationResult::Conflict {
+                    reason: format!(
+                        "schema(s) {:?} have dependent objects outside the schema; use CASCADE",
+                        drop_schema.names
+                    ),
+                };
+            }
             let has_relation = self.local.relations.iter().any(|(id, overlay)| {
                 drop_schema.names.contains(&id.schema)
                     && !matches!(overlay, RelationOverlay::Dropped)

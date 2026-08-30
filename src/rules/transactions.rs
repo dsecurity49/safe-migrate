@@ -45,22 +45,24 @@ impl Rule for ConcurrentInsideTransactionRule {
                     });
                 }
                 Mutation::DropIndex(d) if d.concurrently => {
-                    violations.push(Violation {
-                        source_range: None,
-                        rule_id: self.id(),
-                        operation_kind: OperationKind::DropIndex,
-                        object_kind: ObjectKind::Index,
-                        object_name: d.id.to_string(),
-                        tier: self.default_tier(),
-                        reason: format!(
-                            "DROP INDEX CONCURRENTLY on {} inside a transaction block",
-                            d.id
-                        ),
-                        recipe: self.recipe(),
-                        dedup_key: None,
-                        sql: None,
-                        fk_dependency_related: false,
-                    });
+                    for id in &d.ids {
+                        violations.push(Violation {
+                            source_range: None,
+                            rule_id: self.id(),
+                            operation_kind: OperationKind::DropIndex,
+                            object_kind: ObjectKind::Index,
+                            object_name: id.to_string(),
+                            tier: self.default_tier(),
+                            reason: format!(
+                                "DROP INDEX CONCURRENTLY on {} inside a transaction block",
+                                id
+                            ),
+                            recipe: self.recipe(),
+                            dedup_key: None,
+                            sql: None,
+                            fk_dependency_related: false,
+                        });
+                    }
                 }
                 _ => {}
             }

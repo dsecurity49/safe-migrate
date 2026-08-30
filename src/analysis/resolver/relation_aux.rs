@@ -127,6 +127,7 @@ impl Resolver {
         table: &QualifiedName,
         permissive: bool,
         command: &PolicyCommand,
+        semantics_complete: bool,
         state: &AnalysisState,
     ) -> Mutation {
         Mutation::CreatePolicy(CreatePolicyMutation {
@@ -134,6 +135,7 @@ impl Resolver {
             table: Self::resolve_relation_lookup_name(table, state),
             permissive,
             command: command.clone(),
+            semantics_complete,
         })
     }
 

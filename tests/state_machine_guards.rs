@@ -138,7 +138,7 @@ mod state_machine_guards_tests {
     }
 
     #[test]
-    fn unknown_view_in_multi_drop_does_not_preserve_known_targets() {
+    fn unknown_view_in_multi_drop_preserves_known_targets() {
         let engine = setup_engine();
         let mut cache = safe_migrate::db::cache::DbCache::new();
         cache.metadata.schemas = Some(vec!["app".to_string()]);
@@ -180,8 +180,8 @@ mod state_machine_guards_tests {
             )
             .unwrap();
 
-        assert!(!state.relation_is_present(&view_id));
-        assert!(!state.relation_is_present(&materialized_view_id));
+        assert!(state.relation_is_present(&view_id));
+        assert!(state.relation_is_present(&materialized_view_id));
         assert_eq!(
             state.local.confidence,
             safe_migrate::analysis::state::Confidence::Tainted

@@ -199,11 +199,19 @@ pub fn assert_state_invariants(state: &AnalysisState) {
                 "foreign-key edge must have a matching constraint"
             ),
             DependencyKind::ViewDependency { .. } => {
-                assert!(matches!(
+                let dependent_is_modeled_view = matches!(
                     local.relations.get(&edge.dependent),
                     Some(RelationOverlay::Present(relation))
                         if matches!(relation.kind, safe_migrate::model::relation::RelationKind::View | safe_migrate::model::relation::RelationKind::MaterializedView)
-                ));
+                );
+                let dependent_schema_is_omitted = state
+                    .baseline_schemas
+                    .as_ref()
+                    .is_some_and(|schemas| !schemas.contains(&edge.dependent.schema));
+                assert!(
+                    dependent_is_modeled_view || dependent_schema_is_omitted,
+                    "view dependency must have a modeled view or an explicitly omitted dependent schema"
+                );
                 assert!(!matches!(
                     local.relations.get(&edge.referenced),
                     Some(RelationOverlay::Dropped)
@@ -222,6 +230,14 @@ pub fn assert_state_invariants(state: &AnalysisState) {
                 local.publications.get(publication_name),
                 Some(PublicationOverlay::Present(publication)) if publication.name == *publication_name
             )),
+            DependencyKind::ConstraintOnRelation {
+                constraint_name, ..
+            } => assert!(
+                local
+                    .constraints
+                    .contains_key(&(edge.dependent.clone(), constraint_name.clone())),
+                "constraint key edge must have a matching constraint"
+            ),
             DependencyKind::IndexOnRelation { .. }
             | DependencyKind::RenameTo
             | DependencyKind::PartitionOf

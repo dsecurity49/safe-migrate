@@ -65,7 +65,7 @@ mod tests {
     use super::*;
     use crate::analysis::mutations::Mutation;
     use crate::analysis::state::MutationResult;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     #[test]
     fn test_conflict_rule_emits_tier1_on_conflict() {
@@ -87,6 +87,7 @@ mod tests {
                 sequences: HashMap::new(),
                 types: HashMap::new(),
                 indexes: Vec::new(),
+                baseline_foreign_keys: HashSet::new(),
             },
             &crate::analysis::state::AnalysisState::new(crate::db::cache::DbCache::new()),
             &Config::default(),
@@ -118,6 +119,7 @@ mod tests {
                 sequences: HashMap::new(),
                 types: HashMap::new(),
                 indexes: Vec::new(),
+                baseline_foreign_keys: HashSet::new(),
             },
             &crate::analysis::state::AnalysisState::new(crate::db::cache::DbCache::new()),
             &Config::default(),

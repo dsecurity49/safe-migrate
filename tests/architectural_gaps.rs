@@ -12,36 +12,29 @@ mod architectural_gap_tests {
     #[test]
     fn test_fk_parent_table_lock_escalation() {
         let engine = setup_engine();
-        let mut cache = safe_migrate::db::cache::DbCache::new();
-
-        // Parent is huge (causes Tier 1 lock if evaluated correctly)
-        cache.insert_baseline(
-            object_id("public", "parent_tbl"),
-            safe_migrate::model::relation::RelationState::new(
-                object_id("public", "parent_tbl"),
-                ObjectId::new("public", "postgres"),
-                0,
-                Some(500_000),
-                RelationKind::Table,
-                Persistence::Permanent,
-                0,
-            ),
-        );
-        // Child is tiny
-        cache.insert_baseline(
-            object_id("public", "child_tbl"),
-            safe_migrate::model::relation::RelationState::new(
-                object_id("public", "child_tbl"),
-                ObjectId::new("public", "postgres"),
-                0,
-                Some(10),
-                RelationKind::Table,
-                Persistence::Permanent,
-                0,
-            ),
-        );
-
-        let mut state = safe_migrate::analysis::state::AnalysisState::new(cache);
+        let mut state = setup_state();
+        // Use valid PostgreSQL topology so the FK mutation is applied and the
+        // lock rule can classify the larger parent table.
+        engine
+            .analyze(
+                "CREATE TABLE parent_tbl(id int PRIMARY KEY); CREATE TABLE child_tbl(p_id int);",
+                &mut state,
+            )
+            .unwrap();
+        if let Some(RelationOverlay::Present(parent)) = state
+            .local
+            .relations
+            .get_mut(&object_id("public", "parent_tbl"))
+        {
+            parent.estimated_rows = Some(500_000);
+        }
+        if let Some(RelationOverlay::Present(child)) = state
+            .local
+            .relations
+            .get_mut(&object_id("public", "child_tbl"))
+        {
+            child.estimated_rows = Some(10);
+        }
         let violations = engine.analyze("ALTER TABLE child_tbl ADD CONSTRAINT fk FOREIGN KEY (p_id) REFERENCES parent_tbl(id);", &mut state).unwrap();
 
         let is_tier_1 = violations
@@ -89,7 +82,7 @@ mod architectural_gap_tests {
             .analyze(
                 "
             BEGIN;
-            CREATE TABLE a(id int);
+            CREATE TABLE a(id int PRIMARY KEY);
             SAVEPOINT s;
             CREATE TABLE b(id int);
             ROLLBACK TO s;
@@ -271,7 +264,10 @@ mod architectural_gap_tests {
         let engine = setup_engine();
         let mut state = setup_state();
         engine
-            .analyze("CREATE TABLE sessions(id int);", &mut state)
+            .analyze(
+                "CREATE SCHEMA app; CREATE TABLE app.sessions(id int);",
+                &mut state,
+            )
             .unwrap();
         engine
             .analyze("CREATE VIEW v AS SELECT * FROM app.sessions;", &mut state)
@@ -471,7 +467,7 @@ mod architectural_gap_tests {
         engine
             .analyze(
                 "
-            CREATE TABLE a(id int);
+            CREATE TABLE a(id int PRIMARY KEY);
             CREATE VIEW v AS SELECT * FROM a;
             ALTER TABLE a RENAME TO b;
             DROP TABLE b CASCADE;
@@ -628,7 +624,7 @@ mod architectural_gap_tests {
         engine
             .analyze(
                 "
-            CREATE TABLE a(id int);
+            CREATE TABLE a(id int PRIMARY KEY);
             CREATE TABLE b(a_id int);
             ALTER TABLE b ADD CONSTRAINT fk FOREIGN KEY (a_id) REFERENCES a(id);
             ALTER TABLE a RENAME TO a2;
@@ -688,7 +684,7 @@ mod architectural_gap_tests {
         engine
             .analyze(
                 "
-            CREATE TABLE a(id int);
+            CREATE TABLE a(id int PRIMARY KEY);
             CREATE TABLE b(a_id int);
             ALTER TABLE b ADD CONSTRAINT fk FOREIGN KEY (a_id) REFERENCES a(id);
         ",

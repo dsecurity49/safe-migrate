@@ -113,6 +113,37 @@ impl AnalysisState {
                 unreachable!("publication names have a dedicated namespace")
             }
         }
+        // Validate a rename destination before taking statement snapshots or
+        // advancing generation state.  In a scoped/incomplete catalog an
+        // absent destination is not authoritative, so applying the rename
+        // would hide a possible namespace collision.
+        if let crate::analysis::facts::AlterPublicationActionFact::Rename { to } = &p.action {
+            match self.publication_lookup(to) {
+                PublicationLookup::Present => {
+                    return MutationResult::Conflict {
+                        reason: format!("publication '{}' already exists", to),
+                    };
+                }
+                PublicationLookup::Unknown => {
+                    self.snapshot_confidence();
+                    self.local.confidence = Confidence::Tainted;
+                    return MutationResult::Skipped;
+                }
+                PublicationLookup::Tombstone
+                | PublicationLookup::AuthoritativelyAbsent
+                | PublicationLookup::WrongKind => {}
+            }
+        }
+        if let crate::analysis::facts::AlterPublicationActionFact::OwnerChange(role) = &p.action
+            && let Some((owner, known)) = self.role_fact_identity(role)
+            && known
+            && self.local.roles_known
+            && self.present_role(&owner).is_none()
+        {
+            return MutationResult::Conflict {
+                reason: format!("role '{}' does not exist", owner),
+            };
+        }
         self.snapshot_publication(&p.name);
         self.snapshot_generation_counter();
         self.local.generation_counter += 1;
@@ -210,6 +241,10 @@ impl AnalysisState {
             AlterPublicationActionFact::OwnerChange(role) => {
                 if let Some((owner, known)) = self.role_fact_identity(role) {
                     if known {
+                        if !self.local.roles_known {
+                            self.snapshot_confidence();
+                            self.local.confidence = Confidence::Tainted;
+                        }
                         if let Some(crate::model::replication::PublicationOverlay::Present(
                             publication,
                         )) = self.local.publications.get_mut(&p.name)
@@ -238,11 +273,6 @@ impl AnalysisState {
                 }
             }
             AlterPublicationActionFact::Rename { to } => {
-                if self.publication_lookup(to) == PublicationLookup::Present {
-                    return MutationResult::Conflict {
-                        reason: format!("publication '{}' already exists", to),
-                    };
-                }
                 rename_to = Some(to.clone());
             }
         }
@@ -289,6 +319,7 @@ impl AnalysisState {
 
     pub(super) fn apply_drop_publication(&mut self, p: &DropPublicationMutation) -> MutationResult {
         let mut present_names = Vec::new();
+        let mut unknown_target = false;
         for name in &p.names {
             match self.publication_lookup(name) {
                 PublicationLookup::Present => present_names.push(name.clone()),
@@ -303,6 +334,7 @@ impl AnalysisState {
                 PublicationLookup::Unknown if p.if_exists => {
                     self.snapshot_confidence();
                     self.local.confidence = Confidence::Tainted;
+                    unknown_target = true;
                 }
                 PublicationLookup::AuthoritativelyAbsent => {
                     return MutationResult::Conflict {
@@ -318,6 +350,9 @@ impl AnalysisState {
                     unreachable!("publication names have a dedicated namespace")
                 }
             }
+        }
+        if unknown_target {
+            return MutationResult::Skipped;
         }
         for name in &present_names {
             self.snapshot_publication(name);
@@ -481,6 +516,35 @@ impl AnalysisState {
             SubscriptionLookup::WrongKind => {
                 unreachable!("subscription names have a dedicated namespace")
             }
+        }
+        // As with publications, an unknown destination in an incomplete
+        // catalog cannot be treated as free for a namespace rename.
+        if let crate::analysis::facts::AlterSubscriptionActionFact::Rename { to } = &s.action {
+            match self.subscription_lookup(to) {
+                SubscriptionLookup::Present => {
+                    return MutationResult::Conflict {
+                        reason: format!("subscription '{}' already exists", to),
+                    };
+                }
+                SubscriptionLookup::Unknown => {
+                    self.snapshot_confidence();
+                    self.local.confidence = Confidence::Tainted;
+                    return MutationResult::Skipped;
+                }
+                SubscriptionLookup::Tombstone
+                | SubscriptionLookup::AuthoritativelyAbsent
+                | SubscriptionLookup::WrongKind => {}
+            }
+        }
+        if let crate::analysis::facts::AlterSubscriptionActionFact::OwnerChange(role) = &s.action
+            && let Some((owner, known)) = self.role_fact_identity(role)
+            && known
+            && self.local.roles_known
+            && self.present_role(&owner).is_none()
+        {
+            return MutationResult::Conflict {
+                reason: format!("role '{}' does not exist", owner),
+            };
         }
         let existing = match self.local.subscriptions.get(&s.name) {
             Some(crate::model::replication::SubscriptionOverlay::Present(subscription)) => {
@@ -724,6 +788,10 @@ impl AnalysisState {
             AlterSubscriptionActionFact::OwnerChange(role) => {
                 if let Some((owner, known)) = self.role_fact_identity(role) {
                     if known {
+                        if !self.local.roles_known {
+                            self.snapshot_confidence();
+                            self.local.confidence = Confidence::Tainted;
+                        }
                         if let Some(crate::model::replication::SubscriptionOverlay::Present(
                             subscription,
                         )) = self.local.subscriptions.get_mut(&s.name)
@@ -752,11 +820,6 @@ impl AnalysisState {
                 }
             }
             AlterSubscriptionActionFact::Rename { to } => {
-                if self.subscription_lookup(to) == SubscriptionLookup::Present {
-                    return MutationResult::Conflict {
-                        reason: format!("subscription '{}' already exists", to),
-                    };
-                }
                 rename_to = Some(to.clone());
             }
         }

@@ -24,7 +24,7 @@ mod transaction_lifecycle_tests {
 
         let violations = engine
             .analyze(
-                "BEGIN; COMMIT AND CHAIN; CREATE INDEX CONCURRENTLY idx ON users (id); ROLLBACK;",
+                "CREATE TABLE users (id int); BEGIN; COMMIT AND CHAIN; CREATE INDEX CONCURRENTLY idx ON users (id); ROLLBACK;",
                 &mut state,
             )
             .unwrap();
@@ -44,7 +44,7 @@ mod transaction_lifecycle_tests {
 
         let violations = engine
             .analyze(
-                "BEGIN; ROLLBACK AND CHAIN; CREATE INDEX CONCURRENTLY idx ON users (id); ROLLBACK;",
+                "CREATE TABLE users (id int); BEGIN; ROLLBACK AND CHAIN; CREATE INDEX CONCURRENTLY idx ON users (id); ROLLBACK;",
                 &mut state,
             )
             .unwrap();
@@ -154,7 +154,7 @@ mod transaction_lifecycle_tests {
 
         let violations = engine
             .analyze(
-                "BEGIN; SAVEPOINT MixedCase; ROLLBACK TO SAVEPOINT mixedcase; CREATE INDEX CONCURRENTLY idx ON users (id); ROLLBACK;",
+                "CREATE TABLE users (id int); BEGIN; SAVEPOINT MixedCase; ROLLBACK TO SAVEPOINT mixedcase; CREATE INDEX CONCURRENTLY idx ON users (id); ROLLBACK;",
                 &mut state,
             )
             .unwrap();
