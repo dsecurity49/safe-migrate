@@ -7,88 +7,25 @@ notes are available on the
 
 ## v0.7.0 — 2026-08-30
 
-- Made Cache V6 loading and writing reject semantically inconsistent metadata
-  (including mismatched identities and dangling catalog relationships), and
-  made cache installation durable after its atomic replacement.
-- Preserved report locations while reusing the parser result already needed to
-  calculate statement ranges; the local 250-statement location-report scenario
-  improved from 922 ms to a 235 ms median in the optimized profile.
-- Strengthened rollback, savepoint, graph, cache, and serialized-report
-  contracts with deterministic regression coverage. Invalid internal
-  savepoint data, automatic-sync configuration, and report serialization now
-  produce diagnostics rather than unchecked failures.
-- Expanded release readiness checks to cover the frozen fixture suite, package
-  contents, Rust 1.94, and supported operating systems.
-- Matched PostgreSQL's 63-byte identifier truncation for quoted and unquoted
-  names, including UTF-8-safe clipping, namespace conflicts, routine aliases,
-  and generated-name differential coverage.
-- Added PostgreSQL 17 relation-ACL support for `MAINTAIN`, including
-  version-aware `GRANT ALL` expansion and typed grant/revoke extraction.
-- Hardened migration-state validation for dependent relation, routine, foreign
-  key, partition, index, trigger, policy, view, and privilege targets, with
-  conservative tainting for incomplete scoped baselines.
-- Corrected view replacement metadata and `DROP VIEW`/`DROP MATERIALIZED VIEW`
-  dependency cleanup, removed stale relation edges after table drops, and
-  stopped unsupported domain, sequence, and role transitions from claiming
-  exact state.
-- Tightened sequence ownership and trigger target validation, and tainted
-  cascades that remove relations omitted from a scoped baseline.
-- Restricted view dependency discovery to relation-name AST nodes, avoiding
-  false conflicts for casts and function expressions inside view definitions.
-- Limited synchronized view edges to relation kinds currently modeled by the
-  dependency graph.
-- Made view-dependency synchronization require PostgreSQL rewrite-to-relation
-  dependency classes, preventing unrelated catalog dependencies from entering
-  the modeled graph.
-- Removed foreign-key metadata from surviving tables during cascades, including
-  cross-schema view and foreign-key cleanup for `DROP SCHEMA ... CASCADE`.
-- Record inline foreign-key, CHECK, and exclusion constraints; reserve all
-  generated constraint names before creating a table; and track `NOT VALID`
-  constraints until validation completes.
-- Validate partition parent, strategy, attachment, and detach state before
-  applying partition changes. Publication scopes that imply all or inherited
-  tables now conservatively taint confidence when those catalogs are absent.
-- Match PostgreSQL statement atomicity for multi-target view drops when a
-  scoped baseline cannot resolve one target, and retain conservative rewrite
-  findings for type changes whose column evidence is incomplete.
-- Keep irreversible-drop and `WITH GRANT OPTION` findings visible when the
-  state matrix conservatively skips an operation because Cache V6 evidence is
-  incomplete; guarded drops of absent columns remain no-ops.
-- Match PostgreSQL `CASCADE` cleanup for `DROP SEQUENCE` and `DROP SCHEMA` by
-  removing modeled `nextval(...)` column defaults that depend on dropped
-  sequences, including cross-schema defaults.
-- Route parser-accepted but unmodeled `ALTER TABLE` actions through the
-  explicit opaque/tainted path instead of silently treating them as no-ops.
-- Treat `CREATE TABLE` inheritance, typed-table, `LIKE`, and `ON COMMIT` forms
-  as opaque until their copied metadata is modeled; CTAS now taints column
-  completeness so later column edits remain conservative.
-- Route parser-accepted `ALTER TYPE` owner, option, and attribute actions to
-  the opaque path, and reject CTAS `ON COMMIT` lifecycle forms rather than
-  recording a relation with the wrong transaction lifetime.
-- Route unsupported `ALTER MATERIALIZED VIEW` actions to the opaque path
-  instead of producing a fact that resolves to no mutation.
-- Route unsupported `ALTER VIEW` column-default and option changes to the
-  opaque path instead of producing facts that the resolver discards.
-- Route unmodeled `CREATE ROLE`/`CREATE USER` options (such as `SUPERUSER`,
-  `CREATEDB`, passwords, and memberships) to the opaque path rather than
-  recording incomplete role state as exact.
-- Route view options, `WITH CHECK OPTION`, unpopulated materialized views, and
-  constrained/collated domains to the opaque path until
-  their state semantics are modeled.
-- Preserve policy mutations for restrictive-policy findings while tainting
-  state when policy roles or `USING`/`WITH CHECK` expressions are unmodeled.
-- Preserve expression indexes for their concurrency, uniqueness, and predicate
-  checks; their unmodeled key/dependency metadata remains conservative during
-  later constraint adoption.
-- Keep aggregate identities for lookup while tainting their unmodeled
-  transition functions and implementation options.
-- Route composite, range, and base `CREATE TYPE` forms to the opaque path;
-  only enum metadata is currently modeled completely.
-- Keep database DDL available to database-specific rules while tainting
-  confidence because database catalogs are outside the current schema model.
-- Route unknown `RESET` settings through the opaque path; only the modeled
-  timeout/search-path resets remain exact, while unrelated known settings stay
-  explicit schema-neutral no-ops.
+- Added semantic Cache V6 validation and durable cache replacement; invalid
+  cache, configuration, rollback, and report state now produces diagnostics.
+- Matched PostgreSQL's 63-byte identifier behavior, including UTF-8-safe
+  truncation, and added PostgreSQL 17 `MAINTAIN`/`GRANT ALL` support.
+- Added inline foreign-key, CHECK, exclusion, and `NOT VALID` constraint state,
+  with validation tracking and generated-constraint name reservation.
+- Fixed cascade cleanup for foreign keys, views, indexes, triggers, and
+  sequence-backed defaults, including cross-schema `DROP SCHEMA ... CASCADE`.
+- Made scoped multi-target drops atomic and tightened validation for sequence
+  ownership, trigger targets, partition changes, and dependent routines.
+- Improved view dependency extraction and catalog filtering, preventing casts,
+  function expressions, and unrelated catalog rows from creating false edges.
+- Added conservative handling for incomplete baseline evidence, including
+  expression indexes, inherited/publication tables, and type rewrite safety.
+- Routed unsupported `ALTER TABLE`/type/view/materialized-view actions,
+  copied-table forms, unmodeled role options, and incomplete domain/type forms
+  to explicit tainted analysis rather than recording an exact no-op.
+- Preserved relevant safety findings when an operation is skipped because cache
+  evidence is incomplete, including irreversible drops and `WITH GRANT OPTION`.
 
 ## v0.6.2 — 2026-08-27
 
