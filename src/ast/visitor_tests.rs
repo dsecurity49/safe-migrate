@@ -1569,6 +1569,12 @@ mod tests {
     }
 
     #[test]
+    fn unquoted_identifiers_use_postgres_ascii_folding() {
+        let ident = Ident::new("ÄTable".to_string(), false);
+        assert_eq!(ident.resolve(), "Ätable");
+    }
+
+    #[test]
     fn test_qualified_name_new() {
         let schema = Some(Ident::new("my_schema".to_string(), false));
         let name = Ident::new("my_table".to_string(), false);

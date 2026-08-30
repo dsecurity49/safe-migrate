@@ -209,6 +209,90 @@ mod state_machine_guards_tests {
     }
 
     #[test]
+    fn alter_view_rename_column_taints_instead_of_becoming_an_exact_noop() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE TABLE source (id int); CREATE VIEW v AS SELECT id FROM source;",
+                &mut state,
+            )
+            .expect("view setup should analyze");
+        engine
+            .analyze("ALTER VIEW v RENAME COLUMN id TO renamed_id;", &mut state)
+            .expect("typed but unsupported view alteration should analyze");
+
+        assert_eq!(
+            state.local.confidence,
+            safe_migrate::analysis::state::Confidence::Tainted
+        );
+    }
+
+    #[test]
+    fn all_tables_in_schema_grants_are_tainted_when_relation_scope_is_incomplete() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE SCHEMA app; CREATE TABLE app.entries (id int); GRANT SELECT ON ALL TABLES IN SCHEMA app TO reader;",
+                &mut state,
+            )
+            .expect("schema-wide grant should analyze");
+
+        assert_eq!(
+            state.local.confidence,
+            safe_migrate::analysis::state::Confidence::Tainted
+        );
+    }
+
+    #[test]
+    fn schema_cascade_skips_already_dropped_sequences_without_panicking() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE SCHEMA app; CREATE SEQUENCE app.counter; DROP SEQUENCE app.counter; DROP SCHEMA app CASCADE;",
+                &mut state,
+            )
+            .expect("schema cascade after sequence drop should analyze");
+
+        assert!(matches!(
+            state.local.schemas.get("app"),
+            Some(safe_migrate::model::schema::SchemaOverlay::Dropped)
+        ));
+    }
+
+    #[test]
+    fn conflicting_cascade_does_not_report_dependencies_that_were_not_dropped() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TABLE parent (id int PRIMARY KEY); CREATE TABLE child (id int REFERENCES parent(id));",
+                &mut state,
+            )
+            .expect("dependency setup should analyze");
+
+        let findings = engine
+            .analyze("DROP TABLE parent, missing CASCADE;", &mut state)
+            .expect("conflicting cascade should analyze");
+
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict")
+        );
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding.rule_id != "destructive-cascade")
+        );
+    }
+
+    #[test]
     fn missing_unguarded_drop_aborts_following_transaction_statements() {
         let engine = setup_engine();
         let mut state = setup_state();

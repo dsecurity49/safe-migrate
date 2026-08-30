@@ -2321,13 +2321,22 @@ fn normalize_data_type_with_identity(
         return normalized;
     };
 
-    // Keep array dimensions from the display string while replacing the
-    // search_path-dependent base name with its stable schema/name identity.
+    // Keep type modifiers and array dimensions from the display string while
+    // replacing the search_path-dependent base name with its stable identity.
     let suffix = normalized
-        .find('[')
+        .find(|character| ['(', '['].contains(&character))
         .map(|index| &normalized[index..])
         .unwrap_or("");
     format!("{}.{}{}", type_id.schema, type_id.name, suffix)
+}
+
+#[test]
+fn normalized_type_identity_preserves_modifiers_and_arrays() {
+    let type_id = safe_migrate::ast::identifiers::ObjectId::new("public", "amount");
+    assert_eq!(
+        normalize_data_type_with_identity("numeric(10,2)[]", Some(&type_id)),
+        "public.amount(10,2)[]"
+    );
 }
 
 fn qualified_name(schema: &str, name: &str) -> String {

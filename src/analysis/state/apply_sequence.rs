@@ -309,7 +309,7 @@ impl AnalysisState {
                     }
                 }
                 self.snapshot_sequence(&alter.id);
-                self.snapshot_graph();
+                self.snapshot_graph_full();
                 self.local.graph.retain_edges(|edge| {
                     !(matches!(edge.kind, DependencyKind::SequenceOwnedBy { .. })
                         && edge.dependent == alter.id)

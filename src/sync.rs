@@ -727,7 +727,6 @@ fn load_schemas(
 fn load_sequences(
     client: &mut impl GenericClient,
     schema_values: &Option<Vec<String>>,
-    _schema_filter: &str,
 ) -> Result<std::collections::HashMap<ObjectId, crate::model::sequence::SequenceState>> {
     // Keep a sequence when either side of OWNED BY is in the requested
     // scope. A sequence can live in a different schema from its owning
@@ -1080,6 +1079,7 @@ fn load_triggers(
         JOIN pg_proc f ON f.oid = t.tgfoid
         JOIN pg_namespace fn ON fn.oid = f.pronamespace
         WHERE t.tgisinternal = false
+          AND c.relkind IN ('r', 'p', 'v', 'm')
           AND n.nspname NOT IN ('pg_catalog', 'information_schema')
           {schema_filter_with_fk};
     "
@@ -1136,6 +1136,7 @@ fn load_constraints(
         JOIN pg_class c ON c.oid = con.conrelid
         JOIN pg_namespace n ON n.oid = c.relnamespace
         WHERE con.contype IN ('c', 'f', 'p', 'u', 'x')
+          AND c.relkind IN ('r', 'p', 'v', 'm')
           AND n.nspname NOT IN ('pg_catalog', 'information_schema')
           {schema_filter_with_fk};
         "
@@ -1873,7 +1874,7 @@ fn populate_cache_from_client(
         .search_path
         .retain(|schema| cache.schemas.contains_key(schema));
 
-    cache.sequences = load_sequences(client, &schema_values, schema_filter)?;
+    cache.sequences = load_sequences(client, &schema_values)?;
 
     cache.relations =
         load_relations_and_columns(client, schemas, &schema_values, schema_filter_with_fk)?;

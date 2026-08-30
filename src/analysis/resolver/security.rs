@@ -9,6 +9,7 @@ use crate::analysis::mutations::{
     RevokeMutation,
 };
 use crate::analysis::state::AnalysisState;
+use crate::ast::identifiers::ObjectId;
 
 impl Resolver {
     fn resolve_grant_target(target: &GrantTarget, state: &AnalysisState) -> ResolvedGrantTarget {
@@ -75,22 +76,16 @@ impl Resolver {
         })
     }
 
-    pub(super) fn resolve_alter_database(
-        fact: &AlterDatabaseFact,
-        state: &AnalysisState,
-    ) -> Mutation {
+    pub(super) fn resolve_alter_database(fact: &AlterDatabaseFact) -> Mutation {
         Mutation::AlterDatabase(AlterDatabaseMutation {
-            id: Self::resolve_relation_lookup_name(&fact.name, state),
+            id: ObjectId::new("", fact.name.name.resolve()),
             action: fact.action.clone(),
         })
     }
 
-    pub(super) fn resolve_drop_database(
-        fact: &DropDatabaseFact,
-        state: &AnalysisState,
-    ) -> Mutation {
+    pub(super) fn resolve_drop_database(fact: &DropDatabaseFact) -> Mutation {
         Mutation::DropDatabase(DropDatabaseMutation {
-            id: Self::resolve_relation_lookup_name(&fact.name, state),
+            id: ObjectId::new("", fact.name.name.resolve()),
             if_exists: fact.if_exists,
         })
     }

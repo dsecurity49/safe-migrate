@@ -48,7 +48,9 @@ impl Resolver {
                 AlterSequenceActionMutation::OwnerTo(owner.clone())
             }
             AlterSequenceActionFact::RenameTo(new_name) => {
-                AlterSequenceActionMutation::RenameTo(ObjectId::new(&id.schema, new_name.resolve()))
+                let mut new_id = ObjectId::new(&id.schema, new_name.resolve());
+                new_id.inferred_schema = id.inferred_schema;
+                AlterSequenceActionMutation::RenameTo(new_id)
             }
             AlterSequenceActionFact::SetSchema(schema) => {
                 AlterSequenceActionMutation::SetSchema(ObjectId::new(schema, &id.name))

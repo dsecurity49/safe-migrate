@@ -22,7 +22,7 @@ impl Rule for CascadingDropRule {
     fn evaluate(
         &self,
         mutation: &Mutation,
-        _result: &MutationResult,
+        result: &MutationResult,
         pre_state: &crate::analysis::state::PreState,
         state: &AnalysisState,
         _config: &Config,
@@ -30,7 +30,8 @@ impl Rule for CascadingDropRule {
     ) -> Vec<Violation> {
         let mut violations = Vec::new();
 
-        if let Mutation::DropTable(drop) = mutation
+        if !matches!(result, MutationResult::Conflict { .. })
+            && let Mutation::DropTable(drop) = mutation
             && drop.cascade
             && let Some(closure) = cascade_closure
         {

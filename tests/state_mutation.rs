@@ -1097,16 +1097,15 @@ mod state_mutation_tests {
             cache.metadata.source_statement_timeout_ms = 10_000;
             cache
         };
-        for name in ["public", "seq_schema"] {
-            cache.schemas.insert(
-                name.to_string(),
-                SchemaState {
-                    name: name.to_string(),
-                    owner: object_id("", "postgres"),
-                    generation: 0,
-                },
-            );
-        }
+        let name = "public";
+        cache.schemas.insert(
+            name.to_string(),
+            SchemaState {
+                name: name.to_string(),
+                owner: object_id("", "postgres"),
+                generation: 0,
+            },
+        );
         let mut state = safe_migrate::AnalysisState::new(cache);
 
         engine

@@ -282,7 +282,7 @@ impl AnalysisState {
                 self.local.transactions.len(),
             )),
         );
-        self.snapshot_graph();
+        self.snapshot_graph_full();
         for dependency in &create.depends_on {
             self.local.graph.add_edge(DependencyEdge::new(
                 create.id.clone(),

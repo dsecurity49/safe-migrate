@@ -160,8 +160,9 @@ impl AnalysisState {
             return MutationResult::Skipped;
         }
         let return_type = return_type
-            .strip_prefix("pg_catalog.")
-            .or_else(|| return_type.strip_prefix("PG_CATALOG."))
+            .split_once('.')
+            .filter(|(schema, _)| schema.eq_ignore_ascii_case("pg_catalog"))
+            .map(|(_, type_name)| type_name)
             .unwrap_or(return_type);
         if !return_type.eq_ignore_ascii_case("trigger") {
             return MutationResult::Conflict {
@@ -281,15 +282,27 @@ impl AnalysisState {
         }
         let old_id = Self::trigger_key(&rename_trigger.table, &rename_trigger.name);
         let new_id = Self::trigger_key(&rename_trigger.table, &rename_trigger.new_name);
-        let Some(TriggerOverlay::Present(mut trigger)) = self.local.triggers.get(&old_id).cloned()
-        else {
-            return MutationResult::Conflict {
-                reason: format!(
-                    "trigger '{}' does not exist on relation '{}'",
-                    rename_trigger.name, rename_trigger.table
-                ),
-            };
+        let trigger = match self.trigger_lookup(&old_id) {
+            TriggerLookup::Present => match self.local.triggers.get(&old_id).cloned() {
+                Some(TriggerOverlay::Present(trigger)) => trigger,
+                _ => unreachable!("trigger lookup established presence"),
+            },
+            TriggerLookup::Tombstone | TriggerLookup::AuthoritativelyAbsent => {
+                return MutationResult::Conflict {
+                    reason: format!(
+                        "trigger '{}' does not exist on relation '{}'",
+                        rename_trigger.name, rename_trigger.table
+                    ),
+                };
+            }
+            TriggerLookup::Unknown => {
+                self.snapshot_confidence();
+                self.local.confidence = super::Confidence::Tainted;
+                return MutationResult::Skipped;
+            }
+            TriggerLookup::WrongKind => unreachable!("triggers have a dedicated namespace"),
         };
+        let mut trigger = trigger;
         if old_id != new_id && self.trigger_lookup(&new_id) == TriggerLookup::Present {
             return MutationResult::Conflict {
                 reason: format!(

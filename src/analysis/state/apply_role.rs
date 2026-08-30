@@ -171,12 +171,24 @@ impl AnalysisState {
                 }
             }
             ResolvedGrantTarget::AllTablesInSchema(schemas) => {
+                // The cache does not retain every PostgreSQL relation kind
+                // eligible for ALL TABLES IN SCHEMA. Apply the modeled subset
+                // but do not claim that the resulting privilege matrix is
+                // complete.
+                self.snapshot_confidence();
+                self.local.confidence = Confidence::Tainted;
                 let target_ids: Vec<ObjectId> = self
                     .local
                     .relations
-                    .keys()
-                    .filter(|id| schemas.contains(&id.schema))
-                    .cloned()
+                    .iter()
+                    .filter_map(|(id, overlay)| {
+                        (schemas.contains(&id.schema)
+                            && matches!(
+                                overlay,
+                                crate::model::relation::RelationOverlay::Present(_)
+                            ))
+                        .then_some(id.clone())
+                    })
                     .collect();
                 for id in &target_ids {
                     self.apply_grant_to_relation(id, &privileges, &grantees);
@@ -217,12 +229,20 @@ impl AnalysisState {
                 }
             }
             ResolvedGrantTarget::AllTablesInSchema(schemas) => {
+                self.snapshot_confidence();
+                self.local.confidence = Confidence::Tainted;
                 let target_ids: Vec<ObjectId> = self
                     .local
                     .relations
-                    .keys()
-                    .filter(|id| schemas.contains(&id.schema))
-                    .cloned()
+                    .iter()
+                    .filter_map(|(id, overlay)| {
+                        (schemas.contains(&id.schema)
+                            && matches!(
+                                overlay,
+                                crate::model::relation::RelationOverlay::Present(_)
+                            ))
+                        .then_some(id.clone())
+                    })
                     .collect();
                 for id in &target_ids {
                     self.apply_revoke_to_relation(id, &privileges, &revokees);

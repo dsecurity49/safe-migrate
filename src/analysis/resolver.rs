@@ -530,10 +530,10 @@ impl Resolver {
                 mutations.push(Self::resolve_create_database(d));
             }
             StatementFact::AlterDatabase(d) => {
-                mutations.push(Self::resolve_alter_database(d, state));
+                mutations.push(Self::resolve_alter_database(d));
             }
             StatementFact::DropDatabase(d) => {
-                mutations.push(Self::resolve_drop_database(d, state));
+                mutations.push(Self::resolve_drop_database(d));
             }
             StatementFact::SetRole {
                 role,

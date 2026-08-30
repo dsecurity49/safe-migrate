@@ -105,6 +105,13 @@ mod invariant_sequences {
                 "ROLLBACK;".to_string(),
             ] {
                 analyze_and_validate(&mut state, &sql);
+                if sql.starts_with("SAVEPOINT") {
+                    assert!(state.local.schemas.contains_key(&schema));
+                    assert!(state.local.relations.keys().any(|id| id.schema == schema));
+                    assert!(state.local.types.keys().any(|id| id.schema == schema));
+                    assert!(state.local.sequences.keys().any(|id| id.schema == schema));
+                    assert!(state.local.functions.keys().any(|id| id.schema == schema));
+                }
             }
 
             assert!(state.local.transactions.is_empty());

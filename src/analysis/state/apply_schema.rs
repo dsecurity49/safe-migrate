@@ -253,30 +253,22 @@ impl AnalysisState {
                 self.local.types.insert(id, TypeOverlay::Dropped);
             }
 
-            let sequences_to_drop: Vec<SequenceDrop> =
-                self.local
-                    .sequences
-                    .iter()
-                    .filter_map(|(id, overlay)| {
-                        let owned_by_dropped_relation = matches!(
-                            overlay,
-                            SequenceOverlay::Present(sequence)
-                                if sequence.owned_by.as_ref().is_some_and(|(table, _)| {
-                                    all_dropped_relations
-                                        .contains(self.local.graph.resolve_rename(table))
-                                })
-                        );
-                        (dropped_schema_names.contains(&id.schema) || owned_by_dropped_relation)
-                            .then(|| match overlay {
-                                SequenceOverlay::Present(sequence) => {
-                                    (id.clone(), sequence.kind.clone(), sequence.owned_by.clone())
-                                }
-                                SequenceOverlay::Dropped => unreachable!(
-                                    "dropped sequence cannot be selected for schema cascade"
-                                ),
-                            })
-                    })
-                    .collect();
+            let sequences_to_drop: Vec<SequenceDrop> = self
+                .local
+                .sequences
+                .iter()
+                .filter_map(|(id, overlay)| {
+                    let SequenceOverlay::Present(sequence) = overlay else {
+                        return None;
+                    };
+                    let owned_by_dropped_relation =
+                        sequence.owned_by.as_ref().is_some_and(|(table, _)| {
+                            all_dropped_relations.contains(self.local.graph.resolve_rename(table))
+                        });
+                    (dropped_schema_names.contains(&id.schema) || owned_by_dropped_relation)
+                        .then(|| (id.clone(), sequence.kind.clone(), sequence.owned_by.clone()))
+                })
+                .collect();
             for (id, kind, owned_by) in sequences_to_drop {
                 self.clear_sequence_defaults_on_cascade(&id, kind, owned_by);
                 self.local.sequences.insert(id, SequenceOverlay::Dropped);
@@ -418,6 +410,13 @@ impl AnalysisState {
                     ),
                 };
             }
+            // The state model deliberately omits several PostgreSQL object
+            // families. With RESTRICT, any omitted object can make this
+            // statement fail, so an apparently empty modeled namespace is not
+            // sufficient evidence to drop the schema exactly.
+            self.snapshot_confidence();
+            self.local.confidence = Confidence::Tainted;
+            return MutationResult::Skipped;
         }
         for name in present_names {
             self.snapshot_schema(&name);

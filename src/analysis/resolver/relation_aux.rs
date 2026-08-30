@@ -2,8 +2,8 @@ use super::Resolver;
 use crate::analysis::facts::{AlterIndexActionFact, AlterViewAction, PolicyCommand};
 use crate::analysis::mutations::{
     CreateIndex, CreateMaterializedView, CreatePolicyMutation, CreateTriggerMutation, CreateView,
-    DropPolicyMutation, DropTriggerMutation, Mutation, RefreshMaterializedViewMutation, Rename,
-    RenameTriggerMutation,
+    DropPolicyMutation, DropTriggerMutation, Mutation, OpaqueMutation,
+    RefreshMaterializedViewMutation, Rename, RenameTriggerMutation,
 };
 use crate::analysis::state::AnalysisState;
 use crate::ast::identifiers::{Ident, ObjectId, QualifiedName};
@@ -46,9 +46,11 @@ impl Resolver {
                 id: Self::resolve_relation_lookup_name(name, state),
                 new_owner: new_owner.clone(),
             }),
+            AlterViewAction::RenameColumn { .. } => {
+                Some(Mutation::Opaque(OpaqueMutation::UnsupportedStatement))
+            }
             AlterViewAction::SetDefault { .. }
             | AlterViewAction::DropDefault { .. }
-            | AlterViewAction::RenameColumn { .. }
             | AlterViewAction::SetOptions { .. }
             | AlterViewAction::ResetOptions { .. } => None,
         }
@@ -158,10 +160,10 @@ impl Resolver {
         function: &Option<QualifiedName>,
         state: &AnalysisState,
     ) -> Mutation {
-        let function_id = function
-            .as_ref()
-            .map(|function| Self::resolve_routine_lookup_name(function, &[], state))
-            .unwrap_or_else(|| ObjectId::new("public", "unknown_function"));
+        let Some(function) = function else {
+            return Mutation::Opaque(OpaqueMutation::UnsupportedStatement);
+        };
+        let function_id = Self::resolve_routine_lookup_name(function, &[], state);
         Mutation::CreateTrigger(CreateTriggerMutation {
             name: name.to_string(),
             table: Self::resolve_relation_lookup_name(table, state),

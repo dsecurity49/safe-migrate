@@ -189,10 +189,14 @@ irreversible or `WITH GRANT OPTION`) remain reportable. Multi-target view drops
 with an unresolved target are likewise treated atomically, preserving known
 targets in the simulated state.
 
+`GRANT` and `REVOKE` on `ALL TABLES IN SCHEMA` update the modeled relations but
+are `Tainted`: the cache does not represent every PostgreSQL relation kind that
+the server may include in that target set.
+
 Parser-valid DDL whose semantics are not represented by the state model is
 handled as opaque and taints confidence. This includes copied or inherited
 tables, CTAS transaction-lifecycle actions, unsupported role attributes, and
-unmodeled type or materialized-view alterations; these statements are never
+unmodeled type, view, or materialized-view alterations; these statements are never
 silently recorded as exact no-ops.
 The same rule applies to view options/check options, unpopulated materialized
 views, and domain constraints or collations. CTAS `WITH NO DATA` and expression

@@ -22,7 +22,7 @@ impl Ident {
         let resolved = if self.quoted {
             self.text.clone()
         } else {
-            self.text.to_lowercase()
+            self.text.to_ascii_lowercase()
         };
         truncate_postgres_identifier(&resolved).to_string()
     }
