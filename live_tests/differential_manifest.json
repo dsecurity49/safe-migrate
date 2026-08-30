@@ -98,7 +98,6 @@
         "001_drop_table.sql",
         "004_drop_table_if_exists.sql",
         "005_drop_cascade.sql",
-        "006_drop_column_if_exists.sql",
         "safe_001_rename_col.sql",
         "safe_002_add_col.sql",
         "safe_003_widen_varchar.sql",
@@ -111,7 +110,11 @@
       "excluded_fixtures": [
         {
           "fixture": "002_drop_column.sql",
-          "reason": "Cache V6 foreign-key edges do not retain conkey/confkey column lists. The simulator conservatively skips a drop when dependency columns are unknown; exact column-aware replay is a 0.8.0 cache-evidence TODO."
+          "reason": "Cache V6 does not retain all foreign-key, index, view, and expression dependency column lists. The simulator conservatively skips a drop when those dependencies are unknown; exact column-aware replay is a 0.8.0 cache-evidence TODO."
+        },
+        {
+          "fixture": "006_drop_column_if_exists.sql",
+          "reason": "IF EXISTS only suppresses an absent-column error; it does not make Cache V6's unknown foreign-key, index, view, and expression column dependencies exact. Exact column-aware replay is a 0.8.0 cache-evidence TODO."
         },
         {
           "fixture": "safe_005_create_table.sql",
