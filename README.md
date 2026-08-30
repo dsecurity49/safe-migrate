@@ -41,8 +41,6 @@ Run `bash install.sh --help` after downloading the installer for pinning and
 destination options. Archives, checksums, and manual downloads are available on
 the
 [GitHub Releases page](https://github.com/dsecurity49/safe-migrate/releases).
-Maintainers should use the checked-in [release checklist](docs/RELEASING.md)
-before tagging or publishing a version.
 
 ## Quick start
 
@@ -84,11 +82,9 @@ SQL alone cannot show the existing schema, table statistics, dependencies,
 role and search-path context, or inherited timeout settings. `sync` captures
 that baseline once, so later `lint` runs are offline and review the same state.
 
-Cache V6 includes all routine kinds, publications, and redacted subscription
-metadata as well as ordinary schema state. It never stores subscription
-connection strings. Refresh publisher-side state, or a publication edit that
-does not use `ONLY`, remains `Tainted` when PostgreSQL inheritance or remote
-publisher state would decide the outcome.
+The cache records schema, dependency, privilege, and statistics metadata, but
+never connection credentials or password hashes. Treat it as sensitive and do
+not publish it.
 
 Sync with the database, role, and defaults used by the migration runner; it
 only reads them. Refresh the cache when that baseline changes. If the runner
@@ -242,8 +238,8 @@ no command-line flag to enable it. Use `--no-auto-sync` to suppress it for one
 lint run. If refresh fails, safe-migrate prints the cause and continues with the
 previous readable cache; the old cache is replaced only after a new cache has
 been written successfully. `--no-cache` also bypasses automatic sync. The
-previous cache must already be V6; an unsupported V1–V5 cache cannot be reused
-after a failed refresh.
+existing cache must use a supported format; otherwise rerun `sync` once
+database access is available.
 
 ### Cache encryption
 
@@ -259,10 +255,6 @@ The key is accepted only through the environment. Encrypted mode rejects
 plaintext caches, and plaintext mode rejects encrypted caches. Changing modes
 requires a fresh `sync`.
 
-Cache files contain schema and role names, dependencies, privileges, and
-statistics. They do not contain connection credentials or password hashes.
-Treat cache files as sensitive and do not publish them.
-
 ### Cache compatibility
 
 When safe-migrate encounters an unsupported cache format, rebuild it from the
@@ -272,9 +264,8 @@ database:
 safe-migrate sync
 ```
 
-v0.6.0 introduces Cache V6 for synchronized timeout provenance, the complete
-routine namespace, publications, and redacted subscriptions. Every V1–V5 cache
-requires resynchronization.
+Cache formats are checked before use. If a format is unsupported, rebuild the
+cache with `safe-migrate sync`; no migration SQL is changed.
 
 Use `safe-migrate cache inspect` to view cache provenance and redacted object
 and role counts without connecting to PostgreSQL. It never lists role names or
@@ -294,14 +285,8 @@ Pull-request job
 GitHub Actions cache -> runner baseline file -> lint-chain -> reports
 ```
 
-The Action uses
-`~/.cache/safe-migrate-action/baselines/<baseline>/baseline-v6.cache` on the
-runner. After a successful sync, it saves that file in GitHub Actions cache
-under the `default` baseline name. A pull-request run restores the file to the
-same managed path, then runs `lint-chain` with it; it does not connect to
-PostgreSQL or run `sync` again. GitHub-hosted runners are discarded after the
-job; on self-hosted runners the Action clears the selected baseline before each
-restore.
+The trusted workflow refreshes the baseline. Pull-request workflows restore it
+and run `lint-chain` without connecting to PostgreSQL.
 
 ### 1. Refresh the baseline
 
