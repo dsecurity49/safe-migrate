@@ -138,12 +138,25 @@ mod state_machine_guards_tests {
     }
 
     #[test]
-    fn unknown_view_in_multi_drop_preserves_known_targets() {
+    fn unknown_scoped_target_in_multi_drop_preserves_known_targets() {
         let engine = setup_engine();
         let mut cache = safe_migrate::db::cache::DbCache::new();
         cache.metadata.schemas = Some(vec!["app".to_string()]);
+        let table_id = object_id("app", "known_table");
         let view_id = object_id("app", "known_view");
         let materialized_view_id = object_id("app", "known_materialized_view");
+        cache.insert_baseline(
+            table_id.clone(),
+            RelationState::new(
+                table_id.clone(),
+                object_id("", "postgres"),
+                0,
+                None,
+                RelationKind::Table,
+                Persistence::Permanent,
+                0,
+            ),
+        );
         cache.insert_baseline(
             view_id.clone(),
             RelationState::new(
@@ -171,6 +184,12 @@ mod state_machine_guards_tests {
         let mut state = AnalysisState::new(cache);
 
         engine
+            .analyze(
+                "DROP TABLE IF EXISTS app.known_table, tenant.unknown_table;",
+                &mut state,
+            )
+            .unwrap();
+        engine
             .analyze("DROP VIEW app.known_view, tenant.unknown_view;", &mut state)
             .unwrap();
         engine
@@ -180,6 +199,7 @@ mod state_machine_guards_tests {
             )
             .unwrap();
 
+        assert!(state.relation_is_present(&table_id));
         assert!(state.relation_is_present(&view_id));
         assert!(state.relation_is_present(&materialized_view_id));
         assert_eq!(

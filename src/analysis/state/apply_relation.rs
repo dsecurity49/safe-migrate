@@ -100,15 +100,16 @@ impl AnalysisState {
 
         present_targets.sort_unstable_by_key(ToString::to_string);
         present_targets.dedup();
+        // `IF EXISTS` suppresses an absent-object error; it does not prove an
+        // object outside a scoped baseline is absent. PostgreSQL can therefore
+        // drop an unmodeled target (and its dependencies) in the same atomic
+        // statement. Do not apply known siblings with an incomplete target
+        // list.
+        if unknown_target {
+            return MutationResult::Skipped;
+        }
         if present_targets.is_empty() {
-            // A guarded CASCADE against an omitted scoped object still has
-            // destructive potential. Keep the operation visible to rules while
-            // leaving state untouched; confidence is already tainted above.
-            return if unknown_target && drop_table.cascade {
-                MutationResult::Applied
-            } else {
-                MutationResult::Skipped
-            };
+            return MutationResult::Skipped;
         }
 
         let roots: HashSet<ObjectId> = present_targets.iter().map(&resolve).collect();
