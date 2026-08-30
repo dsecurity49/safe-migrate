@@ -1062,11 +1062,11 @@ mod phase10_bug_fixes_and_sorting_tests {
     }
 
     #[test]
-    fn postgres18_all_grant_tracks_maintain_without_leaking_to_older_versions() {
+    fn postgres17_all_grant_tracks_maintain_without_leaking_to_older_versions() {
         use safe_migrate::model::relation::{Privilege, RelationOverlay};
 
         let engine = setup_engine();
-        for (version, expected) in [(180_000, true), (170_000, false)] {
+        for (version, expected) in [(170_000, true), (160_000, false)] {
             let mut cache = cache_with_table("public", "t_large", None);
             cache.pg_version_num = Some(version);
             let mut state = AnalysisState::new(cache);

@@ -3080,7 +3080,7 @@ impl AstVisitor {
         } else if cmd.all_token().is_some() {
             crate::analysis::facts::PrivilegeFact::All
         } else if let Some(role_ref) = cmd.role_ref() {
-            // Squawk 2.63.0 exposes PostgreSQL 18 MAINTAIN through the
+            // Squawk 2.63.0 exposes PostgreSQL 17 MAINTAIN through the
             // grammar's generic identifier branch (there is no
             // `maintain_token()` accessor), so recognize it before treating
             // the same branch as legacy role-membership syntax.

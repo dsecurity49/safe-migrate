@@ -55,7 +55,7 @@ mod tests {
     }
 
     #[test]
-    fn postgres18_maintain_privilege_is_extracted_from_grant_and_revoke() {
+    fn postgres17_maintain_privilege_is_extracted_from_grant_and_revoke() {
         for sql in [
             "GRANT MAINTAIN ON TABLE test_table TO app_user;",
             "REVOKE MAINTAIN ON TABLE test_table FROM app_user;",

@@ -1561,7 +1561,7 @@ impl AnalysisState {
     ) -> HashSet<Privilege> {
         let supports_maintain = self
             .pg_version_num
-            .is_some_and(|version| version >= 180_000);
+            .is_some_and(|version| version >= 170_000);
         match spec {
             crate::analysis::facts::PrivilegeSpec::All => {
                 let mut privileges = [

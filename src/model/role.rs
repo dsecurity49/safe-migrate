@@ -11,7 +11,7 @@ pub enum Privilege {
     References,
     Trigger,
     All,
-    /// PostgreSQL 18's table-maintenance privilege.
+    /// PostgreSQL 17's table-maintenance privilege.
     Maintain,
 }
 

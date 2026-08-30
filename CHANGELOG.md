@@ -22,7 +22,7 @@ notes are available on the
 - Matched PostgreSQL's 63-byte identifier truncation for quoted and unquoted
   names, including UTF-8-safe clipping, namespace conflicts, routine aliases,
   and generated-name differential coverage.
-- Added PostgreSQL 18 relation-ACL support for `MAINTAIN`, including
+- Added PostgreSQL 17 relation-ACL support for `MAINTAIN`, including
   version-aware `GRANT ALL` expansion and typed grant/revoke extraction.
 - Hardened migration-state validation for dependent relation, routine, foreign
   key, partition, index, trigger, policy, view, and privilege targets, with
