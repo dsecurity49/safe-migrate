@@ -54,7 +54,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dsecurity49/safe-migrate@v0.6.2
+      - uses: dsecurity49/safe-migrate@v0.7.0
         env:
           SAFE_MIGRATE_CACHE_KEY: ${{ secrets.SAFE_MIGRATE_CACHE_KEY }}
         with:
@@ -83,7 +83,7 @@ explicitly.
 In a trusted branch job, pass the checked-out file directly:
 
 ```yaml
-      - uses: dsecurity49/safe-migrate@v0.6.2
+      - uses: dsecurity49/safe-migrate@v0.7.0
         with:
           path: migrations
           config: safe-migrate.toml
@@ -107,7 +107,7 @@ separately:
           sparse-checkout-cone-mode: false
           persist-credentials: false
 
-      - uses: dsecurity49/safe-migrate@v0.6.2
+      - uses: dsecurity49/safe-migrate@v0.7.0
         with:
           path: migrations
           config: .safe-migrate-base/safe-migrate.toml
@@ -153,7 +153,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dsecurity49/safe-migrate@v0.6.2
+      - uses: dsecurity49/safe-migrate@v0.7.0
         env:
           DATABASE_URL: ${{ secrets.SAFE_MIGRATE_DATABASE_URL }}
           SAFE_MIGRATE_CACHE_KEY: ${{ secrets.SAFE_MIGRATE_CACHE_KEY }}

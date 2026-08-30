@@ -14,15 +14,28 @@ impl Ident {
         }
     }
 
-    /// Returns the lookup spelling used by the analyzer. Quoted identifiers
-    /// preserve their contents; unquoted identifiers are lowercased.
+    /// Returns the lookup spelling used by PostgreSQL and the analyzer. Quoted
+    /// identifiers preserve case, unquoted identifiers are folded, and both are
+    /// clipped to PostgreSQL's default `NAMEDATALEN - 1` byte limit without
+    /// splitting a UTF-8 code point.
     pub fn resolve(&self) -> String {
-        if self.quoted {
+        let resolved = if self.quoted {
             self.text.clone()
         } else {
-            self.text.to_lowercase()
-        }
+            self.text.to_ascii_lowercase()
+        };
+        truncate_postgres_identifier(&resolved).to_string()
     }
+}
+
+fn truncate_postgres_identifier(value: &str) -> &str {
+    const MAX_IDENTIFIER_BYTES: usize = 63;
+
+    let mut end = value.len().min(MAX_IDENTIFIER_BYTES);
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -34,6 +47,22 @@ pub struct QualifiedName {
 impl QualifiedName {
     pub fn new(schema: Option<Ident>, name: Ident) -> Self {
         Self { schema, name }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Ident;
+
+    #[test]
+    fn identifiers_follow_postgresql_byte_truncation() {
+        let ascii = "A".repeat(70);
+        assert_eq!(Ident::new(ascii, false).resolve(), "a".repeat(63));
+
+        let quoted = format!("{}suffix", "é".repeat(32));
+        let resolved = Ident::new(quoted, true).resolve();
+        assert_eq!(resolved.len(), 62);
+        assert_eq!(resolved, "é".repeat(31));
     }
 }
 

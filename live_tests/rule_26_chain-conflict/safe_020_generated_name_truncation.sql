@@ -1,0 +1,5 @@
+CREATE TABLE sm_core.phase5_table_name_that_exceeds_the_postgresql_identifier_byte_limit_for_testing (
+    phase5_column_name_that_also_exceeds_the_postgresql_identifier_byte_limit integer PRIMARY KEY,
+    phase5_unique_column_name_that_also_exceeds_the_postgresql_identifier_byte_limit integer,
+    UNIQUE (phase5_unique_column_name_that_also_exceeds_the_postgresql_identifier_byte_limit)
+);

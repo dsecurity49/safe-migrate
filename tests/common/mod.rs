@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+pub mod invariants;
+
 use safe_migrate::ast::identifiers::ObjectId;
 use safe_migrate::db::cache::DbCache;
 use safe_migrate::engine::config::Config;

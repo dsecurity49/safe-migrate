@@ -55,6 +55,28 @@ mod tests {
     }
 
     #[test]
+    fn postgres17_maintain_privilege_is_extracted_from_grant_and_revoke() {
+        for sql in [
+            "GRANT MAINTAIN ON TABLE test_table TO app_user;",
+            "REVOKE MAINTAIN ON TABLE test_table FROM app_user;",
+        ] {
+            let fact = parse_and_extract_statement(sql).expect("privilege fact");
+            let privileges = match fact {
+                StatementFact::Grant(grant) => grant.privileges,
+                StatementFact::Revoke(revoke) => revoke.privileges,
+                other => panic!("expected grant or revoke fact, got {other:?}"),
+            };
+            assert_eq!(
+                privileges,
+                crate::analysis::facts::PrivilegeSpec::List(vec![
+                    crate::analysis::facts::PrivilegeFact::Maintain,
+                ]),
+                "MAINTAIN must remain a typed relation privilege: {sql}"
+            );
+        }
+    }
+
+    #[test]
     fn test_create_table_with_columns() {
         let sql = "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255) NOT NULL);";
         let facts = parse_and_extract_statement(sql);
@@ -124,6 +146,33 @@ mod tests {
     }
 
     #[test]
+    fn create_table_preserves_table_check_and_exclusion_constraint_names() {
+        let fact = parse_and_extract_statement(
+            "CREATE TABLE reservations (
+                id integer,
+                period int4range,
+                CONSTRAINT reservations_id_check CHECK (id > 0),
+                CONSTRAINT reservations_period_excl EXCLUDE USING gist (period WITH &&)
+            );",
+        )
+        .expect("create table fact");
+
+        let StatementFact::CreateTable {
+            table_constraints, ..
+        } = fact
+        else {
+            panic!("expected create table fact");
+        };
+        assert!(matches!(
+            table_constraints.as_slice(),
+            [
+                TableConstraintFact::Check { constraint_name: Some(check) },
+                TableConstraintFact::Exclude { constraint_name: Some(exclude) },
+            ] if check == "reservations_id_check" && exclude == "reservations_period_excl"
+        ));
+    }
+
+    #[test]
     fn test_create_table_with_quoted_identifiers() {
         let sql = r#"CREATE TABLE "MyTable" ("MyColumn" INT);"#;
         let facts = parse_and_extract_statement(sql);
@@ -174,6 +223,27 @@ mod tests {
             }
             _ => panic!("expected create trigger fact"),
         }
+    }
+
+    #[test]
+    fn qualified_trigger_function_preserves_schema() {
+        let fact = parse_and_extract_statement(
+            "CREATE TRIGGER trg AFTER INSERT ON s.t1 FOR EACH ROW EXECUTE FUNCTION s.notify_func();",
+        )
+        .expect("trigger fact");
+
+        let StatementFact::CreateTrigger {
+            function: Some(function),
+            ..
+        } = fact
+        else {
+            panic!("expected qualified trigger function");
+        };
+        assert_eq!(
+            function.schema.as_ref().map(Ident::resolve),
+            Some("s".into())
+        );
+        assert_eq!(function.name.resolve(), "notify_func");
     }
 
     #[test]
@@ -491,6 +561,7 @@ mod tests {
         let AlterTableActionFact::AddUniqueConstraint {
             constraint_name,
             using_index,
+            ..
         } = &actions[0]
         else {
             panic!("expected unique constraint fact");
@@ -515,6 +586,7 @@ mod tests {
         let AlterTableActionFact::AddPrimaryKeyConstraint {
             constraint_name,
             using_index,
+            ..
         } = &actions[0]
         else {
             panic!("expected primary-key constraint fact");
@@ -549,8 +621,9 @@ mod tests {
         let facts = parse_and_extract_statement(sql);
         assert!(facts.is_some());
         match facts.unwrap() {
-            StatementFact::DropTable { name, .. } => {
-                assert_eq!(name.name.resolve(), "users");
+            StatementFact::DropTable { names, .. } => {
+                assert_eq!(names.len(), 1);
+                assert_eq!(names[0].name.resolve(), "users");
             }
             _ => panic!("Expected DropTable fact"),
         }
@@ -563,9 +636,10 @@ mod tests {
         assert!(facts.is_some());
         match facts.unwrap() {
             StatementFact::DropTable {
-                name, if_exists, ..
+                names, if_exists, ..
             } => {
-                assert_eq!(name.name.resolve(), "users");
+                assert_eq!(names.len(), 1);
+                assert_eq!(names[0].name.resolve(), "users");
                 assert!(if_exists);
             }
             _ => panic!("Expected DropTable fact"),
@@ -578,8 +652,9 @@ mod tests {
         let facts = parse_and_extract_statement(sql);
         assert!(facts.is_some());
         match facts.unwrap() {
-            StatementFact::DropTable { name, cascade, .. } => {
-                assert_eq!(name.name.resolve(), "users");
+            StatementFact::DropTable { names, cascade, .. } => {
+                assert_eq!(names.len(), 1);
+                assert_eq!(names[0].name.resolve(), "users");
                 assert!(cascade);
             }
             _ => panic!("Expected DropTable fact"),
@@ -765,6 +840,16 @@ mod tests {
 
         let facts = parse_and_extract_statement("COMMIT AND NO CHAIN;");
         assert!(matches!(facts, Some(StatementFact::CommitTransaction)));
+    }
+
+    #[test]
+    fn prepare_transaction_uses_the_typed_literal_and_decodes_quotes() {
+        let fact = parse_and_extract_statement("PREPARE TRANSACTION 'a''b';")
+            .expect("prepare transaction fact");
+        assert!(matches!(
+            fact,
+            StatementFact::PrepareTransaction { name } if name == "a'b"
+        ));
     }
 
     #[test]
@@ -961,6 +1046,36 @@ mod tests {
             assert_eq!(role.name, expected_name, "{sql}");
             assert_eq!(role.inherits, expected_inherits, "{sql}");
             assert_eq!(role.can_login, expected_login, "{sql}");
+        }
+    }
+
+    #[test]
+    fn unsupported_create_role_options_are_not_silent_noops() {
+        for sql in [
+            "CREATE ROLE privileged SUPERUSER;",
+            "CREATE USER app CREATEDB;",
+            "CREATE ROLE member IN ROLE admins;",
+        ] {
+            let parsed = SourceFile::parse(sql);
+            let statement = parsed.tree().stmts().next().expect("statement");
+            assert!(
+                AstVisitor::extract(&statement).is_none(),
+                "unmodeled role option must use the opaque engine path: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn alter_role_extracts_both_inherit_options() {
+        for (sql, expected) in [
+            ("ALTER ROLE app_user WITH INHERIT;", Some(true)),
+            ("ALTER ROLE app_user WITH NOINHERIT;", Some(false)),
+            ("ALTER ROLE app_user WITH LOGIN;", None),
+        ] {
+            let Some(StatementFact::AlterRole(role)) = parse_and_extract_statement(sql) else {
+                panic!("expected alter role fact for {sql}");
+            };
+            assert_eq!(role.inherits, expected, "{sql}");
         }
     }
 
@@ -1275,6 +1390,7 @@ mod tests {
             parse_and_extract_statement("RESET application_name;"),
             Some(StatementFact::SchemaNeutralNoop)
         );
+        assert!(parse_and_extract_statement("RESET synchronous_commit;").is_none());
         assert_eq!(
             parse_and_extract_statement("SET application_name = 'migration-check';"),
             Some(StatementFact::SchemaNeutralNoop)
@@ -1348,8 +1464,9 @@ mod tests {
         let facts = parse_and_extract_statement(sql);
         assert!(facts.is_some());
         match facts.unwrap() {
-            StatementFact::DropView { name, cascade, .. } => {
-                assert_eq!(name.name.resolve(), "user_view");
+            StatementFact::DropView { names, cascade, .. } => {
+                assert_eq!(names.len(), 1);
+                assert_eq!(names[0].name.resolve(), "user_view");
                 assert!(cascade);
             }
             _ => panic!("Expected DropView fact"),
@@ -1412,6 +1529,27 @@ mod tests {
     }
 
     #[test]
+    fn attach_partition_strategy_comes_from_typed_partition_node() {
+        // The range bound deliberately contains the words "FOR VALUES IN".
+        // Classifying from statement text would misidentify this as a LIST
+        // partition; Squawk's typed PartitionType is authoritative.
+        let fact = parse_and_extract_statement(
+            "ALTER TABLE parent ATTACH PARTITION child FOR VALUES FROM ('FOR VALUES IN') TO ('z');",
+        )
+        .expect("attach partition fact");
+        let StatementFact::AlterTable { actions, .. } = fact else {
+            panic!("expected alter table fact");
+        };
+        assert!(matches!(
+            actions.as_slice(),
+            [AlterTableActionFact::AttachPartition {
+                strategy: Some(strategy),
+                ..
+            }] if strategy == "RANGE"
+        ));
+    }
+
+    #[test]
     fn test_alter_table_detach_partition() {
         let sql = "ALTER TABLE parent DETACH PARTITION child;";
         let facts = parse_and_extract_statement(sql);
@@ -1428,6 +1566,12 @@ mod tests {
     fn test_ident_resolve_unquoted() {
         let ident = Ident::new("MyIdent".to_string(), false);
         assert_eq!(ident.resolve(), "myident");
+    }
+
+    #[test]
+    fn unquoted_identifiers_use_postgres_ascii_folding() {
+        let ident = Ident::new("ÄTable".to_string(), false);
+        assert_eq!(ident.resolve(), "Ätable");
     }
 
     #[test]
@@ -1902,34 +2046,203 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_alter_table_actions_are_not_silent_noops() {
+        let parsed = SourceFile::parse("ALTER TABLE events SET WITHOUT CLUSTER;");
+        let statement = parsed.tree().stmts().next().expect("statement");
+
+        assert!(
+            AstVisitor::extract(&statement).is_none(),
+            "parser-accepted but unmodeled ALTER TABLE actions must use the opaque engine path"
+        );
+    }
+
+    #[test]
+    fn unsupported_create_table_copy_forms_are_not_silent_noops() {
+        for sql in [
+            "CREATE TABLE copied (LIKE source);",
+            "CREATE TABLE child () INHERITS (parent);",
+            "CREATE TABLE typed OF composite_type;",
+        ] {
+            let parsed = SourceFile::parse(sql);
+            let statement = parsed.tree().stmts().next().expect("statement");
+            assert!(
+                AstVisitor::extract(&statement).is_none(),
+                "unsupported CREATE TABLE form must use the opaque engine path: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_create_table_as_transaction_lifecycle_is_not_silent() {
+        let parsed = SourceFile::parse(
+            "CREATE TEMP TABLE snapshot ON COMMIT DROP AS SELECT id FROM source;",
+        );
+        let statement = parsed.tree().stmts().next().expect("statement");
+        assert!(
+            AstVisitor::extract(&statement).is_none(),
+            "CTAS transaction lifecycle must use the opaque engine path"
+        );
+
+        let parsed =
+            SourceFile::parse("CREATE TABLE snapshot AS SELECT id FROM source WITH NO DATA;");
+        let statement = parsed.tree().stmts().next().expect("statement");
+        assert!(matches!(
+            AstVisitor::extract(&statement),
+            Some(StatementFact::CreateTable {
+                as_select: true,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn unsupported_create_view_semantics_are_not_silent_noops() {
+        for sql in [
+            "CREATE VIEW writable AS SELECT id FROM source WITH CHECK OPTION;",
+            "CREATE VIEW protected AS SELECT id FROM source WITH (security_barrier = true);",
+        ] {
+            let parsed = SourceFile::parse(sql);
+            let statement = parsed.tree().stmts().next().expect("statement");
+            assert!(
+                AstVisitor::extract(&statement).is_none(),
+                "unsupported CREATE VIEW semantics must use the opaque engine path: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_create_materialized_view_population_is_not_silent() {
+        let parsed = SourceFile::parse(
+            "CREATE MATERIALIZED VIEW snapshot AS SELECT id FROM source WITH NO DATA;",
+        );
+        let statement = parsed.tree().stmts().next().expect("statement");
+        assert!(
+            AstVisitor::extract(&statement).is_none(),
+            "unpopulated materialized views must use the opaque engine path"
+        );
+    }
+
+    #[test]
+    fn unsupported_create_domain_constraints_are_not_silent() {
+        for sql in [
+            "CREATE DOMAIN bounded AS integer CHECK (VALUE > 0);",
+            "CREATE DOMAIN collated AS text COLLATE \"C\";",
+        ] {
+            let parsed = SourceFile::parse(sql);
+            let statement = parsed.tree().stmts().next().expect("statement");
+            assert!(
+                AstVisitor::extract(&statement).is_none(),
+                "unmodeled CREATE DOMAIN semantics must use the opaque engine path: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_create_non_enum_types_are_not_silent() {
+        for sql in [
+            "CREATE TYPE address AS (street text, city text);",
+            "CREATE TYPE floatrange AS RANGE (subtype = float8);",
+        ] {
+            let parsed = SourceFile::parse(sql);
+            let statement = parsed.tree().stmts().next().expect("statement");
+            assert!(
+                AstVisitor::extract(&statement).is_none(),
+                "unmodeled CREATE TYPE semantics must use the opaque engine path: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_create_policy_semantics_are_not_silent() {
+        for sql in [
+            "CREATE POLICY scoped ON source TO app_user;",
+            "CREATE POLICY filtered ON source USING (id > 0);",
+            "CREATE POLICY checked ON source WITH CHECK (id > 0);",
+        ] {
+            let parsed = SourceFile::parse(sql);
+            let statement = parsed.tree().stmts().next().expect("statement");
+            let Some(StatementFact::CreatePolicy {
+                semantics_complete, ..
+            }) = AstVisitor::extract(&statement)
+            else {
+                panic!("expected policy fact retaining rule-visible semantics: {sql}");
+            };
+            assert!(
+                !semantics_complete,
+                "policy semantics must be marked incomplete: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn expression_indexes_preserve_index_rule_metadata() {
+        let parsed =
+            SourceFile::parse("CREATE UNIQUE INDEX normalized_name ON source ((lower(name)));");
+        let statement = parsed.tree().stmts().next().expect("statement");
+        assert!(matches!(
+            AstVisitor::extract(&statement),
+            Some(StatementFact::CreateIndex {
+                unique: true,
+                concurrently: false,
+                has_predicate: false,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn unsupported_alter_type_actions_are_not_silent_noops() {
+        for sql in [
+            "ALTER TYPE mood OWNER TO app_user;",
+            "ALTER TYPE mood ADD ATTRIBUTE label text;",
+        ] {
+            let parsed = SourceFile::parse(sql);
+            let statement = parsed.tree().stmts().next().expect("statement");
+            assert!(
+                AstVisitor::extract(&statement).is_none(),
+                "unsupported ALTER TYPE action must use the opaque engine path: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_alter_materialized_view_actions_are_not_silent_noops() {
+        let parsed = SourceFile::parse("ALTER MATERIALIZED VIEW report SET SCHEMA archive;");
+        let statement = parsed.tree().stmts().next().expect("statement");
+        assert!(
+            AstVisitor::extract(&statement).is_none(),
+            "unsupported ALTER MATERIALIZED VIEW action must use the opaque engine path"
+        );
+    }
+
+    #[test]
+    fn unsupported_alter_view_actions_are_not_silent_noops() {
+        for sql in [
+            "ALTER VIEW report ALTER COLUMN total SET DEFAULT 0;",
+            "ALTER VIEW report ALTER COLUMN total DROP DEFAULT;",
+            "ALTER VIEW report SET (security_barrier = true);",
+        ] {
+            let parsed = SourceFile::parse(sql);
+            let statement = parsed.tree().stmts().next().expect("statement");
+            assert!(
+                AstVisitor::extract(&statement).is_none(),
+                "unsupported ALTER VIEW action must use the opaque engine path: {sql}"
+            );
+        }
+    }
+
+    #[test]
     fn squawk_263_typed_view_sequence_policy_and_function_children_preserve_facts() {
         let facts = parse_and_extract(
-            "ALTER VIEW report ALTER COLUMN total SET DEFAULT 0;
-             ALTER VIEW report ALTER COLUMN total DROP DEFAULT;
-             CREATE SEQUENCE event_ids OWNED BY public.events.id;
+            "CREATE SEQUENCE event_ids OWNED BY public.events.id;
              ALTER SEQUENCE event_ids OWNED BY NONE;
              CREATE POLICY readers ON events FOR SELECT TO PUBLIC USING (true);
              CREATE FUNCTION stable_owner() RETURNS integer
                  LANGUAGE sql IMMUTABLE SECURITY DEFINER AS 'SELECT 1';",
         );
-        assert_eq!(facts.len(), 6);
-
+        assert_eq!(facts.len(), 4);
         assert!(matches!(
             &facts[0],
-            StatementFact::AlterView {
-                action: crate::analysis::facts::AlterViewAction::SetDefault { column, .. },
-                ..
-            } if column == "total"
-        ));
-        assert!(matches!(
-            &facts[1],
-            StatementFact::AlterView {
-                action: crate::analysis::facts::AlterViewAction::DropDefault { column },
-                ..
-            } if column == "total"
-        ));
-        assert!(matches!(
-            &facts[2],
             StatementFact::CreateSequence {
                 owned_by: Some((table, column)),
                 ..
@@ -1938,20 +2251,20 @@ mod tests {
                 && column == "id"
         ));
         assert!(matches!(
-            &facts[3],
+            &facts[1],
             StatementFact::AlterSequence {
                 action: crate::analysis::facts::AlterSequenceActionFact::OwnedBy(None),
                 ..
             }
         ));
         assert!(matches!(
-            &facts[4],
+            &facts[2],
             StatementFact::CreatePolicy {
                 command: crate::analysis::facts::PolicyCommand::Select,
                 ..
             }
         ));
-        let StatementFact::CreateFunction(function) = &facts[5] else {
+        let StatementFact::CreateFunction(function) = &facts[3] else {
             panic!("expected create function fact");
         };
         assert!(function.options.iter().any(|option| matches!(
@@ -1965,6 +2278,33 @@ mod tests {
             crate::analysis::facts::FuncOptionFact::Security(
                 crate::analysis::facts::SecurityKind::Definer
             )
+        )));
+    }
+
+    #[test]
+    fn function_options_use_typed_targets_and_decode_literals() {
+        let fact = parse_and_extract_statement(
+            "CREATE FUNCTION native_fn() RETURNS integer LANGUAGE c PARALLEL SAFE NOT LEAKPROOF AS 'lib''x', 'entry''x';",
+        )
+        .expect("create function fact");
+        let StatementFact::CreateFunction(function) = fact else {
+            panic!("expected create function fact");
+        };
+        assert!(function.options.iter().any(|option| matches!(
+            option,
+            crate::analysis::facts::FuncOptionFact::Parallel(value) if value == "safe"
+        )));
+        assert!(function.options.iter().any(|option| matches!(
+            option,
+            crate::analysis::facts::FuncOptionFact::Leakproof(false)
+        )));
+        assert!(function.options.iter().any(|option| matches!(
+            option,
+            crate::analysis::facts::FuncOptionFact::As {
+                obj_file: Some(obj_file),
+                link_symbol: Some(link_symbol),
+                definition: None,
+            } if obj_file == "lib'x" && link_symbol == "entry'x"
         )));
     }
 

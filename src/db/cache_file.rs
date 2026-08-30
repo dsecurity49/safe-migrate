@@ -65,6 +65,13 @@ pub fn protect_cache_bytes(cache_bytes: Vec<u8>, encryption_enabled: bool) -> Re
     Ok(envelope)
 }
 
+pub(crate) fn validate_cache_encryption_configuration(encryption_enabled: bool) -> Result<()> {
+    if encryption_enabled {
+        cipher_from_environment()?;
+    }
+    Ok(())
+}
+
 /// Returns plaintext encoded cache bytes. Encrypted files require both an
 /// enabled configuration and the environment-only key; authentication failures
 /// intentionally do not distinguish a wrong key from modified ciphertext.
@@ -188,5 +195,13 @@ mod tests {
         let error = unprotect_cache_bytes(b"plaintext cache".to_vec(), true)
             .expect_err("encryption-enabled configuration must reject plaintext caches");
         assert!(error.to_string().contains("not encrypted"));
+    }
+
+    #[test]
+    fn encryption_configuration_is_validated_without_payload_processing() {
+        let _guard = EnvironmentValueGuard::set(CACHE_KEY_ENV, "not-a-key");
+        let error = validate_cache_encryption_configuration(true).unwrap_err();
+        assert!(error.to_string().contains("64 hexadecimal characters"));
+        assert!(validate_cache_encryption_configuration(false).is_ok());
     }
 }

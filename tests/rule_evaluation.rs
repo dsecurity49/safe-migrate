@@ -505,6 +505,27 @@ mod rule_evaluation_tests {
     }
 
     #[test]
+    fn grant_option_warns_even_when_state_matrix_skips_unmodeled_grant_chain() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze("CREATE TABLE grant_option_target(id int);", &mut state)
+            .unwrap();
+
+        let findings = engine
+            .analyze(
+                "GRANT SELECT ON grant_option_target TO app_user WITH GRANT OPTION;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(findings.iter().any(|finding| {
+            finding.rule_id == "overbroad-grant" && finding.reason.contains("WITH GRANT OPTION")
+        }));
+    }
+
+    #[test]
     fn grant_all_owner_exemption_requires_every_grantee_to_own_every_table() {
         let engine = setup_engine();
         let table_id = object_id("public", "owned_table");

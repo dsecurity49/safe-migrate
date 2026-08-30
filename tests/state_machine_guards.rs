@@ -138,12 +138,25 @@ mod state_machine_guards_tests {
     }
 
     #[test]
-    fn unknown_view_in_multi_drop_does_not_preserve_known_targets() {
+    fn unknown_scoped_target_in_multi_drop_preserves_known_targets() {
         let engine = setup_engine();
         let mut cache = safe_migrate::db::cache::DbCache::new();
         cache.metadata.schemas = Some(vec!["app".to_string()]);
+        let table_id = object_id("app", "known_table");
         let view_id = object_id("app", "known_view");
         let materialized_view_id = object_id("app", "known_materialized_view");
+        cache.insert_baseline(
+            table_id.clone(),
+            RelationState::new(
+                table_id.clone(),
+                object_id("", "postgres"),
+                0,
+                None,
+                RelationKind::Table,
+                Persistence::Permanent,
+                0,
+            ),
+        );
         cache.insert_baseline(
             view_id.clone(),
             RelationState::new(
@@ -171,6 +184,12 @@ mod state_machine_guards_tests {
         let mut state = AnalysisState::new(cache);
 
         engine
+            .analyze(
+                "DROP TABLE IF EXISTS app.known_table, tenant.unknown_table;",
+                &mut state,
+            )
+            .unwrap();
+        engine
             .analyze("DROP VIEW app.known_view, tenant.unknown_view;", &mut state)
             .unwrap();
         engine
@@ -180,11 +199,96 @@ mod state_machine_guards_tests {
             )
             .unwrap();
 
-        assert!(!state.relation_is_present(&view_id));
-        assert!(!state.relation_is_present(&materialized_view_id));
+        assert!(state.relation_is_present(&table_id));
+        assert!(state.relation_is_present(&view_id));
+        assert!(state.relation_is_present(&materialized_view_id));
         assert_eq!(
             state.local.confidence,
             safe_migrate::analysis::state::Confidence::Tainted
+        );
+    }
+
+    #[test]
+    fn alter_view_rename_column_taints_instead_of_becoming_an_exact_noop() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE TABLE source (id int); CREATE VIEW v AS SELECT id FROM source;",
+                &mut state,
+            )
+            .expect("view setup should analyze");
+        engine
+            .analyze("ALTER VIEW v RENAME COLUMN id TO renamed_id;", &mut state)
+            .expect("typed but unsupported view alteration should analyze");
+
+        assert_eq!(
+            state.local.confidence,
+            safe_migrate::analysis::state::Confidence::Tainted
+        );
+    }
+
+    #[test]
+    fn all_tables_in_schema_grants_are_tainted_when_relation_scope_is_incomplete() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE SCHEMA app; CREATE TABLE app.entries (id int); GRANT SELECT ON ALL TABLES IN SCHEMA app TO reader;",
+                &mut state,
+            )
+            .expect("schema-wide grant should analyze");
+
+        assert_eq!(
+            state.local.confidence,
+            safe_migrate::analysis::state::Confidence::Tainted
+        );
+    }
+
+    #[test]
+    fn schema_cascade_skips_already_dropped_sequences_without_panicking() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE SCHEMA app; CREATE SEQUENCE app.counter; DROP SEQUENCE app.counter; DROP SCHEMA app CASCADE;",
+                &mut state,
+            )
+            .expect("schema cascade after sequence drop should analyze");
+
+        assert!(matches!(
+            state.local.schemas.get("app"),
+            Some(safe_migrate::model::schema::SchemaOverlay::Dropped)
+        ));
+    }
+
+    #[test]
+    fn conflicting_cascade_does_not_report_dependencies_that_were_not_dropped() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TABLE parent (id int PRIMARY KEY); CREATE TABLE child (id int REFERENCES parent(id));",
+                &mut state,
+            )
+            .expect("dependency setup should analyze");
+
+        let findings = engine
+            .analyze("DROP TABLE parent, missing CASCADE;", &mut state)
+            .expect("conflicting cascade should analyze");
+
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict")
+        );
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding.rule_id != "destructive-cascade")
         );
     }
 
@@ -243,7 +347,7 @@ mod state_machine_guards_tests {
         let edge_count = state
             .local
             .graph
-            .edges
+            .edges()
             .iter()
             .filter(|e| {
                 matches!(
@@ -260,7 +364,7 @@ mod state_machine_guards_tests {
             state
                 .local
                 .graph
-                .edges
+                .edges()
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
@@ -280,7 +384,7 @@ mod state_machine_guards_tests {
         let before = state
             .local
             .graph
-            .edges
+            .edges()
             .iter()
             .filter(|e| {
                 matches!(
@@ -299,7 +403,7 @@ mod state_machine_guards_tests {
             state
                 .local
                 .graph
-                .edges
+                .edges()
                 .iter()
                 .filter(|e| matches!(
                     e.kind,

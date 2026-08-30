@@ -1,7 +1,7 @@
 use crate::ast::identifiers::ObjectId;
 use crate::model::constraint::ConstraintState;
 use crate::model::function::FunctionState;
-use crate::model::relation::RelationState;
+use crate::model::relation::{RelationKind, RelationState};
 use crate::model::replication::{PublicationState, SubscriptionState};
 use crate::model::role::RoleState;
 use crate::model::schema::SchemaState;
@@ -9,7 +9,7 @@ use crate::model::sequence::SequenceState;
 use crate::model::trigger::TriggerEnableMode;
 use crate::model::types::TypeState;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForeignKeyCache {
@@ -135,7 +135,10 @@ impl DbCacheVersioned {
                 "This cache format is unsupported. Run `safe-migrate sync` to rebuild it."
                     .to_string(),
             ),
-            DbCacheVersioned::V6(c) => Ok(*c),
+            DbCacheVersioned::V6(c) => {
+                c.validate_semantics()?;
+                Ok(*c)
+            }
         }
     }
 }
@@ -175,6 +178,292 @@ impl DbCache {
     pub fn baseline_relations(&self) -> impl Iterator<Item = (&ObjectId, &RelationState)> {
         self.relations.iter()
     }
+
+    pub(crate) fn validate_semantics(&self) -> Result<(), String> {
+        for (id, relation) in &self.relations {
+            if id != &relation.id {
+                return Err(format!(
+                    "relation cache key '{}' disagrees with embedded identity '{}'",
+                    id, relation.id
+                ));
+            }
+        }
+        for (id, function) in &self.functions {
+            if id != &function.id {
+                return Err(format!(
+                    "routine cache key '{}' disagrees with embedded identity '{}'",
+                    id, function.id
+                ));
+            }
+        }
+        for (id, ty) in &self.types {
+            if id != &ty.id {
+                return Err(format!(
+                    "type cache key '{}' disagrees with embedded identity '{}'",
+                    id, ty.id
+                ));
+            }
+        }
+        for (id, role) in &self.roles {
+            if id != &role.id {
+                return Err(format!(
+                    "role cache key '{}' disagrees with embedded identity '{}'",
+                    id, role.id
+                ));
+            }
+        }
+        for (name, schema) in &self.schemas {
+            if name != &schema.name {
+                return Err(format!(
+                    "schema cache key '{}' disagrees with embedded identity '{}'",
+                    name, schema.name
+                ));
+            }
+        }
+        for (id, sequence) in &self.sequences {
+            if id != &sequence.id {
+                return Err(format!(
+                    "sequence cache key '{}' disagrees with embedded identity '{}'",
+                    id, sequence.id
+                ));
+            }
+        }
+        for (name, publication) in &self.publications {
+            if name != &publication.name {
+                return Err(format!(
+                    "publication cache key '{}' disagrees with embedded identity '{}'",
+                    name, publication.name
+                ));
+            }
+        }
+        for (name, subscription) in &self.subscriptions {
+            if name != &subscription.name {
+                return Err(format!(
+                    "subscription cache key '{}' disagrees with embedded identity '{}'",
+                    name, subscription.name
+                ));
+            }
+        }
+
+        for schema in &self.search_path {
+            if !self.schemas.is_empty() && !self.schemas.contains_key(schema) {
+                return Err(format!(
+                    "effective search path references missing schema '{}'",
+                    schema
+                ));
+            }
+        }
+
+        for (id, sequence) in &self.sequences {
+            if let Some((table_id, column_name)) = &sequence.owned_by {
+                let Some(relation) = self.relations.get(table_id) else {
+                    let omitted_owner_schema =
+                        self.metadata.schemas.as_ref().is_some_and(|schemas| {
+                            !schemas.iter().any(|schema| schema == &table_id.schema)
+                        });
+                    if omitted_owner_schema {
+                        continue;
+                    }
+                    return Err(format!(
+                        "sequence '{}' ownership references missing relation '{}'",
+                        id, table_id
+                    ));
+                };
+                if !matches!(relation.kind, RelationKind::Table) {
+                    return Err(format!(
+                        "sequence '{}' ownership target '{}' is not a table",
+                        id, table_id
+                    ));
+                }
+                if !relation.has_column(column_name) {
+                    return Err(format!(
+                        "sequence '{}' ownership references missing column '{}.{}'",
+                        id, table_id, column_name
+                    ));
+                }
+            }
+        }
+
+        for (id, role) in &self.roles {
+            for target in role.member_of.iter().chain(&role.can_set_role_to) {
+                if !self.roles.contains_key(target) {
+                    return Err(format!(
+                        "role '{}' membership references missing role '{}'",
+                        id, target
+                    ));
+                }
+            }
+        }
+
+        let mut constraint_keys = HashSet::new();
+        for constraint in &self.constraints {
+            let Some(relation) = self.relations.get(&constraint.table_id) else {
+                return Err(format!(
+                    "constraint '{}.{}' references a missing relation",
+                    constraint.table_id, constraint.name
+                ));
+            };
+            if !matches!(relation.kind, RelationKind::Table) {
+                return Err(format!(
+                    "constraint '{}.{}' targets a non-table relation",
+                    constraint.table_id, constraint.name
+                ));
+            }
+            if !constraint_keys.insert((constraint.table_id.clone(), constraint.name.clone())) {
+                return Err(format!(
+                    "constraint '{}.{}' appears more than once",
+                    constraint.table_id, constraint.name
+                ));
+            }
+        }
+
+        let mut index_ids = HashSet::new();
+        for index in &self.indexes {
+            let Some(relation) = self.relations.get(&index.table_id) else {
+                return Err(format!(
+                    "index '{}' references missing relation '{}'",
+                    index.index_id, index.table_id
+                ));
+            };
+            if !matches!(
+                relation.kind,
+                RelationKind::Table | RelationKind::MaterializedView
+            ) {
+                return Err(format!(
+                    "index '{}' targets a non-indexable relation '{}'",
+                    index.index_id, index.table_id
+                ));
+            }
+            if !index_ids.insert(index.index_id.clone()) {
+                return Err(format!("index '{}' appears more than once", index.index_id));
+            }
+        }
+
+        let mut trigger_ids = HashSet::new();
+        for trigger in &self.triggers {
+            let Some(relation) = self.relations.get(&trigger.table_id) else {
+                return Err(format!(
+                    "trigger '{}' references missing relation '{}'",
+                    trigger.trigger_id, trigger.table_id
+                ));
+            };
+            if !matches!(relation.kind, RelationKind::Table | RelationKind::View) {
+                return Err(format!(
+                    "trigger '{}' targets a relation kind that cannot have triggers",
+                    trigger.trigger_id
+                ));
+            }
+            if !trigger_ids.insert(trigger.trigger_id.clone()) {
+                return Err(format!(
+                    "trigger '{}' appears more than once",
+                    trigger.trigger_id
+                ));
+            }
+        }
+
+        let mut foreign_key_ids = HashSet::new();
+        for foreign_key in &self.foreign_keys {
+            let Some(from_relation) = self.relations.get(&foreign_key.from_table) else {
+                return Err(format!(
+                    "foreign key '{}.{}' references a missing relation",
+                    foreign_key.from_table, foreign_key.constraint_name
+                ));
+            };
+            let Some(to_relation) = self.relations.get(&foreign_key.to_table) else {
+                return Err(format!(
+                    "foreign key '{}.{}' references a missing relation",
+                    foreign_key.from_table, foreign_key.constraint_name
+                ));
+            };
+            if !matches!(from_relation.kind, RelationKind::Table)
+                || !matches!(to_relation.kind, RelationKind::Table)
+            {
+                return Err(format!(
+                    "foreign key '{}.{}' must reference tables",
+                    foreign_key.from_table, foreign_key.constraint_name
+                ));
+            }
+            if !foreign_key_ids.insert((
+                foreign_key.from_table.clone(),
+                foreign_key.constraint_name.clone(),
+            )) {
+                return Err(format!(
+                    "foreign key '{}.{}' appears more than once",
+                    foreign_key.from_table, foreign_key.constraint_name
+                ));
+            }
+            if !self.constraints.iter().any(|constraint| {
+                constraint.table_id == foreign_key.from_table
+                    && constraint.name == foreign_key.constraint_name
+                    && matches!(
+                        constraint.kind,
+                        crate::model::constraint::ConstraintKind::ForeignKey
+                    )
+            }) {
+                return Err(format!(
+                    "foreign key '{}.{}' has no matching constraint",
+                    foreign_key.from_table, foreign_key.constraint_name
+                ));
+            }
+        }
+
+        for dependency in &self.dependencies {
+            if dependency.deptype != "view" {
+                // Early Cache V6 writers included generic pg_depend rows.
+                // Hydration never consumed them, but retaining readability
+                // is part of the V6 byte-compatibility contract.
+                continue;
+            }
+            if dependency
+                .obj_schema
+                .as_deref()
+                .is_some_and(|schema| schema == "information_schema" || schema.starts_with("pg_"))
+                || dependency.ref_schema.as_deref().is_some_and(|schema| {
+                    schema == "information_schema" || schema.starts_with("pg_")
+                })
+            {
+                // Early V6 writers also retained system-catalog view
+                // dependencies while deliberately omitting those relations.
+                continue;
+            }
+            let object_id = dependency
+                .obj_schema
+                .as_deref()
+                .zip(dependency.obj_name.as_deref())
+                .map(|(schema, name)| ObjectId::new(schema, name))
+                .ok_or_else(|| "view dependency is missing its object identity".to_string())?;
+            let referenced_id = dependency
+                .ref_schema
+                .as_deref()
+                .zip(dependency.ref_name.as_deref())
+                .map(|(schema, name)| ObjectId::new(schema, name))
+                .ok_or_else(|| {
+                    format!(
+                        "view dependency for '{}' is missing its referenced identity",
+                        object_id
+                    )
+                })?;
+            let omitted_schema = |schema: Option<&str>| {
+                self.metadata
+                    .schemas
+                    .as_ref()
+                    .zip(schema)
+                    .is_some_and(|(schemas, schema)| !schemas.iter().any(|known| known == schema))
+            };
+            let object_missing = !self.relations.contains_key(&object_id);
+            let referenced_missing = !self.relations.contains_key(&referenced_id);
+            if (object_missing && !omitted_schema(dependency.obj_schema.as_deref()))
+                || (referenced_missing && !omitted_schema(dependency.ref_schema.as_deref()))
+            {
+                return Err(format!(
+                    "view dependency '{} -> {}' references a missing relation",
+                    object_id, referenced_id
+                ));
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -208,5 +497,152 @@ mod tests {
         assert_eq!(CACHE_FORMAT_VERSION, 6);
         assert_eq!(DbCacheVersioned::V6(Box::default()).format_version(), 6);
         assert_eq!(CACHE_V6_MAGIC, b"SMCACHE06");
+    }
+
+    #[test]
+    fn current_cache_rejects_mismatched_embedded_identity() {
+        let mut cache = DbCache::new();
+        cache.schemas.insert(
+            "app".to_string(),
+            SchemaState {
+                name: "other".to_string(),
+                owner: ObjectId::new("", "postgres"),
+                generation: 0,
+            },
+        );
+
+        let error = DbCacheVersioned::V6(Box::new(cache))
+            .into_cache()
+            .unwrap_err();
+        assert!(error.contains("schema cache key 'app'"));
+    }
+
+    #[test]
+    fn scoped_cache_accepts_a_dependency_to_an_omitted_schema() {
+        let view_id = ObjectId::new("app", "v");
+        let mut cache = DbCache::new();
+        cache.metadata.schemas = Some(vec!["app".to_string()]);
+        cache.insert_baseline(
+            view_id.clone(),
+            RelationState::new(
+                view_id.clone(),
+                ObjectId::new("", "postgres"),
+                0,
+                None,
+                crate::model::relation::RelationKind::View,
+                crate::model::relation::Persistence::Permanent,
+                0,
+            ),
+        );
+        cache.dependencies.push(DependencyCache {
+            classid: 0,
+            objid: 0,
+            objsubid: 0,
+            refclassid: 0,
+            refobjid: 0,
+            refobjsubid: 0,
+            deptype: "view".to_string(),
+            obj_schema: Some("app".to_string()),
+            obj_name: Some("v".to_string()),
+            ref_schema: Some("tenant".to_string()),
+            ref_name: Some("base".to_string()),
+        });
+
+        assert!(cache.validate_semantics().is_ok());
+    }
+
+    #[test]
+    fn current_cache_rejects_dangling_index_relationship() {
+        let mut cache = DbCache::new();
+        cache.indexes.push(IndexCache {
+            index_id: ObjectId::new("public", "items_idx"),
+            table_id: ObjectId::new("public", "items"),
+        });
+
+        let error = DbCacheVersioned::V6(Box::new(cache))
+            .into_cache()
+            .unwrap_err();
+        assert!(error.contains("references missing relation 'public.items'"));
+    }
+
+    #[test]
+    fn current_cache_rejects_cross_catalog_contradictions() {
+        let mut missing_search_schema = DbCache::new();
+        missing_search_schema.schemas.insert(
+            "app".to_string(),
+            SchemaState {
+                name: "app".to_string(),
+                owner: ObjectId::new("", "postgres"),
+                generation: 0,
+            },
+        );
+        assert!(
+            missing_search_schema
+                .validate_semantics()
+                .unwrap_err()
+                .contains("search path references missing schema 'public'")
+        );
+
+        let mut missing_sequence_owner = DbCache::new();
+        let sequence_id = ObjectId::new("public", "items_id_seq");
+        missing_sequence_owner.sequences.insert(
+            sequence_id.clone(),
+            SequenceState {
+                id: sequence_id,
+                owner: ObjectId::new("", "postgres"),
+                owned_by: Some((ObjectId::new("public", "items"), "id".to_string())),
+                kind: crate::model::sequence::SequenceKind::Owned,
+                generation: 0,
+            },
+        );
+        assert!(
+            missing_sequence_owner
+                .validate_semantics()
+                .unwrap_err()
+                .contains("ownership references missing relation 'public.items'")
+        );
+
+        let mut missing_membership_role = DbCache::new();
+        let role_id = ObjectId::new("", "member");
+        missing_membership_role.roles.insert(
+            role_id.clone(),
+            RoleState {
+                id: role_id,
+                can_login: true,
+                is_superuser: false,
+                member_of: vec![ObjectId::new("", "missing")],
+                can_set_role_to: Vec::new(),
+                granted_privileges: Vec::new(),
+            },
+        );
+        assert!(
+            missing_membership_role
+                .validate_semantics()
+                .unwrap_err()
+                .contains("membership references missing role")
+        );
+
+        let mut incomplete_view_dependency = DbCache::new();
+        incomplete_view_dependency
+            .dependencies
+            .push(DependencyCache {
+                classid: 0,
+                objid: 0,
+                objsubid: 0,
+                refclassid: 0,
+                refobjid: 0,
+                refobjsubid: 0,
+                deptype: "view".to_string(),
+                obj_schema: None,
+                obj_name: None,
+                ref_schema: None,
+                ref_name: None,
+            });
+        assert!(
+            incomplete_view_dependency
+                .validate_semantics()
+                .unwrap_err()
+                .contains("view dependency is missing its object identity")
+        );
     }
 }

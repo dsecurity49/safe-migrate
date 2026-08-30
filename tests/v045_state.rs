@@ -75,7 +75,7 @@ fn cache_v5_hydrates_schema_sequence_and_ownership_edge() {
         state.local.sequences.get(&sequence_id),
         Some(SequenceOverlay::Present(sequence)) if sequence.kind == SequenceKind::SerialLike
     ));
-    assert!(state.local.graph.edges.iter().any(|edge| {
+    assert!(state.local.graph.edges().iter().any(|edge| {
         edge.dependent == sequence_id
             && edge.referenced == table_id
             && matches!(

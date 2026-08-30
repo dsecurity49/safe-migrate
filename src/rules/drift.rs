@@ -59,22 +59,26 @@ impl Rule for DriftDetectionRule {
                 });
             }
             Mutation::DropTable(d) => {
-                if !d.if_exists && !pre_state.relations.contains_key(&d.id) {
-                    violations.push(Violation { source_range: None,
-                        rule_id: self.id(),
-                        operation_kind: OperationKind::DropTable,
-                        object_kind: ObjectKind::Table,
-                        object_name: d.id.to_string(),
-                        tier: self.default_tier(),
-                        reason: format!(
-                            "Migration DROPs table \"{}\" which does not exist in the production baseline",
-                            d.id
-                        ),
-                        recipe: self.recipe(),
-                        dedup_key: None,
-                                    sql: None,
-                                    fk_dependency_related: false,
-                    });
+                if !d.if_exists {
+                    for id in &d.ids {
+                        if !pre_state.relations.contains_key(id) {
+                            violations.push(Violation { source_range: None,
+                                rule_id: self.id(),
+                                operation_kind: OperationKind::DropTable,
+                                object_kind: ObjectKind::Table,
+                                object_name: id.to_string(),
+                                tier: self.default_tier(),
+                                reason: format!(
+                                    "Migration DROPs table \"{}\" which does not exist in the production baseline",
+                                    id
+                                ),
+                                recipe: self.recipe(),
+                                dedup_key: None,
+                                sql: None,
+                                fk_dependency_related: false,
+                            });
+                        }
+                    }
                 }
             }
             Mutation::AlterTable(a) => {
@@ -184,22 +188,24 @@ impl Rule for DriftDetectionRule {
                 }
             }
             Mutation::DropIndex(d) => {
-                if !d.if_exists && !pre_state.indexes.iter().any(|idx| idx.dependent == d.id) {
-                    violations.push(Violation { source_range: None,
+                for id in &d.ids {
+                    if !d.if_exists && !pre_state.indexes.iter().any(|idx| idx.dependent == *id) {
+                        violations.push(Violation { source_range: None,
                         rule_id: self.id(),
                         operation_kind: OperationKind::DropIndex,
                         object_kind: ObjectKind::Index,
-                        object_name: d.id.to_string(),
+                        object_name: id.to_string(),
                         tier: self.default_tier(),
                         reason: format!(
                             "Migration DROPs index \"{}\" which does not exist in the production baseline",
-                            d.id
+                            id
                         ),
                         recipe: self.recipe(),
                         dedup_key: None,
                                     sql: None,
                                     fk_dependency_related: false,
-                    });
+                        });
+                    }
                 }
             }
             Mutation::DropDomain(d) => {

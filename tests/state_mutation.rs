@@ -2,9 +2,13 @@ mod common;
 
 mod state_mutation_tests {
     use crate::common::*;
+    use safe_migrate::analysis::facts::FunctionSigFact;
     use safe_migrate::analysis::graph::{DependencyEdge, DependencyGraph, DependencyKind};
-    use safe_migrate::analysis::state::Confidence;
-    use safe_migrate::ast::identifiers::ObjectId;
+    use safe_migrate::analysis::mutations::{
+        DropAggregateMutation, DropFunctionMutation, DropProcedureMutation, Mutation,
+    };
+    use safe_migrate::analysis::state::{Confidence, MutationResult};
+    use safe_migrate::ast::identifiers::{Ident, ObjectId, QualifiedName};
     use safe_migrate::db::cache::{DbCache, DependencyCache};
     use safe_migrate::model::constraint::ConstraintKind;
     use safe_migrate::model::function::{
@@ -14,6 +18,7 @@ mod state_mutation_tests {
         Persistence, RelationKind, RelationOverlay, RelationState,
     };
     use safe_migrate::model::role::RoleState;
+    use safe_migrate::model::schema::SchemaState;
     use safe_migrate::model::sequence::SequenceOverlay;
     use safe_migrate::model::types::{TypeKind, TypeOverlay, TypeState};
 
@@ -37,6 +42,263 @@ mod state_mutation_tests {
         } else {
             panic!("relation should be present");
         }
+    }
+
+    #[test]
+    fn missing_alter_table_does_not_leave_an_implicit_sequence() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let violations = engine
+            .analyze("ALTER TABLE missing ADD COLUMN id serial;", &mut state)
+            .unwrap();
+
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict")
+        );
+        assert!(state.local.sequences.is_empty());
+        assert!(!state.relation_is_present(&object_id("public", "missing")));
+    }
+
+    #[test]
+    fn dropping_a_child_table_removes_its_outgoing_dependency_edges() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE TABLE parent (id int primary key); CREATE TABLE child (id int, parent_id int REFERENCES parent(id)); CREATE INDEX child_idx ON child(id); DROP TABLE child;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(!state.relation_is_present(&object_id("public", "child")));
+        assert!(!state.local.graph.edges().iter().any(|edge| {
+            edge.dependent == object_id("public", "child")
+                || (matches!(
+                    edge.kind,
+                    safe_migrate::analysis::graph::DependencyKind::IndexOnRelation { .. }
+                ) && edge.referenced == object_id("public", "child"))
+        }));
+    }
+
+    #[test]
+    fn dropping_a_table_removes_publication_and_partition_edges() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE TABLE parent (id int) PARTITION BY LIST (id); CREATE TABLE child PARTITION OF parent FOR VALUES IN (1); CREATE PUBLICATION pub FOR TABLE child; DROP TABLE parent CASCADE;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(state.local.graph.edges().iter().all(|edge| {
+            edge.dependent != object_id("public", "parent")
+                && edge.dependent != object_id("public", "child")
+                && edge.referenced != object_id("public", "parent")
+                && edge.referenced != object_id("public", "child")
+        }));
+    }
+
+    #[test]
+    fn replacing_a_view_replaces_its_dependency_edges() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE TABLE first (id int); CREATE TABLE second (id int); CREATE VIEW v AS SELECT * FROM first; CREATE OR REPLACE VIEW v AS SELECT * FROM second;",
+                &mut state,
+            )
+            .unwrap();
+
+        let dependencies: Vec<_> = state
+            .local
+            .graph
+            .edges()
+            .iter()
+            .filter(|edge| {
+                matches!(
+                    edge.kind,
+                    safe_migrate::analysis::graph::DependencyKind::ViewDependency { .. }
+                ) && edge.dependent == object_id("public", "v")
+            })
+            .map(|edge| edge.referenced.clone())
+            .collect();
+        assert_eq!(dependencies, vec![object_id("public", "second")]);
+    }
+
+    #[test]
+    fn replacing_a_view_preserves_relation_metadata() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE TABLE base (id int); CREATE VIEW v AS SELECT * FROM base; CREATE FUNCTION notify_view() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END; $$; CREATE TRIGGER v_insert INSTEAD OF INSERT ON v FOR EACH ROW EXECUTE FUNCTION notify_view(); GRANT SELECT ON v TO app_user; CREATE OR REPLACE VIEW v AS SELECT id FROM base;",
+                &mut state,
+            )
+            .unwrap();
+
+        let Some(RelationOverlay::Present(view)) =
+            state.local.relations.get(&object_id("public", "v"))
+        else {
+            panic!("view should remain present");
+        };
+        assert!(view.triggers.contains("v_insert"));
+        assert!(
+            view.privileges
+                .grants
+                .contains_key(&ObjectId::new("", "app_user"))
+        );
+    }
+
+    #[test]
+    fn dropping_a_view_honors_restrict_and_cascade_dependencies() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE TABLE source (id int); CREATE VIEW base_view AS SELECT * FROM source; CREATE VIEW dependent_view AS SELECT * FROM base_view;",
+                &mut state,
+            )
+            .unwrap();
+        let restricted = engine.analyze("DROP VIEW base_view;", &mut state).unwrap();
+        assert!(
+            restricted
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict")
+        );
+        assert!(state.relation_is_present(&object_id("public", "base_view")));
+        assert!(state.relation_is_present(&object_id("public", "dependent_view")));
+
+        engine
+            .analyze("DROP VIEW base_view CASCADE;", &mut state)
+            .unwrap();
+        assert!(!state.relation_is_present(&object_id("public", "base_view")));
+        assert!(!state.relation_is_present(&object_id("public", "dependent_view")));
+    }
+
+    #[test]
+    fn dependent_object_creates_and_type_alterations_require_existing_targets() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        for sql in [
+            "CREATE INDEX missing_idx ON missing(id);",
+            "CREATE TRIGGER missing_trigger BEFORE INSERT ON missing FOR EACH ROW EXECUTE FUNCTION missing_function();",
+            "REFRESH MATERIALIZED VIEW missing_view;",
+            "ALTER TYPE missing_type ADD VALUE 'new';",
+        ] {
+            let violations = engine.analyze(sql, &mut state).unwrap();
+            assert!(
+                violations
+                    .iter()
+                    .any(|violation| violation.rule_id == "chain-conflict"),
+                "expected target validation for {sql}"
+            );
+        }
+        assert!(state.local.graph.edges().is_empty());
+        assert!(state.local.types.is_empty());
+    }
+
+    #[test]
+    fn sequence_ownership_requires_a_table_target() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze("CREATE VIEW occupied (id) AS SELECT 1;", &mut state)
+            .unwrap();
+        let violations = engine
+            .analyze("CREATE SEQUENCE owned OWNED BY occupied.id;", &mut state)
+            .unwrap();
+
+        assert!(violations.iter().any(|violation| {
+            violation.rule_id == "chain-conflict" && violation.reason.contains("not a table")
+        }));
+        assert!(
+            !state
+                .local
+                .sequences
+                .contains_key(&object_id("public", "owned"))
+        );
+    }
+
+    #[test]
+    fn views_using_sequence_functions_do_not_treat_function_names_as_relations() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let violations = engine
+            .analyze(
+                "CREATE SEQUENCE source_seq; CREATE VIEW sequence_view AS SELECT nextval('source_seq'::regclass);",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict"),
+            "sequence-backed view should be accepted: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn policies_require_existing_table_targets() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze("CREATE VIEW protected_view AS SELECT 1 AS id;", &mut state)
+            .unwrap();
+        let violations = engine
+            .analyze(
+                "CREATE POLICY protected_policy ON protected_view USING (true);",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(violations.iter().any(|violation| {
+            violation.rule_id == "chain-conflict" && violation.reason.contains("is not a table")
+        }));
+        let Some(RelationOverlay::Present(view)) = state
+            .local
+            .relations
+            .get(&object_id("public", "protected_view"))
+        else {
+            panic!("view should remain present");
+        };
+        assert!(view.policies.is_empty());
+    }
+
+    #[test]
+    fn dropping_a_type_with_modeled_dependents_requires_cascade() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE TYPE status AS ENUM ('new'); CREATE TABLE jobs (state status);",
+                &mut state,
+            )
+            .unwrap();
+        let violations = engine.analyze("DROP TYPE status;", &mut state).unwrap();
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict")
+        );
+        assert!(matches!(
+            state.local.types.get(&object_id("public", "status")),
+            Some(TypeOverlay::Present(_))
+        ));
     }
 
     #[test]
@@ -80,16 +342,191 @@ mod state_mutation_tests {
         cache.dependencies.push(dependency(&table_id));
 
         let state = safe_migrate::AnalysisState::new(cache);
-        assert!(!state.local.graph.edges.iter().any(|edge| {
+        assert!(!state.local.graph.edges().iter().any(|edge| {
             matches!(edge.kind, DependencyKind::ViewDependency { .. })
                 && edge.dependent == view_id
                 && edge.referenced == view_id
         }));
-        assert!(state.local.graph.edges.iter().any(|edge| {
+        assert!(state.local.graph.edges().iter().any(|edge| {
             matches!(edge.kind, DependencyKind::ViewDependency { .. })
                 && edge.dependent == view_id
                 && edge.referenced == table_id
         }));
+    }
+
+    #[test]
+    fn scoped_view_dependencies_keep_edges_to_omitted_schemas() {
+        let view_id = object_id("app", "v");
+        let external_table = object_id("tenant", "base");
+        let mut cache = DbCache::new();
+        cache.metadata.schemas = Some(vec!["app".to_string()]);
+        cache.insert_baseline(
+            view_id.clone(),
+            RelationState::new(
+                view_id.clone(),
+                object_id("public", "owner"),
+                0,
+                None,
+                RelationKind::View,
+                Persistence::Permanent,
+                0,
+            ),
+        );
+        cache.dependencies.push(DependencyCache {
+            classid: 0,
+            objid: 0,
+            objsubid: 0,
+            refclassid: 0,
+            refobjid: 0,
+            refobjsubid: 0,
+            deptype: "view".to_string(),
+            obj_schema: Some(view_id.schema.clone()),
+            obj_name: Some(view_id.name.clone()),
+            ref_schema: Some(external_table.schema.clone()),
+            ref_name: Some(external_table.name.clone()),
+        });
+
+        let state = safe_migrate::AnalysisState::new(cache);
+        assert!(state.local.graph.edges().iter().any(|edge| {
+            matches!(edge.kind, DependencyKind::ViewDependency { .. })
+                && edge.dependent == view_id
+                && edge.referenced == external_table
+        }));
+    }
+
+    #[test]
+    fn scoped_view_dependencies_keep_omitted_dependents() {
+        let in_scope_table = object_id("app", "base");
+        let omitted_view = object_id("tenant", "v");
+        let mut cache = DbCache::new();
+        cache.metadata.schemas = Some(vec!["app".to_string()]);
+        cache.insert_baseline(
+            in_scope_table.clone(),
+            RelationState::new(
+                in_scope_table.clone(),
+                object_id("public", "owner"),
+                0,
+                None,
+                RelationKind::Table,
+                Persistence::Permanent,
+                0,
+            ),
+        );
+        cache.dependencies.push(DependencyCache {
+            classid: 0,
+            objid: 0,
+            objsubid: 0,
+            refclassid: 0,
+            refobjid: 0,
+            refobjsubid: 0,
+            deptype: "view".to_string(),
+            obj_schema: Some(omitted_view.schema.clone()),
+            obj_name: Some(omitted_view.name.clone()),
+            ref_schema: Some(in_scope_table.schema.clone()),
+            ref_name: Some(in_scope_table.name.clone()),
+        });
+
+        let state = safe_migrate::AnalysisState::new(cache);
+        assert!(state.local.graph.edges().iter().any(|edge| {
+            matches!(edge.kind, DependencyKind::ViewDependency { .. })
+                && edge.dependent == omitted_view
+                && edge.referenced == in_scope_table
+        }));
+    }
+
+    #[test]
+    fn cascades_taint_when_a_scoped_dependent_is_omitted() {
+        let in_scope_table = object_id("app", "base");
+        let omitted_view = object_id("tenant", "v");
+        let mut cache = DbCache::new();
+        cache.metadata.schemas = Some(vec!["app".to_string()]);
+        cache.insert_baseline(
+            in_scope_table.clone(),
+            RelationState::new(
+                in_scope_table.clone(),
+                object_id("public", "owner"),
+                0,
+                None,
+                RelationKind::Table,
+                Persistence::Permanent,
+                0,
+            ),
+        );
+        cache.dependencies.push(DependencyCache {
+            classid: 0,
+            objid: 0,
+            objsubid: 0,
+            refclassid: 0,
+            refobjid: 0,
+            refobjsubid: 0,
+            deptype: "view".to_string(),
+            obj_schema: Some(omitted_view.schema),
+            obj_name: Some(omitted_view.name),
+            ref_schema: Some(in_scope_table.schema.clone()),
+            ref_name: Some(in_scope_table.name.clone()),
+        });
+
+        let engine = setup_engine();
+        let mut state = safe_migrate::AnalysisState::new(cache);
+        let violations = engine
+            .analyze("DROP TABLE app.base CASCADE;", &mut state)
+            .unwrap();
+
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict"),
+            "known cascade should execute: {violations:?}"
+        );
+        assert_eq!(state.local.confidence, Confidence::Tainted);
+        assert!(!state.relation_is_present(&in_scope_table));
+    }
+
+    #[test]
+    fn non_view_catalog_dependencies_do_not_enter_the_modeled_graph() {
+        let view_id = object_id("public", "v");
+        let table_id = object_id("public", "t");
+        let mut cache = DbCache::new();
+        for (id, kind) in [
+            (view_id.clone(), RelationKind::View),
+            (table_id.clone(), RelationKind::Table),
+        ] {
+            cache.insert_baseline(
+                id.clone(),
+                RelationState::new(
+                    id,
+                    object_id("public", "owner"),
+                    0,
+                    None,
+                    kind,
+                    Persistence::Permanent,
+                    0,
+                ),
+            );
+        }
+        cache.dependencies.push(DependencyCache {
+            classid: 0,
+            objid: 0,
+            objsubid: 0,
+            refclassid: 0,
+            refobjid: 0,
+            refobjsubid: 0,
+            deptype: "n".to_string(),
+            obj_schema: Some(view_id.schema.clone()),
+            obj_name: Some(view_id.name.clone()),
+            ref_schema: Some(table_id.schema.clone()),
+            ref_name: Some(table_id.name.clone()),
+        });
+
+        let state = safe_migrate::AnalysisState::new(cache);
+        assert!(
+            !state
+                .local
+                .graph
+                .edges()
+                .iter()
+                .any(|edge| { edge.dependent == view_id && edge.referenced == table_id })
+        );
     }
 
     #[test]
@@ -230,6 +667,73 @@ mod state_mutation_tests {
     }
 
     #[test]
+    fn cascade_drop_removes_foreign_key_metadata_from_surviving_tables() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE TABLE parent (id integer PRIMARY KEY);
+                 CREATE TABLE child (parent_id integer);
+                 ALTER TABLE child ADD CONSTRAINT child_parent_fk
+                    FOREIGN KEY (parent_id) REFERENCES parent(id);
+                 DROP TABLE parent CASCADE;",
+                &mut state,
+            )
+            .unwrap();
+
+        let child = object_id("public", "child");
+        assert!(state.relation_is_present(&child));
+        assert!(
+            !state
+                .local
+                .constraints
+                .contains_key(&(child.clone(), "child_parent_fk".to_string())),
+            "the surviving table must not retain a dropped foreign key"
+        );
+        assert!(!state.local.graph.edges().iter().any(|edge| {
+            matches!(
+                edge.kind,
+                DependencyKind::ForeignKey {
+                    constraint_name: Some(ref name),
+                    ..
+                } if name == "child_parent_fk"
+            )
+        }));
+    }
+
+    #[test]
+    fn schema_cascade_cleans_cross_schema_view_and_foreign_key_state() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE SCHEMA base;
+                 CREATE SCHEMA app;
+                 CREATE TABLE base.parent (id integer PRIMARY KEY);
+                 CREATE TABLE app.child (parent_id integer);
+                 ALTER TABLE app.child ADD CONSTRAINT child_parent_fk
+                    FOREIGN KEY (parent_id) REFERENCES base.parent(id);
+                 CREATE VIEW app.parent_view AS SELECT * FROM base.parent;
+                 DROP SCHEMA base CASCADE;",
+                &mut state,
+            )
+            .unwrap();
+
+        let child = object_id("app", "child");
+        let view = object_id("app", "parent_view");
+        assert!(state.relation_is_present(&child));
+        assert!(!state.relation_is_present(&view));
+        assert!(
+            !state
+                .local
+                .constraints
+                .contains_key(&(child, "child_parent_fk".to_string()))
+        );
+    }
+
+    #[test]
     fn failed_drop_table_keeps_owned_triggers_for_later_dependency_checks() {
         let engine = setup_engine();
         let mut state = setup_state();
@@ -271,7 +775,7 @@ mod state_mutation_tests {
             state
                 .local
                 .graph
-                .edges
+                .edges()
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
@@ -303,18 +807,48 @@ mod state_mutation_tests {
         let b = object_id("public", "b");
         let child = object_id("public", "new_child");
         let mut graph = DependencyGraph::new();
-        graph.edges.push(DependencyEdge::new(
+        graph.add_edge(DependencyEdge::new(
             a.clone(),
             b.clone(),
             DependencyKind::PartitionOf,
         ));
-        graph.edges.push(DependencyEdge::new(
+        graph.add_edge(DependencyEdge::new(
             b,
             a.clone(),
             DependencyKind::PartitionOf,
         ));
 
         assert!(graph.check_partition_cycle(&a, &child));
+    }
+
+    #[test]
+    fn partition_operations_reject_unpartitioned_or_unattached_targets() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let violations = engine
+            .analyze(
+                "CREATE TABLE plain (id integer);
+                 CREATE TABLE child (id integer);
+                 CREATE TABLE invalid PARTITION OF plain FOR VALUES IN (1);
+                 ALTER TABLE plain ATTACH PARTITION child FOR VALUES IN (1);
+                 ALTER TABLE plain DETACH PARTITION child;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(!state.relation_is_present(&object_id("public", "invalid")));
+        assert!(!state.local.graph.edges().iter().any(|edge| {
+            matches!(edge.kind, DependencyKind::PartitionOf)
+                && edge.dependent == object_id("public", "child")
+        }));
+        assert_eq!(
+            violations
+                .iter()
+                .filter(|violation| violation.rule_id == "chain-conflict")
+                .count(),
+            3,
+            "every invalid partition operation should be rejected: {violations:?}"
+        );
     }
 
     #[test]
@@ -333,7 +867,7 @@ mod state_mutation_tests {
             state
                 .local
                 .graph
-                .edges
+                .edges()
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
@@ -345,7 +879,7 @@ mod state_mutation_tests {
             !state
                 .local
                 .graph
-                .edges
+                .edges()
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
@@ -362,7 +896,7 @@ mod state_mutation_tests {
 
         engine
             .analyze(
-                "CREATE TABLE p(id int); CREATE TABLE c(p_id int); ALTER TABLE c ADD CONSTRAINT fk FOREIGN KEY (p_id) REFERENCES p(id);",
+                "CREATE TABLE p(id int PRIMARY KEY); CREATE TABLE c(p_id int); ALTER TABLE c ADD CONSTRAINT fk FOREIGN KEY (p_id) REFERENCES p(id);",
                 &mut state,
             )
             .unwrap();
@@ -371,7 +905,7 @@ mod state_mutation_tests {
             state
                 .local
                 .graph
-                .edges
+                .edges()
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
@@ -388,7 +922,7 @@ mod state_mutation_tests {
             state
                 .local
                 .graph
-                .edges
+                .edges()
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
@@ -415,7 +949,7 @@ mod state_mutation_tests {
             state
                 .local
                 .graph
-                .edges
+                .edges()
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
@@ -430,7 +964,7 @@ mod state_mutation_tests {
             state
                 .local
                 .graph
-                .edges
+                .edges()
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
@@ -457,7 +991,7 @@ mod state_mutation_tests {
             state
                 .local
                 .graph
-                .edges
+                .edges()
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
@@ -484,7 +1018,7 @@ mod state_mutation_tests {
             state
                 .local
                 .graph
-                .edges
+                .edges()
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
@@ -503,7 +1037,7 @@ mod state_mutation_tests {
             state
                 .local
                 .graph
-                .edges
+                .edges()
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
@@ -512,6 +1046,120 @@ mod state_mutation_tests {
                 .count()
                 == 0
         );
+    }
+
+    #[test]
+    fn dropping_owned_sequence_cascade_removes_dependent_nextval_default() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE TABLE t(id int, other_id int); CREATE SEQUENCE s OWNED BY t.id; CREATE SEQUENCE other OWNED BY t.other_id; ALTER TABLE t ALTER COLUMN id SET DEFAULT nextval('s'); ALTER TABLE t ALTER COLUMN other_id SET DEFAULT nextval('other');",
+                &mut state,
+            )
+            .unwrap();
+
+        engine
+            .analyze("DROP SEQUENCE s CASCADE;", &mut state)
+            .unwrap();
+
+        let Some(RelationOverlay::Present(table)) = state.get_relation(&object_id("public", "t"))
+        else {
+            panic!("table should remain present");
+        };
+        assert_eq!(
+            table
+                .get_column("id")
+                .and_then(|column| column.default.as_ref()),
+            None
+        );
+        assert!(
+            table
+                .get_column("other_id")
+                .and_then(|column| column.default.as_ref())
+                .is_some()
+        );
+        assert_eq!(
+            table
+                .get_column("id")
+                .and_then(|column| column.default_expr_text.as_deref()),
+            None
+        );
+    }
+
+    #[test]
+    fn dropping_schema_cascade_removes_cross_schema_sequence_defaults() {
+        let engine = setup_engine();
+        let mut cache = {
+            let mut cache = DbCache::new();
+            cache.metadata.source_lock_timeout_ms = 1_000;
+            cache.metadata.source_statement_timeout_ms = 10_000;
+            cache
+        };
+        let name = "public";
+        cache.schemas.insert(
+            name.to_string(),
+            SchemaState {
+                name: name.to_string(),
+                owner: object_id("", "postgres"),
+                generation: 0,
+            },
+        );
+        let mut state = safe_migrate::AnalysisState::new(cache);
+
+        engine
+            .analyze(
+                "CREATE SCHEMA seq_schema; CREATE TABLE t(id int); CREATE SEQUENCE seq_schema.s; ALTER TABLE t ALTER COLUMN id SET DEFAULT nextval('seq_schema.s');",
+                &mut state,
+            )
+            .unwrap();
+
+        engine
+            .analyze("DROP SCHEMA seq_schema CASCADE;", &mut state)
+            .unwrap();
+
+        assert!(matches!(
+            state.local.schemas.get("seq_schema"),
+            Some(safe_migrate::model::schema::SchemaOverlay::Dropped)
+        ));
+
+        assert!(matches!(
+            state.local.sequences.get(&object_id("seq_schema", "s")),
+            Some(SequenceOverlay::Dropped)
+        ));
+
+        let Some(RelationOverlay::Present(table)) = state.get_relation(&object_id("public", "t"))
+        else {
+            panic!("table should remain present");
+        };
+        assert_eq!(
+            table
+                .get_column("id")
+                .and_then(|column| column.default.as_ref()),
+            None
+        );
+    }
+
+    #[test]
+    fn create_table_as_select_taints_unknown_columns_and_skips_later_column_edits() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze("CREATE TABLE copied AS SELECT 1 AS id;", &mut state)
+            .unwrap();
+        assert_eq!(state.local.confidence, Confidence::Tainted);
+
+        let violations = engine
+            .analyze("ALTER TABLE copied DROP COLUMN id;", &mut state)
+            .unwrap();
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict")
+        );
+        assert!(state.relation_is_present(&object_id("public", "copied")));
     }
 
     #[test]
@@ -1337,10 +1985,16 @@ mod state_mutation_tests {
 
         engine
             .analyze(
-                "CREATE TABLE t(id int); CREATE POLICY p ON t FOR SELECT USING(true); CREATE TRIGGER tr BEFORE INSERT ON t EXECUTE FUNCTION f();",
+                "CREATE TABLE t(id int); CREATE POLICY p ON t FOR SELECT USING(true); CREATE FUNCTION f() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END; $$; CREATE TRIGGER tr BEFORE INSERT ON t EXECUTE FUNCTION f();",
                 &mut state,
             )
             .unwrap();
+
+        assert_eq!(
+            state.local.confidence,
+            Confidence::Tainted,
+            "policy expressions are retained for rule evaluation but are not modeled in relation state"
+        );
 
         if let Some(RelationOverlay::Present(r)) = state.get_relation(&object_id("public", "t")) {
             assert!(r.policies.contains("p"));
@@ -1355,6 +2009,32 @@ mod state_mutation_tests {
             assert!(!r.policies.contains("p"));
             assert!(!r.triggers.contains("tr"));
         }
+    }
+
+    #[test]
+    fn instead_of_trigger_on_view_is_tracked() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let violations = engine
+            .analyze(
+                "CREATE TABLE base(id int); CREATE VIEW v AS SELECT * FROM base; CREATE FUNCTION f() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END; $$; CREATE TRIGGER tr INSTEAD OF INSERT ON v FOR EACH ROW EXECUTE FUNCTION f();",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict"),
+            "view trigger target should be valid: {violations:?}"
+        );
+        let Some(RelationOverlay::Present(view)) =
+            state.local.relations.get(&object_id("public", "v"))
+        else {
+            panic!("view should remain present");
+        };
+        assert!(view.triggers.contains("tr"));
     }
 
     #[test]
@@ -1430,7 +2110,7 @@ mod state_mutation_tests {
             .unwrap();
         assert!(state.local.publications.contains_key("pub"));
 
-        let deps = &state.local.graph.edges;
+        let deps = &state.local.graph.edges();
         assert!(
             deps.iter()
                 .any(|d| matches!(&d.kind, DependencyKind::PublicationIncludes { publication_name } if publication_name == "pub") && d.dependent == object_id("public", "t1"))
@@ -1640,7 +2320,7 @@ mod state_mutation_tests {
             )
             .unwrap();
 
-        assert!(state.local.graph.edges.iter().any(|edge| {
+        assert!(state.local.graph.edges().iter().any(|edge| {
             edge.dependent == object_id("public", "indexed_table_id_idx")
                 && edge.referenced == object_id("public", "indexed_table")
                 && matches!(
@@ -1774,7 +2454,7 @@ mod state_mutation_tests {
             state
                 .local
                 .graph
-                .edges
+                .edges()
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
@@ -1802,7 +2482,7 @@ mod state_mutation_tests {
             )
             .unwrap();
 
-        assert!(!state.local.graph.edges.iter().any(|edge| {
+        assert!(!state.local.graph.edges().iter().any(|edge| {
             matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
                 && edge.referenced == object_id("public", "mv")
         }));
@@ -1821,7 +2501,7 @@ mod state_mutation_tests {
     }
 
     #[test]
-    fn creating_a_new_function_is_exact_when_v6_proves_the_routine_name_is_free() {
+    fn creating_a_new_function_taints_unmodeled_body_state() {
         let engine = setup_engine();
         let mut state = setup_state();
 
@@ -1832,7 +2512,10 @@ mod state_mutation_tests {
             )
             .unwrap();
 
-        assert_eq!(state.local.confidence, Confidence::Exact);
+        // FunctionState tracks identity and selected options, but not the
+        // SQL body/dependency graph represented by `AS`; retaining Exact here
+        // would overstate what later dependency checks can prove.
+        assert_eq!(state.local.confidence, Confidence::Tainted);
         assert!(matches!(
             state.local.functions.get(&object_id("public", "work()")),
             Some(FunctionOverlay::Present(function))
@@ -1902,7 +2585,11 @@ mod state_mutation_tests {
                 .get(&object_id("public", "combined(integer)")),
             Some(FunctionOverlay::Dropped)
         ));
-        assert_eq!(state.local.confidence, Confidence::Exact);
+        assert_eq!(
+            state.local.confidence,
+            Confidence::Tainted,
+            "aggregate implementation details are intentionally not modeled"
+        );
 
         engine
             .analyze(
@@ -2073,6 +2760,120 @@ mod state_mutation_tests {
     }
 
     #[test]
+    fn routine_drop_lookup_outcomes_preserve_guarded_and_unknown_semantics() {
+        fn signature(schema: &str) -> FunctionSigFact {
+            FunctionSigFact {
+                name: QualifiedName::new(
+                    Some(Ident::new(schema, false)),
+                    Ident::new("work", false),
+                ),
+                params: vec!["integer".into()],
+            }
+        }
+
+        fn routine(kind: RoutineKind) -> FunctionState {
+            let id = object_id("public", "work(integer)");
+            FunctionState {
+                id,
+                routine_kind: kind,
+                arg_types: vec!["integer".into()],
+                arg_type_ids: Vec::new(),
+                return_type: "void".into(),
+                return_type_id: None,
+                volatility: Volatility::Volatile,
+                language: "sql".into(),
+                security: SecurityMode::Invoker,
+            }
+        }
+
+        let function_drop = |schema: &str, if_exists| {
+            Mutation::DropFunction(DropFunctionMutation {
+                signatures: vec![signature(schema)],
+                if_exists,
+                cascade: false,
+            })
+        };
+        let procedure_drop = |schema: &str, if_exists| {
+            Mutation::DropProcedure(DropProcedureMutation {
+                signatures: vec![signature(schema)],
+                if_exists,
+                cascade: false,
+            })
+        };
+        let aggregate_drop = |schema: &str, if_exists| {
+            Mutation::DropAggregate(DropAggregateMutation {
+                signatures: vec![signature(schema)],
+                if_exists,
+                cascade: false,
+            })
+        };
+
+        for (kind, drop) in [
+            (RoutineKind::Procedure, function_drop("public", true)),
+            (RoutineKind::Function, procedure_drop("public", true)),
+        ] {
+            let mut cache = DbCache::new();
+            cache
+                .functions
+                .insert(object_id("public", "work(integer)"), routine(kind));
+            let mut state = safe_migrate::AnalysisState::new(cache);
+            assert!(matches!(
+                state.apply(&drop, None),
+                MutationResult::Conflict { .. }
+            ));
+            assert_eq!(state.local.confidence, Confidence::Exact);
+        }
+
+        let mut wrong_kind_cache = DbCache::new();
+        wrong_kind_cache.functions.insert(
+            object_id("public", "work(integer)"),
+            routine(RoutineKind::Function),
+        );
+        let mut wrong_kind_state = safe_migrate::AnalysisState::new(wrong_kind_cache);
+        assert!(matches!(
+            wrong_kind_state.apply(&aggregate_drop("public", true), None),
+            MutationResult::Conflict { .. }
+        ));
+        assert_eq!(wrong_kind_state.local.confidence, Confidence::Exact);
+
+        for drop in [
+            function_drop("public", true),
+            procedure_drop("public", true),
+            aggregate_drop("public", true),
+        ] {
+            let mut state = setup_state();
+            assert_eq!(state.apply(&drop, None), MutationResult::Skipped);
+            assert_eq!(state.local.confidence, Confidence::Exact);
+        }
+
+        for drop in [
+            function_drop("tenant", false),
+            procedure_drop("tenant", false),
+            aggregate_drop("tenant", false),
+        ] {
+            let mut cache = DbCache::new();
+            cache.metadata.schemas = Some(vec!["public".into()]);
+            let mut state = safe_migrate::AnalysisState::new(cache);
+            assert_eq!(state.apply(&drop, None), MutationResult::Skipped);
+            assert_eq!(state.local.confidence, Confidence::Tainted);
+        }
+
+        let mut cache = DbCache::new();
+        cache.metadata.schemas = Some(vec!["public".into()]);
+        let mut state = safe_migrate::AnalysisState::new(cache);
+        assert_eq!(
+            state.apply(&function_drop("tenant", true), None),
+            MutationResult::Skipped
+        );
+        assert_eq!(state.local.confidence, Confidence::Tainted);
+        assert_eq!(
+            state.apply(&aggregate_drop("tenant", true), None),
+            MutationResult::Skipped
+        );
+        assert_eq!(state.local.confidence, Confidence::Tainted);
+    }
+
+    #[test]
     fn procedure_kind_and_lifecycle_are_enforced_within_the_chain() {
         let engine = setup_engine();
         let mut state = setup_state();
@@ -2159,7 +2960,11 @@ mod state_mutation_tests {
                 && violation.reason.contains("missing_pub")
                 && violation.reason.contains("does not exist")
         }));
-        assert_eq!(state.local.confidence, Confidence::Exact);
+        assert_eq!(
+            state.local.confidence,
+            Confidence::Tainted,
+            "FOR ALL TABLES publication state depends on catalog-wide inheritance knowledge"
+        );
     }
 
     #[test]
@@ -2280,7 +3085,7 @@ mod state_mutation_tests {
             panic!("expected explicit publication scope");
         };
         assert_eq!(objects.len(), 2);
-        assert!(state.local.graph.edges.iter().any(|edge| {
+        assert!(state.local.graph.edges().iter().any(|edge| {
             matches!(
                 &edge.kind,
                 DependencyKind::PublicationIncludes { publication_name }
@@ -2863,6 +3668,7 @@ mod state_mutation_tests {
             .expect("foreign key should be recorded");
         assert_eq!(constraint.kind, ConstraintKind::ForeignKey);
         assert!(!constraint.validated);
+        assert!(state.local.pending_validation.contains(&key));
 
         engine
             .analyze(
@@ -2871,6 +3677,7 @@ mod state_mutation_tests {
             )
             .unwrap();
         assert!(state.local.constraints[&key].validated);
+        assert!(!state.local.pending_validation.contains(&key));
     }
 
     #[test]
@@ -2930,6 +3737,55 @@ mod state_mutation_tests {
             .expect("table unique constraint should be recorded");
         assert_eq!(unique.kind, ConstraintKind::Unique);
         assert!(unique.validated);
+    }
+
+    #[test]
+    fn create_table_records_inline_foreign_key_check_and_exclusion_constraints() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TABLE parent (id integer PRIMARY KEY);
+                 CREATE TABLE reservations (
+                    id integer,
+                    parent_id integer,
+                    period int4range,
+                    CONSTRAINT reservations_parent_fk
+                        FOREIGN KEY (parent_id) REFERENCES parent(id),
+                    CONSTRAINT reservations_id_check CHECK (id > 0),
+                    CONSTRAINT reservations_period_excl
+                        EXCLUDE USING gist (period WITH &&)
+                 );",
+                &mut state,
+            )
+            .unwrap();
+
+        let table = object_id("public", "reservations");
+        for (name, kind) in [
+            ("reservations_parent_fk", ConstraintKind::ForeignKey),
+            ("reservations_id_check", ConstraintKind::Check),
+            ("reservations_period_excl", ConstraintKind::Exclusion),
+        ] {
+            assert_eq!(
+                state
+                    .local
+                    .constraints
+                    .get(&(table.clone(), name.to_string()))
+                    .map(|constraint| constraint.kind),
+                Some(kind),
+                "missing inline constraint {name}"
+            );
+        }
+        assert!(state.local.graph.edges().iter().any(|edge| {
+            edge.dependent == table
+                && matches!(
+                    edge.kind,
+                    DependencyKind::ForeignKey {
+                        constraint_name: Some(ref name),
+                        ..
+                    } if name == "reservations_parent_fk"
+                )
+        }));
     }
 
     #[test]

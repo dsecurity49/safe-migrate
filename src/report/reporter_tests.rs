@@ -69,7 +69,8 @@ mod tests {
             statement_index: Some(1),
         };
 
-        let markdown = Reporter::markdown_report(&[finding], &Confidence::Exact);
+        let markdown =
+            Reporter::markdown_report(std::slice::from_ref(&finding), &Confidence::Exact);
         assert!(markdown.starts_with("# safe-migrate report\n"));
         assert!(markdown.contains("**Verdict:** CAUTIOUS"));
         assert!(markdown.contains("### WARN — test-rule (`test-rule`)"));
@@ -99,6 +100,54 @@ mod tests {
         assert_eq!(report["violations"][0]["impact"], "locking");
         assert_eq!(report["violations"][0]["statement_index"], 1);
         assert!(report["violations"][0]["rule_summary"].is_string());
+    }
+
+    #[test]
+    fn representative_reports_match_complete_goldens() {
+        let finding = ReportFinding {
+            violation: make_violation("test-rule", ViolationTier::Tier2, "needs review"),
+            location: Some(SourceLocation {
+                file: "migrations/001.sql".to_string(),
+                line: 3,
+                column: 5,
+            }),
+            statement_index: Some(1),
+        };
+
+        let json = Reporter::json_report_with_locations(
+            std::slice::from_ref(&finding),
+            &Confidence::Exact,
+        );
+        let expected_json: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/golden/representative-report.json"
+        ))
+        .expect("JSON golden must be valid");
+        assert_eq!(json, expected_json);
+
+        let markdown =
+            Reporter::markdown_report(std::slice::from_ref(&finding), &Confidence::Exact);
+        assert_eq!(
+            markdown,
+            include_str!("../../tests/golden/representative-report.md")
+        );
+
+        let canonical_json = serde_json::to_string_pretty(&json).expect("serialize report");
+        for _ in 0..32 {
+            assert_eq!(
+                serde_json::to_string_pretty(&Reporter::json_report_with_locations(
+                    std::slice::from_ref(&finding),
+                    &Confidence::Exact,
+                ))
+                .expect("serialize repeated report"),
+                canonical_json,
+                "JSON output must be byte-stable across repeated runs"
+            );
+            assert_eq!(
+                Reporter::markdown_report(std::slice::from_ref(&finding), &Confidence::Exact),
+                markdown,
+                "Markdown output must be byte-stable across repeated runs"
+            );
+        }
     }
 
     #[test]

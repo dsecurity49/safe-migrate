@@ -535,7 +535,7 @@ mod phase10_bug_fixes_and_sorting_tests {
             state
                 .local
                 .graph
-                .edges
+                .edges()
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
@@ -548,7 +548,7 @@ mod phase10_bug_fixes_and_sorting_tests {
             state
                 .local
                 .graph
-                .edges
+                .edges()
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
@@ -568,7 +568,7 @@ mod phase10_bug_fixes_and_sorting_tests {
             state
                 .local
                 .graph
-                .edges
+                .edges()
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
@@ -581,7 +581,7 @@ mod phase10_bug_fixes_and_sorting_tests {
             state
                 .local
                 .graph
-                .edges
+                .edges()
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
@@ -940,7 +940,7 @@ mod phase10_bug_fixes_and_sorting_tests {
     // Bug 17 — SetType/SetDefault on nonexistent column
     // ─────────────────────────────────────────────
     #[test]
-    fn test_bug017_set_type_on_nonexistent_column_taints_confidence() {
+    fn test_bug017_set_type_on_nonexistent_column_is_a_conflict() {
         let engine = setup_engine();
         let mut state = setup_state();
 
@@ -948,22 +948,21 @@ mod phase10_bug_fixes_and_sorting_tests {
             .analyze("CREATE TABLE t(id int);", &mut state)
             .unwrap();
 
-        let _v = engine
+        let violations = engine
             .analyze(
                 "ALTER TABLE t ALTER COLUMN nonexistent_col SET DATA TYPE text;",
                 &mut state,
             )
             .unwrap();
 
-        assert_eq!(
-            state.local.confidence,
-            safe_migrate::analysis::state::Confidence::Tainted,
-            "Confidence should be Tainted when SET TYPE on a nonexistent column"
-        );
+        assert!(violations.iter().any(|violation| {
+            violation.rule_id == "chain-conflict" && violation.reason.contains("nonexistent_col")
+        }));
+        assert_eq!(state.local.confidence, Confidence::Exact);
     }
 
     #[test]
-    fn test_bug017_set_default_on_nonexistent_column_taints_confidence() {
+    fn test_bug017_set_default_on_nonexistent_column_is_a_conflict() {
         let engine = setup_engine();
         let mut state = setup_state();
 
@@ -971,18 +970,17 @@ mod phase10_bug_fixes_and_sorting_tests {
             .analyze("CREATE TABLE t(id int);", &mut state)
             .unwrap();
 
-        let _v = engine
+        let violations = engine
             .analyze(
                 "ALTER TABLE t ALTER COLUMN nonexistent_col SET DEFAULT 42;",
                 &mut state,
             )
             .unwrap();
 
-        assert_eq!(
-            state.local.confidence,
-            safe_migrate::analysis::state::Confidence::Tainted,
-            "Confidence should be Tainted when SET DEFAULT on a nonexistent column"
-        );
+        assert!(violations.iter().any(|violation| {
+            violation.rule_id == "chain-conflict" && violation.reason.contains("nonexistent_col")
+        }));
+        assert_eq!(state.local.confidence, Confidence::Exact);
     }
 
     #[test]
@@ -1050,6 +1048,7 @@ mod phase10_bug_fixes_and_sorting_tests {
         assert!(matrix.has_privilege(&role, Privilege::Truncate));
         assert!(matrix.has_privilege(&role, Privilege::References));
         assert!(matrix.has_privilege(&role, Privilege::Trigger));
+        assert!(matrix.has_privilege(&role, Privilege::Maintain));
 
         // 3. has_privilege for All itself should also work
         assert!(matrix.has_privilege(&role, Privilege::All));
@@ -1060,6 +1059,37 @@ mod phase10_bug_fixes_and_sorting_tests {
         matrix.revoke(&role, &revoke_all);
         assert!(!matrix.has_privilege(&role, Privilege::Select));
         assert!(!matrix.has_privilege(&role, Privilege::All));
+    }
+
+    #[test]
+    fn postgres17_all_grant_tracks_maintain_without_leaking_to_older_versions() {
+        use safe_migrate::model::relation::{Privilege, RelationOverlay};
+
+        let engine = setup_engine();
+        for (version, expected) in [(170_000, true), (160_000, false)] {
+            let mut cache = cache_with_table("public", "t_large", None);
+            cache.pg_version_num = Some(version);
+            let mut state = AnalysisState::new(cache);
+            engine
+                .analyze("GRANT ALL ON TABLE t_large TO app_user;", &mut state)
+                .expect("GRANT ALL should analyze");
+
+            let Some(RelationOverlay::Present(relation)) =
+                state.local.relations.get(&object_id("public", "t_large"))
+            else {
+                panic!("baseline relation should remain present");
+            };
+            let grantee = object_id("", "app_user");
+            assert_eq!(
+                relation
+                    .privileges
+                    .grants
+                    .get(&grantee)
+                    .is_some_and(|privileges| privileges.contains(&Privilege::Maintain)),
+                expected,
+                "PG {version} GRANT ALL MAINTAIN expansion mismatch"
+            );
+        }
     }
     // ─────────────────────────────────────────────
     // Bug 14 — Directive parsing tolerates whitespace
@@ -1273,8 +1303,7 @@ mod phase10_bug_fixes_and_sorting_tests {
     }
 
     #[test]
-    fn test_bug018_drop_schema_no_cascade_ok_when_empty() {
-        // 1a inverse: DROP SCHEMA without CASCADE must NOT conflict when schema is empty.
+    fn drop_schema_without_cascade_taints_when_emptiness_is_not_complete_evidence() {
         let engine = setup_engine();
         let mut state = setup_state();
 
@@ -1284,12 +1313,12 @@ mod phase10_bug_fixes_and_sorting_tests {
 
         let violations = engine.analyze("DROP SCHEMA myschema;", &mut state).unwrap();
 
-        let conflict = violations.iter().find(|v| v.rule_id == "chain-conflict");
         assert!(
-            conflict.is_none(),
-            "Expected no chain-conflict for DROP SCHEMA on empty schema, got: {:?}",
-            violations
+            !violations.iter().any(|v| v.rule_id == "chain-conflict"),
+            "an apparently empty schema is uncertain rather than a conflict: {violations:?}"
         );
+        assert!(state.local.schemas.contains_key("myschema"));
+        assert_eq!(state.local.confidence, Confidence::Tainted);
     }
 
     #[test]

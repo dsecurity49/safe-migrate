@@ -23,26 +23,24 @@ impl Rule for CascadingDropRule {
         &self,
         mutation: &Mutation,
         result: &MutationResult,
-        _pre_state: &crate::analysis::state::PreState,
+        pre_state: &crate::analysis::state::PreState,
         state: &AnalysisState,
         _config: &Config,
         cascade_closure: Option<&CascadeResult>,
     ) -> Vec<Violation> {
-        if *result == MutationResult::Skipped {
-            return vec![];
-        }
-
         let mut violations = Vec::new();
 
-        if let Mutation::DropTable(drop) = mutation
+        if !matches!(result, MutationResult::Conflict { .. })
+            && let Mutation::DropTable(drop) = mutation
             && drop.cascade
             && let Some(closure) = cascade_closure
         {
             let mut affects_baseline = false;
             let mut has_fk_pulled = false;
 
+            let roots = drop.ids.iter().collect::<std::collections::HashSet<_>>();
             for rel_id in &closure.dropped_relations {
-                if rel_id != &drop.id && state.baseline_relations.contains(rel_id) {
+                if !roots.contains(rel_id) && state.baseline_relations.contains(rel_id) {
                     affects_baseline = true;
                     if state.baseline_fk_dependencies.contains(rel_id) {
                         has_fk_pulled = true;
@@ -52,7 +50,7 @@ impl Rule for CascadingDropRule {
 
             if !affects_baseline {
                 for (from_table, cname) in &closure.dropped_constraints {
-                    if state
+                    if pre_state
                         .baseline_foreign_keys
                         .contains(&(from_table.clone(), cname.clone()))
                     {
@@ -71,7 +69,11 @@ impl Rule for CascadingDropRule {
             if affects_baseline {
                 let mut reason = format!(
                     "DROP TABLE {} CASCADE silently destroys pre-existing database dependencies",
-                    drop.id
+                    drop.ids
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 );
                 if has_fk_pulled {
                     reason.push_str(
@@ -83,7 +85,12 @@ impl Rule for CascadingDropRule {
                     rule_id: self.id(),
                     operation_kind: OperationKind::DropTable,
                     object_kind: ObjectKind::Table,
-                    object_name: drop.id.to_string(),
+                    object_name: drop
+                        .ids
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", "),
                     tier: self.default_tier(),
                     reason,
                     recipe: self.recipe(),
@@ -398,7 +405,26 @@ impl Rule for ReversibilityRule {
         config: &Config,
         _cascade_closure: Option<&CascadeResult>,
     ) -> Vec<Violation> {
-        if *result != MutationResult::Applied {
+        let skipped_known_drop_column = *result == MutationResult::Skipped
+            && matches!(
+                mutation,
+                Mutation::AlterTable(crate::analysis::mutations::AlterTable {
+                    id: _,
+                    action: AlterTableActionMutation::DropColumn { .. },
+                })
+            )
+            && matches!(
+                mutation,
+                Mutation::AlterTable(alter)
+                    if pre_state.relations.get(&alter.id).is_some_and(|relation| {
+                        matches!(
+                            &alter.action,
+                            AlterTableActionMutation::DropColumn { name, .. }
+                                if relation.has_column(name)
+                        )
+                    })
+            );
+        if *result != MutationResult::Applied && !skipped_known_drop_column {
             return vec![];
         }
 
@@ -446,10 +472,10 @@ impl Rule for ReversibilityRule {
                     .and_then(|r| r.estimated_rows)
                     .unwrap_or(config.default_rows)
             } else if let Mutation::DropTable(d) = mutation {
-                pre_state
-                    .relations
-                    .get(&d.id)
-                    .and_then(|r| r.estimated_rows)
+                d.ids
+                    .iter()
+                    .filter_map(|id| pre_state.relations.get(id).and_then(|r| r.estimated_rows))
+                    .max()
                     .unwrap_or(config.default_rows)
             } else {
                 config.default_rows
@@ -485,7 +511,11 @@ impl Rule for ReversibilityRule {
                 Mutation::DropTable(d) => (
                     OperationKind::DropTable,
                     ObjectKind::Table,
-                    d.id.to_string(),
+                    d.ids
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", "),
                 ),
                 Mutation::DropDatabase(d) => (
                     OperationKind::DropDatabase,
@@ -831,7 +861,20 @@ impl Rule for TypeChangeRewriteRule {
         config: &Config,
         _cascade_closure: Option<&CascadeResult>,
     ) -> Vec<Violation> {
-        if *result == MutationResult::Skipped {
+        // A skipped type change against a present relation can mean that the
+        // baseline did not expose enough column/type evidence to mutate state.
+        // Keep the rewrite warning conservative in that case; silently
+        // dropping it would turn an uncertain ACCESS EXCLUSIVE operation into
+        // a false clean result. Other skipped mutations remain non-events.
+        if *result == MutationResult::Skipped
+            && !matches!(
+                mutation,
+                Mutation::AlterTable(crate::analysis::mutations::AlterTable {
+                    action: AlterTableActionMutation::SetType { .. },
+                    ..
+                })
+            )
+        {
             return vec![];
         }
 

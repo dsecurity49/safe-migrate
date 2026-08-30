@@ -96,10 +96,8 @@
       "enabled": true,
       "fixtures": [
         "001_drop_table.sql",
-        "002_drop_column.sql",
         "004_drop_table_if_exists.sql",
         "005_drop_cascade.sql",
-        "006_drop_column_if_exists.sql",
         "safe_001_rename_col.sql",
         "safe_002_add_col.sql",
         "safe_003_widen_varchar.sql",
@@ -110,6 +108,14 @@
         "safe_009_add_index.sql"
       ],
       "excluded_fixtures": [
+        {
+          "fixture": "002_drop_column.sql",
+          "reason": "Cache V6 does not retain all foreign-key, index, view, and expression dependency column lists. The simulator conservatively skips a drop when those dependencies are unknown; exact column-aware replay is a 0.8.0 cache-evidence TODO."
+        },
+        {
+          "fixture": "006_drop_column_if_exists.sql",
+          "reason": "IF EXISTS only suppresses an absent-column error; it does not make Cache V6's unknown foreign-key, index, view, and expression column dependencies exact. Exact column-aware replay is a 0.8.0 cache-evidence TODO."
+        },
         {
           "fixture": "safe_005_create_table.sql",
           "reason": "The cumulative canonical baseline contains sm_core.t for rule_18 drop/idempotency cases, so PostgreSQL correctly rejects this unqualified duplicate CREATE TABLE."
@@ -1161,16 +1167,18 @@
         "safe_002_drop_not_null.sql",
         "safe_003_create_table.sql",
         "safe_004_add_column.sql",
-        "safe_005_drop_column.sql",
         "safe_006_rename_column.sql",
         "safe_007_create_index.sql",
         "safe_008_drop_constraint.sql",
         "safe_009_alter_set_default.sql",
         "safe_011_foreign_key_not_valid.sql",
-        "safe_012_foreign_key_validate_later.sql",
-        "safe_013_unique_using_index.sql"
+        "safe_012_foreign_key_validate_later.sql"
       ],
       "excluded_fixtures": [
+        {
+          "fixture": "safe_005_drop_column.sql",
+          "reason": "Cache V6 foreign-key edges do not retain conkey/confkey column lists. The simulator conservatively skips a drop when dependency columns are unknown; exact column-aware replay is a 0.8.0 cache-evidence TODO."
+        },
         {
           "fixture": "006_set_storage.sql",
           "reason": "Column storage strategy is not synchronized or normalized by the differential harness."
@@ -1182,6 +1190,10 @@
         {
           "fixture": "safe_010_drop_index.sql",
           "reason": "DROP INDEX IF EXISTS idx is a no-op against the canonical baseline."
+        },
+        {
+          "fixture": "safe_013_unique_using_index.sql",
+          "reason": "Cache V6 index edges do not retain uniqueness, predicate, or eligibility metadata. The simulator conservatively skips USING INDEX until the 0.8.0 cache-evidence TODO is proved."
         }
       ],
       "schemas": [
@@ -1222,10 +1234,6 @@
           "relations",
           "columns"
         ],
-        "safe_005_drop_column.sql": [
-          "relations",
-          "columns"
-        ],
         "safe_006_rename_column.sql": [
           "relations",
           "columns"
@@ -1247,9 +1255,6 @@
         "safe_012_foreign_key_validate_later.sql": [
           "constraints",
           "foreign_keys"
-        ],
-        "safe_013_unique_using_index.sql": [
-          "constraints"
         ]
       },
       "required_relations": [
@@ -1693,7 +1698,6 @@
       "rule_dir": "rule_26_chain-conflict",
       "enabled": true,
       "fixtures": [
-        "004_conflict.sql",
         "010_conflict.sql",
         "011_missing_fk_source_column.sql",
         "012_rename_enum_missing_label.sql",
@@ -1702,6 +1706,7 @@
         "015_rename_value_missing_type.sql",
         "016_missing_set_role.sql",
         "017_unauthorized_set_role.sql",
+        "018_identifier_truncation_collision.sql",
         "safe_001_chain.sql",
         "safe_001_create_table.sql",
         "safe_002_create_index.sql",
@@ -1716,7 +1721,12 @@
         "safe_013_quoted_session_authorization.sql",
         "safe_014_session_authorization_rollback.sql",
         "safe_015_session_authorization_default.sql",
-        "safe_016_transitive_set_role_membership.sql"
+        "safe_016_transitive_set_role_membership.sql",
+        "safe_017_relation_namespace_resolution.sql",
+        "safe_018_type_namespace_resolution.sql",
+        "safe_019_routine_namespace_resolution.sql",
+        "safe_020_generated_name_truncation.sql",
+        "safe_021_routine_type_aliases.sql"
       ],
       "fixture_transactional": {
         "safe_010_role_transaction_semantics.sql": false,
@@ -1755,9 +1765,17 @@
         "017_unauthorized_set_role.sql": {
           "sqlstate": "42501",
           "simulator_rule": "chain-conflict"
+        },
+        "018_identifier_truncation_collision.sql": {
+          "sqlstate": "42P07",
+          "simulator_rule": "chain-conflict"
         }
       },
       "excluded_fixtures": [
+        {
+          "fixture": "004_conflict.sql",
+          "reason": "The chain drops a column whose dependency-column evidence is absent from Cache V6; the simulator conservatively retains it after a skipped transition. Exact column-aware replay is a 0.8.0 cache-evidence TODO."
+        },
         {
           "fixture": "001_chain.sql",
           "reason": "PostgreSQL rejects the second incompatible duplicate column definition, leaving no committed resulting state."
@@ -1821,17 +1839,19 @@
         "sm_audit",
         "sm_analytics",
         "app_user",
-        "sm_role_quote"
+        "sm_role_quote",
+        "sm_ns_early",
+        "sm_ns_late",
+        "sm_type_early",
+        "sm_type_late",
+        "sm_routine_early",
+        "sm_routine_late"
       ],
       "scope": [
         "relations",
         "columns"
       ],
       "fixture_scopes": {
-        "004_conflict.sql": [
-          "relations",
-          "columns"
-        ],
         "010_conflict.sql": [
           "relations",
           "columns"
@@ -1873,6 +1893,30 @@
         ],
         "safe_016_transitive_set_role_membership.sql": [
           "relations"
+        ],
+        "safe_017_relation_namespace_resolution.sql": [
+          "schemas",
+          "relations",
+          "columns",
+          "types"
+        ],
+        "safe_018_type_namespace_resolution.sql": [
+          "schemas",
+          "relations",
+          "columns",
+          "types"
+        ],
+        "safe_019_routine_namespace_resolution.sql": [
+          "schemas",
+          "functions"
+        ],
+        "safe_020_generated_name_truncation.sql": [
+          "relations",
+          "columns",
+          "constraints"
+        ],
+        "safe_021_routine_type_aliases.sql": [
+          "functions"
         ]
       },
       "required_relations": [

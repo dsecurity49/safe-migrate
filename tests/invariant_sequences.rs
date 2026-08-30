@@ -1,262 +1,11 @@
 mod common;
 
 mod invariant_sequences {
+    use crate::common::invariants::{assert_cache_invariants, assert_state_invariants};
     use crate::common::{cache_with_table, object_id, setup_engine, setup_state};
-    use safe_migrate::analysis::graph::DependencyKind;
     use safe_migrate::analysis::state::AnalysisState;
-    use safe_migrate::analysis::transaction::TransactionFrameKind;
-    use safe_migrate::db::cache::DbCache;
-    use safe_migrate::model::function::FunctionOverlay;
     use safe_migrate::model::relation::RelationOverlay;
-    use safe_migrate::model::replication::{PublicationOverlay, SubscriptionOverlay};
-    use safe_migrate::model::role::RoleOverlay;
     use safe_migrate::model::schema::SchemaOverlay;
-    use safe_migrate::model::sequence::SequenceOverlay;
-    use safe_migrate::model::trigger::TriggerOverlay;
-    use safe_migrate::model::types::TypeOverlay;
-    use std::collections::HashSet;
-
-    fn assert_cache_invariants(cache: &DbCache) {
-        for (id, relation) in &cache.relations {
-            assert_eq!(
-                id, &relation.id,
-                "cached relation map key disagrees with state"
-            );
-        }
-        for (id, ty) in &cache.types {
-            assert_eq!(id, &ty.id, "cached type map key disagrees with state");
-        }
-        for (id, function) in &cache.functions {
-            assert_eq!(
-                id, &function.id,
-                "cached function map key disagrees with state"
-            );
-        }
-        for (id, sequence) in &cache.sequences {
-            assert_eq!(
-                id, &sequence.id,
-                "cached sequence map key disagrees with state"
-            );
-            if let Some((table_id, _)) = &sequence.owned_by {
-                assert!(
-                    cache.relations.contains_key(table_id),
-                    "cached owned sequence must reference a cached relation"
-                );
-            }
-        }
-        for (id, role) in &cache.roles {
-            assert_eq!(id, &role.id, "cached role map key disagrees with state");
-        }
-        for (name, schema) in &cache.schemas {
-            assert_eq!(
-                name, &schema.name,
-                "cached schema map key disagrees with state"
-            );
-        }
-        for (name, publication) in &cache.publications {
-            assert_eq!(
-                name, &publication.name,
-                "cached publication map key disagrees with state"
-            );
-        }
-        for (name, subscription) in &cache.subscriptions {
-            assert_eq!(
-                name, &subscription.name,
-                "cached subscription map key disagrees with state"
-            );
-        }
-
-        let mut constraint_keys = HashSet::new();
-        for constraint in &cache.constraints {
-            assert!(
-                cache.relations.contains_key(&constraint.table_id),
-                "cached constraint must reference a cached relation"
-            );
-            assert!(
-                constraint_keys.insert((constraint.table_id.clone(), constraint.name.clone())),
-                "cached constraints must have unique table/name identities"
-            );
-        }
-        for index in &cache.indexes {
-            assert!(
-                cache.relations.contains_key(&index.table_id),
-                "cached index must reference a cached relation"
-            );
-        }
-        for trigger in &cache.triggers {
-            assert!(
-                cache.relations.contains_key(&trigger.table_id),
-                "cached trigger must reference a cached relation"
-            );
-        }
-        for foreign_key in &cache.foreign_keys {
-            assert!(
-                cache.relations.contains_key(&foreign_key.from_table)
-                    && cache.relations.contains_key(&foreign_key.to_table),
-                "cached foreign key must reference cached relations"
-            );
-        }
-    }
-
-    fn assert_state_invariants(state: &AnalysisState) {
-        let local = &state.local;
-
-        for (name, schema) in &local.schemas {
-            if let SchemaOverlay::Present(schema) = schema {
-                assert_eq!(name, &schema.name, "schema map key disagrees with state");
-            }
-        }
-        for (id, relation) in &local.relations {
-            if let RelationOverlay::Present(relation) = relation {
-                assert_eq!(id, &relation.id, "relation map key disagrees with state");
-            }
-        }
-        for (id, ty) in &local.types {
-            if let TypeOverlay::Present(ty) = ty {
-                assert_eq!(id, &ty.id, "type map key disagrees with state");
-            }
-        }
-        for (id, function) in &local.functions {
-            if let FunctionOverlay::Present(function) = function {
-                assert_eq!(id, &function.id, "function map key disagrees with state");
-            }
-        }
-        for (id, sequence) in &local.sequences {
-            if let SequenceOverlay::Present(sequence) = sequence {
-                assert_eq!(id, &sequence.id, "sequence map key disagrees with state");
-            }
-        }
-        for (id, role) in &local.roles {
-            if let RoleOverlay::Present(role) = role {
-                assert_eq!(id, &role.id, "role map key disagrees with state");
-            }
-        }
-        for (name, publication) in &local.publications {
-            if let PublicationOverlay::Present(publication) = publication {
-                assert_eq!(
-                    name, &publication.name,
-                    "publication map key disagrees with state"
-                );
-            }
-        }
-        for (name, subscription) in &local.subscriptions {
-            if let SubscriptionOverlay::Present(subscription) = subscription {
-                assert_eq!(
-                    name, &subscription.name,
-                    "subscription map key disagrees with state"
-                );
-            }
-        }
-        for (id, trigger) in &local.triggers {
-            if let TriggerOverlay::Present(trigger) = trigger {
-                assert_eq!(id, &trigger.id, "trigger map key disagrees with state");
-                assert!(
-                    !matches!(
-                        local.relations.get(&trigger.table_id),
-                        Some(RelationOverlay::Dropped)
-                    ),
-                    "present trigger belongs to a dropped relation"
-                );
-            }
-        }
-        for ((table_id, name), constraint) in &local.constraints {
-            assert_eq!(
-                table_id, &constraint.table_id,
-                "constraint table key disagrees with state"
-            );
-            assert_eq!(
-                name, &constraint.name,
-                "constraint name key disagrees with state"
-            );
-            assert!(
-                !matches!(
-                    local.relations.get(table_id),
-                    Some(RelationOverlay::Dropped)
-                ),
-                "constraint belongs to a dropped relation"
-            );
-        }
-        for key in &local.pending_validation {
-            let constraint = local
-                .constraints
-                .get(key)
-                .expect("pending validation must reference a known constraint");
-            assert!(
-                !constraint.validated,
-                "validated constraint cannot be pending"
-            );
-        }
-
-        for edge in &local.graph.edges {
-            match &edge.kind {
-                DependencyKind::ForeignKey {
-                    constraint_name: Some(name),
-                    ..
-                } => assert!(
-                    local
-                        .constraints
-                        .contains_key(&(edge.dependent.clone(), name.clone())),
-                    "foreign-key edge must have a matching constraint"
-                ),
-                DependencyKind::ViewDependency { .. } => {
-                    assert!(matches!(
-                        local.relations.get(&edge.dependent),
-                        Some(RelationOverlay::Present(relation))
-                            if matches!(
-                                relation.kind,
-                                safe_migrate::model::relation::RelationKind::View
-                                    | safe_migrate::model::relation::RelationKind::MaterializedView
-                            )
-                    ));
-                    assert!(!matches!(
-                        local.relations.get(&edge.referenced),
-                        Some(RelationOverlay::Dropped)
-                    ));
-                }
-                DependencyKind::SequenceOwnedBy { column } => assert!(matches!(
-                    local.sequences.get(&edge.dependent),
-                    Some(SequenceOverlay::Present(sequence))
-                        if sequence.owned_by == Some((edge.referenced.clone(), column.clone()))
-                )),
-                DependencyKind::TriggerOnTable { trigger_id, .. } => assert!(matches!(
-                    local.triggers.get(trigger_id),
-                    Some(TriggerOverlay::Present(trigger)) if trigger.table_id == edge.referenced
-                )),
-                DependencyKind::PublicationIncludes { publication_name } => assert!(matches!(
-                    local.publications.get(publication_name),
-                    Some(PublicationOverlay::Present(publication)) if publication.name == *publication_name
-                )),
-                DependencyKind::IndexOnRelation { .. }
-                | DependencyKind::RenameTo
-                | DependencyKind::PartitionOf
-                | DependencyKind::ColumnGeneratedFrom { .. }
-                | DependencyKind::ForeignKey {
-                    constraint_name: None,
-                    ..
-                } => {}
-            }
-        }
-
-        if local.transactions.is_empty() {
-            assert!(
-                !local.transaction_aborted,
-                "an aborted transaction must retain its root frame"
-            );
-        } else {
-            assert!(matches!(
-                local.transactions.first().map(|frame| &frame.kind),
-                Some(TransactionFrameKind::Root)
-            ));
-            assert!(
-                local
-                    .transactions
-                    .iter()
-                    .skip(1)
-                    .all(|frame| matches!(frame.kind, TransactionFrameKind::Savepoint { .. })),
-                "only the first transaction frame may be the root"
-            );
-        }
-    }
 
     fn analyze_and_validate(state: &mut AnalysisState, sql: &str) {
         let findings = setup_engine()
@@ -321,5 +70,218 @@ mod invariant_sequences {
             state.local.schemas.get("app"),
             Some(SchemaOverlay::Present(schema)) if schema.name == "app"
         ));
+    }
+
+    #[test]
+    fn deterministic_generated_sequences_restore_every_modeled_family() {
+        let mut state = setup_state();
+
+        for sequence in 0..16 {
+            let schema = format!("generated_{sequence}");
+            for sql in [
+                "BEGIN;".to_string(),
+                format!("CREATE SCHEMA {schema};"),
+                format!("CREATE TABLE {schema}.items (id bigint PRIMARY KEY, value text);"),
+                format!("CREATE INDEX items_value_idx ON {schema}.items(value);"),
+                format!("CREATE VIEW {schema}.item_ids AS SELECT id FROM {schema}.items;"),
+                format!("CREATE TYPE {schema}.item_state AS ENUM ('new', 'ready');"),
+                format!("CREATE SEQUENCE {schema}.item_counter;"),
+                format!(
+                    "CREATE FUNCTION {schema}.item_identity(value integer) RETURNS integer LANGUAGE SQL IMMUTABLE AS $$ SELECT value $$;"
+                ),
+                format!(
+                    "CREATE FUNCTION {schema}.item_rank() RETURNS bigint AS 'window_row_number' LANGUAGE internal WINDOW;"
+                ),
+                format!(
+                    "CREATE PROCEDURE {schema}.refresh_items() LANGUAGE SQL AS $$ SELECT 1 $$;"
+                ),
+                format!(
+                    "CREATE AGGREGATE {schema}.sum_items(integer) (SFUNC = int4pl, STYPE = integer, INITCOND = '0');"
+                ),
+                "SAVEPOINT generated_checkpoint;".to_string(),
+                format!("ALTER TABLE {schema}.items RENAME TO renamed_items;"),
+                format!("DROP VIEW {schema}.item_ids;"),
+                "ROLLBACK TO SAVEPOINT generated_checkpoint;".to_string(),
+                "ROLLBACK;".to_string(),
+            ] {
+                analyze_and_validate(&mut state, &sql);
+                if sql.starts_with("SAVEPOINT") {
+                    assert!(state.local.schemas.contains_key(&schema));
+                    assert!(state.local.relations.keys().any(|id| id.schema == schema));
+                    assert!(state.local.types.keys().any(|id| id.schema == schema));
+                    assert!(state.local.sequences.keys().any(|id| id.schema == schema));
+                    assert!(state.local.functions.keys().any(|id| id.schema == schema));
+                }
+            }
+
+            assert!(state.local.transactions.is_empty());
+            assert!(!state.local.transaction_aborted);
+            assert!(!state.local.schemas.contains_key(&schema));
+            assert!(state.local.relations.keys().all(|id| id.schema != schema));
+            assert!(state.local.types.keys().all(|id| id.schema != schema));
+            assert!(state.local.sequences.keys().all(|id| id.schema != schema));
+            assert!(state.local.functions.keys().all(|id| id.schema != schema));
+            assert!(state.local.graph.edges().iter().all(|edge| {
+                edge.dependent.schema != schema && edge.referenced.schema != schema
+            }));
+            assert_state_invariants(&state);
+        }
+    }
+
+    #[test]
+    fn guarded_absent_operations_are_idempotent_and_rejections_only_abort() {
+        let mut state = AnalysisState::new(cache_with_table("public", "kept", Some(10)));
+        let initial_generation = state.local.generation_counter;
+
+        for _ in 0..8 {
+            let findings = setup_engine()
+                .analyze(
+                    "DROP TABLE IF EXISTS absent_table; DROP TYPE IF EXISTS absent_type;",
+                    &mut state,
+                )
+                .expect("guarded absent operations should analyze");
+            assert!(
+                !findings
+                    .iter()
+                    .any(|finding| finding.rule_id == "chain-conflict"),
+                "guarded absence must not conflict: {findings:?}"
+            );
+            assert!(state.relation_is_present(&object_id("public", "kept")));
+            assert_state_invariants(&state);
+        }
+        assert_eq!(state.local.generation_counter, initial_generation);
+
+        let findings = setup_engine()
+            .analyze(
+                "BEGIN; DROP TABLE absent_table; DROP TABLE kept;",
+                &mut state,
+            )
+            .expect("rejected transaction sequence should analyze");
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict"),
+            "missing unguarded object must conflict: {findings:?}"
+        );
+        assert!(state.local.transaction_aborted);
+        assert!(state.relation_is_present(&object_id("public", "kept")));
+        assert_state_invariants(&state);
+
+        analyze_and_validate(&mut state, "ROLLBACK;");
+        assert!(!state.local.transaction_aborted);
+        assert!(state.relation_is_present(&object_id("public", "kept")));
+    }
+
+    #[test]
+    fn inverse_rename_preserves_view_dependencies() {
+        let mut state = setup_state();
+        for sql in [
+            "CREATE TABLE rename_source (id bigint);",
+            "CREATE VIEW rename_view AS SELECT id FROM rename_source;",
+        ] {
+            analyze_and_validate(&mut state, sql);
+        }
+
+        let source = object_id("public", "rename_source");
+        let view = object_id("public", "rename_view");
+        assert!(
+            state
+                .local
+                .graph
+                .edges()
+                .iter()
+                .any(|edge| { edge.dependent == view && edge.referenced == source })
+        );
+
+        analyze_and_validate(
+            &mut state,
+            "ALTER TABLE rename_source RENAME TO renamed_source;",
+        );
+        analyze_and_validate(
+            &mut state,
+            "ALTER TABLE renamed_source RENAME TO rename_source;",
+        );
+
+        assert!(state.relation_is_present(&source));
+        assert!(!state.relation_is_present(&object_id("public", "renamed_source")));
+        assert!(
+            state
+                .local
+                .graph
+                .edges()
+                .iter()
+                .any(|edge| { edge.dependent == view && edge.referenced == source })
+        );
+        assert_state_invariants(&state);
+    }
+
+    #[test]
+    fn structured_cross_family_rollback_is_exact_and_reports_are_repeatable() {
+        let statements = [
+            "BEGIN;",
+            "CREATE SCHEMA phase5;",
+            "SET LOCAL search_path TO phase5, public;",
+            "SET LOCAL lock_timeout = '750ms';",
+            "SET LOCAL statement_timeout = '3s';",
+            "CREATE ROLE phase5_owner;",
+            "SET LOCAL SESSION AUTHORIZATION phase5_owner;",
+            "CREATE TABLE phase5.parent (id integer) PARTITION BY RANGE (id);",
+            "CREATE TABLE phase5.child (id integer);",
+            "ALTER TABLE phase5.parent ATTACH PARTITION phase5.child FOR VALUES FROM (0) TO (10);",
+            "ALTER TABLE phase5.parent DETACH PARTITION phase5.child;",
+            "CREATE FUNCTION phase5.identity(value integer) RETURNS integer LANGUAGE SQL IMMUTABLE AS $$ SELECT value $$;",
+            "CREATE FUNCTION phase5.identity(value text) RETURNS text LANGUAGE SQL IMMUTABLE AS $$ SELECT value $$;",
+            "CREATE PUBLICATION phase5_changes FOR TABLE phase5.parent;",
+            "CREATE SUBSCRIPTION phase5_sub CONNECTION 'host=publisher.invalid' PUBLICATION phase5_changes WITH (connect=false);",
+            "SAVEPOINT phase5_checkpoint;",
+            "ALTER PUBLICATION phase5_changes RENAME TO phase5_renamed_changes;",
+            "ALTER SUBSCRIPTION phase5_sub RENAME TO phase5_renamed_sub;",
+            "ROLLBACK TO SAVEPOINT phase5_checkpoint;",
+            "ROLLBACK;",
+        ];
+
+        let run = || {
+            let mut state = setup_state();
+            let mut reports = Vec::new();
+            for sql in statements {
+                let findings = setup_engine()
+                    .analyze(sql, &mut state)
+                    .expect("structure-aware statement should analyze");
+                assert_state_invariants(&state);
+                reports.push(
+                    serde_json::to_string(&safe_migrate::Reporter::json_report(
+                        &findings,
+                        &state.local.confidence,
+                    ))
+                    .expect("report should serialize"),
+                );
+            }
+
+            assert!(state.local.transactions.is_empty());
+            assert!(!state.local.transaction_aborted);
+            assert_eq!(state.local.search_path, ["public"]);
+            assert!(!state.local.schemas.contains_key("phase5"));
+            assert!(state.local.relations.keys().all(|id| id.schema != "phase5"));
+            assert!(state.local.functions.keys().all(|id| id.schema != "phase5"));
+            assert!(!state.local.publications.contains_key("phase5_changes"));
+            assert!(!state.local.subscriptions.contains_key("phase5_sub"));
+            assert!(
+                !state
+                    .local
+                    .roles
+                    .contains_key(&object_id("", "phase5_owner"))
+            );
+            assert!(state.local.graph.edges().iter().all(|edge| {
+                edge.dependent.schema != "phase5" && edge.referenced.schema != "phase5"
+            }));
+            assert_state_invariants(&state);
+            reports
+        };
+
+        assert_eq!(
+            run(),
+            run(),
+            "repeated analysis must produce identical reports"
+        );
     }
 }

@@ -61,7 +61,10 @@ mod identifier_casing_tests {
         let mut state = setup_state();
 
         engine
-            .analyze("CREATE TABLE MySchema.MyTable (id int);", &mut state)
+            .analyze(
+                "CREATE SCHEMA MySchema; CREATE TABLE MySchema.MyTable (id int);",
+                &mut state,
+            )
             .unwrap();
 
         assert!(state.relation_is_present(&object_id("myschema", "mytable")));

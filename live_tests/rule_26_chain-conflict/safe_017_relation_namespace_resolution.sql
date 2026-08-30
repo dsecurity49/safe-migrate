@@ -1,0 +1,12 @@
+CREATE SCHEMA sm_ns_early;
+CREATE SCHEMA sm_ns_late;
+CREATE TYPE sm_ns_early.shadowed_relation AS ENUM ('one');
+CREATE TABLE sm_ns_late.shadowed_relation (id integer);
+CREATE TABLE sm_ns_early.dropped_relation (id integer);
+CREATE TABLE sm_ns_late.dropped_relation (id integer);
+DROP TABLE sm_ns_early.dropped_relation;
+CREATE TABLE sm_ns_early."QuotedRelation" (id integer);
+SET search_path TO sm_ns_early, sm_ns_late, public;
+ALTER TABLE shadowed_relation ADD COLUMN selected_by_relation_namespace integer;
+ALTER TABLE dropped_relation ADD COLUMN selected_after_tombstone integer;
+ALTER TABLE "QuotedRelation" ADD COLUMN quoted_lookup integer;

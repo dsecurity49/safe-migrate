@@ -13,6 +13,11 @@ pub enum Privilege {
     References,
     Trigger,
     All,
+    /// PostgreSQL 17's table-maintenance privilege.
+    ///
+    /// Keep this variant after the historical variants so V6 cache enum
+    /// discriminants remain stable for caches written before PostgreSQL 17.
+    Maintain,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]

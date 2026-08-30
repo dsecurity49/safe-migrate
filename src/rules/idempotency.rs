@@ -90,14 +90,16 @@ impl Rule for IdempotencyRule {
                 );
             }
 
-            // Drop Guards (Singular targets)
+            // Drop Guards
             Mutation::DropTable(d) if !d.if_exists => {
-                add_violation(
-                    OperationKind::DropTable,
-                    ObjectKind::Table,
-                    d.id.to_string(),
-                    format!("DROP TABLE {} without IF EXISTS", d.id),
-                );
+                for id in &d.ids {
+                    add_violation(
+                        OperationKind::DropTable,
+                        ObjectKind::Table,
+                        id.to_string(),
+                        format!("DROP TABLE {} without IF EXISTS", id),
+                    );
+                }
             }
             Mutation::DropSchema(d) if !d.if_exists => {
                 for name in &d.names {
@@ -110,12 +112,14 @@ impl Rule for IdempotencyRule {
                 }
             }
             Mutation::DropIndex(d) if !d.if_exists => {
-                add_violation(
-                    OperationKind::DropIndex,
-                    ObjectKind::Index,
-                    d.id.to_string(),
-                    format!("DROP INDEX {} without IF EXISTS", d.id),
-                );
+                for id in &d.ids {
+                    add_violation(
+                        OperationKind::DropIndex,
+                        ObjectKind::Index,
+                        id.to_string(),
+                        format!("DROP INDEX {} without IF EXISTS", id),
+                    );
+                }
             }
             Mutation::DropPolicy(d) if !d.if_exists => {
                 add_violation(

@@ -5,6 +5,28 @@ commits and pull requests. Published binaries, checksums, and generated release
 notes are available on the
 [GitHub Releases page](https://github.com/dsecurity49/safe-migrate/releases).
 
+## v0.7.0 — 2026-08-30
+
+- Added semantic Cache V6 validation and durable cache replacement; invalid
+  cache, configuration, rollback, and report state now produces diagnostics.
+- Matched PostgreSQL's 63-byte identifier behavior, including UTF-8-safe
+  truncation, and added PostgreSQL 17 `MAINTAIN`/`GRANT ALL` support.
+- Added inline foreign-key, CHECK, exclusion, and `NOT VALID` constraint state,
+  with validation tracking and generated-constraint name reservation.
+- Fixed cascade cleanup for foreign keys, views, indexes, triggers, and
+  sequence-backed defaults, including cross-schema `DROP SCHEMA ... CASCADE`.
+- Made scoped multi-target drops atomic and tightened validation for sequence
+  ownership, trigger targets, partition changes, and dependent routines.
+- Improved view dependency extraction and catalog filtering, preventing casts,
+  function expressions, and unrelated catalog rows from creating false edges.
+- Added conservative handling for incomplete baseline evidence, including
+  expression indexes, inherited/publication tables, and type rewrite safety.
+- Routed unsupported `ALTER TABLE`/type/view/materialized-view actions,
+  copied-table forms, unmodeled role options, and incomplete domain/type forms
+  to explicit tainted analysis rather than recording an exact no-op.
+- Preserved relevant safety findings when an operation is skipped because cache
+  evidence is incomplete, including irreversible drops and `WITH GRANT OPTION`.
+
 ## v0.6.2 — 2026-08-27
 
 - Added reproducible, ignored performance scenarios for large synchronized

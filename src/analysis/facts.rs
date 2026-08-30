@@ -152,6 +152,8 @@ pub enum StatementFact {
         table: QualifiedName,
         permissive: bool,
         command: PolicyCommand,
+        /// False when roles or policy expressions are present but not modeled.
+        semantics_complete: bool,
     },
     DropPolicy {
         name: String,
@@ -217,12 +219,12 @@ pub enum StatementFact {
         cascade: bool,
     },
     DropTable {
-        name: QualifiedName,
+        names: Vec<QualifiedName>,
         if_exists: bool,
         cascade: bool,
     },
     DropView {
-        name: QualifiedName,
+        names: Vec<QualifiedName>,
         if_exists: bool,
         cascade: bool,
     },
@@ -235,6 +237,7 @@ pub enum StatementFact {
         names: Vec<QualifiedName>,
         if_exists: bool,
         concurrently: bool,
+        cascade: bool,
     },
     SetSearchPath {
         target: SearchPathTarget,
@@ -681,6 +684,7 @@ pub enum PrivilegeFact {
     Truncate,
     References,
     Trigger,
+    Maintain,
     Execute,
     Create,
     Temporary,
@@ -787,8 +791,12 @@ pub enum TableConstraintFact {
         constraint_name: Option<String>,
         columns: Vec<String>,
     },
-    Check,
-    Exclude,
+    Check {
+        constraint_name: Option<String>,
+    },
+    Exclude {
+        constraint_name: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -819,6 +827,7 @@ pub enum AlterTableActionFact {
     DropColumn {
         name: String,
         if_exists: bool,
+        cascade: bool,
     },
     RenameColumn {
         from: Ident,
@@ -844,6 +853,8 @@ pub enum AlterTableActionFact {
     },
     DropConstraint {
         name: String,
+        if_exists: bool,
+        cascade: bool,
     },
     AddCheckConstraint {
         constraint_name: Option<String>,
@@ -851,10 +862,12 @@ pub enum AlterTableActionFact {
     },
     AddUniqueConstraint {
         constraint_name: Option<String>,
+        columns: Vec<String>,
         using_index: Option<QualifiedName>,
     },
     AddPrimaryKeyConstraint {
         constraint_name: Option<String>,
+        columns: Vec<String>,
         using_index: Option<QualifiedName>,
     },
     AddExcludeConstraint {

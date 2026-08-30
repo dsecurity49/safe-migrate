@@ -131,6 +131,7 @@ pub struct CreatePolicyMutation {
     pub table: ObjectId,
     pub permissive: bool,
     pub command: crate::analysis::facts::PolicyCommand,
+    pub semantics_complete: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -335,16 +336,17 @@ pub struct Rename {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct DropTable {
-    pub id: ObjectId,
+    pub ids: Vec<ObjectId>,
     pub if_exists: bool,
     pub cascade: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct DropIndex {
-    pub id: ObjectId,
+    pub ids: Vec<ObjectId>,
     pub if_exists: bool,
     pub concurrently: bool,
+    pub cascade: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -572,6 +574,7 @@ pub enum AlterTableActionMutation {
     DropColumn {
         name: String,
         if_exists: bool,
+        cascade: bool,
     },
     RenameColumn {
         from: String,
@@ -594,6 +597,8 @@ pub enum AlterTableActionMutation {
     },
     DropConstraint {
         name: String,
+        if_exists: bool,
+        cascade: bool,
     },
     AddCheckConstraint {
         constraint_name: Option<String>,
@@ -601,10 +606,12 @@ pub enum AlterTableActionMutation {
     },
     AddUniqueConstraint {
         constraint_name: Option<String>,
+        columns: Vec<String>,
         using_index: Option<ObjectId>,
     },
     AddPrimaryKeyConstraint {
         constraint_name: Option<String>,
+        columns: Vec<String>,
         using_index: Option<ObjectId>,
     },
     AddExcludeConstraint {
