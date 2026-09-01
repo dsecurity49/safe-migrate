@@ -30,5 +30,6 @@ pub mod api {
     pub use crate::engine::config::Config;
     pub use crate::engine::engine::SafeMigrateEngine;
     pub use crate::report::reporter::Reporter;
+    pub use crate::rules::RuleCapability;
     pub use crate::{AnalysisState, DbCache};
 }
