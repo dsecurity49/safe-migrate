@@ -664,6 +664,35 @@ impl AnalysisState {
                 })
             });
         }
+        // Publication membership can retain an explicitly named table or
+        // schema even when the corresponding relation rows are outside a
+        // scoped cache. Preserve that namespace evidence as well.
+        for publication in cache.publications.values() {
+            if let crate::analysis::facts::PublicationScope::Explicit(objects) = &publication.scope
+            {
+                for object in objects {
+                    let schema = match object {
+                        crate::analysis::facts::PublicationObjectFact::Table { name, .. } => {
+                            name.schema.as_ref().map(|schema| schema.resolve())
+                        }
+                        crate::analysis::facts::PublicationObjectFact::SchemaTables {
+                            schema,
+                            ..
+                        } => Some(schema.clone()),
+                        _ => None,
+                    };
+                    if let Some(schema) = schema {
+                        schemas.entry(schema.clone()).or_insert_with(|| {
+                            SchemaOverlay::Present(crate::model::schema::SchemaState {
+                                name: schema.clone(),
+                                owner: inferred_schema_owner.clone(),
+                                generation: 0,
+                            })
+                        });
+                    }
+                }
+            }
+        }
         if cache.schemas.is_empty() && cache.metadata.schemas.is_none() {
             for name in &cache.search_path {
                 schemas.entry(name.clone()).or_insert_with(|| {
