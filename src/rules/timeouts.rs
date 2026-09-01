@@ -1,8 +1,7 @@
 use crate::analysis::mutations::Mutation;
-use crate::analysis::state::{AnalysisState, CascadeResult, MutationResult};
-use crate::engine::config::Config;
+use crate::analysis::state::MutationResult;
 use crate::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
-use crate::rules::LegacyRule as Rule;
+use crate::rules::{Rule, RuleContext};
 
 pub struct RequireLockTimeoutRule;
 
@@ -19,23 +18,17 @@ impl Rule for RequireLockTimeoutRule {
         "Set a positive lock_timeout before this operation, or configure it for the intended migration role and run safe-migrate sync again."
     }
 
-    fn evaluate(
-        &self,
-        mutation: &Mutation,
-        result: &MutationResult,
-        _pre_state: &crate::analysis::state::PreState,
-        state: &AnalysisState,
-        _config: &Config,
-        _cascade: Option<&CascadeResult>,
-    ) -> Vec<Violation> {
-        if !matches!(mutation, Mutation::CheckTimeouts) || result != &MutationResult::Applied {
+    fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
+        if !matches!(context.mutation(), Mutation::CheckTimeouts)
+            || context.result() != &MutationResult::Applied
+        {
             return Vec::new();
         }
 
-        let reason = match state.local.lock_timeout.effective {
+        let reason = match context.state().local.lock_timeout.effective {
             None => "No lock_timeout is known from SQL or a synchronized cache.".to_string(),
             Some(0) => "lock_timeout is disabled (0).".to_string(),
-            Some(lock_timeout) => match state.local.statement_timeout.effective {
+            Some(lock_timeout) => match context.state().local.statement_timeout.effective {
                 Some(statement_timeout)
                     if statement_timeout > 0 && lock_timeout >= statement_timeout =>
                 {
@@ -78,20 +71,14 @@ impl Rule for RequireStatementTimeoutRule {
         "Set a positive statement_timeout before this operation, or configure it for the intended migration role and run safe-migrate sync again."
     }
 
-    fn evaluate(
-        &self,
-        mutation: &Mutation,
-        result: &MutationResult,
-        _pre_state: &crate::analysis::state::PreState,
-        state: &AnalysisState,
-        _config: &Config,
-        _cascade: Option<&CascadeResult>,
-    ) -> Vec<Violation> {
-        if !matches!(mutation, Mutation::CheckTimeouts) || result != &MutationResult::Applied {
+    fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
+        if !matches!(context.mutation(), Mutation::CheckTimeouts)
+            || context.result() != &MutationResult::Applied
+        {
             return Vec::new();
         }
 
-        let reason = match state.local.statement_timeout.effective {
+        let reason = match context.state().local.statement_timeout.effective {
             None => "No statement_timeout is known from SQL or a synchronized cache.".to_string(),
             Some(0) => "statement_timeout is disabled (0).".to_string(),
             Some(_) => return Vec::new(),
