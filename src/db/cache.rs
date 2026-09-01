@@ -440,7 +440,9 @@ impl DbCache {
         self.relations.iter()
     }
 
-    pub(crate) fn validate_semantics(&self) -> Result<(), String> {
+    /// Validate cross-record identity, relationship, and catalog-coverage
+    /// invariants before a cache is used as an authoritative baseline.
+    pub fn validate_semantics(&self) -> Result<(), String> {
         let required_families = [
             CatalogFamily::Schemas,
             CatalogFamily::Relations,
@@ -1066,6 +1068,14 @@ impl DbCache {
         }
 
         Ok(())
+    }
+
+    /// Return this cache only when all semantic invariants pass validation.
+    /// This is the supported constructor for library callers that build a
+    /// cache without going through the on-disk decoder.
+    pub fn validated(self) -> Result<Self, String> {
+        self.validate_semantics()?;
+        Ok(self)
     }
 }
 

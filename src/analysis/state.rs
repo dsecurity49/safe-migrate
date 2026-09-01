@@ -524,6 +524,11 @@ impl AnalysisState {
         Self::with_baseline(cache, true)
     }
 
+    /// Construct an authoritative state only from a semantically valid cache.
+    pub fn try_new(cache: DbCache) -> Result<Self, String> {
+        Ok(Self::new(cache.validated()?))
+    }
+
     pub fn with_baseline(cache: DbCache, baseline_available: bool) -> Self {
         let baseline_coverage = cache.coverage.clone();
         let source_lock_timeout =
@@ -1086,6 +1091,12 @@ impl AnalysisState {
             );
         }
         state
+    }
+
+    /// Construct state from a cache after validating its cross-record
+    /// invariants, preserving the requested baseline-availability flag.
+    pub fn try_with_baseline(cache: DbCache, baseline_available: bool) -> Result<Self, String> {
+        Ok(Self::with_baseline(cache.validated()?, baseline_available))
     }
 
     pub fn get_relation(&self, id: &ObjectId) -> Option<&RelationOverlay> {
@@ -3043,5 +3054,24 @@ mod evidence_tests {
                     } if evidence.pk_fk == ["pg_catalog.=(integer,integer)".to_string()]
                 )
         }));
+    }
+
+    #[test]
+    fn try_new_rejects_semantically_invalid_cache_before_hydration() {
+        let mut cache = DbCache::new();
+        cache.schemas.insert(
+            "public".into(),
+            crate::model::schema::SchemaState {
+                name: "other".into(),
+                owner: ObjectId::new("", "postgres"),
+                generation: 0,
+            },
+        );
+
+        let error = match AnalysisState::try_new(cache) {
+            Ok(_) => panic!("invalid cache unexpectedly hydrated"),
+            Err(error) => error,
+        };
+        assert!(error.contains("schema cache key 'public'"));
     }
 }
