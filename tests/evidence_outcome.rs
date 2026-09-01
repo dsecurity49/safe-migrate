@@ -94,3 +94,26 @@ fn unknown_sequence_target_has_typed_object_state_evidence() {
             .any(|record| record.code == EvidenceCode::LegacyStateUncertainty)
     );
 }
+
+#[test]
+fn unavailable_rule_capability_is_recorded_before_rule_evaluation() {
+    let engine = common::setup_engine();
+    let mut state =
+        safe_migrate::AnalysisState::with_baseline(safe_migrate::db::cache::DbCache::new(), false);
+    let outcome = engine
+        .analyze_outcome_with_locations(
+            "migrations/004.sql".to_string(),
+            "CREATE INDEX idx ON accounts (id);".to_string(),
+            &mut state,
+        )
+        .expect("index migration should analyze without a baseline");
+
+    assert!(
+        outcome
+            .evidence
+            .iter()
+            .any(|record| record.code == EvidenceCode::BaselineUnavailable),
+        "stateful rule capability gap must be explicit: {:?}",
+        outcome.evidence
+    );
+}

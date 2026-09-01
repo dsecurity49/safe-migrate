@@ -50,6 +50,42 @@ pub enum RuleCapability {
     FunctionCatalog,
 }
 
+impl RuleCapability {
+    pub(crate) fn available(self, state: &AnalysisState) -> bool {
+        if self == Self::TransactionState {
+            return state.evidence().iter().all(|record| {
+                record.code != crate::analysis::evidence::EvidenceCode::TransactionStateUnknown
+            });
+        }
+        if !state.baseline_available {
+            return false;
+        }
+        let family = match self {
+            Self::BaselineRelations | Self::RowStatistics => {
+                crate::db::cache::CatalogFamily::Relations
+            }
+            Self::CatalogDependencies => crate::db::cache::CatalogFamily::Dependencies,
+            Self::FunctionCatalog => crate::db::cache::CatalogFamily::Routines,
+            Self::TransactionState => unreachable!(),
+        };
+        state.baseline_coverage.has(family)
+    }
+
+    pub(crate) const fn evidence_code(self) -> crate::analysis::evidence::EvidenceCode {
+        match self {
+            Self::BaselineRelations
+            | Self::CatalogDependencies
+            | Self::RowStatistics
+            | Self::FunctionCatalog => {
+                crate::analysis::evidence::EvidenceCode::CatalogCoverageIncomplete
+            }
+            Self::TransactionState => {
+                crate::analysis::evidence::EvidenceCode::TransactionStateUnknown
+            }
+        }
+    }
+}
+
 pub(crate) const BASELINE_STATS_CAPABILITIES: &[RuleCapability] = &[
     RuleCapability::BaselineRelations,
     RuleCapability::RowStatistics,

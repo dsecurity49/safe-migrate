@@ -2,7 +2,7 @@ use crate::analysis::mutations::Mutation;
 use crate::analysis::state::MutationResult;
 use crate::model::relation::Persistence;
 use crate::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
-use crate::rules::{Rule, RuleContext};
+use crate::rules::{BASELINE_STATS_CAPABILITIES, Rule, RuleCapability, RuleContext};
 
 pub struct MaterializedViewRefreshRule;
 
@@ -15,6 +15,10 @@ impl Rule for MaterializedViewRefreshRule {
     }
     fn recipe(&self) -> &'static str {
         "Refreshing a materialized view without CONCURRENTLY prevents reading from it during the refresh."
+    }
+
+    fn required_capabilities(&self) -> &'static [RuleCapability] {
+        BASELINE_STATS_CAPABILITIES
     }
 
     fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {

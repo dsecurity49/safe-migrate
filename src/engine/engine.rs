@@ -362,6 +362,21 @@ impl SafeMigrateEngine {
                         continue;
                     }
 
+                    // Capability declarations are an executable contract:
+                    // unavailable catalog/transaction surfaces become
+                    // explicit evidence before a rule evaluates, so a rule
+                    // cannot accidentally turn missing state into certainty.
+                    for capability in rule.required_capabilities() {
+                        if !capability.available(state) {
+                            let code = if state.baseline_available {
+                                capability.evidence_code()
+                            } else {
+                                crate::analysis::evidence::EvidenceCode::BaselineUnavailable
+                            };
+                            state.taint(code, crate::analysis::evidence::EvidenceScope::Statement);
+                        }
+                    }
+
                     let rule_context = RuleContext::new(
                         &mutation,
                         &result,

@@ -427,6 +427,7 @@ mod tests {
             "type-change-rewrite",
             "blocking-constraint",
             "require-concurrent-index",
+            "blocking-mat-view-refresh",
             "blocking-partition-mutation",
             "partition-strategy-mismatch",
             "function-volatility-change",
