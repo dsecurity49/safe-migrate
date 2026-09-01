@@ -68,6 +68,30 @@ impl<'a> RuleContext<'a> {
     pub fn confidence(&self) -> &Confidence {
         self.confidence
     }
+
+    pub fn mutation(&self) -> &Mutation {
+        self.mutation
+    }
+
+    pub fn result(&self) -> &MutationResult {
+        self.result
+    }
+
+    pub fn pre_state(&self) -> &crate::analysis::state::PreState {
+        self.pre_state
+    }
+
+    pub fn state(&self) -> &AnalysisState {
+        self.state
+    }
+
+    pub fn config(&self) -> &Config {
+        self.config
+    }
+
+    pub fn cascade_closure(&self) -> Option<&CascadeResult> {
+        self.cascade_closure
+    }
 }
 
 pub trait Rule {
