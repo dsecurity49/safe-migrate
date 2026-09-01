@@ -1,8 +1,7 @@
 use crate::analysis::mutations::Mutation;
-use crate::analysis::state::{AnalysisState, CascadeResult, MutationResult};
-use crate::engine::config::Config;
+use crate::analysis::state::MutationResult;
 use crate::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
-use crate::rules::LegacyRule as Rule;
+use crate::rules::{Rule, RuleContext};
 
 pub struct VolatileDefaultRule;
 
@@ -17,22 +16,14 @@ impl Rule for VolatileDefaultRule {
         "Using volatile functions such as random() or gen_random_uuid() as defaults can cause unexpected behavior in logical replication or caching."
     }
 
-    fn evaluate(
-        &self,
-        mutation: &Mutation,
-        result: &MutationResult,
-        _pre_state: &crate::analysis::state::PreState,
-        _state: &AnalysisState,
-        _config: &Config,
-        _cascade: Option<&CascadeResult>,
-    ) -> Vec<Violation> {
-        if *result == MutationResult::Skipped {
+    fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
+        if *context.result() == MutationResult::Skipped {
             return vec![];
         }
 
         let mut violations = Vec::new();
 
-        if let Mutation::CreateTable(c) = mutation {
+        if let Mutation::CreateTable(c) = context.mutation() {
             for col in &c.columns {
                 if let Some(def) = &col.default
                     && def.is_volatile()
@@ -54,7 +45,7 @@ impl Rule for VolatileDefaultRule {
             }
         }
 
-        if let Mutation::AlterTable(a) = mutation {
+        if let Mutation::AlterTable(a) = context.mutation() {
             match &a.action {
                 crate::analysis::mutations::AlterTableActionMutation::AddColumn {
                     name,

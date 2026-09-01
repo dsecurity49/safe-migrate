@@ -1,8 +1,6 @@
 use crate::analysis::mutations::Mutation;
-use crate::analysis::state::{AnalysisState, CascadeResult, MutationResult};
-use crate::engine::config::Config;
 use crate::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
-use crate::rules::LegacyRule as Rule;
+use crate::rules::{Rule, RuleContext};
 
 pub struct OpaqueDynamicSqlRule;
 
@@ -17,18 +15,10 @@ impl Rule for OpaqueDynamicSqlRule {
         "Procedural or dynamic SQL (DO blocks, EXECUTE) obscures schema mutations. Lock analysis confidence is heavily degraded."
     }
 
-    fn evaluate(
-        &self,
-        mutation: &Mutation,
-        _result: &MutationResult,
-        _pre_state: &crate::analysis::state::PreState,
-        _state: &AnalysisState,
-        _config: &Config,
-        _cascade: Option<&CascadeResult>,
-    ) -> Vec<Violation> {
+    fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
         let mut violations = Vec::new();
 
-        if let Mutation::Opaque(op) = mutation {
+        if let Mutation::Opaque(op) = context.mutation() {
             if matches!(
                 op,
                 crate::analysis::mutations::OpaqueMutation::UnresolvedReference { .. }
