@@ -1,8 +1,6 @@
-use crate::analysis::mutations::Mutation;
 use crate::analysis::state::MutationResult;
-use crate::engine::config::Config;
 use crate::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
-use crate::rules::LegacyRule as Rule;
+use crate::rules::{Rule, RuleContext};
 
 pub struct ConflictRule;
 
@@ -32,16 +30,8 @@ impl Rule for ConflictRule {
         Self::RECIPE
     }
 
-    fn evaluate(
-        &self,
-        _mutation: &Mutation,
-        result: &MutationResult,
-        _pre_state: &crate::analysis::state::PreState,
-        _state: &crate::analysis::state::AnalysisState,
-        _config: &Config,
-        _cascade_closure: Option<&crate::analysis::state::CascadeResult>,
-    ) -> Vec<Violation> {
-        match Self::extract_conflict_reason(result) {
+    fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
+        match Self::extract_conflict_reason(context.result()) {
             Some(reason) => vec![Violation {
                 source_range: None,
                 rule_id: Self::ID,
@@ -65,6 +55,7 @@ mod tests {
     use super::*;
     use crate::analysis::mutations::Mutation;
     use crate::analysis::state::MutationResult;
+    use crate::engine::config::Config;
     use std::collections::{HashMap, HashSet};
 
     #[test]
@@ -75,24 +66,22 @@ mod tests {
                 "column 'x' already added with type int, this file adds it again with type text"
                     .to_string(),
         };
-        let violations = rule.evaluate(
-            &Mutation::Opaque(crate::analysis::mutations::OpaqueMutation::DynamicSql),
-            &result,
-            &crate::analysis::state::PreState {
-                relations: HashMap::new(),
-                functions: HashMap::new(),
-                roles: HashMap::new(),
-                publications: HashMap::new(),
-                subscriptions: HashMap::new(),
-                sequences: HashMap::new(),
-                types: HashMap::new(),
-                indexes: Vec::new(),
-                baseline_foreign_keys: HashSet::new(),
-            },
-            &crate::analysis::state::AnalysisState::new(crate::db::cache::DbCache::new()),
-            &Config::default(),
-            None,
-        );
+        let mutation = Mutation::Opaque(crate::analysis::mutations::OpaqueMutation::DynamicSql);
+        let pre_state = crate::analysis::state::PreState {
+            relations: HashMap::new(),
+            functions: HashMap::new(),
+            roles: HashMap::new(),
+            publications: HashMap::new(),
+            subscriptions: HashMap::new(),
+            sequences: HashMap::new(),
+            types: HashMap::new(),
+            indexes: Vec::new(),
+            baseline_foreign_keys: HashSet::new(),
+        };
+        let state = crate::analysis::state::AnalysisState::new(crate::db::cache::DbCache::new());
+        let config = Config::default();
+        let context = RuleContext::new(&mutation, &result, &pre_state, &state, &config, None);
+        let violations = rule.evaluate(&context);
         assert_eq!(violations.len(), 1);
         assert_eq!(violations[0].rule_id, "chain-conflict");
         assert_eq!(violations[0].tier, ViolationTier::Tier1);
@@ -107,24 +96,22 @@ mod tests {
     fn test_conflict_rule_silent_on_applied() {
         let rule = ConflictRule;
         let result = MutationResult::Applied;
-        let violations = rule.evaluate(
-            &Mutation::Opaque(crate::analysis::mutations::OpaqueMutation::DynamicSql),
-            &result,
-            &crate::analysis::state::PreState {
-                relations: HashMap::new(),
-                functions: HashMap::new(),
-                roles: HashMap::new(),
-                publications: HashMap::new(),
-                subscriptions: HashMap::new(),
-                sequences: HashMap::new(),
-                types: HashMap::new(),
-                indexes: Vec::new(),
-                baseline_foreign_keys: HashSet::new(),
-            },
-            &crate::analysis::state::AnalysisState::new(crate::db::cache::DbCache::new()),
-            &Config::default(),
-            None,
-        );
+        let mutation = Mutation::Opaque(crate::analysis::mutations::OpaqueMutation::DynamicSql);
+        let pre_state = crate::analysis::state::PreState {
+            relations: HashMap::new(),
+            functions: HashMap::new(),
+            roles: HashMap::new(),
+            publications: HashMap::new(),
+            subscriptions: HashMap::new(),
+            sequences: HashMap::new(),
+            types: HashMap::new(),
+            indexes: Vec::new(),
+            baseline_foreign_keys: HashSet::new(),
+        };
+        let state = crate::analysis::state::AnalysisState::new(crate::db::cache::DbCache::new());
+        let config = Config::default();
+        let context = RuleContext::new(&mutation, &result, &pre_state, &state, &config, None);
+        let violations = rule.evaluate(&context);
         assert!(violations.is_empty());
     }
 }
