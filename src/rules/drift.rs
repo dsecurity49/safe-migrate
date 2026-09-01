@@ -1,9 +1,7 @@
 use crate::analysis::mutations::Mutation;
-use crate::analysis::state::{AnalysisState, CascadeResult, MutationResult};
 use crate::ast::identifiers::ObjectId;
-use crate::engine::config::Config;
 use crate::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
-use crate::rules::LegacyRule as Rule;
+use crate::rules::{Rule, RuleContext};
 
 pub struct DriftDetectionRule;
 
@@ -18,25 +16,20 @@ impl Rule for DriftDetectionRule {
         "This migration references a database object that does not exist in the production baseline. If this object exists in production, sync the cache with `safe-migrate sync`. If it does not, this migration may fail."
     }
 
-    fn evaluate(
-        &self,
-        mutation: &Mutation,
-        _result: &MutationResult,
-        pre_state: &crate::analysis::state::PreState,
-        state: &AnalysisState,
-        _config: &Config,
-        _cascade_closure: Option<&CascadeResult>,
-    ) -> Vec<Violation> {
+    fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
         // A missing cache is not proof that production lacks an object. Keep
         // the stateful analyzer useful offline without turning every ALTER or
         // DROP into a false blocking baseline-drift finding.
-        if !state.baseline_available {
+        if !context.state().baseline_available {
             return Vec::new();
         }
 
+        let pre_state = context.pre_state();
+        let state = context.state();
+
         let mut violations = Vec::new();
 
-        match mutation {
+        match context.mutation() {
             Mutation::Opaque(crate::analysis::mutations::OpaqueMutation::UnresolvedReference {
                 object_kind,
                 object_name,

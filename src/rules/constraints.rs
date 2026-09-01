@@ -1,9 +1,8 @@
 use crate::analysis::mutations::{AlterTableActionMutation, Mutation};
-use crate::analysis::state::{AnalysisState, CascadeResult, MutationResult};
-use crate::engine::config::Config;
+use crate::analysis::state::MutationResult;
 use crate::model::relation::Persistence;
 use crate::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
-use crate::rules::LegacyRule as Rule;
+use crate::rules::{Rule, RuleContext};
 
 pub struct BlockingConstraintRule;
 
@@ -18,34 +17,28 @@ impl Rule for BlockingConstraintRule {
         "Adding a valid CHECK or FOREIGN KEY constraint takes an ACCESS EXCLUSIVE lock and scans the table. Add it as NOT VALID first, then VALIDATE it in a separate transaction."
     }
 
-    fn evaluate(
-        &self,
-        mutation: &Mutation,
-        result: &MutationResult,
-        pre_state: &crate::analysis::state::PreState,
-        state: &AnalysisState,
-        config: &Config,
-        _cascade: Option<&CascadeResult>,
-    ) -> Vec<Violation> {
-        if *result == MutationResult::Skipped {
+    fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
+        if *context.result() == MutationResult::Skipped {
             return vec![];
         }
 
         let mut violations = Vec::new();
 
-        if let Mutation::AlterTable(alter) = mutation {
-            let (is_temp, mut is_stale, child_rows) = match pre_state.relations.get(&alter.id) {
-                Some(rel) => {
-                    // Only cache-backed relations have meaningful statistics age.
-                    let stale = rel.is_stale() && state.baseline_relations.contains(&alter.id);
-                    (
-                        rel.persistence == Persistence::Temporary,
-                        stale,
-                        rel.estimated_rows.unwrap_or(config.default_rows),
-                    )
-                }
-                None => (false, true, config.default_rows),
-            };
+        if let Mutation::AlterTable(alter) = context.mutation() {
+            let (is_temp, mut is_stale, child_rows) =
+                match context.pre_state().relations.get(&alter.id) {
+                    Some(rel) => {
+                        // Only cache-backed relations have meaningful statistics age.
+                        let stale = rel.is_stale()
+                            && context.state().baseline_relations.contains(&alter.id);
+                        (
+                            rel.persistence == Persistence::Temporary,
+                            stale,
+                            rel.estimated_rows.unwrap_or(context.config().default_rows),
+                        )
+                    }
+                    None => (false, true, context.config().default_rows),
+                };
 
             // Temporary-table locks do not block other sessions.
             if is_temp {
@@ -80,17 +73,20 @@ impl Rule for BlockingConstraintRule {
             let max_locked_rows = match &alter.action {
                 AlterTableActionMutation::AddForeignKey { to_table, .. } => {
                     // Foreign keys can lock both sides; classify by the larger table.
-                    let parent_rows = match pre_state.relations.get(to_table) {
+                    let parent_rows = match context.pre_state().relations.get(to_table) {
                         Some(parent_rel) => {
-                            if parent_rel.is_stale() && state.baseline_relations.contains(to_table)
+                            if parent_rel.is_stale()
+                                && context.state().baseline_relations.contains(to_table)
                             {
                                 is_stale = true;
                             }
-                            parent_rel.estimated_rows.unwrap_or(config.default_rows)
+                            parent_rel
+                                .estimated_rows
+                                .unwrap_or(context.config().default_rows)
                         }
                         None => {
                             is_stale = true;
-                            config.default_rows
+                            context.config().default_rows
                         }
                     };
                     std::cmp::max(child_rows, parent_rows)
@@ -98,17 +94,19 @@ impl Rule for BlockingConstraintRule {
                 _ => child_rows,
             };
 
-            let tier1_threshold = config.rule_tier1_threshold(self.id());
-            let tier2_threshold = config.rule_tier2_threshold(self.id());
+            let tier1_threshold = context.config().rule_tier1_threshold(self.id());
+            let tier2_threshold = context.config().rule_tier2_threshold(self.id());
 
             // Check if either table is partitioned (partitioned tables have higher lock costs)
             let is_partitioned =
                 if let AlterTableActionMutation::AddForeignKey { to_table, .. } = &alter.action {
-                    let child_partitioned = pre_state
+                    let child_partitioned = context
+                        .pre_state()
                         .relations
                         .get(&alter.id)
                         .is_some_and(|rel| rel.partition_type.is_some());
-                    let parent_partitioned = pre_state
+                    let parent_partitioned = context
+                        .pre_state()
                         .relations
                         .get(to_table)
                         .is_some_and(|rel| rel.partition_type.is_some());
@@ -219,7 +217,8 @@ impl Rule for BlockingConstraintRule {
                     });
                 }
                 AlterTableActionMutation::SetNotNull { column } => {
-                    let has_fast_path = pre_state
+                    let has_fast_path = context
+                        .pre_state()
                         .relations
                         .get(&alter.id)
                         .map(|r| {

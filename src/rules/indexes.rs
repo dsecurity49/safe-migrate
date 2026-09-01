@@ -1,9 +1,8 @@
 use crate::analysis::mutations::Mutation;
-use crate::analysis::state::{AnalysisState, CascadeResult, MutationResult};
-use crate::engine::config::Config;
+use crate::analysis::state::MutationResult;
 use crate::model::relation::Persistence;
 use crate::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
-use crate::rules::LegacyRule as Rule;
+use crate::rules::{Rule, RuleContext};
 
 pub struct ConcurrentIndexRule;
 
@@ -18,23 +17,15 @@ impl Rule for ConcurrentIndexRule {
         "Index operations block writes (or both reads and writes) when executed synchronously. Add the CONCURRENTLY keyword."
     }
 
-    fn evaluate(
-        &self,
-        mutation: &Mutation,
-        result: &MutationResult,
-        pre_state: &crate::analysis::state::PreState,
-        state: &AnalysisState,
-        config: &Config,
-        _cascade: Option<&CascadeResult>,
-    ) -> Vec<Violation> {
-        if *result == MutationResult::Skipped {
+    fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
+        if *context.result() == MutationResult::Skipped {
             // An index that is present in the pre-state still incurs the
             // synchronous DROP INDEX risk even when V6 metadata is too
             // incomplete to mutate it exactly (for example, eligibility for
             // a backing constraint is not serialized).  A truly absent,
             // guarded drop remains a no-op and is correctly suppressed.
-            let known_drop_target = matches!(mutation, Mutation::DropIndex(drop)
-                if drop.ids.iter().any(|id| pre_state.indexes.iter().any(|edge| edge.dependent == *id)));
+            let known_drop_target = matches!(context.mutation(), Mutation::DropIndex(drop)
+                if drop.ids.iter().any(|id| context.pre_state().indexes.iter().any(|edge| edge.dependent == *id)));
             if !known_drop_target {
                 return vec![];
             }
@@ -42,24 +33,25 @@ impl Rule for ConcurrentIndexRule {
 
         let mut violations = Vec::new();
 
-        match mutation {
+        match context.mutation() {
             Mutation::CreateIndex(create) if !create.concurrently => {
                 let (is_temp, is_stale, rows, tx_depth) =
-                    match pre_state.relations.get(&create.table) {
+                    match context.pre_state().relations.get(&create.table) {
                         Some(rel) => {
-                            let stale =
-                                rel.is_stale() && state.baseline_relations.contains(&create.table);
+                            let stale = rel.is_stale()
+                                && context.state().baseline_relations.contains(&create.table);
                             (
                                 rel.persistence == Persistence::Temporary,
                                 stale,
-                                rel.estimated_rows.unwrap_or(config.default_rows),
+                                rel.estimated_rows.unwrap_or(context.config().default_rows),
                                 rel.created_at_tx_depth,
                             )
                         }
-                        None => (false, true, config.default_rows, 0),
+                        None => (false, true, context.config().default_rows, 0),
                     };
 
-                if is_temp || (tx_depth > 0 && tx_depth <= state.local.transactions.len()) {
+                if is_temp || (tx_depth > 0 && tx_depth <= context.state().local.transactions.len())
+                {
                     return violations;
                 }
 
@@ -79,8 +71,8 @@ impl Rule for ConcurrentIndexRule {
                     });
                 }
 
-                let tier1_threshold = config.rule_tier1_threshold(self.id());
-                let tier2_threshold = config.rule_tier2_threshold(self.id());
+                let tier1_threshold = context.config().rule_tier1_threshold(self.id());
+                let tier2_threshold = context.config().rule_tier2_threshold(self.id());
 
                 let tier = if rows >= tier1_threshold {
                     ViolationTier::Tier1
@@ -111,14 +103,14 @@ impl Rule for ConcurrentIndexRule {
             }
             Mutation::DropIndex(drop) if !drop.concurrently => {
                 let rule_id = "require-concurrent-drop-index";
-                let tier1_threshold = config.rule_tier1_threshold(self.id());
-                let tier2_threshold = config.rule_tier2_threshold(self.id());
+                let tier1_threshold = context.config().rule_tier1_threshold(self.id());
+                let tier2_threshold = context.config().rule_tier2_threshold(self.id());
 
                 // DROP INDEX classification does not emit a stale-statistics finding.
 
                 for id in &drop.ids {
-                    if pre_state.relations.is_empty() {
-                        let rows = config.default_rows;
+                    if context.pre_state().relations.is_empty() {
+                        let rows = context.config().default_rows;
                         let tier = if rows >= tier1_threshold {
                             ViolationTier::Tier1
                         } else if rows >= tier2_threshold {
@@ -141,17 +133,18 @@ impl Rule for ConcurrentIndexRule {
                             fk_dependency_related: false,
                         });
                     } else {
-                        let target_relations = pre_state
+                        let target_relations = context
+                            .pre_state()
                             .indexes
                             .iter()
                             .filter_map(|idx| {
                                 (idx.dependent == *id)
-                                    .then(|| pre_state.relations.get(&idx.referenced))
+                                    .then(|| context.pre_state().relations.get(&idx.referenced))
                                     .flatten()
                             })
                             .collect::<Vec<_>>();
                         if target_relations.is_empty() {
-                            let rows = config.default_rows;
+                            let rows = context.config().default_rows;
                             let tier = if rows >= tier1_threshold {
                                 ViolationTier::Tier1
                             } else if rows >= tier2_threshold {
@@ -178,7 +171,7 @@ impl Rule for ConcurrentIndexRule {
                                 continue;
                             }
 
-                            let rows = rel.estimated_rows.unwrap_or(config.default_rows);
+                            let rows = rel.estimated_rows.unwrap_or(context.config().default_rows);
                             let tier = if rows >= tier1_threshold {
                                 ViolationTier::Tier1
                             } else if rows >= tier2_threshold {

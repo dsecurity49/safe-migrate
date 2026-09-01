@@ -1,9 +1,8 @@
 use crate::analysis::mutations::{AlterTableActionMutation, Mutation};
-use crate::analysis::state::{AnalysisState, CascadeResult, MutationResult};
-use crate::engine::config::Config;
+use crate::analysis::state::MutationResult;
 use crate::model::relation::Persistence;
 use crate::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
-use crate::rules::LegacyRule as Rule;
+use crate::rules::{Rule, RuleContext};
 
 pub struct PartitionLockRule;
 
@@ -18,30 +17,22 @@ impl Rule for PartitionLockRule {
         "Attaching or detaching partitions takes an ACCESS EXCLUSIVE lock on the parent table. Run ATTACH PARTITION concurrently (or manage locks explicitly during low traffic)."
     }
 
-    fn evaluate(
-        &self,
-        mutation: &Mutation,
-        result: &MutationResult,
-        pre_state: &crate::analysis::state::PreState,
-        state: &AnalysisState,
-        config: &Config,
-        _cascade: Option<&CascadeResult>,
-    ) -> Vec<Violation> {
-        if *result == MutationResult::Skipped {
+    fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
+        if *context.result() == MutationResult::Skipped {
             return vec![];
         }
 
         let mut violations = Vec::new();
 
-        if let Mutation::AlterTable(alter) = mutation {
+        if let Mutation::AlterTable(alter) = context.mutation() {
             match &alter.action {
                 AlterTableActionMutation::AttachPartition { .. }
                 | AlterTableActionMutation::DetachPartition { .. } => {
                     let (is_temp, is_stale, rows, is_hash_partitioned) =
-                        match pre_state.relations.get(&alter.id) {
+                        match context.pre_state().relations.get(&alter.id) {
                             Some(rel) => {
-                                let stale =
-                                    rel.is_stale() && state.baseline_relations.contains(&alter.id);
+                                let stale = rel.is_stale()
+                                    && context.state().baseline_relations.contains(&alter.id);
                                 let is_hash = rel
                                     .partition_type
                                     .as_ref()
@@ -49,11 +40,11 @@ impl Rule for PartitionLockRule {
                                 (
                                     rel.persistence == Persistence::Temporary,
                                     stale,
-                                    rel.estimated_rows.unwrap_or(config.default_rows),
+                                    rel.estimated_rows.unwrap_or(context.config().default_rows),
                                     is_hash,
                                 )
                             }
-                            None => (false, true, config.default_rows, false),
+                            None => (false, true, context.config().default_rows, false),
                         };
 
                     if is_temp {
@@ -85,8 +76,8 @@ impl Rule for PartitionLockRule {
                         });
                     }
 
-                    let tier1_threshold = config.rule_tier1_threshold(self.id());
-                    let tier2_threshold = config.rule_tier2_threshold(self.id());
+                    let tier1_threshold = context.config().rule_tier1_threshold(self.id());
+                    let tier2_threshold = context.config().rule_tier2_threshold(self.id());
 
                     let (adjusted_tier1, adjusted_tier2) = if is_hash_partitioned {
                         (tier1_threshold / 2, tier2_threshold / 2)
@@ -157,25 +148,18 @@ impl Rule for PartitionStrategyMismatchRule {
         "Ensure the partition being attached matches the parent table's partition strategy (RANGE/LIST/HASH). Mismatched strategies will cause ATTACH PARTITION to fail."
     }
 
-    fn evaluate(
-        &self,
-        mutation: &Mutation,
-        result: &MutationResult,
-        pre_state: &crate::analysis::state::PreState,
-        _state: &AnalysisState,
-        _config: &Config,
-        _cascade: Option<&CascadeResult>,
-    ) -> Vec<Violation> {
-        if *result == MutationResult::Skipped {
+    fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
+        if *context.result() == MutationResult::Skipped {
             return vec![];
         }
 
         let mut violations = Vec::new();
 
-        if let Mutation::AlterTable(alter) = mutation
+        if let Mutation::AlterTable(alter) = context.mutation()
             && let AlterTableActionMutation::AttachPartition { child, strategy } = &alter.action
         {
-            let parent_partition_type = pre_state
+            let parent_partition_type = context
+                .pre_state()
                 .relations
                 .get(&alter.id)
                 .and_then(|rel| rel.partition_type.clone());
@@ -191,7 +175,8 @@ impl Rule for PartitionStrategyMismatchRule {
                         .to_string()
                 };
                 let parent_kind = normalized(&parent_type);
-                let child_kind = pre_state
+                let child_kind = context
+                    .pre_state()
                     .relations
                     .get(child)
                     .and_then(|rel| rel.partition_type.as_deref())

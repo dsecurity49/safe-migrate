@@ -1,8 +1,7 @@
 use crate::analysis::mutations::{AlterTableActionMutation, Mutation};
-use crate::analysis::state::{AnalysisState, CascadeResult, MutationResult};
-use crate::engine::config::Config;
+use crate::analysis::state::MutationResult;
 use crate::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
-use crate::rules::LegacyRule as Rule;
+use crate::rules::{Rule, RuleContext};
 
 pub const IRREVERSIBLE_MIGRATION_RULE_ID: &str = "irreversible-migration";
 
@@ -19,15 +18,12 @@ impl Rule for CascadingDropRule {
         "Avoid CASCADE on DROP TABLE in production. Handle dependencies explicitly."
     }
 
-    fn evaluate(
-        &self,
-        mutation: &Mutation,
-        result: &MutationResult,
-        pre_state: &crate::analysis::state::PreState,
-        state: &AnalysisState,
-        _config: &Config,
-        cascade_closure: Option<&CascadeResult>,
-    ) -> Vec<Violation> {
+    fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
+        let mutation = context.mutation();
+        let result = context.result();
+        let pre_state = context.pre_state();
+        let state = context.state();
+        let cascade_closure = context.cascade_closure();
         let mut violations = Vec::new();
 
         if !matches!(result, MutationResult::Conflict { .. })
@@ -117,15 +113,12 @@ impl Rule for SizeAwareAddColumnRule {
         "Adding a column with a default requires a table rewrite. For PG11+, constant defaults are safe. For volatiles or <PG11, use a multi-step backfill."
     }
 
-    fn evaluate(
-        &self,
-        mutation: &Mutation,
-        result: &MutationResult,
-        pre_state: &crate::analysis::state::PreState,
-        state: &AnalysisState,
-        config: &Config,
-        _cascade_closure: Option<&CascadeResult>,
-    ) -> Vec<Violation> {
+    fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
+        let mutation = context.mutation();
+        let result = context.result();
+        let pre_state = context.pre_state();
+        let state = context.state();
+        let config = context.config();
         if *result == MutationResult::Skipped {
             return vec![];
         }
@@ -242,15 +235,8 @@ impl Rule for DropDatabaseRule {
         "DROP DATABASE is an irreversible, high-blast-radius operation that destroys the entire database context."
     }
 
-    fn evaluate(
-        &self,
-        mutation: &Mutation,
-        _result: &MutationResult,
-        _pre_state: &crate::analysis::state::PreState,
-        _state: &AnalysisState,
-        _config: &Config,
-        _cascade: Option<&CascadeResult>,
-    ) -> Vec<Violation> {
+    fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
+        let mutation = context.mutation();
         if let Mutation::DropDatabase(d) = mutation {
             return vec![Violation {
                 source_range: None,
@@ -283,15 +269,8 @@ impl Rule for DropSchemaCascadeRule {
         "DROP SCHEMA ... CASCADE recursively destroys every object in the schema. Handle dependencies explicitly."
     }
 
-    fn evaluate(
-        &self,
-        mutation: &Mutation,
-        _result: &MutationResult,
-        _pre_state: &crate::analysis::state::PreState,
-        _state: &AnalysisState,
-        _config: &Config,
-        _cascade: Option<&CascadeResult>,
-    ) -> Vec<Violation> {
+    fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
+        let mutation = context.mutation();
         let mut violations = Vec::new();
 
         if let Mutation::DropSchema(drop) = mutation
@@ -329,15 +308,9 @@ impl Rule for CreateTableAsSelectRule {
         "CREATE TABLE AS SELECT can be extremely slow and resource-intensive on large datasets. Consider creating the table first and using INSERT INTO ... SELECT in batches."
     }
 
-    fn evaluate(
-        &self,
-        mutation: &Mutation,
-        result: &MutationResult,
-        _pre_state: &crate::analysis::state::PreState,
-        _state: &AnalysisState,
-        _config: &Config,
-        _cascade_closure: Option<&CascadeResult>,
-    ) -> Vec<Violation> {
+    fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
+        let mutation = context.mutation();
+        let result = context.result();
         if *result == MutationResult::Skipped {
             return vec![];
         }
@@ -396,15 +369,12 @@ impl Rule for ReversibilityRule {
         "This operation is irreversible. Ensure backups are available."
     }
 
-    fn evaluate(
-        &self,
-        mutation: &Mutation,
-        result: &MutationResult,
-        pre_state: &crate::analysis::state::PreState,
-        state: &AnalysisState,
-        config: &Config,
-        _cascade_closure: Option<&CascadeResult>,
-    ) -> Vec<Violation> {
+    fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
+        let mutation = context.mutation();
+        let result = context.result();
+        let pre_state = context.pre_state();
+        let state = context.state();
+        let config = context.config();
         let skipped_known_drop_column = *result == MutationResult::Skipped
             && matches!(
                 mutation,
@@ -645,15 +615,8 @@ impl Rule for GeneralCascadeRule {
         "Using CASCADE on DROP operations can silently delete dependent objects. Explicitly drop dependencies to avoid accidental data loss."
     }
 
-    fn evaluate(
-        &self,
-        mutation: &Mutation,
-        _result: &MutationResult,
-        _pre_state: &crate::analysis::state::PreState,
-        _state: &AnalysisState,
-        _config: &Config,
-        _cascade: Option<&CascadeResult>,
-    ) -> Vec<Violation> {
+    fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
+        let mutation = context.mutation();
         let cascade_info: Option<(OperationKind, ObjectKind, String)> = match mutation {
             Mutation::DropView(d) if d.cascade => Some((
                 OperationKind::DropView,
@@ -852,15 +815,12 @@ impl Rule for TypeChangeRewriteRule {
         "Changing this column type requires an ACCESS EXCLUSIVE table rewrite. Add a new column, backfill, and swap."
     }
 
-    fn evaluate(
-        &self,
-        mutation: &Mutation,
-        result: &MutationResult,
-        pre_state: &crate::analysis::state::PreState,
-        state: &AnalysisState,
-        config: &Config,
-        _cascade_closure: Option<&CascadeResult>,
-    ) -> Vec<Violation> {
+    fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
+        let mutation = context.mutation();
+        let result = context.result();
+        let pre_state = context.pre_state();
+        let state = context.state();
+        let config = context.config();
         // A skipped type change against a present relation can mean that the
         // baseline did not expose enough column/type evidence to mutate state.
         // Keep the rewrite warning conservative in that case; silently
