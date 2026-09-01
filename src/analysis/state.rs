@@ -3008,4 +3008,40 @@ mod evidence_tests {
             )
         }));
     }
+
+    #[test]
+    fn complete_baseline_fk_operator_evidence_reaches_graph_edge() {
+        let child = ObjectId::new("public", "child");
+        let parent = ObjectId::new("public", "parent");
+        let mut cache = DbCache::new();
+        cache.insert_baseline(
+            child.clone(),
+            table_with_columns(child.clone(), &["parent_id"]),
+        );
+        cache.insert_baseline(parent.clone(), table_with_columns(parent.clone(), &["id"]));
+        cache.foreign_keys.push(crate::db::cache::ForeignKeyCache {
+            constraint_name: "child_parent_fkey".into(),
+            from_table: child.clone(),
+            to_table: parent.clone(),
+            from_columns: vec!["parent_id".into()],
+            to_columns: vec!["id".into()],
+            pk_fk_equality_operators: vec!["pg_catalog.=(integer,integer)".into()],
+            pk_pk_equality_operators: vec!["pg_catalog.=(integer,integer)".into()],
+            fk_fk_equality_operators: vec!["pg_catalog.=(integer,integer)".into()],
+        });
+
+        let state = AnalysisState::with_baseline(cache, true);
+        assert_eq!(*state.confidence(), Confidence::Exact);
+        assert!(state.local.graph.edges().iter().any(|edge| {
+            edge.dependent == child
+                && edge.referenced == parent
+                && matches!(
+                    &edge.kind,
+                    DependencyKind::ForeignKey {
+                        operator_evidence: Some(evidence),
+                        ..
+                    } if evidence.pk_fk == ["pg_catalog.=(integer,integer)".to_string()]
+                )
+        }));
+    }
 }
