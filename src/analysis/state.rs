@@ -569,6 +569,7 @@ impl AnalysisState {
         let mut baseline_indexes = HashSet::new();
         let mut baseline_foreign_keys = HashSet::new();
         let mut baseline_fk_dependencies = HashSet::new();
+        let mut incomplete_fk_operator_evidence = false;
         let mut triggers = HashMap::new();
         let mut constraints = HashMap::new();
         let mut types = HashMap::new();
@@ -767,6 +768,16 @@ impl AnalysisState {
         }
         for fk in cache.foreign_keys {
             baseline_foreign_keys.insert((fk.from_table.clone(), fk.constraint_name.clone()));
+            let operator_evidence = if fk.has_complete_operator_evidence() {
+                Some(crate::analysis::graph::ForeignKeyOperatorEvidence {
+                    pk_fk: fk.pk_fk_equality_operators,
+                    pk_pk: fk.pk_pk_equality_operators,
+                    fk_fk: fk.fk_fk_equality_operators,
+                })
+            } else {
+                incomplete_fk_operator_evidence = true;
+                None
+            };
             graph.add_edge(DependencyEdge::new(
                 fk.from_table,
                 fk.to_table,
@@ -774,11 +785,7 @@ impl AnalysisState {
                     constraint_name: Some(fk.constraint_name),
                     from_columns: fk.from_columns,
                     to_columns: fk.to_columns,
-                    operator_evidence: Some(crate::analysis::graph::ForeignKeyOperatorEvidence {
-                        pk_fk: fk.pk_fk_equality_operators,
-                        pk_pk: fk.pk_pk_equality_operators,
-                        fk_fk: fk.fk_fk_equality_operators,
-                    }),
+                    operator_evidence,
                     from_generation: 0,
                 },
             ));
@@ -1072,6 +1079,12 @@ impl AnalysisState {
         };
         state.refresh_role_sensitive_search_path();
         state.local.default_search_path = state.local.search_path.clone();
+        if baseline_available && incomplete_fk_operator_evidence {
+            state.taint(
+                crate::analysis::evidence::EvidenceCode::CatalogCoverageIncomplete,
+                crate::analysis::evidence::EvidenceScope::Chain,
+            );
+        }
         state
     }
 
@@ -2953,6 +2966,46 @@ mod evidence_tests {
                         is_primary: true,
                     } if constraint_name == "parent_pkey" && columns == &["id"]
                 )
+        }));
+    }
+
+    #[test]
+    fn malformed_baseline_fk_operator_evidence_is_tainted_not_claimed_exact() {
+        let child = ObjectId::new("public", "child");
+        let parent = ObjectId::new("public", "parent");
+        let mut cache = DbCache::new();
+        cache.insert_baseline(
+            child.clone(),
+            table_with_columns(child.clone(), &["parent_id"]),
+        );
+        cache.insert_baseline(parent.clone(), table_with_columns(parent.clone(), &["id"]));
+        cache.foreign_keys.push(crate::db::cache::ForeignKeyCache {
+            constraint_name: "child_parent_fkey".into(),
+            from_table: child.clone(),
+            to_table: parent.clone(),
+            from_columns: vec!["parent_id".into()],
+            to_columns: vec!["id".into()],
+            pk_fk_equality_operators: Vec::new(),
+            pk_pk_equality_operators: vec!["=".into()],
+            fk_fk_equality_operators: vec!["=".into()],
+        });
+
+        let state = AnalysisState::with_baseline(cache, true);
+        assert_eq!(*state.confidence(), Confidence::Tainted);
+        assert!(
+            state
+                .evidence()
+                .iter()
+                .any(|record| record.code == EvidenceCode::CatalogCoverageIncomplete)
+        );
+        assert!(state.local.graph.edges().iter().any(|edge| {
+            matches!(
+                &edge.kind,
+                DependencyKind::ForeignKey {
+                    operator_evidence: None,
+                    ..
+                }
+            )
         }));
     }
 }

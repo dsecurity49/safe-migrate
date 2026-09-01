@@ -385,11 +385,12 @@ impl DbCacheVersioned {
             | DbCacheVersioned::V3
             | DbCacheVersioned::V4
             | DbCacheVersioned::V5(_)
-            | DbCacheVersioned::V6(_) => Err(
+            | DbCacheVersioned::V6(_)
+            | DbCacheVersioned::V7(_) => Err(
                 "This cache format is unsupported. Run `safe-migrate sync` to rebuild it."
                     .to_string(),
             ),
-            DbCacheVersioned::V7(c) | DbCacheVersioned::V8(c) => {
+            DbCacheVersioned::V8(c) => {
                 c.validate_semantics()?;
                 Ok(*c)
             }
@@ -1122,6 +1123,12 @@ mod tests {
         assert_eq!(v6.format_version(), 6);
         assert_eq!(
             v6.into_cache().unwrap_err(),
+            "This cache format is unsupported. Run `safe-migrate sync` to rebuild it."
+        );
+        let v7 = DbCacheVersioned::V7(Box::default());
+        assert_eq!(v7.format_version(), 7);
+        assert_eq!(
+            v7.into_cache().unwrap_err(),
             "This cache format is unsupported. Run `safe-migrate sync` to rebuild it."
         );
     }
