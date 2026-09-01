@@ -1,7 +1,9 @@
 use crate::analysis::mutations::{AlterTableActionMutation, Mutation};
 use crate::analysis::state::MutationResult;
 use crate::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
-use crate::rules::{Rule, RuleContext};
+use crate::rules::{
+    BASELINE_RELATION_CAPABILITIES, BASELINE_STATS_CAPABILITIES, Rule, RuleCapability, RuleContext,
+};
 
 pub const IRREVERSIBLE_MIGRATION_RULE_ID: &str = "irreversible-migration";
 
@@ -16,6 +18,10 @@ impl Rule for CascadingDropRule {
     }
     fn recipe(&self) -> &'static str {
         "Avoid CASCADE on DROP TABLE in production. Handle dependencies explicitly."
+    }
+
+    fn required_capabilities(&self) -> &'static [RuleCapability] {
+        BASELINE_RELATION_CAPABILITIES
     }
 
     fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
@@ -111,6 +117,10 @@ impl Rule for SizeAwareAddColumnRule {
     }
     fn recipe(&self) -> &'static str {
         "Adding a column with a default requires a table rewrite. For PG11+, constant defaults are safe. For volatiles or <PG11, use a multi-step backfill."
+    }
+
+    fn required_capabilities(&self) -> &'static [RuleCapability] {
+        BASELINE_STATS_CAPABILITIES
     }
 
     fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
@@ -367,6 +377,10 @@ impl Rule for ReversibilityRule {
     }
     fn recipe(&self) -> &'static str {
         "This operation is irreversible. Ensure backups are available."
+    }
+
+    fn required_capabilities(&self) -> &'static [RuleCapability] {
+        BASELINE_STATS_CAPABILITIES
     }
 
     fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
@@ -813,6 +827,10 @@ impl Rule for TypeChangeRewriteRule {
     }
     fn recipe(&self) -> &'static str {
         "Changing this column type requires an ACCESS EXCLUSIVE table rewrite. Add a new column, backfill, and swap."
+    }
+
+    fn required_capabilities(&self) -> &'static [RuleCapability] {
+        BASELINE_STATS_CAPABILITIES
     }
 
     fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {

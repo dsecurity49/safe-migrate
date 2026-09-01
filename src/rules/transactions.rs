@@ -1,6 +1,6 @@
 use crate::analysis::mutations::{AlterTypeActionMutation, Mutation};
 use crate::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
-use crate::rules::{Rule, RuleContext};
+use crate::rules::{Rule, RuleCapability, RuleContext, TRANSACTION_CAPABILITIES};
 
 pub struct ConcurrentInsideTransactionRule;
 
@@ -13,6 +13,10 @@ impl Rule for ConcurrentInsideTransactionRule {
     }
     fn recipe(&self) -> &'static str {
         "PostgreSQL does not allow CREATE/DROP INDEX CONCURRENTLY inside a transaction block (BEGIN/COMMIT)."
+    }
+
+    fn required_capabilities(&self) -> &'static [RuleCapability] {
+        TRANSACTION_CAPABILITIES
     }
 
     fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
@@ -75,6 +79,10 @@ impl Rule for AlterTypeAddValueRule {
         "Commit before later statements use the new enum value, or put the dependent work in a later migration."
     }
 
+    fn required_capabilities(&self) -> &'static [RuleCapability] {
+        TRANSACTION_CAPABILITIES
+    }
+
     fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
         if !context.state().local.transactions.is_empty()
             && let Mutation::AlterType(alter) = context.mutation()
@@ -112,6 +120,10 @@ impl Rule for VacuumFullRule {
     }
     fn recipe(&self) -> &'static str {
         "VACUUM FULL rewrites the entire table and requires an ACCESS EXCLUSIVE lock. Run this manually outside of migration pipelines."
+    }
+
+    fn required_capabilities(&self) -> &'static [RuleCapability] {
+        TRANSACTION_CAPABILITIES
     }
 
     fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {

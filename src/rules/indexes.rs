@@ -2,7 +2,7 @@ use crate::analysis::mutations::Mutation;
 use crate::analysis::state::MutationResult;
 use crate::model::relation::Persistence;
 use crate::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
-use crate::rules::{Rule, RuleContext};
+use crate::rules::{BASELINE_STATS_CAPABILITIES, Rule, RuleCapability, RuleContext};
 
 pub struct ConcurrentIndexRule;
 
@@ -15,6 +15,10 @@ impl Rule for ConcurrentIndexRule {
     }
     fn recipe(&self) -> &'static str {
         "Index operations block writes (or both reads and writes) when executed synchronously. Add the CONCURRENTLY keyword."
+    }
+
+    fn required_capabilities(&self) -> &'static [RuleCapability] {
+        BASELINE_STATS_CAPABILITIES
     }
 
     fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {

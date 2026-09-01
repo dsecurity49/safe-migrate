@@ -38,6 +38,27 @@ pub struct RuleContext<'a> {
     pub(crate) confidence: &'a Confidence,
 }
 
+/// Semantic state surfaces a rule must account for before claiming an exact
+/// result. Declarations are checked centrally so new rules cannot silently
+/// depend on an untracked part of the transition state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuleCapability {
+    BaselineRelations,
+    CatalogDependencies,
+    RowStatistics,
+    TransactionState,
+    FunctionCatalog,
+}
+
+pub(crate) const BASELINE_STATS_CAPABILITIES: &[RuleCapability] = &[
+    RuleCapability::BaselineRelations,
+    RuleCapability::RowStatistics,
+];
+pub(crate) const BASELINE_RELATION_CAPABILITIES: &[RuleCapability] =
+    &[RuleCapability::BaselineRelations];
+pub(crate) const FUNCTION_CAPABILITIES: &[RuleCapability] = &[RuleCapability::FunctionCatalog];
+pub(crate) const TRANSACTION_CAPABILITIES: &[RuleCapability] = &[RuleCapability::TransactionState];
+
 impl<'a> RuleContext<'a> {
     pub(crate) fn new(
         mutation: &'a Mutation,
@@ -98,6 +119,10 @@ pub trait Rule {
     fn id(&self) -> &'static str;
     fn default_tier(&self) -> ViolationTier;
     fn recipe(&self) -> &'static str;
+
+    fn required_capabilities(&self) -> &'static [RuleCapability] {
+        &[]
+    }
 
     fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation>;
 }

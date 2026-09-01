@@ -419,6 +419,38 @@ mod tests {
     }
 
     #[test]
+    fn stateful_rules_declare_their_required_capabilities() {
+        let expected: HashSet<_> = [
+            "irreversible-migration",
+            "destructive-cascade",
+            "size-aware-add-column",
+            "type-change-rewrite",
+            "blocking-constraint",
+            "require-concurrent-index",
+            "blocking-partition-mutation",
+            "partition-strategy-mismatch",
+            "function-volatility-change",
+            "broken-compute",
+            "concurrent-in-transaction",
+            "alter-type-add-value-txn",
+            "vacuum-full",
+            "schema-drift",
+        ]
+        .into_iter()
+        .collect();
+
+        for descriptor in PRIMARY_RULES {
+            let rule = descriptor.build();
+            assert_eq!(
+                !rule.required_capabilities().is_empty(),
+                expected.contains(descriptor.id),
+                "capability declaration mismatch for {}",
+                descriptor.id
+            );
+        }
+    }
+
+    #[test]
     fn threshold_validation_requires_tier1_at_or_above_tier2() {
         let globally_reversed = crate::engine::config::Config {
             tier1_threshold_rows: 9,

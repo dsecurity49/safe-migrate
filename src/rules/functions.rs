@@ -1,7 +1,7 @@
 use crate::analysis::mutations::Mutation;
 use crate::analysis::state::MutationResult;
 use crate::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
-use crate::rules::{Rule, RuleContext};
+use crate::rules::{FUNCTION_CAPABILITIES, Rule, RuleCapability, RuleContext};
 
 pub struct FunctionVolatilityRule;
 
@@ -14,6 +14,10 @@ impl Rule for FunctionVolatilityRule {
     }
     fn recipe(&self) -> &'static str {
         "Changing a function's volatility (e.g., IMMUTABLE -> VOLATILE) can invalidate existing indexes or change query plan stability."
+    }
+
+    fn required_capabilities(&self) -> &'static [RuleCapability] {
+        FUNCTION_CAPABILITIES
     }
 
     fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
@@ -77,6 +81,10 @@ impl Rule for BrokenComputeRule {
     }
     fn recipe(&self) -> &'static str {
         "Drop or replace the dependent triggers first. Use CASCADE only after reviewing every dependent object."
+    }
+
+    fn required_capabilities(&self) -> &'static [RuleCapability] {
+        FUNCTION_CAPABILITIES
     }
 
     fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {

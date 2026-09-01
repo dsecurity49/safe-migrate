@@ -2,7 +2,7 @@ use crate::analysis::mutations::{AlterTableActionMutation, Mutation};
 use crate::analysis::state::MutationResult;
 use crate::model::relation::Persistence;
 use crate::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
-use crate::rules::{Rule, RuleContext};
+use crate::rules::{BASELINE_STATS_CAPABILITIES, Rule, RuleCapability, RuleContext};
 
 pub struct BlockingConstraintRule;
 
@@ -15,6 +15,10 @@ impl Rule for BlockingConstraintRule {
     }
     fn recipe(&self) -> &'static str {
         "Adding a valid CHECK or FOREIGN KEY constraint takes an ACCESS EXCLUSIVE lock and scans the table. Add it as NOT VALID first, then VALIDATE it in a separate transaction."
+    }
+
+    fn required_capabilities(&self) -> &'static [RuleCapability] {
+        BASELINE_STATS_CAPABILITIES
     }
 
     fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {

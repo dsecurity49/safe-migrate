@@ -2,7 +2,7 @@ use crate::analysis::mutations::{AlterTableActionMutation, Mutation};
 use crate::analysis::state::MutationResult;
 use crate::model::relation::Persistence;
 use crate::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
-use crate::rules::{Rule, RuleContext};
+use crate::rules::{BASELINE_STATS_CAPABILITIES, Rule, RuleCapability, RuleContext};
 
 pub struct PartitionLockRule;
 
@@ -15,6 +15,10 @@ impl Rule for PartitionLockRule {
     }
     fn recipe(&self) -> &'static str {
         "Attaching or detaching partitions takes an ACCESS EXCLUSIVE lock on the parent table. Run ATTACH PARTITION concurrently (or manage locks explicitly during low traffic)."
+    }
+
+    fn required_capabilities(&self) -> &'static [RuleCapability] {
+        BASELINE_STATS_CAPABILITIES
     }
 
     fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
@@ -146,6 +150,10 @@ impl Rule for PartitionStrategyMismatchRule {
     }
     fn recipe(&self) -> &'static str {
         "Ensure the partition being attached matches the parent table's partition strategy (RANGE/LIST/HASH). Mismatched strategies will cause ATTACH PARTITION to fail."
+    }
+
+    fn required_capabilities(&self) -> &'static [RuleCapability] {
+        crate::rules::BASELINE_RELATION_CAPABILITIES
     }
 
     fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {

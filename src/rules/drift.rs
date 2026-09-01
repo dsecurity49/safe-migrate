@@ -1,7 +1,7 @@
 use crate::analysis::mutations::Mutation;
 use crate::ast::identifiers::ObjectId;
 use crate::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
-use crate::rules::{Rule, RuleContext};
+use crate::rules::{BASELINE_RELATION_CAPABILITIES, Rule, RuleCapability, RuleContext};
 
 pub struct DriftDetectionRule;
 
@@ -14,6 +14,10 @@ impl Rule for DriftDetectionRule {
     }
     fn recipe(&self) -> &'static str {
         "This migration references a database object that does not exist in the production baseline. If this object exists in production, sync the cache with `safe-migrate sync`. If it does not, this migration may fail."
+    }
+
+    fn required_capabilities(&self) -> &'static [RuleCapability] {
+        BASELINE_RELATION_CAPABILITIES
     }
 
     fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
