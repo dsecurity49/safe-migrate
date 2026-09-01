@@ -499,7 +499,7 @@ mod architectural_gap_tests {
         let mut state = setup_state();
 
         // Attempting to attach 'a' as a partition of 'b', while 'b' is a partition of 'a'
-        engine
+        let findings = engine
             .analyze(
                 "
             CREATE TABLE a(id int) PARTITION BY RANGE(id);
@@ -510,12 +510,18 @@ mod architectural_gap_tests {
             )
             .unwrap();
 
-        // The cycle detector should catch the infinite loop and gracefully degrade
-        // to an Opaque/DynamicSql mutation, tainting the engine rather than stack-overflowing.
+        // A modeled, impossible topology is a deterministic PostgreSQL-style
+        // conflict, not unknown semantics. It must neither apply nor taint the
+        // following chain state.
         assert_eq!(
             state.local.confidence,
-            Confidence::Tainted,
-            "Partition cycle should taint the engine"
+            Confidence::Exact,
+            "partition cycle conflict must not taint the engine"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict")
         );
     }
 

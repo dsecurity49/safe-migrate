@@ -1,3 +1,5 @@
+use crate::analysis::evidence::EvidenceRecord;
+use crate::analysis::outcome::AnalysisOutcome;
 use crate::analysis::state::Confidence;
 use crate::report::violations::{ReportFinding, Violation, ViolationTier};
 use crate::rules::destructive::IRREVERSIBLE_MIGRATION_RULE_ID;
@@ -91,7 +93,7 @@ fn terminal_width() -> usize {
 pub struct Reporter;
 
 impl Reporter {
-    pub const JSON_SCHEMA_VERSION: u32 = 1;
+    pub const JSON_SCHEMA_VERSION: u32 = 2;
 
     pub fn json_report(violations: &[Violation], confidence: &Confidence) -> serde_json::Value {
         let verdict = compute_verdict(violations);
@@ -120,8 +122,20 @@ impl Reporter {
                 "tier2": tier2,
                 "tier3": tier3,
             },
+            "evidence": [],
             "violations": violations,
         })
+    }
+
+    /// Serialize a complete immutable analysis outcome. Schema v2 adds stable
+    /// evidence alongside the existing finding contract.
+    pub fn json_outcome_with_locations(
+        outcome: &AnalysisOutcome<ReportFinding>,
+    ) -> serde_json::Value {
+        let mut report = Self::json_report_with_locations(&outcome.findings, &outcome.confidence);
+        report["evidence"] = serde_json::to_value(&outcome.evidence)
+            .expect("analysis evidence is always serializable");
+        report
     }
 
     /// Additive JSON rendering that includes file/line locations when analysis
@@ -249,6 +263,13 @@ impl Reporter {
                 output.push_str(&markdown_sql_block(sql.trim()));
             }
         }
+        output
+    }
+
+    /// Render findings and structured conservative-analysis evidence.
+    pub fn markdown_outcome(outcome: &AnalysisOutcome<ReportFinding>) -> String {
+        let mut output = Self::markdown_report(&outcome.findings, &outcome.confidence);
+        append_markdown_evidence(&mut output, &outcome.evidence);
         output
     }
 
@@ -413,6 +434,55 @@ impl Reporter {
 
         Self::should_halt(violations)
     }
+
+    /// Print findings and a compact, deterministic evidence summary.
+    pub fn print_outcome(outcome: &AnalysisOutcome<ReportFinding>) -> bool {
+        let violations: Vec<_> = outcome
+            .findings
+            .iter()
+            .map(|finding| finding.violation.clone())
+            .collect();
+        let should_halt = Self::print_report(&violations, &outcome.confidence);
+        if !outcome.evidence.is_empty() {
+            println!("Analysis evidence:");
+            for evidence in &outcome.evidence {
+                let location = evidence
+                    .location
+                    .as_ref()
+                    .map_or_else(String::new, |location| {
+                        format!(
+                            " ({} statement {})",
+                            location.file, location.statement_index
+                        )
+                    });
+                println!("  - {}{}", evidence.summary, location);
+            }
+            println!();
+        }
+        should_halt
+    }
+}
+
+fn append_markdown_evidence(output: &mut String, evidence: &[EvidenceRecord]) {
+    if evidence.is_empty() {
+        return;
+    }
+    output.push_str("\n## Analysis evidence\n");
+    for record in evidence {
+        output.push_str(&format!(
+            "\n- `{}`: {}",
+            record.code.as_str(),
+            record.summary
+        ));
+        if let Some(location) = &record.location {
+            output.push_str(&format!(
+                " ({} statement {})",
+                markdown_code(&location.file),
+                location.statement_index
+            ));
+        }
+    }
+    output.push('\n');
 }
 
 fn markdown_tier_label(tier: &ViolationTier) -> &'static str {

@@ -1037,6 +1037,10 @@ impl AstVisitor {
                     .expr()
                     .map(crate::analysis::expr_visitor::ExprVisitor::convert),
             }),
+            AlterColumnOption::DropDefault(_) => Some(AlterTableActionFact::SetDefault {
+                column: col_name,
+                default: None,
+            }),
             AlterColumnOption::SetExpression(se) => Some(AlterTableActionFact::SetExpression {
                 column: col_name,
                 expr: se
@@ -1393,6 +1397,44 @@ impl AstVisitor {
 
         let has_predicate = node.where_clause().is_some();
         let unique = node.unique_token().is_some();
+        let included_columns = node
+            .index_include_clause()
+            .and_then(|include| include.partition_item_list())
+            .into_iter()
+            .flat_map(|items| items.partition_items())
+            .filter_map(|item| match item.expr() {
+                Some(ast::Expr::NameRef(name)) => Some(Self::resolve_identifier_token(name.text())),
+                _ => None,
+            })
+            .collect();
+        let mut key_columns = Vec::new();
+        let mut has_expression_keys = false;
+        let mut has_default_sort_order = true;
+        let mut has_default_opclasses = true;
+        let mut has_default_collations = true;
+        for item in node
+            .syntax()
+            .children()
+            .find_map(ast::PartitionItemList::cast)
+            .into_iter()
+            .flat_map(|items| items.partition_items())
+        {
+            if item.sort_order().is_some() || item.nulls_order().is_some() {
+                has_default_sort_order = false;
+            }
+            if item.op_class_ref().is_some() {
+                has_default_opclasses = false;
+            }
+            if item.collate().is_some() {
+                has_default_collations = false;
+            }
+            match item.expr() {
+                Some(ast::Expr::NameRef(name)) => {
+                    key_columns.push(Self::resolve_identifier_token(name.text()));
+                }
+                _ => has_expression_keys = true,
+            }
+        }
 
         Some(StatementFact::CreateIndex {
             name: QualifiedName::new(None, index_ident),
@@ -1402,6 +1444,12 @@ impl AstVisitor {
             using_method,
             has_predicate,
             unique,
+            key_columns,
+            included_columns,
+            has_expression_keys,
+            has_default_sort_order,
+            has_default_opclasses,
+            has_default_collations,
         })
     }
 

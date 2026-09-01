@@ -590,6 +590,7 @@ mod transaction_lifecycle_tests {
                 referenced: t1_id.clone(),
                 kind: safe_migrate::analysis::graph::DependencyKind::ViewDependency {
                     view_generation: 0,
+                    referenced_column: None,
                 },
             });
 

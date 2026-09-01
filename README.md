@@ -126,7 +126,7 @@ Machine-readable output, confidence values, and exit codes are defined in the
 
 `safe-migrate rules` lists rule IDs, tiers, remediation, supported
 configuration fields, and effective settings. Rule discovery JSON uses schema
-version 2; lint JSON uses schema version 1.
+version 2; lint JSON uses schema version 2.
 
 ```bash
 safe-migrate rules
@@ -166,7 +166,7 @@ Reports also include confidence:
 | Confidence | Meaning |
 | --- | --- |
 | `Exact` | Analysis stayed consistent with the supplied SQL and baseline. |
-| `Tainted` | Baseline evidence or modeled state is incomplete or uncertain. |
+| `Tainted` | Baseline evidence or modeled state is incomplete or uncertain; JSON and Markdown reports list the reason and, when available, its statement. |
 
 `Exact` means exact relative to the modeled evidence; it is not a production
 deployment guarantee.

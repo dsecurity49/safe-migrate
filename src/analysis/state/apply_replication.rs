@@ -1,4 +1,5 @@
-use super::{AnalysisState, Confidence, MutationResult, ObjectLookup};
+use super::{AnalysisState, MutationResult, ObjectLookup};
+use crate::analysis::evidence::{EvidenceCode, EvidenceScope};
 use crate::analysis::graph::{DependencyEdge, DependencyKind};
 use crate::analysis::mutations::{
     AlterPublicationMutation, AlterSubscriptionMutation, CreatePublicationMutation,
@@ -41,8 +42,7 @@ impl AnalysisState {
                 };
             }
             PublicationLookup::Unknown => {
-                self.snapshot_confidence();
-                self.local.confidence = Confidence::Tainted;
+                self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
             }
             PublicationLookup::Tombstone | PublicationLookup::AuthoritativelyAbsent => {}
             PublicationLookup::WrongKind => {
@@ -105,8 +105,7 @@ impl AnalysisState {
                 };
             }
             PublicationLookup::Unknown => {
-                self.snapshot_confidence();
-                self.local.confidence = Confidence::Tainted;
+                self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
                 return MutationResult::Skipped;
             }
             PublicationLookup::WrongKind => {
@@ -125,8 +124,7 @@ impl AnalysisState {
                     };
                 }
                 PublicationLookup::Unknown => {
-                    self.snapshot_confidence();
-                    self.local.confidence = Confidence::Tainted;
+                    self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
                     return MutationResult::Skipped;
                 }
                 PublicationLookup::Tombstone
@@ -242,8 +240,10 @@ impl AnalysisState {
                 if let Some((owner, known)) = self.role_fact_identity(role) {
                     if known {
                         if !self.local.roles_known {
-                            self.snapshot_confidence();
-                            self.local.confidence = Confidence::Tainted;
+                            self.taint(
+                                EvidenceCode::CatalogCoverageIncomplete,
+                                EvidenceScope::Chain,
+                            );
                         }
                         if let Some(crate::model::replication::PublicationOverlay::Present(
                             publication,
@@ -252,8 +252,7 @@ impl AnalysisState {
                             publication.owner = Some(owner);
                         }
                     } else {
-                        self.snapshot_confidence();
-                        self.local.confidence = Confidence::Tainted;
+                        self.taint(EvidenceCode::UnresolvedReference, EvidenceScope::Chain);
                         if let Some(crate::model::replication::PublicationOverlay::Present(
                             publication,
                         )) = self.local.publications.get_mut(&p.name)
@@ -262,8 +261,7 @@ impl AnalysisState {
                         }
                     }
                 } else {
-                    self.snapshot_confidence();
-                    self.local.confidence = Confidence::Tainted;
+                    self.taint(EvidenceCode::UnresolvedReference, EvidenceScope::Chain);
                     if let Some(crate::model::replication::PublicationOverlay::Present(
                         publication,
                     )) = self.local.publications.get_mut(&p.name)
@@ -332,8 +330,7 @@ impl AnalysisState {
                 }
                 PublicationLookup::AuthoritativelyAbsent if p.if_exists => {}
                 PublicationLookup::Unknown if p.if_exists => {
-                    self.snapshot_confidence();
-                    self.local.confidence = Confidence::Tainted;
+                    self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
                     unknown_target = true;
                 }
                 PublicationLookup::AuthoritativelyAbsent => {
@@ -342,8 +339,7 @@ impl AnalysisState {
                     };
                 }
                 PublicationLookup::Unknown => {
-                    self.snapshot_confidence();
-                    self.local.confidence = Confidence::Tainted;
+                    self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
                     return MutationResult::Skipped;
                 }
                 PublicationLookup::WrongKind => {
@@ -385,8 +381,7 @@ impl AnalysisState {
                 };
             }
             SubscriptionLookup::Unknown => {
-                self.snapshot_confidence();
-                self.local.confidence = Confidence::Tainted;
+                self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
             }
             SubscriptionLookup::Tombstone | SubscriptionLookup::AuthoritativelyAbsent => {}
             SubscriptionLookup::WrongKind => {
@@ -442,8 +437,7 @@ impl AnalysisState {
         let generation = self.local.generation_counter;
 
         if connects_to_publisher {
-            self.snapshot_confidence();
-            self.local.confidence = Confidence::Tainted;
+            self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
         }
 
         let enabled = connects_to_publisher
@@ -509,8 +503,7 @@ impl AnalysisState {
                 };
             }
             SubscriptionLookup::Unknown => {
-                self.snapshot_confidence();
-                self.local.confidence = Confidence::Tainted;
+                self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
                 return MutationResult::Skipped;
             }
             SubscriptionLookup::WrongKind => {
@@ -527,8 +520,7 @@ impl AnalysisState {
                     };
                 }
                 SubscriptionLookup::Unknown => {
-                    self.snapshot_confidence();
-                    self.local.confidence = Confidence::Tainted;
+                    self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
                     return MutationResult::Skipped;
                 }
                 SubscriptionLookup::Tombstone
@@ -716,8 +708,7 @@ impl AnalysisState {
                     subscription.connection =
                         crate::analysis::facts::ConnectionTarget::Server(server.clone());
                 }
-                self.snapshot_confidence();
-                self.local.confidence = Confidence::Tainted;
+                self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
             }
             AlterSubscriptionActionFact::Publications {
                 mode,
@@ -727,8 +718,7 @@ impl AnalysisState {
                 let refreshes =
                     Self::subscription_boolean_option(Some(params), "refresh") != Some(false);
                 if refreshes {
-                    self.snapshot_confidence();
-                    self.local.confidence = Confidence::Tainted;
+                    self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
                 }
                 if let Some(crate::model::replication::SubscriptionOverlay::Present(subscription)) =
                     self.local.subscriptions.get_mut(&s.name)
@@ -751,8 +741,7 @@ impl AnalysisState {
                 }
             }
             AlterSubscriptionActionFact::RefreshPublication(_) => {
-                self.snapshot_confidence();
-                self.local.confidence = Confidence::Tainted;
+                self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
             }
             AlterSubscriptionActionFact::SetEnabled(enabled) => {
                 if let Some(crate::model::replication::SubscriptionOverlay::Present(subscription)) =
@@ -789,8 +778,10 @@ impl AnalysisState {
                 if let Some((owner, known)) = self.role_fact_identity(role) {
                     if known {
                         if !self.local.roles_known {
-                            self.snapshot_confidence();
-                            self.local.confidence = Confidence::Tainted;
+                            self.taint(
+                                EvidenceCode::CatalogCoverageIncomplete,
+                                EvidenceScope::Chain,
+                            );
                         }
                         if let Some(crate::model::replication::SubscriptionOverlay::Present(
                             subscription,
@@ -799,8 +790,7 @@ impl AnalysisState {
                             subscription.owner = Some(owner);
                         }
                     } else {
-                        self.snapshot_confidence();
-                        self.local.confidence = Confidence::Tainted;
+                        self.taint(EvidenceCode::UnresolvedReference, EvidenceScope::Chain);
                         if let Some(crate::model::replication::SubscriptionOverlay::Present(
                             subscription,
                         )) = self.local.subscriptions.get_mut(&s.name)
@@ -809,8 +799,7 @@ impl AnalysisState {
                         }
                     }
                 } else {
-                    self.snapshot_confidence();
-                    self.local.confidence = Confidence::Tainted;
+                    self.taint(EvidenceCode::UnresolvedReference, EvidenceScope::Chain);
                     if let Some(crate::model::replication::SubscriptionOverlay::Present(
                         subscription,
                     )) = self.local.subscriptions.get_mut(&s.name)
@@ -873,8 +862,7 @@ impl AnalysisState {
                 return MutationResult::Skipped;
             }
             SubscriptionLookup::Unknown => {
-                self.snapshot_confidence();
-                self.local.confidence = Confidence::Tainted;
+                self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
                 return MutationResult::Skipped;
             }
             SubscriptionLookup::WrongKind => {
@@ -889,8 +877,7 @@ impl AnalysisState {
                 ),
             };
         }
-        self.snapshot_confidence();
-        self.local.confidence = Confidence::Tainted;
+        self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
         self.snapshot_subscription(&s.name);
         self.local.subscriptions.insert(
             s.name.clone(),

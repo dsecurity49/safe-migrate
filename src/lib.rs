@@ -12,6 +12,7 @@ pub mod sync_tests;
 pub(crate) mod test_support;
 
 pub use analysis::state::AnalysisState;
+pub use analysis::{evidence, outcome};
 pub use db::cache::DbCache;
 pub use engine::config::Config;
 pub use engine::engine::SafeMigrateEngine;

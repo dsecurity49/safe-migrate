@@ -1,4 +1,5 @@
-use super::{AnalysisState, Confidence, MutationResult, ObjectLookup, RelationOverlay};
+use super::{AnalysisState, MutationResult, ObjectLookup, RelationOverlay};
+use crate::analysis::evidence::{EvidenceCode, EvidenceScope};
 use crate::analysis::expr_ir::ExprIr;
 use crate::analysis::graph::{DependencyEdge, DependencyKind};
 use crate::analysis::mutations::{
@@ -47,7 +48,7 @@ impl AnalysisState {
         .any(|candidate| candidate == &value)
     }
 
-    fn expression_references_sequence(expression: &ExprIr, sequence: &ObjectId) -> bool {
+    pub(super) fn expression_references_sequence(expression: &ExprIr, sequence: &ObjectId) -> bool {
         match expression {
             ExprIr::FunctionCall { name, args } => {
                 let is_nextval = name
@@ -69,6 +70,22 @@ impl AnalysisState {
             }
             ExprIr::Cast { expr, .. } => Self::expression_references_sequence(expr, sequence),
             ExprIr::ColumnRef(_) | ExprIr::Omitted => false,
+        }
+    }
+
+    pub(super) fn expression_contains_nextval(expression: &ExprIr) -> bool {
+        match expression {
+            ExprIr::FunctionCall { name, args } => {
+                name.rsplit('.')
+                    .next()
+                    .is_some_and(|name| name.eq_ignore_ascii_case("nextval"))
+                    || args.iter().any(Self::expression_contains_nextval)
+            }
+            ExprIr::BinaryOp { left, right, .. } => {
+                Self::expression_contains_nextval(left) || Self::expression_contains_nextval(right)
+            }
+            ExprIr::Cast { expr, .. } => Self::expression_contains_nextval(expr),
+            ExprIr::Literal(_) | ExprIr::ColumnRef(_) | ExprIr::Omitted => false,
         }
     }
 
@@ -99,6 +116,34 @@ impl AnalysisState {
         kind: SequenceKind,
         owned_by: Option<(ObjectId, String)>,
     ) {
+        // Synchronized defaults carry an exact catalog dependency. Prefer it
+        // over rendering-dependent `pg_get_expr` text: an unqualified
+        // `regclass` literal can name a same-named sequence in a different
+        // schema under the recorded search path.
+        let typed_default_columns = self
+            .local
+            .graph
+            .edges()
+            .iter()
+            .filter(|edge| {
+                matches!(edge.kind, DependencyKind::ColumnDefaultOnSequence { .. })
+                    && self.local.graph.resolve_rename(&edge.referenced) == sequence
+            })
+            .map(|edge| match &edge.kind {
+                DependencyKind::ColumnDefaultOnSequence { column } => (
+                    self.local.graph.resolve_rename(&edge.dependent),
+                    column.clone(),
+                ),
+                _ => unreachable!("filtered default dependency"),
+            })
+            .collect::<Vec<_>>();
+        let has_typed_default_evidence = self
+            .local
+            .graph
+            .edges()
+            .iter()
+            .any(|edge| matches!(edge.kind, DependencyKind::ColumnDefaultOnSequence { .. }));
+
         let relation_ids = self
             .local
             .relations
@@ -118,13 +163,16 @@ impl AnalysisState {
                     && owned_by
                         .as_ref()
                         .is_some_and(|(table, name)| table == &relation_id && name == &column.name);
-                let references_sequence =
-                    column.default.as_ref().is_some_and(|default| {
+                let typed_dependency = typed_default_columns
+                    .iter()
+                    .any(|(table, name)| *table == &relation_id && name == &column.name);
+                let references_sequence = !has_typed_default_evidence
+                    && (column.default.as_ref().is_some_and(|default| {
                         Self::expression_references_sequence(default, sequence)
                     }) || column.default_expr_text.as_deref().is_some_and(|default| {
                         Self::raw_default_references_sequence(default, sequence)
-                    });
-                if generated_default || references_sequence {
+                    }));
+                if generated_default || typed_dependency || references_sequence {
                     columns_to_clear.push((relation_id.clone(), column.name.clone()));
                 }
             }
@@ -204,8 +252,7 @@ impl AnalysisState {
                     };
                 }
                 _ => {
-                    self.snapshot_confidence();
-                    self.local.confidence = Confidence::Tainted;
+                    self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
                     return MutationResult::Skipped;
                 }
             }
@@ -261,8 +308,7 @@ impl AnalysisState {
             }
             SequenceLookup::Tombstone if alter.if_exists => return MutationResult::Skipped,
             SequenceLookup::Tombstone | SequenceLookup::Unknown => {
-                self.snapshot_confidence();
-                self.local.confidence = Confidence::Tainted;
+                self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
                 return MutationResult::Skipped;
             }
             SequenceLookup::WrongKind => unreachable!("sequence lookup has no kind predicate"),
@@ -342,8 +388,7 @@ impl AnalysisState {
                     };
                 }
                 let Some((owner_name, known)) = self.role_fact_identity(owner) else {
-                    self.snapshot_confidence();
-                    self.local.confidence = Confidence::Tainted;
+                    self.taint(EvidenceCode::UnresolvedReference, EvidenceScope::Chain);
                     return MutationResult::Skipped;
                 };
                 if known && self.local.roles_known && self.present_role(&owner_name).is_none() {
@@ -352,8 +397,10 @@ impl AnalysisState {
                     };
                 }
                 if known && !self.local.roles_known {
-                    self.snapshot_confidence();
-                    self.local.confidence = Confidence::Tainted;
+                    self.taint(
+                        EvidenceCode::CatalogCoverageIncomplete,
+                        EvidenceScope::Chain,
+                    );
                 }
                 if let Some((table_id, _)) = &current.owned_by {
                     if let Err(result) = self.ensure_relation_target(
@@ -428,8 +475,7 @@ impl AnalysisState {
             AlterSequenceActionMutation::Other => {
                 // No typed state transition exists for this Squawk action;
                 // retaining Applied would make subsequent analysis look exact.
-                self.snapshot_confidence();
-                self.local.confidence = Confidence::Tainted;
+                self.taint(EvidenceCode::UnsupportedSemantics, EvidenceScope::Chain);
                 MutationResult::Skipped
             }
         }
@@ -450,8 +496,7 @@ impl AnalysisState {
                     // IF EXISTS cannot prove that an out-of-scope object is
                     // absent.  Do not apply the other targets and then claim
                     // an exact state transition.
-                    self.snapshot_confidence();
-                    self.local.confidence = Confidence::Tainted;
+                    self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
                     return MutationResult::Skipped;
                 }
                 SequenceLookup::WrongKind => {
@@ -477,7 +522,13 @@ impl AnalysisState {
                     reason: format!("cannot drop identity sequence '{}' independently", id),
                 };
             }
-            if sequence.kind == SequenceKind::SerialLike && !drop.cascade {
+            let has_default_dependencies = self.local.graph.edges().iter().any(|edge| {
+                edge.referenced == *id
+                    && matches!(edge.kind, DependencyKind::ColumnDefaultOnSequence { .. })
+            });
+            if (sequence.kind == SequenceKind::SerialLike || has_default_dependencies)
+                && !drop.cascade
+            {
                 return MutationResult::Conflict {
                     reason: format!("sequence '{}' still has dependent defaults", id),
                 };
@@ -509,9 +560,10 @@ impl AnalysisState {
                 .insert(id.clone(), SequenceOverlay::Dropped);
         }
         self.snapshot_graph_full();
-        self.local.graph.retain_edges(|edge| {
-            !(matches!(edge.kind, DependencyKind::SequenceOwnedBy { .. })
-                && present.contains(&edge.dependent))
+        self.local.graph.retain_edges(|edge| !match edge.kind {
+            DependencyKind::SequenceOwnedBy { .. } => present.contains(&edge.dependent),
+            DependencyKind::ColumnDefaultOnSequence { .. } => present.contains(&edge.referenced),
+            _ => false,
         });
         MutationResult::Applied
     }

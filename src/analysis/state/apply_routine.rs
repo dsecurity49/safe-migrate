@@ -1,4 +1,5 @@
-use super::{AnalysisState, Confidence, MutationResult, ObjectLookup, RelationOverlay};
+use super::{AnalysisState, MutationResult, ObjectLookup, RelationOverlay};
+use crate::analysis::evidence::{EvidenceCode, EvidenceScope};
 use crate::analysis::facts::{
     AlterFunctionAction, FuncOptionFact, ParamModeFact, RetTypeFact, SecurityKind, VolatilityKind,
 };
@@ -63,8 +64,7 @@ impl AnalysisState {
                 };
             }
             RoutineLookup::Unknown => {
-                self.snapshot_confidence();
-                self.local.confidence = Confidence::Tainted;
+                self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
             }
             _ => {}
         }
@@ -109,8 +109,7 @@ impl AnalysisState {
             // current rules.  Keep the useful identity/volatility fields, but
             // taint the state when PostgreSQL attributes such as STRICT,
             // PARALLEL, COST, or SUPPORT cannot be represented.
-            self.snapshot_confidence();
-            self.local.confidence = Confidence::Tainted;
+            self.taint(EvidenceCode::UnsupportedSemantics, EvidenceScope::Chain);
         }
 
         self.local.functions.insert(
@@ -181,8 +180,7 @@ impl AnalysisState {
                 };
             }
             RoutineLookup::Unknown => {
-                self.snapshot_confidence();
-                self.local.confidence = Confidence::Tainted;
+                self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
                 return MutationResult::Skipped;
             }
         }
@@ -216,8 +214,7 @@ impl AnalysisState {
                     }
                 }
                 if options.iter().any(Self::function_option_unmodeled) {
-                    self.snapshot_confidence();
-                    self.local.confidence = Confidence::Tainted;
+                    self.taint(EvidenceCode::UnsupportedSemantics, EvidenceScope::Chain);
                 }
             }
             AlterFunctionAction::Rename { to, .. } => {
@@ -246,8 +243,7 @@ impl AnalysisState {
                 // Ownership and extension dependencies are not represented
                 // by FunctionState, so retaining Applied would overstate the
                 // precision of subsequent dependency checks.
-                self.snapshot_confidence();
-                self.local.confidence = Confidence::Tainted;
+                self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
                 return MutationResult::Skipped;
             }
         }
@@ -291,8 +287,7 @@ impl AnalysisState {
                     };
                 }
                 RoutineLookup::Unknown => {
-                    self.snapshot_confidence();
-                    self.local.confidence = Confidence::Tainted;
+                    self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
                     return MutationResult::Skipped;
                 }
                 RoutineLookup::Present => {
@@ -391,8 +386,7 @@ impl AnalysisState {
                 };
             }
             RoutineLookup::Unknown => {
-                self.snapshot_confidence();
-                self.local.confidence = Confidence::Tainted;
+                self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
             }
             RoutineLookup::Tombstone | RoutineLookup::AuthoritativelyAbsent => {}
         }
@@ -440,8 +434,7 @@ impl AnalysisState {
             // but their AS body and other function options are not retained.
             // Preserve the useful attributes while making the uncertainty
             // visible to downstream verdicts.
-            self.snapshot_confidence();
-            self.local.confidence = Confidence::Tainted;
+            self.taint(EvidenceCode::UnsupportedSemantics, EvidenceScope::Chain);
         }
 
         self.local.functions.insert(
@@ -488,8 +481,7 @@ impl AnalysisState {
                 };
             }
             RoutineLookup::Unknown => {
-                self.snapshot_confidence();
-                self.local.confidence = Confidence::Tainted;
+                self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
                 return MutationResult::Skipped;
             }
         }
@@ -516,8 +508,7 @@ impl AnalysisState {
                 self.move_function(&procedure.id, &new_id);
             }
             _ => {
-                self.snapshot_confidence();
-                self.local.confidence = Confidence::Tainted;
+                self.taint(EvidenceCode::UnsupportedSemantics, EvidenceScope::Chain);
                 return MutationResult::Skipped;
             }
         }
@@ -560,8 +551,7 @@ impl AnalysisState {
                     };
                 }
                 RoutineLookup::Unknown => {
-                    self.snapshot_confidence();
-                    self.local.confidence = Confidence::Tainted;
+                    self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
                     return MutationResult::Skipped;
                 }
                 RoutineLookup::AuthoritativelyAbsent => {}
@@ -595,8 +585,7 @@ impl AnalysisState {
                 };
             }
             RoutineLookup::Unknown => {
-                self.snapshot_confidence();
-                self.local.confidence = Confidence::Tainted;
+                self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
             }
             RoutineLookup::Tombstone | RoutineLookup::AuthoritativelyAbsent => {}
         }
@@ -604,8 +593,7 @@ impl AnalysisState {
         // related catalog dependencies) are not carried by this mutation.
         // Keep the routine identity for conservative lookup, but never claim
         // the resulting aggregate state is exact.
-        self.snapshot_confidence();
-        self.local.confidence = Confidence::Tainted;
+        self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
         self.snapshot_function(&aggregate.id);
         self.local.functions.insert(
             aggregate.id.clone(),
@@ -651,8 +639,7 @@ impl AnalysisState {
                 };
             }
             RoutineLookup::Unknown => {
-                self.snapshot_confidence();
-                self.local.confidence = Confidence::Tainted;
+                self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
                 return MutationResult::Skipped;
             }
         }
@@ -678,8 +665,7 @@ impl AnalysisState {
                 self.move_function(&aggregate.id, &new_id);
             }
             AlterFunctionAction::OwnerChange(_) => {
-                self.snapshot_confidence();
-                self.local.confidence = Confidence::Tainted;
+                self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
                 return MutationResult::Skipped;
             }
             _ => unreachable!("aggregate extraction only emits rename, owner, or schema"),
@@ -719,8 +705,7 @@ impl AnalysisState {
                     };
                 }
                 RoutineLookup::Unknown => {
-                    self.snapshot_confidence();
-                    self.local.confidence = Confidence::Tainted;
+                    self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
                     return MutationResult::Skipped;
                 }
             }
@@ -732,8 +717,7 @@ impl AnalysisState {
                 .insert(id.clone(), FunctionOverlay::Dropped);
         }
         if aggregate.cascade && !targets.is_empty() {
-            self.snapshot_confidence();
-            self.local.confidence = Confidence::Tainted;
+            self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
         }
         if !targets.is_empty() {
             MutationResult::Applied

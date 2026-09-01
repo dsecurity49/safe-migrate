@@ -103,6 +103,12 @@ impl Resolver {
         using_method: &Option<String>,
         has_predicate: bool,
         unique: bool,
+        key_columns: &[String],
+        included_columns: &[String],
+        has_expression_keys: bool,
+        has_default_sort_order: bool,
+        has_default_opclasses: bool,
+        has_default_collations: bool,
         state: &AnalysisState,
     ) -> Mutation {
         let table = Self::resolve_relation_lookup_name(relation, state);
@@ -121,6 +127,12 @@ impl Resolver {
             using_method: using_method.clone(),
             has_predicate,
             unique,
+            key_columns: key_columns.to_vec(),
+            included_columns: included_columns.to_vec(),
+            has_expression_keys,
+            has_default_sort_order,
+            has_default_opclasses,
+            has_default_collations,
         })
     }
 

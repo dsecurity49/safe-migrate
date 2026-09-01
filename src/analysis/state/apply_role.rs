@@ -1,4 +1,5 @@
-use super::{AnalysisState, Confidence, MutationResult, ObjectLookup};
+use super::{AnalysisState, MutationResult, ObjectLookup};
+use crate::analysis::evidence::{EvidenceCode, EvidenceScope};
 use crate::analysis::facts::RoleFact;
 use crate::analysis::mutations::{
     AlterRoleMutation, CreateRoleMutation, DropRoleMutation, GrantMutation, ResolvedGrantTarget,
@@ -28,8 +29,7 @@ impl AnalysisState {
                 };
             }
             RoleLookup::Unknown => {
-                self.snapshot_confidence();
-                self.local.confidence = Confidence::Tainted;
+                self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
             }
             RoleLookup::Tombstone | RoleLookup::AuthoritativelyAbsent => {}
             RoleLookup::WrongKind => unreachable!("roles have a dedicated namespace"),
@@ -37,8 +37,7 @@ impl AnalysisState {
         if !role.inherits {
             // RoleState intentionally does not carry the PostgreSQL INHERIT
             // bit yet; do not claim an exact state transition for NOINHERIT.
-            self.snapshot_confidence();
-            self.local.confidence = Confidence::Tainted;
+            self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
         }
         self.snapshot_role(&role_id);
         self.snapshot_generation_counter();
@@ -74,15 +73,13 @@ impl AnalysisState {
                 };
             }
             RoleLookup::Unknown => {
-                self.snapshot_confidence();
-                self.local.confidence = Confidence::Tainted;
+                self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
                 return MutationResult::Skipped;
             }
             RoleLookup::WrongKind => unreachable!("roles have a dedicated namespace"),
         }
         if role.inherits.is_some() {
-            self.snapshot_confidence();
-            self.local.confidence = Confidence::Tainted;
+            self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
             return MutationResult::Skipped;
         }
         self.snapshot_generation_counter();
@@ -112,8 +109,7 @@ impl AnalysisState {
                         };
                     }
                     RoleLookup::Unknown => {
-                        self.snapshot_confidence();
-                        self.local.confidence = Confidence::Tainted;
+                        self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
                         return MutationResult::Skipped;
                     }
                     RoleLookup::WrongKind => unreachable!("roles have a dedicated namespace"),
@@ -125,8 +121,7 @@ impl AnalysisState {
         // completely in RoleState, so do not claim an exact drop when a
         // catalog-backed role list is available.
         if self.local.roles_known && !present_roles.is_empty() {
-            self.snapshot_confidence();
-            self.local.confidence = Confidence::Tainted;
+            self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
             return MutationResult::Skipped;
         }
         for role_id in present_roles {
@@ -152,15 +147,16 @@ impl AnalysisState {
             // of the privilege matrix.  Keep the matrix untouched rather
             // than silently treating an authorization-sensitive statement as
             // exact.
-            self.snapshot_confidence();
-            self.local.confidence = Confidence::Tainted;
+            self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
             return MutationResult::Skipped;
         }
         if grant.with_grant_option {
             // PrivilegeMatrix records effective privileges but not grant
             // options or grant chains.
-            self.snapshot_confidence();
-            self.local.confidence = Confidence::Tainted;
+            self.taint(
+                EvidenceCode::CatalogCoverageIncomplete,
+                EvidenceScope::Chain,
+            );
             return MutationResult::Skipped;
         }
         let privileges = self.resolve_grant_privileges(&grant.privileges);
@@ -175,8 +171,10 @@ impl AnalysisState {
                 // eligible for ALL TABLES IN SCHEMA. Apply the modeled subset
                 // but do not claim that the resulting privilege matrix is
                 // complete.
-                self.snapshot_confidence();
-                self.local.confidence = Confidence::Tainted;
+                self.taint(
+                    EvidenceCode::CatalogCoverageIncomplete,
+                    EvidenceScope::Chain,
+                );
                 let target_ids: Vec<ObjectId> = self
                     .local
                     .relations
@@ -210,15 +208,13 @@ impl AnalysisState {
             if let Err(result) = self.validate_role_facts(std::slice::from_ref(granted_by)) {
                 return result;
             }
-            self.snapshot_confidence();
-            self.local.confidence = Confidence::Tainted;
+            self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
             return MutationResult::Skipped;
         }
         if revoke.grant_option_only || revoke.cascade {
             // The matrix has no grant-option or dependency-chain state, so a
             // GRANT OPTION/CASCADE revoke cannot be represented exactly.
-            self.snapshot_confidence();
-            self.local.confidence = Confidence::Tainted;
+            self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
             return MutationResult::Skipped;
         }
         let privileges = self.resolve_grant_privileges(&revoke.privileges);
@@ -229,8 +225,10 @@ impl AnalysisState {
                 }
             }
             ResolvedGrantTarget::AllTablesInSchema(schemas) => {
-                self.snapshot_confidence();
-                self.local.confidence = Confidence::Tainted;
+                self.taint(
+                    EvidenceCode::CatalogCoverageIncomplete,
+                    EvidenceScope::Chain,
+                );
                 let target_ids: Vec<ObjectId> = self
                     .local
                     .relations
@@ -287,8 +285,7 @@ impl AnalysisState {
         let mut ids = Vec::with_capacity(facts.len());
         for fact in facts {
             let Some((name, _identity_known)) = self.role_fact_identity(fact) else {
-                self.snapshot_confidence();
-                self.local.confidence = Confidence::Tainted;
+                self.taint(EvidenceCode::UnresolvedReference, EvidenceScope::Chain);
                 return Err(MutationResult::Skipped);
             };
             // PUBLIC is a PostgreSQL pseudo-role, not a row in pg_roles.
@@ -305,8 +302,10 @@ impl AnalysisState {
                     });
                 }
                 RoleLookup::Unknown => {
-                    self.snapshot_confidence();
-                    self.local.confidence = Confidence::Tainted;
+                    self.taint(
+                        EvidenceCode::CatalogCoverageIncomplete,
+                        EvidenceScope::Chain,
+                    );
                     // A cache without a complete role catalog cannot prove
                     // the role's existence, but the privilege grant itself
                     // is still useful state. Preserve it while making the

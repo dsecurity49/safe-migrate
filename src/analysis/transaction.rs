@@ -23,6 +23,10 @@ pub struct NamespaceSnapshot {
     pub baseline_foreign_keys: HashSet<(ObjectId, String)>,
     pub baseline_fk_dependencies: HashSet<ObjectId>,
     pub baseline_sequences: HashSet<ObjectId>,
+    pub baseline_schemas: Option<HashSet<String>>,
+    pub search_path: Vec<String>,
+    pub search_path_template: Vec<String>,
+    pub session_search_path_template: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -105,6 +109,9 @@ pub enum StateChange {
     },
     ConfidenceSnapshot {
         previous: crate::analysis::state::Confidence,
+    },
+    EvidenceSnapshot {
+        previous: crate::analysis::evidence::EvidenceLog,
     },
 }
 

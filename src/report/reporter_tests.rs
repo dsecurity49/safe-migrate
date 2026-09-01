@@ -1,5 +1,9 @@
 #[cfg(test)]
 mod tests {
+    use crate::analysis::evidence::{
+        EvidenceCode, EvidenceLocation, EvidenceRecord, EvidenceScope,
+    };
+    use crate::analysis::outcome::AnalysisOutcome;
     use crate::analysis::state::Confidence;
     use crate::report::reporter::{Reporter, Verdict, compute_verdict};
     use crate::report::violations::{
@@ -100,6 +104,37 @@ mod tests {
         assert_eq!(report["violations"][0]["impact"], "locking");
         assert_eq!(report["violations"][0]["statement_index"], 1);
         assert!(report["violations"][0]["rule_summary"].is_string());
+    }
+
+    #[test]
+    fn outcome_reports_include_structured_evidence() {
+        let finding = ReportFinding {
+            violation: make_violation("test-rule", ViolationTier::Tier2, "needs review"),
+            location: None,
+            statement_index: Some(1),
+        };
+        let outcome = AnalysisOutcome::new(
+            vec![finding],
+            Confidence::Tainted,
+            vec![
+                EvidenceRecord::new(EvidenceCode::UnsupportedStatement, EvidenceScope::Chain).at(
+                    EvidenceLocation {
+                        file: "migrations/001.sql".to_string(),
+                        statement_index: 1,
+                    },
+                ),
+            ],
+        );
+
+        let json = Reporter::json_outcome_with_locations(&outcome);
+        assert_eq!(json["schema_version"], 2);
+        assert_eq!(json["evidence"][0]["code"], "unsupported_statement");
+        assert_eq!(json["evidence"][0]["location"]["statement_index"], 1);
+
+        let markdown = Reporter::markdown_outcome(&outcome);
+        assert!(markdown.contains("## Analysis evidence"));
+        assert!(markdown.contains("`unsupported_statement`"));
+        assert!(markdown.contains("migrations/001.sql"));
     }
 
     #[test]

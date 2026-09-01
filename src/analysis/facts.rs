@@ -145,7 +145,13 @@ pub enum StatementFact {
         concurrently: bool,
         using_method: Option<String>,
         has_predicate: bool,
-        unique: bool, // Added for CreateIndexFact
+        unique: bool,
+        key_columns: Vec<String>,
+        included_columns: Vec<String>,
+        has_expression_keys: bool,
+        has_default_sort_order: bool,
+        has_default_opclasses: bool,
+        has_default_collations: bool,
     },
     CreatePolicy {
         name: String,

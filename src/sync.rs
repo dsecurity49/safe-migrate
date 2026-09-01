@@ -1,5 +1,9 @@
 use crate::ast::identifiers::ObjectId;
-use crate::db::cache::{CACHE_V6_MAGIC, DbCache, DbCacheVersioned, ForeignKeyCache, IndexCache};
+use crate::db::cache::{
+    CACHE_V7_MAGIC, CatalogCoverage, ConstraintDependencyCache, ConstraintKeyCache, DbCache,
+    DbCacheVersioned, DefaultSequenceDependencyCache, ForeignKeyCache,
+    GeneratedColumnDependencyCache, IndexCache, InheritanceCache, ViewDependencyCache,
+};
 use crate::db::cache_file::{
     MAX_CACHE_DECODE_BYTES, MAX_CACHE_FILE_BYTES, protect_cache_bytes,
     validate_cache_encryption_configuration,
@@ -266,7 +270,7 @@ fn write_cache_with_protection_and_limits(
     cache
         .validate_semantics()
         .map_err(anyhow::Error::msg)
-        .context("Refusing to write a semantically invalid Cache V6 baseline")?;
+        .context("Refusing to write a semantically invalid Cache V7 baseline")?;
     let parent = cache_parent(out_path);
     let mut temp_file = NamedTempFile::new_in(parent).with_context(|| {
         format!(
@@ -279,17 +283,17 @@ fn write_cache_with_protection_and_limits(
         .context("Failed to init zstd compression")?;
     let mut encoder = SizeLimitedWriter::new(encoder, max_decode_bytes);
 
-    if let Err(error) = encoder.write_all(CACHE_V6_MAGIC) {
+    if let Err(error) = encoder.write_all(CACHE_V7_MAGIC) {
         if encoder.limit_exceeded() {
             anyhow::bail!(
                 "Cache payload exceeds the {} MiB decoded-size limit",
                 max_decode_bytes / (1024 * 1024)
             );
         }
-        return Err(error).context("Failed to write cache V6 payload header");
+        return Err(error).context("Failed to write cache V7 payload header");
     }
 
-    let versioned = DbCacheVersioned::V6(Box::new(cache));
+    let versioned = DbCacheVersioned::V7(Box::new(cache));
     let bincode_config = bincode::config::standard().with_variable_int_encoding();
 
     let encode_result =
@@ -495,25 +499,24 @@ pub fn populate_cache_in_current_transaction(
 fn load_view_dependencies(
     client: &mut impl GenericClient,
     schema_values: &Option<Vec<String>>,
-) -> Result<Vec<crate::db::cache::DependencyCache>> {
+) -> Result<Vec<ViewDependencyCache>> {
     let query = r#"
         SELECT DISTINCT
-            'pg_class'::regclass::oid AS classid,
-            vc.oid AS objid,
-            0 AS objsubid,
-            'pg_class'::regclass::oid AS refclassid,
-            tc.oid AS refobjid,
-            0 AS refobjsubid,
             vn.nspname AS obj_schema,
             vc.relname AS obj_name,
             tn.nspname AS ref_schema,
-            tc.relname AS ref_name
+            tc.relname AS ref_name,
+            a.attname AS ref_column
         FROM pg_rewrite rw
         JOIN pg_class vc ON vc.oid = rw.ev_class
         JOIN pg_namespace vn ON vn.oid = vc.relnamespace
         JOIN pg_depend d ON d.objid = rw.oid
         JOIN pg_class tc ON tc.oid = d.refobjid
         JOIN pg_namespace tn ON tn.oid = tc.relnamespace
+        LEFT JOIN pg_attribute a
+          ON a.attrelid = tc.oid
+         AND a.attnum = d.refobjsubid
+         AND NOT a.attisdropped
             WHERE vc.relkind IN ('v', 'm')
               AND d.classid = 'pg_rewrite'::regclass
               AND d.refclassid = 'pg_class'::regclass
@@ -536,27 +539,22 @@ fn load_view_dependencies(
         .context("Failed to load view dependencies from pg_rewrite/pg_depend")?;
     rows.into_iter()
         .map(|row| {
-            Ok(crate::db::cache::DependencyCache {
-                classid: row.try_get(0).context("view dependency classid")?,
-                objid: row.try_get(1).context("view dependency object oid")?,
-                objsubid: row.try_get(2).context("view dependency object sub-id")?,
-                refclassid: row
-                    .try_get(3)
-                    .context("view dependency referenced classid")?,
-                refobjid: row
-                    .try_get(4)
-                    .context("view dependency referenced object oid")?,
-                refobjsubid: row
-                    .try_get(5)
-                    .context("view dependency referenced object sub-id")?,
-                deptype: "view".to_string(),
-                obj_schema: Some(row.try_get(6).context("view dependency schema")?),
-                obj_name: Some(row.try_get(7).context("view dependency name")?),
-                ref_schema: Some(
-                    row.try_get(8)
-                        .context("view dependency referenced schema")?,
+            Ok(ViewDependencyCache {
+                dependent: ObjectId::new(
+                    row.try_get::<_, String>("obj_schema")
+                        .context("view dependency schema")?,
+                    row.try_get::<_, String>("obj_name")
+                        .context("view dependency name")?,
                 ),
-                ref_name: Some(row.try_get(9).context("view dependency referenced name")?),
+                referenced: ObjectId::new(
+                    row.try_get::<_, String>("ref_schema")
+                        .context("view dependency referenced schema")?,
+                    row.try_get::<_, String>("ref_name")
+                        .context("view dependency referenced name")?,
+                ),
+                referenced_column: row
+                    .try_get("ref_column")
+                    .context("view dependency referenced column")?,
             })
         })
         .collect()
@@ -1180,6 +1178,236 @@ fn load_constraints(
         .collect()
 }
 
+fn load_constraint_keys(
+    client: &mut impl GenericClient,
+    schema_values: &Option<Vec<String>>,
+    schema_filter_with_fk: &str,
+) -> Result<Vec<ConstraintKeyCache>> {
+    let query = format!(
+        "
+        SELECT
+            n.nspname AS table_schema,
+            c.relname AS table_name,
+            con.conname AS constraint_name,
+            (con.contype = 'p') AS is_primary,
+            ARRAY(
+                SELECT a.attname
+                FROM unnest(con.conkey) WITH ORDINALITY AS key_column(attnum, ordinality)
+                JOIN pg_attribute a
+                  ON a.attrelid = con.conrelid
+                 AND a.attnum = key_column.attnum
+                 AND NOT a.attisdropped
+                ORDER BY key_column.ordinality
+            ) AS columns
+        FROM pg_constraint con
+        JOIN pg_class c ON c.oid = con.conrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE con.contype IN ('p', 'u')
+          AND c.relkind IN ('r', 'p')
+          AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+          {schema_filter_with_fk};
+    "
+    );
+    client
+        .query(&query, &[schema_values])
+        .context("Failed to load primary and unique key columns from pg_constraint")?
+        .into_iter()
+        .map(|row| {
+            Ok(ConstraintKeyCache {
+                table_id: ObjectId::new(
+                    row.try_get::<_, String>("table_schema")
+                        .context("constraint-key table schema")?,
+                    row.try_get::<_, String>("table_name")
+                        .context("constraint-key table name")?,
+                ),
+                constraint_name: row
+                    .try_get("constraint_name")
+                    .context("constraint-key name")?,
+                columns: row.try_get("columns").context("constraint-key columns")?,
+                is_primary: row
+                    .try_get("is_primary")
+                    .context("constraint-key primary flag")?,
+            })
+        })
+        .collect()
+}
+
+fn load_constraint_dependencies(
+    client: &mut impl GenericClient,
+    schema_values: &Option<Vec<String>>,
+    schema_filter_with_fk: &str,
+) -> Result<Vec<ConstraintDependencyCache>> {
+    let query = format!(
+        "
+        SELECT
+            n.nspname AS table_schema,
+            c.relname AS table_name,
+            con.conname AS constraint_name,
+            ARRAY(
+                SELECT DISTINCT a.attname
+                FROM pg_depend d
+                JOIN pg_attribute a
+                  ON a.attrelid = d.refobjid
+                 AND a.attnum = d.refobjsubid
+                 AND NOT a.attisdropped
+                WHERE d.classid = 'pg_constraint'::regclass
+                  AND d.objid = con.oid
+                  AND d.refclassid = 'pg_class'::regclass
+                  AND d.refobjid = con.conrelid
+                  AND d.refobjsubid > 0
+                  AND d.deptype = 'n'
+                ORDER BY a.attname
+            ) AS dependency_columns
+        FROM pg_constraint con
+        JOIN pg_class c ON c.oid = con.conrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE con.contype IN ('c', 'x')
+          AND c.relkind IN ('r', 'p')
+          AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+          {schema_filter_with_fk};
+        "
+    );
+    client
+        .query(&query, &[schema_values])
+        .context("Failed to load constraint expression dependencies")?
+        .into_iter()
+        .map(|row| {
+            Ok(ConstraintDependencyCache {
+                table_id: ObjectId::new(
+                    row.try_get::<_, String>("table_schema")
+                        .context("constraint dependency table schema")?,
+                    row.try_get::<_, String>("table_name")
+                        .context("constraint dependency table name")?,
+                ),
+                constraint_name: row
+                    .try_get("constraint_name")
+                    .context("constraint dependency name")?,
+                columns: row
+                    .try_get("dependency_columns")
+                    .context("constraint dependency columns")?,
+            })
+        })
+        .collect()
+}
+
+fn load_generated_column_dependencies(
+    client: &mut impl GenericClient,
+    schema_values: &Option<Vec<String>>,
+    schema_filter_with_fk: &str,
+) -> Result<Vec<GeneratedColumnDependencyCache>> {
+    let query = format!(
+        "
+        SELECT
+            n.nspname AS table_schema,
+            c.relname AS table_name,
+            a.attname AS column_name,
+            source_a.attname AS depends_on_column
+        FROM pg_attribute a
+        JOIN pg_class c ON c.oid = a.attrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        JOIN pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum
+        JOIN pg_depend d
+          ON d.classid = 'pg_attrdef'::regclass
+         AND d.objid = ad.oid
+         AND d.refclassid = 'pg_class'::regclass
+         AND d.refobjsubid > 0
+         AND d.deptype = 'n'
+        JOIN pg_attribute source_a
+          ON source_a.attrelid = d.refobjid
+         AND source_a.attnum = d.refobjsubid
+         AND NOT source_a.attisdropped
+        WHERE a.attnum > 0
+          AND NOT a.attisdropped
+          AND a.attgenerated = 's'
+          AND c.relkind IN ('r', 'p')
+          AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+          {schema_filter_with_fk}
+        ORDER BY n.nspname, c.relname, a.attname, source_a.attname;
+        "
+    );
+    client
+        .query(&query, &[schema_values])
+        .context("Failed to load generated-column dependencies")?
+        .into_iter()
+        .map(|row| {
+            Ok(GeneratedColumnDependencyCache {
+                table_id: ObjectId::new(
+                    row.try_get::<_, String>("table_schema")
+                        .context("generated dependency table schema")?,
+                    row.try_get::<_, String>("table_name")
+                        .context("generated dependency table name")?,
+                ),
+                column_name: row
+                    .try_get("column_name")
+                    .context("generated dependency column")?,
+                depends_on_column: row
+                    .try_get("depends_on_column")
+                    .context("generated dependency source column")?,
+            })
+        })
+        .collect()
+}
+
+fn load_default_sequence_dependencies(
+    client: &mut impl GenericClient,
+    schema_values: &Option<Vec<String>>,
+    schema_filter_with_fk: &str,
+) -> Result<Vec<DefaultSequenceDependencyCache>> {
+    let query = format!(
+        "
+        SELECT
+            n.nspname AS table_schema,
+            c.relname AS table_name,
+            a.attname AS column_name,
+            seqn.nspname AS sequence_schema,
+            seq.relname AS sequence_name
+        FROM pg_attribute a
+        JOIN pg_class c ON c.oid = a.attrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        JOIN pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum
+        JOIN pg_depend d
+          ON d.classid = 'pg_attrdef'::regclass
+         AND d.objid = ad.oid
+         AND d.refclassid = 'pg_class'::regclass
+         AND d.refobjsubid = 0
+         AND d.deptype = 'n'
+        JOIN pg_class seq ON seq.oid = d.refobjid AND seq.relkind = 'S'
+        JOIN pg_namespace seqn ON seqn.oid = seq.relnamespace
+        WHERE a.attnum > 0
+          AND NOT a.attisdropped
+          AND a.attgenerated = ''
+          AND c.relkind IN ('r', 'p')
+          AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+          {schema_filter_with_fk}
+        ORDER BY n.nspname, c.relname, a.attname, seqn.nspname, seq.relname;
+        "
+    );
+    client
+        .query(&query, &[schema_values])
+        .context("Failed to load default sequence dependencies")?
+        .into_iter()
+        .map(|row| {
+            Ok(DefaultSequenceDependencyCache {
+                table_id: ObjectId::new(
+                    row.try_get::<_, String>("table_schema")
+                        .context("default dependency table schema")?,
+                    row.try_get::<_, String>("table_name")
+                        .context("default dependency table name")?,
+                ),
+                column_name: row
+                    .try_get("column_name")
+                    .context("default dependency column")?,
+                sequence_id: ObjectId::new(
+                    row.try_get::<_, String>("sequence_schema")
+                        .context("default dependency sequence schema")?,
+                    row.try_get::<_, String>("sequence_name")
+                        .context("default dependency sequence name")?,
+                ),
+            })
+        })
+        .collect()
+}
+
 fn load_foreign_keys(
     client: &mut impl GenericClient,
     schemas: Option<&[String]>,
@@ -1191,7 +1419,25 @@ fn load_foreign_keys(
         SELECT
             c.conname AS constraint_name,
             n1.nspname AS from_schema, t1.relname AS from_table,
-            n2.nspname AS to_schema, t2.relname AS to_table
+            n2.nspname AS to_schema, t2.relname AS to_table,
+            ARRAY(
+                SELECT a.attname
+                FROM unnest(c.conkey) WITH ORDINALITY AS source_key(attnum, ordinality)
+                JOIN pg_attribute a
+                  ON a.attrelid = c.conrelid
+                 AND a.attnum = source_key.attnum
+                 AND NOT a.attisdropped
+                ORDER BY source_key.ordinality
+            ) AS from_columns,
+            ARRAY(
+                SELECT a.attname
+                FROM unnest(c.confkey) WITH ORDINALITY AS target_key(attnum, ordinality)
+                JOIN pg_attribute a
+                  ON a.attrelid = c.confrelid
+                 AND a.attnum = target_key.attnum
+                 AND NOT a.attisdropped
+                ORDER BY target_key.ordinality
+            ) AS to_columns
         FROM pg_constraint c
         JOIN pg_class t1 ON t1.oid = c.conrelid
         JOIN pg_namespace n1 ON n1.oid = t1.relnamespace
@@ -1221,6 +1467,12 @@ fn load_foreign_keys(
             let to_table: String = row
                 .try_get("to_table")
                 .context("foreign-key target table")?;
+            let from_columns: Vec<String> = row
+                .try_get("from_columns")
+                .context("foreign-key source columns")?;
+            let to_columns: Vec<String> = row
+                .try_get("to_columns")
+                .context("foreign-key target columns")?;
             if let Some(scoped_schemas) = schemas
                 && (!scoped_schemas.contains(&from_schema)
                     || !scoped_schemas.contains(&to_schema))
@@ -1240,6 +1492,67 @@ fn load_foreign_keys(
                 constraint_name,
                 from_table: ObjectId::new(from_schema, from_table),
                 to_table: ObjectId::new(to_schema, to_table),
+                from_columns,
+                to_columns,
+            })
+        })
+        .collect()
+}
+
+fn load_inheritances(
+    client: &mut impl GenericClient,
+    schema_values: &Option<Vec<String>>,
+) -> Result<Vec<InheritanceCache>> {
+    let query = r#"
+        SELECT
+            child_ns.nspname AS child_schema,
+            child.relname AS child_name,
+            parent_ns.nspname AS parent_schema,
+            parent.relname AS parent_name,
+            inh.inhseqno,
+            child.relispartition AS child_is_partition,
+            inh.inhdetachpending
+        FROM pg_inherits inh
+        JOIN pg_class child ON child.oid = inh.inhrelid
+        JOIN pg_namespace child_ns ON child_ns.oid = child.relnamespace
+        JOIN pg_class parent ON parent.oid = inh.inhparent
+        JOIN pg_namespace parent_ns ON parent_ns.oid = parent.relnamespace
+        WHERE child.relkind IN ('r', 'p')
+          AND parent.relkind IN ('r', 'p')
+          AND child_ns.nspname NOT IN ('pg_catalog', 'information_schema')
+          AND parent_ns.nspname NOT IN ('pg_catalog', 'information_schema')
+          AND (
+              $1::text[] IS NULL
+              OR child_ns.nspname = ANY($1)
+              OR parent_ns.nspname = ANY($1)
+          )
+        ORDER BY child_ns.nspname, child.relname, inh.inhseqno
+    "#;
+    client
+        .query(query, &[schema_values])
+        .context("Failed to load table inheritance from pg_inherits")?
+        .into_iter()
+        .map(|row| {
+            Ok(InheritanceCache {
+                child: ObjectId::new(
+                    row.try_get::<_, String>("child_schema")
+                        .context("inheritance child schema")?,
+                    row.try_get::<_, String>("child_name")
+                        .context("inheritance child name")?,
+                ),
+                parent: ObjectId::new(
+                    row.try_get::<_, String>("parent_schema")
+                        .context("inheritance parent schema")?,
+                    row.try_get::<_, String>("parent_name")
+                        .context("inheritance parent name")?,
+                ),
+                sequence: row.try_get("inhseqno").context("inheritance sequence")?,
+                is_partition: row
+                    .try_get("child_is_partition")
+                    .context("inheritance partition flag")?,
+                detach_pending: row
+                    .try_get("inhdetachpending")
+                    .context("inheritance detach-pending flag")?,
             })
         })
         .collect()
@@ -1254,14 +1567,85 @@ fn load_indexes(
         "
         SELECT
             n_i.nspname AS index_schema, i.relname AS index_name,
-            n_t.nspname AS table_schema, t.relname AS table_name
+            n_t.nspname AS table_schema, t.relname AS table_name,
+            am.amname AS using_method,
+            x.indisvalid AS is_valid,
+            x.indisready AS is_ready,
+            x.indislive AS is_live,
+            x.indisunique AS is_unique,
+            x.indpred IS NOT NULL AS has_predicate,
+            ARRAY(
+                SELECT a.attname
+                FROM unnest(x.indkey::smallint[]) WITH ORDINALITY AS key_part(attnum, ordinality)
+                JOIN pg_attribute a
+                  ON a.attrelid = x.indrelid
+                 AND a.attnum = key_part.attnum
+                 AND NOT a.attisdropped
+                WHERE key_part.ordinality <= x.indnkeyatts
+                ORDER BY key_part.ordinality
+            ) AS key_columns,
+            ARRAY(
+                SELECT a.attname
+                FROM unnest(x.indkey::smallint[]) WITH ORDINALITY AS included_part(attnum, ordinality)
+                JOIN pg_attribute a
+                  ON a.attrelid = x.indrelid
+                 AND a.attnum = included_part.attnum
+                 AND NOT a.attisdropped
+                WHERE included_part.ordinality > x.indnkeyatts
+                ORDER BY included_part.ordinality
+            ) AS included_columns,
+            ARRAY(
+                SELECT a.attname
+                FROM pg_depend d
+                JOIN pg_attribute a
+                  ON a.attrelid = d.refobjid
+                 AND a.attnum = d.refobjsubid
+                 AND NOT a.attisdropped
+                WHERE d.classid = 'pg_class'::regclass
+                  AND d.objid = x.indexrelid
+                  AND d.refclassid = 'pg_class'::regclass
+                  AND d.refobjid = x.indrelid
+                  AND d.refobjsubid > 0
+                ORDER BY a.attnum
+            ) AS dependency_columns,
+            EXISTS (
+                SELECT 1
+                FROM unnest(x.indkey::smallint[]) WITH ORDINALITY AS key_part(attnum, ordinality)
+                WHERE key_part.ordinality <= x.indnkeyatts
+                  AND key_part.attnum = 0
+            ) AS has_expression_keys,
+            NOT EXISTS (
+                SELECT 1
+                FROM unnest(x.indoption::smallint[]) AS option_part(flags)
+                WHERE option_part.flags <> 0
+            ) AS has_default_sort_order,
+            NOT EXISTS (
+                SELECT 1
+                FROM unnest(x.indclass::oid[]) WITH ORDINALITY AS opclass_part(opclass_oid, ordinality)
+                JOIN pg_opclass opclass ON opclass.oid = opclass_part.opclass_oid
+                WHERE opclass_part.ordinality <= x.indnkeyatts
+                  AND (NOT opclass.opcdefault OR opclass.opcmethod <> i.relam)
+            ) AS has_default_opclasses,
+            NOT EXISTS (
+                SELECT 1
+                FROM unnest(x.indcollation::oid[]) WITH ORDINALITY AS collation_part(collation_oid, ordinality)
+                JOIN unnest(x.indkey::smallint[]) WITH ORDINALITY AS key_part(attnum, key_ordinality)
+                  ON key_part.key_ordinality = collation_part.ordinality
+                JOIN pg_attribute a
+                  ON a.attrelid = x.indrelid
+                 AND a.attnum = key_part.attnum
+                 AND NOT a.attisdropped
+                WHERE collation_part.ordinality <= x.indnkeyatts
+                  AND key_part.attnum <> 0
+                  AND collation_part.collation_oid <> a.attcollation
+            ) AS has_default_collations
         FROM pg_index x
         JOIN pg_class i ON i.oid = x.indexrelid
         JOIN pg_namespace n_i ON n_i.oid = i.relnamespace
         JOIN pg_class t ON t.oid = x.indrelid
         JOIN pg_namespace n_t ON n_t.oid = t.relnamespace
-        WHERE x.indisvalid = true
-          AND n_i.nspname !~ '^pg_'
+        JOIN pg_am am ON am.oid = i.relam
+        WHERE n_i.nspname !~ '^pg_'
           AND n_i.nspname <> 'information_schema'
           AND n_t.nspname !~ '^pg_'
           AND n_t.nspname <> 'information_schema'
@@ -1270,7 +1654,7 @@ fn load_indexes(
     );
     let rows = client
         .query(&query, &[schema_values])
-        .context("Failed to load valid indexes from pg_index")?;
+        .context("Failed to load index definitions from pg_index")?;
     let mut indexes = Vec::with_capacity(rows.len());
     for row in rows {
         let index_schema: String = row.try_get("index_schema").context("index schema")?;
@@ -1291,6 +1675,34 @@ fn load_indexes(
                 row.try_get::<_, String>("table_name")
                     .context("indexed table name")?,
             ),
+            using_method: row.try_get("using_method").context("index access method")?,
+            key_columns: row.try_get("key_columns").context("index key columns")?,
+            included_columns: row
+                .try_get("included_columns")
+                .context("index included columns")?,
+            dependency_columns: row
+                .try_get("dependency_columns")
+                .context("index dependency columns")?,
+            dependency_columns_known: true,
+            has_expression_keys: row
+                .try_get("has_expression_keys")
+                .context("index expression key flag")?,
+            has_predicate: row
+                .try_get("has_predicate")
+                .context("index predicate flag")?,
+            is_unique: row.try_get("is_unique").context("index uniqueness flag")?,
+            is_valid: row.try_get("is_valid").context("index validity flag")?,
+            is_ready: row.try_get("is_ready").context("index readiness flag")?,
+            is_live: row.try_get("is_live").context("index liveness flag")?,
+            has_default_sort_order: row
+                .try_get("has_default_sort_order")
+                .context("index sort ordering")?,
+            has_default_opclasses: row
+                .try_get("has_default_opclasses")
+                .context("index operator classes")?,
+            has_default_collations: row
+                .try_get("has_default_collations")
+                .context("index collations")?,
         });
     }
     Ok(indexes)
@@ -1829,6 +2241,7 @@ fn populate_cache_from_client(
     let provenance = load_provenance(client, schemas)?;
     cache.pg_version_num = Some(provenance.pg_version_num);
     cache.metadata = provenance.metadata;
+    cache.coverage = CatalogCoverage::from_sync_scope(schemas);
     cache.search_path = provenance.search_path;
 
     let schema_filter = "AND ($1::text[] IS NULL OR n.nspname = ANY($1))";
@@ -1919,9 +2332,18 @@ fn populate_cache_from_client(
     cache.triggers = load_triggers(client, &schema_values, schema_filter_with_fk)?;
 
     cache.constraints = load_constraints(client, &schema_values, schema_filter_with_fk)?;
+    cache.constraint_keys = load_constraint_keys(client, &schema_values, schema_filter_with_fk)?;
+    cache.constraint_dependencies =
+        load_constraint_dependencies(client, &schema_values, schema_filter_with_fk)?;
+    cache.generated_column_dependencies =
+        load_generated_column_dependencies(client, &schema_values, schema_filter_with_fk)?;
+    cache.default_sequence_dependencies =
+        load_default_sequence_dependencies(client, &schema_values, schema_filter_with_fk)?;
 
     cache.foreign_keys =
         load_foreign_keys(client, schemas, &schema_values, schema_filter_n1_or_n2)?;
+
+    cache.inheritances = load_inheritances(client, &schema_values)?;
 
     cache.indexes = load_indexes(client, &schema_values, schema_filter_nt)?;
 
@@ -1935,7 +2357,7 @@ fn populate_cache_from_client(
 
     // Only view dependencies are consumed by cache hydration. Generic
     // pg_depend rows use PostgreSQL dependency codes (n/a/i) and were ignored
-    // after synchronization, so avoid loading them into Cache V6.
+    // after synchronization, so avoid loading them into Cache V7.
     cache.dependencies = load_view_dependencies(client, &schema_values)?;
 
     // Role identity and membership are required to distinguish a valid
@@ -1946,7 +2368,7 @@ fn populate_cache_from_client(
     cache
         .validate_semantics()
         .map_err(anyhow::Error::msg)
-        .context("PostgreSQL catalogs produced a semantically invalid Cache V6 baseline")?;
+        .context("PostgreSQL catalogs produced a semantically invalid Cache V7 baseline")?;
     Ok(cache)
 }
 
@@ -2035,8 +2457,8 @@ mod atomic_write_tests {
         let mut payload = Vec::new();
         decoder.read_to_end(&mut payload).unwrap();
         let payload = payload
-            .strip_prefix(CACHE_V6_MAGIC)
-            .expect("writer must prefix V6 cache payloads");
+            .strip_prefix(CACHE_V7_MAGIC)
+            .expect("writer must prefix V7 cache payloads");
         let config = bincode::config::standard().with_variable_int_encoding();
         let versioned: DbCacheVersioned = bincode::serde::decode_from_slice(payload, config)
             .unwrap()
@@ -2131,7 +2553,7 @@ mod atomic_write_tests {
             DbCache::new(),
             Ok,
             MAX_CACHE_FILE_BYTES,
-            CACHE_V6_MAGIC.len(),
+            CACHE_V7_MAGIC.len(),
         )
         .unwrap_err();
 

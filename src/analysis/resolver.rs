@@ -274,6 +274,12 @@ impl Resolver {
                 using_method,
                 has_predicate,
                 unique,
+                key_columns,
+                included_columns,
+                has_expression_keys,
+                has_default_sort_order,
+                has_default_opclasses,
+                has_default_collations,
             } => {
                 mutations.push(Self::resolve_create_index(
                     name,
@@ -283,6 +289,12 @@ impl Resolver {
                     using_method,
                     *has_predicate,
                     *unique,
+                    key_columns,
+                    included_columns,
+                    *has_expression_keys,
+                    *has_default_sort_order,
+                    *has_default_opclasses,
+                    *has_default_collations,
                     state,
                 ));
             }

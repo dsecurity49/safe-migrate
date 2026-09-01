@@ -12,24 +12,49 @@ pub enum DependencyKind {
     },
     ViewDependency {
         view_generation: u64,
+        /// `Some` is a catalog-proven column dependency. `None` is used for
+        /// relation-level baseline evidence and locally parsed views whose
+        /// expression-column dependencies are not modeled yet.
+        referenced_column: Option<String>,
     },
     IndexOnRelation {
         using_method: Option<String>,
+        key_columns: Vec<String>,
+        included_columns: Vec<String>,
+        dependency_columns: Vec<String>,
+        dependency_columns_known: bool,
+        has_expression_keys: bool,
         has_predicate: bool,
         is_concurrent: bool,
         is_unique: bool,
+        is_valid: bool,
+        is_ready: bool,
+        is_live: bool,
+        has_default_sort_order: bool,
+        has_default_opclasses: bool,
+        has_default_collations: bool,
         eligibility_known: bool,
     },
-    /// A local primary-key/unique constraint whose key columns are known.
-    /// This edge is intentionally state-only (not a cache row): V6 caches
-    /// retain constraint identity but historically did not retain key
-    /// columns, so baseline callers must remain conservative.
+    /// A primary-key/unique constraint whose ordered key columns are known.
+    /// V7 hydration and local mutations share this edge; legacy or incomplete
+    /// cache construction must still remain conservative.
     ConstraintOnRelation {
         constraint_name: String,
         columns: Vec<String>,
         is_primary: bool,
     },
+    /// A check/exclusion constraint's expression dependency columns.
+    ConstraintDependency {
+        constraint_name: String,
+        columns: Vec<String>,
+    },
     RenameTo,
+    /// Traditional `CREATE TABLE ... INHERITS (...)` relationship.
+    ///
+    /// It shares PostgreSQL's drop dependency behaviour with a partition, but
+    /// must remain distinct: partition-only lifecycle checks do not apply to
+    /// ordinary table inheritance.
+    InheritanceOf,
     PartitionOf,
     SequenceOwnedBy {
         column: String,
@@ -37,6 +62,9 @@ pub enum DependencyKind {
     ColumnGeneratedFrom {
         column: String,
         depends_on_column: String,
+    },
+    ColumnDefaultOnSequence {
+        column: String,
     },
     TriggerOnTable {
         trigger_id: ObjectId,
@@ -204,6 +232,7 @@ impl DependencyGraph {
                         DependencyKind::ViewDependency { .. }
                             | DependencyKind::IndexOnRelation { .. }
                             | DependencyKind::ForeignKey { .. }
+                            | DependencyKind::InheritanceOf
                             | DependencyKind::PartitionOf
                     ) && self.resolve_rename(&edge.referenced) == target
                 })
@@ -216,6 +245,7 @@ impl DependencyGraph {
                     DependencyKind::ViewDependency { .. }
                         | DependencyKind::IndexOnRelation { .. }
                         | DependencyKind::ForeignKey { .. }
+                        | DependencyKind::InheritanceOf
                         | DependencyKind::PartitionOf
                 )
             })
@@ -347,8 +377,11 @@ impl DependencyGraph {
                 DependencyKind::RenameTo => {}
                 DependencyKind::ForeignKey { .. }
                 | DependencyKind::ViewDependency { .. }
+                | DependencyKind::InheritanceOf
                 | DependencyKind::PartitionOf
-                | DependencyKind::ColumnGeneratedFrom { .. } => {
+                | DependencyKind::ConstraintDependency { .. }
+                | DependencyKind::ColumnGeneratedFrom { .. }
+                | DependencyKind::ColumnDefaultOnSequence { .. } => {
                     if edge.dependent == *old_id {
                         edge.dependent = new_id.clone();
                     }
@@ -452,19 +485,6 @@ impl DependencyGraph {
     }
 
     pub fn triggers_for_function(&self, function_id: &ObjectId) -> Vec<&DependencyEdge> {
-        let normalize = |id: &ObjectId| -> ObjectId {
-            let name = if let Some(idx) = id.name.find('(') {
-                format!("{}()", &id.name[..idx])
-            } else {
-                id.name.clone()
-            };
-            ObjectId {
-                schema: id.schema.clone(),
-                name,
-                inferred_schema: id.inferred_schema,
-            }
-        };
-        let target_id = normalize(function_id);
         self.edges
             .iter()
             .filter(|e| {
@@ -472,7 +492,7 @@ impl DependencyGraph {
                     function_id: fid, ..
                 } = &e.kind
                 {
-                    normalize(fid) == target_id
+                    fid == function_id
                 } else {
                     false
                 }
@@ -493,7 +513,10 @@ mod tests {
         DependencyEdge::new(
             id(dependent),
             id(referenced),
-            DependencyKind::ViewDependency { view_generation: 1 },
+            DependencyKind::ViewDependency {
+                view_generation: 1,
+                referenced_column: None,
+            },
         )
     }
 
@@ -587,5 +610,40 @@ mod tests {
         assert_eq!(graph.resolve_rename(&b), &b);
         assert_eq!(graph.resolve_rename(&c), &c);
         assert_indexed_views_match_scan(&graph, &targets);
+    }
+
+    #[test]
+    fn trigger_dependencies_preserve_overloaded_function_identity() {
+        let mut graph = DependencyGraph::new();
+        let trigger_function = id("notify()");
+        let overload = id("notify(integer)");
+        graph.add_edge(DependencyEdge::new(
+            id("events_notify_trigger"),
+            id("events"),
+            DependencyKind::TriggerOnTable {
+                trigger_id: id("events_notify_trigger"),
+                function_id: trigger_function.clone(),
+            },
+        ));
+
+        assert_eq!(graph.triggers_for_function(&trigger_function).len(), 1);
+        assert!(graph.triggers_for_function(&overload).is_empty());
+    }
+
+    #[test]
+    fn traditional_inheritance_cascades_without_becoming_a_partition() {
+        let parent = id("parent");
+        let child = id("child");
+        let mut graph = DependencyGraph::new();
+        graph.add_edge(DependencyEdge::new(
+            child.clone(),
+            parent.clone(),
+            DependencyKind::InheritanceOf,
+        ));
+
+        assert!(graph.partitions_of(&parent).is_empty());
+        assert!(graph.cascade_edges(&parent).iter().any(|edge| {
+            edge.dependent == child && matches!(edge.kind, DependencyKind::InheritanceOf)
+        }));
     }
 }

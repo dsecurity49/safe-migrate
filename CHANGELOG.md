@@ -5,6 +5,47 @@ commits and pull requests. Published binaries, checksums, and generated release
 notes are available on the
 [GitHub Releases page](https://github.com/dsecurity49/safe-migrate/releases).
 
+## Unreleased
+
+- Began the v0.8.0 report-contract migration: lint JSON now uses schema v2 and
+  includes structured conservative-analysis evidence with stable reason codes
+  and statement locations when available.
+- Began Cache V7: synchronized baselines now record validated catalog coverage
+  alongside schema scope, and Cache V6 must be rebuilt with `safe-migrate sync`.
+- Cache V7 now retains ordered foreign-key column identities so column
+  dependency checks no longer discard known baseline FK relationships.
+- Cache V7 also records primary and unique key columns, allowing retained FK
+  references to use known target-key definitions.
+- Cache V7 now retains typed index definitions and uses them to validate
+  `USING INDEX` constraint adoption, concurrent materialized-view refreshes,
+  and exact simple-index cleanup after column renames/drops.
+- Cache V7 now records stable direct inheritance and partition topology from
+  `pg_inherits`, explicitly distinguishing traditional `INHERITS` from
+  declarative partitions; synchronization refuses a detach-in-progress row
+  rather than claiming a stable dependency graph.
+- Cache V7 normalizes view dependencies to stable relation and referenced-column
+  identities from `pg_rewrite`/`pg_depend`. This allows a proven unrelated
+  column drop to proceed without weakening conservative handling of
+  relation-level or locally parsed view dependencies.
+- Cache V7 records complete `pg_depend` column identities for expression and
+  partial indexes. A synchronized `DROP COLUMN` can now preserve an unrelated
+  index or remove its proven dependent index exactly; locally parsed complex
+  indexes remain conservative.
+- Cache V7 now records direct `CHECK`/exclusion expression dependencies from
+  `pg_constraint` and uses them to distinguish an unrelated column drop from
+  a constraint-bearing drop, including transactional CASCADE cleanup.
+- Cache V7 now hydrates generated-column source identities from `pg_attrdef`;
+  dropping a source column now applies its proven dependent-column CASCADE
+  behavior, while additional unresolved generated-column dependencies remain
+  conservative and dropping the generated column removes only its expression
+  edge.
+- Cache V7 distinguishes standalone sequence references in column defaults
+  from `OWNED BY` metadata, so dropping a referenced sequence is no longer
+  treated as independent of its default.
+- A synchronized column-level view dependency now drives recursive view/index
+  cleanup for `DROP COLUMN ... CASCADE`, while relation-level view evidence
+  remains conservative.
+
 ## v0.7.0 — 2026-08-30
 
 - Fixed `sync --out <filename>` for bare relative cache filenames and made the

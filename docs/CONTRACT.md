@@ -66,13 +66,14 @@ Conflicting output modes exit `1`.
 
 ## JSON report
 
-The v1 JSON report has these top-level fields:
+The v2 JSON report has these top-level fields:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "confidence": "Exact",
   "verdict": "HALT",
+  "evidence": [],
   "violations": []
 }
 ```
@@ -97,6 +98,16 @@ additive fields; `rule_id` remains the stable identifier.
 
 The additive top-level `summary` object contains `total`, `tier1`, `tier2`,
 and `tier3` counts.
+
+`evidence` is an ordered, deduplicated list of reasons the analyzer became
+conservative. Each record has a stable snake-case `code`, a `scope` of either
+`statement` or `chain`, a concise `summary`, and, when available, the migration
+`file` and one-based `statement_index` that introduced it. Evidence contains no
+connection strings, SQL text, or database credentials.
+
+Schema v2 supersedes v1 by adding this field and versioning the document. JSON
+consumers must branch on `schema_version`; the rule-discovery JSON schema is a
+separate contract and remains version 2.
 
 The additive `baseline` object records cache/baseline status, cache provenance,
 and automatic-sync outcome:
@@ -181,8 +192,20 @@ an absent cache does not lower a finding by itself. A stale cache taints
 confidence and emits a warning on standard error. `stale_stats_days` uses the
 timestamp inside the cache, not file modification time.
 
-Cache V6 does not carry foreign-key column-number lists or index eligibility
-metadata. A transition whose correctness depends on either fact is skipped and
+Cache V7 records explicit catalog coverage, ordered foreign-key column
+identities, primary/unique constraint keys, stable direct inheritance topology
+(with traditional inheritance distinct from declarative partitioning),
+stable view-dependency relation/column identities, and typed index definitions
+(method, simple key and included columns, complete dependency columns for
+expression keys/predicates, usability, and default-ordering/operator-class/
+collation proof). It also records direct `CHECK`/exclusion expression columns
+from `pg_constraint`; an empty typed dependency is authoritative only for a
+constant expression. Generated-column source identities are also retained from
+`pg_attrdef`, including source-column CASCADE cleanup when the dependent
+closure is fully modeled. It does not yet carry foreign-key operator proof.
+Standalone sequence references used
+by column defaults are retained separately from sequence ownership. A
+transition whose correctness depends on missing catalog fact is skipped and
 taints confidence rather than inventing state; syntax-level findings that are
 independent of the skipped state update (for example `DROP COLUMN` being
 irreversible or `WITH GRANT OPTION`) remain reportable. Multi-target view drops
@@ -200,9 +223,11 @@ unmodeled type, view, or materialized-view alterations; these statements are nev
 silently recorded as exact no-ops.
 The same rule applies to view options/check options, unpopulated materialized
 views, and domain constraints or collations. CTAS `WITH NO DATA` and expression
-indexes remain typed so their dedicated safety rules can report them; expression
-index key/dependency metadata is not used to claim exact later constraint
-adoption. Policy mutations remain available to security rules, but
+indexes remain typed so their dedicated safety rules can report them.
+Synchronized expression/predicate index dependency columns support exact
+unrelated-column and automatic-index-cleanup transitions; locally parsed
+complex indexes do not claim that precision. Policy mutations remain available
+to security rules, but
 policy role lists and expressions taint confidence because relation state does
 not store them.
 Aggregate creation retains its routine identity but is tainted because
@@ -216,7 +241,7 @@ Unknown `RESET` parameters are opaque; only modeled timeout/search-path values
 are exact, and explicitly schema-neutral settings such as `application_name`
 remain no-ops.
 
-Cache V6 synchronizes all `pg_proc.prokind` values in PostgreSQL's shared
+Cache V7 synchronizes all `pg_proc.prokind` values in PostgreSQL's shared
 routine namespace. Function, procedure, aggregate, and window-function
 lifecycle operations use that baseline. Routine DDL without a typed Squawk
 extractor remains opaque.
@@ -224,9 +249,12 @@ extractor remains opaque.
 Publication synchronization is database-wide even when relation sync is
 schema-scoped. It records owners, publication options, explicit tables, schema
 membership, column lists, and row filters where the connected PostgreSQL
-version provides them. Cache V6 does not store `pg_inherits`, so a later
-publication table edit without `ONLY` is `Tainted`; `ONLY` edits do not require
-inheritance evidence.
+version provides them. Cache V7 stores stable direct `pg_inherits` rows, marked
+as traditional inheritance or declarative partitioning, for dependency
+reasoning; only the latter participates in partition lifecycle checks.
+Publication table edits without
+`ONLY` remain `Tainted` until the analyzer also proves their full effective
+partition scope; `ONLY` edits do not require that proof.
 
 Subscription synchronization is limited to the current database and selects
 only non-secret catalog fields. It records owner, enabled state, slot name,
@@ -249,7 +277,7 @@ lock-timeout rule also reports a positive `lock_timeout` that is greater than
 or equal to a positive `statement_timeout`, because PostgreSQL reaches the
 statement timeout first in that ordering.
 
-Analysis initializes both settings from Cache V6, or as unknown when no cache
+Analysis initializes both settings from Cache V7, or as unknown when no cache
 is available. Ordered `SET`, `SET LOCAL`, `SET ... DEFAULT`, `RESET`, and
 `RESET ALL` statements update modeled values. Transaction commit, rollback,
 and savepoint rollback must match PostgreSQL session-versus-local behavior.
@@ -268,7 +296,7 @@ These conditions exit `1` instead of producing a clean report:
 - internal serialization or analysis failure.
 
 Automatic refresh failure prints the error and continues with the old readable
-V6 cache, or with no baseline if none exists. A fresh retained cache keeps its
+V7 cache, or with no baseline if none exists. A fresh retained cache keeps its
 confidence; an unavailable or stale baseline is `Tainted`. JSON records the
 failed refresh.
 
@@ -278,14 +306,14 @@ Encrypted caches require `cache_encryption = true` and a valid
 caches, and encrypted mode rejects plaintext caches. Changing modes requires a
 fresh `safe-migrate sync`.
 
-V6 cache payloads carry an explicit format header and record effective/session
-role provenance, the unexpanded search-path setting, effective lock and
+V7 cache payloads carry an explicit format header, explicit catalog coverage,
+and effective/session role provenance, the unexpanded search-path setting, effective lock and
 statement timeouts in milliseconds, PostgreSQL role membership, authoritative
 synchronized schemas, sequence ownership/kind, all routine kinds,
 publications, and redacted subscriptions. They never include password hashes
-or subscription connection strings. V1–V5 and unheadered payloads are rejected
+or subscription connection strings. V1–V6 and unheadered payloads are rejected
 with guidance to run `safe-migrate sync`. A failed automatic refresh may reuse
-a readable V6 cache, but never an older format.
+a readable V7 cache, but never an older format.
 
 ### GitHub Action
 

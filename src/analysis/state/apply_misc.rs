@@ -1,4 +1,5 @@
-use super::{AnalysisState, Confidence, MutationResult};
+use super::{AnalysisState, MutationResult};
+use crate::analysis::evidence::{EvidenceCode, EvidenceScope};
 use crate::analysis::mutations::{
     AlterDatabaseMutation, CreateDatabaseMutation, DropDatabaseMutation,
 };
@@ -16,8 +17,7 @@ impl AnalysisState {
         // Database objects are outside the current-database schema model.
         // Keep the mutation available to database-specific rules, but do not
         // claim an exact catalog state transition.
-        self.snapshot_confidence();
-        self.local.confidence = Confidence::Tainted;
+        self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
         MutationResult::Applied
     }
 
@@ -25,8 +25,7 @@ impl AnalysisState {
         &mut self,
         _alter_database: &AlterDatabaseMutation,
     ) -> MutationResult {
-        self.snapshot_confidence();
-        self.local.confidence = Confidence::Tainted;
+        self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
         MutationResult::Applied
     }
 
@@ -34,8 +33,7 @@ impl AnalysisState {
         &mut self,
         _drop_database: &DropDatabaseMutation,
     ) -> MutationResult {
-        self.snapshot_confidence();
-        self.local.confidence = Confidence::Tainted;
+        self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
         MutationResult::Applied
     }
 

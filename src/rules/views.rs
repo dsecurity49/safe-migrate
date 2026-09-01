@@ -105,10 +105,23 @@ impl Rule for MaterializedViewRefreshRule {
                 let has_unique_index = state.local.graph.edges().iter().any(|e| {
                     if let crate::analysis::graph::DependencyKind::IndexOnRelation {
                         is_unique,
+                        has_expression_keys,
+                        has_predicate,
+                        is_valid,
+                        is_ready,
+                        is_live,
+                        eligibility_known,
                         ..
                     } = &e.kind
                     {
-                        e.referenced == refresh.id && *is_unique
+                        e.referenced == refresh.id
+                            && *eligibility_known
+                            && *is_unique
+                            && !*has_expression_keys
+                            && !*has_predicate
+                            && *is_valid
+                            && *is_ready
+                            && *is_live
                     } else {
                         false
                     }

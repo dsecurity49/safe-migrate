@@ -229,7 +229,7 @@ mod performance_scenarios {
         let cache = large_baseline();
         let started = Instant::now();
         let config = bincode::config::standard().with_variable_int_encoding();
-        let payload = bincode::serde::encode_to_vec(DbCacheVersioned::V6(Box::new(cache)), config)
+        let payload = bincode::serde::encode_to_vec(DbCacheVersioned::V7(Box::new(cache)), config)
             .expect("cache should encode");
         let compressed = zstd::stream::encode_all(Cursor::new(payload), 3)
             .expect("cache payload should compress");
@@ -317,7 +317,10 @@ mod performance_scenarios {
             graph.add_edge(DependencyEdge::new(
                 object_id("public", &format!("perf_view_{index}")),
                 object_id("public", &format!("perf_target_{}", index % TARGETS)),
-                DependencyKind::ViewDependency { view_generation: 1 },
+                DependencyKind::ViewDependency {
+                    view_generation: 1,
+                    referenced_column: None,
+                },
             ));
         }
         let targets = (0..TARGETS)

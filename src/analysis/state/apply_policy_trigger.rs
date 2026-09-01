@@ -1,4 +1,5 @@
 use super::{AnalysisState, MutationResult, ObjectLookup, RelationOverlay};
+use crate::analysis::evidence::{EvidenceCode, EvidenceScope};
 use crate::analysis::graph::{DependencyEdge, DependencyKind};
 use crate::analysis::mutations::{
     CreatePolicyMutation, CreateTriggerMutation, DropPolicyMutation, DropTriggerMutation,
@@ -54,8 +55,7 @@ impl AnalysisState {
         if !create_policy.semantics_complete {
             // Keep the policy identity for rule evaluation and DROP POLICY
             // lookup, but do not claim authorization state is complete.
-            self.snapshot_confidence();
-            self.local.confidence = super::Confidence::Tainted;
+            self.taint(EvidenceCode::UnsupportedSemantics, EvidenceScope::Chain);
         }
         MutationResult::Applied
     }
@@ -149,14 +149,18 @@ impl AnalysisState {
         let Some(crate::model::function::FunctionOverlay::Present(function)) =
             self.local.functions.get(&create_trigger.function_id)
         else {
-            self.snapshot_confidence();
-            self.local.confidence = super::Confidence::Tainted;
+            self.taint(
+                EvidenceCode::CatalogCoverageIncomplete,
+                EvidenceScope::Chain,
+            );
             return MutationResult::Skipped;
         };
         let return_type = function.return_type.trim();
         if return_type.is_empty() || return_type.eq_ignore_ascii_case("unknown") {
-            self.snapshot_confidence();
-            self.local.confidence = super::Confidence::Tainted;
+            self.taint(
+                EvidenceCode::CatalogCoverageIncomplete,
+                EvidenceScope::Chain,
+            );
             return MutationResult::Skipped;
         }
         let return_type = return_type
@@ -296,8 +300,7 @@ impl AnalysisState {
                 };
             }
             TriggerLookup::Unknown => {
-                self.snapshot_confidence();
-                self.local.confidence = super::Confidence::Tainted;
+                self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
                 return MutationResult::Skipped;
             }
             TriggerLookup::WrongKind => unreachable!("triggers have a dedicated namespace"),

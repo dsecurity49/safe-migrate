@@ -217,12 +217,28 @@ mod tests {
             constraint_name: "fk_test".into(),
             from_table: ObjectId::new("public", "child"),
             to_table: ObjectId::new("public", "parent"),
+            from_columns: vec!["parent_id".into()],
+            to_columns: vec!["id".into()],
         });
 
         // Add index
         cache.indexes.push(crate::db::cache::IndexCache {
             index_id: ObjectId::new("public", "idx_test"),
             table_id: ObjectId::new("public", "test_table"),
+            using_method: "btree".into(),
+            key_columns: vec!["id".into()],
+            included_columns: Vec::new(),
+            dependency_columns: vec!["id".into()],
+            dependency_columns_known: true,
+            has_expression_keys: false,
+            has_predicate: false,
+            is_unique: false,
+            is_valid: true,
+            is_ready: true,
+            is_live: true,
+            has_default_sort_order: true,
+            has_default_opclasses: true,
+            has_default_collations: true,
         });
         let type_id = ObjectId::new("app", "status");
         cache.types.insert(
@@ -278,8 +294,8 @@ mod tests {
             },
         );
 
-        // Cache V6 uses bincode.
-        let versioned = crate::db::cache::DbCacheVersioned::V6(Box::new(cache));
+        // Cache V7 uses bincode.
+        let versioned = crate::db::cache::DbCacheVersioned::V7(Box::new(cache));
         let config = bincode::config::standard().with_variable_int_encoding();
         let encoded = bincode::serde::encode_to_vec(&versioned, config).unwrap();
 
@@ -287,8 +303,8 @@ mod tests {
             bincode::serde::decode_from_slice(&encoded, config)
                 .unwrap()
                 .0;
-        let crate::db::cache::DbCacheVersioned::V6(deserialized) = decoded else {
-            panic!("Expected V6");
+        let crate::db::cache::DbCacheVersioned::V7(deserialized) = decoded else {
+            panic!("Expected V7");
         };
         assert_eq!(deserialized.pg_version_num, Some(160000));
         assert_eq!(
@@ -376,15 +392,15 @@ mod tests {
         });
         cache.insert_baseline(id.clone(), rel);
 
-        let versioned = crate::db::cache::DbCacheVersioned::V6(Box::new(cache));
+        let versioned = crate::db::cache::DbCacheVersioned::V7(Box::new(cache));
         let config = bincode::config::standard().with_variable_int_encoding();
         let encoded = bincode::serde::encode_to_vec(&versioned, config).unwrap();
         let decoded: crate::db::cache::DbCacheVersioned =
             bincode::serde::decode_from_slice(&encoded, config)
                 .unwrap()
                 .0;
-        let crate::db::cache::DbCacheVersioned::V6(deserialized) = decoded else {
-            panic!("Expected V6");
+        let crate::db::cache::DbCacheVersioned::V7(deserialized) = decoded else {
+            panic!("Expected V7");
         };
         let rel = deserialized.relations.get(&id).unwrap();
         assert_eq!(rel.columns[0].default_expr_text, Some("now()".into()));
@@ -462,7 +478,7 @@ mod tests {
                 config,
             )
             .is_err(),
-            "the pre-release routine layout must require a fresh V6 sync"
+            "the pre-release routine layout must require a fresh V7 sync"
         );
     }
 

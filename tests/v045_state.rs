@@ -112,6 +112,19 @@ fn schema_rename_remaps_namespace_and_rolls_back_atomically() {
             generation: 0,
         },
     );
+    cache.schemas.insert(
+        "schema_new".into(),
+        SchemaState {
+            name: "schema_new".into(),
+            owner: owner.clone(),
+            generation: 0,
+        },
+    );
+    cache.metadata.schemas = Some(vec![
+        "public".into(),
+        "schema_old".into(),
+        "schema_new".into(),
+    ]);
     let table = object_id("schema_old", "t");
     cache.insert_baseline(
         table.clone(),
@@ -156,6 +169,11 @@ fn schema_rename_remaps_namespace_and_rolls_back_atomically() {
             "CREATE PUBLICATION app_publication FOR TABLE schema_old.t;",
             &mut state,
         )
+        .unwrap();
+    // Make the target a locally authoritative tombstone. A scoped baseline
+    // cannot prove that an entirely unseen schema name is absent.
+    engine
+        .analyze("DROP SCHEMA schema_new CASCADE;", &mut state)
         .unwrap();
 
     let rename_findings = engine
@@ -218,6 +236,15 @@ fn schema_rename_remaps_namespace_and_rolls_back_atomically() {
             .contains_key(&object_id("schema_old", "t_id_seq"))
     );
     assert_eq!(state.local.search_path, ["schema_old", "public"]);
+    assert_eq!(
+        state.baseline_schemas.as_ref(),
+        Some(&std::collections::HashSet::from([
+            "public".to_string(),
+            "schema_old".to_string(),
+            "schema_new".to_string(),
+        ])),
+        "rollback must restore authoritative schema scope as well as local objects"
+    );
     assert!(matches!(
         state.local.publications.get("app_publication"),
         Some(safe_migrate::model::replication::PublicationOverlay::Present(publication))

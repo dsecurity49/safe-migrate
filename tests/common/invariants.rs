@@ -240,8 +240,11 @@ pub fn assert_state_invariants(state: &AnalysisState) {
             ),
             DependencyKind::IndexOnRelation { .. }
             | DependencyKind::RenameTo
+            | DependencyKind::InheritanceOf
             | DependencyKind::PartitionOf
+            | DependencyKind::ConstraintDependency { .. }
             | DependencyKind::ColumnGeneratedFrom { .. }
+            | DependencyKind::ColumnDefaultOnSequence { .. }
             | DependencyKind::ForeignKey {
                 constraint_name: None,
                 ..

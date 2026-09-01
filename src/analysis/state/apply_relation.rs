@@ -1,6 +1,5 @@
-use super::{
-    AnalysisState, CascadeResult, Confidence, MutationResult, ObjectLookup, RelationOverlay,
-};
+use super::{AnalysisState, CascadeResult, MutationResult, ObjectLookup, RelationOverlay};
+use crate::analysis::evidence::{EvidenceCode, EvidenceScope};
 use crate::analysis::facts::TableConstraintFact;
 use crate::analysis::graph::{DependencyEdge, DependencyKind};
 use crate::analysis::mutations::{
@@ -88,8 +87,7 @@ impl AnalysisState {
                     };
                 }
                 RelationLookup::Unknown => {
-                    self.snapshot_confidence();
-                    self.local.confidence = Confidence::Tainted;
+                    self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
                     unknown_target = true;
                     if !drop_table.if_exists {
                         return MutationResult::Skipped;
@@ -135,8 +133,7 @@ impl AnalysisState {
                 // whose catalog row was omitted. CASCADE removes it in
                 // PostgreSQL, but its unmodeled metadata makes the result
                 // incomplete rather than exact.
-                self.snapshot_confidence();
-                self.local.confidence = Confidence::Tainted;
+                self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
             }
             dropped_relations = closure.dropped_relations.clone();
             dropped_indexes = closure.dropped_indexes.clone();
@@ -187,13 +184,15 @@ impl AnalysisState {
                     && roots.contains(&resolve(&e.referenced))
                     && !roots.contains(&resolve(&e.dependent))
             });
-            let has_partition_deps = self.local.graph.edges().iter().any(|e| {
-                matches!(e.kind, DependencyKind::PartitionOf)
-                    && roots.contains(&resolve(&e.referenced))
+            let has_inheritance_deps = self.local.graph.edges().iter().any(|e| {
+                matches!(
+                    e.kind,
+                    DependencyKind::InheritanceOf | DependencyKind::PartitionOf
+                ) && roots.contains(&resolve(&e.referenced))
                     && !roots.contains(&resolve(&e.dependent))
             });
 
-            if has_view_deps || has_fk_deps || has_partition_deps {
+            if has_view_deps || has_fk_deps || has_inheritance_deps {
                 let relation_word = if present_targets.len() == 1 {
                     "relation"
                 } else {
@@ -226,6 +225,7 @@ impl AnalysisState {
                         e.kind,
                         DependencyKind::ForeignKey { .. }
                             | DependencyKind::ColumnGeneratedFrom { .. }
+                            | DependencyKind::ColumnDefaultOnSequence { .. }
                     );
                 }
                 if roots.contains(&resolve(&e.referenced)) {
@@ -438,8 +438,7 @@ impl AnalysisState {
         }
         if let Some(parent_id) = &create.partition_of {
             let Some(RelationOverlay::Present(parent)) = self.local.relations.get(parent_id) else {
-                self.snapshot_confidence();
-                self.local.confidence = Confidence::Tainted;
+                self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
                 return MutationResult::Skipped;
             };
             if parent.partition_type.is_none() {
@@ -504,8 +503,7 @@ impl AnalysisState {
                 }
                 let Some(RelationOverlay::Present(parent)) = self.local.relations.get(&fk.to_table)
                 else {
-                    self.snapshot_confidence();
-                    self.local.confidence = Confidence::Tainted;
+                    self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
                     return MutationResult::Skipped;
                 };
                 parent
@@ -514,7 +512,7 @@ impl AnalysisState {
                     .map(|column| column.name.clone())
                     .collect()
             };
-            // A scoped/programmatic V6 baseline may omit column facts while
+            // A scoped/programmatic legacy baseline may omit column facts while
             // retaining the relation identity.  Do not turn that absence into
             // a false column conflict; key/index eligibility is checked
             // separately and remains conservative.
@@ -608,8 +606,10 @@ impl AnalysisState {
                     ),
                 };
             } else if target_keys.is_none() {
-                self.snapshot_confidence();
-                self.local.confidence = Confidence::Tainted;
+                self.taint(
+                    EvidenceCode::CatalogCoverageIncomplete,
+                    EvidenceScope::Chain,
+                );
             }
             let source_types: Vec<Option<(Option<ObjectId>, Option<String>)>> = fk
                 .from_columns
@@ -687,13 +687,17 @@ impl AnalysisState {
                         }
                     });
             if type_mismatch {
-                self.snapshot_confidence();
-                self.local.confidence = Confidence::Tainted;
+                self.taint(
+                    EvidenceCode::CatalogCoverageIncomplete,
+                    EvidenceScope::Chain,
+                );
                 return MutationResult::Skipped;
             }
             if type_evidence_unknown {
-                self.snapshot_confidence();
-                self.local.confidence = Confidence::Tainted;
+                self.taint(
+                    EvidenceCode::CatalogCoverageIncomplete,
+                    EvidenceScope::Chain,
+                );
             }
         }
 
@@ -871,8 +875,7 @@ impl AnalysisState {
             // represented in the current fact model. Keep the relation
             // identity for the destructive-operation rule, but make later
             // column-targeting transitions conservative.
-            self.snapshot_confidence();
-            self.local.confidence = Confidence::Tainted;
+            self.taint(EvidenceCode::UnsupportedSemantics, EvidenceScope::Chain);
         }
 
         // Store partition strategy information
@@ -1119,9 +1122,20 @@ impl AnalysisState {
         };
         let DependencyKind::IndexOnRelation {
             using_method,
+            key_columns,
+            included_columns,
+            dependency_columns,
+            dependency_columns_known,
+            has_expression_keys,
             has_predicate,
             is_concurrent,
             is_unique,
+            is_valid,
+            is_ready,
+            is_live,
+            has_default_sort_order,
+            has_default_opclasses,
+            has_default_collations,
             eligibility_known,
         } = edge.kind
         else {
@@ -1137,9 +1151,20 @@ impl AnalysisState {
             table.clone(),
             DependencyKind::IndexOnRelation {
                 using_method,
+                key_columns,
+                included_columns,
+                dependency_columns,
+                dependency_columns_known,
+                has_expression_keys,
                 has_predicate,
                 is_concurrent,
                 is_unique,
+                is_valid,
+                is_ready,
+                is_live,
+                has_default_sort_order,
+                has_default_opclasses,
+                has_default_collations,
                 eligibility_known,
             },
         ));
@@ -1159,21 +1184,24 @@ impl AnalysisState {
                 };
             }
             ObjectLookup::Unknown => {
-                self.snapshot_confidence();
-                self.local.confidence = Confidence::Tainted;
+                self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
                 return MutationResult::Skipped;
             }
         }
 
         if let AlterTableActionMutation::OwnerTo { new_owner } = &alter.action {
             let Some((owner, known)) = self.role_fact_identity(new_owner) else {
-                self.snapshot_confidence();
-                self.local.confidence = Confidence::Tainted;
+                self.taint(
+                    EvidenceCode::CatalogCoverageIncomplete,
+                    EvidenceScope::Chain,
+                );
                 return MutationResult::Skipped;
             };
             if !known {
-                self.snapshot_confidence();
-                self.local.confidence = Confidence::Tainted;
+                self.taint(
+                    EvidenceCode::CatalogCoverageIncomplete,
+                    EvidenceScope::Chain,
+                );
             }
             if known && self.local.roles_known && self.present_role(&owner).is_none() {
                 return MutationResult::Conflict {
@@ -1181,8 +1209,10 @@ impl AnalysisState {
                 };
             }
             if known && !self.local.roles_known {
-                self.snapshot_confidence();
-                self.local.confidence = Confidence::Tainted;
+                self.taint(
+                    EvidenceCode::CatalogCoverageIncomplete,
+                    EvidenceScope::Chain,
+                );
             }
             self.snapshot_relation(&alter.id);
             return match self.local.relations.get_mut(&alter.id) {
@@ -1222,8 +1252,10 @@ impl AnalysisState {
                     | AlterTableActionMutation::SetDefault { .. }
             )
         {
-            self.snapshot_confidence();
-            self.local.confidence = Confidence::Tainted;
+            self.taint(
+                EvidenceCode::CatalogCoverageIncomplete,
+                EvidenceScope::Chain,
+            );
             return MutationResult::Skipped;
         }
         match &alter.action {
@@ -1318,8 +1350,10 @@ impl AnalysisState {
                             ),
                         }
                     } else {
-                        self.snapshot_confidence();
-                        self.local.confidence = Confidence::Tainted;
+                        self.taint(
+                            EvidenceCode::CatalogCoverageIncomplete,
+                            EvidenceScope::Chain,
+                        );
                         MutationResult::Skipped
                     };
                 }
@@ -1526,8 +1560,7 @@ impl AnalysisState {
             }
             AlterTableActionMutation::AlterConstraint { name, .. } => {
                 let Some(name) = name else {
-                    self.snapshot_confidence();
-                    self.local.confidence = Confidence::Tainted;
+                    self.taint(EvidenceCode::UnsupportedSemantics, EvidenceScope::Chain);
                     return MutationResult::Applied;
                 };
                 if !self
@@ -1542,8 +1575,7 @@ impl AnalysisState {
                         ),
                     };
                 }
-                self.snapshot_confidence();
-                self.local.confidence = Confidence::Tainted;
+                self.taint(EvidenceCode::UnsupportedSemantics, EvidenceScope::Chain);
                 return MutationResult::Applied;
             }
             AlterTableActionMutation::AttachPartition {
@@ -1578,11 +1610,12 @@ impl AnalysisState {
                     };
                 }
                 if self.local.graph.check_partition_cycle(&alter.id, child) {
-                    // Preserve the established no-edge behavior for malformed
-                    // ancestry, but make the uncertainty explicit.
-                    self.snapshot_confidence();
-                    self.local.confidence = Confidence::Tainted;
-                    return MutationResult::Applied;
+                    return MutationResult::Conflict {
+                        reason: format!(
+                            "attaching partition '{}' to '{}' would create a partition cycle",
+                            child, alter.id
+                        ),
+                    };
                 }
                 let existing_parent = self.local.graph.edges().iter().find_map(|edge| {
                     (matches!(edge.kind, DependencyKind::PartitionOf) && edge.dependent == *child)
@@ -1626,8 +1659,7 @@ impl AnalysisState {
             AlterTableActionMutation::SetStorage { .. }
             | AlterTableActionMutation::SetAccessMethod => return MutationResult::Applied,
             AlterTableActionMutation::Opaque => {
-                self.snapshot_confidence();
-                self.local.confidence = Confidence::Tainted;
+                self.taint(EvidenceCode::UnsupportedSemantics, EvidenceScope::Chain);
                 return MutationResult::Applied;
             }
             _ => {}
@@ -1729,8 +1761,7 @@ impl AnalysisState {
                 return result;
             }
             let Some(RelationOverlay::Present(parent)) = self.local.relations.get(to_table) else {
-                self.snapshot_confidence();
-                self.local.confidence = Confidence::Tainted;
+                self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
                 return MutationResult::Skipped;
             };
             let target_columns_known =
@@ -1829,16 +1860,20 @@ impl AnalysisState {
                 // PostgreSQL permits some binary-compatible type pairs, but
                 // the cache model does not carry the catalog cast graph.  A
                 // mismatch therefore cannot be classified safely here.
-                self.snapshot_confidence();
-                self.local.confidence = Confidence::Tainted;
+                self.taint(
+                    EvidenceCode::CatalogCoverageIncomplete,
+                    EvidenceScope::Chain,
+                );
                 return MutationResult::Skipped;
             }
             if type_evidence_unknown {
                 fk_evidence_unknown = true;
             }
             if fk_evidence_unknown {
-                self.snapshot_confidence();
-                self.local.confidence = Confidence::Tainted;
+                self.taint(
+                    EvidenceCode::CatalogCoverageIncomplete,
+                    EvidenceScope::Chain,
+                );
             }
         }
 
@@ -1914,25 +1949,44 @@ impl AnalysisState {
                 };
             }
             if let DependencyKind::IndexOnRelation {
+                using_method,
+                has_expression_keys,
                 has_predicate,
                 is_unique,
+                is_valid,
+                is_ready,
+                is_live,
+                has_default_sort_order,
+                has_default_opclasses,
+                has_default_collations,
                 eligibility_known,
                 ..
             } = &edge.kind
             {
                 if !*eligibility_known {
-                    // V6 baseline index rows do not retain uniqueness or
-                    // predicate metadata. PostgreSQL would reject a USING
-                    // INDEX constraint for an ineligible index, so do not
-                    // manufacture an exact constraint in that case.
-                    self.snapshot_confidence();
-                    self.local.confidence = Confidence::Tainted;
+                    self.taint(
+                        EvidenceCode::CatalogCoverageIncomplete,
+                        crate::analysis::evidence::EvidenceScope::Chain,
+                    );
                     return MutationResult::Skipped;
                 }
-                if !*is_unique || *has_predicate {
+                let is_btree = using_method
+                    .as_deref()
+                    .is_some_and(|method| method.eq_ignore_ascii_case("btree"));
+                if !*is_unique
+                    || *has_predicate
+                    || *has_expression_keys
+                    || !*is_valid
+                    || !*is_ready
+                    || !*is_live
+                    || !*has_default_sort_order
+                    || !*has_default_opclasses
+                    || !*has_default_collations
+                    || !is_btree
+                {
                     return MutationResult::Conflict {
                         reason: format!(
-                            "constraint index '{}' must be unique and non-partial",
+                            "constraint index '{}' must be unique and non-partial, live/valid/ready, a btree with simple columns, and use the default definition",
                             index
                         ),
                     };
@@ -1960,6 +2014,9 @@ impl AnalysisState {
         }
 
         let mut drop_column_constraints: HashSet<(ObjectId, String)> = HashSet::new();
+        let mut drop_column_indexes: HashSet<ObjectId> = HashSet::new();
+        let mut cascade_generated_columns: HashSet<String> = HashSet::new();
+        let mut cascade_view_roots: HashSet<ObjectId> = HashSet::new();
         if let AlterTableActionMutation::DropColumn { name, cascade, .. } = &alter.action {
             let resolved_table = self.local.graph.resolve_rename(&alter.id).clone();
             let mut unknown_dependency = false;
@@ -2021,30 +2078,146 @@ impl AnalysisState {
                                 .insert((resolved_table.clone(), constraint_name.clone()));
                         }
                     }
-                    // Index and view rows in Cache V6 do not carry the
-                    // referenced column list. A drop may therefore be a
-                    // PostgreSQL dependency error or a CASCADE operation;
-                    // do not manufacture an exact state transition.
-                    DependencyKind::IndexOnRelation { .. } if referenced == &resolved_table => {
-                        unknown_dependency = true;
+                    DependencyKind::IndexOnRelation {
+                        key_columns,
+                        included_columns,
+                        dependency_columns,
+                        dependency_columns_known,
+                        has_expression_keys,
+                        has_predicate,
+                        ..
+                    } if referenced == &resolved_table => {
+                        // PostgreSQL automatically removes an index when a
+                        // dependent column is dropped; it does not require
+                        // CASCADE. Synchronized catalog rows prove expression
+                        // and predicate columns through pg_depend. Locally
+                        // parsed expression/predicate indexes do not have
+                        // equivalent evidence and remain conservative.
+                        if !*dependency_columns_known {
+                            unknown_dependency = true;
+                        } else if dependency_columns.iter().any(|column| column == name) {
+                            drop_column_indexes.insert(dependent.clone());
+                        } else if !*has_expression_keys && !*has_predicate {
+                            debug_assert!(
+                                key_columns
+                                    .iter()
+                                    .chain(included_columns)
+                                    .all(|column| dependency_columns.contains(column))
+                            );
+                        }
                     }
-                    DependencyKind::ViewDependency { .. } if referenced == &resolved_table => {
-                        unknown_dependency = true;
+                    DependencyKind::ViewDependency {
+                        referenced_column, ..
+                    } if referenced == &resolved_table => match referenced_column {
+                        Some(column) if column == name => {
+                            known_dependency = true;
+                            if *cascade {
+                                cascade_view_roots.insert(dependent.clone());
+                            }
+                        }
+                        Some(_) => {}
+                        None => unknown_dependency = true,
+                    },
+                    DependencyKind::ConstraintDependency {
+                        constraint_name,
+                        columns,
+                    } if dependent == &resolved_table => {
+                        if columns.iter().any(|column| column == name) {
+                            known_dependency = true;
+                            drop_column_constraints
+                                .insert((resolved_table.clone(), constraint_name.clone()));
+                        }
                     }
-                    DependencyKind::ColumnGeneratedFrom { .. }
-                        if dependent == &resolved_table || referenced == &resolved_table =>
+                    DependencyKind::ColumnGeneratedFrom {
+                        column,
+                        depends_on_column,
+                    } if (dependent == &resolved_table || referenced == &resolved_table)
+                        && column != name
+                        && depends_on_column == name =>
                     {
-                        unknown_dependency = true;
+                        known_dependency = true;
+                        if *cascade {
+                            cascade_generated_columns.insert(column.clone());
+                        }
                     }
                     _ => {}
                 }
             }
 
-            // CHECK/EXCLUDE expressions and baseline key definitions do not
-            // retain their column expressions in the current cache model.
-            // If one is present without a precise ConstraintOnRelation edge,
-            // the column may be a dependency and must remain conservative.
-            for ((table_id, constraint_name), constraint) in &self.local.constraints {
+            // A generated dependent can itself participate in another
+            // dependency.  Preserve exactness only for the catalog closures
+            // we can apply here; do not drop the source and leave a typed
+            // foreign-key/constraint edge referring to a removed column.
+            if !cascade_generated_columns.is_empty() {
+                for edge in self.local.graph.edges() {
+                    let dependent = self.local.graph.resolve_rename(&edge.dependent);
+                    let referenced = self.local.graph.resolve_rename(&edge.referenced);
+                    match &edge.kind {
+                        DependencyKind::IndexOnRelation {
+                            dependency_columns,
+                            dependency_columns_known,
+                            ..
+                        } if referenced == &resolved_table => {
+                            if !*dependency_columns_known {
+                                unknown_dependency = true;
+                            } else if dependency_columns
+                                .iter()
+                                .any(|column| cascade_generated_columns.contains(column))
+                            {
+                                drop_column_indexes.insert(dependent.clone());
+                            }
+                        }
+                        DependencyKind::ViewDependency {
+                            referenced_column, ..
+                        } if referenced == &resolved_table => match referenced_column {
+                            Some(column) if cascade_generated_columns.contains(column) => {
+                                cascade_view_roots.insert(dependent.clone());
+                            }
+                            Some(_) => {}
+                            None => unknown_dependency = true,
+                        },
+                        DependencyKind::ForeignKey {
+                            from_columns,
+                            to_columns,
+                            ..
+                        } if (dependent == &resolved_table
+                            && from_columns
+                                .iter()
+                                .any(|column| cascade_generated_columns.contains(column)))
+                            || (referenced == &resolved_table
+                                && to_columns
+                                    .iter()
+                                    .any(|column| cascade_generated_columns.contains(column))) =>
+                        {
+                            unknown_dependency = true;
+                        }
+                        DependencyKind::ConstraintOnRelation { columns, .. }
+                        | DependencyKind::ConstraintDependency { columns, .. }
+                            if dependent == &resolved_table
+                                && columns
+                                    .iter()
+                                    .any(|column| cascade_generated_columns.contains(column)) =>
+                        {
+                            unknown_dependency = true;
+                        }
+                        DependencyKind::ColumnGeneratedFrom {
+                            column,
+                            depends_on_column,
+                        } if referenced == &resolved_table
+                            && cascade_generated_columns.contains(depends_on_column)
+                            && !cascade_generated_columns.contains(column) =>
+                        {
+                            unknown_dependency = true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            // Every CHECK/EXCLUDE constraint must have a typed dependency edge.
+            // An empty edge is authoritative for a constant expression; a
+            // missing edge means the cache is incomplete.
+            for (table_id, constraint_name) in self.local.constraints.keys() {
                 if self.local.graph.resolve_rename(table_id) != &resolved_table {
                     continue;
                 }
@@ -2057,20 +2230,24 @@ impl AnalysisState {
                                 ..
                             } if name == constraint_name
                         )
+                        || matches!(
+                            &edge.kind,
+                            DependencyKind::ConstraintDependency {
+                                constraint_name: name,
+                                ..
+                            } if name == constraint_name
+                        )
                 });
-                if !represented
-                    || matches!(
-                        constraint.kind,
-                        ConstraintKind::Check | ConstraintKind::Exclusion
-                    )
-                {
+                if !represented {
                     unknown_dependency = true;
                 }
             }
 
             if unknown_dependency {
-                self.snapshot_confidence();
-                self.local.confidence = Confidence::Tainted;
+                self.taint(
+                    EvidenceCode::CatalogCoverageIncomplete,
+                    EvidenceScope::Chain,
+                );
                 return MutationResult::Skipped;
             }
             if known_dependency && !cascade {
@@ -2169,6 +2346,13 @@ impl AnalysisState {
                         };
                     }
                     rel.apply_column_action(&ColumnAction::Drop { name: name.clone() });
+                    for generated_column in &cascade_generated_columns {
+                        if rel.has_column(generated_column) {
+                            rel.apply_column_action(&ColumnAction::Drop {
+                                name: generated_column.clone(),
+                            });
+                        }
+                    }
                 }
                 AlterTableActionMutation::RenameColumn { from, to } => {
                     rel.apply_column_action(&ColumnAction::Rename {
@@ -2187,9 +2371,6 @@ impl AnalysisState {
                     });
                 }
                 AlterTableActionMutation::SetType { column, ty, .. } => {
-                    if !rel.has_column(column) {
-                        self.local.confidence = Confidence::Tainted;
-                    }
                     rel.apply_column_action(&ColumnAction::SetType {
                         name: column.clone(),
                         data_type: ty.clone(),
@@ -2200,9 +2381,6 @@ impl AnalysisState {
                     }
                 }
                 AlterTableActionMutation::SetDefault { column, default } => {
-                    if !rel.has_column(column) {
-                        self.local.confidence = Confidence::Tainted;
-                    }
                     rel.apply_column_action(&ColumnAction::SetDefault {
                         name: column.clone(),
                         default: default.clone(),
@@ -2405,8 +2583,10 @@ impl AnalysisState {
                         },
                     );
                     if columns.is_empty() || !relation_columns_known {
-                        self.snapshot_confidence();
-                        self.local.confidence = Confidence::Tainted;
+                        self.taint(
+                            EvidenceCode::CatalogCoverageIncomplete,
+                            EvidenceScope::Chain,
+                        );
                     } else {
                         self.snapshot_graph();
                         self.local.graph.add_edge(DependencyEdge::new(
@@ -2451,8 +2631,10 @@ impl AnalysisState {
                         },
                     );
                     if columns.is_empty() || !relation_columns_known {
-                        self.snapshot_confidence();
-                        self.local.confidence = Confidence::Tainted;
+                        self.taint(
+                            EvidenceCode::CatalogCoverageIncomplete,
+                            EvidenceScope::Chain,
+                        );
                     } else {
                         self.snapshot_graph();
                         self.local.graph.add_edge(DependencyEdge::new(
@@ -2508,10 +2690,14 @@ impl AnalysisState {
                     }
                 }
                 AlterTableActionMutation::AttachPartition { child, .. } => {
-                    // Reject attachments that would make partition ancestry cyclic.
+                    // Validation above rejects cyclic attachments before state mutation.
                     if self.local.graph.check_partition_cycle(&alter.id, child) {
-                        self.snapshot_confidence();
-                        self.local.confidence = Confidence::Tainted;
+                        return MutationResult::Conflict {
+                            reason: format!(
+                                "attaching partition '{}' to '{}' would create a partition cycle",
+                                child, alter.id
+                            ),
+                        };
                     } else {
                         self.snapshot_graph();
                         self.local.graph.add_edge(DependencyEdge::new(
@@ -2530,6 +2716,44 @@ impl AnalysisState {
                     });
                 }
                 _ => {}
+            }
+        }
+        if let AlterTableActionMutation::SetDefault { column, default } = &alter.action {
+            self.snapshot_graph_full();
+            self.local.graph.retain_edges(|edge| {
+                !matches!(
+                    &edge.kind,
+                    DependencyKind::ColumnDefaultOnSequence { column: edge_column }
+                        if edge.dependent == alter.id && edge_column == column
+                )
+            });
+            if let Some(default) = default {
+                let matching_sequences = self
+                    .local
+                    .sequences
+                    .iter()
+                    .filter_map(|(id, overlay)| {
+                        matches!(overlay, SequenceOverlay::Present(_)).then_some(id.clone())
+                    })
+                    .filter(|id| Self::expression_references_sequence(default, id))
+                    .collect::<Vec<_>>();
+                match matching_sequences.as_slice() {
+                    [sequence] => self.local.graph.add_edge(DependencyEdge::new(
+                        alter.id.clone(),
+                        sequence.clone(),
+                        DependencyKind::ColumnDefaultOnSequence {
+                            column: column.clone(),
+                        },
+                    )),
+                    [] if Self::expression_contains_nextval(default) => self.taint(
+                        EvidenceCode::CatalogCoverageIncomplete,
+                        EvidenceScope::Chain,
+                    ),
+                    _ => self.taint(
+                        EvidenceCode::CatalogCoverageIncomplete,
+                        EvidenceScope::Chain,
+                    ),
+                }
             }
         }
         if let AlterTableActionMutation::RenameColumn { from, to } = &alter.action {
@@ -2576,6 +2800,11 @@ impl AnalysisState {
                             if edge.referenced == alter.id && depends_on_column == from {
                                 *depends_on_column = to.clone();
                             }
+                        }
+                        DependencyKind::ColumnDefaultOnSequence { column }
+                            if edge.dependent == alter.id && column == from =>
+                        {
+                            *column = to.clone();
                         }
                         _ => {}
                     }
@@ -2689,6 +2918,10 @@ impl AnalysisState {
                         constraint_name: name,
                         ..
                     } => !drop_column_constraints.contains(&(dependent.clone(), name.clone())),
+                    DependencyKind::ConstraintDependency {
+                        constraint_name: name,
+                        ..
+                    } => !drop_column_constraints.contains(&(dependent.clone(), name.clone())),
                     _ => {
                         // The preflight above has already rejected unknown
                         // column-bearing edges; this arm keeps unrelated
@@ -2696,6 +2929,45 @@ impl AnalysisState {
                         true
                     }
                 }
+            });
+        }
+        if !cascade_view_roots.is_empty() {
+            let views = cascade_view_roots.into_iter().collect::<Vec<_>>();
+            // Preflight established a column-level dependency and CASCADE;
+            // this applies the recursive view/index closure PostgreSQL drops.
+            let _ = self.apply_drop_relation_family(&views, true, "view");
+        }
+        if let AlterTableActionMutation::DropColumn { name, .. } = &alter.action {
+            let resolved_table = self.local.graph.resolve_rename(&alter.id).clone();
+            let resolution_graph = self.local.graph.clone();
+            if self.local.graph.edges().iter().any(|edge| {
+                resolution_graph.resolve_rename(&edge.dependent) == &resolved_table
+                    && matches!(
+                        &edge.kind,
+                        DependencyKind::ColumnGeneratedFrom { column, .. }
+                            | DependencyKind::ColumnDefaultOnSequence { column }
+                            if column == name || cascade_generated_columns.contains(column)
+                    )
+            }) {
+                self.snapshot_graph_full();
+                self.local.graph.retain_edges(|edge| {
+                    !(resolution_graph.resolve_rename(&edge.dependent) == &resolved_table
+                        && matches!(
+                            &edge.kind,
+                            DependencyKind::ColumnGeneratedFrom { column, .. }
+                                | DependencyKind::ColumnDefaultOnSequence { column }
+                                if column == name || cascade_generated_columns.contains(column)
+                        ))
+                });
+            }
+        }
+        if matches!(alter.action, AlterTableActionMutation::DropColumn { .. })
+            && !drop_column_indexes.is_empty()
+        {
+            self.snapshot_graph_full();
+            self.local.graph.retain_edges(|edge| {
+                !(matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
+                    && drop_column_indexes.contains(&edge.dependent))
             });
         }
         match &alter.action {
@@ -2713,6 +2985,33 @@ impl AnalysisState {
                 }
             }
             AlterTableActionMutation::RenameColumn { to, .. } => {
+                if let AlterTableActionMutation::RenameColumn { from, .. } = &alter.action {
+                    self.snapshot_graph_full();
+                    let resolved_table = self.local.graph.resolve_rename(&alter.id).clone();
+                    self.local.graph.mutate_edges(|edges| {
+                        for edge in edges {
+                            if matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
+                                && edge.referenced == resolved_table
+                                && let DependencyKind::IndexOnRelation {
+                                    key_columns,
+                                    included_columns,
+                                    dependency_columns,
+                                    ..
+                                } = &mut edge.kind
+                            {
+                                for column in key_columns
+                                    .iter_mut()
+                                    .chain(included_columns)
+                                    .chain(dependency_columns)
+                                {
+                                    if column == from {
+                                        *column = to.clone();
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
                 for sequence_id in owned_sequences_for_column {
                     self.snapshot_sequence(&sequence_id);
                     if let Some(SequenceOverlay::Present(sequence)) =
@@ -2814,8 +3113,7 @@ impl AnalysisState {
             RelationLookup::Tombstone
             | RelationLookup::AuthoritativelyAbsent
             | RelationLookup::Unknown => {
-                self.snapshot_confidence();
-                self.local.confidence = Confidence::Tainted;
+                self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
                 return MutationResult::Skipped;
             }
             RelationLookup::WrongKind => {
@@ -2835,8 +3133,10 @@ impl AnalysisState {
                     reason: format!("schema '{}' does not exist", rename.new_id.schema),
                 };
             }
-            self.snapshot_confidence();
-            self.local.confidence = Confidence::Tainted;
+            self.taint(
+                EvidenceCode::CatalogCoverageIncomplete,
+                EvidenceScope::Chain,
+            );
             return MutationResult::Skipped;
         }
 
@@ -3036,13 +3336,14 @@ impl AnalysisState {
         new_owner: &crate::analysis::facts::RoleFact,
     ) -> MutationResult {
         let Some((owner, known)) = self.role_fact_identity(new_owner) else {
-            self.snapshot_confidence();
-            self.local.confidence = Confidence::Tainted;
+            self.taint(EvidenceCode::UnresolvedReference, EvidenceScope::Chain);
             return MutationResult::Skipped;
         };
         if !known {
-            self.snapshot_confidence();
-            self.local.confidence = Confidence::Tainted;
+            self.taint(
+                EvidenceCode::CatalogCoverageIncomplete,
+                EvidenceScope::Chain,
+            );
         }
         if known && self.local.roles_known && self.present_role(&owner).is_none() {
             return MutationResult::Conflict {
@@ -3050,8 +3351,10 @@ impl AnalysisState {
             };
         }
         if known && !self.local.roles_known {
-            self.snapshot_confidence();
-            self.local.confidence = Confidence::Tainted;
+            self.taint(
+                EvidenceCode::CatalogCoverageIncomplete,
+                EvidenceScope::Chain,
+            );
         }
         match self.relation_lookup(id, |_| true) {
             RelationLookup::Present => {
@@ -3072,8 +3375,7 @@ impl AnalysisState {
                 }
             }
             RelationLookup::Unknown => {
-                self.snapshot_confidence();
-                self.local.confidence = Confidence::Tainted;
+                self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
                 MutationResult::Skipped
             }
         }

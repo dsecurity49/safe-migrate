@@ -1,4 +1,6 @@
+use crate::analysis::evidence::EvidenceLocation;
 use crate::analysis::mutations::Mutation;
+use crate::analysis::outcome::AnalysisOutcome;
 use crate::analysis::resolver::Resolver;
 use crate::analysis::state::{AnalysisState, PreState};
 use crate::ast::visitor::AstVisitor;
@@ -191,6 +193,32 @@ impl SafeMigrateEngine {
         self.analyze_chain_with_locations(&[(filename, sql)], state)
     }
 
+    /// Analyze a migration chain and return immutable findings, confidence, and
+    /// conservative-analysis evidence together.
+    pub fn analyze_chain_outcome_with_locations(
+        &self,
+        files: &[(String, String)],
+        state: &mut AnalysisState,
+    ) -> Result<AnalysisOutcome<ReportFinding>, Vec<String>> {
+        let findings = self.analyze_chain_with_locations(files, state)?;
+        Ok(AnalysisOutcome::new(
+            findings,
+            state.confidence().clone(),
+            state.evidence().to_vec(),
+        ))
+    }
+
+    /// Analyze one migration and return immutable findings, confidence, and
+    /// conservative-analysis evidence together.
+    pub fn analyze_outcome_with_locations(
+        &self,
+        filename: String,
+        sql: String,
+        state: &mut AnalysisState,
+    ) -> Result<AnalysisOutcome<ReportFinding>, Vec<String>> {
+        self.analyze_chain_outcome_with_locations(&[(filename, sql)], state)
+    }
+
     fn analyze_single_file(
         &self,
         filename: &str,
@@ -213,7 +241,7 @@ impl SafeMigrateEngine {
 
     fn analyze_parsed_file(
         &self,
-        _filename: &str,
+        filename: &str,
         sql: &str,
         parsed: &Parse<SourceFile>,
         state: &mut AnalysisState,
@@ -239,7 +267,11 @@ impl SafeMigrateEngine {
             Self::parse_directives(token.text(), &mut file_ignores, &mut dummy);
         }
 
-        for stmt in parsed.tree().stmts() {
+        for (statement_offset, stmt) in parsed.tree().stmts().enumerate() {
+            state.set_evidence_location(Some(EvidenceLocation {
+                file: filename.to_string(),
+                statement_index: statement_offset + 1,
+            }));
             let mut stmt_ignores = HashSet::new();
 
             let mut prev = stmt.syntax().prev_sibling_or_token();
@@ -396,6 +428,7 @@ impl SafeMigrateEngine {
             all_violations.extend(statement_violations);
         }
 
+        state.set_evidence_location(None);
         Ok(all_violations)
     }
 

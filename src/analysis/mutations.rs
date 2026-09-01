@@ -320,6 +320,12 @@ pub struct CreateIndex {
     pub using_method: Option<String>,
     pub has_predicate: bool,
     pub unique: bool,
+    pub key_columns: Vec<String>,
+    pub included_columns: Vec<String>,
+    pub has_expression_keys: bool,
+    pub has_default_sort_order: bool,
+    pub has_default_opclasses: bool,
+    pub has_default_collations: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]

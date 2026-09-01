@@ -549,6 +549,22 @@ mod tests {
     }
 
     #[test]
+    fn alter_table_drop_default_is_a_typed_default_reset() {
+        let fact =
+            parse_and_extract_statement("ALTER TABLE users ALTER COLUMN email DROP DEFAULT;")
+                .expect("alter table fact");
+
+        let StatementFact::AlterTable { actions, .. } = fact else {
+            panic!("expected alter table fact");
+        };
+        assert!(matches!(
+            actions.as_slice(),
+            [AlterTableActionFact::SetDefault { column, default: None }]
+                if column == "email"
+        ));
+    }
+
+    #[test]
     fn test_alter_table_unique_using_index() {
         let fact = parse_and_extract_statement(
             "ALTER TABLE users ADD CONSTRAINT users_email_key UNIQUE USING INDEX users_email_key;",
@@ -2185,9 +2201,35 @@ mod tests {
                 unique: true,
                 concurrently: false,
                 has_predicate: false,
+                has_expression_keys: true,
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn create_index_retains_eligibility_proof_facts() {
+        let parsed =
+            SourceFile::parse("CREATE UNIQUE INDEX source_name_idx ON source (name) INCLUDE (id);");
+        let statement = parsed.tree().stmts().next().expect("statement");
+        let Some(StatementFact::CreateIndex {
+            key_columns,
+            has_expression_keys,
+            included_columns,
+            has_default_sort_order,
+            has_default_opclasses,
+            has_default_collations,
+            ..
+        }) = AstVisitor::extract(&statement)
+        else {
+            panic!("expected create index fact");
+        };
+        assert_eq!(key_columns, ["name"]);
+        assert!(!has_expression_keys);
+        assert_eq!(included_columns, ["id"]);
+        assert!(has_default_sort_order);
+        assert!(has_default_opclasses);
+        assert!(has_default_collations);
     }
 
     #[test]

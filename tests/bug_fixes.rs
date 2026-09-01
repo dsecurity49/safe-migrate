@@ -8,6 +8,30 @@ mod phase10_bug_fixes_and_sorting_tests {
     use safe_migrate::model::relation::{Persistence, RelationKind};
     use safe_migrate::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
 
+    fn baseline_index(
+        index_id: ObjectId,
+        table_id: ObjectId,
+    ) -> safe_migrate::db::cache::IndexCache {
+        safe_migrate::db::cache::IndexCache {
+            index_id,
+            table_id,
+            using_method: "btree".into(),
+            key_columns: vec!["id".into()],
+            included_columns: Vec::new(),
+            dependency_columns: vec!["id".into()],
+            dependency_columns_known: true,
+            has_expression_keys: false,
+            has_predicate: false,
+            is_unique: false,
+            is_valid: true,
+            is_ready: true,
+            is_live: true,
+            has_default_sort_order: true,
+            has_default_opclasses: true,
+            has_default_collations: true,
+        }
+    }
+
     #[test]
     fn comment_on_is_schema_neutral_and_preserves_confidence() {
         let engine = setup_engine();
@@ -65,10 +89,10 @@ mod phase10_bug_fixes_and_sorting_tests {
     #[test]
     fn test_bug008_index_not_in_baseline_relations() {
         let mut cache = DbCache::new();
-        cache.indexes.push(safe_migrate::db::cache::IndexCache {
-            index_id: object_id("public", "idx_accounts_username"),
-            table_id: object_id("public", "accounts"),
-        });
+        cache.indexes.push(baseline_index(
+            object_id("public", "idx_accounts_username"),
+            object_id("public", "accounts"),
+        ));
         let state = AnalysisState::new(cache);
         assert!(
             !state
@@ -80,10 +104,10 @@ mod phase10_bug_fixes_and_sorting_tests {
     #[test]
     fn test_bug008_index_in_baseline_indexes() {
         let mut cache = DbCache::new();
-        cache.indexes.push(safe_migrate::db::cache::IndexCache {
-            index_id: object_id("public", "idx_accounts_username"),
-            table_id: object_id("public", "accounts"),
-        });
+        cache.indexes.push(baseline_index(
+            object_id("public", "idx_accounts_username"),
+            object_id("public", "accounts"),
+        ));
         let state = AnalysisState::new(cache);
         assert!(
             state
@@ -108,10 +132,10 @@ mod phase10_bug_fixes_and_sorting_tests {
                 0,
             ),
         );
-        cache.indexes.push(safe_migrate::db::cache::IndexCache {
-            index_id: object_id("public", "idx_accounts_username"),
-            table_id: object_id("public", "accounts"),
-        });
+        cache.indexes.push(baseline_index(
+            object_id("public", "idx_accounts_username"),
+            object_id("public", "accounts"),
+        ));
 
         let mut state = AnalysisState::new(cache);
 
@@ -213,10 +237,10 @@ mod phase10_bug_fixes_and_sorting_tests {
                 0,
             ),
         );
-        cache.indexes.push(safe_migrate::db::cache::IndexCache {
-            index_id: object_id("public", "idx_t_id"),
-            table_id: object_id("public", "t"),
-        });
+        cache.indexes.push(baseline_index(
+            object_id("public", "idx_t_id"),
+            object_id("public", "t"),
+        ));
 
         let mut state = AnalysisState::new(cache);
 

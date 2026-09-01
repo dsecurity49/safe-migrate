@@ -1,4 +1,5 @@
-use super::{AnalysisState, Confidence, MutationResult, ObjectLookup, RelationOverlay};
+use super::{AnalysisState, MutationResult, ObjectLookup, RelationOverlay};
+use crate::analysis::evidence::{EvidenceCode, EvidenceScope};
 use crate::analysis::graph::{DependencyEdge, DependencyKind};
 use crate::analysis::mutations::{
     AlterDomainMutation, AlterTypeActionMutation, AlterTypeMutation, CreateDomainMutation,
@@ -45,8 +46,7 @@ impl AnalysisState {
                 };
             }
             TypeLookup::Tombstone | TypeLookup::AuthoritativelyAbsent | TypeLookup::Unknown => {
-                self.snapshot_confidence();
-                self.local.confidence = Confidence::Tainted;
+                self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
                 return MutationResult::Skipped;
             }
             TypeLookup::WrongKind => unreachable!("all present type kinds are accepted"),
@@ -64,8 +64,7 @@ impl AnalysisState {
                     reason: format!("schema '{}' does not exist", rename.new_id.schema),
                 };
             }
-            self.snapshot_confidence();
-            self.local.confidence = Confidence::Tainted;
+            self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
             return MutationResult::Skipped;
         }
 
@@ -221,8 +220,7 @@ impl AnalysisState {
                 };
             }
             TypeLookup::Unknown => {
-                self.snapshot_confidence();
-                self.local.confidence = Confidence::Tainted;
+                self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
                 return MutationResult::Skipped;
             }
         }
@@ -331,8 +329,7 @@ impl AnalysisState {
     pub(super) fn apply_alter_domain(&mut self, alter: &AlterDomainMutation) -> MutationResult {
         match self.type_lookup(&alter.id, |kind| matches!(kind, TypeKind::Domain { .. })) {
             TypeLookup::Present => {
-                self.snapshot_confidence();
-                self.local.confidence = Confidence::Tainted;
+                self.taint(EvidenceCode::UnsupportedSemantics, EvidenceScope::Chain);
                 MutationResult::Skipped
             }
             TypeLookup::WrongKind => MutationResult::Conflict {
@@ -342,8 +339,7 @@ impl AnalysisState {
                 reason: format!("domain '{}' does not exist", alter.id),
             },
             TypeLookup::Unknown => {
-                self.snapshot_confidence();
-                self.local.confidence = Confidence::Tainted;
+                self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
                 MutationResult::Skipped
             }
         }
@@ -366,8 +362,7 @@ impl AnalysisState {
                     };
                 }
                 TypeLookup::Unknown => {
-                    self.snapshot_confidence();
-                    self.local.confidence = Confidence::Tainted;
+                    self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
                     return MutationResult::Skipped;
                 }
             }
@@ -381,8 +376,7 @@ impl AnalysisState {
                     reason: format!("domain '{}' has dependent objects; use CASCADE", dependent),
                 };
             }
-            self.snapshot_confidence();
-            self.local.confidence = Confidence::Tainted;
+            self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
             return MutationResult::Skipped;
         }
         for id in &present {
@@ -409,8 +403,7 @@ impl AnalysisState {
                     };
                 }
                 TypeLookup::Unknown => {
-                    self.snapshot_confidence();
-                    self.local.confidence = Confidence::Tainted;
+                    self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
                     return MutationResult::Skipped;
                 }
             }
@@ -424,8 +417,7 @@ impl AnalysisState {
                     reason: format!("type '{}' has dependent objects; use CASCADE", dependent),
                 };
             }
-            self.snapshot_confidence();
-            self.local.confidence = Confidence::Tainted;
+            self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
             return MutationResult::Skipped;
         }
         for id in &present {

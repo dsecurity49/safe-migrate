@@ -9,7 +9,7 @@ use safe_migrate::analysis::facts::{
 };
 use safe_migrate::analysis::state::AnalysisState;
 use safe_migrate::ast::identifiers::ObjectId;
-use safe_migrate::db::cache::{CACHE_V6_MAGIC, DbCacheVersioned};
+use safe_migrate::db::cache::{CACHE_V7_MAGIC, DbCacheVersioned};
 use safe_migrate::engine::config::Config;
 use safe_migrate::engine::engine::SafeMigrateEngine;
 use safe_migrate::model::function::{FunctionOverlay, RoutineKind, SecurityMode, Volatility};
@@ -68,14 +68,14 @@ fn decode_cache(path: &std::path::Path) -> (safe_migrate::DbCache, Vec<u8>) {
         .read_to_end(&mut payload)
         .expect("read decoded cache payload");
     let v6_payload = payload
-        .strip_prefix(CACHE_V6_MAGIC)
-        .expect("catalog sync must write a V6 cache");
+        .strip_prefix(CACHE_V7_MAGIC)
+        .expect("catalog sync must write a V7 cache");
     let config = bincode::config::standard().with_variable_int_encoding();
     let (versioned, bytes_read): (DbCacheVersioned, usize) =
-        bincode::serde::decode_from_slice(v6_payload, config).expect("decode V6 cache");
+        bincode::serde::decode_from_slice(v6_payload, config).expect("decode V7 cache");
     assert_eq!(bytes_read, v6_payload.len());
-    let DbCacheVersioned::V6(cache) = versioned else {
-        panic!("catalog sync must encode the V6 cache variant");
+    let DbCacheVersioned::V7(cache) = versioned else {
+        panic!("catalog sync must encode the V7 cache variant");
     };
     (*cache, payload)
 }
@@ -115,7 +115,36 @@ fn seed_catalog(client: &mut postgres::Client, version: i32) {
         .batch_execute(&format!(
             "CREATE SCHEMA {SCHEMA};
              CREATE SCHEMA {SECOND_SCHEMA};
-             CREATE TABLE {SCHEMA}.entries (id integer PRIMARY KEY, note text);
+             CREATE TABLE {SCHEMA}.entries (
+               id integer PRIMARY KEY,
+               note text,
+               CONSTRAINT entries_note_check CHECK (note IS NOT NULL)
+             );
+             CREATE TABLE {SCHEMA}.entry_refs (
+               entry_id integer NOT NULL REFERENCES {SCHEMA}.entries(id)
+             );
+             CREATE UNIQUE INDEX entries_note_key ON {SCHEMA}.entries(note);
+             CREATE INDEX entries_note_partial_key ON {SCHEMA}.entries(id)
+               WHERE note IS NOT NULL;
+             CREATE INDEX entries_note_expression_idx ON {SCHEMA}.entries((lower(note)));
+             CREATE INDEX entries_id_include_idx ON {SCHEMA}.entries(id) INCLUDE (note);
+             CREATE TABLE {SCHEMA}.view_source (id integer, note text, unused text);
+             CREATE TABLE {SCHEMA}.generated_source (
+               source integer,
+               derived integer GENERATED ALWAYS AS (source * 2) STORED
+             );
+             CREATE SEQUENCE {SCHEMA}.standalone_default_seq;
+             CREATE TABLE {SCHEMA}.default_source (
+               value integer DEFAULT nextval('{SCHEMA}.standalone_default_seq'::regclass)
+             );
+             CREATE VIEW {SCHEMA}.entry_projection AS
+               SELECT id, note FROM {SCHEMA}.view_source;
+             CREATE TABLE {SCHEMA}.inheritance_parent (id integer);
+             CREATE TABLE {SCHEMA}.inheritance_child (extra text)
+               INHERITS ({SCHEMA}.inheritance_parent);
+             CREATE TABLE {SCHEMA}.partition_root (id integer) PARTITION BY RANGE (id);
+             CREATE TABLE {SCHEMA}.partition_leaf PARTITION OF {SCHEMA}.partition_root
+               FOR VALUES FROM (0) TO (100);
              CREATE TABLE {SECOND_SCHEMA}.audit_entries (id integer PRIMARY KEY);
              CREATE FUNCTION {SCHEMA}.with_out(value integer, OUT doubled integer)
                LANGUAGE sql IMMUTABLE AS 'SELECT value * 2';
@@ -312,6 +341,169 @@ fn live_sync_preserves_routine_and_replication_catalogs_without_connection_secre
     let cache_path = temp_dir.path().join("catalog.cache");
     sync_cache(&cache_path, None, false).expect("sync seeded live catalog");
     let (cache, decoded_payload) = decode_cache(&cache_path);
+
+    let entry_id = safe_migrate::ast::identifiers::ObjectId::new(SCHEMA, "entries");
+    let entry_ref_id = safe_migrate::ast::identifiers::ObjectId::new(SCHEMA, "entry_refs");
+    let view_source_id = ObjectId::new(SCHEMA, "view_source");
+    let foreign_key = cache
+        .foreign_keys
+        .iter()
+        .find(|key| key.from_table == entry_ref_id && key.to_table == entry_id)
+        .expect("synchronized entry_refs foreign key");
+    assert_eq!(foreign_key.from_columns, ["entry_id"]);
+    assert_eq!(foreign_key.to_columns, ["id"]);
+    assert!(cache.constraint_dependencies.iter().any(|dependency| {
+        dependency.table_id == entry_id
+            && dependency.constraint_name == "entries_note_check"
+            && dependency.columns == ["note"]
+    }));
+    let generated_table = ObjectId::new(SCHEMA, "generated_source");
+    assert!(
+        cache
+            .generated_column_dependencies
+            .iter()
+            .any(|dependency| {
+                dependency.table_id == generated_table
+                    && dependency.column_name == "derived"
+                    && dependency.depends_on_column == "source"
+            })
+    );
+    let default_table = ObjectId::new(SCHEMA, "default_source");
+    let default_sequence = ObjectId::new(SCHEMA, "standalone_default_seq");
+    assert!(
+        cache
+            .default_sequence_dependencies
+            .iter()
+            .any(|dependency| {
+                dependency.table_id == default_table
+                    && dependency.column_name == "value"
+                    && dependency.sequence_id == default_sequence
+            })
+    );
+    assert!(cache.constraint_keys.iter().any(|key| {
+        key.table_id == entry_id
+            && key.is_primary
+            && key.columns == ["id"]
+            && key.constraint_name == "entries_pkey"
+    }));
+    let simple_unique = cache
+        .indexes
+        .iter()
+        .find(|index| index.index_id == ObjectId::new(SCHEMA, "entries_note_key"))
+        .expect("synchronized simple unique index");
+    assert_eq!(simple_unique.using_method, "btree");
+    assert_eq!(simple_unique.key_columns, ["note"]);
+    assert!(simple_unique.included_columns.is_empty());
+    assert!(!simple_unique.has_expression_keys);
+    assert!(!simple_unique.has_predicate);
+    assert!(simple_unique.is_unique);
+    assert!(simple_unique.is_valid && simple_unique.is_ready && simple_unique.is_live);
+    assert!(simple_unique.has_default_sort_order);
+    assert!(simple_unique.has_default_opclasses);
+    assert!(simple_unique.has_default_collations);
+    let partial = cache
+        .indexes
+        .iter()
+        .find(|index| index.index_id == ObjectId::new(SCHEMA, "entries_note_partial_key"))
+        .expect("synchronized partial index");
+    assert!(partial.has_predicate);
+    assert_eq!(partial.key_columns, ["id"]);
+    assert_eq!(partial.dependency_columns, ["id", "note"]);
+    assert!(partial.dependency_columns_known);
+    let expression = cache
+        .indexes
+        .iter()
+        .find(|index| index.index_id == ObjectId::new(SCHEMA, "entries_note_expression_idx"))
+        .expect("synchronized expression index");
+    assert!(expression.has_expression_keys);
+    assert_eq!(expression.dependency_columns, ["note"]);
+    assert!(expression.dependency_columns_known);
+    assert!(cache.indexes.iter().any(|index| {
+        index.index_id == ObjectId::new(SCHEMA, "entries_id_include_idx")
+            && index.included_columns == ["note"]
+    }));
+    for column in ["id", "note"] {
+        assert!(cache.dependencies.iter().any(|dependency| {
+            dependency.dependent == ObjectId::new(SCHEMA, "entry_projection")
+                && dependency.referenced == view_source_id
+                && dependency.referenced_column.as_deref() == Some(column)
+        }));
+    }
+    assert!(cache.inheritances.iter().any(|inheritance| {
+        inheritance.child == ObjectId::new(SCHEMA, "inheritance_child")
+            && inheritance.parent == ObjectId::new(SCHEMA, "inheritance_parent")
+            && inheritance.sequence == 1
+            && !inheritance.is_partition
+            && !inheritance.detach_pending
+    }));
+    assert!(cache.inheritances.iter().any(|inheritance| {
+        inheritance.child == ObjectId::new(SCHEMA, "partition_leaf")
+            && inheritance.parent == ObjectId::new(SCHEMA, "partition_root")
+            && inheritance.sequence == 1
+            && inheritance.is_partition
+            && !inheritance.detach_pending
+    }));
+    let mut hydrated_state = AnalysisState::new(cache.clone());
+    assert!(hydrated_state.local.graph.edges().iter().any(|edge| {
+        matches!(
+            edge.kind,
+            safe_migrate::analysis::graph::DependencyKind::InheritanceOf
+        ) && edge.dependent == ObjectId::new(SCHEMA, "inheritance_child")
+            && edge.referenced == ObjectId::new(SCHEMA, "inheritance_parent")
+    }));
+    assert!(hydrated_state.local.graph.edges().iter().any(|edge| {
+        matches!(
+            edge.kind,
+            safe_migrate::analysis::graph::DependencyKind::PartitionOf
+        ) && edge.dependent == ObjectId::new(SCHEMA, "partition_leaf")
+            && edge.referenced == ObjectId::new(SCHEMA, "partition_root")
+    }));
+    let findings = SafeMigrateEngine::new(Config::default())
+        .analyze(
+            &format!("ALTER TABLE {SCHEMA}.view_source DROP COLUMN unused;"),
+            &mut hydrated_state,
+        )
+        .expect("analyze catalog-proven unrelated view column drop");
+    assert!(
+        !findings
+            .iter()
+            .any(|finding| finding.rule_id == "chain-conflict"),
+        "unrelated synchronized view column drop must not conflict: {findings:?}"
+    );
+    assert_eq!(
+        hydrated_state.local.confidence,
+        safe_migrate::analysis::state::Confidence::Exact,
+        "unrelated synchronized view column drop tainted state: {:?}",
+        hydrated_state.evidence()
+    );
+    assert!(
+        hydrated_state
+            .get_relation(&view_source_id)
+            .is_some_and(|relation| match relation {
+                safe_migrate::model::relation::RelationOverlay::Present(table) => {
+                    !table.has_column("unused")
+                }
+                safe_migrate::model::relation::RelationOverlay::Dropped => false,
+            })
+    );
+
+    let mut cascade_state = AnalysisState::new(cache.clone());
+    let findings = SafeMigrateEngine::new(Config::default())
+        .analyze(
+            &format!("ALTER TABLE {SCHEMA}.view_source DROP COLUMN note CASCADE;"),
+            &mut cascade_state,
+        )
+        .expect("analyze catalog-proven view-column cascade");
+    assert!(
+        !findings
+            .iter()
+            .any(|finding| finding.rule_id == "chain-conflict"),
+        "synchronized view column cascade must not conflict: {findings:?}"
+    );
+    assert!(matches!(
+        cascade_state.get_relation(&ObjectId::new(SCHEMA, "entry_projection")),
+        Some(safe_migrate::model::relation::RelationOverlay::Dropped)
+    ));
 
     let routine_kinds = cache
         .functions
@@ -534,6 +726,7 @@ fn live_sync_preserves_routine_and_replication_catalogs_without_connection_secre
         ),
         ("publications", cache.publications.len()),
         ("subscriptions", cache.subscriptions.len()),
+        ("inheritances", cache.inheritances.len()),
     ] {
         assert!(expected > 0, "seeded cache count {field} must be nonzero");
         assert_eq!(contents[field], expected, "cache inspect count {field}");

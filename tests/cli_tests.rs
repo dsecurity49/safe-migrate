@@ -7,7 +7,7 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit},
 };
 use safe_migrate::ast::identifiers::ObjectId;
-use safe_migrate::db::cache::{CACHE_V6_MAGIC, DbCache, DbCacheVersioned};
+use safe_migrate::db::cache::{CACHE_V7_MAGIC, DbCache, DbCacheVersioned};
 use safe_migrate::model::relation::{Persistence, RelationKind, RelationState};
 use safe_migrate::model::schema::SchemaState;
 
@@ -44,9 +44,9 @@ fn write_cache_with_timestamp(path: &std::path::Path, created_at_unix_secs: u64)
     let mut compressed = Vec::new();
     let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3).unwrap();
     let config = bincode::config::standard().with_variable_int_encoding();
-    encoder.write_all(CACHE_V6_MAGIC).unwrap();
+    encoder.write_all(CACHE_V7_MAGIC).unwrap();
     bincode::serde::encode_into_std_write(
-        DbCacheVersioned::V6(Box::new(cache)),
+        DbCacheVersioned::V7(Box::new(cache)),
         &mut encoder,
         config,
     )
@@ -264,7 +264,7 @@ fn test_cli_lint_invalid_cache() {
 }
 
 #[test]
-fn test_cli_rejects_semantically_contradictory_v6_cache() {
+fn test_cli_rejects_semantically_contradictory_v7_cache() {
     let mut invalid = DbCache::new();
     invalid.schemas.insert(
         "app".to_string(),
@@ -276,10 +276,10 @@ fn test_cli_rejects_semantically_contradictory_v6_cache() {
     );
     let config = bincode::config::standard().with_variable_int_encoding();
     let encoded =
-        bincode::serde::encode_to_vec(DbCacheVersioned::V6(Box::new(invalid)), config).unwrap();
+        bincode::serde::encode_to_vec(DbCacheVersioned::V7(Box::new(invalid)), config).unwrap();
     let mut compressed = Vec::new();
     let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3).unwrap();
-    encoder.write_all(CACHE_V6_MAGIC).unwrap();
+    encoder.write_all(CACHE_V7_MAGIC).unwrap();
     encoder.write_all(&encoded).unwrap();
     encoder.finish().unwrap();
     let cache = tempfile::NamedTempFile::new().unwrap();
@@ -301,7 +301,7 @@ fn test_cli_rejects_semantically_contradictory_v6_cache() {
 }
 
 #[test]
-fn test_cli_rejects_authenticated_semantically_contradictory_v6_cache() {
+fn test_cli_rejects_authenticated_semantically_contradictory_v7_cache() {
     let mut invalid = DbCache::new();
     invalid.schemas.insert(
         "app".to_string(),
@@ -313,10 +313,10 @@ fn test_cli_rejects_authenticated_semantically_contradictory_v6_cache() {
     );
     let config = bincode::config::standard().with_variable_int_encoding();
     let encoded =
-        bincode::serde::encode_to_vec(DbCacheVersioned::V6(Box::new(invalid)), config).unwrap();
+        bincode::serde::encode_to_vec(DbCacheVersioned::V7(Box::new(invalid)), config).unwrap();
     let mut compressed = Vec::new();
     let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3).unwrap();
-    encoder.write_all(CACHE_V6_MAGIC).unwrap();
+    encoder.write_all(CACHE_V7_MAGIC).unwrap();
     encoder.write_all(&encoded).unwrap();
     encoder.finish().unwrap();
 
@@ -357,8 +357,8 @@ fn test_cli_rejects_authenticated_semantically_contradictory_v6_cache() {
 fn test_cli_rejects_cache_with_oversized_decoded_container() {
     let config = bincode::config::standard().with_variable_int_encoding();
     let encoded =
-        bincode::serde::encode_to_vec(DbCacheVersioned::V6(Box::default()), config).unwrap();
-    assert_eq!(&encoded[..4], &[5, 0, 0, 0]);
+        bincode::serde::encode_to_vec(DbCacheVersioned::V7(Box::default()), config).unwrap();
+    assert_eq!(&encoded[..4], &[6, 0, 0, 0]);
 
     let mut malicious = encoded[..3].to_vec();
     malicious.push(1);
@@ -367,7 +367,7 @@ fn test_cli_rejects_cache_with_oversized_decoded_container() {
 
     let mut compressed = Vec::new();
     let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3).unwrap();
-    encoder.write_all(CACHE_V6_MAGIC).unwrap();
+    encoder.write_all(CACHE_V7_MAGIC).unwrap();
     encoder.write_all(&malicious).unwrap();
     encoder.finish().unwrap();
 
@@ -392,11 +392,11 @@ fn test_cli_rejects_cache_with_oversized_decoded_container() {
 fn test_cli_rejects_trailing_data_after_streamed_cache_decode() {
     let config = bincode::config::standard().with_variable_int_encoding();
     let encoded =
-        bincode::serde::encode_to_vec(DbCacheVersioned::V6(Box::default()), config).unwrap();
+        bincode::serde::encode_to_vec(DbCacheVersioned::V7(Box::default()), config).unwrap();
 
     let mut compressed = Vec::new();
     let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3).unwrap();
-    encoder.write_all(CACHE_V6_MAGIC).unwrap();
+    encoder.write_all(CACHE_V7_MAGIC).unwrap();
     encoder.write_all(&encoded).unwrap();
     encoder.write_all(b"trailing-data").unwrap();
     encoder.finish().unwrap();
@@ -525,14 +525,22 @@ fn test_cache_inspect_outputs_a_redacted_json_summary() {
     let report = parse_json_stdout(assert.get_output());
 
     assert_eq!(report["path"], cache_path.display().to_string());
-    assert_eq!(report["format_version"], 6);
+    assert_eq!(report["format_version"], 7);
     assert_eq!(report["encrypted"], false);
+    assert_eq!(report["coverage"]["schema_scope"], "all_non_system");
+    assert!(report["coverage"]["families"].is_array());
+    assert!(
+        report["coverage"]["families"]
+            .as_array()
+            .is_some_and(|families| families.iter().any(|family| family == "relations"))
+    );
     assert_eq!(report["observed_settings"]["lock_timeout_ms"], 0);
     assert_eq!(report["observed_settings"]["statement_timeout_ms"], 0);
     assert!(report["contents"]["relations"].is_number());
     assert!(report["contents"]["columns"].is_number());
     assert!(report["contents"]["roles"].is_number());
     assert!(report["contents"]["schemas"].is_number());
+    assert!(report["contents"]["constraint_keys"].is_number());
     assert!(report["contents"]["sequences"].is_number());
     assert!(report["contents"]["functions"].is_number());
     assert!(report["contents"]["procedures"].is_number());
@@ -562,6 +570,7 @@ fn test_cache_inspect_human_summary_discloses_redaction() {
 
     assert!(stdout.contains("Observed lock_timeout: 0 ms"));
     assert!(stdout.contains("Observed statement_timeout: 0 ms"));
+    assert!(stdout.contains("Catalog coverage: schemas, relations"));
     assert!(stdout.contains("Contents (counts only):\n  Database objects\n"));
     assert!(stdout.contains("\n  Routines\n"));
     assert!(stdout.contains("\n  Replication\n"));
@@ -591,7 +600,7 @@ fn test_cli_json_is_machine_clean_and_marks_missing_baseline_tainted() {
     let output = assert.get_output();
     let report = parse_json_stdout(output);
 
-    assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["schema_version"], 2);
     assert_eq!(report["confidence"], "Tainted");
     assert_eq!(report["baseline"]["status"], "unavailable");
     assert!(report["baseline"]["observed_settings"]["lock_timeout_ms"].is_null());
@@ -1046,7 +1055,7 @@ fn test_cli_chain_json_is_machine_clean() {
     let output = assert.get_output();
     let report = parse_json_stdout(output);
 
-    assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["schema_version"], 2);
     assert_eq!(report["confidence"], "Tainted");
     assert!(!String::from_utf8_lossy(&output.stdout).contains("Analyzing migration"));
 }

@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "confidence": "Exact",
   "verdict": "CAUTIOUS",
   "summary": {
@@ -8,6 +8,7 @@
     "tier2": 1,
     "tier3": 0
   },
+  "evidence": [],
   "violations": [
     {
       "rule_id": "test-rule",

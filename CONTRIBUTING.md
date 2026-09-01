@@ -181,8 +181,9 @@ The frozen cache under `live_tests/` belongs to the test corpus. Update it only
 when a fixture requires a changed baseline, and explain the assumption in the
 pull request.
 
-Cache V6 synchronizes every PostgreSQL routine kind, publications, and redacted
-subscription metadata. Never query or store `pg_subscription.subconninfo`.
+Cache V7 synchronizes every PostgreSQL routine kind, publications, redacted
+subscription metadata, and explicit catalog coverage. Never query or store
+`pg_subscription.subconninfo`.
 Changes to the cache model require serialization and inspection regressions,
 an updated frozen cache, and live catalog coverage across supported PostgreSQL
 versions.

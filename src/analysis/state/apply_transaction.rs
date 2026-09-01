@@ -1,4 +1,5 @@
-use super::{AnalysisState, Confidence, MutationResult};
+use super::{AnalysisState, MutationResult};
+use crate::analysis::evidence::{EvidenceCode, EvidenceScope};
 use crate::analysis::mutations::{
     ReleaseSavepointMutation, RollbackToSavepointMutation, SavepointMutation,
 };
@@ -16,7 +17,7 @@ impl AnalysisState {
 
     pub(super) fn apply_commit_transaction(&mut self, chain: bool) -> MutationResult {
         if chain && self.local.transactions.is_empty() {
-            self.local.confidence = Confidence::Tainted;
+            self.taint(EvidenceCode::TransactionStateUnknown, EvidenceScope::Chain);
             return MutationResult::Conflict {
                 reason: "COMMIT AND CHAIN can only be used in transaction blocks".to_string(),
             };
@@ -39,7 +40,7 @@ impl AnalysisState {
 
     pub(super) fn apply_rollback_transaction(&mut self, chain: bool) -> MutationResult {
         if chain && self.local.transactions.is_empty() {
-            self.local.confidence = Confidence::Tainted;
+            self.taint(EvidenceCode::TransactionStateUnknown, EvidenceScope::Chain);
             return MutationResult::Conflict {
                 reason: "ROLLBACK AND CHAIN can only be used in transaction blocks".to_string(),
             };
@@ -64,7 +65,7 @@ impl AnalysisState {
             .iter()
             .rposition(|frame| frame.is_named_savepoint(&rollback.name))
         else {
-            self.local.confidence = Confidence::Tainted;
+            self.taint(EvidenceCode::TransactionStateUnknown, EvidenceScope::Chain);
             if !self.local.transactions.is_empty() {
                 self.local.transaction_aborted = true;
             }
@@ -84,7 +85,7 @@ impl AnalysisState {
 
     pub(super) fn apply_savepoint(&mut self, savepoint: &SavepointMutation) -> MutationResult {
         if self.local.transactions.is_empty() {
-            self.local.confidence = Confidence::Tainted;
+            self.taint(EvidenceCode::TransactionStateUnknown, EvidenceScope::Chain);
             return MutationResult::Conflict {
                 reason: "SAVEPOINT can only be used in transaction blocks".to_string(),
             };
@@ -105,7 +106,7 @@ impl AnalysisState {
             .iter()
             .rposition(|frame| frame.is_named_savepoint(&release.name))
         else {
-            self.local.confidence = Confidence::Tainted;
+            self.taint(EvidenceCode::TransactionStateUnknown, EvidenceScope::Chain);
             if !self.local.transactions.is_empty() {
                 self.local.transaction_aborted = true;
             }
@@ -114,7 +115,7 @@ impl AnalysisState {
             };
         };
         if position == 0 {
-            self.local.confidence = Confidence::Tainted;
+            self.taint(EvidenceCode::TransactionStateUnknown, EvidenceScope::Chain);
             return MutationResult::Conflict {
                 reason: format!("savepoint '{}' is not inside a transaction", release.name),
             };
@@ -122,7 +123,7 @@ impl AnalysisState {
 
         let released = self.local.transactions.split_off(position);
         let Some(outer) = self.local.transactions.last_mut() else {
-            self.local.confidence = Confidence::Tainted;
+            self.taint(EvidenceCode::TransactionStateUnknown, EvidenceScope::Chain);
             return MutationResult::Conflict {
                 reason: format!("savepoint '{}' is not inside a transaction", release.name),
             };

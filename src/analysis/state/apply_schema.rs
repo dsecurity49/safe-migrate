@@ -1,4 +1,5 @@
-use super::{AnalysisState, Confidence, MutationResult, ObjectLookup};
+use super::{AnalysisState, MutationResult, ObjectLookup};
+use crate::analysis::evidence::{EvidenceCode, EvidenceScope};
 use crate::analysis::facts::{PublicationObjectFact, PublicationScope};
 use crate::analysis::graph::DependencyKind;
 use crate::analysis::mutations::{AlterSchemaMutation, CreateSchemaMutation, DropSchemaMutation};
@@ -31,8 +32,7 @@ impl AnalysisState {
             }
             SchemaLookup::AuthoritativelyAbsent | SchemaLookup::Tombstone => {}
             SchemaLookup::Unknown => {
-                self.snapshot_confidence();
-                self.local.confidence = Confidence::Tainted;
+                self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
                 return MutationResult::Skipped;
             }
             SchemaLookup::WrongKind => unreachable!("schemas have a dedicated namespace"),
@@ -41,8 +41,7 @@ impl AnalysisState {
             Some(role) => match self.role_fact_identity(role) {
                 Some(identity) => identity,
                 None => {
-                    self.snapshot_confidence();
-                    self.local.confidence = Confidence::Tainted;
+                    self.taint(EvidenceCode::UnresolvedReference, EvidenceScope::Chain);
                     (self.local.current_role.clone(), false)
                 }
             },
@@ -57,8 +56,10 @@ impl AnalysisState {
             };
         }
         if !owner_known || !self.local.roles_known {
-            self.snapshot_confidence();
-            self.local.confidence = Confidence::Tainted;
+            self.taint(
+                EvidenceCode::CatalogCoverageIncomplete,
+                EvidenceScope::Chain,
+            );
         }
         self.snapshot_generation_counter();
         self.local.generation_counter += 1;
@@ -91,8 +92,7 @@ impl AnalysisState {
                         };
                     }
                     SchemaLookup::Unknown => {
-                        self.snapshot_confidence();
-                        self.local.confidence = Confidence::Tainted;
+                        self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
                         return MutationResult::Skipped;
                     }
                     SchemaLookup::WrongKind => {
@@ -100,8 +100,7 @@ impl AnalysisState {
                     }
                 }
                 let Some((owner_name, owner_known)) = self.role_fact_identity(new_owner) else {
-                    self.snapshot_confidence();
-                    self.local.confidence = Confidence::Tainted;
+                    self.taint(EvidenceCode::UnresolvedReference, EvidenceScope::Chain);
                     return MutationResult::Skipped;
                 };
                 if owner_known && self.local.roles_known && self.present_role(&owner_name).is_none()
@@ -111,8 +110,10 @@ impl AnalysisState {
                     };
                 }
                 if !owner_known || !self.local.roles_known {
-                    self.snapshot_confidence();
-                    self.local.confidence = Confidence::Tainted;
+                    self.taint(
+                        EvidenceCode::CatalogCoverageIncomplete,
+                        EvidenceScope::Chain,
+                    );
                 }
                 self.snapshot_schema(name);
                 if let Some(SchemaOverlay::Present(schema)) = self.local.schemas.get_mut(name) {
@@ -124,8 +125,7 @@ impl AnalysisState {
                 match self.schema_lookup(old_name) {
                     SchemaLookup::Present => {}
                     SchemaLookup::Unknown => {
-                        self.snapshot_confidence();
-                        self.local.confidence = Confidence::Tainted;
+                        self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
                         return MutationResult::Skipped;
                     }
                     SchemaLookup::Tombstone | SchemaLookup::AuthoritativelyAbsent => {
@@ -144,8 +144,7 @@ impl AnalysisState {
                         };
                     }
                     SchemaLookup::Unknown => {
-                        self.snapshot_confidence();
-                        self.local.confidence = Confidence::Tainted;
+                        self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
                         return MutationResult::Skipped;
                     }
                     SchemaLookup::Tombstone | SchemaLookup::AuthoritativelyAbsent => {}
@@ -173,8 +172,7 @@ impl AnalysisState {
                     }
                 }
                 SchemaLookup::Unknown => {
-                    self.snapshot_confidence();
-                    self.local.confidence = Confidence::Tainted;
+                    self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
                     unknown_target = true;
                 }
                 SchemaLookup::WrongKind => {
@@ -233,8 +231,10 @@ impl AnalysisState {
                 // A scoped cache may retain a dependency edge without the
                 // dependent relation's catalog row. PostgreSQL would drop it,
                 // but the simulator cannot reproduce its full state exactly.
-                self.snapshot_confidence();
-                self.local.confidence = Confidence::Tainted;
+                self.taint(
+                    EvidenceCode::CatalogCoverageIncomplete,
+                    EvidenceScope::Chain,
+                );
             }
             for id in &dropped_relations {
                 self.local
@@ -414,8 +414,7 @@ impl AnalysisState {
             // families. With RESTRICT, any omitted object can make this
             // statement fail, so an apparently empty modeled namespace is not
             // sufficient evidence to drop the schema exactly.
-            self.snapshot_confidence();
-            self.local.confidence = Confidence::Tainted;
+            self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
             return MutationResult::Skipped;
         }
         for name in present_names {

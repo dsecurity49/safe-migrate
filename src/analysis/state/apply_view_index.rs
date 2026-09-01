@@ -1,6 +1,5 @@
-use super::{
-    AnalysisState, CascadeResult, Confidence, MutationResult, ObjectLookup, RelationOverlay,
-};
+use super::{AnalysisState, CascadeResult, MutationResult, ObjectLookup, RelationOverlay};
+use crate::analysis::evidence::{EvidenceCode, EvidenceScope};
 use crate::analysis::graph::{DependencyEdge, DependencyKind};
 use crate::analysis::mutations::{
     CreateIndex, CreateMaterializedView, CreateView, DropIndex, DropMaterializedViewMutation,
@@ -80,7 +79,7 @@ impl AnalysisState {
         })
     }
 
-    fn apply_drop_relation_family(
+    pub(super) fn apply_drop_relation_family(
         &mut self,
         present: &[ObjectId],
         cascade: bool,
@@ -110,8 +109,10 @@ impl AnalysisState {
             // metadata was intentionally omitted. CASCADE will remove that
             // relation in PostgreSQL, but the simulator cannot reproduce its
             // full state, so the result is necessarily tainted.
-            self.snapshot_confidence();
-            self.local.confidence = Confidence::Tainted;
+            self.taint(
+                EvidenceCode::CatalogCoverageIncomplete,
+                EvidenceScope::Chain,
+            );
         }
         let all_dropped_relations = cascade_result
             .as_ref()
@@ -245,6 +246,7 @@ impl AnalysisState {
                 dependency.clone(),
                 DependencyKind::ViewDependency {
                     view_generation: generation,
+                    referenced_column: None,
                 },
             ));
         }
@@ -289,6 +291,7 @@ impl AnalysisState {
                 dependency.clone(),
                 DependencyKind::ViewDependency {
                     view_generation: generation,
+                    referenced_column: None,
                 },
             ));
         }
@@ -310,8 +313,7 @@ impl AnalysisState {
                 }
             }
             RelationLookup::Unknown => {
-                self.snapshot_confidence();
-                self.local.confidence = Confidence::Tainted;
+                self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
                 MutationResult::Skipped
             }
         }
@@ -342,10 +344,29 @@ impl AnalysisState {
             create.id.clone(),
             create.table.clone(),
             DependencyKind::IndexOnRelation {
-                using_method: create.using_method.clone(),
+                using_method: create
+                    .using_method
+                    .clone()
+                    .or_else(|| Some("btree".to_string())),
+                key_columns: create.key_columns.clone(),
+                included_columns: create.included_columns.clone(),
+                dependency_columns: create
+                    .key_columns
+                    .iter()
+                    .chain(&create.included_columns)
+                    .cloned()
+                    .collect(),
+                dependency_columns_known: !create.has_expression_keys && !create.has_predicate,
+                has_expression_keys: create.has_expression_keys,
                 has_predicate: create.has_predicate,
                 is_concurrent: create.concurrently,
                 is_unique: create.unique,
+                is_valid: true,
+                is_ready: true,
+                is_live: true,
+                has_default_sort_order: create.has_default_sort_order,
+                has_default_opclasses: create.has_default_opclasses,
+                has_default_collations: create.has_default_collations,
                 eligibility_known: true,
             },
         ));
@@ -376,8 +397,7 @@ impl AnalysisState {
                     };
                 }
                 RelationLookup::Unknown => {
-                    self.snapshot_confidence();
-                    self.local.confidence = Confidence::Tainted;
+                    self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
                     unknown_target = true;
                 }
             }
@@ -421,8 +441,7 @@ impl AnalysisState {
                     };
                 }
                 RelationLookup::Unknown => {
-                    self.snapshot_confidence();
-                    self.local.confidence = Confidence::Tainted;
+                    self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
                     unknown_target = true;
                 }
             }
@@ -455,8 +474,7 @@ impl AnalysisState {
                     };
                 }
                 IndexLookup::Unknown => {
-                    self.snapshot_confidence();
-                    self.local.confidence = Confidence::Tainted;
+                    self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
                     return MutationResult::Skipped;
                 }
                 IndexLookup::WrongKind | IndexLookup::Tombstone => {
@@ -473,8 +491,10 @@ impl AnalysisState {
             let Some(index_edge) = self.local.graph.edges().iter().find(|edge| {
                 matches!(edge.kind, DependencyKind::IndexOnRelation { .. }) && edge.dependent == *id
             }) else {
-                self.snapshot_confidence();
-                self.local.confidence = Confidence::Tainted;
+                self.taint(
+                    EvidenceCode::CatalogCoverageIncomplete,
+                    EvidenceScope::Chain,
+                );
                 return MutationResult::Skipped;
             };
             let referenced_table = self.local.graph.resolve_rename(&index_edge.referenced);
@@ -506,8 +526,10 @@ impl AnalysisState {
                     ..
                 }
             ) {
-                self.snapshot_confidence();
-                self.local.confidence = Confidence::Tainted;
+                self.taint(
+                    EvidenceCode::CatalogCoverageIncomplete,
+                    EvidenceScope::Chain,
+                );
                 return MutationResult::Skipped;
             }
         }

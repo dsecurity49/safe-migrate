@@ -1,4 +1,5 @@
-use super::{AnalysisState, Confidence, MutationResult};
+use super::{AnalysisState, MutationResult};
+use crate::analysis::evidence::{EvidenceCode, EvidenceScope};
 use crate::analysis::facts::{
     ResetSettingTarget, RoleFact, SearchPathTarget, TimeoutSetting, TimeoutSettingValue,
 };
@@ -107,8 +108,7 @@ impl AnalysisState {
 
         let (target_name, target_known) = if let Some(role) = role {
             let Some(identity) = self.role_fact_identity(role) else {
-                self.snapshot_confidence();
-                self.local.confidence = Confidence::Tainted;
+                self.taint(EvidenceCode::UnresolvedReference, EvidenceScope::Chain);
                 return MutationResult::Skipped;
             };
             identity
@@ -150,8 +150,10 @@ impl AnalysisState {
                 };
             }
             None => {
-                self.snapshot_confidence();
-                self.local.confidence = Confidence::Tainted;
+                self.taint(
+                    EvidenceCode::CatalogCoverageIncomplete,
+                    EvidenceScope::Chain,
+                );
             }
             Some(true) => {}
         }
@@ -184,9 +186,13 @@ impl AnalysisState {
         MutationResult::Applied
     }
 
-    pub(super) fn apply_opaque(&mut self, _opaque: &OpaqueMutation) -> MutationResult {
-        self.snapshot_confidence();
-        self.local.confidence = Confidence::Tainted;
+    pub(super) fn apply_opaque(&mut self, opaque: &OpaqueMutation) -> MutationResult {
+        let code = match opaque {
+            OpaqueMutation::UnsupportedStatement => EvidenceCode::UnsupportedStatement,
+            OpaqueMutation::UnresolvedReference { .. } => EvidenceCode::UnresolvedReference,
+            _ => EvidenceCode::UnsupportedSemantics,
+        };
+        self.taint(code, EvidenceScope::Chain);
         MutationResult::Applied
     }
 }

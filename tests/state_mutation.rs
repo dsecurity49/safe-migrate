@@ -9,17 +9,20 @@ mod state_mutation_tests {
     };
     use safe_migrate::analysis::state::{Confidence, MutationResult};
     use safe_migrate::ast::identifiers::{Ident, ObjectId, QualifiedName};
-    use safe_migrate::db::cache::{DbCache, DependencyCache};
+    use safe_migrate::db::cache::{
+        ConstraintDependencyCache, DbCache, GeneratedColumnDependencyCache, ViewDependencyCache,
+    };
+    use safe_migrate::model::column::Column;
     use safe_migrate::model::constraint::ConstraintKind;
     use safe_migrate::model::function::{
         FunctionOverlay, FunctionState, RoutineKind, SecurityMode, Volatility,
     };
     use safe_migrate::model::relation::{
-        Persistence, RelationKind, RelationOverlay, RelationState,
+        ColumnAction, Persistence, RelationKind, RelationOverlay, RelationState,
     };
     use safe_migrate::model::role::RoleState;
     use safe_migrate::model::schema::SchemaState;
-    use safe_migrate::model::sequence::SequenceOverlay;
+    use safe_migrate::model::sequence::{SequenceKind, SequenceOverlay, SequenceState};
     use safe_migrate::model::types::{TypeKind, TypeOverlay, TypeState};
 
     #[test]
@@ -42,6 +45,62 @@ mod state_mutation_tests {
         } else {
             panic!("relation should be present");
         }
+    }
+
+    #[test]
+    fn index_column_identities_follow_rename_and_drop_cleanup() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE TABLE t(id int, name text); \
+                 CREATE INDEX t_name_idx ON t(name) INCLUDE (id); \
+                 ALTER TABLE t RENAME COLUMN name TO full_name; \
+                 ALTER TABLE t DROP COLUMN full_name;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(
+            !state
+                .local
+                .graph
+                .edges()
+                .iter()
+                .any(|edge| edge.dependent == object_id("public", "t_name_idx")),
+            "dropping an indexed column must remove PostgreSQL's implicit index dependency"
+        );
+    }
+
+    #[test]
+    fn simple_unique_btree_index_can_be_adopted_as_a_constraint() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let findings = engine
+            .analyze(
+                "CREATE TABLE t(id int); \
+                 CREATE UNIQUE INDEX t_id_idx ON t(id); \
+                 ALTER TABLE t ADD CONSTRAINT t_id_key UNIQUE USING INDEX t_id_idx;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict"),
+            "a catalog-equivalent unique btree index should be adoptable: {findings:?}"
+        );
+        assert!(state.local.graph.edges().iter().any(|edge| {
+            matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
+                && edge.dependent == object_id("public", "t_id_key")
+        }));
+        assert!(!state.local.graph.edges().iter().any(|edge| {
+            matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
+                && edge.dependent == object_id("public", "t_id_idx")
+        }));
     }
 
     #[test]
@@ -325,18 +384,10 @@ mod state_mutation_tests {
             );
         }
 
-        let dependency = |referenced: &ObjectId| DependencyCache {
-            classid: 0,
-            objid: 0,
-            objsubid: 0,
-            refclassid: 0,
-            refobjid: 0,
-            refobjsubid: 0,
-            deptype: "view".to_string(),
-            obj_schema: Some(view_id.schema.clone()),
-            obj_name: Some(view_id.name.clone()),
-            ref_schema: Some(referenced.schema.clone()),
-            ref_name: Some(referenced.name.clone()),
+        let dependency = |referenced: &ObjectId| ViewDependencyCache {
+            dependent: view_id.clone(),
+            referenced: referenced.clone(),
+            referenced_column: None,
         };
         cache.dependencies.push(dependency(&view_id));
         cache.dependencies.push(dependency(&table_id));
@@ -351,6 +402,167 @@ mod state_mutation_tests {
             matches!(edge.kind, DependencyKind::ViewDependency { .. })
                 && edge.dependent == view_id
                 && edge.referenced == table_id
+        }));
+    }
+
+    #[test]
+    fn cached_view_column_dependencies_allow_dropping_an_unreferenced_column() {
+        let table_id = object_id("public", "t");
+        let view_id = object_id("public", "v");
+        let mut cache = DbCache::new();
+        let mut table = RelationState::new(
+            table_id.clone(),
+            object_id("public", "owner"),
+            0,
+            None,
+            RelationKind::Table,
+            Persistence::Permanent,
+            0,
+        );
+        for name in ["id", "unused"] {
+            table.apply_column_action(&ColumnAction::Add {
+                name: name.to_string(),
+                data_type: Some("integer".to_string()),
+                not_null: false,
+                default: None,
+            });
+        }
+        cache.insert_baseline(table_id.clone(), table);
+        cache.insert_baseline(
+            view_id.clone(),
+            RelationState::new(
+                view_id.clone(),
+                object_id("public", "owner"),
+                0,
+                None,
+                RelationKind::View,
+                Persistence::Permanent,
+                0,
+            ),
+        );
+        cache.dependencies.push(ViewDependencyCache {
+            dependent: view_id.clone(),
+            referenced: table_id.clone(),
+            referenced_column: Some("id".to_string()),
+        });
+
+        let engine = setup_engine();
+        let mut state = safe_migrate::AnalysisState::new(cache.clone());
+        let findings = engine
+            .analyze("ALTER TABLE t DROP COLUMN unused;", &mut state)
+            .unwrap();
+
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict"),
+            "unrelated column drop must not conflict: {findings:?}"
+        );
+        assert_eq!(state.local.confidence, Confidence::Exact);
+        assert!(
+            state
+                .get_relation(&table_id)
+                .is_some_and(|relation| match relation {
+                    RelationOverlay::Present(table) => !table.has_column("unused"),
+                    RelationOverlay::Dropped => false,
+                })
+        );
+        let mut blocked_state = safe_migrate::AnalysisState::new(cache.clone());
+        let findings = engine
+            .analyze("ALTER TABLE t DROP COLUMN id;", &mut blocked_state)
+            .unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict")
+        );
+
+        let mut cascade_state = safe_migrate::AnalysisState::new(cache);
+        let findings = engine
+            .analyze("ALTER TABLE t DROP COLUMN id CASCADE;", &mut cascade_state)
+            .unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict")
+        );
+        assert!(matches!(
+            cascade_state.get_relation(&view_id),
+            Some(RelationOverlay::Dropped)
+        ));
+    }
+    #[test]
+    fn cached_expression_index_dependencies_follow_the_referenced_columns() {
+        let table_id = object_id("public", "t");
+        let index_id = object_id("public", "t_lower_note_idx");
+        let mut cache = DbCache::new();
+        let mut table = RelationState::new(
+            table_id.clone(),
+            object_id("public", "owner"),
+            0,
+            None,
+            RelationKind::Table,
+            Persistence::Permanent,
+            0,
+        );
+        for name in ["id", "note", "unused"] {
+            table.apply_column_action(&ColumnAction::Add {
+                name: name.to_string(),
+                data_type: Some("text".to_string()),
+                not_null: false,
+                default: None,
+            });
+        }
+        cache.insert_baseline(table_id.clone(), table);
+        cache.indexes.push(safe_migrate::db::cache::IndexCache {
+            index_id: index_id.clone(),
+            table_id: table_id.clone(),
+            using_method: "btree".to_string(),
+            key_columns: Vec::new(),
+            included_columns: Vec::new(),
+            dependency_columns: vec!["note".to_string()],
+            dependency_columns_known: true,
+            has_expression_keys: true,
+            has_predicate: false,
+            is_unique: false,
+            is_valid: true,
+            is_ready: true,
+            is_live: true,
+            has_default_sort_order: true,
+            has_default_opclasses: true,
+            has_default_collations: true,
+        });
+
+        let engine = setup_engine();
+        let mut state = safe_migrate::AnalysisState::new(cache);
+        let unrelated = engine
+            .analyze("ALTER TABLE t DROP COLUMN unused;", &mut state)
+            .unwrap();
+        assert!(
+            !unrelated
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict"),
+            "unrelated expression-index column drop must not conflict: {unrelated:?}"
+        );
+        assert_eq!(state.local.confidence, Confidence::Exact);
+        assert!(state.local.graph.edges().iter().any(|edge| {
+            matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
+                && edge.dependent == index_id
+        }));
+
+        let referenced = engine
+            .analyze("ALTER TABLE t DROP COLUMN note;", &mut state)
+            .unwrap();
+        assert!(
+            !referenced
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict"),
+            "dependent expression-index column drop must match PostgreSQL cleanup: {referenced:?}"
+        );
+        assert_eq!(state.local.confidence, Confidence::Exact);
+        assert!(!state.local.graph.edges().iter().any(|edge| {
+            matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
+                && edge.dependent == index_id
         }));
     }
 
@@ -372,18 +584,10 @@ mod state_mutation_tests {
                 0,
             ),
         );
-        cache.dependencies.push(DependencyCache {
-            classid: 0,
-            objid: 0,
-            objsubid: 0,
-            refclassid: 0,
-            refobjid: 0,
-            refobjsubid: 0,
-            deptype: "view".to_string(),
-            obj_schema: Some(view_id.schema.clone()),
-            obj_name: Some(view_id.name.clone()),
-            ref_schema: Some(external_table.schema.clone()),
-            ref_name: Some(external_table.name.clone()),
+        cache.dependencies.push(ViewDependencyCache {
+            dependent: view_id.clone(),
+            referenced: external_table.clone(),
+            referenced_column: None,
         });
 
         let state = safe_migrate::AnalysisState::new(cache);
@@ -412,18 +616,10 @@ mod state_mutation_tests {
                 0,
             ),
         );
-        cache.dependencies.push(DependencyCache {
-            classid: 0,
-            objid: 0,
-            objsubid: 0,
-            refclassid: 0,
-            refobjid: 0,
-            refobjsubid: 0,
-            deptype: "view".to_string(),
-            obj_schema: Some(omitted_view.schema.clone()),
-            obj_name: Some(omitted_view.name.clone()),
-            ref_schema: Some(in_scope_table.schema.clone()),
-            ref_name: Some(in_scope_table.name.clone()),
+        cache.dependencies.push(ViewDependencyCache {
+            dependent: omitted_view.clone(),
+            referenced: in_scope_table.clone(),
+            referenced_column: None,
         });
 
         let state = safe_migrate::AnalysisState::new(cache);
@@ -452,18 +648,10 @@ mod state_mutation_tests {
                 0,
             ),
         );
-        cache.dependencies.push(DependencyCache {
-            classid: 0,
-            objid: 0,
-            objsubid: 0,
-            refclassid: 0,
-            refobjid: 0,
-            refobjsubid: 0,
-            deptype: "view".to_string(),
-            obj_schema: Some(omitted_view.schema),
-            obj_name: Some(omitted_view.name),
-            ref_schema: Some(in_scope_table.schema.clone()),
-            ref_name: Some(in_scope_table.name.clone()),
+        cache.dependencies.push(ViewDependencyCache {
+            dependent: omitted_view,
+            referenced: in_scope_table.clone(),
+            referenced_column: None,
         });
 
         let engine = setup_engine();
@@ -483,7 +671,7 @@ mod state_mutation_tests {
     }
 
     #[test]
-    fn non_view_catalog_dependencies_do_not_enter_the_modeled_graph() {
+    fn empty_typed_view_dependency_cache_does_not_create_graph_edges() {
         let view_id = object_id("public", "v");
         let table_id = object_id("public", "t");
         let mut cache = DbCache::new();
@@ -504,20 +692,6 @@ mod state_mutation_tests {
                 ),
             );
         }
-        cache.dependencies.push(DependencyCache {
-            classid: 0,
-            objid: 0,
-            objsubid: 0,
-            refclassid: 0,
-            refobjid: 0,
-            refobjsubid: 0,
-            deptype: "n".to_string(),
-            obj_schema: Some(view_id.schema.clone()),
-            obj_name: Some(view_id.name.clone()),
-            ref_schema: Some(table_id.schema.clone()),
-            ref_name: Some(table_id.name.clone()),
-        });
-
         let state = safe_migrate::AnalysisState::new(cache);
         assert!(
             !state
@@ -1060,6 +1234,14 @@ mod state_mutation_tests {
             )
             .unwrap();
 
+        let findings = engine.analyze("DROP SEQUENCE s;", &mut state).unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict"),
+            "migration-local nextval default must block a non-CASCADE sequence drop: {findings:?}"
+        );
+
         engine
             .analyze("DROP SEQUENCE s CASCADE;", &mut state)
             .unwrap();
@@ -1085,6 +1267,62 @@ mod state_mutation_tests {
                 .get_column("id")
                 .and_then(|column| column.default_expr_text.as_deref()),
             None
+        );
+    }
+
+    #[test]
+    fn migration_local_default_blocks_standalone_sequence_drop() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE TABLE local_defaults(id int); CREATE SEQUENCE local_defaults_id_seq; ALTER TABLE local_defaults ALTER COLUMN id SET DEFAULT nextval('local_defaults_id_seq');",
+                &mut state,
+            )
+            .unwrap();
+
+        let findings = engine
+            .analyze("DROP SEQUENCE local_defaults_id_seq;", &mut state)
+            .unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict"),
+            "migration-local default must block a standalone sequence drop: {findings:?}"
+        );
+
+        engine
+            .analyze("DROP SEQUENCE local_defaults_id_seq CASCADE;", &mut state)
+            .unwrap();
+        let table = object_id("public", "local_defaults");
+        assert!(matches!(
+            state.get_relation(&table),
+            Some(RelationOverlay::Present(relation))
+                if relation.get_column("id").is_some_and(|column| column.default.is_none())
+        ));
+    }
+
+    #[test]
+    fn dropping_migration_local_default_removes_sequence_dependency() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE TABLE local_default_reset(id int); CREATE SEQUENCE local_default_reset_seq; ALTER TABLE local_default_reset ALTER COLUMN id SET DEFAULT nextval('local_default_reset_seq'); ALTER TABLE local_default_reset ALTER COLUMN id DROP DEFAULT;",
+                &mut state,
+            )
+            .unwrap();
+
+        let findings = engine
+            .analyze("DROP SEQUENCE local_default_reset_seq;", &mut state)
+            .unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict"),
+            "DROP DEFAULT must remove the local sequence dependency: {findings:?}"
         );
     }
 
@@ -3515,6 +3753,352 @@ mod state_mutation_tests {
         assert!(constraint.validated);
     }
 
+    #[test]
+    fn cached_check_dependency_blocks_drop_without_cascade_and_cleans_up_with_cascade() {
+        let engine = setup_engine();
+        let table = object_id("public", "accounts");
+        let mut cache = cache_with_table("public", "accounts", None);
+        cache
+            .relations
+            .get_mut(&table)
+            .expect("baseline table")
+            .columns
+            .extend([
+                Column {
+                    name: "id".to_string(),
+                    data_type: Some("integer".to_string()),
+                    type_id: None,
+                    is_nullable: false,
+                    default: None,
+                    avg_width: None,
+                    default_expr_text: None,
+                    type_modifier: Some(-1),
+                },
+                Column {
+                    name: "note".to_string(),
+                    data_type: Some("text".to_string()),
+                    type_id: None,
+                    is_nullable: true,
+                    default: None,
+                    avg_width: None,
+                    default_expr_text: None,
+                    type_modifier: Some(-1),
+                },
+            ]);
+        cache
+            .constraints
+            .push(safe_migrate::model::constraint::ConstraintState {
+                table_id: table.clone(),
+                name: "accounts_note_check".to_string(),
+                kind: ConstraintKind::Check,
+                validated: true,
+            });
+        cache
+            .constraint_dependencies
+            .push(ConstraintDependencyCache {
+                table_id: table.clone(),
+                constraint_name: "accounts_note_check".to_string(),
+                columns: vec!["note".to_string()],
+            });
+
+        let mut state = safe_migrate::AnalysisState::new(cache.clone());
+        let findings = engine
+            .analyze("ALTER TABLE accounts DROP COLUMN note;", &mut state)
+            .unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict")
+        );
+        assert!(matches!(
+            state.get_relation(&table),
+            Some(RelationOverlay::Present(relation)) if relation.has_column("note")
+        ));
+
+        let mut cascade_state = safe_migrate::AnalysisState::new(cache);
+        let findings = engine
+            .analyze(
+                "ALTER TABLE accounts DROP COLUMN note CASCADE;",
+                &mut cascade_state,
+            )
+            .unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict")
+        );
+        assert!(!matches!(
+            cascade_state.get_relation(&table),
+            Some(RelationOverlay::Present(relation)) if relation.has_column("note")
+        ));
+        assert!(
+            !cascade_state
+                .local
+                .constraints
+                .contains_key(&(table, "accounts_note_check".to_string()))
+        );
+    }
+
+    #[test]
+    fn cached_generated_column_drop_removes_only_its_expression_edge() {
+        let engine = setup_engine();
+        let table = object_id("public", "metrics");
+        let mut cache = cache_with_table("public", "metrics", None);
+        cache
+            .relations
+            .get_mut(&table)
+            .expect("baseline table")
+            .columns
+            .extend([
+                Column {
+                    name: "source".to_string(),
+                    data_type: Some("integer".to_string()),
+                    type_id: None,
+                    is_nullable: true,
+                    default: None,
+                    avg_width: None,
+                    default_expr_text: None,
+                    type_modifier: Some(-1),
+                },
+                Column {
+                    name: "derived".to_string(),
+                    data_type: Some("integer".to_string()),
+                    type_id: None,
+                    is_nullable: true,
+                    default: None,
+                    avg_width: None,
+                    default_expr_text: None,
+                    type_modifier: Some(-1),
+                },
+            ]);
+        cache
+            .generated_column_dependencies
+            .push(GeneratedColumnDependencyCache {
+                table_id: table.clone(),
+                column_name: "derived".to_string(),
+                depends_on_column: "source".to_string(),
+            });
+        let derived_index = object_id("public", "metrics_derived_idx");
+        cache.indexes.push(safe_migrate::db::cache::IndexCache {
+            index_id: derived_index.clone(),
+            table_id: table.clone(),
+            using_method: "btree".to_string(),
+            key_columns: vec!["derived".to_string()],
+            included_columns: Vec::new(),
+            dependency_columns: vec!["derived".to_string()],
+            dependency_columns_known: true,
+            has_expression_keys: false,
+            has_predicate: false,
+            is_unique: false,
+            is_valid: true,
+            is_ready: true,
+            is_live: true,
+            has_default_sort_order: true,
+            has_default_opclasses: true,
+            has_default_collations: true,
+        });
+        let mut state = safe_migrate::AnalysisState::new(cache.clone());
+
+        let findings = engine
+            .analyze("ALTER TABLE metrics DROP COLUMN derived;", &mut state)
+            .unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict")
+        );
+        assert!(
+            !state
+                .local
+                .graph
+                .edges()
+                .iter()
+                .any(|edge| { matches!(edge.kind, DependencyKind::ColumnGeneratedFrom { .. }) })
+        );
+        assert!(matches!(
+            state.get_relation(&table),
+            Some(RelationOverlay::Present(relation)) if !relation.has_column("derived")
+        ));
+
+        let mut source_state = safe_migrate::AnalysisState::new(cache.clone());
+        let findings = engine
+            .analyze("ALTER TABLE metrics DROP COLUMN source;", &mut source_state)
+            .unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict")
+        );
+        let mut cascade_state = safe_migrate::AnalysisState::new(cache);
+        let findings = engine
+            .analyze(
+                "ALTER TABLE metrics DROP COLUMN source CASCADE;",
+                &mut cascade_state,
+            )
+            .unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict")
+        );
+        assert!(matches!(
+            cascade_state.get_relation(&table),
+            Some(RelationOverlay::Present(relation))
+                if !relation.has_column("source") && !relation.has_column("derived")
+        ));
+        assert!(!cascade_state.local.graph.edges().iter().any(|edge| {
+            matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
+                && edge.dependent == derived_index
+        }));
+    }
+
+    #[test]
+    fn standalone_default_sequence_is_a_drop_dependency() {
+        let engine = setup_engine();
+        let table = object_id("public", "events");
+        let sequence = object_id("public", "event_seq");
+        let mut cache = cache_with_table("public", "events", None);
+        cache
+            .relations
+            .get_mut(&table)
+            .expect("baseline table")
+            .columns
+            .push(Column {
+                name: "event_id".to_string(),
+                data_type: Some("integer".to_string()),
+                type_id: None,
+                is_nullable: true,
+                default: None,
+                avg_width: None,
+                default_expr_text: Some("nextval('public.event_seq'::regclass)".to_string()),
+                type_modifier: Some(-1),
+            });
+        cache.sequences.insert(
+            sequence.clone(),
+            SequenceState {
+                id: sequence.clone(),
+                owner: object_id("public", "postgres"),
+                owned_by: None,
+                kind: SequenceKind::Standalone,
+                generation: 0,
+            },
+        );
+        cache.default_sequence_dependencies.push(
+            safe_migrate::db::cache::DefaultSequenceDependencyCache {
+                table_id: table.clone(),
+                column_name: "event_id".to_string(),
+                sequence_id: sequence.clone(),
+            },
+        );
+
+        let mut state = safe_migrate::AnalysisState::new(cache.clone());
+        let findings = engine
+            .analyze("DROP SEQUENCE event_seq;", &mut state)
+            .unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict")
+        );
+
+        let mut cascade_state = safe_migrate::AnalysisState::new(cache.clone());
+        let findings = engine
+            .analyze("DROP SEQUENCE event_seq CASCADE;", &mut cascade_state)
+            .unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict")
+        );
+        assert!(
+            !cascade_state.local.graph.edges().iter().any(|edge| {
+                matches!(edge.kind, DependencyKind::ColumnDefaultOnSequence { .. })
+            })
+        );
+        assert!(matches!(
+            cascade_state.get_relation(&table),
+            Some(RelationOverlay::Present(relation))
+                if relation
+                    .get_column("event_id")
+                    .is_some_and(|column| column.default_expr_text.is_none())
+        ));
+
+        let mut table_drop_state = safe_migrate::AnalysisState::new(cache.clone());
+        let findings = engine
+            .analyze("DROP TABLE events;", &mut table_drop_state)
+            .unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict")
+        );
+        assert!(matches!(
+            table_drop_state.local.sequences.get(&sequence),
+            Some(SequenceOverlay::Present(_))
+        ));
+        assert!(
+            !table_drop_state.local.graph.edges().iter().any(|edge| {
+                matches!(edge.kind, DependencyKind::ColumnDefaultOnSequence { .. })
+            })
+        );
+        // An unqualified regclass rendering is interpreted through PostgreSQL's
+        // search path. The typed catalog edge, rather than this text, must
+        // decide which same-named sequence owns the default.
+        let alternate_sequence = object_id("tenant", "event_seq");
+        let mut same_name_cache = cache.clone();
+        same_name_cache.sequences.insert(
+            alternate_sequence.clone(),
+            SequenceState {
+                id: alternate_sequence.clone(),
+                owner: object_id("public", "postgres"),
+                owned_by: None,
+                kind: SequenceKind::Standalone,
+                generation: 0,
+            },
+        );
+        same_name_cache.default_sequence_dependencies.clear();
+        same_name_cache.default_sequence_dependencies.push(
+            safe_migrate::db::cache::DefaultSequenceDependencyCache {
+                table_id: table.clone(),
+                column_name: "event_id".to_string(),
+                sequence_id: alternate_sequence,
+            },
+        );
+        let column = same_name_cache
+            .relations
+            .get_mut(&table)
+            .expect("baseline table")
+            .columns
+            .iter_mut()
+            .find(|column| column.name == "event_id")
+            .expect("baseline column");
+        column.default_expr_text = Some("nextval('event_seq'::regclass)".to_string());
+        let mut same_name_state = safe_migrate::AnalysisState::new(same_name_cache);
+        engine
+            .analyze(
+                "DROP SEQUENCE public.event_seq CASCADE;",
+                &mut same_name_state,
+            )
+            .unwrap();
+        assert!(matches!(
+            same_name_state.get_relation(&table),
+            Some(RelationOverlay::Present(relation))
+                if relation.get_column("event_id").is_some_and(|column| column.default_expr_text.is_some())
+        ));
+
+        let mut rollback_state = safe_migrate::AnalysisState::new(cache);
+        engine
+            .analyze("BEGIN; DROP TABLE events; ROLLBACK;", &mut rollback_state)
+            .unwrap();
+        assert!(rollback_state.relation_is_present(&table));
+        assert!(rollback_state.local.graph.edges().iter().any(|edge| {
+            matches!(
+                edge.kind,
+                DependencyKind::ColumnDefaultOnSequence { ref column } if column == "event_id"
+            ) && edge.dependent == table
+                && edge.referenced == sequence
+        }));
+    }
     #[test]
     fn test_state_adds_named_unique_constraint() {
         use safe_migrate::model::constraint::ConstraintKind;

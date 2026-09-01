@@ -8,7 +8,7 @@ These SQL fixtures feed three suites:
   disposable PostgreSQL database for fixtures enabled in
   `differential_manifest.json`.
 - `scripts/live-catalog-sync` seeds routines, publications, and a disconnected
-  subscription, then verifies their Cache V6 representation and connection
+  subscription, then verifies their Cache V7 representation and connection
   redaction.
 
 In short: `run.sh` checks expected linter findings, `live-differential` compares
