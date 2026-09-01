@@ -608,6 +608,17 @@ impl DbCache {
                     key.table_id, key.constraint_name
                 ));
             }
+            let mut key_columns = HashSet::new();
+            if let Some(column) = key
+                .columns
+                .iter()
+                .find(|column| !key_columns.insert(column.as_str()))
+            {
+                return Err(format!(
+                    "constraint key '{}.{}' repeats column '{}'",
+                    key.table_id, key.constraint_name, column
+                ));
+            }
             for column in &key.columns {
                 if !relation.has_column(column) {
                     return Err(format!(
@@ -901,6 +912,12 @@ impl DbCache {
                     dependency.table_id, dependency.column_name, dependency.depends_on_column
                 ));
             }
+            if dependency.column_name == dependency.depends_on_column {
+                return Err(format!(
+                    "generated column dependency '{}.{}' cannot depend on itself",
+                    dependency.table_id, dependency.column_name
+                ));
+            }
             let Some(relation) = self.relations.get(&dependency.table_id) else {
                 return Err(format!(
                     "generated column dependency references missing relation '{}'",
@@ -1170,6 +1187,31 @@ mod tests {
     }
 
     #[test]
+    fn current_cache_rejects_repeated_constraint_key_columns() {
+        let table_id = ObjectId::new("public", "entries");
+        let mut cache = DbCache::new();
+        cache.insert_baseline(
+            table_id.clone(),
+            table(table_id.clone(), &["id", "tenant_id"]),
+        );
+        cache.constraints.push(ConstraintState {
+            table_id: table_id.clone(),
+            name: "entries_key".to_string(),
+            kind: ConstraintKind::Unique,
+            validated: true,
+        });
+        cache.constraint_keys.push(ConstraintKeyCache {
+            table_id,
+            constraint_name: "entries_key".to_string(),
+            columns: vec!["id".to_string(), "id".to_string()],
+            is_primary: false,
+        });
+
+        let error = cache.validate_semantics().unwrap_err();
+        assert!(error.contains("constraint key 'public.entries.entries_key' repeats column 'id'"));
+    }
+
+    #[test]
     fn scoped_cache_accepts_a_dependency_to_an_omitted_schema() {
         let view_id = ObjectId::new("app", "v");
         let mut cache = DbCache::new();
@@ -1297,6 +1339,23 @@ mod tests {
                 .unwrap_err()
                 .contains("generated column dependency")
         );
+    }
+
+    #[test]
+    fn current_cache_rejects_self_referencing_generated_dependency() {
+        let table_id = ObjectId::new("public", "entries");
+        let mut cache = DbCache::new();
+        cache.insert_baseline(table_id.clone(), table(table_id.clone(), &["total"]));
+        cache
+            .generated_column_dependencies
+            .push(GeneratedColumnDependencyCache {
+                table_id,
+                column_name: "total".to_string(),
+                depends_on_column: "total".to_string(),
+            });
+
+        let error = cache.validate_semantics().unwrap_err();
+        assert!(error.contains("cannot depend on itself"));
     }
 
     #[test]
