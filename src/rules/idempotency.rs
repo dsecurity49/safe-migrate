@@ -1,8 +1,6 @@
 use crate::analysis::mutations::{AlterTableActionMutation, Mutation};
-use crate::analysis::state::{AnalysisState, CascadeResult, MutationResult};
-use crate::engine::config::Config;
 use crate::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
-use crate::rules::LegacyRule as Rule;
+use crate::rules::{Rule, RuleContext};
 
 pub struct IdempotencyRule;
 
@@ -17,15 +15,7 @@ impl Rule for IdempotencyRule {
         "Use IF EXISTS or IF NOT EXISTS to prevent migration failures on partial re-runs."
     }
 
-    fn evaluate(
-        &self,
-        mutation: &Mutation,
-        _result: &MutationResult,
-        _pre_state: &crate::analysis::state::PreState,
-        _state: &AnalysisState,
-        _config: &Config,
-        _cascade: Option<&CascadeResult>,
-    ) -> Vec<Violation> {
+    fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
         // Idempotency is syntactic, so a skipped mutation still needs an explicit guard.
 
         let mut violations = Vec::new();
@@ -47,7 +37,7 @@ impl Rule for IdempotencyRule {
                 });
             };
 
-        match mutation {
+        match context.mutation() {
             // Creation Guards
             Mutation::CreateTable(c) if !c.if_not_exists => {
                 add_violation(
