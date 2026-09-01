@@ -1,8 +1,7 @@
 use crate::analysis::mutations::Mutation;
-use crate::analysis::state::{AnalysisState, CascadeResult, MutationResult, PreState};
-use crate::engine::config::Config;
+use crate::analysis::state::MutationResult;
 use crate::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
-use crate::rules::LegacyRule as Rule;
+use crate::rules::{Rule, RuleContext};
 
 pub struct OverbroadGrantRule;
 
@@ -17,30 +16,22 @@ impl Rule for OverbroadGrantRule {
         "Avoid GRANT ALL to public roles. Use granular privileges."
     }
 
-    fn evaluate(
-        &self,
-        mutation: &Mutation,
-        result: &MutationResult,
-        _pre_state: &PreState,
-        state: &AnalysisState,
-        _config: &Config,
-        _cascade_closure: Option<&CascadeResult>,
-    ) -> Vec<Violation> {
+    fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
         // `WITH GRANT OPTION` is itself the security-sensitive operation. The
         // state matrix intentionally skips it because grant chains are not
         // modeled, but that uncertainty must not suppress the syntax-level
         // warning for a statement PostgreSQL will execute.
-        let skipped_grant_option = *result == MutationResult::Skipped
+        let skipped_grant_option = *context.result() == MutationResult::Skipped
             && matches!(
-                mutation,
+                context.mutation(),
                 Mutation::Grant(grant) if grant.with_grant_option
             );
-        if *result == MutationResult::Skipped && !skipped_grant_option {
+        if *context.result() == MutationResult::Skipped && !skipped_grant_option {
             return vec![];
         }
         let mut violations = Vec::new();
 
-        if let Mutation::Grant(grant) = mutation {
+        if let Mutation::Grant(grant) = context.mutation() {
             let (obj_kind, obj_name) = match &grant.target {
                 crate::analysis::mutations::ResolvedGrantTarget::Tables(tables) => (
                     ObjectKind::Table,
@@ -99,7 +90,7 @@ impl Rule for OverbroadGrantRule {
                             // uses the role name.
                             tables.iter().all(|table_id| {
                                 matches!(
-                                    state.local.relations.get(table_id),
+                                    context.state().local.relations.get(table_id),
                                     Some(crate::model::relation::RelationOverlay::Present(relation))
                                         if relation.owner.name == *name
                                 )

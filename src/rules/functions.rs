@@ -1,8 +1,7 @@
 use crate::analysis::mutations::Mutation;
-use crate::analysis::state::{AnalysisState, CascadeResult, MutationResult, PreState};
-use crate::engine::config::Config;
+use crate::analysis::state::MutationResult;
 use crate::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
-use crate::rules::LegacyRule as Rule;
+use crate::rules::{Rule, RuleContext};
 
 pub struct FunctionVolatilityRule;
 
@@ -17,19 +16,11 @@ impl Rule for FunctionVolatilityRule {
         "Changing a function's volatility (e.g., IMMUTABLE -> VOLATILE) can invalidate existing indexes or change query plan stability."
     }
 
-    fn evaluate(
-        &self,
-        mutation: &Mutation,
-        _result: &MutationResult,
-        pre_state: &PreState,
-        _state: &AnalysisState,
-        _config: &Config,
-        _cascade: Option<&CascadeResult>,
-    ) -> Vec<Violation> {
+    fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
         let mut violations = Vec::new();
 
-        if let Mutation::AlterFunction(alter) = mutation
-            && let Some(old_func) = pre_state.functions.get(&alter.id)
+        if let Mutation::AlterFunction(alter) = context.mutation()
+            && let Some(old_func) = context.pre_state().functions.get(&alter.id)
             && let crate::analysis::facts::AlterFunctionAction::OptionsChange(new_opts) =
                 &alter.action
             && let Some(nv) = new_opts.iter().find_map(|opt| {
@@ -88,27 +79,23 @@ impl Rule for BrokenComputeRule {
         "Drop or replace the dependent triggers first. Use CASCADE only after reviewing every dependent object."
     }
 
-    fn evaluate(
-        &self,
-        mutation: &Mutation,
-        result: &MutationResult,
-        _pre_state: &PreState,
-        state: &AnalysisState,
-        _config: &Config,
-        _cascade_closure: Option<&CascadeResult>,
-    ) -> Vec<Violation> {
-        if !matches!(result, MutationResult::Conflict { .. }) {
+    fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
+        if !matches!(context.result(), MutationResult::Conflict { .. }) {
             return vec![];
         }
-        if let Mutation::DropFunction(drop) = mutation
+        if let Mutation::DropFunction(drop) = context.mutation()
             && !drop.cascade
         {
             for sig in &drop.signatures {
                 let sig_str = format!("{}({})", sig.name.name.resolve(), sig.params.join(","));
-                let schema = state.resolve_function_schema(&sig.name, &sig_str);
+                let schema = context.state().resolve_function_schema(&sig.name, &sig_str);
                 let function_id = crate::ast::identifiers::ObjectId::new(schema, sig_str);
 
-                let affected = state.local.graph.triggers_for_function(&function_id);
+                let affected = context
+                    .state()
+                    .local
+                    .graph
+                    .triggers_for_function(&function_id);
 
                 if !affected.is_empty() {
                     let triggers_info: Vec<String> = affected

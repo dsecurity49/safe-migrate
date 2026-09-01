@@ -1,9 +1,8 @@
 use crate::analysis::mutations::Mutation;
-use crate::analysis::state::{AnalysisState, CascadeResult, MutationResult};
-use crate::engine::config::Config;
+use crate::analysis::state::MutationResult;
 use crate::model::relation::Persistence;
 use crate::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
-use crate::rules::LegacyRule as Rule;
+use crate::rules::{Rule, RuleContext};
 
 pub struct MaterializedViewRefreshRule;
 
@@ -18,34 +17,27 @@ impl Rule for MaterializedViewRefreshRule {
         "Refreshing a materialized view without CONCURRENTLY prevents reading from it during the refresh."
     }
 
-    fn evaluate(
-        &self,
-        mutation: &Mutation,
-        result: &MutationResult,
-        pre_state: &crate::analysis::state::PreState,
-        state: &AnalysisState,
-        config: &Config,
-        _cascade: Option<&CascadeResult>,
-    ) -> Vec<Violation> {
-        if *result == MutationResult::Skipped {
+    fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
+        if *context.result() == MutationResult::Skipped {
             return vec![];
         }
 
         let mut violations = Vec::new();
 
-        if let Mutation::RefreshMaterializedView(refresh) = mutation {
+        if let Mutation::RefreshMaterializedView(refresh) = context.mutation() {
             if !refresh.concurrently {
-                let (is_temp, is_stale, rows) = match pre_state.relations.get(&refresh.id) {
+                let (is_temp, is_stale, rows) = match context.pre_state().relations.get(&refresh.id)
+                {
                     Some(rel) => {
-                        let stale =
-                            rel.is_stale() && state.baseline_relations.contains(&refresh.id);
+                        let stale = rel.is_stale()
+                            && context.state().baseline_relations.contains(&refresh.id);
                         (
                             rel.persistence == Persistence::Temporary,
                             stale,
-                            rel.estimated_rows.unwrap_or(config.default_rows),
+                            rel.estimated_rows.unwrap_or(context.config().default_rows),
                         )
                     }
-                    None => (false, true, config.default_rows),
+                    None => (false, true, context.config().default_rows),
                 };
 
                 if is_temp {
@@ -68,8 +60,8 @@ impl Rule for MaterializedViewRefreshRule {
                     });
                 }
 
-                let tier1_threshold = config.rule_tier1_threshold(self.id());
-                let tier2_threshold = config.rule_tier2_threshold(self.id());
+                let tier1_threshold = context.config().rule_tier1_threshold(self.id());
+                let tier2_threshold = context.config().rule_tier2_threshold(self.id());
 
                 let tier = if rows >= tier1_threshold {
                     ViolationTier::Tier1
@@ -102,7 +94,7 @@ impl Rule for MaterializedViewRefreshRule {
                 }
             } else {
                 // CONCURRENTLY refresh requires at least one unique index
-                let has_unique_index = state.local.graph.edges().iter().any(|e| {
+                let has_unique_index = context.state().local.graph.edges().iter().any(|e| {
                     if let crate::analysis::graph::DependencyKind::IndexOnRelation {
                         is_unique,
                         has_expression_keys,
