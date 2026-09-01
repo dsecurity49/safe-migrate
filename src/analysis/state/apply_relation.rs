@@ -467,6 +467,32 @@ impl AnalysisState {
                     ),
                 };
             }
+            let mut source_columns = HashSet::new();
+            if let Some(column) = fk
+                .from_columns
+                .iter()
+                .find(|column| !source_columns.insert(column.as_str()))
+            {
+                return MutationResult::Conflict {
+                    reason: format!(
+                        "foreign key on '{}' repeats source column '{}'",
+                        create.id, column
+                    ),
+                };
+            }
+            let mut target_columns = HashSet::new();
+            if let Some(column) = fk
+                .to_columns
+                .iter()
+                .find(|column| !target_columns.insert(column.as_str()))
+            {
+                return MutationResult::Conflict {
+                    reason: format!(
+                        "foreign key on '{}' repeats referenced column '{}'",
+                        create.id, column
+                    ),
+                };
+            }
             if let Some(column) = fk.from_columns.iter().find(|name| {
                 !create
                     .columns
@@ -1734,6 +1760,30 @@ impl AnalysisState {
                         alter.id,
                         from_columns.len(),
                         to_columns.len()
+                    ),
+                };
+            }
+            let mut source_columns = HashSet::new();
+            if let Some(column) = from_columns
+                .iter()
+                .find(|column| !source_columns.insert(column.as_str()))
+            {
+                return MutationResult::Conflict {
+                    reason: format!(
+                        "foreign key on '{}' repeats source column '{}'",
+                        alter.id, column
+                    ),
+                };
+            }
+            let mut target_columns = HashSet::new();
+            if let Some(column) = to_columns
+                .iter()
+                .find(|column| !target_columns.insert(column.as_str()))
+            {
+                return MutationResult::Conflict {
+                    reason: format!(
+                        "foreign key on '{}' repeats referenced column '{}'",
+                        alter.id, column
                     ),
                 };
             }

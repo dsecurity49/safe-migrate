@@ -730,6 +730,28 @@ impl DbCache {
                     foreign_key.to_columns.len()
                 ));
             }
+            let mut source_columns = HashSet::new();
+            if let Some(column) = foreign_key
+                .from_columns
+                .iter()
+                .find(|column| !source_columns.insert(column.as_str()))
+            {
+                return Err(format!(
+                    "foreign key '{}.{}' repeats source column '{}'",
+                    foreign_key.from_table, foreign_key.constraint_name, column
+                ));
+            }
+            let mut target_columns = HashSet::new();
+            if let Some(column) = foreign_key
+                .to_columns
+                .iter()
+                .find(|column| !target_columns.insert(column.as_str()))
+            {
+                return Err(format!(
+                    "foreign key '{}.{}' repeats referenced column '{}'",
+                    foreign_key.from_table, foreign_key.constraint_name, column
+                ));
+            }
             for column in &foreign_key.from_columns {
                 if !from_relation.has_column(column) {
                     return Err(format!(
@@ -1099,6 +1121,31 @@ mod tests {
 
         let error = cache.validate_semantics().unwrap_err();
         assert!(error.contains("missing source column 'public.child.missing'"));
+    }
+
+    #[test]
+    fn current_cache_rejects_repeated_foreign_key_columns() {
+        let child = ObjectId::new("public", "child");
+        let parent = ObjectId::new("public", "parent");
+        let mut cache = DbCache::new();
+        cache.insert_baseline(child.clone(), table(child.clone(), &["a", "b"]));
+        cache.insert_baseline(parent.clone(), table(parent.clone(), &["id", "other"]));
+        cache.constraints.push(ConstraintState {
+            table_id: child.clone(),
+            name: "child_parent_fkey".to_string(),
+            kind: ConstraintKind::ForeignKey,
+            validated: true,
+        });
+        cache.foreign_keys.push(ForeignKeyCache {
+            constraint_name: "child_parent_fkey".to_string(),
+            from_table: child,
+            to_table: parent,
+            from_columns: vec!["a".to_string(), "a".to_string()],
+            to_columns: vec!["id".to_string(), "other".to_string()],
+        });
+
+        let error = cache.validate_semantics().unwrap_err();
+        assert!(error.contains("repeats source column 'a'"));
     }
 
     #[test]
