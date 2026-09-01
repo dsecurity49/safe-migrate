@@ -6,8 +6,8 @@ use crate::analysis::state::{AnalysisState, PreState};
 use crate::ast::visitor::AstVisitor;
 use crate::engine::config::Config;
 use crate::report::violations::{ReportFinding, SourceLocation, Violation};
-use crate::rules::Rule;
 use crate::rules::registry;
+use crate::rules::{Rule, RuleContext};
 use squawk_syntax::{
     Parse, SyntaxKind,
     ast::{AstNode, SourceFile},
@@ -362,7 +362,7 @@ impl SafeMigrateEngine {
                         continue;
                     }
 
-                    let violations = rule.evaluate(
+                    let rule_context = RuleContext::new(
                         &mutation,
                         &result,
                         &pre_state,
@@ -370,6 +370,7 @@ impl SafeMigrateEngine {
                         &self.config,
                         pre_cascade.as_ref(),
                     );
+                    let violations = rule.evaluate_context(&rule_context);
 
                     for v in violations {
                         if let Some(key) = &v.dedup_key
