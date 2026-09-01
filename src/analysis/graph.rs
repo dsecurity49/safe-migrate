@@ -269,6 +269,13 @@ impl DependencyGraph {
 
     // Dependency lookups follow the current end of a rename chain.
     pub fn is_referenced_by_view(&self, id: &ObjectId) -> Vec<&ObjectId> {
+        if self.edges.len() >= Self::CASCADE_INDEX_MIN_EDGES {
+            return self
+                .resolved_referenced_edges(id)
+                .filter(|edge| matches!(edge.kind, DependencyKind::ViewDependency { .. }))
+                .map(|edge| self.resolve_rename(&edge.dependent))
+                .collect();
+        }
         let target = self.resolve_rename(id);
         self.edges
             .iter()
@@ -281,6 +288,21 @@ impl DependencyGraph {
     }
 
     pub fn is_referenced_by_fk(&self, id: &ObjectId) -> Vec<(&ObjectId, u64)> {
+        if self.edges.len() >= Self::CASCADE_INDEX_MIN_EDGES {
+            return self
+                .resolved_referenced_edges(id)
+                .filter_map(|edge| {
+                    if let DependencyKind::ForeignKey {
+                        from_generation, ..
+                    } = &edge.kind
+                    {
+                        Some((self.resolve_rename(&edge.dependent), *from_generation))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+        }
         let target = self.resolve_rename(id);
         self.edges
             .iter()
@@ -299,6 +321,13 @@ impl DependencyGraph {
     }
 
     pub fn is_referenced_by_index(&self, id: &ObjectId) -> Vec<&ObjectId> {
+        if self.edges.len() >= Self::CASCADE_INDEX_MIN_EDGES {
+            return self
+                .resolved_referenced_edges(id)
+                .filter(|edge| matches!(edge.kind, DependencyKind::IndexOnRelation { .. }))
+                .map(|edge| self.resolve_rename(&edge.dependent))
+                .collect();
+        }
         let target = self.resolve_rename(id);
         self.edges
             .iter()
@@ -311,6 +340,13 @@ impl DependencyGraph {
     }
 
     pub fn partitions_of(&self, id: &ObjectId) -> Vec<&ObjectId> {
+        if self.edges.len() >= Self::CASCADE_INDEX_MIN_EDGES {
+            return self
+                .resolved_referenced_edges(id)
+                .filter(|edge| matches!(edge.kind, DependencyKind::PartitionOf))
+                .map(|edge| self.resolve_rename(&edge.dependent))
+                .collect();
+        }
         let target = self.resolve_rename(id);
         self.edges
             .iter()
@@ -323,23 +359,10 @@ impl DependencyGraph {
     }
 
     pub fn resolve_rename<'a>(&'a self, id: &'a ObjectId) -> &'a ObjectId {
-        let mut current = id;
-        let mut visited = HashSet::new();
-        loop {
-            // A rename back to an earlier name is valid PostgreSQL. The graph
-            // retains historical aliases, so resolve only acyclic paths; a
-            // cycle has no unique alias target and must leave the supplied
-            // identity unchanged.
-            if !visited.insert(current.clone()) {
-                return id;
-            }
-            match self.edges.iter().find(|edge| {
-                matches!(edge.kind, DependencyKind::RenameTo) && &edge.dependent == current
-            }) {
-                Some(edge) => current = &edge.referenced,
-                None => return current,
-            }
-        }
+        // A rename back to an earlier name is valid PostgreSQL. The indexed
+        // resolver retains the same cycle fallback while avoiding a full edge
+        // scan for every dependency lookup on large baselines.
+        Self::resolve_rename_with(&self.edges, self.indexes(), id)
     }
 
     // Partition ancestry must remain acyclic.
@@ -531,6 +554,10 @@ mod tests {
         )
     }
 
+    fn relation_edge(dependent: &str, referenced: &str, kind: DependencyKind) -> DependencyEdge {
+        DependencyEdge::new(id(dependent), id(referenced), kind)
+    }
+
     fn canonical_views<'a>(graph: &'a DependencyGraph, target: &ObjectId) -> Vec<&'a ObjectId> {
         let resolved_target = graph.resolve_rename(target);
         graph
@@ -639,6 +666,104 @@ mod tests {
 
         assert_eq!(graph.triggers_for_function(&trigger_function).len(), 1);
         assert!(graph.triggers_for_function(&overload).is_empty());
+    }
+
+    #[test]
+    fn indexed_reverse_dependency_lookups_match_alias_resolution() {
+        let target = id("target");
+        let renamed = id("renamed_target");
+        let mut graph = DependencyGraph::new();
+        for index in 0..DependencyGraph::CASCADE_INDEX_MIN_EDGES {
+            graph.add_edge(view_edge(
+                &format!("unrelated_view_{index}"),
+                &format!("unrelated_table_{index}"),
+            ));
+        }
+        graph.add_edge(relation_edge(
+            "view",
+            "target",
+            DependencyKind::ViewDependency {
+                view_generation: 1,
+                referenced_column: None,
+            },
+        ));
+        graph.add_edge(relation_edge(
+            "index",
+            "target",
+            DependencyKind::IndexOnRelation {
+                using_method: Some("btree".into()),
+                key_columns: vec!["id".into()],
+                included_columns: Vec::new(),
+                dependency_columns: Vec::new(),
+                dependency_columns_known: true,
+                has_expression_keys: false,
+                has_predicate: false,
+                is_concurrent: false,
+                is_unique: false,
+                is_valid: true,
+                is_ready: true,
+                is_live: true,
+                has_default_sort_order: true,
+                has_default_opclasses: true,
+                has_default_collations: true,
+                eligibility_known: true,
+            },
+        ));
+        graph.add_edge(relation_edge(
+            "child",
+            "target",
+            DependencyKind::ForeignKey {
+                constraint_name: Some("child_target_fkey".into()),
+                from_columns: vec!["target_id".into()],
+                to_columns: vec!["id".into()],
+                operator_evidence: None,
+                from_generation: 7,
+            },
+        ));
+        graph.add_edge(relation_edge(
+            "partition",
+            "target",
+            DependencyKind::PartitionOf,
+        ));
+        graph.add_edge(DependencyEdge::new(
+            target.clone(),
+            renamed.clone(),
+            DependencyKind::RenameTo,
+        ));
+
+        assert_eq!(
+            graph
+                .is_referenced_by_view(&renamed)
+                .into_iter()
+                .map(|id| id.name.clone())
+                .collect::<Vec<_>>(),
+            vec!["view"]
+        );
+        assert_eq!(
+            graph
+                .is_referenced_by_index(&renamed)
+                .into_iter()
+                .map(|id| id.name.clone())
+                .collect::<Vec<_>>(),
+            vec!["index"]
+        );
+        assert_eq!(
+            graph
+                .is_referenced_by_fk(&renamed)
+                .into_iter()
+                .map(|(id, generation)| (id.name.clone(), generation))
+                .collect::<Vec<_>>(),
+            vec![("child".into(), 7)]
+        );
+        assert_eq!(
+            graph
+                .partitions_of(&renamed)
+                .into_iter()
+                .map(|id| id.name.clone())
+                .collect::<Vec<_>>(),
+            vec!["partition"]
+        );
+        assert!(graph.indexes_are_valid());
     }
 
     #[test]

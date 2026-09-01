@@ -1242,6 +1242,12 @@ mod tests {
         let mut cache = DbCache::new();
         cache.insert_baseline(child.clone(), table(child.clone(), &["parent_id"]));
         cache.insert_baseline(parent.clone(), table(parent.clone(), &["id"]));
+        cache.constraints.push(ConstraintState {
+            table_id: child.clone(),
+            name: "child_parent_fkey".into(),
+            kind: ConstraintKind::ForeignKey,
+            validated: true,
+        });
         cache.foreign_keys.push(ForeignKeyCache {
             constraint_name: "child_parent_fkey".into(),
             from_table: child,
@@ -1254,7 +1260,7 @@ mod tests {
         });
 
         let error = cache.validate_semantics().unwrap_err();
-        assert!(error.contains("incomplete equality-operator evidence"));
+        assert!(error.contains("incomplete PK/FK equality-operator evidence"));
     }
 
     #[test]
@@ -1489,7 +1495,7 @@ mod tests {
             has_default_collations: true,
         });
 
-        let error = DbCacheVersioned::V7(Box::new(cache))
+        let error = DbCacheVersioned::V8(Box::new(cache))
             .into_cache()
             .unwrap_err();
         assert!(error.contains("references missing relation 'public.items'"));
@@ -1520,7 +1526,7 @@ mod tests {
         });
 
         assert!(
-            DbCacheVersioned::V7(Box::new(cache))
+            DbCacheVersioned::V8(Box::new(cache))
                 .into_cache()
                 .unwrap_err()
                 .contains("missing complete dependency-column evidence")
@@ -1543,13 +1549,13 @@ mod tests {
             detach_pending: false,
         });
         assert!(
-            DbCacheVersioned::V7(Box::new(cache.clone()))
+            DbCacheVersioned::V8(Box::new(cache.clone()))
                 .into_cache()
                 .is_ok()
         );
 
         cache.inheritances[0].detach_pending = true;
-        let error = DbCacheVersioned::V7(Box::new(cache))
+        let error = DbCacheVersioned::V8(Box::new(cache))
             .into_cache()
             .unwrap_err();
         assert!(error.contains("being detached"));
