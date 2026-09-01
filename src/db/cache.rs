@@ -440,6 +440,38 @@ impl DbCache {
         self.relations.iter()
     }
 
+    fn role_membership_cycle(&self) -> Option<ObjectId> {
+        fn visit(
+            role_id: &ObjectId,
+            roles: &HashMap<ObjectId, RoleState>,
+            visiting: &mut HashSet<ObjectId>,
+            visited: &mut HashSet<ObjectId>,
+        ) -> Option<ObjectId> {
+            if visiting.contains(role_id) {
+                return Some(role_id.clone());
+            }
+            if !visited.insert(role_id.clone()) {
+                return None;
+            }
+            visiting.insert(role_id.clone());
+            if let Some(role) = roles.get(role_id) {
+                for parent in &role.member_of {
+                    if let Some(cycle) = visit(parent, roles, visiting, visited) {
+                        return Some(cycle);
+                    }
+                }
+            }
+            visiting.remove(role_id);
+            None
+        }
+
+        let mut visiting = HashSet::new();
+        let mut visited = HashSet::new();
+        self.roles
+            .keys()
+            .find_map(|role_id| visit(role_id, &self.roles, &mut visiting, &mut visited))
+    }
+
     /// Validate cross-record identity, relationship, and catalog-coverage
     /// invariants before a cache is used as an authoritative baseline.
     pub fn validate_semantics(&self) -> Result<(), String> {
@@ -502,6 +534,12 @@ impl DbCache {
                     id, role.id
                 ));
             }
+        }
+        if let Some(role_id) = self.role_membership_cycle() {
+            return Err(format!(
+                "role membership graph contains a circular path at '{}'",
+                role_id.name
+            ));
         }
         for (name, schema) in &self.schemas {
             if name != &schema.name {
@@ -1341,6 +1379,38 @@ mod tests {
 
         let error = cache.validate_semantics().unwrap_err();
         assert!(error.contains("SET ROLE access") && error.contains("without membership"));
+    }
+
+    #[test]
+    fn current_cache_rejects_circular_role_membership() {
+        let first = ObjectId::new("", "first");
+        let second = ObjectId::new("", "second");
+        let mut cache = DbCache::new();
+        cache.roles.insert(
+            first.clone(),
+            RoleState {
+                id: first.clone(),
+                can_login: false,
+                is_superuser: false,
+                member_of: vec![second.clone()],
+                can_set_role_to: vec![second.clone()],
+                granted_privileges: Vec::new(),
+            },
+        );
+        cache.roles.insert(
+            second.clone(),
+            RoleState {
+                id: second,
+                can_login: false,
+                is_superuser: false,
+                member_of: vec![first.clone()],
+                can_set_role_to: vec![first],
+                granted_privileges: Vec::new(),
+            },
+        );
+
+        let error = cache.validate_semantics().unwrap_err();
+        assert!(error.contains("circular path"));
     }
 
     #[test]

@@ -17,7 +17,10 @@ notes are available on the
 - Large dependency graphs reuse indexed rename and reverse-dependency lookups
   while preserving the existing small-graph behavior.
 - Added the supported `safe_migrate::api` Rust façade for configuration, cache,
-  analysis, findings, and evidence consumers.
+  analysis, findings, and evidence consumers, including managed analysis helpers
+  that validate caches before hydration.
+- Cache validation now rejects circular or internally inconsistent role
+  membership edges before synchronized state can be treated as authoritative.
 
 ## v0.7.0 — 2026-08-30
 
