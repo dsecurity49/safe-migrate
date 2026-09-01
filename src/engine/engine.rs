@@ -369,6 +369,8 @@ impl SafeMigrateEngine {
                         state,
                         &self.config,
                         pre_cascade.as_ref(),
+                        state.evidence(),
+                        state.confidence(),
                     );
                     let violations = rule.evaluate_context(&rule_context);
 

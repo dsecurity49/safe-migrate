@@ -16,8 +16,9 @@ pub mod transactions;
 pub mod triggers;
 pub mod views;
 
+use crate::analysis::evidence::EvidenceRecord;
 use crate::analysis::mutations::Mutation;
-use crate::analysis::state::{AnalysisState, CascadeResult, MutationResult};
+use crate::analysis::state::{AnalysisState, CascadeResult, Confidence, MutationResult};
 use crate::engine::config::Config;
 use crate::report::violations::{Violation, ViolationTier};
 
@@ -33,6 +34,8 @@ pub struct RuleContext<'a> {
     pub(crate) state: &'a AnalysisState,
     pub(crate) config: &'a Config,
     pub(crate) cascade_closure: Option<&'a CascadeResult>,
+    pub(crate) evidence: &'a [EvidenceRecord],
+    pub(crate) confidence: &'a Confidence,
 }
 
 impl<'a> RuleContext<'a> {
@@ -43,6 +46,8 @@ impl<'a> RuleContext<'a> {
         state: &'a AnalysisState,
         config: &'a Config,
         cascade_closure: Option<&'a CascadeResult>,
+        evidence: &'a [EvidenceRecord],
+        confidence: &'a Confidence,
     ) -> Self {
         Self {
             mutation,
@@ -51,7 +56,17 @@ impl<'a> RuleContext<'a> {
             state,
             config,
             cascade_closure,
+            evidence,
+            confidence,
         }
+    }
+
+    pub fn evidence(&self) -> &[EvidenceRecord] {
+        self.evidence
+    }
+
+    pub fn confidence(&self) -> &Confidence {
+        self.confidence
     }
 }
 
