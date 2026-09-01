@@ -379,10 +379,6 @@ impl Rule for ReversibilityRule {
         "This operation is irreversible. Ensure backups are available."
     }
 
-    fn required_capabilities(&self) -> &'static [RuleCapability] {
-        BASELINE_STATS_CAPABILITIES
-    }
-
     fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
         let mutation = context.mutation();
         let result = context.result();

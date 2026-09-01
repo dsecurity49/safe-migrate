@@ -421,7 +421,6 @@ mod tests {
     #[test]
     fn stateful_rules_declare_their_required_capabilities() {
         let expected: HashSet<_> = [
-            "irreversible-migration",
             "destructive-cascade",
             "size-aware-add-column",
             "type-change-rewrite",

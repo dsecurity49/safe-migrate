@@ -362,21 +362,6 @@ impl SafeMigrateEngine {
                         continue;
                     }
 
-                    // Capability declarations are an executable contract:
-                    // unavailable catalog/transaction surfaces become
-                    // explicit evidence before a rule evaluates, so a rule
-                    // cannot accidentally turn missing state into certainty.
-                    for capability in rule.required_capabilities() {
-                        if !capability.available(state) {
-                            let code = if state.baseline_available {
-                                capability.evidence_code()
-                            } else {
-                                crate::analysis::evidence::EvidenceCode::BaselineUnavailable
-                            };
-                            state.taint(code, crate::analysis::evidence::EvidenceScope::Statement);
-                        }
-                    }
-
                     let rule_context = RuleContext::new(
                         &mutation,
                         &result,
@@ -386,6 +371,27 @@ impl SafeMigrateEngine {
                         pre_cascade.as_ref(),
                     );
                     let violations = rule.evaluate(&rule_context);
+
+                    // A capability is relevant only when this rule actually
+                    // produces a finding for the current mutation. Recording
+                    // it for every unrelated statement would taint an
+                    // otherwise exact chain (for example, DROP DATABASE does
+                    // not need relation statistics).
+                    if !violations.is_empty() {
+                        for capability in rule.required_capabilities() {
+                            if !capability.available(state) {
+                                let code = if state.baseline_available {
+                                    capability.evidence_code()
+                                } else {
+                                    crate::analysis::evidence::EvidenceCode::BaselineUnavailable
+                                };
+                                state.taint(
+                                    code,
+                                    crate::analysis::evidence::EvidenceScope::Statement,
+                                );
+                            }
+                        }
+                    }
 
                     for v in violations {
                         if let Some(key) = &v.dedup_key

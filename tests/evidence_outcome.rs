@@ -103,7 +103,7 @@ fn unavailable_rule_capability_is_recorded_before_rule_evaluation() {
     let outcome = engine
         .analyze_outcome_with_locations(
             "migrations/004.sql".to_string(),
-            "CREATE INDEX idx ON accounts (id);".to_string(),
+            "CREATE TABLE accounts (id integer); CREATE INDEX idx ON accounts (id);".to_string(),
             &mut state,
         )
         .expect("index migration should analyze without a baseline");
