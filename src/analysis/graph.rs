@@ -8,6 +8,10 @@ pub enum DependencyKind {
         constraint_name: Option<String>,
         from_columns: Vec<String>,
         to_columns: Vec<String>,
+        /// Catalog-selected equality operators for an exact synchronized FK.
+        /// Local migrations use `None` until PostgreSQL operator resolution is
+        /// proven from typed catalog evidence.
+        operator_evidence: Option<ForeignKeyOperatorEvidence>,
         from_generation: u64,
     },
     ViewDependency {
@@ -36,7 +40,7 @@ pub enum DependencyKind {
         eligibility_known: bool,
     },
     /// A primary-key/unique constraint whose ordered key columns are known.
-    /// V7 hydration and local mutations share this edge; legacy or incomplete
+    /// V8 hydration and local mutations share this edge; legacy or incomplete
     /// cache construction must still remain conservative.
     ConstraintOnRelation {
         constraint_name: String,
@@ -73,6 +77,13 @@ pub enum DependencyKind {
     PublicationIncludes {
         publication_name: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ForeignKeyOperatorEvidence {
+    pub pk_fk: Vec<String>,
+    pub pk_pk: Vec<String>,
+    pub fk_fk: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// Catalog families whose completeness is independently meaningful to the
-/// analyzer. The V7 cache records this explicitly instead of treating one
+/// analyzer. The V8 cache records this explicitly instead of treating one
 /// optional schema list as evidence for every object class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -129,7 +129,7 @@ impl Default for CatalogCoverage {
     fn default() -> Self {
         // Programmatic test baselines retain the historical all-schema
         // assumption. Production sync always overwrites this with its actual
-        // requested scope before a V7 cache can be written.
+        // requested scope before a V8 cache can be written.
         Self::from_sync_scope(None)
     }
 }
@@ -140,16 +140,42 @@ pub struct ForeignKeyCache {
     pub from_table: ObjectId,
     pub to_table: ObjectId,
     /// Ordered `pg_constraint.conkey` identities resolved through
-    /// `pg_attribute`. Empty vectors are invalid for V7 FK records.
+    /// `pg_attribute`. Empty vectors are invalid for V8 FK records.
     pub from_columns: Vec<String>,
     /// Ordered `pg_constraint.confkey` identities resolved through
     /// `pg_attribute`. Position pairs with `from_columns`.
     pub to_columns: Vec<String>,
+    /// Ordered equality operators selected by PostgreSQL for PK = FK
+    /// comparisons. These are textual identities rather than OIDs so a cache
+    /// remains meaningful across cluster restarts and logical restores.
+    pub pk_fk_equality_operators: Vec<String>,
+    /// Ordered equality operators selected for PK = PK comparisons.
+    pub pk_pk_equality_operators: Vec<String>,
+    /// Ordered equality operators selected for FK = FK comparisons.
+    pub fk_fk_equality_operators: Vec<String>,
+}
+
+impl ForeignKeyCache {
+    pub fn has_complete_operator_evidence(&self) -> bool {
+        let count = self.from_columns.len();
+        count > 0
+            && self.to_columns.len() == count
+            && [
+                &self.pk_fk_equality_operators,
+                &self.pk_pk_equality_operators,
+                &self.fk_fk_equality_operators,
+            ]
+            .iter()
+            .all(|operators| {
+                operators.len() == count
+                    && operators.iter().all(|operator| !operator.trim().is_empty())
+            })
+    }
 }
 
 /// Ordered key columns for a primary or unique constraint. This is separate
 /// from `ConstraintState` so the runtime state model remains focused on the
-/// mutable constraint lifecycle while Cache V7 can preserve catalog proof.
+/// mutable constraint lifecycle while Cache V8 can preserve catalog proof.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConstraintKeyCache {
     pub table_id: ObjectId,
@@ -315,14 +341,18 @@ pub struct DbCache {
     pub subscriptions: HashMap<String, SubscriptionState>,
 }
 
-pub const CACHE_FORMAT_VERSION: u32 = 7;
+pub const CACHE_FORMAT_VERSION: u32 = 8;
 
+/// Current durable cache header. V8 adds PostgreSQL-selected FK equality
+/// operator evidence to the normalized catalog snapshot.
+pub const CACHE_V8_MAGIC: &[u8] = b"SMCACHE08";
+/// Retained for decoding fixtures and reporting actionable legacy-cache errors.
 pub const CACHE_V7_MAGIC: &[u8] = b"SMCACHE07";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DbCacheVersioned {
     // Unit variants reserve the historic bincode discriminants. The reader
-    // rejects non-V7 headers before decoding, so legacy layouts are not part
+    // rejects non-current headers before decoding, so legacy layouts are not part
     // of the production model and cannot be converted accidentally.
     V1,
     V2,
@@ -331,6 +361,7 @@ pub enum DbCacheVersioned {
     V5(Box<DbCache>),
     V6(Box<DbCache>),
     V7(Box<DbCache>),
+    V8(Box<DbCache>),
 }
 
 impl DbCacheVersioned {
@@ -343,6 +374,7 @@ impl DbCacheVersioned {
             DbCacheVersioned::V5(_) => 5,
             DbCacheVersioned::V6(_) => 6,
             DbCacheVersioned::V7(_) => 7,
+            DbCacheVersioned::V8(_) => 8,
         }
     }
 
@@ -357,7 +389,7 @@ impl DbCacheVersioned {
                 "This cache format is unsupported. Run `safe-migrate sync` to rebuild it."
                     .to_string(),
             ),
-            DbCacheVersioned::V7(c) => {
+            DbCacheVersioned::V7(c) | DbCacheVersioned::V8(c) => {
                 c.validate_semantics()?;
                 Ok(*c)
             }
@@ -426,14 +458,14 @@ impl DbCache {
         for family in required_families {
             if !self.coverage.has(family) {
                 return Err(format!(
-                    "Cache V7 coverage is missing the required '{}' catalog family",
+                    "Cache V8 coverage is missing the required '{}' catalog family",
                     family.as_str(),
                 ));
             }
         }
         if self.coverage.schema_scope.explicit_schemas() != self.metadata.schemas {
             return Err(
-                "Cache V7 schema coverage disagrees with legacy metadata schema scope".to_string(),
+                "Cache V8 schema coverage disagrees with legacy metadata schema scope".to_string(),
             );
         }
         for (id, relation) in &self.relations {
@@ -740,6 +772,21 @@ impl DbCache {
                     foreign_key.from_columns.len(),
                     foreign_key.to_columns.len()
                 ));
+            }
+            let column_count = foreign_key.from_columns.len();
+            for (label, operators) in [
+                ("PK/FK", &foreign_key.pk_fk_equality_operators),
+                ("PK/PK", &foreign_key.pk_pk_equality_operators),
+                ("FK/FK", &foreign_key.fk_fk_equality_operators),
+            ] {
+                if operators.len() != column_count
+                    || operators.iter().any(|operator| operator.trim().is_empty())
+                {
+                    return Err(format!(
+                        "foreign key '{}.{}' has incomplete {} equality-operator evidence",
+                        foreign_key.from_table, foreign_key.constraint_name, label
+                    ));
+                }
             }
             let mut source_columns = HashSet::new();
             if let Some(column) = foreign_key
@@ -1080,10 +1127,10 @@ mod tests {
     }
 
     #[test]
-    fn current_cache_format_is_v7() {
-        assert_eq!(CACHE_FORMAT_VERSION, 7);
-        assert_eq!(DbCacheVersioned::V7(Box::default()).format_version(), 7);
-        assert_eq!(CACHE_V7_MAGIC, b"SMCACHE07");
+    fn current_cache_format_is_v8() {
+        assert_eq!(CACHE_FORMAT_VERSION, 8);
+        assert_eq!(DbCacheVersioned::V8(Box::default()).format_version(), 8);
+        assert_eq!(CACHE_V8_MAGIC, b"SMCACHE08");
     }
 
     #[test]
@@ -1098,7 +1145,7 @@ mod tests {
             },
         );
 
-        let error = DbCacheVersioned::V7(Box::new(cache))
+        let error = DbCacheVersioned::V8(Box::new(cache))
             .into_cache()
             .unwrap_err();
         assert!(error.contains("schema cache key 'app'"));
@@ -1109,7 +1156,7 @@ mod tests {
         let mut cache = DbCache::new();
         cache.metadata.schemas = Some(vec!["app".to_string()]);
 
-        let error = DbCacheVersioned::V7(Box::new(cache))
+        let error = DbCacheVersioned::V8(Box::new(cache))
             .into_cache()
             .unwrap_err();
         assert!(error.contains("schema coverage disagrees"));
@@ -1134,6 +1181,9 @@ mod tests {
             to_table: parent,
             from_columns: vec!["missing".to_string()],
             to_columns: vec!["id".to_string()],
+            pk_fk_equality_operators: vec!["=".to_string()],
+            pk_pk_equality_operators: vec!["=".to_string()],
+            fk_fk_equality_operators: vec!["=".to_string()],
         });
 
         let error = cache.validate_semantics().unwrap_err();
@@ -1159,10 +1209,35 @@ mod tests {
             to_table: parent,
             from_columns: vec!["a".to_string(), "a".to_string()],
             to_columns: vec!["id".to_string(), "other".to_string()],
+            pk_fk_equality_operators: vec!["=".to_string(), "=".to_string()],
+            pk_pk_equality_operators: vec!["=".to_string(), "=".to_string()],
+            fk_fk_equality_operators: vec!["=".to_string(), "=".to_string()],
         });
 
         let error = cache.validate_semantics().unwrap_err();
         assert!(error.contains("repeats source column 'a'"));
+    }
+
+    #[test]
+    fn current_cache_rejects_incomplete_foreign_key_operator_evidence() {
+        let child = ObjectId::new("public", "child");
+        let parent = ObjectId::new("public", "parent");
+        let mut cache = DbCache::new();
+        cache.insert_baseline(child.clone(), table(child.clone(), &["parent_id"]));
+        cache.insert_baseline(parent.clone(), table(parent.clone(), &["id"]));
+        cache.foreign_keys.push(ForeignKeyCache {
+            constraint_name: "child_parent_fkey".into(),
+            from_table: child,
+            to_table: parent,
+            from_columns: vec!["parent_id".into()],
+            to_columns: vec!["id".into()],
+            pk_fk_equality_operators: vec!["".into()],
+            pk_pk_equality_operators: vec!["=".into()],
+            fk_fk_equality_operators: vec!["=".into()],
+        });
+
+        let error = cache.validate_semantics().unwrap_err();
+        assert!(error.contains("incomplete equality-operator evidence"));
     }
 
     #[test]

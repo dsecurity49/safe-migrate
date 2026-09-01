@@ -235,7 +235,7 @@ pub struct AnalysisState {
     /// cache can be a valid baseline for an empty database, so availability
     /// must not be inferred from the number of modeled objects.
     pub baseline_available: bool,
-    /// V7 catalog completeness used for authoritative absence decisions.
+    /// V8 catalog completeness used for authoritative absence decisions.
     /// Family-specific legacy fields remain only while their consumers migrate.
     pub baseline_coverage: CatalogCoverage,
     /// `None` means the cache covered all non-system schemas. A populated set
@@ -774,6 +774,11 @@ impl AnalysisState {
                     constraint_name: Some(fk.constraint_name),
                     from_columns: fk.from_columns,
                     to_columns: fk.to_columns,
+                    operator_evidence: Some(crate::analysis::graph::ForeignKeyOperatorEvidence {
+                        pk_fk: fk.pk_fk_equality_operators,
+                        pk_pk: fk.pk_pk_equality_operators,
+                        fk_fk: fk.fk_fk_equality_operators,
+                    }),
                     from_generation: 0,
                 },
             ));
@@ -1129,7 +1134,7 @@ impl AnalysisState {
     /// A scoped cache only establishes absence in the schemas it actually
     /// synchronized.
     pub fn baseline_covers_object(&self, id: &ObjectId) -> bool {
-        // V7 validation requires these scopes to agree. Keep the legacy
+        // V8 validation requires these scopes to agree. Keep the legacy
         // metadata intersection while direct in-process cache construction is
         // supported, so a caller cannot accidentally turn an explicitly
         // scoped baseline into global absence knowledge by omitting coverage.

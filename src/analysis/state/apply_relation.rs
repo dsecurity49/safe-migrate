@@ -1072,6 +1072,7 @@ impl AnalysisState {
                     constraint_name: Some(constraint_name),
                     from_columns: fk.from_columns.clone(),
                     to_columns: referenced_columns,
+                    operator_evidence: None,
                     from_generation: generation,
                 },
             ));
@@ -2478,6 +2479,7 @@ impl AnalysisState {
                             to_columns: effective_fk_target_columns
                                 .clone()
                                 .unwrap_or_else(|| to_columns.clone()),
+                            operator_evidence: None,
                             from_generation: generation,
                         },
                     ));

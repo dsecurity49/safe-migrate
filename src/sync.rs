@@ -1,6 +1,6 @@
 use crate::ast::identifiers::ObjectId;
 use crate::db::cache::{
-    CACHE_V7_MAGIC, CatalogCoverage, ConstraintDependencyCache, ConstraintKeyCache, DbCache,
+    CACHE_V8_MAGIC, CatalogCoverage, ConstraintDependencyCache, ConstraintKeyCache, DbCache,
     DbCacheVersioned, DefaultSequenceDependencyCache, ForeignKeyCache,
     GeneratedColumnDependencyCache, IndexCache, InheritanceCache, ViewDependencyCache,
 };
@@ -270,7 +270,7 @@ fn write_cache_with_protection_and_limits(
     cache
         .validate_semantics()
         .map_err(anyhow::Error::msg)
-        .context("Refusing to write a semantically invalid Cache V7 baseline")?;
+        .context("Refusing to write a semantically invalid Cache V8 baseline")?;
     let parent = cache_parent(out_path);
     let mut temp_file = NamedTempFile::new_in(parent).with_context(|| {
         format!(
@@ -283,17 +283,17 @@ fn write_cache_with_protection_and_limits(
         .context("Failed to init zstd compression")?;
     let mut encoder = SizeLimitedWriter::new(encoder, max_decode_bytes);
 
-    if let Err(error) = encoder.write_all(CACHE_V7_MAGIC) {
+    if let Err(error) = encoder.write_all(CACHE_V8_MAGIC) {
         if encoder.limit_exceeded() {
             anyhow::bail!(
                 "Cache payload exceeds the {} MiB decoded-size limit",
                 max_decode_bytes / (1024 * 1024)
             );
         }
-        return Err(error).context("Failed to write cache V7 payload header");
+        return Err(error).context("Failed to write cache V8 payload header");
     }
 
-    let versioned = DbCacheVersioned::V7(Box::new(cache));
+    let versioned = DbCacheVersioned::V8(Box::new(cache));
     let bincode_config = bincode::config::standard().with_variable_int_encoding();
 
     let encode_result =
@@ -1437,7 +1437,34 @@ fn load_foreign_keys(
                  AND a.attnum = target_key.attnum
                  AND NOT a.attisdropped
                 ORDER BY target_key.ordinality
-            ) AS to_columns
+            ) AS to_columns,
+            ARRAY(
+                SELECT format('%s.%s(%s,%s)', op_ns.nspname, op.oprname,
+                              pg_catalog.format_type(op.oprleft, NULL),
+                              pg_catalog.format_type(op.oprright, NULL))
+                FROM unnest(c.conpfeqop) WITH ORDINALITY AS selected_operator(oid, ordinality)
+                JOIN pg_operator op ON op.oid = selected_operator.oid
+                JOIN pg_namespace op_ns ON op_ns.oid = op.oprnamespace
+                ORDER BY selected_operator.ordinality
+            ) AS pk_fk_equality_operators,
+            ARRAY(
+                SELECT format('%s.%s(%s,%s)', op_ns.nspname, op.oprname,
+                              pg_catalog.format_type(op.oprleft, NULL),
+                              pg_catalog.format_type(op.oprright, NULL))
+                FROM unnest(c.conppeqop) WITH ORDINALITY AS selected_operator(oid, ordinality)
+                JOIN pg_operator op ON op.oid = selected_operator.oid
+                JOIN pg_namespace op_ns ON op_ns.oid = op.oprnamespace
+                ORDER BY selected_operator.ordinality
+            ) AS pk_pk_equality_operators,
+            ARRAY(
+                SELECT format('%s.%s(%s,%s)', op_ns.nspname, op.oprname,
+                              pg_catalog.format_type(op.oprleft, NULL),
+                              pg_catalog.format_type(op.oprright, NULL))
+                FROM unnest(c.conffeqop) WITH ORDINALITY AS selected_operator(oid, ordinality)
+                JOIN pg_operator op ON op.oid = selected_operator.oid
+                JOIN pg_namespace op_ns ON op_ns.oid = op.oprnamespace
+                ORDER BY selected_operator.ordinality
+            ) AS fk_fk_equality_operators
         FROM pg_constraint c
         JOIN pg_class t1 ON t1.oid = c.conrelid
         JOIN pg_namespace n1 ON n1.oid = t1.relnamespace
@@ -1473,6 +1500,15 @@ fn load_foreign_keys(
             let to_columns: Vec<String> = row
                 .try_get("to_columns")
                 .context("foreign-key target columns")?;
+            let pk_fk_equality_operators: Vec<String> = row
+                .try_get("pk_fk_equality_operators")
+                .context("foreign-key PK/FK equality operators")?;
+            let pk_pk_equality_operators: Vec<String> = row
+                .try_get("pk_pk_equality_operators")
+                .context("foreign-key PK/PK equality operators")?;
+            let fk_fk_equality_operators: Vec<String> = row
+                .try_get("fk_fk_equality_operators")
+                .context("foreign-key FK/FK equality operators")?;
             if let Some(scoped_schemas) = schemas
                 && (!scoped_schemas.contains(&from_schema)
                     || !scoped_schemas.contains(&to_schema))
@@ -1494,6 +1530,9 @@ fn load_foreign_keys(
                 to_table: ObjectId::new(to_schema, to_table),
                 from_columns,
                 to_columns,
+                pk_fk_equality_operators,
+                pk_pk_equality_operators,
+                fk_fk_equality_operators,
             })
         })
         .collect()
@@ -2357,7 +2396,7 @@ fn populate_cache_from_client(
 
     // Only view dependencies are consumed by cache hydration. Generic
     // pg_depend rows use PostgreSQL dependency codes (n/a/i) and were ignored
-    // after synchronization, so avoid loading them into Cache V7.
+    // after synchronization, so avoid loading them into Cache V8.
     cache.dependencies = load_view_dependencies(client, &schema_values)?;
 
     // Role identity and membership are required to distinguish a valid
@@ -2368,7 +2407,7 @@ fn populate_cache_from_client(
     cache
         .validate_semantics()
         .map_err(anyhow::Error::msg)
-        .context("PostgreSQL catalogs produced a semantically invalid Cache V7 baseline")?;
+        .context("PostgreSQL catalogs produced a semantically invalid Cache V8 baseline")?;
     Ok(cache)
 }
 
@@ -2457,8 +2496,8 @@ mod atomic_write_tests {
         let mut payload = Vec::new();
         decoder.read_to_end(&mut payload).unwrap();
         let payload = payload
-            .strip_prefix(CACHE_V7_MAGIC)
-            .expect("writer must prefix V7 cache payloads");
+            .strip_prefix(CACHE_V8_MAGIC)
+            .expect("writer must prefix V8 cache payloads");
         let config = bincode::config::standard().with_variable_int_encoding();
         let versioned: DbCacheVersioned = bincode::serde::decode_from_slice(payload, config)
             .unwrap()
@@ -2553,7 +2592,7 @@ mod atomic_write_tests {
             DbCache::new(),
             Ok,
             MAX_CACHE_FILE_BYTES,
-            CACHE_V7_MAGIC.len(),
+            CACHE_V8_MAGIC.len(),
         )
         .unwrap_err();
 
