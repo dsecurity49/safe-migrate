@@ -1,8 +1,6 @@
 use crate::analysis::mutations::{AlterTypeActionMutation, Mutation};
-use crate::analysis::state::{AnalysisState, CascadeResult, MutationResult};
-use crate::engine::config::Config;
 use crate::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
-use crate::rules::LegacyRule as Rule;
+use crate::rules::{Rule, RuleContext};
 
 pub struct ConcurrentInsideTransactionRule;
 
@@ -17,19 +15,11 @@ impl Rule for ConcurrentInsideTransactionRule {
         "PostgreSQL does not allow CREATE/DROP INDEX CONCURRENTLY inside a transaction block (BEGIN/COMMIT)."
     }
 
-    fn evaluate(
-        &self,
-        mutation: &Mutation,
-        _result: &MutationResult,
-        _pre_state: &crate::analysis::state::PreState,
-        state: &AnalysisState,
-        _config: &Config,
-        _cascade: Option<&CascadeResult>,
-    ) -> Vec<Violation> {
+    fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
         let mut violations = Vec::new();
 
-        if !state.local.transactions.is_empty() {
-            match mutation {
+        if !context.state().local.transactions.is_empty() {
+            match context.mutation() {
                 Mutation::CreateIndex(c) if c.concurrently => {
                     violations.push(Violation { source_range: None,
                         rule_id: self.id(),
@@ -85,17 +75,9 @@ impl Rule for AlterTypeAddValueRule {
         "Commit before later statements use the new enum value, or put the dependent work in a later migration."
     }
 
-    fn evaluate(
-        &self,
-        mutation: &Mutation,
-        _result: &MutationResult,
-        _pre_state: &crate::analysis::state::PreState,
-        state: &AnalysisState,
-        _config: &Config,
-        _cascade: Option<&CascadeResult>,
-    ) -> Vec<Violation> {
-        if !state.local.transactions.is_empty()
-            && let Mutation::AlterType(alter) = mutation
+    fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
+        if !context.state().local.transactions.is_empty()
+            && let Mutation::AlterType(alter) = context.mutation()
             && matches!(alter.action, AlterTypeActionMutation::AddValue { .. })
         {
             return vec![Violation {
@@ -132,19 +114,11 @@ impl Rule for VacuumFullRule {
         "VACUUM FULL rewrites the entire table and requires an ACCESS EXCLUSIVE lock. Run this manually outside of migration pipelines."
     }
 
-    fn evaluate(
-        &self,
-        mutation: &Mutation,
-        _result: &MutationResult,
-        _pre_state: &crate::analysis::state::PreState,
-        _state: &AnalysisState,
-        _config: &Config,
-        _cascade: Option<&CascadeResult>,
-    ) -> Vec<Violation> {
+    fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
         if let Mutation::Vacuum {
             is_full: true,
             table_id,
-        } = mutation
+        } = context.mutation()
         {
             let object_name = table_id
                 .as_ref()
