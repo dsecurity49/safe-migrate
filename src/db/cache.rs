@@ -576,11 +576,38 @@ impl DbCache {
         }
 
         for (id, role) in &self.roles {
+            let mut memberships = HashSet::new();
             for target in role.member_of.iter().chain(&role.can_set_role_to) {
                 if !self.roles.contains_key(target) {
                     return Err(format!(
                         "role '{}' membership references missing role '{}'",
                         id, target
+                    ));
+                }
+            }
+            for target in &role.member_of {
+                if target == id {
+                    return Err(format!("role '{}' cannot be a member of itself", id.name));
+                }
+                if !memberships.insert(target) {
+                    return Err(format!(
+                        "role '{}' contains duplicate membership in '{}'",
+                        id.name, target.name
+                    ));
+                }
+            }
+            let mut set_role_targets = HashSet::new();
+            for target in &role.can_set_role_to {
+                if !memberships.contains(target) {
+                    return Err(format!(
+                        "role '{}' has SET ROLE access to '{}' without membership",
+                        id.name, target.name
+                    ));
+                }
+                if !set_role_targets.insert(target) {
+                    return Err(format!(
+                        "role '{}' contains duplicate SET ROLE target '{}'",
+                        id.name, target.name
                     ));
                 }
             }
@@ -1282,6 +1309,38 @@ mod tests {
         });
 
         assert!(cache.validate_semantics().is_ok());
+    }
+
+    #[test]
+    fn current_cache_rejects_inconsistent_role_membership_edges() {
+        let member = ObjectId::new("", "member");
+        let parent = ObjectId::new("", "parent");
+        let mut cache = DbCache::new();
+        cache.roles.insert(
+            member.clone(),
+            RoleState {
+                id: member.clone(),
+                can_login: true,
+                is_superuser: false,
+                member_of: Vec::new(),
+                can_set_role_to: vec![parent.clone()],
+                granted_privileges: Vec::new(),
+            },
+        );
+        cache.roles.insert(
+            parent.clone(),
+            RoleState {
+                id: parent,
+                can_login: false,
+                is_superuser: false,
+                member_of: Vec::new(),
+                can_set_role_to: Vec::new(),
+                granted_privileges: Vec::new(),
+            },
+        );
+
+        let error = cache.validate_semantics().unwrap_err();
+        assert!(error.contains("SET ROLE access") && error.contains("without membership"));
     }
 
     #[test]

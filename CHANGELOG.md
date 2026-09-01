@@ -11,6 +11,11 @@ notes are available on the
   declarations and scoped evidence for missing catalog or transaction state.
 - Cache hydration preserves namespace evidence across typed dependencies,
   publications, constraints, indexes, triggers, and generated/default links.
+- Cache V8 records PostgreSQL-selected foreign-key equality operators and
+  rejects incomplete proof; validated cache/state constructors keep malformed
+  programmatic baselines conservative.
+- Large dependency graphs reuse indexed rename and reverse-dependency lookups
+  while preserving the existing small-graph behavior.
 - Added the supported `safe_migrate::api` Rust façade for configuration, cache,
   analysis, findings, and evidence consumers.
 

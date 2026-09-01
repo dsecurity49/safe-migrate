@@ -109,7 +109,7 @@ The returned public fields and values remain unchanged; an equivalence test
 compares incremental capture with a fresh capture after update, insertion, and
 removal mutations.
 
-Cache V7 decoding streams decompressed bytes through the bounded bincode
+Cache V8 decoding streams decompressed bytes through the bounded bincode
 reader instead of retaining a second, fully decompressed byte vector. This is a
 structural peak-memory reduction, not an RSS claim: authenticated decryption
 still completes before decompression, the 256 MiB decoded-size bound remains
