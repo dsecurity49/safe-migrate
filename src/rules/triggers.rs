@@ -1,8 +1,7 @@
 use crate::analysis::mutations::{AlterTableActionMutation, Mutation};
-use crate::analysis::state::{AnalysisState, CascadeResult, MutationResult};
-use crate::engine::config::Config;
+use crate::analysis::state::MutationResult;
 use crate::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
-use crate::rules::LegacyRule as Rule;
+use crate::rules::{Rule, RuleContext};
 
 pub struct DisableTriggerRule;
 
@@ -17,21 +16,13 @@ impl Rule for DisableTriggerRule {
         "Disabling triggers can lead to data inconsistency and bypasses critical business logic. Use with extreme caution and ensure triggers are re-enabled."
     }
 
-    fn evaluate(
-        &self,
-        mutation: &Mutation,
-        result: &MutationResult,
-        _pre_state: &crate::analysis::state::PreState,
-        _state: &AnalysisState,
-        _config: &Config,
-        _cascade: Option<&CascadeResult>,
-    ) -> Vec<Violation> {
-        if *result == MutationResult::Skipped {
+    fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
+        if *context.result() == MutationResult::Skipped {
             return vec![];
         }
         let mut violations = Vec::new();
 
-        if let Mutation::AlterTable(alter) = mutation {
+        if let Mutation::AlterTable(alter) = context.mutation() {
             match &alter.action {
                 AlterTableActionMutation::DisableTrigger { trigger_name } => {
                     let name = trigger_name.as_deref().unwrap_or("ALL");

@@ -1,8 +1,7 @@
 use crate::analysis::mutations::Mutation;
-use crate::analysis::state::{AnalysisState, CascadeResult, MutationResult};
-use crate::engine::config::Config;
+use crate::analysis::state::MutationResult;
 use crate::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
-use crate::rules::LegacyRule as Rule;
+use crate::rules::{Rule, RuleContext};
 
 pub struct RestrictivePolicyRule;
 
@@ -17,21 +16,13 @@ impl Rule for RestrictivePolicyRule {
         "Adding a RESTRICTIVE policy narrows access for all users. This can silently make rows invisible that were previously accessible."
     }
 
-    fn evaluate(
-        &self,
-        mutation: &Mutation,
-        result: &MutationResult,
-        _pre_state: &crate::analysis::state::PreState,
-        _state: &AnalysisState,
-        _config: &Config,
-        _cascade: Option<&CascadeResult>,
-    ) -> Vec<Violation> {
-        if *result == MutationResult::Skipped {
+    fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
+        if *context.result() == MutationResult::Skipped {
             return vec![];
         }
         let mut violations = Vec::new();
 
-        if let Mutation::CreatePolicy(policy) = mutation
+        if let Mutation::CreatePolicy(policy) = context.mutation()
             && !policy.permissive
         {
             violations.push(Violation {
