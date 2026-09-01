@@ -7,6 +7,11 @@ simulate migrations against the captured state.
 safe-migrate is a review aid, not a substitute for testing migrations on a
 representative database or planning application rollouts and backfills.
 
+Rust integrations should use the supported `safe_migrate::api` façade for
+configuration, cache loading, analysis, findings, and evidence. AST, resolver,
+and mutable state modules are implementation details and may change between
+minor releases.
+
 ## Install
 
 ### With Rust

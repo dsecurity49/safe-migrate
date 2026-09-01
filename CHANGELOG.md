@@ -7,6 +7,12 @@ notes are available on the
 
 ## Unreleased
 
+- Rule evaluation now declares required state capabilities and records scoped
+  evidence when a relevant finding lacks synchronized catalog or transaction
+  state; unrelated statements retain exactness.
+- Baseline hydration preserves namespace evidence from cached dependency and
+  publication relationships, and `safe_migrate::api` provides the supported
+  Rust integration façade.
 - Began the v0.8.0 report-contract migration: lint JSON now uses schema v2 and
   includes structured conservative-analysis evidence with stable reason codes
   and statement locations when available.

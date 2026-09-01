@@ -18,3 +18,17 @@ pub use engine::config::Config;
 pub use engine::engine::SafeMigrateEngine;
 pub use report::interactive::run_interactive;
 pub use report::reporter::Reporter;
+
+/// Supported library entry points. Internal AST, resolver, state-map, and
+/// cache-wire modules remain available for the CLI and integration tests while
+/// consumers migrate to this intentionally small façade.
+pub mod api {
+    pub use crate::analysis::evidence::{
+        EvidenceCode, EvidenceLocation, EvidenceRecord, EvidenceScope,
+    };
+    pub use crate::analysis::outcome::AnalysisOutcome;
+    pub use crate::engine::config::Config;
+    pub use crate::engine::engine::SafeMigrateEngine;
+    pub use crate::report::reporter::Reporter;
+    pub use crate::{AnalysisState, DbCache};
+}
