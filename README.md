@@ -12,7 +12,8 @@ configuration, cache loading, analysis, findings, and evidence. AST, resolver,
 and mutable state modules are implementation details and may change between
 minor releases. Caches assembled in code should pass through
 `DbCache::validated()` (or `AnalysisState::try_new`) before being treated as an
-authoritative baseline.
+authoritative baseline. For a fully managed run, use `safe_migrate::api::analyze`
+or `analyze_chain`; both own state creation and return immutable outcomes.
 
 ## Install
 
