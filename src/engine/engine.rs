@@ -369,10 +369,8 @@ impl SafeMigrateEngine {
                         state,
                         &self.config,
                         pre_cascade.as_ref(),
-                        state.evidence(),
-                        state.confidence(),
                     );
-                    let violations = rule.evaluate_context(&rule_context);
+                    let violations = rule.evaluate(&rule_context);
 
                     for v in violations {
                         if let Some(key) = &v.dedup_key

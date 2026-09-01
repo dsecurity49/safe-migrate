@@ -2,7 +2,7 @@ use crate::analysis::mutations::{AlterTypeActionMutation, Mutation};
 use crate::analysis::state::{AnalysisState, CascadeResult, MutationResult};
 use crate::engine::config::Config;
 use crate::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
-use crate::rules::Rule;
+use crate::rules::LegacyRule as Rule;
 
 pub struct ConcurrentInsideTransactionRule;
 

@@ -46,8 +46,6 @@ impl<'a> RuleContext<'a> {
         state: &'a AnalysisState,
         config: &'a Config,
         cascade_closure: Option<&'a CascadeResult>,
-        evidence: &'a [EvidenceRecord],
-        confidence: &'a Confidence,
     ) -> Self {
         Self {
             mutation,
@@ -56,8 +54,8 @@ impl<'a> RuleContext<'a> {
             state,
             config,
             cascade_closure,
-            evidence,
-            confidence,
+            evidence: state.evidence(),
+            confidence: state.confidence(),
         }
     }
 
@@ -94,7 +92,20 @@ impl<'a> RuleContext<'a> {
     }
 }
 
+/// Supported rule interface. Implementations receive one immutable context
+/// object, so future inputs can be added without another argument explosion.
 pub trait Rule {
+    fn id(&self) -> &'static str;
+    fn default_tier(&self) -> ViolationTier;
+    fn recipe(&self) -> &'static str;
+
+    fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation>;
+}
+
+/// Transitional implementation interface for rules that have not yet been
+/// mechanically migrated to `RuleContext`. This trait is crate-private in
+/// practice: it is only used by the blanket bridge below.
+trait LegacyRule {
     fn id(&self) -> &'static str;
     fn default_tier(&self) -> ViolationTier;
     fn recipe(&self) -> &'static str;
@@ -108,13 +119,24 @@ pub trait Rule {
         config: &Config,
         cascade_closure: Option<&CascadeResult>,
     ) -> Vec<Violation>;
+}
 
-    /// Evaluate through the immutable context boundary.
-    ///
-    /// The compatibility adapter is temporary: individual rules can migrate
-    /// to `RuleContext` without forcing a repository-wide behavior change.
-    fn evaluate_context(&self, context: &RuleContext<'_>) -> Vec<Violation> {
-        self.evaluate(
+impl<T: LegacyRule> Rule for T {
+    fn id(&self) -> &'static str {
+        LegacyRule::id(self)
+    }
+
+    fn default_tier(&self) -> ViolationTier {
+        LegacyRule::default_tier(self)
+    }
+
+    fn recipe(&self) -> &'static str {
+        LegacyRule::recipe(self)
+    }
+
+    fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
+        LegacyRule::evaluate(
+            self,
             context.mutation,
             context.result,
             context.pre_state,
