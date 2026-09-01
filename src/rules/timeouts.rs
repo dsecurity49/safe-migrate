@@ -25,10 +25,10 @@ impl Rule for RequireLockTimeoutRule {
             return Vec::new();
         }
 
-        let reason = match context.state().local.lock_timeout.effective {
+        let reason = match context.state().effective_lock_timeout() {
             None => "No lock_timeout is known from SQL or a synchronized cache.".to_string(),
             Some(0) => "lock_timeout is disabled (0).".to_string(),
-            Some(lock_timeout) => match context.state().local.statement_timeout.effective {
+            Some(lock_timeout) => match context.state().effective_statement_timeout() {
                 Some(statement_timeout)
                     if statement_timeout > 0 && lock_timeout >= statement_timeout =>
                 {
@@ -78,7 +78,7 @@ impl Rule for RequireStatementTimeoutRule {
             return Vec::new();
         }
 
-        let reason = match context.state().local.statement_timeout.effective {
+        let reason = match context.state().effective_statement_timeout() {
             None => "No statement_timeout is known from SQL or a synchronized cache.".to_string(),
             Some(0) => "statement_timeout is disabled (0).".to_string(),
             Some(_) => return Vec::new(),

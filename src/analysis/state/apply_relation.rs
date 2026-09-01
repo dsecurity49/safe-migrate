@@ -20,7 +20,9 @@ impl AnalysisState {
             RelationLookup::Present
         } else if matches!(self.local.relations.get(id), Some(RelationOverlay::Dropped)) {
             RelationLookup::Tombstone
-        } else if self.baseline_available && self.baseline_covers_object(id) {
+        } else if self.baseline_covers_family_object(id, crate::db::cache::CatalogFamily::Relations)
+            || self.baseline_covers_family_object(id, crate::db::cache::CatalogFamily::Indexes)
+        {
             RelationLookup::AuthoritativelyAbsent
         } else {
             RelationLookup::Unknown
@@ -110,6 +112,38 @@ impl AnalysisState {
             return MutationResult::Skipped;
         }
 
+        // A synchronized relation row proves that the table exists, but it
+        // cannot prove a DROP result when the dependency catalog family was
+        // omitted.  Treat both RESTRICT and CASCADE conservatively rather
+        // than letting a partial graph look complete merely because it has
+        // some cached edges.
+        if present_targets
+            .iter()
+            .any(|id| self.baseline_relation_is_known(id))
+            && !self.baseline_has_coverage(crate::db::cache::CatalogFamily::Dependencies)
+        {
+            self.taint(
+                EvidenceCode::CatalogCoverageIncomplete,
+                EvidenceScope::Chain,
+            );
+            return MutationResult::Skipped;
+        }
+
+        // Relation-owned dependency loaders currently expand selected
+        // foreign-key boundaries, but do not establish that every possible
+        // cross-schema default, generated expression, policy, or extension
+        // dependency was loaded. Keep a scoped baseline DROP TABLE
+        // conservative until that object-class coverage is explicit.
+        if present_targets.iter().any(|id| {
+            self.baseline_scoped_family_object(id, crate::db::cache::CatalogFamily::Relations)
+        }) {
+            self.taint(
+                EvidenceCode::CatalogCoverageIncomplete,
+                EvidenceScope::Chain,
+            );
+            return MutationResult::Skipped;
+        }
+
         let roots: HashSet<ObjectId> = present_targets.iter().map(&resolve).collect();
         let mut dropped_relations = roots.clone();
         let mut dropped_indexes = HashSet::new();
@@ -124,10 +158,27 @@ impl AnalysisState {
                     &local_closure
                 }
             };
+            let closure_touches_baseline = closure
+                .dropped_relations
+                .iter()
+                .any(|id| self.baseline_relation_is_known(id) && !roots.contains(id))
+                || closure
+                    .dropped_constraints
+                    .iter()
+                    .any(|constraint| self.baseline_foreign_keys.contains(constraint));
+            if closure_touches_baseline
+                && !self.baseline_has_coverage(crate::db::cache::CatalogFamily::Dependencies)
+            {
+                self.taint(
+                    EvidenceCode::CatalogCoverageIncomplete,
+                    EvidenceScope::Chain,
+                );
+                return MutationResult::Skipped;
+            }
             if closure
                 .dropped_relations
                 .iter()
-                .any(|id| !self.relation_is_present(id) && !self.baseline_covers_object(id))
+                .any(|id| !self.relation_is_present(id) && !self.baseline_relation_is_known(id))
             {
                 // A scoped cache may retain a dependency edge to a relation
                 // whose catalog row was omitted. CASCADE removes it in
@@ -175,12 +226,14 @@ impl AnalysisState {
             });
         } else {
             let has_view_deps = self.local.graph.edges().iter().any(|e| {
-                matches!(e.kind, DependencyKind::ViewDependency { .. })
+                self.dependency_edge_is_current(e)
+                    && matches!(e.kind, DependencyKind::ViewDependency { .. })
                     && roots.contains(&resolve(&e.referenced))
                     && !roots.contains(&resolve(&e.dependent))
             });
             let has_fk_deps = self.local.graph.edges().iter().any(|e| {
-                matches!(e.kind, DependencyKind::ForeignKey { .. })
+                self.dependency_edge_is_current(e)
+                    && matches!(e.kind, DependencyKind::ForeignKey { .. })
                     && roots.contains(&resolve(&e.referenced))
                     && !roots.contains(&resolve(&e.dependent))
             });
@@ -543,7 +596,7 @@ impl AnalysisState {
             // a false column conflict; key/index eligibility is checked
             // separately and remains conservative.
             let target_columns_known =
-                !self.baseline_relations.contains(&fk.to_table) || !target_columns.is_empty();
+                !self.baseline_relation_is_known(&fk.to_table) || !target_columns.is_empty();
             if target_columns_known
                 && let Some(column) = fk
                     .to_columns
@@ -1009,6 +1062,7 @@ impl AnalysisState {
                     name: name.clone(),
                     kind: ConstraintKind::PrimaryKey,
                     validated: true,
+                    backing_index: None,
                 },
             );
         }
@@ -1022,6 +1076,7 @@ impl AnalysisState {
                     name: name.clone(),
                     kind: ConstraintKind::Unique,
                     validated: true,
+                    backing_index: None,
                 },
             );
             self.snapshot_graph();
@@ -1063,6 +1118,7 @@ impl AnalysisState {
                     name: constraint_name.clone(),
                     kind: ConstraintKind::ForeignKey,
                     validated: true,
+                    backing_index: None,
                 },
             );
             self.local.graph.add_edge(DependencyEdge::new(
@@ -1086,6 +1142,7 @@ impl AnalysisState {
                     name,
                     kind,
                     validated: true,
+                    backing_index: None,
                 },
             );
         }
@@ -1242,15 +1299,19 @@ impl AnalysisState {
                 );
             }
             self.snapshot_relation(&alter.id);
-            return match self.local.relations.get_mut(&alter.id) {
+            let result = match self.local.relations.get_mut(&alter.id) {
                 Some(RelationOverlay::Present(relation)) => {
-                    relation.owner = ObjectId::new("", owner);
+                    relation.owner = ObjectId::new("", owner.clone());
                     MutationResult::Applied
                 }
                 _ => MutationResult::Conflict {
                     reason: format!("relation '{}' does not exist", alter.id),
                 },
             };
+            if matches!(result, MutationResult::Applied) {
+                self.transfer_owned_sequence_owners(&alter.id, &ObjectId::new("", owner));
+            }
+            return result;
         }
 
         // Validate all targets before taking snapshots or creating implicit
@@ -1367,9 +1428,16 @@ impl AnalysisState {
                     .constraints
                     .contains_key(&(alter.id.clone(), name.clone()))
                 {
-                    return if *if_exists && self.baseline_covers_object(&alter.id) {
+                    return if *if_exists
+                        && self.baseline_covers_family_object(
+                            &alter.id,
+                            crate::db::cache::CatalogFamily::Relations,
+                        ) {
                         MutationResult::Skipped
-                    } else if self.baseline_covers_object(&alter.id) {
+                    } else if self.baseline_covers_family_object(
+                        &alter.id,
+                        crate::db::cache::CatalogFamily::Relations,
+                    ) {
                         MutationResult::Conflict {
                             reason: format!(
                                 "constraint '{}' does not exist on relation '{}'",
@@ -1680,11 +1748,15 @@ impl AnalysisState {
                 }
             }
             // These are fully typed, but their physical storage details are
-            // intentionally outside the schema state. They do not change any
-            // modeled identity, so retain exact confidence while rules still
-            // report their rewrite/locking cost.
+            // intentionally outside the schema state. Preserve the modeled
+            // relation while recording that the post-statement physical
+            // state is not represented; returning Applied without evidence
+            // would falsely claim an exact transition.
             AlterTableActionMutation::SetStorage { .. }
-            | AlterTableActionMutation::SetAccessMethod => return MutationResult::Applied,
+            | AlterTableActionMutation::SetAccessMethod => {
+                self.taint(EvidenceCode::UnsupportedSemantics, EvidenceScope::Statement);
+                return MutationResult::Applied;
+            }
             AlterTableActionMutation::Opaque => {
                 self.taint(EvidenceCode::UnsupportedSemantics, EvidenceScope::Chain);
                 return MutationResult::Applied;
@@ -1789,7 +1861,7 @@ impl AnalysisState {
                 };
             }
             if let Some(RelationOverlay::Present(child)) = self.local.relations.get(&alter.id)
-                && (!self.baseline_relations.contains(&alter.id) || !child.columns.is_empty())
+                && (!self.baseline_relation_is_known(&alter.id) || !child.columns.is_empty())
                 && let Some(column) = from_columns.iter().find(|column| !child.has_column(column))
             {
                 return MutationResult::Conflict {
@@ -1816,7 +1888,7 @@ impl AnalysisState {
                 return MutationResult::Skipped;
             };
             let target_columns_known =
-                !self.baseline_relations.contains(to_table) || !parent.columns.is_empty();
+                !self.baseline_relation_is_known(to_table) || !parent.columns.is_empty();
             if target_columns_known
                 && let Some(column) = to_columns.iter().find(|column| !parent.has_column(column))
             {
@@ -2070,9 +2142,25 @@ impl AnalysisState {
         let mut cascade_view_roots: HashSet<ObjectId> = HashSet::new();
         if let AlterTableActionMutation::DropColumn { name, cascade, .. } = &alter.action {
             let resolved_table = self.local.graph.resolve_rename(&alter.id).clone();
+            if self.baseline_relation_is_known(&resolved_table)
+                && (!self.baseline_has_coverage(crate::db::cache::CatalogFamily::Dependencies)
+                    || self.baseline_scoped_family_object(
+                        &resolved_table,
+                        crate::db::cache::CatalogFamily::Relations,
+                    ))
+            {
+                self.taint(
+                    EvidenceCode::CatalogCoverageIncomplete,
+                    EvidenceScope::Chain,
+                );
+                return MutationResult::Skipped;
+            }
             let mut unknown_dependency = false;
             let mut known_dependency = false;
             for edge in self.local.graph.edges() {
+                if !self.dependency_edge_is_current(edge) {
+                    continue;
+                }
                 let dependent = self.local.graph.resolve_rename(&edge.dependent);
                 let referenced = self.local.graph.resolve_rename(&edge.referenced);
                 match &edge.kind {
@@ -2196,11 +2284,50 @@ impl AnalysisState {
             }
 
             // A generated dependent can itself participate in another
-            // dependency.  Preserve exactness only for the catalog closures
-            // we can apply here; do not drop the source and leave a typed
-            // foreign-key/constraint edge referring to a removed column.
+            // dependency. Compute the complete generated-column closure first
+            // so CASCADE does not drop the source and leave a typed edge
+            // referring to a generated column that PostgreSQL also removes.
+            loop {
+                let additional: Vec<String> = self
+                    .local
+                    .graph
+                    .edges()
+                    .iter()
+                    .filter_map(|edge| {
+                        let dependent = self.local.graph.resolve_rename(&edge.dependent);
+                        let referenced = self.local.graph.resolve_rename(&edge.referenced);
+                        match &edge.kind {
+                            DependencyKind::ColumnGeneratedFrom {
+                                column,
+                                depends_on_column,
+                            } if dependent == &resolved_table
+                                && referenced == &resolved_table
+                                && cascade_generated_columns.contains(depends_on_column)
+                                && column != name
+                                && !cascade_generated_columns.contains(column) =>
+                            {
+                                Some(column.clone())
+                            }
+                            _ => None,
+                        }
+                    })
+                    .collect();
+                if additional.is_empty() {
+                    break;
+                }
+                cascade_generated_columns.extend(additional);
+            }
+
+            // A generated dependent can itself participate in another
+            // dependency. Preserve exactness only for closures whose
+            // dependent constraint identity is available; otherwise leave the
+            // operation conservative rather than dropping a column while
+            // retaining a typed foreign-key/constraint edge.
             if !cascade_generated_columns.is_empty() {
                 for edge in self.local.graph.edges() {
+                    if !self.dependency_edge_is_current(edge) {
+                        continue;
+                    }
                     let dependent = self.local.graph.resolve_rename(&edge.dependent);
                     let referenced = self.local.graph.resolve_rename(&edge.referenced);
                     match &edge.kind {
@@ -2228,6 +2355,7 @@ impl AnalysisState {
                             None => unknown_dependency = true,
                         },
                         DependencyKind::ForeignKey {
+                            constraint_name,
                             from_columns,
                             to_columns,
                             ..
@@ -2240,26 +2368,37 @@ impl AnalysisState {
                                     .iter()
                                     .any(|column| cascade_generated_columns.contains(column))) =>
                         {
-                            unknown_dependency = true;
+                            if let Some(constraint_name) = constraint_name {
+                                known_dependency = true;
+                                drop_column_constraints
+                                    .insert((dependent.clone(), constraint_name.clone()));
+                            } else {
+                                unknown_dependency = true;
+                            }
                         }
-                        DependencyKind::ConstraintOnRelation { columns, .. }
-                        | DependencyKind::ConstraintDependency { columns, .. }
-                            if dependent == &resolved_table
-                                && columns
-                                    .iter()
-                                    .any(|column| cascade_generated_columns.contains(column)) =>
+                        DependencyKind::ConstraintOnRelation {
+                            constraint_name,
+                            columns,
+                            ..
+                        }
+                        | DependencyKind::ConstraintDependency {
+                            constraint_name,
+                            columns,
+                        } if dependent == &resolved_table
+                            && columns
+                                .iter()
+                                .any(|column| cascade_generated_columns.contains(column)) =>
                         {
-                            unknown_dependency = true;
+                            known_dependency = true;
+                            drop_column_constraints
+                                .insert((dependent.clone(), constraint_name.clone()));
                         }
                         DependencyKind::ColumnGeneratedFrom {
                             column,
                             depends_on_column,
                         } if referenced == &resolved_table
                             && cascade_generated_columns.contains(depends_on_column)
-                            && !cascade_generated_columns.contains(column) =>
-                        {
-                            unknown_dependency = true;
-                        }
+                            && !cascade_generated_columns.contains(column) => {}
                         _ => {}
                     }
                 }
@@ -2461,6 +2600,7 @@ impl AnalysisState {
                             name: constraint_name.clone(),
                             kind: ConstraintKind::ForeignKey,
                             validated: !not_valid,
+                            backing_index: None,
                         },
                     );
                     if *not_valid {
@@ -2520,6 +2660,9 @@ impl AnalysisState {
                             DependencyKind::ConstraintOnRelation {
                                 constraint_name, ..
                             } => !(dependent == &alter.id && constraint_name == name),
+                            DependencyKind::ConstraintDependency {
+                                constraint_name, ..
+                            } => !(dependent == &alter.id && constraint_name == name),
                             _ => true,
                         }
                     });
@@ -2561,18 +2704,9 @@ impl AnalysisState {
                             .insert((alter.id.clone(), new_name.clone()));
                     }
                     self.snapshot_graph_full();
-                    self.local.graph.mutate_edges(|edges| {
-                        for edge in edges {
-                            if edge.dependent == alter.id
-                                && let DependencyKind::ForeignKey {
-                                    constraint_name, ..
-                                } = &mut edge.kind
-                                && constraint_name.as_deref() == Some(old_name)
-                            {
-                                *constraint_name = Some(new_name.clone());
-                            }
-                        }
-                    });
+                    self.local
+                        .graph
+                        .rename_foreign_key_constraint(&alter.id, old_name, new_name);
                 }
                 AlterTableActionMutation::AddCheckConstraint {
                     constraint_name,
@@ -2595,6 +2729,7 @@ impl AnalysisState {
                             name: constraint_name.clone(),
                             kind: ConstraintKind::Check,
                             validated: !not_valid,
+                            backing_index: None,
                         },
                     );
                     if *not_valid {
@@ -2621,6 +2756,9 @@ impl AnalysisState {
                                 &HashSet::new(),
                             )
                         });
+                    let backing_index = using_index
+                        .as_ref()
+                        .map(|index| ObjectId::new(index.schema.clone(), constraint_name.clone()));
                     if let Some(index) = using_index {
                         self.adopt_index_for_constraint(index, &alter.id, &constraint_name);
                     }
@@ -2632,6 +2770,7 @@ impl AnalysisState {
                             name: constraint_name.clone(),
                             kind: ConstraintKind::Unique,
                             validated: true,
+                            backing_index,
                         },
                     );
                     if columns.is_empty() || !relation_columns_known {
@@ -2669,6 +2808,9 @@ impl AnalysisState {
                                 &HashSet::new(),
                             )
                         });
+                    let backing_index = using_index
+                        .as_ref()
+                        .map(|index| ObjectId::new(index.schema.clone(), constraint_name.clone()));
                     if let Some(index) = using_index {
                         self.adopt_index_for_constraint(index, &alter.id, &constraint_name);
                     }
@@ -2680,6 +2822,7 @@ impl AnalysisState {
                             name: constraint_name.clone(),
                             kind: ConstraintKind::PrimaryKey,
                             validated: true,
+                            backing_index,
                         },
                     );
                     if columns.is_empty() || !relation_columns_known {
@@ -2718,6 +2861,7 @@ impl AnalysisState {
                             name: constraint_name,
                             kind: ConstraintKind::Exclusion,
                             validated: true,
+                            backing_index: None,
                         },
                     );
                 }
@@ -2810,58 +2954,9 @@ impl AnalysisState {
         }
         if let AlterTableActionMutation::RenameColumn { from, to } = &alter.action {
             self.snapshot_graph_full();
-            self.local.graph.mutate_edges(|edges| {
-                for edge in edges {
-                    match &mut edge.kind {
-                        DependencyKind::ForeignKey {
-                            from_columns,
-                            to_columns,
-                            ..
-                        } => {
-                            if edge.dependent == alter.id {
-                                for column in from_columns {
-                                    if column == from {
-                                        *column = to.clone();
-                                    }
-                                }
-                            }
-                            if edge.referenced == alter.id {
-                                for column in to_columns {
-                                    if column == from {
-                                        *column = to.clone();
-                                    }
-                                }
-                            }
-                        }
-                        DependencyKind::ConstraintOnRelation { columns, .. }
-                            if edge.dependent == alter.id =>
-                        {
-                            for column in columns {
-                                if column == from {
-                                    *column = to.clone();
-                                }
-                            }
-                        }
-                        DependencyKind::ColumnGeneratedFrom {
-                            column,
-                            depends_on_column,
-                        } => {
-                            if edge.dependent == alter.id && column == from {
-                                *column = to.clone();
-                            }
-                            if edge.referenced == alter.id && depends_on_column == from {
-                                *depends_on_column = to.clone();
-                            }
-                        }
-                        DependencyKind::ColumnDefaultOnSequence { column }
-                            if edge.dependent == alter.id && column == from =>
-                        {
-                            *column = to.clone();
-                        }
-                        _ => {}
-                    }
-                }
-            });
+            self.local
+                .graph
+                .rename_column_dependencies(&alter.id, from, to);
 
             // Publication column lists are catalog identities, not merely
             // display text. PostgreSQL follows a renamed column in an
@@ -3036,34 +3131,12 @@ impl AnalysisState {
                     });
                 }
             }
-            AlterTableActionMutation::RenameColumn { to, .. } => {
-                if let AlterTableActionMutation::RenameColumn { from, .. } = &alter.action {
-                    self.snapshot_graph_full();
-                    let resolved_table = self.local.graph.resolve_rename(&alter.id).clone();
-                    self.local.graph.mutate_edges(|edges| {
-                        for edge in edges {
-                            if matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
-                                && edge.referenced == resolved_table
-                                && let DependencyKind::IndexOnRelation {
-                                    key_columns,
-                                    included_columns,
-                                    dependency_columns,
-                                    ..
-                                } = &mut edge.kind
-                            {
-                                for column in key_columns
-                                    .iter_mut()
-                                    .chain(included_columns)
-                                    .chain(dependency_columns)
-                                {
-                                    if column == from {
-                                        *column = to.clone();
-                                    }
-                                }
-                            }
-                        }
-                    });
-                }
+            AlterTableActionMutation::RenameColumn { from, to } => {
+                self.snapshot_graph_full();
+                let resolved_table = self.local.graph.resolve_rename(&alter.id).clone();
+                self.local
+                    .graph
+                    .rename_index_column(&resolved_table, from, to);
                 for sequence_id in owned_sequences_for_column {
                     self.snapshot_sequence(&sequence_id);
                     if let Some(SequenceOverlay::Present(sequence)) =
@@ -3073,15 +3146,9 @@ impl AnalysisState {
                         *column = to.clone();
                     }
                     self.snapshot_graph_full();
-                    self.local.graph.mutate_edges(|edges| {
-                        for edge in edges {
-                            if edge.dependent == sequence_id
-                                && let DependencyKind::SequenceOwnedBy { column } = &mut edge.kind
-                            {
-                                *column = to.clone();
-                            }
-                        }
-                    });
+                    self.local
+                        .graph
+                        .rename_owned_sequence_column(&sequence_id, from, to);
                 }
             }
             _ => {}
@@ -3095,7 +3162,7 @@ impl AnalysisState {
     /// than invent a matching foreign-key target in that case.
     fn unique_keys_for_relation(&self, id: &ObjectId) -> Option<Vec<(Vec<String>, bool)>> {
         let resolved = self.local.graph.resolve_rename(id);
-        if self.baseline_relations.contains(resolved)
+        if self.baseline_relation_is_known(resolved)
             && self
                 .local
                 .relations
@@ -3157,7 +3224,14 @@ impl AnalysisState {
         let renames_index = self.index_is_present(&rename.old_id);
         match self.relation_or_index_lookup(&rename.old_id) {
             RelationLookup::Present => {}
-            _ if self.baseline_covers_object(&rename.old_id) => {
+            _ if self.baseline_covers_family_object(
+                &rename.old_id,
+                crate::db::cache::CatalogFamily::Relations,
+            ) || self.baseline_covers_family_object(
+                &rename.old_id,
+                crate::db::cache::CatalogFamily::Indexes,
+            ) =>
+            {
                 return MutationResult::Conflict {
                     reason: format!("relation '{}' does not exist", rename.old_id),
                 };
@@ -3190,6 +3264,60 @@ impl AnalysisState {
                 EvidenceScope::Chain,
             );
             return MutationResult::Skipped;
+        }
+
+        let schema_move = rename.old_id.schema != rename.new_id.schema;
+        let associated_sequence_moves: Vec<(ObjectId, ObjectId)> = if schema_move {
+            self.local
+                .sequences
+                .iter()
+                .filter_map(|(id, overlay)| {
+                    let SequenceOverlay::Present(sequence) = overlay else {
+                        return None;
+                    };
+                    sequence
+                        .owned_by
+                        .as_ref()
+                        .is_some_and(|(table, _)| table == &rename.old_id)
+                        .then(|| {
+                            (
+                                id.clone(),
+                                ObjectId::new(rename.new_id.schema.clone(), id.name.clone()),
+                            )
+                        })
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let associated_index_moves: Vec<(ObjectId, ObjectId)> = if schema_move {
+            self.local
+                .graph
+                .edges()
+                .iter()
+                .filter(|edge| {
+                    matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
+                        && edge.referenced == rename.old_id
+                })
+                .map(|edge| {
+                    (
+                        edge.dependent.clone(),
+                        ObjectId::new(rename.new_id.schema.clone(), edge.dependent.name.clone()),
+                    )
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        for (old_id, new_id) in associated_sequence_moves
+            .iter()
+            .chain(&associated_index_moves)
+        {
+            if old_id != new_id && self.relation_namespace_is_taken(new_id) {
+                return MutationResult::Conflict {
+                    reason: format!("associated object '{}' already exists", new_id),
+                };
+            }
         }
 
         let publication_scope_updates: Vec<(String, Vec<usize>)> = self
@@ -3255,6 +3383,40 @@ impl AnalysisState {
             {
                 *table = rename.new_id.clone();
             }
+        }
+        for (old_sequence_id, new_sequence_id) in &associated_sequence_moves {
+            self.snapshot_sequence(old_sequence_id);
+            self.snapshot_sequence(new_sequence_id);
+            let Some(SequenceOverlay::Present(mut sequence)) =
+                self.local.sequences.remove(old_sequence_id)
+            else {
+                continue;
+            };
+            sequence.id = new_sequence_id.clone();
+            if let Some((table, _)) = &mut sequence.owned_by {
+                *table = rename.new_id.clone();
+            }
+            self.local
+                .sequences
+                .insert(new_sequence_id.clone(), SequenceOverlay::Present(sequence));
+            self.local
+                .graph
+                .propagate_sequence_rename(old_sequence_id, new_sequence_id);
+            self.local.graph.add_edge(DependencyEdge::new(
+                old_sequence_id.clone(),
+                new_sequence_id.clone(),
+                DependencyKind::RenameTo,
+            ));
+        }
+        for (old_index_id, new_index_id) in &associated_index_moves {
+            self.local
+                .graph
+                .propagate_index_rename(old_index_id, new_index_id);
+            self.local.graph.add_edge(DependencyEdge::new(
+                old_index_id.clone(),
+                new_index_id.clone(),
+                DependencyKind::RenameTo,
+            ));
         }
         let triggers_to_move: Vec<(ObjectId, crate::model::trigger::TriggerState)> = self
             .local
@@ -3378,6 +3540,16 @@ impl AnalysisState {
         if renames_index && self.baseline_indexes.remove(&rename.old_id) {
             self.baseline_indexes.insert(rename.new_id.clone());
         }
+        for (old_sequence_id, new_sequence_id) in &associated_sequence_moves {
+            if self.baseline_sequences.remove(old_sequence_id) {
+                self.baseline_sequences.insert(new_sequence_id.clone());
+            }
+        }
+        for (old_index_id, new_index_id) in &associated_index_moves {
+            if self.baseline_indexes.remove(old_index_id) {
+                self.baseline_indexes.insert(new_index_id.clone());
+            }
+        }
 
         MutationResult::Applied
     }
@@ -3410,12 +3582,16 @@ impl AnalysisState {
         }
         match self.relation_lookup(id, |_| true) {
             RelationLookup::Present => {
+                let owner_id = ObjectId::new("", owner.clone());
                 self.snapshot_relation(id);
-                let Some(RelationOverlay::Present(relation)) = self.local.relations.get_mut(id)
-                else {
-                    unreachable!("relation lookup established presence")
-                };
-                relation.owner = ObjectId::new("", owner);
+                {
+                    let Some(RelationOverlay::Present(relation)) = self.local.relations.get_mut(id)
+                    else {
+                        unreachable!("relation lookup established presence")
+                    };
+                    relation.owner = owner_id.clone();
+                }
+                self.transfer_owned_sequence_owners(id, &owner_id);
                 MutationResult::Applied
             }
             RelationLookup::WrongKind => {
@@ -3429,6 +3605,35 @@ impl AnalysisState {
             RelationLookup::Unknown => {
                 self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
                 MutationResult::Skipped
+            }
+        }
+    }
+
+    /// PostgreSQL transfers ownership of sequences owned by table columns
+    /// together with the table. Keep this dependent metadata synchronized for
+    /// both ALTER TABLE OWNER and the direct relation-owner mutation path.
+    fn transfer_owned_sequence_owners(&mut self, table: &ObjectId, owner: &ObjectId) {
+        let owned_sequence_ids: Vec<ObjectId> = self
+            .local
+            .sequences
+            .iter()
+            .filter_map(|(sequence_id, overlay)| {
+                let SequenceOverlay::Present(sequence) = overlay else {
+                    return None;
+                };
+                sequence
+                    .owned_by
+                    .as_ref()
+                    .is_some_and(|(owned_table, _)| owned_table == table)
+                    .then_some(sequence_id.clone())
+            })
+            .collect();
+        for sequence_id in owned_sequence_ids {
+            self.snapshot_sequence(&sequence_id);
+            if let Some(SequenceOverlay::Present(sequence)) =
+                self.local.sequences.get_mut(&sequence_id)
+            {
+                sequence.owner = owner.clone();
             }
         }
     }

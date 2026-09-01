@@ -40,7 +40,11 @@ impl AnalysisState {
     pub(super) fn apply_rename_type(&mut self, rename: &Rename) -> MutationResult {
         match self.type_lookup(&rename.old_id, |_| true) {
             TypeLookup::Present => {}
-            _ if self.baseline_covers_object(&rename.old_id) => {
+            _ if self.baseline_covers_family_object(
+                &rename.old_id,
+                crate::db::cache::CatalogFamily::Types,
+            ) =>
+            {
                 return MutationResult::Conflict {
                     reason: format!("type '{}' does not exist", rename.old_id),
                 };
@@ -370,6 +374,15 @@ impl AnalysisState {
         if present.is_empty() {
             return MutationResult::Skipped;
         }
+        if present.iter().any(|id| {
+            self.baseline_scoped_family_object(id, crate::db::cache::CatalogFamily::Types)
+        }) {
+            self.taint(
+                EvidenceCode::CatalogCoverageIncomplete,
+                EvidenceScope::Chain,
+            );
+            return MutationResult::Skipped;
+        }
         if let Some(dependent) = present.iter().find(|id| self.has_type_dependents(id)) {
             if !drop.cascade {
                 return MutationResult::Conflict {
@@ -409,6 +422,15 @@ impl AnalysisState {
             }
         }
         if present.is_empty() {
+            return MutationResult::Skipped;
+        }
+        if present.iter().any(|id| {
+            self.baseline_scoped_family_object(id, crate::db::cache::CatalogFamily::Types)
+        }) {
+            self.taint(
+                EvidenceCode::CatalogCoverageIncomplete,
+                EvidenceScope::Chain,
+            );
             return MutationResult::Skipped;
         }
         if let Some(dependent) = present.iter().find(|id| self.has_type_dependents(id)) {

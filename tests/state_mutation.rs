@@ -20,7 +20,7 @@ mod state_mutation_tests {
     use safe_migrate::model::relation::{
         ColumnAction, Persistence, RelationKind, RelationOverlay, RelationState,
     };
-    use safe_migrate::model::role::RoleState;
+    use safe_migrate::model::role::{RoleOverlay, RoleState};
     use safe_migrate::model::schema::SchemaState;
     use safe_migrate::model::sequence::{SequenceKind, SequenceOverlay, SequenceState};
     use safe_migrate::model::types::{TypeKind, TypeOverlay, TypeState};
@@ -101,6 +101,39 @@ mod state_mutation_tests {
             matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
                 && edge.dependent == object_id("public", "t_id_idx")
         }));
+    }
+
+    #[test]
+    fn local_expression_index_separates_eligibility_from_dependency_proof() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE TABLE t(name text); CREATE INDEX t_lower_name_idx ON t ((lower(name)));",
+                &mut state,
+            )
+            .unwrap();
+
+        let edge = state
+            .local
+            .graph
+            .edges()
+            .iter()
+            .find(|edge| {
+                edge.dependent == object_id("public", "t_lower_name_idx")
+                    && matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
+            })
+            .expect("expression index edge should be retained");
+        assert!(matches!(
+            edge.kind,
+            DependencyKind::IndexOnRelation {
+                has_expression_keys: true,
+                dependency_columns_known: false,
+                eligibility_known: true,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -264,6 +297,30 @@ mod state_mutation_tests {
         }
         assert!(state.local.graph.edges().is_empty());
         assert!(state.local.types.is_empty());
+    }
+
+    #[test]
+    fn unavailable_baseline_never_claims_schema_coverage() {
+        let engine = setup_engine();
+        let mut state = safe_migrate::AnalysisState::with_baseline(
+            safe_migrate::db::cache::DbCache::new(),
+            false,
+        );
+        let missing = object_id("public", "not_loaded");
+
+        assert!(!state.baseline_covers_object(&missing));
+        let findings = engine
+            .analyze("ALTER TABLE not_loaded RENAME TO moved;", &mut state)
+            .unwrap();
+
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict"),
+            "unknown baseline must not become a deterministic conflict: {findings:?}"
+        );
+        assert_eq!(state.confidence(), &Confidence::Tainted);
+        assert!(!state.relation_is_present(&object_id("public", "moved")));
     }
 
     #[test]
@@ -1323,6 +1380,43 @@ mod state_mutation_tests {
                 .iter()
                 .any(|finding| finding.rule_id == "chain-conflict"),
             "DROP DEFAULT must remove the local sequence dependency: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn sequence_rename_preserves_default_dependency() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TABLE local_default_reset(id int); CREATE SEQUENCE local_default_reset_seq; ALTER TABLE local_default_reset ALTER COLUMN id SET DEFAULT nextval('local_default_reset_seq'); ALTER SEQUENCE local_default_reset_seq RENAME TO local_default_reset_seq_renamed;",
+                &mut state,
+            )
+            .unwrap();
+        let findings = engine
+            .analyze("DROP SEQUENCE local_default_reset_seq_renamed;", &mut state)
+            .unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict"),
+            "renaming must preserve the default dependency: {findings:?}"
+        );
+
+        engine
+            .analyze(
+                "ALTER TABLE local_default_reset ALTER COLUMN id DROP DEFAULT;",
+                &mut state,
+            )
+            .unwrap();
+        let findings = engine
+            .analyze("DROP SEQUENCE local_default_reset_seq_renamed;", &mut state)
+            .unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict"),
+            "DROP DEFAULT must remove the renamed sequence dependency: {findings:?}"
         );
     }
 
@@ -3792,6 +3886,7 @@ mod state_mutation_tests {
                 name: "accounts_note_check".to_string(),
                 kind: ConstraintKind::Check,
                 validated: true,
+                backing_index: None,
             });
         cache
             .constraint_dependencies
@@ -3800,6 +3895,28 @@ mod state_mutation_tests {
                 constraint_name: "accounts_note_check".to_string(),
                 columns: vec!["note".to_string()],
             });
+
+        let mut drop_constraint_state = safe_migrate::AnalysisState::new(cache.clone());
+        engine
+            .analyze(
+                "ALTER TABLE accounts DROP CONSTRAINT accounts_note_check;",
+                &mut drop_constraint_state,
+            )
+            .unwrap();
+        assert!(
+            !drop_constraint_state
+                .local
+                .graph
+                .edges()
+                .iter()
+                .any(|edge| {
+                    matches!(
+                        edge.kind,
+                        DependencyKind::ConstraintDependency { ref constraint_name, .. }
+                            if constraint_name == "accounts_note_check"
+                    )
+                })
+        );
 
         let mut state = safe_migrate::AnalysisState::new(cache.clone());
         let findings = engine
@@ -3840,7 +3957,7 @@ mod state_mutation_tests {
     }
 
     #[test]
-    fn cached_generated_column_drop_removes_only_its_expression_edge() {
+    fn cached_generated_column_drop_handles_transitive_cascade_closure() {
         let engine = setup_engine();
         let table = object_id("public", "metrics");
         let mut cache = cache_with_table("public", "metrics", None);
@@ -3870,6 +3987,16 @@ mod state_mutation_tests {
                     default_expr_text: None,
                     type_modifier: Some(-1),
                 },
+                Column {
+                    name: "derived_twice".to_string(),
+                    data_type: Some("integer".to_string()),
+                    type_id: None,
+                    is_nullable: true,
+                    default: None,
+                    avg_width: None,
+                    default_expr_text: None,
+                    type_modifier: Some(-1),
+                },
             ]);
         cache
             .generated_column_dependencies
@@ -3877,6 +4004,29 @@ mod state_mutation_tests {
                 table_id: table.clone(),
                 column_name: "derived".to_string(),
                 depends_on_column: "source".to_string(),
+            });
+        cache
+            .generated_column_dependencies
+            .push(GeneratedColumnDependencyCache {
+                table_id: table.clone(),
+                column_name: "derived_twice".to_string(),
+                depends_on_column: "derived".to_string(),
+            });
+        cache
+            .constraints
+            .push(safe_migrate::model::constraint::ConstraintState {
+                table_id: table.clone(),
+                name: "derived_twice_check".to_string(),
+                kind: ConstraintKind::Check,
+                validated: true,
+                backing_index: None,
+            });
+        cache
+            .constraint_dependencies
+            .push(ConstraintDependencyCache {
+                table_id: table.clone(),
+                constraint_name: "derived_twice_check".to_string(),
+                columns: vec!["derived_twice".to_string()],
             });
         let derived_index = object_id("public", "metrics_derived_idx");
         cache.indexes.push(safe_migrate::db::cache::IndexCache {
@@ -3903,12 +4053,12 @@ mod state_mutation_tests {
             .analyze("ALTER TABLE metrics DROP COLUMN derived;", &mut state)
             .unwrap();
         assert!(
-            !findings
+            findings
                 .iter()
                 .any(|finding| finding.rule_id == "chain-conflict")
         );
         assert!(
-            !state
+            state
                 .local
                 .graph
                 .edges()
@@ -3917,8 +4067,32 @@ mod state_mutation_tests {
         );
         assert!(matches!(
             state.get_relation(&table),
-            Some(RelationOverlay::Present(relation)) if !relation.has_column("derived")
+            Some(RelationOverlay::Present(relation)) if relation.has_column("derived")
         ));
+
+        let mut derived_cascade_state = safe_migrate::AnalysisState::new(cache.clone());
+        let findings = engine
+            .analyze(
+                "ALTER TABLE metrics DROP COLUMN derived CASCADE;",
+                &mut derived_cascade_state,
+            )
+            .unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict")
+        );
+        assert!(matches!(
+            derived_cascade_state.get_relation(&table),
+            Some(RelationOverlay::Present(relation))
+                if !relation.has_column("derived") && !relation.has_column("derived_twice")
+        ));
+        assert!(
+            !derived_cascade_state
+                .local
+                .constraints
+                .contains_key(&(table.clone(), "derived_twice_check".to_string()))
+        );
 
         let mut source_state = safe_migrate::AnalysisState::new(cache.clone());
         let findings = engine
@@ -3944,7 +4118,9 @@ mod state_mutation_tests {
         assert!(matches!(
             cascade_state.get_relation(&table),
             Some(RelationOverlay::Present(relation))
-                if !relation.has_column("source") && !relation.has_column("derived")
+                if !relation.has_column("source")
+                    && !relation.has_column("derived")
+                    && !relation.has_column("derived_twice")
         ));
         assert!(!cascade_state.local.graph.edges().iter().any(|edge| {
             matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
@@ -4609,6 +4785,26 @@ mod state_mutation_tests {
     }
 
     #[test]
+    fn role_inherit_option_is_preserved_across_create_and_alter() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE ROLE no_inherit NOINHERIT;
+                 ALTER ROLE no_inherit INHERIT;",
+                &mut state,
+            )
+            .unwrap();
+
+        let role_id = object_id("", "no_inherit");
+        let RoleOverlay::Present(role) = state.local.roles.get(&role_id).unwrap() else {
+            panic!("expected role to be present");
+        };
+        assert!(role.inherits);
+    }
+
+    #[test]
     fn set_session_authorization_updates_session_role_and_allows_reset() {
         let engine = setup_engine();
         let mut cache = DbCache::new();
@@ -4626,9 +4822,9 @@ mod state_mutation_tests {
                     id,
                     can_login: true,
                     is_superuser: superuser,
+                    inherits: true,
                     member_of: Vec::new(),
                     can_set_role_to: Vec::new(),
-                    granted_privileges: Vec::new(),
                 },
             );
         }
@@ -4845,9 +5041,9 @@ mod state_mutation_tests {
                     id,
                     can_login: true,
                     is_superuser: superuser,
+                    inherits: true,
                     member_of: Vec::new(),
                     can_set_role_to: Vec::new(),
-                    granted_privileges: Vec::new(),
                 },
             );
         }
@@ -4914,6 +5110,51 @@ mod state_mutation_tests {
     }
 
     #[test]
+    fn alter_table_owner_moves_owned_sequence_owner() {
+        let engine = setup_engine();
+        let mut cache = DbCache::new();
+        let table = object_id("public", "owned_table");
+        let sequence = object_id("public", "owned_table_id_seq");
+        cache.insert_baseline(
+            table.clone(),
+            RelationState::new(
+                table.clone(),
+                object_id("", "old_owner"),
+                0,
+                None,
+                RelationKind::Table,
+                Persistence::Permanent,
+                0,
+            ),
+        );
+        cache.sequences.insert(
+            sequence.clone(),
+            SequenceState {
+                id: sequence.clone(),
+                owner: object_id("", "old_owner"),
+                owned_by: Some((table.clone(), "id".into())),
+                kind: SequenceKind::Owned,
+                generation: 0,
+            },
+        );
+        let mut state = safe_migrate::AnalysisState::new(cache);
+
+        engine
+            .analyze(
+                "ALTER TABLE public.owned_table OWNER TO new_owner;",
+                &mut state,
+            )
+            .unwrap();
+
+        let SequenceOverlay::Present(sequence_state) =
+            state.local.sequences.get(&sequence).unwrap()
+        else {
+            panic!("owned sequence missing");
+        };
+        assert_eq!(sequence_state.owner, object_id("", "new_owner"));
+    }
+
+    #[test]
     fn complete_role_catalog_rejects_missing_role_switch() {
         let engine = setup_engine();
         let mut cache = DbCache::new();
@@ -4926,9 +5167,9 @@ mod state_mutation_tests {
                 id: login,
                 can_login: true,
                 is_superuser: false,
+                inherits: true,
                 member_of: Vec::new(),
                 can_set_role_to: Vec::new(),
-                granted_privileges: Vec::new(),
             },
         );
         let mut state = safe_migrate::AnalysisState::new(cache);
@@ -4962,9 +5203,9 @@ mod state_mutation_tests {
                     id,
                     can_login: name == "member",
                     is_superuser: false,
+                    inherits: true,
                     member_of: can_set_role_to.clone(),
                     can_set_role_to,
-                    granted_privileges: Vec::new(),
                 },
             );
         }
@@ -5004,9 +5245,9 @@ mod state_mutation_tests {
                     id,
                     can_login: name == "member",
                     is_superuser: false,
+                    inherits: true,
                     member_of,
                     can_set_role_to: Vec::new(),
-                    granted_privileges: Vec::new(),
                 },
             );
         }

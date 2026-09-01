@@ -16,10 +16,8 @@ pub struct Column {
     pub avg_width: Option<i32>,
     /// Raw default expression text from pg_get_expr(), unparsed.
     /// Used for display and heuristic volatility checks without an ExprIr parser.
-    #[serde(default)]
     pub default_expr_text: Option<String>,
     /// Raw type modifier integer from pg_attribute.atttypmod.
     /// For VARCHAR(50), PostgreSQL stores the character limit plus VARHDRSZ: 54.
-    #[serde(default)]
     pub type_modifier: Option<i32>,
 }

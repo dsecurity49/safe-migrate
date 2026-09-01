@@ -325,9 +325,7 @@ pub struct DbCache {
     pub constraints: Vec<ConstraintState>,
     pub constraint_keys: Vec<ConstraintKeyCache>,
     pub constraint_dependencies: Vec<ConstraintDependencyCache>,
-    #[serde(default)]
     pub generated_column_dependencies: Vec<GeneratedColumnDependencyCache>,
-    #[serde(default)]
     pub default_sequence_dependencies: Vec<DefaultSequenceDependencyCache>,
     pub triggers: Vec<TriggerCache>,
     pub functions: HashMap<ObjectId, FunctionState>,
@@ -336,6 +334,13 @@ pub struct DbCache {
     pub schemas: HashMap<String, SchemaState>,
     pub sequences: HashMap<ObjectId, SequenceState>,
     pub dependencies: Vec<ViewDependencyCache>,
+    /// Synchronized relations with a known dependent outside an explicit
+    /// schema scope. Scoped destructive transitions stay conservative for
+    /// these identities; an absent entry means no such dependent was observed
+    /// in the catalog families the synchronizer resolves.
+    pub scoped_external_relation_dependencies: Vec<ObjectId>,
+    pub scoped_external_type_dependencies: Vec<ObjectId>,
+    pub scoped_external_routine_dependencies: Vec<ObjectId>,
     pub inheritances: Vec<InheritanceCache>,
     pub publications: HashMap<String, PublicationState>,
     pub subscriptions: HashMap<String, SubscriptionState>,
@@ -426,6 +431,9 @@ impl DbCache {
             schemas: HashMap::new(),
             sequences: HashMap::new(),
             dependencies: Vec::new(),
+            scoped_external_relation_dependencies: Vec::new(),
+            scoped_external_type_dependencies: Vec::new(),
+            scoped_external_routine_dependencies: Vec::new(),
             inheritances: Vec::new(),
             publications: HashMap::new(),
             subscriptions: HashMap::new(),
@@ -475,6 +483,83 @@ impl DbCache {
     /// Validate cross-record identity, relationship, and catalog-coverage
     /// invariants before a cache is used as an authoritative baseline.
     pub fn validate_semantics(&self) -> Result<(), String> {
+        // Cache identities are authoritative catalog names, never resolver
+        // guesses. Reject malformed or inferred IDs at the boundary so every
+        // downstream map lookup has one canonical representation.
+        let validate_id = |label: &str, id: &ObjectId, require_schema: bool| {
+            if id.name.is_empty() {
+                return Err(format!("{label} has an empty object name"));
+            }
+            if require_schema && id.schema.is_empty() {
+                return Err(format!(
+                    "{label} '{}' must include a schema identity",
+                    id.name
+                ));
+            }
+            if id.inferred_schema {
+                return Err(format!(
+                    "{label} '{}' is marked as an inferred schema identity",
+                    id
+                ));
+            }
+            Ok(())
+        };
+        let validate_role_ref = |label: &str, id: &ObjectId| {
+            validate_id(label, id, false)?;
+            if !self.roles.is_empty() && !self.roles.contains_key(id) {
+                return Err(format!(
+                    "{label} '{}' references a role absent from the synchronized role catalog",
+                    id.name
+                ));
+            }
+            Ok(())
+        };
+
+        if let Some(schemas) = &self.metadata.schemas {
+            let mut seen = HashSet::new();
+            for schema in schemas {
+                if schema.is_empty() {
+                    return Err("cache schema scope contains an empty schema identity".to_string());
+                }
+                if !seen.insert(schema) {
+                    return Err(format!(
+                        "cache schema scope contains duplicate schema '{}'",
+                        schema
+                    ));
+                }
+            }
+        }
+        for (label, value) in [
+            ("source database", self.metadata.source_database.as_deref()),
+            ("source role", self.metadata.source_role.as_deref()),
+            (
+                "source session role",
+                self.metadata.source_session_role.as_deref(),
+            ),
+        ] {
+            if value.is_some_and(str::is_empty) {
+                return Err(format!("cache metadata contains an empty {label} identity"));
+            }
+        }
+        if let Some(template) = &self.metadata.source_search_path
+            && template.iter().any(String::is_empty)
+        {
+            return Err(
+                "cache metadata source search path contains an empty schema identity".to_string(),
+            );
+        }
+        let mut search_path = HashSet::new();
+        for schema in &self.search_path {
+            if schema.is_empty() {
+                return Err("cache search path contains an empty schema identity".to_string());
+            }
+            if !search_path.insert(schema) {
+                return Err(format!(
+                    "cache search path contains duplicate schema '{}'",
+                    schema
+                ));
+            }
+        }
         let required_families = [
             CatalogFamily::Schemas,
             CatalogFamily::Relations,
@@ -498,20 +583,131 @@ impl DbCache {
                 ));
             }
         }
-        if self.coverage.schema_scope.explicit_schemas() != self.metadata.schemas {
+        let mut scoped_external_relations = HashSet::new();
+        for id in &self.scoped_external_relation_dependencies {
+            validate_id("scoped external relation dependency identity", id, true)?;
+            if !scoped_external_relations.insert(id) {
+                return Err(format!(
+                    "scoped external relation dependency '{}' appears more than once",
+                    id
+                ));
+            }
+            if !matches!(self.coverage.schema_scope, SchemaCoverage::Explicit(_)) {
+                return Err(format!(
+                    "scoped external relation dependency '{}' requires an explicit schema scope",
+                    id
+                ));
+            }
+            if !self.coverage.schema_scope.covers(&id.schema) {
+                return Err(format!(
+                    "scoped external relation dependency '{}' is outside the cache schema scope",
+                    id
+                ));
+            }
+        }
+        for (label, ids) in [
+            (
+                "scoped external type dependency",
+                &self.scoped_external_type_dependencies,
+            ),
+            (
+                "scoped external routine dependency",
+                &self.scoped_external_routine_dependencies,
+            ),
+        ] {
+            let mut seen = HashSet::new();
+            for id in ids {
+                validate_id(label, id, true)?;
+                if !seen.insert(id) {
+                    return Err(format!("{label} '{}' appears more than once", id));
+                }
+                if !matches!(self.coverage.schema_scope, SchemaCoverage::Explicit(_)) {
+                    return Err(format!(
+                        "{label} '{}' requires an explicit schema scope",
+                        id
+                    ));
+                }
+                if !self.coverage.schema_scope.covers(&id.schema) {
+                    return Err(format!(
+                        "{label} '{}' is outside the cache schema scope",
+                        id
+                    ));
+                }
+            }
+        }
+        let coverage_scope = self
+            .coverage
+            .schema_scope
+            .explicit_schemas()
+            .map(|schemas| schemas.into_iter().collect::<BTreeSet<_>>());
+        let metadata_scope = self
+            .metadata
+            .schemas
+            .as_ref()
+            .map(|schemas| schemas.iter().cloned().collect::<BTreeSet<_>>());
+        if coverage_scope != metadata_scope {
             return Err(
                 "Cache V8 schema coverage disagrees with legacy metadata schema scope".to_string(),
             );
         }
         for (id, relation) in &self.relations {
+            validate_id("relation cache identity", id, true)?;
+            validate_id("relation embedded identity", &relation.id, true)?;
+            validate_role_ref("relation owner identity", &relation.owner)?;
             if id != &relation.id {
                 return Err(format!(
                     "relation cache key '{}' disagrees with embedded identity '{}'",
                     id, relation.id
                 ));
             }
+            if relation.is_populated.is_some()
+                && !matches!(relation.kind, RelationKind::MaterializedView)
+            {
+                return Err(format!(
+                    "relation '{}' carries materialized-view population state but is not a materialized view",
+                    id
+                ));
+            }
+            let mut column_names = HashSet::new();
+            for column in &relation.columns {
+                if column.name.is_empty() {
+                    return Err(format!(
+                        "relation '{}' contains a column with an empty identity",
+                        id
+                    ));
+                }
+                if !column_names.insert(column.name.as_str()) {
+                    return Err(format!(
+                        "relation '{}' contains duplicate column '{}', which makes lookup ambiguous",
+                        id, column.name
+                    ));
+                }
+            }
+            for (grantee, privileges) in &relation.privileges.grants {
+                validate_id("relation privilege grantee", grantee, false)?;
+                if !grantee.schema.is_empty() {
+                    return Err(format!(
+                        "relation '{}' privilege grantee '{}' must use the cluster role namespace",
+                        id, grantee
+                    ));
+                }
+                if privileges.is_empty() {
+                    return Err(format!(
+                        "relation '{}' has an empty privilege set for grantee '{}'",
+                        id, grantee
+                    ));
+                }
+                if grantee.name != "public" && !self.roles.contains_key(grantee) {
+                    return Err(format!(
+                        "relation '{}' privilege references missing grantee role '{}'",
+                        id, grantee
+                    ));
+                }
+            }
         }
         for (id, function) in &self.functions {
+            validate_id("routine cache identity", id, true)?;
+            validate_id("routine embedded identity", &function.id, true)?;
             if id != &function.id {
                 return Err(format!(
                     "routine cache key '{}' disagrees with embedded identity '{}'",
@@ -520,6 +716,8 @@ impl DbCache {
             }
         }
         for (id, ty) in &self.types {
+            validate_id("type cache identity", id, true)?;
+            validate_id("type embedded identity", &ty.id, true)?;
             if id != &ty.id {
                 return Err(format!(
                     "type cache key '{}' disagrees with embedded identity '{}'",
@@ -528,10 +726,18 @@ impl DbCache {
             }
         }
         for (id, role) in &self.roles {
+            validate_id("role cache identity", id, false)?;
+            validate_id("role embedded identity", &role.id, false)?;
             if id != &role.id {
                 return Err(format!(
                     "role cache key '{}' disagrees with embedded identity '{}'",
                     id, role.id
+                ));
+            }
+            if !id.schema.is_empty() {
+                return Err(format!(
+                    "role '{}' must use the cluster role namespace, not schema '{}'",
+                    id.name, id.schema
                 ));
             }
         }
@@ -542,6 +748,13 @@ impl DbCache {
             ));
         }
         for (name, schema) in &self.schemas {
+            if name.is_empty() {
+                return Err("schema cache contains an empty schema identity".to_string());
+            }
+            if schema.name.is_empty() {
+                return Err("schema cache contains an empty embedded schema identity".to_string());
+            }
+            validate_role_ref("schema owner identity", &schema.owner)?;
             if name != &schema.name {
                 return Err(format!(
                     "schema cache key '{}' disagrees with embedded identity '{}'",
@@ -550,27 +763,163 @@ impl DbCache {
             }
         }
         for (id, sequence) in &self.sequences {
+            validate_id("sequence cache identity", id, true)?;
+            validate_id("sequence embedded identity", &sequence.id, true)?;
+            validate_role_ref("sequence owner identity", &sequence.owner)?;
             if id != &sequence.id {
                 return Err(format!(
                     "sequence cache key '{}' disagrees with embedded identity '{}'",
                     id, sequence.id
                 ));
             }
+            if self.relations.contains_key(id) {
+                return Err(format!(
+                    "sequence '{}' collides with another relation-namespace object",
+                    id
+                ));
+            }
         }
         for (name, publication) in &self.publications {
+            if name.is_empty() || publication.name.is_empty() {
+                return Err("publication cache contains an empty identity".to_string());
+            }
             if name != &publication.name {
                 return Err(format!(
                     "publication cache key '{}' disagrees with embedded identity '{}'",
                     name, publication.name
                 ));
             }
+            if let Some(owner) = &publication.owner {
+                if owner.is_empty() {
+                    return Err(format!(
+                        "publication '{}' has an empty owner identity",
+                        name
+                    ));
+                }
+                if !self.roles.is_empty() && !self.roles.contains_key(&ObjectId::new("", owner)) {
+                    return Err(format!(
+                        "publication '{}' owner '{}' is absent from the synchronized role catalog",
+                        name, owner
+                    ));
+                }
+            }
+            match &publication.scope {
+                crate::analysis::facts::PublicationScope::AllTables { except } => {
+                    let mut seen = HashSet::new();
+                    for table in except {
+                        let resolved = crate::ast::identifiers::Ident::new(table, false).resolve();
+                        if resolved.is_empty() || !seen.insert(resolved) {
+                            return Err(format!(
+                                "publication '{}' has an empty or duplicate EXCEPT table",
+                                name
+                            ));
+                        }
+                    }
+                }
+                crate::analysis::facts::PublicationScope::Explicit(objects) => {
+                    let mut seen = HashSet::new();
+                    for object in objects {
+                        let key = match object {
+                            crate::analysis::facts::PublicationObjectFact::Table {
+                                name: table,
+                                columns,
+                                ..
+                            } => {
+                                let table_name = table.name.resolve();
+                                let schema = table
+                                    .schema
+                                    .as_ref()
+                                    .map(|schema| schema.resolve());
+                                if table_name.is_empty()
+                                    || schema.as_ref().is_some_and(String::is_empty)
+                                {
+                                    return Err(format!(
+                                        "publication '{}' contains an empty table identity",
+                                        name
+                                    ));
+                                }
+                                if let Some(columns) = columns {
+                                    let mut column_names = HashSet::new();
+                                    for column in columns {
+                                        let resolved =
+                                            crate::ast::identifiers::Ident::new(column, false)
+                                                .resolve();
+                                        if resolved.is_empty() || !column_names.insert(resolved) {
+                                            return Err(format!(
+                                                "publication '{}' contains an empty or duplicate table column",
+                                                name
+                                            ));
+                                        }
+                                    }
+                                }
+                                format!(
+                                    "table:{}:{table_name}",
+                                    schema.unwrap_or_else(|| "<unqualified>".to_string())
+                                )
+                            }
+                            crate::analysis::facts::PublicationObjectFact::SchemaTables {
+                                schema,
+                                ..
+                            } => {
+                                if schema.is_empty() {
+                                    return Err(format!(
+                                        "publication '{}' contains an empty schema identity",
+                                        name
+                                    ));
+                                }
+                                format!("schema:{schema}")
+                            }
+                            crate::analysis::facts::PublicationObjectFact::CurrentSchemaShorthand =>
+                                "current_schema".to_string(),
+                            crate::analysis::facts::PublicationObjectFact::Unknown => {
+                                return Err(format!(
+                                    "publication '{}' contains unsupported unknown scope metadata",
+                                    name
+                                ));
+                            }
+                        };
+                        if !seen.insert(key) {
+                            return Err(format!(
+                                "publication '{}' contains duplicate scope metadata",
+                                name
+                            ));
+                        }
+                    }
+                }
+            }
         }
         for (name, subscription) in &self.subscriptions {
+            if name.is_empty() || subscription.name.is_empty() {
+                return Err("subscription cache contains an empty identity".to_string());
+            }
             if name != &subscription.name {
                 return Err(format!(
                     "subscription cache key '{}' disagrees with embedded identity '{}'",
                     name, subscription.name
                 ));
+            }
+            if let Some(owner) = &subscription.owner {
+                if owner.is_empty() {
+                    return Err(format!(
+                        "subscription '{}' has an empty owner identity",
+                        name
+                    ));
+                }
+                if !self.roles.is_empty() && !self.roles.contains_key(&ObjectId::new("", owner)) {
+                    return Err(format!(
+                        "subscription '{}' owner '{}' is absent from the synchronized role catalog",
+                        name, owner
+                    ));
+                }
+            }
+            let mut publication_names = HashSet::new();
+            for publication in &subscription.publications {
+                if publication.is_empty() || !publication_names.insert(publication) {
+                    return Err(format!(
+                        "subscription '{}' contains an empty or duplicate publication name",
+                        name
+                    ));
+                }
             }
         }
 
@@ -585,6 +934,19 @@ impl DbCache {
 
         for (id, sequence) in &self.sequences {
             if let Some((table_id, column_name)) = &sequence.owned_by {
+                validate_id("sequence ownership table identity", table_id, true)?;
+                if id.schema != table_id.schema {
+                    return Err(format!(
+                        "sequence '{}' must be in the same schema as owning table '{}'",
+                        id, table_id
+                    ));
+                }
+                if column_name.is_empty() {
+                    return Err(format!(
+                        "sequence '{}' ownership has an empty column identity",
+                        id
+                    ));
+                }
                 let Some(relation) = self.relations.get(table_id) else {
                     let omitted_owner_schema =
                         self.metadata.schemas.as_ref().is_some_and(|schemas| {
@@ -616,6 +978,13 @@ impl DbCache {
         for (id, role) in &self.roles {
             let mut memberships = HashSet::new();
             for target in role.member_of.iter().chain(&role.can_set_role_to) {
+                validate_id("role membership target", target, false)?;
+                if !target.schema.is_empty() {
+                    return Err(format!(
+                        "role '{}' membership target '{}' must use the cluster role namespace",
+                        id.name, target
+                    ));
+                }
                 if !self.roles.contains_key(target) {
                     return Err(format!(
                         "role '{}' membership references missing role '{}'",
@@ -653,6 +1022,13 @@ impl DbCache {
 
         let mut constraint_ids = HashSet::new();
         for constraint in &self.constraints {
+            validate_id("constraint table identity", &constraint.table_id, true)?;
+            if constraint.name.is_empty() {
+                return Err(format!(
+                    "constraint on '{}' has an empty constraint name",
+                    constraint.table_id
+                ));
+            }
             let Some(relation) = self.relations.get(&constraint.table_id) else {
                 return Err(format!(
                     "constraint '{}.{}' references a missing relation",
@@ -671,10 +1047,53 @@ impl DbCache {
                     constraint.table_id, constraint.name
                 ));
             }
+            if let Some(backing_index) = &constraint.backing_index {
+                if !matches!(
+                    constraint.kind,
+                    ConstraintKind::PrimaryKey | ConstraintKind::Unique | ConstraintKind::Exclusion
+                ) {
+                    return Err(format!(
+                        "constraint '{}.{}' has a backing index but is not a key or exclusion constraint",
+                        constraint.table_id, constraint.name
+                    ));
+                }
+                validate_id("constraint backing index identity", backing_index, true)?;
+                let Some(index) = self.indexes.iter().find(|index| {
+                    index.index_id == *backing_index && index.table_id == constraint.table_id
+                }) else {
+                    return Err(format!(
+                        "constraint '{}.{}' references missing or unrelated backing index '{}'",
+                        constraint.table_id, constraint.name, backing_index
+                    ));
+                };
+                if !index.is_valid || !index.is_ready || !index.is_live {
+                    return Err(format!(
+                        "constraint '{}.{}' references an unusable backing index '{}'",
+                        constraint.table_id, constraint.name, backing_index
+                    ));
+                }
+                if matches!(
+                    constraint.kind,
+                    ConstraintKind::PrimaryKey | ConstraintKind::Unique
+                ) && !index.is_unique
+                {
+                    return Err(format!(
+                        "constraint '{}.{}' references non-unique backing index '{}'",
+                        constraint.table_id, constraint.name, backing_index
+                    ));
+                }
+            }
         }
 
         let mut constraint_key_ids = HashSet::new();
         for key in &self.constraint_keys {
+            validate_id("constraint key table identity", &key.table_id, true)?;
+            if key.constraint_name.is_empty() {
+                return Err(format!(
+                    "constraint key on '{}' has an empty constraint name",
+                    key.table_id
+                ));
+            }
             let Some(relation) = self.relations.get(&key.table_id) else {
                 return Err(format!(
                     "constraint key '{}.{}' references a missing relation",
@@ -737,6 +1156,28 @@ impl DbCache {
 
         let mut index_ids = HashSet::new();
         for index in &self.indexes {
+            validate_id("index identity", &index.index_id, true)?;
+            validate_id("index table identity", &index.table_id, true)?;
+            if index.index_id.schema != index.table_id.schema {
+                return Err(format!(
+                    "index '{}' must be in the same schema as indexed relation '{}'",
+                    index.index_id, index.table_id
+                ));
+            }
+            if self.relations.contains_key(&index.index_id)
+                || self.sequences.contains_key(&index.index_id)
+            {
+                return Err(format!(
+                    "index '{}' collides with another relation-namespace object",
+                    index.index_id
+                ));
+            }
+            if index.using_method.is_empty() {
+                return Err(format!(
+                    "index '{}' has an empty access method",
+                    index.index_id
+                ));
+            }
             let Some(relation) = self.relations.get(&index.table_id) else {
                 return Err(format!(
                     "index '{}' references missing relation '{}'",
@@ -784,6 +1225,15 @@ impl DbCache {
 
         let mut trigger_ids = HashSet::new();
         for trigger in &self.triggers {
+            validate_id("trigger identity", &trigger.trigger_id, true)?;
+            validate_id("trigger table identity", &trigger.table_id, true)?;
+            validate_id("trigger function identity", &trigger.function_id, true)?;
+            if trigger.trigger_id.schema != trigger.table_id.schema {
+                return Err(format!(
+                    "trigger '{}' must be in the same schema as trigger table '{}'",
+                    trigger.trigger_id, trigger.table_id
+                ));
+            }
             let Some(relation) = self.relations.get(&trigger.table_id) else {
                 return Err(format!(
                     "trigger '{}' references missing relation '{}'",
@@ -806,6 +1256,14 @@ impl DbCache {
 
         let mut foreign_key_ids = HashSet::new();
         for foreign_key in &self.foreign_keys {
+            validate_id("foreign-key source identity", &foreign_key.from_table, true)?;
+            validate_id("foreign-key target identity", &foreign_key.to_table, true)?;
+            if foreign_key.constraint_name.is_empty() {
+                return Err(format!(
+                    "foreign key on '{}' has an empty constraint name",
+                    foreign_key.from_table
+                ));
+            }
             let Some(from_relation) = self.relations.get(&foreign_key.from_table) else {
                 return Err(format!(
                     "foreign key '{}.{}' references a missing relation",
@@ -926,6 +1384,8 @@ impl DbCache {
 
         let mut inheritance_pairs = HashSet::new();
         for inheritance in &self.inheritances {
+            validate_id("inheritance child identity", &inheritance.child, true)?;
+            validate_id("inheritance parent identity", &inheritance.parent, true)?;
             if inheritance.child == inheritance.parent || inheritance.sequence < 1 {
                 return Err(format!(
                     "inheritance '{} -> {}' has invalid direct relationship metadata",
@@ -973,6 +1433,17 @@ impl DbCache {
 
         let mut constraint_dependency_ids = HashSet::new();
         for dependency in &self.constraint_dependencies {
+            validate_id(
+                "constraint dependency table identity",
+                &dependency.table_id,
+                true,
+            )?;
+            if dependency.constraint_name.is_empty() {
+                return Err(format!(
+                    "constraint dependency on '{}' has an empty constraint name",
+                    dependency.table_id
+                ));
+            }
             if !constraint_dependency_ids.insert((
                 dependency.table_id.clone(),
                 dependency.constraint_name.clone(),
@@ -1017,6 +1488,17 @@ impl DbCache {
 
         let mut generated_dependency_ids = HashSet::new();
         for dependency in &self.generated_column_dependencies {
+            validate_id(
+                "generated dependency table identity",
+                &dependency.table_id,
+                true,
+            )?;
+            if dependency.column_name.is_empty() || dependency.depends_on_column.is_empty() {
+                return Err(format!(
+                    "generated dependency on '{}' has an empty column identity",
+                    dependency.table_id
+                ));
+            }
             if !generated_dependency_ids.insert((
                 dependency.table_id.clone(),
                 dependency.column_name.clone(),
@@ -1058,6 +1540,22 @@ impl DbCache {
 
         let mut default_sequence_dependency_ids = HashSet::new();
         for dependency in &self.default_sequence_dependencies {
+            validate_id(
+                "default dependency table identity",
+                &dependency.table_id,
+                true,
+            )?;
+            validate_id(
+                "default dependency sequence identity",
+                &dependency.sequence_id,
+                true,
+            )?;
+            if dependency.column_name.is_empty() {
+                return Err(format!(
+                    "default sequence dependency on '{}' has an empty column identity",
+                    dependency.table_id
+                ));
+            }
             if !default_sequence_dependency_ids.insert((
                 dependency.table_id.clone(),
                 dependency.column_name.clone(),
@@ -1092,7 +1590,20 @@ impl DbCache {
             }
         }
 
+        let mut view_dependency_ids = HashSet::new();
         for dependency in &self.dependencies {
+            validate_id("view dependent identity", &dependency.dependent, true)?;
+            validate_id("view referenced identity", &dependency.referenced, true)?;
+            if !view_dependency_ids.insert((
+                dependency.dependent.clone(),
+                dependency.referenced.clone(),
+                dependency.referenced_column.clone(),
+            )) {
+                return Err(format!(
+                    "view dependency '{} -> {}' appears more than once",
+                    dependency.dependent, dependency.referenced
+                ));
+            }
             let omitted_schema = |schema: Option<&str>| {
                 self.metadata
                     .schemas
@@ -1118,6 +1629,14 @@ impl DbCache {
             {
                 return Err(format!(
                     "view dependency '{} -> {}' has a non-view dependent",
+                    dependency.dependent, dependency.referenced
+                ));
+            }
+            if let Some(column) = &dependency.referenced_column
+                && column.is_empty()
+            {
+                return Err(format!(
+                    "view dependency '{} -> {}' has an empty referenced column identity",
                     dependency.dependent, dependency.referenced
                 ));
             }
@@ -1216,6 +1735,20 @@ mod tests {
     }
 
     #[test]
+    fn current_cache_rejects_external_boundary_identity_outside_scope() {
+        let mut cache = DbCache::new();
+        let schemas = vec!["public".to_string()];
+        cache.coverage = CatalogCoverage::from_sync_scope(Some(&schemas));
+        cache.metadata.schemas = Some(schemas);
+        cache
+            .scoped_external_relation_dependencies
+            .push(ObjectId::new("omitted", "table"));
+
+        let error = cache.validate_semantics().unwrap_err();
+        assert!(error.contains("outside the cache schema scope"), "{error}");
+    }
+
+    #[test]
     fn current_cache_rejects_mismatched_embedded_identity() {
         let mut cache = DbCache::new();
         cache.schemas.insert(
@@ -1256,6 +1789,7 @@ mod tests {
             name: "child_parent_id_fkey".to_string(),
             kind: crate::model::constraint::ConstraintKind::ForeignKey,
             validated: true,
+            backing_index: None,
         });
         cache.foreign_keys.push(ForeignKeyCache {
             constraint_name: "child_parent_id_fkey".to_string(),
@@ -1284,6 +1818,7 @@ mod tests {
             name: "child_parent_fkey".to_string(),
             kind: ConstraintKind::ForeignKey,
             validated: true,
+            backing_index: None,
         });
         cache.foreign_keys.push(ForeignKeyCache {
             constraint_name: "child_parent_fkey".to_string(),
@@ -1312,6 +1847,7 @@ mod tests {
             name: "child_parent_fkey".into(),
             kind: ConstraintKind::ForeignKey,
             validated: true,
+            backing_index: None,
         });
         cache.foreign_keys.push(ForeignKeyCache {
             constraint_name: "child_parent_fkey".into(),
@@ -1338,6 +1874,7 @@ mod tests {
             name: "parent_pkey".to_string(),
             kind: ConstraintKind::PrimaryKey,
             validated: true,
+            backing_index: None,
         });
         cache.constraint_keys.push(ConstraintKeyCache {
             table_id: parent,
@@ -1347,6 +1884,53 @@ mod tests {
         });
 
         assert!(cache.validate_semantics().is_ok());
+    }
+
+    #[test]
+    fn current_cache_accepts_non_unique_exclusion_backing_index() {
+        let table_id = ObjectId::new("public", "ranges");
+        let index_id = ObjectId::new("public", "ranges_excl");
+        let mut cache = DbCache::new();
+        cache.insert_baseline(table_id.clone(), table(table_id.clone(), &["id"]));
+        cache.indexes.push(IndexCache {
+            index_id: index_id.clone(),
+            table_id: table_id.clone(),
+            using_method: "gist".to_string(),
+            key_columns: vec!["id".to_string()],
+            included_columns: Vec::new(),
+            dependency_columns: vec!["id".to_string()],
+            dependency_columns_known: true,
+            has_expression_keys: false,
+            has_predicate: false,
+            is_unique: false,
+            is_valid: true,
+            is_ready: true,
+            is_live: true,
+            has_default_sort_order: true,
+            has_default_opclasses: true,
+            has_default_collations: true,
+        });
+        cache.constraints.push(ConstraintState {
+            table_id,
+            name: "ranges_excl_constraint".to_string(),
+            kind: ConstraintKind::Exclusion,
+            validated: true,
+            backing_index: Some(index_id),
+        });
+
+        assert!(cache.validate_semantics().is_ok());
+    }
+
+    #[test]
+    fn current_cache_rejects_population_state_on_non_materialized_relation() {
+        let table_id = ObjectId::new("public", "events");
+        let mut relation = table(table_id.clone(), &[]);
+        relation.is_populated = Some(true);
+        let mut cache = DbCache::new();
+        cache.insert_baseline(table_id, relation);
+
+        let error = cache.validate_semantics().unwrap_err();
+        assert!(error.contains("materialized-view population state"));
     }
 
     #[test]
@@ -1360,9 +1944,9 @@ mod tests {
                 id: member.clone(),
                 can_login: true,
                 is_superuser: false,
+                inherits: true,
                 member_of: Vec::new(),
                 can_set_role_to: vec![parent.clone()],
-                granted_privileges: Vec::new(),
             },
         );
         cache.roles.insert(
@@ -1371,9 +1955,9 @@ mod tests {
                 id: parent,
                 can_login: false,
                 is_superuser: false,
+                inherits: true,
                 member_of: Vec::new(),
                 can_set_role_to: Vec::new(),
-                granted_privileges: Vec::new(),
             },
         );
 
@@ -1392,9 +1976,9 @@ mod tests {
                 id: first.clone(),
                 can_login: false,
                 is_superuser: false,
+                inherits: true,
                 member_of: vec![second.clone()],
                 can_set_role_to: vec![second.clone()],
-                granted_privileges: Vec::new(),
             },
         );
         cache.roles.insert(
@@ -1403,14 +1987,304 @@ mod tests {
                 id: second,
                 can_login: false,
                 is_superuser: false,
+                inherits: true,
                 member_of: vec![first.clone()],
                 can_set_role_to: vec![first],
-                granted_privileges: Vec::new(),
             },
         );
 
         let error = cache.validate_semantics().unwrap_err();
         assert!(error.contains("circular path"));
+    }
+
+    #[test]
+    fn current_cache_rejects_schema_qualified_role_identity() {
+        let role = ObjectId::new("public", "app_role");
+        let mut cache = DbCache::new();
+        cache.roles.insert(
+            role.clone(),
+            RoleState {
+                id: role,
+                can_login: false,
+                is_superuser: false,
+                inherits: true,
+                member_of: Vec::new(),
+                can_set_role_to: Vec::new(),
+            },
+        );
+
+        let error = cache.validate_semantics().unwrap_err();
+        assert!(error.contains("cluster role namespace"));
+    }
+
+    #[test]
+    fn current_cache_rejects_schema_qualified_role_membership_target() {
+        let member = ObjectId::new("", "member");
+        let parent = ObjectId::new("public", "parent");
+        let mut cache = DbCache::new();
+        cache.roles.insert(
+            member.clone(),
+            RoleState {
+                id: member,
+                can_login: false,
+                is_superuser: false,
+                inherits: true,
+                member_of: vec![parent.clone()],
+                can_set_role_to: vec![parent.clone()],
+            },
+        );
+        cache.roles.insert(
+            parent.clone(),
+            RoleState {
+                id: parent,
+                can_login: false,
+                is_superuser: false,
+                inherits: true,
+                member_of: Vec::new(),
+                can_set_role_to: Vec::new(),
+            },
+        );
+
+        let error = cache.validate_semantics().unwrap_err();
+        assert!(error.contains("cluster role namespace"));
+    }
+
+    #[test]
+    fn current_cache_rejects_ambiguous_relation_columns() {
+        let table_id = ObjectId::new("public", "entries");
+        let mut cache = DbCache::new();
+        cache.insert_baseline(table_id.clone(), table(table_id, &["id", "id"]));
+
+        let error = cache.validate_semantics().unwrap_err();
+        assert!(error.contains("duplicate column 'id'"));
+    }
+
+    #[test]
+    fn current_cache_rejects_empty_relation_column_identity() {
+        let table_id = ObjectId::new("public", "entries");
+        let mut cache = DbCache::new();
+        cache.insert_baseline(table_id.clone(), table(table_id, &[""]));
+
+        let error = cache.validate_semantics().unwrap_err();
+        assert!(error.contains("empty identity"));
+    }
+
+    #[test]
+    fn current_cache_rejects_noncanonical_object_identities() {
+        let mut quoted_whitespace = DbCache::new();
+        let id = ObjectId::new("public", " ");
+        quoted_whitespace
+            .relations
+            .insert(id.clone(), table(id, &[" "]));
+        assert!(quoted_whitespace.validate_semantics().is_ok());
+
+        let mut empty_name = DbCache::new();
+        let id = ObjectId::new("public", "");
+        empty_name.relations.insert(id.clone(), table(id, &[]));
+        let error = empty_name.validate_semantics().unwrap_err();
+        assert!(error.contains("empty object name"));
+
+        let mut inferred = DbCache::new();
+        let mut id = ObjectId::new("public", "items");
+        id.inferred_schema = true;
+        inferred.relations.insert(id.clone(), table(id, &[]));
+        let error = inferred.validate_semantics().unwrap_err();
+        assert!(error.contains("inferred schema identity"));
+    }
+
+    #[test]
+    fn current_cache_rejects_ambiguous_schema_scope_and_search_path() {
+        let mut duplicate_scope = DbCache::new();
+        duplicate_scope.metadata.schemas = Some(vec!["app".into(), "app".into()]);
+        let error = duplicate_scope.validate_semantics().unwrap_err();
+        assert!(error.contains("duplicate schema 'app'"));
+
+        let mut duplicate_path = DbCache::new();
+        duplicate_path.search_path = vec!["public".into(), "public".into()];
+        let error = duplicate_path.validate_semantics().unwrap_err();
+        assert!(error.contains("search path contains duplicate schema 'public'"));
+    }
+
+    #[test]
+    fn current_cache_accepts_explicit_scope_in_caller_order() {
+        let scope = vec!["public".to_string(), "app".to_string()];
+        let mut cache = DbCache::new();
+        cache.metadata.schemas = Some(scope.clone());
+        cache.coverage = CatalogCoverage::from_sync_scope(Some(&scope));
+        assert!(cache.validate_semantics().is_ok());
+    }
+
+    #[test]
+    fn current_cache_rejects_owner_absent_from_role_catalog() {
+        let table_id = ObjectId::new("public", "items");
+        let mut cache = DbCache::new();
+        cache.insert_baseline(table_id.clone(), table(table_id, &[]));
+        let role_id = ObjectId::new("", "known_owner");
+        cache.roles.insert(
+            role_id.clone(),
+            RoleState {
+                id: role_id,
+                can_login: false,
+                is_superuser: false,
+                inherits: true,
+                member_of: Vec::new(),
+                can_set_role_to: Vec::new(),
+            },
+        );
+        let error = cache.validate_semantics().unwrap_err();
+        assert!(error.contains("relation owner identity 'postgres'"));
+    }
+
+    #[test]
+    fn current_cache_rejects_empty_provenance_identities() {
+        let mut cache = DbCache::new();
+        cache.metadata.source_role = Some(String::new());
+        let error = cache.validate_semantics().unwrap_err();
+        assert!(error.contains("empty source role identity"));
+
+        let mut cache = DbCache::new();
+        cache.metadata.source_search_path = Some(vec![String::new()]);
+        let error = cache.validate_semantics().unwrap_err();
+        assert!(error.contains("source search path contains an empty"));
+    }
+
+    #[test]
+    fn current_cache_rejects_malformed_publication_scope_metadata() {
+        let table = crate::analysis::facts::PublicationObjectFact::Table {
+            name: crate::ast::identifiers::QualifiedName::new(
+                Some(crate::ast::identifiers::Ident::new("public", false)),
+                crate::ast::identifiers::Ident::new("items", false),
+            ),
+            only: false,
+            include_partitions: false,
+            columns: Some(vec!["id".into(), "id".into()]),
+            row_filter: None,
+        };
+        let mut cache = DbCache::new();
+        cache.publications.insert(
+            "pub_items".into(),
+            PublicationState {
+                name: "pub_items".into(),
+                owner: None,
+                scope: crate::analysis::facts::PublicationScope::Explicit(vec![
+                    table.clone(),
+                    table,
+                ]),
+                params: Vec::new(),
+                generation: 0,
+            },
+        );
+
+        let error = DbCacheVersioned::V8(Box::new(cache))
+            .into_cache()
+            .unwrap_err();
+        assert!(error.contains("empty or duplicate table column"));
+    }
+
+    #[test]
+    fn current_cache_rejects_subscription_owner_outside_role_catalog() {
+        let mut cache = DbCache::new();
+        cache.roles.insert(
+            ObjectId::new("", "present_owner"),
+            RoleState {
+                id: ObjectId::new("", "present_owner"),
+                can_login: false,
+                is_superuser: false,
+                inherits: true,
+                member_of: Vec::new(),
+                can_set_role_to: Vec::new(),
+            },
+        );
+        cache.subscriptions.insert(
+            "sub".into(),
+            SubscriptionState {
+                name: "sub".into(),
+                owner: Some("missing_owner".into()),
+                connection: crate::analysis::facts::ConnectionTarget::Redacted,
+                publications: vec!["pub".into()],
+                params: None,
+                enabled: true,
+                slot_name: None,
+                generation: 0,
+            },
+        );
+
+        let error = DbCacheVersioned::V8(Box::new(cache))
+            .into_cache()
+            .unwrap_err();
+        assert!(error.contains("owner 'missing_owner' is absent"));
+    }
+
+    #[test]
+    fn current_cache_rejects_duplicate_view_dependencies() {
+        let view = ObjectId::new("public", "active_entries");
+        let table_id = ObjectId::new("public", "entries");
+        let mut cache = DbCache::new();
+        let mut view_state = table(view.clone(), &["id"]);
+        view_state.kind = RelationKind::View;
+        cache.insert_baseline(view.clone(), view_state);
+        cache.insert_baseline(table_id.clone(), table(table_id.clone(), &["id"]));
+        let dependency = ViewDependencyCache {
+            dependent: view,
+            referenced: table_id,
+            referenced_column: Some("id".into()),
+        };
+        cache.dependencies = vec![dependency.clone(), dependency];
+
+        let error = cache.validate_semantics().unwrap_err();
+        assert!(error.contains("appears more than once"));
+    }
+
+    #[test]
+    fn current_cache_rejects_empty_view_dependency_column() {
+        let view = ObjectId::new("public", "active_entries");
+        let table_id = ObjectId::new("public", "entries");
+        let mut cache = DbCache::new();
+        let mut view_state = table(view.clone(), &["id"]);
+        view_state.kind = RelationKind::View;
+        cache.insert_baseline(view.clone(), view_state);
+        cache.insert_baseline(table_id.clone(), table(table_id.clone(), &["id"]));
+        cache.dependencies.push(ViewDependencyCache {
+            dependent: view,
+            referenced: table_id,
+            referenced_column: Some(String::new()),
+        });
+
+        let error = cache.validate_semantics().unwrap_err();
+        assert!(error.contains("empty referenced column identity"));
+    }
+
+    #[test]
+    fn current_cache_rejects_privilege_for_missing_role() {
+        let table_id = ObjectId::new("public", "entries");
+        let mut cache = DbCache::new();
+        let mut relation = table(table_id.clone(), &["id"]);
+        relation.privileges.grants.insert(
+            ObjectId::new("", "missing_role"),
+            [crate::model::relation::Privilege::Select]
+                .into_iter()
+                .collect(),
+        );
+        cache.insert_baseline(table_id, relation);
+
+        let error = cache.validate_semantics().unwrap_err();
+        assert!(error.contains("missing grantee role"));
+    }
+
+    #[test]
+    fn current_cache_allows_public_privilege_grantee() {
+        let table_id = ObjectId::new("public", "entries");
+        let mut cache = DbCache::new();
+        let mut relation = table(table_id.clone(), &["id"]);
+        relation.privileges.grants.insert(
+            ObjectId::new("", "public"),
+            [crate::model::relation::Privilege::Select]
+                .into_iter()
+                .collect(),
+        );
+        cache.insert_baseline(table_id, relation);
+
+        assert!(cache.validate_semantics().is_ok());
     }
 
     #[test]
@@ -1426,6 +2300,7 @@ mod tests {
             name: "entries_key".to_string(),
             kind: ConstraintKind::Unique,
             validated: true,
+            backing_index: None,
         });
         cache.constraint_keys.push(ConstraintKeyCache {
             table_id,
@@ -1530,6 +2405,7 @@ mod tests {
                 name: "entries_check".to_string(),
                 kind: crate::model::constraint::ConstraintKind::Check,
                 validated: true,
+                backing_index: None,
             });
         cache
             .constraint_dependencies
@@ -1631,6 +2507,110 @@ mod tests {
     }
 
     #[test]
+    fn current_cache_rejects_index_in_a_different_schema_than_relation() {
+        let table_id = ObjectId::new("public", "items");
+        let mut cache = DbCache::new();
+        cache.insert_baseline(table_id.clone(), table(table_id.clone(), &["id"]));
+        cache.indexes.push(IndexCache {
+            index_id: ObjectId::new("other", "items_idx"),
+            table_id,
+            using_method: "btree".into(),
+            key_columns: vec!["id".into()],
+            included_columns: Vec::new(),
+            dependency_columns: vec!["id".into()],
+            dependency_columns_known: true,
+            has_expression_keys: false,
+            has_predicate: false,
+            is_unique: false,
+            is_valid: true,
+            is_ready: true,
+            is_live: true,
+            has_default_sort_order: true,
+            has_default_opclasses: true,
+            has_default_collations: true,
+        });
+
+        let error = DbCacheVersioned::V8(Box::new(cache))
+            .into_cache()
+            .unwrap_err();
+        assert!(error.contains("must be in the same schema as indexed relation"));
+    }
+
+    #[test]
+    fn current_cache_rejects_index_colliding_with_relation_namespace_object() {
+        let table_id = ObjectId::new("public", "items");
+        let index_id = ObjectId::new("public", "shared_name");
+        let mut cache = DbCache::new();
+        cache.insert_baseline(table_id.clone(), table(table_id, &["id"]));
+        cache.insert_baseline(index_id.clone(), table(index_id.clone(), &["id"]));
+        cache.indexes.push(IndexCache {
+            index_id,
+            table_id: ObjectId::new("public", "items"),
+            using_method: "btree".into(),
+            key_columns: vec!["id".into()],
+            included_columns: Vec::new(),
+            dependency_columns: vec!["id".into()],
+            dependency_columns_known: true,
+            has_expression_keys: false,
+            has_predicate: false,
+            is_unique: false,
+            is_valid: true,
+            is_ready: true,
+            is_live: true,
+            has_default_sort_order: true,
+            has_default_opclasses: true,
+            has_default_collations: true,
+        });
+
+        let error = DbCacheVersioned::V8(Box::new(cache))
+            .into_cache()
+            .unwrap_err();
+        assert!(error.contains("collides with another relation-namespace object"));
+    }
+
+    #[test]
+    fn current_cache_rejects_sequence_colliding_with_relation_namespace_object() {
+        let table_id = ObjectId::new("public", "items");
+        let shared_id = ObjectId::new("public", "shared_name");
+        let mut cache = DbCache::new();
+        cache.insert_baseline(table_id.clone(), table(table_id, &["id"]));
+        cache.insert_baseline(shared_id.clone(), table(shared_id.clone(), &["id"]));
+        cache.sequences.insert(
+            shared_id.clone(),
+            SequenceState {
+                id: shared_id,
+                owner: ObjectId::new("", "postgres"),
+                owned_by: None,
+                kind: crate::model::sequence::SequenceKind::Owned,
+                generation: 0,
+            },
+        );
+
+        let error = DbCacheVersioned::V8(Box::new(cache))
+            .into_cache()
+            .unwrap_err();
+        assert!(error.contains("collides with another relation-namespace object"));
+    }
+
+    #[test]
+    fn current_cache_rejects_trigger_in_a_different_schema_than_table() {
+        let table_id = ObjectId::new("public", "items");
+        let mut cache = DbCache::new();
+        cache.insert_baseline(table_id.clone(), table(table_id.clone(), &["id"]));
+        cache.triggers.push(TriggerCache {
+            trigger_id: ObjectId::new("other", "items_trigger"),
+            table_id,
+            function_id: ObjectId::new("public", "items_trigger_fn()"),
+            enabled_mode: TriggerEnableMode::Origin,
+        });
+
+        let error = DbCacheVersioned::V8(Box::new(cache))
+            .into_cache()
+            .unwrap_err();
+        assert!(error.contains("must be in the same schema as trigger table"));
+    }
+
+    #[test]
     fn current_cache_rejects_index_without_complete_dependency_evidence() {
         let table_id = ObjectId::new("public", "items");
         let mut cache = DbCache::new();
@@ -1727,6 +2707,26 @@ mod tests {
                 .contains("ownership references missing relation 'public.items'")
         );
 
+        let mut cross_schema_sequence_owner = DbCache::new();
+        let table_id = ObjectId::new("public", "items");
+        cross_schema_sequence_owner.insert_baseline(table_id.clone(), table(table_id, &["id"]));
+        cross_schema_sequence_owner.sequences.insert(
+            ObjectId::new("archive", "items_id_seq"),
+            SequenceState {
+                id: ObjectId::new("archive", "items_id_seq"),
+                owner: ObjectId::new("", "postgres"),
+                owned_by: Some((ObjectId::new("public", "items"), "id".to_string())),
+                kind: crate::model::sequence::SequenceKind::Owned,
+                generation: 0,
+            },
+        );
+        assert!(
+            cross_schema_sequence_owner
+                .validate_semantics()
+                .unwrap_err()
+                .contains("must be in the same schema as owning table")
+        );
+
         let mut missing_membership_role = DbCache::new();
         let role_id = ObjectId::new("", "member");
         missing_membership_role.roles.insert(
@@ -1735,9 +2735,9 @@ mod tests {
                 id: role_id,
                 can_login: true,
                 is_superuser: false,
+                inherits: true,
                 member_of: vec![ObjectId::new("", "missing")],
                 can_set_role_to: Vec::new(),
-                granted_privileges: Vec::new(),
             },
         );
         assert!(

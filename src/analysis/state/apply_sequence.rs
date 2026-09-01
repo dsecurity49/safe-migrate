@@ -196,7 +196,9 @@ impl AnalysisState {
         match self.local.sequences.get(id) {
             Some(SequenceOverlay::Present(_)) => SequenceLookup::Present,
             Some(SequenceOverlay::Dropped) => SequenceLookup::Tombstone,
-            None if self.baseline_available && self.baseline_covers_object(id) => {
+            None if self
+                .baseline_covers_family_object(id, crate::db::cache::CatalogFamily::Sequences) =>
+            {
                 SequenceLookup::AuthoritativelyAbsent
             }
             None => SequenceLookup::Unknown,
@@ -246,7 +248,11 @@ impl AnalysisState {
                         };
                     }
                 }
-                _ if self.baseline_covers_object(table_id) && self.baseline_available => {
+                _ if self.baseline_covers_family_object(
+                    table_id,
+                    crate::db::cache::CatalogFamily::Relations,
+                ) =>
+                {
                     return MutationResult::Conflict {
                         reason: format!("relation '{}' does not exist", table_id),
                     };
@@ -300,7 +306,10 @@ impl AnalysisState {
                 };
             }
             SequenceLookup::Tombstone
-                if self.baseline_available && self.baseline_covers_object(&alter.id) =>
+                if self.baseline_covers_family_object(
+                    &alter.id,
+                    crate::db::cache::CatalogFamily::Sequences,
+                ) =>
             {
                 return MutationResult::Conflict {
                     reason: format!("sequence '{}' does not exist", alter.id),
@@ -511,6 +520,20 @@ impl AnalysisState {
             .cloned()
             .collect();
         if present.is_empty() {
+            return MutationResult::Skipped;
+        }
+        if present.iter().any(|id| {
+            self.baseline_sequences.contains(id)
+                && (!self.baseline_has_coverage(crate::db::cache::CatalogFamily::Dependencies)
+                    || self.baseline_scoped_family_object(
+                        id,
+                        crate::db::cache::CatalogFamily::Sequences,
+                    ))
+        }) {
+            self.taint(
+                EvidenceCode::CatalogCoverageIncomplete,
+                EvidenceScope::Chain,
+            );
             return MutationResult::Skipped;
         }
         for id in &present {

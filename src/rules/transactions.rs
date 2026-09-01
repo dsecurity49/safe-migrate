@@ -12,7 +12,7 @@ impl Rule for ConcurrentInsideTransactionRule {
         ViolationTier::Tier1
     }
     fn recipe(&self) -> &'static str {
-        "PostgreSQL does not allow CREATE/DROP INDEX CONCURRENTLY inside a transaction block (BEGIN/COMMIT)."
+        "PostgreSQL does not allow concurrent index creation/drop or materialized-view refresh inside a transaction block (BEGIN/COMMIT)."
     }
 
     fn required_capabilities(&self) -> &'static [RuleCapability] {
@@ -22,7 +22,7 @@ impl Rule for ConcurrentInsideTransactionRule {
     fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
         let mut violations = Vec::new();
 
-        if !context.state().local.transactions.is_empty() {
+        if context.state().in_transaction() {
             match context.mutation() {
                 Mutation::CreateIndex(c) if c.concurrently => {
                     violations.push(Violation { source_range: None,
@@ -58,6 +58,24 @@ impl Rule for ConcurrentInsideTransactionRule {
                         });
                     }
                 }
+                Mutation::RefreshMaterializedView(refresh) if refresh.concurrently => {
+                    violations.push(Violation {
+                        source_range: None,
+                        rule_id: self.id(),
+                        operation_kind: OperationKind::RefreshMaterializedView,
+                        object_kind: ObjectKind::MaterializedView,
+                        object_name: refresh.id.to_string(),
+                        tier: self.default_tier(),
+                        reason: format!(
+                            "REFRESH MATERIALIZED VIEW CONCURRENTLY on {} inside a transaction block",
+                            refresh.id
+                        ),
+                        recipe: self.recipe(),
+                        dedup_key: Some(format!("{}_{}", self.id(), refresh.id)),
+                        sql: None,
+                        fk_dependency_related: false,
+                    });
+                }
                 _ => {}
             }
         }
@@ -84,7 +102,7 @@ impl Rule for AlterTypeAddValueRule {
     }
 
     fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
-        if !context.state().local.transactions.is_empty()
+        if context.state().in_transaction()
             && let Mutation::AlterType(alter) = context.mutation()
             && matches!(alter.action, AlterTypeActionMutation::AddValue { .. })
         {

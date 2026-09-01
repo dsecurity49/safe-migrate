@@ -2,7 +2,7 @@ use crate::ast::identifiers::ObjectId;
 use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum DependencyKind {
     ForeignKey {
         constraint_name: Option<String>,
@@ -73,20 +73,21 @@ pub enum DependencyKind {
     TriggerOnTable {
         trigger_id: ObjectId,
         function_id: ObjectId,
+        trigger_generation: u64,
     },
     PublicationIncludes {
         publication_name: String,
     },
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ForeignKeyOperatorEvidence {
     pub pk_fk: Vec<String>,
     pub pk_pk: Vec<String>,
     pub fk_fk: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DependencyEdge {
     pub dependent: ObjectId,
     pub referenced: ObjectId,
@@ -106,6 +107,7 @@ impl DependencyEdge {
 #[derive(Debug, Default)]
 pub struct DependencyGraph {
     edges: Vec<DependencyEdge>,
+    edge_set: HashSet<DependencyEdge>,
     indexes: OnceCell<GraphIndexes>,
 }
 
@@ -119,6 +121,7 @@ impl Clone for DependencyGraph {
     fn clone(&self) -> Self {
         Self {
             edges: self.edges.clone(),
+            edge_set: self.edges.iter().cloned().collect(),
             // Indexes are derived state. Avoid duplicating them in statement
             // checkpoints; the clone builds them only if a lookup needs them.
             indexes: OnceCell::new(),
@@ -138,13 +141,23 @@ impl DependencyGraph {
     }
 
     pub fn add_edge(&mut self, edge: DependencyEdge) {
+        // The dependency graph is a set of typed relationships. Replaying a
+        // hydration row or an idempotent mutation must not multiply cascade
+        // work or make traversal results depend on insertion history.
+        if !self.edge_set.insert(edge.clone()) {
+            return;
+        }
         self.edges.push(edge);
         self.invalidate_indexes();
     }
 
     pub(crate) fn retain_edges(&mut self, mut keep: impl FnMut(&DependencyEdge) -> bool) {
+        let previous_len = self.edges.len();
         self.edges.retain(|edge| keep(edge));
-        self.invalidate_indexes();
+        if self.edges.len() != previous_len {
+            self.rebuild_edge_set();
+            self.invalidate_indexes();
+        }
     }
 
     pub(crate) fn edge_count(&self) -> usize {
@@ -152,18 +165,38 @@ impl DependencyGraph {
     }
 
     pub(crate) fn truncate(&mut self, len: usize) {
+        if len >= self.edges.len() {
+            return;
+        }
         self.edges.truncate(len);
+        self.rebuild_edge_set();
         self.invalidate_indexes();
     }
 
     pub(crate) fn replace_edges(&mut self, edges: Vec<DependencyEdge>) {
         self.edges = edges;
+        self.deduplicate_edges();
         self.invalidate_indexes();
     }
 
-    pub(crate) fn mutate_edges(&mut self, mutate: impl FnOnce(&mut [DependencyEdge])) {
+    fn mutate_edges(&mut self, mutate: impl FnOnce(&mut [DependencyEdge])) {
         mutate(&mut self.edges);
+        self.deduplicate_edges();
         self.invalidate_indexes();
+    }
+
+    /// Restore set semantics after an operation that rewrites existing edge
+    /// identities. A rename or namespace remap can collapse two formerly
+    /// distinct edges into one exact typed relationship; keeping both would
+    /// make traversal and cascade results depend on mutation history.
+    fn deduplicate_edges(&mut self) {
+        let mut seen = HashSet::with_capacity(self.edges.len());
+        self.edges.retain(|edge| seen.insert(edge.clone()));
+        self.edge_set = seen;
+    }
+
+    fn rebuild_edge_set(&mut self) {
+        self.edge_set = self.edges.iter().cloned().collect();
     }
 
     /// Confirms that every derived lookup points at the canonical edge list.
@@ -398,6 +431,38 @@ impl DependencyGraph {
         false
     }
 
+    /// Remap every schema-qualified graph endpoint during `ALTER SCHEMA ...
+    /// RENAME`. Synthetic publication nodes remain cluster-scoped, while
+    /// trigger payload identities follow their table/function endpoints.
+    pub(crate) fn remap_schema_namespace(&mut self, old_schema: &str, new_schema: &str) {
+        let remap = |id: &mut ObjectId| {
+            if id.schema == old_schema {
+                id.schema = new_schema.to_string();
+            }
+        };
+        for edge in &mut self.edges {
+            match &mut edge.kind {
+                DependencyKind::PublicationIncludes { .. } => remap(&mut edge.dependent),
+                DependencyKind::TriggerOnTable {
+                    trigger_id,
+                    function_id,
+                    ..
+                } => {
+                    remap(&mut edge.dependent);
+                    remap(&mut edge.referenced);
+                    remap(trigger_id);
+                    remap(function_id);
+                }
+                _ => {
+                    remap(&mut edge.dependent);
+                    remap(&mut edge.referenced);
+                }
+            }
+        }
+        self.deduplicate_edges();
+        self.invalidate_indexes();
+    }
+
     /// Propagate a relation rename through relation-to-relation edges.
     ///
     /// Dependency endpoints are intentionally updated by edge kind rather than
@@ -445,6 +510,7 @@ impl DependencyGraph {
                 }
             }
         }
+        self.deduplicate_edges();
         self.invalidate_indexes();
     }
 
@@ -458,18 +524,26 @@ impl DependencyGraph {
                 edge.dependent = new_id.clone();
             }
         }
+        self.deduplicate_edges();
         self.invalidate_indexes();
     }
 
-    /// Propagate a sequence rename only through sequence ownership edges.
+    /// Propagate a sequence rename through every typed sequence endpoint.
+    /// Ownership uses the sequence as a dependent; a column default uses it
+    /// as a referenced object. Both must follow the canonical identity.
     pub fn propagate_sequence_rename(&mut self, old_id: &ObjectId, new_id: &ObjectId) {
         for edge in &mut self.edges {
-            if matches!(edge.kind, DependencyKind::SequenceOwnedBy { .. })
-                && edge.dependent == *old_id
-            {
-                edge.dependent = new_id.clone();
+            match &edge.kind {
+                DependencyKind::SequenceOwnedBy { .. } if edge.dependent == *old_id => {
+                    edge.dependent = new_id.clone();
+                }
+                DependencyKind::ColumnDefaultOnSequence { .. } if edge.referenced == *old_id => {
+                    edge.referenced = new_id.clone();
+                }
+                _ => {}
             }
         }
+        self.deduplicate_edges();
         self.invalidate_indexes();
     }
 
@@ -485,6 +559,7 @@ impl DependencyGraph {
                 }
             }
         }
+        self.deduplicate_edges();
         self.invalidate_indexes();
     }
 
@@ -497,7 +572,164 @@ impl DependencyGraph {
                 *function_id = new_id.clone();
             }
         }
+        self.deduplicate_edges();
         self.invalidate_indexes();
+    }
+
+    /// Rename a foreign-key constraint payload owned by a relation.
+    pub fn rename_foreign_key_constraint(
+        &mut self,
+        table_id: &ObjectId,
+        old_name: &str,
+        new_name: &str,
+    ) {
+        self.mutate_edges(|edges| {
+            for edge in edges {
+                if edge.dependent == *table_id
+                    && let DependencyKind::ForeignKey {
+                        constraint_name: Some(name),
+                        ..
+                    } = &mut edge.kind
+                    && name == old_name
+                {
+                    *name = new_name.to_string();
+                }
+            }
+        });
+    }
+
+    /// Rename a table column in all typed dependency payloads that can carry
+    /// column identity. The endpoint direction determines whether the column
+    /// is source-side or referenced-side for foreign keys.
+    pub fn rename_column_dependencies(
+        &mut self,
+        table_id: &ObjectId,
+        old_name: &str,
+        new_name: &str,
+    ) {
+        self.mutate_edges(|edges| {
+            for edge in edges {
+                match &mut edge.kind {
+                    DependencyKind::ForeignKey {
+                        from_columns,
+                        to_columns,
+                        ..
+                    } => {
+                        if edge.dependent == *table_id {
+                            for column in from_columns {
+                                if column == old_name {
+                                    *column = new_name.to_string();
+                                }
+                            }
+                        }
+                        if edge.referenced == *table_id {
+                            for column in to_columns {
+                                if column == old_name {
+                                    *column = new_name.to_string();
+                                }
+                            }
+                        }
+                    }
+                    DependencyKind::ConstraintOnRelation { columns, .. }
+                        if edge.dependent == *table_id =>
+                    {
+                        for column in columns {
+                            if column == old_name {
+                                *column = new_name.to_string();
+                            }
+                        }
+                    }
+                    DependencyKind::ConstraintDependency { columns, .. }
+                        if edge.dependent == *table_id =>
+                    {
+                        for column in columns {
+                            if column == old_name {
+                                *column = new_name.to_string();
+                            }
+                        }
+                    }
+                    DependencyKind::ColumnGeneratedFrom {
+                        column,
+                        depends_on_column,
+                    } => {
+                        if edge.dependent == *table_id && column == old_name {
+                            *column = new_name.to_string();
+                        }
+                        if edge.referenced == *table_id && depends_on_column == old_name {
+                            *depends_on_column = new_name.to_string();
+                        }
+                    }
+                    DependencyKind::ColumnDefaultOnSequence { column }
+                        if edge.dependent == *table_id && column == old_name =>
+                    {
+                        *column = new_name.to_string();
+                    }
+                    _ => {}
+                }
+            }
+        });
+    }
+
+    /// Rename a column in an index definition attached to a relation.
+    pub fn rename_index_column(&mut self, table_id: &ObjectId, old_name: &str, new_name: &str) {
+        self.mutate_edges(|edges| {
+            for edge in edges {
+                if edge.referenced != *table_id {
+                    continue;
+                }
+                let DependencyKind::IndexOnRelation {
+                    key_columns,
+                    included_columns,
+                    dependency_columns,
+                    ..
+                } = &mut edge.kind
+                else {
+                    continue;
+                };
+                for column in key_columns
+                    .iter_mut()
+                    .chain(included_columns)
+                    .chain(dependency_columns)
+                {
+                    if column == old_name {
+                        *column = new_name.to_string();
+                    }
+                }
+            }
+        });
+    }
+
+    /// Rename the owned column recorded on a sequence edge.
+    pub fn rename_owned_sequence_column(
+        &mut self,
+        sequence_id: &ObjectId,
+        old_name: &str,
+        new_name: &str,
+    ) {
+        self.mutate_edges(|edges| {
+            for edge in edges {
+                if edge.dependent == *sequence_id
+                    && let DependencyKind::SequenceOwnedBy { column } = &mut edge.kind
+                    && column == old_name
+                {
+                    *column = new_name.to_string();
+                }
+            }
+        });
+    }
+
+    /// Rename a publication node and its membership payloads.
+    pub fn rename_publication(&mut self, old_name: &str, new_name: &str) {
+        self.mutate_edges(|edges| {
+            for edge in edges {
+                if let DependencyKind::PublicationIncludes { publication_name } = &mut edge.kind
+                    && publication_name == old_name
+                {
+                    *publication_name = new_name.to_string();
+                    edge.referenced = ObjectId::new("public", new_name);
+                }
+            }
+        });
     }
 
     /// Backwards-compatible relation rename entry point.
@@ -552,6 +784,84 @@ mod tests {
                 referenced_column: None,
             },
         )
+    }
+
+    #[test]
+    fn identical_dependency_edges_are_deduplicated() {
+        let mut graph = DependencyGraph::new();
+        let edge = view_edge("view", "table");
+        graph.add_edge(edge.clone());
+        graph.add_edge(edge);
+
+        assert_eq!(graph.edge_count(), 1);
+        assert_eq!(graph.cascade_edges(&id("table")).len(), 1);
+    }
+
+    #[test]
+    fn no_op_edge_mutations_preserve_derived_indexes() {
+        let mut graph = DependencyGraph::new();
+        graph.add_edge(view_edge("view", "table"));
+        let _ = graph.cascade_edges(&id("table"));
+
+        graph.retain_edges(|_| true);
+        graph.truncate(graph.edge_count() + 1);
+
+        assert!(graph.indexes_are_valid());
+        assert_eq!(graph.cascade_edges(&id("table")).len(), 1);
+    }
+
+    #[test]
+    fn identity_remaps_collapse_duplicate_edges() {
+        let mut graph = DependencyGraph::new();
+        graph.add_edge(view_edge("view_a", "table"));
+        graph.add_edge(view_edge("view_b", "table"));
+
+        graph.propagate_relation_rename(&id("view_b"), &id("view_a"));
+
+        assert_eq!(graph.edge_count(), 1);
+        assert!(graph.indexes_are_valid());
+    }
+
+    #[test]
+    fn column_rename_updates_both_sides_of_self_referencing_fk() {
+        let table = id("self_ref");
+        let mut graph = DependencyGraph::new();
+        graph.add_edge(DependencyEdge::new(
+            table.clone(),
+            table.clone(),
+            DependencyKind::ForeignKey {
+                constraint_name: Some("self_fk".into()),
+                from_columns: vec!["old_id".into()],
+                to_columns: vec!["old_id".into()],
+                operator_evidence: None,
+                from_generation: 0,
+            },
+        ));
+        graph.add_edge(DependencyEdge::new(
+            table.clone(),
+            table.clone(),
+            DependencyKind::ConstraintDependency {
+                constraint_name: "check_self".into(),
+                columns: vec!["old_id".into()],
+            },
+        ));
+
+        graph.rename_column_dependencies(&table, "old_id", "new_id");
+
+        let DependencyKind::ForeignKey {
+            from_columns,
+            to_columns,
+            ..
+        } = &graph.edges()[0].kind
+        else {
+            panic!("expected foreign-key edge");
+        };
+        assert_eq!(from_columns, &["new_id"]);
+        assert_eq!(to_columns, &["new_id"]);
+        let DependencyKind::ConstraintDependency { columns, .. } = &graph.edges()[1].kind else {
+            panic!("expected constraint dependency edge");
+        };
+        assert_eq!(columns, &["new_id"]);
     }
 
     fn relation_edge(dependent: &str, referenced: &str, kind: DependencyKind) -> DependencyEdge {
@@ -661,6 +971,7 @@ mod tests {
             DependencyKind::TriggerOnTable {
                 trigger_id: id("events_notify_trigger"),
                 function_id: trigger_function.clone(),
+                trigger_generation: 0,
             },
         ));
 

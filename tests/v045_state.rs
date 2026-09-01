@@ -4,7 +4,7 @@ use common::{object_id, setup_engine};
 use safe_migrate::AnalysisState;
 use safe_migrate::analysis::facts::{PublicationObjectFact, PublicationScope};
 use safe_migrate::analysis::graph::DependencyKind;
-use safe_migrate::db::cache::DbCache;
+use safe_migrate::db::cache::{DbCache, IndexCache};
 use safe_migrate::model::relation::{Persistence, RelationKind, RelationState};
 use safe_migrate::model::role::RoleState;
 use safe_migrate::model::schema::{SchemaOverlay, SchemaState};
@@ -22,9 +22,9 @@ fn cache_with_public_schema() -> DbCache {
             id: owner.clone(),
             can_login: true,
             is_superuser: true,
+            inherits: true,
             member_of: Vec::new(),
             can_set_role_to: Vec::new(),
-            granted_privileges: Vec::new(),
         },
     );
     cache.schemas.insert(
@@ -298,6 +298,36 @@ fn table_set_schema_moves_the_relation_and_preserves_baseline_origin() {
             0,
         ),
     );
+    let sequence_id = object_id("public", "accounts_id_seq");
+    cache.sequences.insert(
+        sequence_id.clone(),
+        SequenceState {
+            id: sequence_id.clone(),
+            owner: object_id("", "owner"),
+            owned_by: Some((old_id.clone(), "id".into())),
+            kind: SequenceKind::SerialLike,
+            generation: 0,
+        },
+    );
+    let index_id = object_id("public", "accounts_id_idx");
+    cache.indexes.push(IndexCache {
+        index_id: index_id.clone(),
+        table_id: old_id.clone(),
+        using_method: "btree".into(),
+        key_columns: vec!["id".into()],
+        included_columns: Vec::new(),
+        dependency_columns: vec!["id".into()],
+        dependency_columns_known: true,
+        has_expression_keys: false,
+        has_predicate: false,
+        is_unique: false,
+        is_valid: true,
+        is_ready: true,
+        is_live: true,
+        has_default_sort_order: true,
+        has_default_opclasses: true,
+        has_default_collations: true,
+    });
     let mut state = AnalysisState::new(cache);
 
     engine
@@ -309,6 +339,33 @@ fn table_set_schema_moves_the_relation_and_preserves_baseline_origin() {
     assert!(!state.relation_is_present(&old_id));
     assert!(state.baseline_relations.contains(&new_id));
     assert!(!state.baseline_relations.contains(&old_id));
+
+    let new_sequence_id = object_id("app", "accounts_id_seq");
+    assert!(matches!(
+        state.local.sequences.get(&new_sequence_id),
+        Some(SequenceOverlay::Present(sequence))
+            if sequence.id == new_sequence_id
+                && sequence.owned_by == Some((new_id.clone(), "id".into()))
+    ));
+    assert!(!state.local.sequences.contains_key(&sequence_id));
+    assert!(state.baseline_sequences.contains(&new_sequence_id));
+    assert!(!state.baseline_sequences.contains(&sequence_id));
+
+    let new_index_id = object_id("app", "accounts_id_idx");
+    assert!(!state.local.graph.edges().iter().any(|edge| {
+        edge.dependent == index_id && matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
+    }));
+    assert!(state.local.graph.edges().iter().any(|edge| {
+        edge.dependent == new_index_id
+            && matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
+    }));
+    assert!(state.baseline_indexes.contains(&new_index_id));
+    assert!(!state.baseline_indexes.contains(&index_id));
+    assert!(state.local.graph.edges().iter().any(|edge| {
+        edge.dependent == new_index_id
+            && edge.referenced == new_id
+            && matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
+    }));
 }
 
 #[test]

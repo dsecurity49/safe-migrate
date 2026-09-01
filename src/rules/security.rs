@@ -89,11 +89,7 @@ impl Rule for OverbroadGrantRule {
                             // PostgreSQL roles are global, so owner comparison
                             // uses the role name.
                             tables.iter().all(|table_id| {
-                                matches!(
-                                    context.state().local.relations.get(table_id),
-                                    Some(crate::model::relation::RelationOverlay::Present(relation))
-                                        if relation.owner.name == *name
-                                )
+                                context.state().relation_is_owned_by(table_id, name)
                             })
                         })
                     }

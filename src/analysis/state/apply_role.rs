@@ -34,11 +34,6 @@ impl AnalysisState {
             RoleLookup::Tombstone | RoleLookup::AuthoritativelyAbsent => {}
             RoleLookup::WrongKind => unreachable!("roles have a dedicated namespace"),
         }
-        if !role.inherits {
-            // RoleState intentionally does not carry the PostgreSQL INHERIT
-            // bit yet; do not claim an exact state transition for NOINHERIT.
-            self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
-        }
         self.snapshot_role(&role_id);
         self.snapshot_generation_counter();
         self.local.generation_counter += 1;
@@ -48,9 +43,9 @@ impl AnalysisState {
                 id: role_id,
                 can_login: role.can_login,
                 is_superuser: false,
+                inherits: role.inherits,
                 member_of: Vec::new(),
                 can_set_role_to: Vec::new(),
-                granted_privileges: Vec::new(),
             }),
         );
         MutationResult::Applied
@@ -78,9 +73,10 @@ impl AnalysisState {
             }
             RoleLookup::WrongKind => unreachable!("roles have a dedicated namespace"),
         }
-        if role.inherits.is_some() {
-            self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
-            return MutationResult::Skipped;
+        if let Some(inherits) = role.inherits
+            && let Some(RoleOverlay::Present(current)) = self.local.roles.get_mut(&role_id)
+        {
+            current.inherits = inherits;
         }
         self.snapshot_generation_counter();
         self.local.generation_counter += 1;

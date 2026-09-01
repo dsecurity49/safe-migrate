@@ -24,7 +24,7 @@ impl Rule for DriftDetectionRule {
         // A missing cache is not proof that production lacks an object. Keep
         // the stateful analyzer useful offline without turning every ALTER or
         // DROP into a false blocking baseline-drift finding.
-        if !context.state().baseline_available {
+        if !context.state().baseline_is_available() {
             return Vec::new();
         }
 

@@ -726,6 +726,18 @@ mod architectural_gap_tests {
             .unwrap();
         let result = engine.analyze("ALTER TABLE t SET ACCESS METHOD heap;", &mut state);
         assert!(result.is_ok(), "SetAccessMethod should not crash");
+        assert!(state.evidence().iter().any(|record| {
+            record.code == safe_migrate::analysis::evidence::EvidenceCode::UnsupportedSemantics
+        }));
+
+        let result = engine.analyze(
+            "ALTER TABLE t ALTER COLUMN id SET STORAGE PLAIN;",
+            &mut state,
+        );
+        assert!(result.is_ok(), "SetStorage should not crash");
+        assert!(state.evidence().iter().any(|record| {
+            record.code == safe_migrate::analysis::evidence::EvidenceCode::UnsupportedSemantics
+        }));
     }
 
     #[test]

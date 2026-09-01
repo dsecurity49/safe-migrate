@@ -33,8 +33,8 @@ impl Rule for BlockingConstraintRule {
                 match context.pre_state().relations.get(&alter.id) {
                     Some(rel) => {
                         // Only cache-backed relations have meaningful statistics age.
-                        let stale = rel.is_stale()
-                            && context.state().baseline_relations.contains(&alter.id);
+                        let stale =
+                            rel.is_stale() && context.state().baseline_relation_is_known(&alter.id);
                         (
                             rel.persistence == Persistence::Temporary,
                             stale,
@@ -80,7 +80,7 @@ impl Rule for BlockingConstraintRule {
                     let parent_rows = match context.pre_state().relations.get(to_table) {
                         Some(parent_rel) => {
                             if parent_rel.is_stale()
-                                && context.state().baseline_relations.contains(to_table)
+                                && context.state().baseline_relation_is_known(to_table)
                             {
                                 is_stale = true;
                             }

@@ -34,7 +34,7 @@ impl Rule for MaterializedViewRefreshRule {
                 {
                     Some(rel) => {
                         let stale = rel.is_stale()
-                            && context.state().baseline_relations.contains(&refresh.id);
+                            && context.state().baseline_relation_is_known(&refresh.id);
                         (
                             rel.persistence == Persistence::Temporary,
                             stale,
@@ -98,30 +98,7 @@ impl Rule for MaterializedViewRefreshRule {
                 }
             } else {
                 // CONCURRENTLY refresh requires at least one unique index
-                let has_unique_index = context.state().local.graph.edges().iter().any(|e| {
-                    if let crate::analysis::graph::DependencyKind::IndexOnRelation {
-                        is_unique,
-                        has_expression_keys,
-                        has_predicate,
-                        is_valid,
-                        is_ready,
-                        is_live,
-                        eligibility_known,
-                        ..
-                    } = &e.kind
-                    {
-                        e.referenced == refresh.id
-                            && *eligibility_known
-                            && *is_unique
-                            && !*has_expression_keys
-                            && !*has_predicate
-                            && *is_valid
-                            && *is_ready
-                            && *is_live
-                    } else {
-                        false
-                    }
-                });
+                let has_unique_index = context.state().has_usable_unique_index(&refresh.id);
 
                 if !has_unique_index {
                     violations.push(Violation { source_range: None,

@@ -15,7 +15,9 @@ impl AnalysisState {
         match self.local.triggers.get(id) {
             Some(TriggerOverlay::Present(_)) => TriggerLookup::Present,
             Some(TriggerOverlay::Dropped) => TriggerLookup::Tombstone,
-            None if self.baseline_available && self.baseline_covers_object(id) => {
+            None if self
+                .baseline_covers_family_object(id, crate::db::cache::CatalogFamily::Triggers) =>
+            {
                 TriggerLookup::AuthoritativelyAbsent
             }
             None => TriggerLookup::Unknown,
@@ -176,6 +178,9 @@ impl AnalysisState {
                 ),
             };
         }
+        self.snapshot_generation_counter();
+        self.local.generation_counter += 1;
+        let generation = self.local.generation_counter;
         self.snapshot_trigger(&trigger_id);
         self.local.triggers.insert(
             trigger_id.clone(),
@@ -184,7 +189,7 @@ impl AnalysisState {
                 id: trigger_id.clone(),
                 table_id: create_trigger.table.clone(),
                 enabled_mode: TriggerEnableMode::Origin,
-                generation: self.local.generation_counter,
+                generation,
             }),
         );
         self.snapshot_relation(&create_trigger.table);
@@ -200,6 +205,7 @@ impl AnalysisState {
             DependencyKind::TriggerOnTable {
                 trigger_id: trigger_id.clone(),
                 function_id: create_trigger.function_id.clone(),
+                trigger_generation: generation,
             },
         ));
         MutationResult::Applied

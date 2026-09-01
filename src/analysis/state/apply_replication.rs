@@ -17,7 +17,7 @@ impl AnalysisState {
         match self.local.publications.get(name) {
             Some(PublicationOverlay::Present(_)) => PublicationLookup::Present,
             Some(PublicationOverlay::Dropped) => PublicationLookup::Tombstone,
-            None if self.baseline_available => PublicationLookup::AuthoritativelyAbsent,
+            None if self.baseline_is_available() => PublicationLookup::AuthoritativelyAbsent,
             None => PublicationLookup::Unknown,
         }
     }
@@ -26,7 +26,7 @@ impl AnalysisState {
         match self.local.subscriptions.get(name) {
             Some(SubscriptionOverlay::Present(_)) => SubscriptionLookup::Present,
             Some(SubscriptionOverlay::Dropped) => SubscriptionLookup::Tombstone,
-            None if self.baseline_available => SubscriptionLookup::AuthoritativelyAbsent,
+            None if self.baseline_is_available() => SubscriptionLookup::AuthoritativelyAbsent,
             None => SubscriptionLookup::Unknown,
         }
     }
@@ -301,16 +301,7 @@ impl AnalysisState {
                 crate::model::replication::PublicationOverlay::Present(publication),
             );
             self.snapshot_graph_full();
-            self.local.graph.mutate_edges(|edges| {
-                for edge in edges {
-                    if let DependencyKind::PublicationIncludes { publication_name } = &mut edge.kind
-                        && publication_name == &p.name
-                    {
-                        *publication_name = to.clone();
-                        edge.referenced = ObjectId::new("public", &to);
-                    }
-                }
-            });
+            self.local.graph.rename_publication(&p.name, &to);
         }
         MutationResult::Applied
     }

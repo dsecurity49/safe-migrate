@@ -73,7 +73,8 @@ impl AnalysisState {
 
     fn has_external_view_dependents(&self, roots: &HashSet<ObjectId>) -> bool {
         self.local.graph.edges().iter().any(|edge| {
-            matches!(edge.kind, DependencyKind::ViewDependency { .. })
+            self.dependency_edge_is_current(edge)
+                && matches!(edge.kind, DependencyKind::ViewDependency { .. })
                 && roots.contains(self.local.graph.resolve_rename(&edge.referenced))
                 && !roots.contains(self.local.graph.resolve_rename(&edge.dependent))
         })
@@ -86,6 +87,18 @@ impl AnalysisState {
         kind_name: &str,
     ) -> MutationResult {
         let roots = present.iter().cloned().collect::<HashSet<_>>();
+        if present.iter().any(|id| {
+            self.baseline_scoped_family_object(id, crate::db::cache::CatalogFamily::Relations)
+        }) {
+            // View dependency rows are scope-aware, but expression and
+            // extension-dependent objects outside the selected schemas are
+            // not yet represented as a complete catalog contract.
+            self.taint(
+                EvidenceCode::CatalogCoverageIncomplete,
+                EvidenceScope::Chain,
+            );
+            return MutationResult::Skipped;
+        }
         if !cascade && self.has_external_view_dependents(&roots) {
             return MutationResult::Conflict {
                 reason: format!(
@@ -171,7 +184,7 @@ impl AnalysisState {
             matches!(edge.kind, DependencyKind::IndexOnRelation { .. }) && edge.dependent == *id
         }) {
             IndexLookup::Present
-        } else if self.baseline_available && self.baseline_covers_object(id) {
+        } else if self.baseline_covers_family_object(id, crate::db::cache::CatalogFamily::Indexes) {
             IndexLookup::AuthoritativelyAbsent
         } else {
             IndexLookup::Unknown
@@ -272,18 +285,19 @@ impl AnalysisState {
         self.snapshot_generation_counter();
         self.local.generation_counter += 1;
         let generation = self.local.generation_counter;
-        self.local.relations.insert(
+        let mut relation = RelationState::new(
             create.id.clone(),
-            RelationOverlay::Present(RelationState::new(
-                create.id.clone(),
-                ObjectId::new("", &self.local.current_role),
-                generation,
-                None,
-                RelationKind::MaterializedView,
-                Persistence::Permanent,
-                self.local.transactions.len(),
-            )),
+            ObjectId::new("", &self.local.current_role),
+            generation,
+            None,
+            RelationKind::MaterializedView,
+            Persistence::Permanent,
+            self.local.transactions.len(),
         );
+        relation.is_populated = Some(true);
+        self.local
+            .relations
+            .insert(create.id.clone(), RelationOverlay::Present(relation));
         self.snapshot_graph_full();
         for dependency in &create.depends_on {
             self.local.graph.add_edge(DependencyEdge::new(
@@ -302,8 +316,44 @@ impl AnalysisState {
         &mut self,
         refresh: &RefreshMaterializedViewMutation,
     ) -> MutationResult {
+        if refresh.concurrently && self.in_transaction() {
+            return MutationResult::Conflict {
+                reason: "REFRESH MATERIALIZED VIEW CONCURRENTLY cannot run inside a transaction"
+                    .to_string(),
+            };
+        }
         match self.relation_lookup(&refresh.id, |kind| *kind == RelationKind::MaterializedView) {
-            RelationLookup::Present => MutationResult::Applied,
+            RelationLookup::Present => {
+                if refresh.concurrently {
+                    match self.local.relations.get(&refresh.id) {
+                        Some(RelationOverlay::Present(relation)) => match relation.is_populated {
+                            Some(false) => {
+                                return MutationResult::Conflict {
+                                    reason: format!(
+                                        "materialized view '{}' must be populated before a concurrent refresh",
+                                        refresh.id
+                                    ),
+                                };
+                            }
+                            None => {
+                                self.taint(
+                                    EvidenceCode::CatalogCoverageIncomplete,
+                                    EvidenceScope::Statement,
+                                );
+                                return MutationResult::Skipped;
+                            }
+                            Some(true) => {}
+                        },
+                        _ => unreachable!("materialized-view lookup established presence"),
+                    }
+                }
+                if let Some(RelationOverlay::Present(relation)) =
+                    self.local.relations.get_mut(&refresh.id)
+                {
+                    relation.is_populated = Some(true);
+                }
+                MutationResult::Applied
+            }
             RelationLookup::WrongKind => MutationResult::Conflict {
                 reason: format!("'{}' is not a materialized view", refresh.id),
             },
@@ -320,6 +370,11 @@ impl AnalysisState {
     }
 
     pub(super) fn apply_create_index(&mut self, create: &CreateIndex) -> MutationResult {
+        if create.concurrently && self.in_transaction() {
+            return MutationResult::Conflict {
+                reason: "CREATE INDEX CONCURRENTLY cannot run inside a transaction".to_string(),
+            };
+        }
         if let Err(result) = self.ensure_schema_target(&create.id.schema) {
             return result;
         }
@@ -338,6 +393,24 @@ impl AnalysisState {
             format!("index target '{}' cannot be indexed", create.table),
         ) {
             return result;
+        }
+        if create.concurrently
+            && self
+                .local
+                .relations
+                .get(&create.table)
+                .and_then(|overlay| match overlay {
+                    RelationOverlay::Present(relation) => relation.partition_type.as_deref(),
+                    RelationOverlay::Dropped => None,
+                })
+                .is_some()
+        {
+            return MutationResult::Conflict {
+                reason: format!(
+                    "CREATE INDEX CONCURRENTLY cannot run on partitioned table '{}'",
+                    create.table
+                ),
+            };
         }
         self.snapshot_graph();
         self.local.graph.add_edge(DependencyEdge::new(
@@ -367,6 +440,11 @@ impl AnalysisState {
                 has_default_sort_order: create.has_default_sort_order,
                 has_default_opclasses: create.has_default_opclasses,
                 has_default_collations: create.has_default_collations,
+                // Eligibility facts are known even when dependency-column
+                // proof is incomplete: expression and partial indexes are
+                // deterministically ineligible for USING INDEX. Keep that
+                // distinction separate from dependency_columns_known, which
+                // governs exact column-drop cleanup.
                 eligibility_known: true,
             },
         ));
@@ -456,6 +534,16 @@ impl AnalysisState {
     }
 
     pub(super) fn apply_drop_index(&mut self, drop: &DropIndex) -> MutationResult {
+        if drop.concurrently && self.in_transaction() {
+            return MutationResult::Conflict {
+                reason: "DROP INDEX CONCURRENTLY cannot run inside a transaction".to_string(),
+            };
+        }
+        if drop.concurrently && drop.cascade {
+            return MutationResult::Conflict {
+                reason: "DROP INDEX CONCURRENTLY cannot use CASCADE".to_string(),
+            };
+        }
         // PostgreSQL resolves every target before it applies a multi-index
         // DROP. Preflight the complete statement so a later invalid target
         // cannot leave an earlier index removed from simulated state.
@@ -487,6 +575,21 @@ impl AnalysisState {
             return MutationResult::Skipped;
         }
 
+        if targets.iter().any(|id| {
+            self.baseline_scoped_family_object(id, crate::db::cache::CatalogFamily::Indexes)
+        }) {
+            // Scoped index rows do not yet carry a complete backing-constraint
+            // identity or every external dependency, so PostgreSQL's DROP
+            // INDEX conflict semantics cannot be proven from the partial
+            // graph. Leave the baseline unchanged until V8 index ownership
+            // coverage is object-complete.
+            self.taint(
+                EvidenceCode::CatalogCoverageIncomplete,
+                EvidenceScope::Chain,
+            );
+            return MutationResult::Skipped;
+        }
+
         for id in &targets {
             let Some(index_edge) = self.local.graph.edges().iter().find(|edge| {
                 matches!(edge.kind, DependencyKind::IndexOnRelation { .. }) && edge.dependent == *id
@@ -498,19 +601,55 @@ impl AnalysisState {
                 return MutationResult::Skipped;
             };
             let referenced_table = self.local.graph.resolve_rename(&index_edge.referenced);
-            let backs_constraint =
-                self.local
+            let resolved_index = self.local.graph.resolve_rename(id);
+            if drop.concurrently
+                && self
+                    .local
+                    .relations
+                    .get(referenced_table)
+                    .and_then(|overlay| match overlay {
+                        RelationOverlay::Present(relation) => relation.partition_type.as_deref(),
+                        RelationOverlay::Dropped => None,
+                    })
+                    .is_some()
+            {
+                return MutationResult::Conflict {
+                    reason: format!(
+                        "DROP INDEX CONCURRENTLY cannot run on partitioned index '{}'",
+                        id
+                    ),
+                };
+            }
+            let unresolved_constraint = self.baseline_indexes.contains(id)
+                && self
+                    .local
                     .constraints
                     .iter()
-                    .any(|((table, name), constraint)| {
-                        name == &id.name
-                            && self.local.graph.resolve_rename(table) == referenced_table
+                    .any(|((table, _), constraint)| {
+                        self.local.graph.resolve_rename(table) == referenced_table
                             && matches!(
                                 constraint.kind,
                                 crate::model::constraint::ConstraintKind::PrimaryKey
                                     | crate::model::constraint::ConstraintKind::Unique
+                                    | crate::model::constraint::ConstraintKind::Exclusion
                             )
+                            && constraint.backing_index.is_none()
                     });
+            if unresolved_constraint {
+                self.taint(
+                    EvidenceCode::CatalogCoverageIncomplete,
+                    EvidenceScope::Chain,
+                );
+                return MutationResult::Skipped;
+            }
+            let backs_constraint = self
+                .local
+                .constraints
+                .iter()
+                .any(|((table, _), constraint)| {
+                    self.local.graph.resolve_rename(table) == referenced_table
+                        && constraint.backing_index.as_ref() == Some(resolved_index)
+                });
             if backs_constraint {
                 return MutationResult::Conflict {
                     reason: format!(

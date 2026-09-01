@@ -42,6 +42,11 @@ impl AnalysisState {
         _table_id: &Option<ObjectId>,
         _is_full: bool,
     ) -> MutationResult {
+        // VACUUM changes physical visibility/storage state and may refresh
+        // planner statistics, neither of which is represented in the
+        // normalized relation model. Keep the statement available to rules,
+        // but do not claim an exact post-VACUUM catalog state.
+        self.taint(EvidenceCode::UnsupportedSemantics, EvidenceScope::Statement);
         MutationResult::Applied
     }
 }

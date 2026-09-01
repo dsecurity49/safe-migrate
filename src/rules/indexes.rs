@@ -43,7 +43,7 @@ impl Rule for ConcurrentIndexRule {
                     match context.pre_state().relations.get(&create.table) {
                         Some(rel) => {
                             let stale = rel.is_stale()
-                                && context.state().baseline_relations.contains(&create.table);
+                                && context.state().baseline_relation_is_known(&create.table);
                             (
                                 rel.persistence == Persistence::Temporary,
                                 stale,
@@ -54,8 +54,7 @@ impl Rule for ConcurrentIndexRule {
                         None => (false, true, context.config().default_rows, 0),
                     };
 
-                if is_temp || (tx_depth > 0 && tx_depth <= context.state().local.transactions.len())
-                {
+                if is_temp || (tx_depth > 0 && tx_depth <= context.state().transaction_depth()) {
                     return violations;
                 }
 

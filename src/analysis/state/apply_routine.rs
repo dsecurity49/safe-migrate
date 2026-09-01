@@ -29,7 +29,9 @@ impl AnalysisState {
             }
             Some(FunctionOverlay::Present(_)) => ObjectLookup::WrongKind,
             Some(FunctionOverlay::Dropped) => ObjectLookup::Tombstone,
-            None if self.baseline_available && self.baseline_covers_object(id) => {
+            None if self
+                .baseline_covers_family_object(id, crate::db::cache::CatalogFamily::Routines) =>
+            {
                 ObjectLookup::AuthoritativelyAbsent
             }
             None => ObjectLookup::Unknown,
@@ -325,6 +327,16 @@ impl AnalysisState {
             return MutationResult::Skipped;
         }
 
+        if targets.iter().any(|(id, _)| {
+            self.baseline_scoped_family_object(id, crate::db::cache::CatalogFamily::Routines)
+        }) {
+            self.taint(
+                EvidenceCode::CatalogCoverageIncomplete,
+                EvidenceScope::Chain,
+            );
+            return MutationResult::Skipped;
+        }
+
         let any_applied = !targets.is_empty();
         for (id, dependent_triggers) in &targets {
             self.snapshot_function(id);
@@ -557,6 +569,22 @@ impl AnalysisState {
                 RoutineLookup::AuthoritativelyAbsent => {}
             }
         }
+        if targets.iter().any(|id| {
+            self.baseline_scoped_family_object(id, crate::db::cache::CatalogFamily::Routines)
+        }) {
+            self.taint(
+                EvidenceCode::CatalogCoverageIncomplete,
+                EvidenceScope::Chain,
+            );
+            return MutationResult::Skipped;
+        }
+        if procedure.cascade && !targets.is_empty() {
+            // Procedure dependents are not yet represented as typed graph
+            // edges. Applying CASCADE would therefore remove only the routine
+            // while leaving PostgreSQL-owned dependents in simulated state.
+            self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
+            return MutationResult::Skipped;
+        }
         for id in &targets {
             self.snapshot_function(id);
             self.local
@@ -710,14 +738,26 @@ impl AnalysisState {
                 }
             }
         }
+        if targets.iter().any(|id| {
+            self.baseline_scoped_family_object(id, crate::db::cache::CatalogFamily::Routines)
+        }) {
+            self.taint(
+                EvidenceCode::CatalogCoverageIncomplete,
+                EvidenceScope::Chain,
+            );
+            return MutationResult::Skipped;
+        }
+        if aggregate.cascade && !targets.is_empty() {
+            // Aggregate implementation-function and dependent-object edges
+            // are not modeled yet; CASCADE must not claim a partial closure.
+            self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
+            return MutationResult::Skipped;
+        }
         for id in &targets {
             self.snapshot_function(id);
             self.local
                 .functions
                 .insert(id.clone(), FunctionOverlay::Dropped);
-        }
-        if aggregate.cascade && !targets.is_empty() {
-            self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
         }
         if !targets.is_empty() {
             MutationResult::Applied

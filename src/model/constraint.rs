@@ -16,4 +16,9 @@ pub struct ConstraintState {
     pub name: String,
     pub kind: ConstraintKind,
     pub validated: bool,
+    /// The PostgreSQL index adopted by a primary/unique/exclusion
+    /// constraint, when catalog evidence provides `pg_constraint.conindid`.
+    /// Local constraints and constraint kinds without a backing index retain
+    /// `None` until an authoritative identity is available.
+    pub backing_index: Option<ObjectId>,
 }

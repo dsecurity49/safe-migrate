@@ -380,6 +380,51 @@ mod rule_evaluation_tests {
     }
 
     #[test]
+    fn missing_relation_statistics_taint_only_statistics_based_findings() {
+        let engine = setup_engine();
+        let mut cache = safe_migrate::db::cache::DbCache::new();
+        let table_id = object_id("public", "stats_unknown");
+        let mut relation = RelationState::new(
+            table_id.clone(),
+            object_id("public", "postgres"),
+            0,
+            None,
+            RelationKind::Table,
+            Persistence::Permanent,
+            0,
+        );
+        relation.columns.push(Column {
+            name: "id".into(),
+            data_type: Some("integer".into()),
+            type_id: None,
+            is_nullable: false,
+            default: None,
+            avg_width: Some(4),
+            default_expr_text: None,
+            type_modifier: None,
+        });
+        cache.insert_baseline(table_id, relation);
+        let mut state = AnalysisState::new(cache);
+
+        let findings = engine
+            .analyze(
+                "CREATE INDEX stats_unknown_idx ON stats_unknown(id);",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(
+            findings
+                .iter()
+                .any(|finding| { finding.rule_id == "require-concurrent-index" })
+        );
+        assert_eq!(state.local.confidence, Confidence::Tainted);
+        assert!(state.evidence().iter().any(|record| {
+            record.code == safe_migrate::analysis::evidence::EvidenceCode::CatalogCoverageIncomplete
+        }));
+    }
+
+    #[test]
     fn test_confidence_taint_does_not_affect_prior_violations() {
         let engine = setup_engine();
         let mut cache = safe_migrate::db::cache::DbCache::new();
@@ -835,6 +880,9 @@ mod rule_evaluation_tests {
         let v = engine.analyze("VACUUM FULL t;", &mut state).unwrap();
 
         assert!(v.iter().any(|v| v.rule_id.contains("vacuum")));
+        assert!(state.evidence().iter().any(|record| {
+            record.code == safe_migrate::analysis::evidence::EvidenceCode::UnsupportedSemantics
+        }));
     }
 
     #[test]

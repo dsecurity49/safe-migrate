@@ -42,9 +42,9 @@ impl Rule for CascadingDropRule {
 
             let roots = drop.ids.iter().collect::<std::collections::HashSet<_>>();
             for rel_id in &closure.dropped_relations {
-                if !roots.contains(rel_id) && state.baseline_relations.contains(rel_id) {
+                if !roots.contains(rel_id) && state.baseline_relation_is_known(rel_id) {
                     affects_baseline = true;
-                    if state.baseline_fk_dependencies.contains(rel_id) {
+                    if state.baseline_fk_dependency_is_known(rel_id) {
                         has_fk_pulled = true;
                     }
                 }
@@ -63,7 +63,7 @@ impl Rule for CascadingDropRule {
             }
 
             for (from_table, _cname) in &closure.dropped_constraints {
-                if state.baseline_fk_dependencies.contains(from_table) {
+                if state.baseline_fk_dependency_is_known(from_table) {
                     has_fk_pulled = true;
                 }
             }
@@ -134,7 +134,7 @@ impl Rule for SizeAwareAddColumnRule {
         }
 
         let mut violations = Vec::new();
-        let pg_version = state.pg_version_num.unwrap_or(config.assume_pg_version);
+        let pg_version = state.effective_pg_version_num(config.assume_pg_version);
 
         if let Mutation::AlterTable(alter) = mutation
             && let AlterTableActionMutation::AddColumn {
@@ -151,7 +151,7 @@ impl Rule for SizeAwareAddColumnRule {
                             c.avg_width.unwrap_or(0) >= config.toast_width_threshold_bytes
                         });
                         // Only cache-backed relations have meaningful statistics age.
-                        let stale = rel.is_stale() && state.baseline_relations.contains(&alter.id);
+                        let stale = rel.is_stale() && state.baseline_relation_is_known(&alter.id);
                         (
                             wide,
                             stale,
@@ -861,7 +861,7 @@ impl Rule for TypeChangeRewriteRule {
                 has_using: _,
             } = &alter.action
         {
-            let pg_version = state.pg_version_num.unwrap_or(config.assume_pg_version);
+            let pg_version = state.effective_pg_version_num(config.assume_pg_version);
 
             let (is_safe, rows, old_type_str, old_modifier) =
                 match pre_state.relations.get(&alter.id) {

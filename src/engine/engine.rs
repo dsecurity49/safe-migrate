@@ -307,7 +307,7 @@ impl SafeMigrateEngine {
             // state, findings, or deduplication keys. A parsed statement
             // without a typed extractor is explicitly opaque: silently
             // ignoring it would claim exact confidence for later SQL.
-            let statement_confidence = state.local.confidence.clone();
+            let statement_confidence = state.confidence().clone();
             let mut statement_violations = Vec::new();
             let mut statement_warned_keys = HashSet::new();
             let mut mutations = match AstVisitor::extract(&stmt) {
@@ -337,14 +337,14 @@ impl SafeMigrateEngine {
                     crate::analysis::state::MutationResult::Conflict { .. }
                 );
                 if statement_failed {
-                    let transaction_aborted = state.local.transaction_aborted;
+                    let transaction_aborted = state.transaction_is_aborted();
                     if let Err(error) = statement_checkpoint.restore(state) {
                         return Err(vec![format!(
                             "failed to restore PostgreSQL statement atomicity: {error}"
                         )]);
                     }
-                    if transaction_aborted && !state.local.transactions.is_empty() {
-                        state.local.transaction_aborted = true;
+                    if transaction_aborted && state.in_transaction() {
+                        state.mark_transaction_aborted();
                     }
                     statement_violations.clear();
                     statement_warned_keys.clear();
@@ -379,8 +379,8 @@ impl SafeMigrateEngine {
                     // not need relation statistics).
                     if !violations.is_empty() {
                         for capability in rule.required_capabilities() {
-                            if !capability.available(state) {
-                                let code = if state.baseline_available {
+                            if !capability.available_for(state, &mutation, &pre_state) {
+                                let code = if state.baseline_is_available() {
                                     capability.evidence_code()
                                 } else {
                                     crate::analysis::evidence::EvidenceCode::BaselineUnavailable

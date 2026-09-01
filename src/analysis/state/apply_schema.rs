@@ -298,7 +298,11 @@ impl AnalysisState {
                     let function_is_dropped = self.local.graph.edges().iter().any(|edge| {
                         matches!(
                             &edge.kind,
-                            DependencyKind::TriggerOnTable { trigger_id, function_id }
+                            DependencyKind::TriggerOnTable {
+                                trigger_id,
+                                function_id,
+                                ..
+                            }
                                 if trigger_id == id && functions_to_drop.contains(function_id)
                         )
                     });
@@ -362,6 +366,7 @@ impl AnalysisState {
                     DependencyKind::TriggerOnTable {
                         trigger_id,
                         function_id,
+                        ..
                     } => {
                         !dropped_trigger_ids.contains(trigger_id)
                             && !functions_to_drop.contains(function_id)
@@ -371,7 +376,8 @@ impl AnalysisState {
             });
         } else {
             let has_external_dependents = self.local.graph.edges().iter().any(|edge| {
-                !matches!(&edge.kind, DependencyKind::RenameTo)
+                self.dependency_edge_is_current(edge)
+                    && !matches!(&edge.kind, DependencyKind::RenameTo)
                     && drop_schema.names.contains(&edge.referenced.schema)
                     && !drop_schema.names.contains(&edge.dependent.schema)
             });

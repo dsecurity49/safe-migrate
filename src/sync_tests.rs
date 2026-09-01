@@ -486,6 +486,33 @@ mod tests {
     }
 
     #[test]
+    fn cache_column_payloads_missing_semantic_fields_require_resync() {
+        #[derive(Serialize)]
+        struct LegacyColumn {
+            name: String,
+            data_type: Option<String>,
+            is_nullable: bool,
+            default: Option<crate::analysis::expr_ir::ExprIr>,
+            avg_width: Option<i32>,
+        }
+
+        let legacy = LegacyColumn {
+            name: "created_at".into(),
+            data_type: Some("timestamp".into()),
+            is_nullable: false,
+            default: None,
+            avg_width: Some(8),
+        };
+        let config = bincode::config::standard().with_variable_int_encoding();
+        let bytes = bincode::serde::encode_to_vec(legacy, config).unwrap();
+        assert!(
+            bincode::serde::decode_from_slice::<crate::model::column::Column, _>(&bytes, config)
+                .is_err(),
+            "cache payloads without default/type evidence must require a fresh V8 sync"
+        );
+    }
+
+    #[test]
     fn domain_type_identity_link_does_not_change_the_cache_bincode_layout() {
         #[allow(dead_code)]
         #[derive(Serialize)]

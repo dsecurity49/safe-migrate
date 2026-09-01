@@ -58,6 +58,27 @@ mod transaction_lifecycle_tests {
     }
 
     #[test]
+    fn concurrent_materialized_view_refresh_is_reported_inside_transaction() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let violations = engine
+            .analyze(
+                "CREATE MATERIALIZED VIEW users_mv AS SELECT 1 AS id; BEGIN; REFRESH MATERIALIZED VIEW CONCURRENTLY users_mv; ROLLBACK;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(violations.iter().any(|violation| {
+            violation.rule_id == "concurrent-in-transaction"
+                && violation
+                    .reason
+                    .contains("REFRESH MATERIALIZED VIEW CONCURRENTLY")
+        }));
+        assert!(state.local.transactions.is_empty());
+    }
+
+    #[test]
     fn test_txn_rollback() {
         let engine = setup_engine();
         let mut state = setup_state();

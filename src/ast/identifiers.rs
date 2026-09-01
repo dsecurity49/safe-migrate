@@ -64,6 +64,12 @@ mod tests {
         assert_eq!(resolved.len(), 62);
         assert_eq!(resolved, "é".repeat(31));
     }
+
+    #[test]
+    fn object_id_requires_explicit_inference_marker_when_deserialized() {
+        let payload = serde_json::json!({"schema": "public", "name": "items"});
+        assert!(serde_json::from_value::<super::ObjectId>(payload).is_err());
+    }
 }
 
 /// ObjectId represents a fully resolved, state-machine tracked database object.
@@ -72,7 +78,6 @@ mod tests {
 pub struct ObjectId {
     pub schema: String,
     pub name: String,
-    #[serde(default)]
     pub inferred_schema: bool,
 }
 

@@ -84,8 +84,11 @@ pub struct RelationState {
     pub privileges: PrivilegeMatrix,
     pub partition_type: Option<String>, // e.g., "RANGE", "LIST", "HASH"
     pub partition_by: Option<String>,   // The partition key expression
-    #[serde(default)]
     pub is_fk_dependency: bool,
+    /// Whether a materialized view has been populated. `None` means the
+    /// catalog did not provide this relation-specific fact; it is ignored for
+    /// tables and ordinary views and treated conservatively for refreshes.
+    pub is_populated: Option<bool>,
 }
 
 impl Default for RelationState {
@@ -108,6 +111,7 @@ impl Default for RelationState {
             partition_type: None,
             partition_by: None,
             is_fk_dependency: false,
+            is_populated: None,
         }
     }
 }
@@ -140,6 +144,7 @@ impl RelationState {
             partition_type: None,
             partition_by: None,
             is_fk_dependency: false,
+            is_populated: None,
         }
     }
 
@@ -218,6 +223,12 @@ impl RelationState {
             ColumnAction::SetType { name, data_type } => {
                 if let Some(col) = self.columns.iter_mut().find(|c| c.name == *name) {
                     col.data_type = Some(data_type.clone());
+                    // A type change invalidates catalog-derived identity and
+                    // statistics for the old type. The state layer resolves
+                    // the new identity after this helper returns.
+                    col.type_id = None;
+                    col.type_modifier = None;
+                    col.avg_width = None;
                 }
             }
             ColumnAction::SetDefault { name, default } => {
@@ -248,6 +259,48 @@ impl RelationState {
 
     pub fn is_stale(&self) -> bool {
         self.last_analyze.is_none() && self.last_autoanalyze.is_none()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn changing_column_type_clears_stale_catalog_metadata() {
+        let id = ObjectId::new("public", "items");
+        let mut relation = RelationState::new(
+            id,
+            ObjectId::new("", "postgres"),
+            0,
+            Some(10),
+            RelationKind::Table,
+            Persistence::Permanent,
+            0,
+        );
+        relation.columns.push(Column {
+            name: "value".into(),
+            data_type: Some("varchar(255)".into()),
+            type_id: Some(ObjectId::new("public", "varchar")),
+            is_nullable: true,
+            default: None,
+            avg_width: Some(32),
+            default_expr_text: None,
+            type_modifier: Some(259),
+        });
+
+        relation.apply_column_action(&ColumnAction::SetType {
+            name: "value".into(),
+            data_type: "integer".into(),
+        });
+
+        let column = relation
+            .get_column("value")
+            .expect("column remains present");
+        assert_eq!(column.data_type.as_deref(), Some("integer"));
+        assert_eq!(column.type_id, None);
+        assert_eq!(column.type_modifier, None);
+        assert_eq!(column.avg_width, None);
     }
 }
 

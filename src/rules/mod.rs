@@ -27,15 +27,39 @@ use crate::report::violations::{Violation, ViolationTier};
 /// Keeping this bundle immutable prevents the engine from accidentally
 /// evaluating a rule against state from a different statement and provides a
 /// single extension point for evidence/capability metadata.
+pub(crate) struct TransitionRecord<'a> {
+    mutation: &'a Mutation,
+    result: &'a MutationResult,
+    pre_state: &'a crate::analysis::state::PreState,
+    cascade_closure: Option<&'a CascadeResult>,
+    evidence: &'a [EvidenceRecord],
+    confidence: &'a Confidence,
+}
+
+impl<'a> TransitionRecord<'a> {
+    fn new(
+        mutation: &'a Mutation,
+        result: &'a MutationResult,
+        pre_state: &'a crate::analysis::state::PreState,
+        cascade_closure: Option<&'a CascadeResult>,
+        evidence: &'a [EvidenceRecord],
+        confidence: &'a Confidence,
+    ) -> Self {
+        Self {
+            mutation,
+            result,
+            pre_state,
+            cascade_closure,
+            evidence,
+            confidence,
+        }
+    }
+}
+
 pub struct RuleContext<'a> {
-    pub(crate) mutation: &'a Mutation,
-    pub(crate) result: &'a MutationResult,
-    pub(crate) pre_state: &'a crate::analysis::state::PreState,
+    pub(crate) transition: TransitionRecord<'a>,
     pub(crate) state: &'a AnalysisState,
     pub(crate) config: &'a Config,
-    pub(crate) cascade_closure: Option<&'a CascadeResult>,
-    pub(crate) evidence: &'a [EvidenceRecord],
-    pub(crate) confidence: &'a Confidence,
 }
 
 /// Semantic state surfaces a rule must account for before claiming an exact
@@ -57,7 +81,7 @@ impl RuleCapability {
                 record.code != crate::analysis::evidence::EvidenceCode::TransactionStateUnknown
             });
         }
-        if !state.baseline_available {
+        if !state.baseline_is_available() {
             return false;
         }
         let family = match self {
@@ -68,7 +92,68 @@ impl RuleCapability {
             Self::FunctionCatalog => crate::db::cache::CatalogFamily::Routines,
             Self::TransactionState => unreachable!(),
         };
-        state.baseline_coverage.has(family)
+        state.baseline_has_coverage(family)
+    }
+
+    /// Check capability availability for the concrete transition being
+    /// evaluated. Catalog-family coverage alone cannot prove row statistics:
+    /// PostgreSQL legitimately reports an unknown estimate for an individual
+    /// relation that has never been analyzed. Keep that uncertainty scoped to
+    /// rules whose finding actually depends on the affected relation.
+    pub(crate) fn available_for(
+        self,
+        state: &AnalysisState,
+        mutation: &crate::analysis::mutations::Mutation,
+        pre_state: &crate::analysis::state::PreState,
+    ) -> bool {
+        if self != Self::RowStatistics {
+            return self.available(state);
+        }
+        if !self.available(state) {
+            return false;
+        }
+
+        let mut targets = Vec::new();
+        match mutation {
+            crate::analysis::mutations::Mutation::AlterTable(alter) => {
+                targets.push(&alter.id);
+            }
+            crate::analysis::mutations::Mutation::CreateIndex(create) => {
+                targets.push(&create.table);
+            }
+            crate::analysis::mutations::Mutation::RefreshMaterializedView(refresh) => {
+                targets.push(&refresh.id);
+            }
+            crate::analysis::mutations::Mutation::DropIndex(drop) => {
+                for index_id in &drop.ids {
+                    targets.extend(pre_state.indexes.iter().filter_map(|edge| {
+                        if edge.dependent == *index_id {
+                            if let crate::analysis::graph::DependencyKind::IndexOnRelation {
+                                ..
+                            } = edge.kind
+                            {
+                                Some(&edge.referenced)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    }));
+                }
+            }
+            _ => {}
+        }
+
+        // A capability can be declared by a rule that has findings for a
+        // different mutation family. In that case there is no relation-local
+        // statistic to require.
+        targets.into_iter().all(|id| {
+            pre_state
+                .relations
+                .get(id)
+                .is_some_and(|relation| relation.estimated_rows.is_some())
+        })
     }
 
     pub(crate) const fn evidence_code(self) -> crate::analysis::evidence::EvidenceCode {
@@ -105,35 +190,37 @@ impl<'a> RuleContext<'a> {
         cascade_closure: Option<&'a CascadeResult>,
     ) -> Self {
         Self {
-            mutation,
-            result,
-            pre_state,
+            transition: TransitionRecord::new(
+                mutation,
+                result,
+                pre_state,
+                cascade_closure,
+                state.evidence(),
+                state.confidence(),
+            ),
             state,
             config,
-            cascade_closure,
-            evidence: state.evidence(),
-            confidence: state.confidence(),
         }
     }
 
     pub fn evidence(&self) -> &[EvidenceRecord] {
-        self.evidence
+        self.transition.evidence
     }
 
     pub fn confidence(&self) -> &Confidence {
-        self.confidence
+        self.transition.confidence
     }
 
     pub fn mutation(&self) -> &Mutation {
-        self.mutation
+        self.transition.mutation
     }
 
     pub fn result(&self) -> &MutationResult {
-        self.result
+        self.transition.result
     }
 
     pub fn pre_state(&self) -> &crate::analysis::state::PreState {
-        self.pre_state
+        self.transition.pre_state
     }
 
     pub fn state(&self) -> &AnalysisState {
@@ -145,7 +232,7 @@ impl<'a> RuleContext<'a> {
     }
 
     pub fn cascade_closure(&self) -> Option<&CascadeResult> {
-        self.cascade_closure
+        self.transition.cascade_closure
     }
 }
 

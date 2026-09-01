@@ -36,7 +36,7 @@ impl Rule for PartitionLockRule {
                         match context.pre_state().relations.get(&alter.id) {
                             Some(rel) => {
                                 let stale = rel.is_stale()
-                                    && context.state().baseline_relations.contains(&alter.id);
+                                    && context.state().baseline_relation_is_known(&alter.id);
                                 let is_hash = rel
                                     .partition_type
                                     .as_ref()

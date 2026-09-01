@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 const VERBOSITY_ENV: &str = "SAFE_MIGRATE_DIFF_VERBOSITY";
 const RULE_FILTER_ENV: &str = "SAFE_MIGRATE_DIFF_RULE";
 const FIXTURE_FILTER_ENV: &str = "SAFE_MIGRATE_DIFF_FIXTURE";
+const DATABASE_NAME_ENV: &str = "SAFE_MIGRATE_DIFF_DATABASE";
 const REQUIRE_LIVE_ENV: &str = "SAFE_MIGRATE_REQUIRE_LIVE";
 
 #[derive(Debug, Deserialize)]
@@ -316,9 +317,18 @@ fn live_postgres_differential_harness() {
         .query_one("SELECT current_database()", &[])
         .expect("failed to identify the live differential database")
         .get(0);
+    let expected_database =
+        std::env::var(DATABASE_NAME_ENV).unwrap_or_else(|_| "safe_migrate".to_string());
+    assert!(
+        !expected_database.trim().is_empty()
+            && expected_database
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '_'),
+        "{DATABASE_NAME_ENV} must be a nonempty unquoted database identifier"
+    );
     assert_eq!(
-        connected_database, "safe_migrate",
-        "live differential harness refuses to modify a database not named safe_migrate"
+        connected_database, expected_database,
+        "live differential harness refuses to modify an unexpected database; set {DATABASE_NAME_ENV} explicitly for a disposable local database"
     );
     if verbosity >= 1 {
         let row = client
@@ -697,7 +707,8 @@ fn live_postgres_differential_harness() {
                 }
             };
 
-            let simulator_projection = snapshot_simulator_state(&simulator_state, scope);
+            let simulator_projection =
+                snapshot_simulator_state(&simulator_state, &rule.schemas, scope);
             verbose(
                 verbosity,
                 2,
@@ -1240,9 +1251,9 @@ fn required_role_edges_distinguish_missing_roles_from_incorrect_edges() {
                 id,
                 can_login: false,
                 is_superuser: false,
+                inherits: true,
                 member_of: Vec::new(),
                 can_set_role_to: Vec::new(),
-                granted_privileges: Vec::new(),
             },
         );
     }
@@ -1539,7 +1550,11 @@ fn snapshot_live_state(
     Ok(state)
 }
 
-fn snapshot_simulator_state(state: &AnalysisState, scope: &[ComparisonScope]) -> NormalizedState {
+fn snapshot_simulator_state(
+    state: &AnalysisState,
+    schema_scope: &[String],
+    scope: &[ComparisonScope],
+) -> NormalizedState {
     let mut projection = NormalizedState::default();
 
     if scope.contains(&ComparisonScope::Schemas) {
@@ -1547,9 +1562,16 @@ fn snapshot_simulator_state(state: &AnalysisState, scope: &[ComparisonScope]) ->
             let SchemaOverlay::Present(schema) = overlay else {
                 continue;
             };
-            projection
-                .schemas
-                .insert(name.clone(), schema.owner.name.clone());
+            // The state hydrator may retain an inferred namespace for an
+            // out-of-scope relationship endpoint.  That evidence is needed
+            // internally for dependency resolution, but the differential
+            // projection must match the manifest's authoritative schema
+            // scope, just like the live catalog snapshot does.
+            if schema_scope.iter().any(|scoped| scoped == name) {
+                projection
+                    .schemas
+                    .insert(name.clone(), schema.owner.name.clone());
+            }
         }
     }
 
@@ -1642,6 +1664,7 @@ fn snapshot_simulator_state(state: &AnalysisState, scope: &[ComparisonScope]) ->
             let DependencyKind::TriggerOnTable {
                 trigger_id,
                 function_id,
+                ..
             } = &edge.kind
             else {
                 continue;

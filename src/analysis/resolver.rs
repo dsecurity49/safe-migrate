@@ -23,8 +23,7 @@ impl Resolver {
             .map(|i| i.resolve())
             .unwrap_or_else(|| {
                 state
-                    .local
-                    .search_path
+                    .search_path()
                     .first()
                     .map(|s| s.as_str())
                     .unwrap_or("public")
@@ -44,7 +43,7 @@ impl Resolver {
             return ObjectId::new(schema_ident.resolve(), object_name);
         }
 
-        for schema in &state.local.search_path {
+        for schema in state.search_path() {
             let mut candidate = ObjectId::new(schema.clone(), object_name.clone());
             if present(state, &candidate) {
                 candidate.inferred_schema = true;
@@ -53,8 +52,7 @@ impl Resolver {
         }
 
         let schema = state
-            .local
-            .search_path
+            .search_path()
             .first()
             .cloned()
             .unwrap_or_else(|| "public".to_string());
