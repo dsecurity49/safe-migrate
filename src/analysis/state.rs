@@ -595,6 +595,66 @@ impl AnalysisState {
             .chain(cache.types.keys().map(|id| &id.schema))
             .chain(cache.functions.keys().map(|id| &id.schema))
             .chain(cache.sequences.keys().map(|id| &id.schema))
+            .chain(
+                cache
+                    .foreign_keys
+                    .iter()
+                    .flat_map(|fk| [&fk.from_table, &fk.to_table])
+                    .map(|id| &id.schema),
+            )
+            .chain(
+                cache
+                    .indexes
+                    .iter()
+                    .flat_map(|index| [&index.index_id, &index.table_id])
+                    .map(|id| &id.schema),
+            )
+            .chain(
+                cache
+                    .dependencies
+                    .iter()
+                    .flat_map(|dependency| [&dependency.dependent, &dependency.referenced])
+                    .map(|id| &id.schema),
+            )
+            .chain(
+                cache
+                    .inheritances
+                    .iter()
+                    .flat_map(|inheritance| [&inheritance.child, &inheritance.parent])
+                    .map(|id| &id.schema),
+            )
+            .chain(
+                cache
+                    .triggers
+                    .iter()
+                    .map(|trigger| &trigger.table_id.schema),
+            )
+            .chain(
+                cache
+                    .constraints
+                    .iter()
+                    .map(|constraint| &constraint.table_id.schema),
+            )
+            .chain(cache.constraint_keys.iter().map(|key| &key.table_id.schema))
+            .chain(
+                cache
+                    .constraint_dependencies
+                    .iter()
+                    .map(|dependency| &dependency.table_id.schema),
+            )
+            .chain(
+                cache
+                    .generated_column_dependencies
+                    .iter()
+                    .map(|dependency| &dependency.table_id.schema),
+            )
+            .chain(
+                cache
+                    .default_sequence_dependencies
+                    .iter()
+                    .flat_map(|dependency| [&dependency.table_id, &dependency.sequence_id])
+                    .map(|id| &id.schema),
+            )
         {
             schemas.entry(name.clone()).or_insert_with(|| {
                 SchemaOverlay::Present(crate::model::schema::SchemaState {
