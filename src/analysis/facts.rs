@@ -813,10 +813,12 @@ pub enum TableConstraintFact {
     Check {
         constraint_name: Option<String>,
         columns: Vec<String>,
+        columns_complete: bool,
     },
     Exclude {
         constraint_name: Option<String>,
         columns: Vec<String>,
+        columns_complete: bool,
     },
 }
 
@@ -880,6 +882,7 @@ pub enum AlterTableActionFact {
     AddCheckConstraint {
         constraint_name: Option<String>,
         columns: Vec<String>,
+        columns_complete: bool,
         not_valid: bool,
     },
     AddUniqueConstraint {
@@ -895,6 +898,7 @@ pub enum AlterTableActionFact {
     AddExcludeConstraint {
         constraint_name: Option<String>,
         columns: Vec<String>,
+        columns_complete: bool,
     },
     SetNotNull {
         column: String,

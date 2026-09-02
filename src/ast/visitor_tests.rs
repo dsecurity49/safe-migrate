@@ -217,12 +217,22 @@ mod tests {
         assert!(matches!(
             table_constraints.as_slice(),
             [
-                TableConstraintFact::Check { constraint_name: Some(check), columns: check_columns },
-                TableConstraintFact::Exclude { constraint_name: Some(exclude), columns: exclude_columns },
+                TableConstraintFact::Check {
+                    constraint_name: Some(check),
+                    columns: check_columns,
+                    columns_complete: check_complete,
+                },
+                TableConstraintFact::Exclude {
+                    constraint_name: Some(exclude),
+                    columns: exclude_columns,
+                    columns_complete: exclude_complete,
+                },
             ] if check == "reservations_id_check"
                 && check_columns == &["id".to_string()]
                 && exclude == "reservations_period_excl"
                 && exclude_columns == &["period".to_string()]
+                && *check_complete
+                && *exclude_complete
         ));
     }
 
@@ -683,9 +693,11 @@ mod tests {
             [AlterTableActionFact::AddExcludeConstraint {
                 constraint_name,
                 columns,
+                columns_complete,
             }]
                 if constraint_name.as_deref() == Some("no_overlap")
                     && columns == &["period".to_string()]
+                    && *columns_complete
         ));
     }
 
@@ -1677,6 +1689,49 @@ mod tests {
     fn test_expr_ir_is_volatile_omitted() {
         let expr = ExprIr::Omitted;
         assert!(!expr.is_volatile());
+        assert!(expr.contains_opaque());
+    }
+
+    #[test]
+    fn test_expr_ir_opaque_sentinel_is_not_dependency_proof() {
+        assert!(ExprIr::Literal("<case>".into()).contains_opaque());
+        assert!(!ExprIr::Literal("'<'".into()).contains_opaque());
+    }
+
+    #[test]
+    fn test_expr_ir_nested_opaque_sentinel_is_detected() {
+        let expr = ExprIr::BinaryOp {
+            left: Box::new(ExprIr::ColumnRef("id".into())),
+            op: "=".into(),
+            right: Box::new(ExprIr::Literal("<complex>".into())),
+        };
+        assert!(expr.contains_opaque());
+    }
+
+    #[test]
+    fn test_expr_ir_structural_sentinels_are_detected() {
+        assert!(
+            ExprIr::FunctionCall {
+                name: "<fn>".into(),
+                args: vec![]
+            }
+            .contains_opaque()
+        );
+        assert!(
+            ExprIr::BinaryOp {
+                left: Box::new(ExprIr::ColumnRef("id".into())),
+                op: "<op>".into(),
+                right: Box::new(ExprIr::Literal("1".into())),
+            }
+            .contains_opaque()
+        );
+        assert!(
+            ExprIr::Cast {
+                expr: Box::new(ExprIr::ColumnRef("id".into())),
+                target_type: "<type>".into(),
+            }
+            .contains_opaque()
+        );
     }
 
     #[test]
@@ -2088,6 +2143,7 @@ mod tests {
                         constraint_name: Some(name),
                         columns,
                         not_valid: true,
+                        columns_complete: true,
                     }] if name == "events_id_positive"
                         && columns == &["generated_id".to_string()]
                 )

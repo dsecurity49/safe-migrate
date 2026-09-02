@@ -901,15 +901,29 @@ impl AnalysisState {
 
         let mut inline_constraint_names = Vec::new();
         for constraint in &create.table_constraints {
-            let (kind, explicit_name, label, columns) = match constraint {
+            let (kind, explicit_name, label, columns, columns_complete) = match constraint {
                 TableConstraintFact::Check {
                     constraint_name,
                     columns,
-                } => (ConstraintKind::Check, constraint_name, "check", columns),
+                    columns_complete,
+                } => (
+                    ConstraintKind::Check,
+                    constraint_name,
+                    "check",
+                    columns,
+                    columns_complete,
+                ),
                 TableConstraintFact::Exclude {
                     constraint_name,
                     columns,
-                } => (ConstraintKind::Exclusion, constraint_name, "excl", columns),
+                    columns_complete,
+                } => (
+                    ConstraintKind::Exclusion,
+                    constraint_name,
+                    "excl",
+                    columns,
+                    columns_complete,
+                ),
                 _ => continue,
             };
             let name = explicit_name.clone().unwrap_or_else(|| {
@@ -926,7 +940,7 @@ impl AnalysisState {
                     reason: format!("constraint '{}' is specified more than once", name),
                 };
             }
-            inline_constraint_names.push((kind, name, columns.clone()));
+            inline_constraint_names.push((kind, name, columns.clone(), *columns_complete));
         }
 
         self.snapshot_relation(&create.id);
@@ -1135,7 +1149,7 @@ impl AnalysisState {
                 },
             ));
         }
-        for (kind, name, columns) in inline_constraint_names {
+        for (kind, name, columns, columns_complete) in inline_constraint_names {
             self.snapshot_constraint(&create.id, &name);
             self.local.constraints.insert(
                 (create.id.clone(), name.clone()),
@@ -1147,15 +1161,22 @@ impl AnalysisState {
                     backing_index: None,
                 },
             );
-            self.snapshot_graph();
-            self.local.graph.add_edge(DependencyEdge::new(
-                create.id.clone(),
-                create.id.clone(),
-                DependencyKind::ConstraintDependency {
-                    constraint_name: name,
-                    columns,
-                },
-            ));
+            if columns_complete {
+                self.snapshot_graph();
+                self.local.graph.add_edge(DependencyEdge::new(
+                    create.id.clone(),
+                    create.id.clone(),
+                    DependencyKind::ConstraintDependency {
+                        constraint_name: name,
+                        columns,
+                    },
+                ));
+            } else {
+                self.taint(
+                    EvidenceCode::CatalogCoverageIncomplete,
+                    EvidenceScope::Chain,
+                );
+            }
         }
         if let Some(name) = primary_key_constraint_name {
             let columns = create
@@ -2733,6 +2754,7 @@ impl AnalysisState {
                 AlterTableActionMutation::AddCheckConstraint {
                     constraint_name,
                     columns,
+                    columns_complete,
                     not_valid,
                 } => {
                     let constraint_name = constraint_name.clone().unwrap_or_else(|| {
@@ -2761,7 +2783,7 @@ impl AnalysisState {
                             .pending_validation
                             .insert((alter.id.clone(), constraint_name.clone()));
                     }
-                    if !relation_columns_known {
+                    if !relation_columns_known || !columns_complete {
                         self.taint(
                             EvidenceCode::CatalogCoverageIncomplete,
                             EvidenceScope::Chain,
@@ -2885,6 +2907,7 @@ impl AnalysisState {
                 AlterTableActionMutation::AddExcludeConstraint {
                     constraint_name,
                     columns,
+                    columns_complete,
                 } => {
                     let constraint_name = constraint_name.clone().unwrap_or_else(|| {
                         self.next_generated_constraint_name_avoiding(
@@ -2906,7 +2929,7 @@ impl AnalysisState {
                             backing_index: None,
                         },
                     );
-                    if !relation_columns_known {
+                    if !relation_columns_known || !columns_complete {
                         self.taint(
                             EvidenceCode::CatalogCoverageIncomplete,
                             EvidenceScope::Chain,

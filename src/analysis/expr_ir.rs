@@ -21,6 +21,45 @@ pub enum ExprIr {
 }
 
 impl ExprIr {
+    /// Returns whether conversion lost part of the source expression. The
+    /// expression visitor uses these sentinel literals for syntax it cannot
+    /// represent yet; callers that need dependency proof must not treat an
+    /// empty column list from such an expression as a proven constant.
+    pub fn contains_opaque(&self) -> bool {
+        const SENTINELS: &[&str] = &[
+            "<array>",
+            "<between>",
+            "<case>",
+            "<cast_inner>",
+            "<collation>",
+            "<complex>",
+            "<field>",
+            "<fn>",
+            "<index>",
+            "<lhs>",
+            "<op>",
+            "<paren>",
+            "<postfix>",
+            "<prefix>",
+            "<rhs>",
+            "<slice>",
+            "<type>",
+        ];
+        let is_sentinel = |value: &str| SENTINELS.contains(&value);
+        match self {
+            Self::Literal(value) => is_sentinel(value),
+            Self::FunctionCall { name, args } => {
+                is_sentinel(name) || args.iter().any(Self::contains_opaque)
+            }
+            Self::BinaryOp { left, op, right } => {
+                is_sentinel(op) || left.contains_opaque() || right.contains_opaque()
+            }
+            Self::Cast { expr, target_type } => is_sentinel(target_type) || expr.contains_opaque(),
+            Self::ColumnRef(_) => false,
+            Self::Omitted => true,
+        }
+    }
+
     pub fn is_volatile(&self) -> bool {
         match self {
             ExprIr::FunctionCall { name, args } => {

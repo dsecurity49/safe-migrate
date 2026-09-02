@@ -47,6 +47,13 @@ impl AstVisitor {
         columns
     }
 
+    fn expr_columns_with_completeness(
+        expr: crate::analysis::expr_ir::ExprIr,
+    ) -> (Vec<String>, bool) {
+        let complete = !expr.contains_opaque();
+        (Self::expr_columns(expr), complete)
+    }
+
     fn resolve_string_literal(literal: &ast::Literal) -> Option<String> {
         let token = literal.syntax().first_token()?;
         let raw = token.text();
@@ -1179,13 +1186,15 @@ impl AstVisitor {
                         .and_then(|cn| cn.ident_token())
                         .map(|t| Self::resolve_identifier_token(t.text()))
                 });
+            let (columns, columns_complete) = cc
+                .expr()
+                .map(crate::analysis::expr_visitor::ExprVisitor::convert)
+                .map(Self::expr_columns_with_completeness)
+                .unwrap_or((Vec::new(), false));
             return Some(AlterTableActionFact::AddCheckConstraint {
                 constraint_name,
-                columns: cc
-                    .expr()
-                    .map(crate::analysis::expr_visitor::ExprVisitor::convert)
-                    .map(Self::expr_columns)
-                    .unwrap_or_default(),
+                columns,
+                columns_complete,
                 not_valid,
             });
         }
@@ -1256,19 +1265,26 @@ impl AstVisitor {
                 .and_then(|clause| clause.constraint_name())
                 .and_then(|name| name.ident_token())
                 .map(|token| Self::resolve_identifier_token(token.text()));
+            let mut columns_complete = true;
             let columns = exclusion
                 .constraint_exclusion_list()
                 .map(|list| {
                     list.constraint_exclusions()
                         .filter_map(|item| item.expr())
                         .map(crate::analysis::expr_visitor::ExprVisitor::convert)
-                        .flat_map(Self::expr_columns)
+                        .map(Self::expr_columns_with_completeness)
+                        .inspect(|(_, complete)| columns_complete &= *complete)
+                        .flat_map(|(columns, _)| columns)
                         .collect()
                 })
-                .unwrap_or_default();
+                .unwrap_or_else(|| {
+                    columns_complete = false;
+                    Vec::new()
+                });
             return Some(AlterTableActionFact::AddExcludeConstraint {
                 constraint_name,
                 columns,
+                columns_complete,
             });
         }
 
@@ -1303,35 +1319,49 @@ impl AstVisitor {
                     .map(Self::extract_constraint_column_list_names)
                     .or_else(|| uc.using_index().map(|_| Vec::new()))?,
             }),
-            TableConstraint::CheckConstraint(check) => Some(TableConstraintFact::Check {
-                constraint_name: check
-                    .constraint_name_clause()
-                    .and_then(|clause| clause.constraint_name())
-                    .and_then(|name| name.ident_token())
-                    .map(|token| Self::resolve_identifier_token(token.text())),
-                columns: check
+            TableConstraint::CheckConstraint(check) => {
+                let (columns, columns_complete) = check
                     .expr()
                     .map(crate::analysis::expr_visitor::ExprVisitor::convert)
-                    .map(Self::expr_columns)
-                    .unwrap_or_default(),
-            }),
-            TableConstraint::ExcludeConstraint(exclude) => Some(TableConstraintFact::Exclude {
-                constraint_name: exclude
-                    .constraint_name_clause()
-                    .and_then(|clause| clause.constraint_name())
-                    .and_then(|name| name.ident_token())
-                    .map(|token| Self::resolve_identifier_token(token.text())),
-                columns: exclude
+                    .map(Self::expr_columns_with_completeness)
+                    .unwrap_or((Vec::new(), false));
+                Some(TableConstraintFact::Check {
+                    constraint_name: check
+                        .constraint_name_clause()
+                        .and_then(|clause| clause.constraint_name())
+                        .and_then(|name| name.ident_token())
+                        .map(|token| Self::resolve_identifier_token(token.text())),
+                    columns,
+                    columns_complete,
+                })
+            }
+            TableConstraint::ExcludeConstraint(exclude) => {
+                let mut columns_complete = true;
+                let columns = exclude
                     .constraint_exclusion_list()
                     .map(|list| {
                         list.constraint_exclusions()
                             .filter_map(|item| item.expr())
                             .map(crate::analysis::expr_visitor::ExprVisitor::convert)
-                            .flat_map(Self::expr_columns)
+                            .map(Self::expr_columns_with_completeness)
+                            .inspect(|(_, complete)| columns_complete &= *complete)
+                            .flat_map(|(columns, _)| columns)
                             .collect()
                     })
-                    .unwrap_or_default(),
-            }),
+                    .unwrap_or_else(|| {
+                        columns_complete = false;
+                        Vec::new()
+                    });
+                Some(TableConstraintFact::Exclude {
+                    constraint_name: exclude
+                        .constraint_name_clause()
+                        .and_then(|clause| clause.constraint_name())
+                        .and_then(|name| name.ident_token())
+                        .map(|token| Self::resolve_identifier_token(token.text())),
+                    columns,
+                    columns_complete,
+                })
+            }
             _ => None,
         }
     }

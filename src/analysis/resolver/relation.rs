@@ -165,10 +165,12 @@ impl Resolver {
                 AlterTableActionFact::AddCheckConstraint {
                     constraint_name,
                     columns,
+                    columns_complete,
                     not_valid,
                 } => AlterTableActionMutation::AddCheckConstraint {
                     constraint_name: constraint_name.clone(),
                     columns: columns.clone(),
+                    columns_complete: *columns_complete,
                     not_valid: *not_valid,
                 },
                 AlterTableActionFact::AddUniqueConstraint {
@@ -196,9 +198,11 @@ impl Resolver {
                 AlterTableActionFact::AddExcludeConstraint {
                     constraint_name,
                     columns,
+                    columns_complete,
                 } => AlterTableActionMutation::AddExcludeConstraint {
                     constraint_name: constraint_name.clone(),
                     columns: columns.clone(),
+                    columns_complete: *columns_complete,
                 },
                 AlterTableActionFact::SetNotNull { column } => {
                     AlterTableActionMutation::SetNotNull {

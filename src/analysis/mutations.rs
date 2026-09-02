@@ -612,6 +612,7 @@ pub enum AlterTableActionMutation {
     AddCheckConstraint {
         constraint_name: Option<String>,
         columns: Vec<String>,
+        columns_complete: bool,
         not_valid: bool,
     },
     AddUniqueConstraint {
@@ -627,6 +628,7 @@ pub enum AlterTableActionMutation {
     AddExcludeConstraint {
         constraint_name: Option<String>,
         columns: Vec<String>,
+        columns_complete: bool,
     },
     SetNotNull {
         column: String,
