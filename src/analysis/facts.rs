@@ -812,9 +812,11 @@ pub enum TableConstraintFact {
     },
     Check {
         constraint_name: Option<String>,
+        columns: Vec<String>,
     },
     Exclude {
         constraint_name: Option<String>,
+        columns: Vec<String>,
     },
 }
 

@@ -901,13 +901,15 @@ impl AnalysisState {
 
         let mut inline_constraint_names = Vec::new();
         for constraint in &create.table_constraints {
-            let (kind, explicit_name, label) = match constraint {
-                TableConstraintFact::Check { constraint_name } => {
-                    (ConstraintKind::Check, constraint_name, "check")
-                }
-                TableConstraintFact::Exclude { constraint_name } => {
-                    (ConstraintKind::Exclusion, constraint_name, "excl")
-                }
+            let (kind, explicit_name, label, columns) = match constraint {
+                TableConstraintFact::Check {
+                    constraint_name,
+                    columns,
+                } => (ConstraintKind::Check, constraint_name, "check", columns),
+                TableConstraintFact::Exclude {
+                    constraint_name,
+                    columns,
+                } => (ConstraintKind::Exclusion, constraint_name, "excl", columns),
                 _ => continue,
             };
             let name = explicit_name.clone().unwrap_or_else(|| {
@@ -924,7 +926,7 @@ impl AnalysisState {
                     reason: format!("constraint '{}' is specified more than once", name),
                 };
             }
-            inline_constraint_names.push((kind, name));
+            inline_constraint_names.push((kind, name, columns.clone()));
         }
 
         self.snapshot_relation(&create.id);
@@ -1133,18 +1135,27 @@ impl AnalysisState {
                 },
             ));
         }
-        for (kind, name) in inline_constraint_names {
+        for (kind, name, columns) in inline_constraint_names {
             self.snapshot_constraint(&create.id, &name);
             self.local.constraints.insert(
                 (create.id.clone(), name.clone()),
                 ConstraintState {
                     table_id: create.id.clone(),
-                    name,
+                    name: name.clone(),
                     kind,
                     validated: true,
                     backing_index: None,
                 },
             );
+            self.snapshot_graph();
+            self.local.graph.add_edge(DependencyEdge::new(
+                create.id.clone(),
+                create.id.clone(),
+                DependencyKind::ConstraintDependency {
+                    constraint_name: name,
+                    columns,
+                },
+            ));
         }
         if let Some(name) = primary_key_constraint_name {
             let columns = create

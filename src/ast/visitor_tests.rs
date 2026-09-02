@@ -217,9 +217,12 @@ mod tests {
         assert!(matches!(
             table_constraints.as_slice(),
             [
-                TableConstraintFact::Check { constraint_name: Some(check) },
-                TableConstraintFact::Exclude { constraint_name: Some(exclude) },
-            ] if check == "reservations_id_check" && exclude == "reservations_period_excl"
+                TableConstraintFact::Check { constraint_name: Some(check), columns: check_columns },
+                TableConstraintFact::Exclude { constraint_name: Some(exclude), columns: exclude_columns },
+            ] if check == "reservations_id_check"
+                && check_columns == &["id".to_string()]
+                && exclude == "reservations_period_excl"
+                && exclude_columns == &["period".to_string()]
         ));
     }
 

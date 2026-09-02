@@ -20,6 +20,33 @@ use squawk_syntax::{SyntaxKind, ast};
 pub struct AstVisitor;
 
 impl AstVisitor {
+    fn expr_columns(expr: crate::analysis::expr_ir::ExprIr) -> Vec<String> {
+        fn walk(expr: crate::analysis::expr_ir::ExprIr, columns: &mut Vec<String>) {
+            use crate::analysis::expr_ir::ExprIr;
+            match expr {
+                ExprIr::ColumnRef(name) => {
+                    if !columns.contains(&name) {
+                        columns.push(name);
+                    }
+                }
+                ExprIr::FunctionCall { args, .. } => {
+                    for arg in args {
+                        walk(arg, columns);
+                    }
+                }
+                ExprIr::BinaryOp { left, right, .. } => {
+                    walk(*left, columns);
+                    walk(*right, columns);
+                }
+                ExprIr::Cast { expr, .. } => walk(*expr, columns),
+                ExprIr::Literal(_) | ExprIr::Omitted => {}
+            }
+        }
+        let mut columns = Vec::new();
+        walk(expr, &mut columns);
+        columns
+    }
+
     fn resolve_string_literal(literal: &ast::Literal) -> Option<String> {
         let token = literal.syntax().first_token()?;
         let raw = token.text();
@@ -1264,6 +1291,11 @@ impl AstVisitor {
                     .and_then(|clause| clause.constraint_name())
                     .and_then(|name| name.ident_token())
                     .map(|token| Self::resolve_identifier_token(token.text())),
+                columns: check
+                    .expr()
+                    .map(crate::analysis::expr_visitor::ExprVisitor::convert)
+                    .map(Self::expr_columns)
+                    .unwrap_or_default(),
             }),
             TableConstraint::ExcludeConstraint(exclude) => Some(TableConstraintFact::Exclude {
                 constraint_name: exclude
@@ -1271,6 +1303,16 @@ impl AstVisitor {
                     .and_then(|clause| clause.constraint_name())
                     .and_then(|name| name.ident_token())
                     .map(|token| Self::resolve_identifier_token(token.text())),
+                columns: exclude
+                    .constraint_exclusion_list()
+                    .map(|list| {
+                        list.constraint_exclusions()
+                            .filter_map(|item| item.expr())
+                            .map(crate::analysis::expr_visitor::ExprVisitor::convert)
+                            .flat_map(Self::expr_columns)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             }),
             _ => None,
         }
