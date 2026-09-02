@@ -1564,6 +1564,7 @@
       "fixtures": [
         "001_grant_public.sql",
         "002_grant_all.sql",
+        "003_grant_with_option.sql",
         "004_grant_all_public.sql",
         "005_grant_all_in_schema.sql",
         "006_grant_insert_public.sql",
@@ -1577,12 +1578,8 @@
       ],
       "excluded_fixtures": [
         {
-          "fixture": "003_grant_with_option.sql",
-          "reason": "Grant-option identity is not yet represented in RelationState privilege entries."
-        },
-        {
           "fixture": "009_grant_select_with_grant_option.sql",
-          "reason": "Grant-option identity is not yet represented in RelationState privilege entries."
+          "reason": "PostgreSQL rejects GRANT OPTION for PUBLIC (SQLSTATE 0LP01); the fixture is not executable against the live oracle."
         },
         {
           "fixture": "safe_006_grant_select_columns.sql",
