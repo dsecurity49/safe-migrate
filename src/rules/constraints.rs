@@ -166,6 +166,7 @@ impl Rule for BlockingConstraintRule {
                 AlterTableActionMutation::AddCheckConstraint {
                     constraint_name,
                     not_valid: false,
+                    ..
                 } => {
                     let name_str = constraint_name.as_deref().unwrap_or("<unnamed>");
                     let mut reason = format!(

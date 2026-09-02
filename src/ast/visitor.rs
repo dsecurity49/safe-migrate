@@ -1181,6 +1181,11 @@ impl AstVisitor {
                 });
             return Some(AlterTableActionFact::AddCheckConstraint {
                 constraint_name,
+                columns: cc
+                    .expr()
+                    .map(crate::analysis::expr_visitor::ExprVisitor::convert)
+                    .map(Self::expr_columns)
+                    .unwrap_or_default(),
                 not_valid,
             });
         }
@@ -1251,7 +1256,20 @@ impl AstVisitor {
                 .and_then(|clause| clause.constraint_name())
                 .and_then(|name| name.ident_token())
                 .map(|token| Self::resolve_identifier_token(token.text()));
-            return Some(AlterTableActionFact::AddExcludeConstraint { constraint_name });
+            let columns = exclusion
+                .constraint_exclusion_list()
+                .map(|list| {
+                    list.constraint_exclusions()
+                        .filter_map(|item| item.expr())
+                        .map(crate::analysis::expr_visitor::ExprVisitor::convert)
+                        .flat_map(Self::expr_columns)
+                        .collect()
+                })
+                .unwrap_or_default();
+            return Some(AlterTableActionFact::AddExcludeConstraint {
+                constraint_name,
+                columns,
+            });
         }
 
         None

@@ -680,8 +680,12 @@ mod tests {
         };
         assert!(matches!(
             actions.as_slice(),
-            [AlterTableActionFact::AddExcludeConstraint { constraint_name }]
+            [AlterTableActionFact::AddExcludeConstraint {
+                constraint_name,
+                columns,
+            }]
                 if constraint_name.as_deref() == Some("no_overlap")
+                    && columns == &["period".to_string()]
         ));
     }
 
@@ -2082,8 +2086,10 @@ mod tests {
                     actions.as_slice(),
                     [AlterTableActionFact::AddCheckConstraint {
                         constraint_name: Some(name),
+                        columns,
                         not_valid: true,
                     }] if name == "events_id_positive"
+                        && columns == &["generated_id".to_string()]
                 )
         ));
         assert!(matches!(

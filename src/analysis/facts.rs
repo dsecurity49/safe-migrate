@@ -879,6 +879,7 @@ pub enum AlterTableActionFact {
     },
     AddCheckConstraint {
         constraint_name: Option<String>,
+        columns: Vec<String>,
         not_valid: bool,
     },
     AddUniqueConstraint {
@@ -893,6 +894,7 @@ pub enum AlterTableActionFact {
     },
     AddExcludeConstraint {
         constraint_name: Option<String>,
+        columns: Vec<String>,
     },
     SetNotNull {
         column: String,

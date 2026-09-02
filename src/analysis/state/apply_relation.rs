@@ -1558,7 +1558,9 @@ impl AnalysisState {
                     };
                 }
             }
-            AlterTableActionMutation::AddExcludeConstraint { constraint_name } => {
+            AlterTableActionMutation::AddExcludeConstraint {
+                constraint_name, ..
+            } => {
                 let name = constraint_name.clone().unwrap_or_else(|| {
                     self.next_generated_constraint_name_avoiding(
                         &alter.id,
@@ -2730,6 +2732,7 @@ impl AnalysisState {
                 }
                 AlterTableActionMutation::AddCheckConstraint {
                     constraint_name,
+                    columns,
                     not_valid,
                 } => {
                     let constraint_name = constraint_name.clone().unwrap_or_else(|| {
@@ -2757,6 +2760,22 @@ impl AnalysisState {
                         self.local
                             .pending_validation
                             .insert((alter.id.clone(), constraint_name.clone()));
+                    }
+                    if !relation_columns_known {
+                        self.taint(
+                            EvidenceCode::CatalogCoverageIncomplete,
+                            EvidenceScope::Chain,
+                        );
+                    } else {
+                        self.snapshot_graph();
+                        self.local.graph.add_edge(DependencyEdge::new(
+                            alter.id.clone(),
+                            alter.id.clone(),
+                            DependencyKind::ConstraintDependency {
+                                constraint_name,
+                                columns: columns.clone(),
+                            },
+                        ));
                     }
                 }
                 AlterTableActionMutation::AddUniqueConstraint {
@@ -2863,7 +2882,10 @@ impl AnalysisState {
                         ));
                     }
                 }
-                AlterTableActionMutation::AddExcludeConstraint { constraint_name } => {
+                AlterTableActionMutation::AddExcludeConstraint {
+                    constraint_name,
+                    columns,
+                } => {
                     let constraint_name = constraint_name.clone().unwrap_or_else(|| {
                         self.next_generated_constraint_name_avoiding(
                             &alter.id,
@@ -2878,12 +2900,28 @@ impl AnalysisState {
                         (alter.id.clone(), constraint_name.clone()),
                         ConstraintState {
                             table_id: alter.id.clone(),
-                            name: constraint_name,
+                            name: constraint_name.clone(),
                             kind: ConstraintKind::Exclusion,
                             validated: true,
                             backing_index: None,
                         },
                     );
+                    if !relation_columns_known {
+                        self.taint(
+                            EvidenceCode::CatalogCoverageIncomplete,
+                            EvidenceScope::Chain,
+                        );
+                    } else {
+                        self.snapshot_graph();
+                        self.local.graph.add_edge(DependencyEdge::new(
+                            alter.id.clone(),
+                            alter.id.clone(),
+                            DependencyKind::ConstraintDependency {
+                                constraint_name,
+                                columns: columns.clone(),
+                            },
+                        ));
+                    }
                 }
                 AlterTableActionMutation::ValidateConstraint { constraint_name } => {
                     self.snapshot_constraint(&alter.id, constraint_name);

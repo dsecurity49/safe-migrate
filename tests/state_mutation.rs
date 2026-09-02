@@ -4237,8 +4237,23 @@ mod state_mutation_tests {
         use safe_migrate::model::constraint::ConstraintKind;
 
         let engine = setup_engine();
-        let mut state =
-            safe_migrate::AnalysisState::new(cache_with_table("public", "t_large", None));
+        let mut cache = cache_with_table("public", "t_large", None);
+        cache
+            .relations
+            .get_mut(&object_id("public", "t_large"))
+            .expect("baseline table")
+            .columns
+            .push(Column {
+                name: "id".to_string(),
+                data_type: Some("integer".to_string()),
+                type_id: None,
+                is_nullable: true,
+                default: None,
+                avg_width: None,
+                default_expr_text: None,
+                type_modifier: Some(-1),
+            });
+        let mut state = safe_migrate::AnalysisState::new(cache);
         engine
             .analyze(
                 "ALTER TABLE t_large ADD CONSTRAINT positive_id CHECK (id > 0);",
@@ -4253,6 +4268,15 @@ mod state_mutation_tests {
             .expect("check constraint should be represented");
         assert_eq!(constraint.kind, ConstraintKind::Check);
         assert!(constraint.validated);
+        assert!(state.local.graph.edges().iter().any(|edge| {
+            matches!(
+                &edge.kind,
+                safe_migrate::analysis::graph::DependencyKind::ConstraintDependency {
+                    constraint_name,
+                    columns,
+                } if constraint_name == "positive_id" && columns == &["id".to_string()]
+            )
+        }));
     }
 
     #[test]

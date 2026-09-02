@@ -164,9 +164,11 @@ impl Resolver {
                 },
                 AlterTableActionFact::AddCheckConstraint {
                     constraint_name,
+                    columns,
                     not_valid,
                 } => AlterTableActionMutation::AddCheckConstraint {
                     constraint_name: constraint_name.clone(),
+                    columns: columns.clone(),
                     not_valid: *not_valid,
                 },
                 AlterTableActionFact::AddUniqueConstraint {
@@ -191,11 +193,13 @@ impl Resolver {
                         .as_ref()
                         .map(|name| Self::resolve_constraint_index_name(name, &id)),
                 },
-                AlterTableActionFact::AddExcludeConstraint { constraint_name } => {
-                    AlterTableActionMutation::AddExcludeConstraint {
-                        constraint_name: constraint_name.clone(),
-                    }
-                }
+                AlterTableActionFact::AddExcludeConstraint {
+                    constraint_name,
+                    columns,
+                } => AlterTableActionMutation::AddExcludeConstraint {
+                    constraint_name: constraint_name.clone(),
+                    columns: columns.clone(),
+                },
                 AlterTableActionFact::SetNotNull { column } => {
                     AlterTableActionMutation::SetNotNull {
                         column: column.clone(),
