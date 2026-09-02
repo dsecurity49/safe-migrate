@@ -32,7 +32,7 @@ body:
       label: Analysis baseline
       options:
         - Fresh `safe-migrate sync`
-        - Existing Cache V6
+        - Existing Cache V7
         - '`auto_sync = true`'
         - '`--no-cache`'
     validations:

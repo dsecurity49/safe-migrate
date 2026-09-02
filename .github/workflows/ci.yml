@@ -263,7 +263,7 @@ jobs:
         run: |
           test "$SYNC_STATUS" = "refreshed"
           test "$BASELINE_SOURCE" = "synced"
-          test "$CACHE_PATH" = "$HOME/.cache/safe-migrate-action/baselines/action-smoke/baseline-v6.cache"
+          test "$CACHE_PATH" = "$HOME/.cache/safe-migrate-action/baselines/action-smoke/baseline-v7.cache"
           jq -e '.baseline.auto_sync == "bypassed"' "$JSON_REPORT"
           grep -q -- '--no-auto-sync bypasses configured automatic cache sync' \
             "$DIAGNOSTIC_LOG"
