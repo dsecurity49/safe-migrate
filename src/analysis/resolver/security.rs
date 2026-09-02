@@ -65,7 +65,7 @@ impl Resolver {
     pub(super) fn resolve_revoke(fact: &RevokeFact, state: &AnalysisState) -> Mutation {
         Mutation::Revoke(RevokeMutation {
             grant_option_only: fact.grant_option_only,
-            role_option: fact.role_option.clone(),
+            role_option: fact.role_option,
             privileges: fact.privileges.clone(),
             target: Self::resolve_grant_target(&fact.target, state),
             revokees: fact.revokees.clone(),

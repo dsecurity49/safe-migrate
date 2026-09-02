@@ -680,7 +680,7 @@ pub struct RevokeFact {
 /// Per-membership option supported by PostgreSQL 16+ role grants. The option
 /// name and value are kept typed at extraction time so state transitions never
 /// need to infer semantics from raw SQL text.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum RoleMembershipOptionFact {
     Admin(bool),
     Inherit(bool),

@@ -24,6 +24,8 @@ fn cache_with_public_schema() -> DbCache {
             is_superuser: true,
             inherits: true,
             member_of: Vec::new(),
+            can_administer_membership: Vec::new(),
+            can_inherit_from: Vec::new(),
             can_set_role_to: Vec::new(),
         },
     );

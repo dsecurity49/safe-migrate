@@ -1253,6 +1253,8 @@ fn required_role_edges_distinguish_missing_roles_from_incorrect_edges() {
                 is_superuser: false,
                 inherits: true,
                 member_of: Vec::new(),
+                can_administer_membership: Vec::new(),
+                can_inherit_from: Vec::new(),
                 can_set_role_to: Vec::new(),
             },
         );

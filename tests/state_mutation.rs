@@ -688,7 +688,7 @@ mod state_mutation_tests {
     }
 
     #[test]
-    fn cascades_taint_when_a_scoped_dependent_is_omitted() {
+    fn scoped_drop_with_incomplete_dependency_coverage_stays_unchanged() {
         let in_scope_table = object_id("app", "base");
         let omitted_view = object_id("tenant", "v");
         let mut cache = DbCache::new();
@@ -721,10 +721,10 @@ mod state_mutation_tests {
             !violations
                 .iter()
                 .any(|violation| violation.rule_id == "chain-conflict"),
-            "known cascade should execute: {violations:?}"
+            "coverage uncertainty should skip without inventing a conflict: {violations:?}"
         );
         assert_eq!(state.local.confidence, Confidence::Tainted);
-        assert!(!state.relation_is_present(&in_scope_table));
+        assert!(state.relation_is_present(&in_scope_table));
     }
 
     #[test]
@@ -4824,6 +4824,8 @@ mod state_mutation_tests {
                     is_superuser: superuser,
                     inherits: true,
                     member_of: Vec::new(),
+                    can_administer_membership: Vec::new(),
+                    can_inherit_from: Vec::new(),
                     can_set_role_to: Vec::new(),
                 },
             );
@@ -5043,6 +5045,8 @@ mod state_mutation_tests {
                     is_superuser: superuser,
                     inherits: true,
                     member_of: Vec::new(),
+                    can_administer_membership: Vec::new(),
+                    can_inherit_from: Vec::new(),
                     can_set_role_to: Vec::new(),
                 },
             );
@@ -5169,6 +5173,8 @@ mod state_mutation_tests {
                 is_superuser: false,
                 inherits: true,
                 member_of: Vec::new(),
+                can_administer_membership: Vec::new(),
+                can_inherit_from: Vec::new(),
                 can_set_role_to: Vec::new(),
             },
         );
@@ -5205,6 +5211,8 @@ mod state_mutation_tests {
                     is_superuser: false,
                     inherits: true,
                     member_of: can_set_role_to.clone(),
+                    can_administer_membership: Vec::new(),
+                    can_inherit_from: Vec::new(),
                     can_set_role_to,
                 },
             );
@@ -5247,6 +5255,8 @@ mod state_mutation_tests {
                     is_superuser: false,
                     inherits: true,
                     member_of,
+                    can_administer_membership: Vec::new(),
+                    can_inherit_from: Vec::new(),
                     can_set_role_to: Vec::new(),
                 },
             );
@@ -5275,6 +5285,8 @@ mod state_mutation_tests {
                     is_superuser: false,
                     inherits: true,
                     member_of: Vec::new(),
+                    can_administer_membership: Vec::new(),
+                    can_inherit_from: Vec::new(),
                     can_set_role_to: Vec::new(),
                 },
             );
@@ -5316,6 +5328,58 @@ mod state_mutation_tests {
     }
 
     #[test]
+    fn role_membership_admin_and_inherit_options_round_trip() {
+        let engine = setup_engine();
+        let mut cache = DbCache::new();
+        for name in ["member", "parent"] {
+            let id = object_id("", name);
+            cache.roles.insert(
+                id.clone(),
+                RoleState {
+                    id,
+                    can_login: false,
+                    is_superuser: false,
+                    inherits: true,
+                    member_of: Vec::new(),
+                    can_administer_membership: Vec::new(),
+                    can_inherit_from: Vec::new(),
+                    can_set_role_to: Vec::new(),
+                },
+            );
+        }
+        let mut state = safe_migrate::AnalysisState::new(cache);
+
+        let violations = engine
+            .analyze(
+                "GRANT parent TO member WITH ADMIN TRUE, INHERIT FALSE, SET FALSE;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(!violations.iter().any(|v| v.rule_id == "chain-conflict"));
+        let RoleOverlay::Present(role) = state.local.roles.get(&object_id("", "member")).unwrap()
+        else {
+            panic!("member role unexpectedly dropped");
+        };
+        assert_eq!(role.member_of, vec![object_id("", "parent")]);
+        assert_eq!(
+            role.can_administer_membership,
+            vec![object_id("", "parent")]
+        );
+        assert!(role.can_inherit_from.is_empty());
+        assert!(role.can_set_role_to.is_empty());
+
+        engine
+            .analyze("REVOKE ADMIN OPTION FOR parent FROM member;", &mut state)
+            .unwrap();
+        let RoleOverlay::Present(role) = state.local.roles.get(&object_id("", "member")).unwrap()
+        else {
+            panic!("member role unexpectedly dropped");
+        };
+        assert!(role.can_administer_membership.is_empty());
+        assert_eq!(role.member_of, vec![object_id("", "parent")]);
+    }
+
+    #[test]
     fn role_grant_to_public_is_rejected_before_partial_mutation() {
         let engine = setup_engine();
         let mut cache = DbCache::new();
@@ -5329,6 +5393,8 @@ mod state_mutation_tests {
                     is_superuser: false,
                     inherits: true,
                     member_of: Vec::new(),
+                    can_administer_membership: Vec::new(),
+                    can_inherit_from: Vec::new(),
                     can_set_role_to: Vec::new(),
                 },
             );
@@ -5362,6 +5428,8 @@ mod state_mutation_tests {
                     is_superuser: false,
                     inherits: true,
                     member_of: Vec::new(),
+                    can_administer_membership: Vec::new(),
+                    can_inherit_from: Vec::new(),
                     can_set_role_to: Vec::new(),
                 },
             );

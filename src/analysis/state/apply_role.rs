@@ -1,6 +1,6 @@
 use super::{AnalysisState, MutationResult, ObjectLookup};
 use crate::analysis::evidence::{EvidenceCode, EvidenceScope};
-use crate::analysis::facts::RoleFact;
+use crate::analysis::facts::{RoleFact, RoleMembershipOptionFact};
 use crate::analysis::mutations::{
     AlterRoleMutation, CreateRoleMutation, DropRoleMutation, GrantMutation, ResolvedGrantTarget,
     RevokeMutation,
@@ -46,6 +46,8 @@ impl AnalysisState {
                 is_superuser: false,
                 inherits: role.inherits,
                 member_of: Vec::new(),
+                can_administer_membership: Vec::new(),
+                can_inherit_from: Vec::new(),
                 can_set_role_to: Vec::new(),
             }),
         );
@@ -190,19 +192,47 @@ impl AnalysisState {
                 }
             }
             ResolvedGrantTarget::Roles(parents) => {
-                let set_value = match grant.role_options.as_slice() {
-                    // PostgreSQL's default for a role grant is to permit
-                    // SET ROLE; an explicit `SET FALSE` is the opt-out.
-                    [] => Some(true),
-                    [crate::analysis::facts::RoleMembershipOptionFact::Set(value)] => Some(*value),
-                    _ => None,
-                };
+                let mut admin_value = None;
+                let mut inherit_value = None;
+                let mut set_value = None;
+                for option in &grant.role_options {
+                    let slot = match option {
+                        RoleMembershipOptionFact::Admin(_) => &mut admin_value,
+                        RoleMembershipOptionFact::Inherit(_) => &mut inherit_value,
+                        RoleMembershipOptionFact::Set(_) => &mut set_value,
+                    };
+                    if slot
+                        .replace(match option {
+                            RoleMembershipOptionFact::Admin(value)
+                            | RoleMembershipOptionFact::Inherit(value)
+                            | RoleMembershipOptionFact::Set(value) => *value,
+                        })
+                        .is_some()
+                    {
+                        self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
+                        return MutationResult::Skipped;
+                    }
+                }
+                // PostgreSQL defaults a newly granted membership to inherit
+                // and permit SET ROLE; ADMIN remains opt-in. Explicit options
+                // override only their own membership capability.
+                let inherit_value =
+                    inherit_value.or_else(|| grant.role_options.is_empty().then_some(true));
+                let set_value = set_value.or_else(|| grant.role_options.is_empty().then_some(true));
                 if (grant.role_options.is_empty() && grant.with_grant_option)
-                    || (!grant.role_options.is_empty() && set_value.is_none())
                     || grant.granted_by.is_some()
                 {
                     self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
                     return MutationResult::Skipped;
+                }
+                if admin_value.is_some()
+                    || inherit_value.is_some() && !grant.role_options.is_empty()
+                {
+                    // The normalized option state is retained for future
+                    // authorization/inherited-privilege consumers, but the
+                    // current privilege engine cannot yet prove those
+                    // transitive effects exactly.
+                    self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
                 }
                 if grantees.iter().any(|member| member.name == "public") {
                     self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
@@ -255,6 +285,21 @@ impl AnalysisState {
                     for parent in parents {
                         if !role.member_of.contains(parent) {
                             role.member_of.push(parent.clone());
+                        }
+                        if admin_value == Some(true) {
+                            if !role.can_administer_membership.contains(parent) {
+                                role.can_administer_membership.push(parent.clone());
+                            }
+                        } else if admin_value == Some(false) {
+                            role.can_administer_membership
+                                .retain(|target| target != parent);
+                        }
+                        if inherit_value == Some(true) {
+                            if !role.can_inherit_from.contains(parent) {
+                                role.can_inherit_from.push(parent.clone());
+                            }
+                        } else if inherit_value == Some(false) {
+                            role.can_inherit_from.retain(|target| target != parent);
                         }
                         if set_value == Some(true) {
                             if !role.can_set_role_to.contains(parent) {
@@ -325,13 +370,28 @@ impl AnalysisState {
                     self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
                     return MutationResult::Skipped;
                 }
-                let revoke_set_only = matches!(
-                    revoke.role_option,
-                    Some(crate::analysis::facts::RoleMembershipOptionFact::Set(false))
-                );
-                if revoke.role_option.is_some() && !revoke_set_only {
+                let revoke_option = match revoke.role_option.as_ref() {
+                    None => None,
+                    Some(RoleMembershipOptionFact::Admin(false)) => {
+                        Some(RoleMembershipOptionFact::Admin(false))
+                    }
+                    Some(RoleMembershipOptionFact::Inherit(false)) => {
+                        Some(RoleMembershipOptionFact::Inherit(false))
+                    }
+                    Some(RoleMembershipOptionFact::Set(false)) => {
+                        Some(RoleMembershipOptionFact::Set(false))
+                    }
+                    Some(_) => {
+                        self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
+                        return MutationResult::Skipped;
+                    }
+                };
+                if matches!(
+                    revoke_option,
+                    Some(RoleMembershipOptionFact::Admin(false))
+                        | Some(RoleMembershipOptionFact::Inherit(false))
+                ) {
                     self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
-                    return MutationResult::Skipped;
                 }
                 if revokees.iter().any(|member| member.name == "public") {
                     self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
@@ -343,9 +403,25 @@ impl AnalysisState {
                         continue;
                     };
                     for parent in parents {
-                        role.can_set_role_to.retain(|target| target != parent);
-                        if !revoke_set_only {
-                            role.member_of.retain(|target| target != parent);
+                        match revoke_option {
+                            Some(RoleMembershipOptionFact::Admin(false)) => {
+                                role.can_administer_membership
+                                    .retain(|target| target != parent);
+                            }
+                            Some(RoleMembershipOptionFact::Inherit(false)) => {
+                                role.can_inherit_from.retain(|target| target != parent);
+                            }
+                            Some(RoleMembershipOptionFact::Set(false)) => {
+                                role.can_set_role_to.retain(|target| target != parent);
+                            }
+                            None => {
+                                role.can_administer_membership
+                                    .retain(|target| target != parent);
+                                role.can_inherit_from.retain(|target| target != parent);
+                                role.can_set_role_to.retain(|target| target != parent);
+                                role.member_of.retain(|target| target != parent);
+                            }
+                            Some(_) => unreachable!(),
                         }
                     }
                 }

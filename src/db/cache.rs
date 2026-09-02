@@ -1013,6 +1013,36 @@ impl DbCache {
                     ));
                 }
             }
+            let mut admin_targets = HashSet::new();
+            for target in &role.can_administer_membership {
+                if !memberships.contains(target) {
+                    return Err(format!(
+                        "role '{}' has ADMIN option for '{}' without membership",
+                        id.name, target.name
+                    ));
+                }
+                if !admin_targets.insert(target) {
+                    return Err(format!(
+                        "role '{}' contains duplicate ADMIN target '{}'",
+                        id.name, target.name
+                    ));
+                }
+            }
+            let mut inherit_targets = HashSet::new();
+            for target in &role.can_inherit_from {
+                if !memberships.contains(target) {
+                    return Err(format!(
+                        "role '{}' has INHERIT option for '{}' without membership",
+                        id.name, target.name
+                    ));
+                }
+                if !inherit_targets.insert(target) {
+                    return Err(format!(
+                        "role '{}' contains duplicate INHERIT target '{}'",
+                        id.name, target.name
+                    ));
+                }
+            }
         }
 
         let mut constraint_ids = HashSet::new();
@@ -1935,6 +1965,8 @@ mod tests {
                 is_superuser: false,
                 inherits: true,
                 member_of: Vec::new(),
+                can_administer_membership: Vec::new(),
+                can_inherit_from: Vec::new(),
                 can_set_role_to: vec![parent.clone()],
             },
         );
@@ -1946,12 +1978,50 @@ mod tests {
                 is_superuser: false,
                 inherits: true,
                 member_of: Vec::new(),
+                can_administer_membership: Vec::new(),
+                can_inherit_from: Vec::new(),
                 can_set_role_to: Vec::new(),
             },
         );
 
         let error = cache.validate_semantics().unwrap_err();
         assert!(error.contains("SET ROLE access") && error.contains("without membership"));
+    }
+
+    #[test]
+    fn current_cache_rejects_membership_options_without_membership() {
+        let member = ObjectId::new("", "member");
+        let parent = ObjectId::new("", "parent");
+        let mut cache = DbCache::new();
+        cache.roles.insert(
+            member.clone(),
+            RoleState {
+                id: member,
+                can_login: true,
+                is_superuser: false,
+                inherits: true,
+                member_of: Vec::new(),
+                can_administer_membership: vec![parent.clone()],
+                can_inherit_from: Vec::new(),
+                can_set_role_to: Vec::new(),
+            },
+        );
+        cache.roles.insert(
+            parent.clone(),
+            RoleState {
+                id: parent,
+                can_login: false,
+                is_superuser: false,
+                inherits: true,
+                member_of: Vec::new(),
+                can_administer_membership: Vec::new(),
+                can_inherit_from: Vec::new(),
+                can_set_role_to: Vec::new(),
+            },
+        );
+
+        let error = cache.validate_semantics().unwrap_err();
+        assert!(error.contains("ADMIN option") && error.contains("without membership"));
     }
 
     #[test]
@@ -1967,6 +2037,8 @@ mod tests {
                 is_superuser: false,
                 inherits: true,
                 member_of: vec![second.clone()],
+                can_administer_membership: Vec::new(),
+                can_inherit_from: Vec::new(),
                 can_set_role_to: vec![second.clone()],
             },
         );
@@ -1978,6 +2050,8 @@ mod tests {
                 is_superuser: false,
                 inherits: true,
                 member_of: vec![first.clone()],
+                can_administer_membership: Vec::new(),
+                can_inherit_from: Vec::new(),
                 can_set_role_to: vec![first],
             },
         );
@@ -1998,6 +2072,8 @@ mod tests {
                 is_superuser: false,
                 inherits: true,
                 member_of: Vec::new(),
+                can_administer_membership: Vec::new(),
+                can_inherit_from: Vec::new(),
                 can_set_role_to: Vec::new(),
             },
         );
@@ -2019,6 +2095,8 @@ mod tests {
                 is_superuser: false,
                 inherits: true,
                 member_of: vec![parent.clone()],
+                can_administer_membership: Vec::new(),
+                can_inherit_from: Vec::new(),
                 can_set_role_to: vec![parent.clone()],
             },
         );
@@ -2030,6 +2108,8 @@ mod tests {
                 is_superuser: false,
                 inherits: true,
                 member_of: Vec::new(),
+                can_administer_membership: Vec::new(),
+                can_inherit_from: Vec::new(),
                 can_set_role_to: Vec::new(),
             },
         );
@@ -2117,6 +2197,8 @@ mod tests {
                 is_superuser: false,
                 inherits: true,
                 member_of: Vec::new(),
+                can_administer_membership: Vec::new(),
+                can_inherit_from: Vec::new(),
                 can_set_role_to: Vec::new(),
             },
         );
@@ -2181,6 +2263,8 @@ mod tests {
                 is_superuser: false,
                 inherits: true,
                 member_of: Vec::new(),
+                can_administer_membership: Vec::new(),
+                can_inherit_from: Vec::new(),
                 can_set_role_to: Vec::new(),
             },
         );
@@ -2726,6 +2810,8 @@ mod tests {
                 is_superuser: false,
                 inherits: true,
                 member_of: vec![ObjectId::new("", "missing")],
+                can_administer_membership: Vec::new(),
+                can_inherit_from: Vec::new(),
                 can_set_role_to: Vec::new(),
             },
         );

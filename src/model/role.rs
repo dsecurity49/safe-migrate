@@ -10,6 +10,10 @@ pub struct RoleState {
     /// `NOINHERIT` is role state, not a property of an individual grant.
     pub inherits: bool,
     pub member_of: Vec<ObjectId>, // roles this role is a member of
+    /// Memberships for which this role has the PostgreSQL ADMIN option.
+    pub can_administer_membership: Vec<ObjectId>,
+    /// Memberships whose privileges this role inherits directly.
+    pub can_inherit_from: Vec<ObjectId>,
     /// Roles this role may select with `SET ROLE`. PostgreSQL 16+ can grant
     /// membership without the SET option, so this is deliberately distinct
     /// from inherited membership.

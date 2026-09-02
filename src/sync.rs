@@ -979,18 +979,22 @@ fn load_roles(
                 is_superuser: row.try_get(2).context("role superuser capability")?,
                 inherits: row.try_get(3).context("role inherit capability")?,
                 member_of: Vec::new(),
+                can_administer_membership: Vec::new(),
+                can_inherit_from: Vec::new(),
                 can_set_role_to: Vec::new(),
             },
         );
     }
 
     let membership_query = if pg_version_num >= 160_000 {
-        "SELECT member.rolname, parent.rolname, membership.set_option
+        "SELECT member.rolname, parent.rolname, membership.admin_option,
+                membership.inherit_option, membership.set_option
          FROM pg_auth_members membership
          JOIN pg_roles member ON member.oid = membership.member
          JOIN pg_roles parent ON parent.oid = membership.roleid;"
     } else {
-        "SELECT member.rolname, parent.rolname, true AS set_option
+        "SELECT member.rolname, parent.rolname, membership.admin_option,
+                true AS inherit_option, true AS set_option
          FROM pg_auth_members membership
          JOIN pg_roles member ON member.oid = membership.member
          JOIN pg_roles parent ON parent.oid = membership.roleid;"
@@ -1001,9 +1005,17 @@ fn load_roles(
     for row in memberships {
         let member = ObjectId::new("", row.try_get::<_, String>(0).context("member role")?);
         let parent = ObjectId::new("", row.try_get::<_, String>(1).context("parent role")?);
-        let set_option: bool = row.try_get(2).context("role membership SET option")?;
+        let admin_option: bool = row.try_get(2).context("role membership ADMIN option")?;
+        let inherit_option: bool = row.try_get(3).context("role membership INHERIT option")?;
+        let set_option: bool = row.try_get(4).context("role membership SET option")?;
         if let Some(role) = roles.get_mut(&member) {
             role.member_of.push(parent.clone());
+            if admin_option {
+                role.can_administer_membership.push(parent.clone());
+            }
+            if inherit_option {
+                role.can_inherit_from.push(parent.clone());
+            }
             if set_option {
                 role.can_set_role_to.push(parent);
             }
