@@ -18,7 +18,7 @@ mod state_mutation_tests {
         FunctionOverlay, FunctionState, RoutineKind, SecurityMode, Volatility,
     };
     use safe_migrate::model::relation::{
-        ColumnAction, Persistence, RelationKind, RelationOverlay, RelationState,
+        ColumnAction, Persistence, Privilege, RelationKind, RelationOverlay, RelationState,
     };
     use safe_migrate::model::role::{RoleOverlay, RoleState};
     use safe_migrate::model::schema::SchemaState;
@@ -3751,6 +3751,46 @@ mod state_mutation_tests {
             .analyze("REVOKE SELECT ON t FROM public;", &mut state)
             .unwrap();
         assert!(state.relation_is_present(&object_id("public", "t")));
+    }
+
+    #[test]
+    fn grant_option_changes_preserve_effective_privilege_state() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let role = object_id("", "app_user");
+        let table = object_id("public", "grant_option_table");
+
+        engine
+            .analyze(
+                "CREATE TABLE grant_option_table(id int); GRANT SELECT ON grant_option_table TO app_user WITH GRANT OPTION;",
+                &mut state,
+            )
+            .unwrap();
+        let RelationOverlay::Present(relation) = state.local.relations.get(&table).unwrap() else {
+            panic!("table missing");
+        };
+        assert!(relation.privileges.has_privilege(&role, Privilege::Select));
+        assert!(
+            relation
+                .privileges
+                .has_grant_option(&role, Privilege::Select)
+        );
+
+        engine
+            .analyze(
+                "REVOKE GRANT OPTION FOR SELECT ON grant_option_table FROM app_user;",
+                &mut state,
+            )
+            .unwrap();
+        let RelationOverlay::Present(relation) = state.local.relations.get(&table).unwrap() else {
+            panic!("table missing");
+        };
+        assert!(relation.privileges.has_privilege(&role, Privilege::Select));
+        assert!(
+            !relation
+                .privileges
+                .has_grant_option(&role, Privilege::Select)
+        );
     }
 
     #[test]

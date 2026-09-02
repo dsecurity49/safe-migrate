@@ -2429,11 +2429,17 @@ impl AnalysisState {
         id: &ObjectId,
         privileges: &HashSet<Privilege>,
         grantees: &[ObjectId],
+        with_grant_option: bool,
     ) {
         self.snapshot_relation(id);
         if let Some(RelationOverlay::Present(rel)) = self.local.relations.get_mut(id) {
             for grantee in grantees {
-                rel.privileges.grant(grantee.clone(), privileges.clone());
+                if with_grant_option {
+                    rel.privileges
+                        .grant_with_option(grantee.clone(), privileges.clone());
+                } else {
+                    rel.privileges.grant(grantee.clone(), privileges.clone());
+                }
             }
         }
     }
@@ -2443,11 +2449,17 @@ impl AnalysisState {
         id: &ObjectId,
         privileges: &HashSet<Privilege>,
         revokees: &[ObjectId],
+        grant_option_only: bool,
     ) {
         self.snapshot_relation(id);
         if let Some(RelationOverlay::Present(rel)) = self.local.relations.get_mut(id) {
             for revokee in revokees {
-                rel.privileges.revoke(revokee, privileges);
+                if grant_option_only {
+                    rel.privileges.revoke_grant_option(revokee, privileges);
+                } else {
+                    rel.privileges.revoke(revokee, privileges);
+                    rel.privileges.revoke_grant_option(revokee, privileges);
+                }
             }
         }
     }

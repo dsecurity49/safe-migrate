@@ -150,19 +150,24 @@ impl AnalysisState {
             return MutationResult::Skipped;
         }
         if grant.with_grant_option {
-            // PrivilegeMatrix records effective privileges but not grant
-            // options or grant chains.
+            // The matrix records the effective privilege and the local grant
+            // option, but not the complete PostgreSQL authorization chain.
+            // Preserve the useful state while keeping the result cautious.
             self.taint(
                 EvidenceCode::CatalogCoverageIncomplete,
                 EvidenceScope::Chain,
             );
-            return MutationResult::Skipped;
         }
         let privileges = self.resolve_grant_privileges(&grant.privileges);
         match &grant.target {
             ResolvedGrantTarget::Tables(ids) => {
                 for id in ids {
-                    self.apply_grant_to_relation(id, &privileges, &grantees);
+                    self.apply_grant_to_relation(
+                        id,
+                        &privileges,
+                        &grantees,
+                        grant.with_grant_option,
+                    );
                 }
             }
             ResolvedGrantTarget::AllTablesInSchema(schemas) => {
@@ -188,7 +193,12 @@ impl AnalysisState {
                     })
                     .collect();
                 for id in &target_ids {
-                    self.apply_grant_to_relation(id, &privileges, &grantees);
+                    self.apply_grant_to_relation(
+                        id,
+                        &privileges,
+                        &grantees,
+                        grant.with_grant_option,
+                    );
                 }
             }
             ResolvedGrantTarget::Roles(parents) => {
@@ -330,17 +340,31 @@ impl AnalysisState {
             self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
             return MutationResult::Skipped;
         }
-        if revoke.grant_option_only || revoke.cascade {
-            // The matrix has no grant-option or dependency-chain state, so a
-            // GRANT OPTION/CASCADE revoke cannot be represented exactly.
+        if revoke.cascade {
+            // CASCADE can remove privileges inherited through other grantors;
+            // that dependency chain is not represented locally.
             self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
             return MutationResult::Skipped;
+        }
+        if revoke.grant_option_only {
+            // Revoke only the re-grant capability; the effective privilege
+            // remains in place. The complete grantor dependency chain is
+            // still unavailable, so retain conservative evidence.
+            self.taint(
+                EvidenceCode::CatalogCoverageIncomplete,
+                EvidenceScope::Chain,
+            );
         }
         let privileges = self.resolve_grant_privileges(&revoke.privileges);
         match &revoke.target {
             ResolvedGrantTarget::Tables(ids) => {
                 for id in ids {
-                    self.apply_revoke_to_relation(id, &privileges, &revokees);
+                    self.apply_revoke_to_relation(
+                        id,
+                        &privileges,
+                        &revokees,
+                        revoke.grant_option_only,
+                    );
                 }
             }
             ResolvedGrantTarget::AllTablesInSchema(schemas) => {
@@ -362,7 +386,12 @@ impl AnalysisState {
                     })
                     .collect();
                 for id in &target_ids {
-                    self.apply_revoke_to_relation(id, &privileges, &revokees);
+                    self.apply_revoke_to_relation(
+                        id,
+                        &privileges,
+                        &revokees,
+                        revoke.grant_option_only,
+                    );
                 }
             }
             ResolvedGrantTarget::Roles(parents) => {

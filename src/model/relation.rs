@@ -24,11 +24,23 @@ pub enum Privilege {
 pub struct PrivilegeMatrix {
     /// Maps role identity to the set of privileges they possess on this relation
     pub grants: HashMap<ObjectId, HashSet<Privilege>>,
+    /// Maps role identity to privileges that role may re-grant. This is kept
+    /// separate from effective privileges because PostgreSQL can revoke the
+    /// grant option while retaining the privilege itself.
+    pub grant_options: HashMap<ObjectId, HashSet<Privilege>>,
 }
 
 impl PrivilegeMatrix {
     pub fn grant(&mut self, role: ObjectId, privileges: HashSet<Privilege>) {
         self.grants.entry(role).or_default().extend(privileges);
+    }
+
+    pub fn grant_with_option(&mut self, role: ObjectId, privileges: HashSet<Privilege>) {
+        self.grant(role.clone(), privileges.clone());
+        self.grant_options
+            .entry(role)
+            .or_default()
+            .extend(privileges);
     }
 
     pub fn revoke(&mut self, role: &ObjectId, privileges: &HashSet<Privilege>) {
@@ -48,6 +60,25 @@ impl PrivilegeMatrix {
             set.contains(&privilege)
                 || (privilege != Privilege::All && set.contains(&Privilege::All))
         })
+    }
+
+    pub fn has_grant_option(&self, role: &ObjectId, privilege: Privilege) -> bool {
+        self.grant_options.get(role).is_some_and(|set| {
+            set.contains(&privilege)
+                || (privilege != Privilege::All && set.contains(&Privilege::All))
+        })
+    }
+
+    pub fn revoke_grant_option(&mut self, role: &ObjectId, privileges: &HashSet<Privilege>) {
+        if let Some(options) = self.grant_options.get_mut(role) {
+            if privileges.contains(&Privilege::All) {
+                options.clear();
+            } else {
+                for privilege in privileges {
+                    options.remove(privilege);
+                }
+            }
+        }
     }
 }
 
