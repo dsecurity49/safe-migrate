@@ -7,6 +7,7 @@ use crate::analysis::mutations::{
 };
 use crate::ast::identifiers::ObjectId;
 use crate::model::role::{RoleOverlay, RoleState};
+use std::collections::{HashMap, HashSet};
 
 type RoleLookup = ObjectLookup;
 
@@ -188,6 +189,83 @@ impl AnalysisState {
                     self.apply_grant_to_relation(id, &privileges, &grantees);
                 }
             }
+            ResolvedGrantTarget::Roles(parents) => {
+                let set_value = match grant.role_options.as_slice() {
+                    // PostgreSQL's default for a role grant is to permit
+                    // SET ROLE; an explicit `SET FALSE` is the opt-out.
+                    [] => Some(true),
+                    [crate::analysis::facts::RoleMembershipOptionFact::Set(value)] => Some(*value),
+                    _ => None,
+                };
+                if (grant.role_options.is_empty() && grant.with_grant_option)
+                    || (!grant.role_options.is_empty() && set_value.is_none())
+                    || grant.granted_by.is_some()
+                {
+                    self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
+                    return MutationResult::Skipped;
+                }
+                if grantees.iter().any(|member| member.name == "public") {
+                    self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
+                    return MutationResult::Skipped;
+                }
+                // PostgreSQL rejects membership cycles. Validate the whole
+                // batch against a proposed adjacency map before taking any
+                // snapshots, so a later cyclic pair cannot partially apply
+                // earlier grants in the same statement.
+                let mut memberships: HashMap<ObjectId, Vec<ObjectId>> = self
+                    .local
+                    .roles
+                    .iter()
+                    .filter_map(|(id, overlay)| match overlay {
+                        RoleOverlay::Present(role) => Some((id.clone(), role.member_of.clone())),
+                        RoleOverlay::Dropped => None,
+                    })
+                    .collect();
+                for member in &grantees {
+                    for parent in parents {
+                        let mut pending = vec![parent.clone()];
+                        let mut visited = HashSet::new();
+                        while let Some(role_id) = pending.pop() {
+                            if role_id == *member {
+                                return MutationResult::Conflict {
+                                    reason: format!(
+                                        "role membership '{}' in '{}' would create a cycle",
+                                        member.name, parent
+                                    ),
+                                };
+                            }
+                            if !visited.insert(role_id.clone()) {
+                                continue;
+                            }
+                            if let Some(next) = memberships.get(&role_id) {
+                                pending.extend(next.iter().cloned());
+                            }
+                        }
+                        memberships
+                            .entry(member.clone())
+                            .or_default()
+                            .push(parent.clone());
+                    }
+                }
+                for member in grantees {
+                    self.snapshot_role(&member);
+                    let Some(RoleOverlay::Present(role)) = self.local.roles.get_mut(&member) else {
+                        continue;
+                    };
+                    for parent in parents {
+                        if !role.member_of.contains(parent) {
+                            role.member_of.push(parent.clone());
+                        }
+                        if set_value == Some(true) {
+                            if !role.can_set_role_to.contains(parent) {
+                                role.can_set_role_to.push(parent.clone());
+                            }
+                        } else if set_value == Some(false) {
+                            role.can_set_role_to.retain(|target| target != parent);
+                        }
+                    }
+                }
+            }
         }
         MutationResult::Applied
     }
@@ -242,6 +320,36 @@ impl AnalysisState {
                     self.apply_revoke_to_relation(id, &privileges, &revokees);
                 }
             }
+            ResolvedGrantTarget::Roles(parents) => {
+                if revoke.granted_by.is_some() || revoke.grant_option_only || revoke.cascade {
+                    self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
+                    return MutationResult::Skipped;
+                }
+                let revoke_set_only = matches!(
+                    revoke.role_option,
+                    Some(crate::analysis::facts::RoleMembershipOptionFact::Set(false))
+                );
+                if revoke.role_option.is_some() && !revoke_set_only {
+                    self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
+                    return MutationResult::Skipped;
+                }
+                if revokees.iter().any(|member| member.name == "public") {
+                    self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
+                    return MutationResult::Skipped;
+                }
+                for member in revokees {
+                    self.snapshot_role(&member);
+                    let Some(RoleOverlay::Present(role)) = self.local.roles.get_mut(&member) else {
+                        continue;
+                    };
+                    for parent in parents {
+                        role.can_set_role_to.retain(|target| target != parent);
+                        if !revoke_set_only {
+                            role.member_of.retain(|target| target != parent);
+                        }
+                    }
+                }
+            }
         }
         MutationResult::Applied
     }
@@ -271,6 +379,23 @@ impl AnalysisState {
             ResolvedGrantTarget::AllTablesInSchema(schemas) => {
                 for schema in schemas {
                     self.ensure_schema_target(schema)?;
+                }
+            }
+            ResolvedGrantTarget::Roles(roles) => {
+                for role in roles {
+                    match self.role_lookup(role) {
+                        RoleLookup::Present => {}
+                        RoleLookup::Tombstone | RoleLookup::AuthoritativelyAbsent => {
+                            return Err(MutationResult::Conflict {
+                                reason: format!("role '{}' does not exist", role.name),
+                            });
+                        }
+                        RoleLookup::Unknown => {
+                            self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
+                            return Err(MutationResult::Skipped);
+                        }
+                        RoleLookup::WrongKind => unreachable!("roles have a dedicated namespace"),
+                    }
                 }
             }
         }

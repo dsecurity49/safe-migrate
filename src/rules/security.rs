@@ -44,6 +44,14 @@ impl Rule for OverbroadGrantRule {
                 crate::analysis::mutations::ResolvedGrantTarget::AllTablesInSchema(schemas) => {
                     (ObjectKind::Schema, schemas.join(", "))
                 }
+                crate::analysis::mutations::ResolvedGrantTarget::Roles(roles) => (
+                    ObjectKind::Role,
+                    roles
+                        .iter()
+                        .map(|role| role.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ),
             };
 
             let is_public = grant.grantees.iter().any(|g| {

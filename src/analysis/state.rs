@@ -242,6 +242,10 @@ pub struct AnalysisState {
     /// cache can be a valid baseline for an empty database, so availability
     /// must not be inferred from the number of modeled objects.
     pub baseline_available: bool,
+    /// Whether scoped cross-catalog boundary queries were run by the
+    /// synchronizer. Programmatic caches lack this provenance and remain
+    /// conservative for destructive scoped transitions.
+    pub baseline_boundary_queries_complete: bool,
     /// V8 catalog completeness used for authoritative absence decisions.
     /// Family-specific legacy fields remain only while their consumers migrate.
     pub baseline_coverage: CatalogCoverage,
@@ -732,6 +736,8 @@ impl AnalysisState {
 
     pub fn with_baseline(cache: DbCache, baseline_available: bool) -> Self {
         let baseline_coverage = cache.coverage.clone();
+        let baseline_boundary_queries_complete =
+            baseline_available && cache.metadata.created_at_unix_secs.is_some();
         let source_lock_timeout =
             baseline_available.then_some(cache.metadata.source_lock_timeout_ms);
         let source_statement_timeout =
@@ -1097,6 +1103,7 @@ impl AnalysisState {
         let mut state = Self {
             pg_version_num: cache.pg_version_num,
             baseline_available,
+            baseline_boundary_queries_complete,
             baseline_coverage,
             baseline_schemas,
             baseline_relations,
@@ -1293,6 +1300,13 @@ impl AnalysisState {
     ) -> bool {
         if self.baseline_schemas.is_none() || !self.baseline_covers_family_object(id, family) {
             return false;
+        }
+        // A scoped cache created programmatically has no proof that the
+        // cross-scope boundary queries ran. Keep it conservative even when
+        // the external-dependency list is empty; an empty list is meaningful
+        // only for a synchronized cache with provenance metadata.
+        if !self.baseline_boundary_queries_complete {
+            return true;
         }
         if matches!(family, crate::db::cache::CatalogFamily::Relations) {
             return self.scoped_external_relation_dependencies.contains(id);

@@ -5258,4 +5258,124 @@ mod state_mutation_tests {
         assert!(violations.iter().any(|v| v.rule_id == "chain-conflict"));
         assert_eq!(state.local.current_role, "member");
     }
+
+    #[test]
+    fn grant_set_option_authorizes_set_role_and_revoke_removes_it() {
+        let engine = setup_engine();
+        let mut cache = DbCache::new();
+        cache.metadata.source_role = Some("member".into());
+        cache.metadata.source_session_role = Some("member".into());
+        for name in ["member", "parent"] {
+            let id = object_id("", name);
+            cache.roles.insert(
+                id.clone(),
+                RoleState {
+                    id,
+                    can_login: name == "member",
+                    is_superuser: false,
+                    inherits: true,
+                    member_of: Vec::new(),
+                    can_set_role_to: Vec::new(),
+                },
+            );
+        }
+        let mut state = safe_migrate::AnalysisState::new(cache);
+
+        let violations = engine
+            .analyze("GRANT parent TO member; SET ROLE parent;", &mut state)
+            .unwrap();
+        assert!(!violations.iter().any(|v| v.rule_id == "chain-conflict"));
+        assert_eq!(state.local.current_role, "parent");
+
+        let violations = engine
+            .analyze(
+                "GRANT parent TO member WITH SET TRUE; SET ROLE parent;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(!violations.iter().any(|v| v.rule_id == "chain-conflict"));
+        assert_eq!(state.local.current_role, "parent");
+
+        let violations = engine
+            .analyze(
+                "SET ROLE member; REVOKE SET OPTION FOR parent FROM member; SET ROLE parent;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(violations.iter().any(|v| v.rule_id == "chain-conflict"));
+        assert_eq!(state.local.current_role, "member");
+
+        let violations = engine
+            .analyze(
+                "BEGIN; GRANT parent TO member WITH SET TRUE; ROLLBACK; SET ROLE parent;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(violations.iter().any(|v| v.rule_id == "chain-conflict"));
+        assert_eq!(state.local.current_role, "member");
+    }
+
+    #[test]
+    fn role_grant_to_public_is_rejected_before_partial_mutation() {
+        let engine = setup_engine();
+        let mut cache = DbCache::new();
+        for name in ["member", "parent"] {
+            let id = object_id("", name);
+            cache.roles.insert(
+                id.clone(),
+                RoleState {
+                    id,
+                    can_login: false,
+                    is_superuser: false,
+                    inherits: true,
+                    member_of: Vec::new(),
+                    can_set_role_to: Vec::new(),
+                },
+            );
+        }
+        let mut state = safe_migrate::AnalysisState::new(cache);
+        let result = engine.analyze("GRANT parent TO member, PUBLIC WITH SET TRUE;", &mut state);
+        assert!(result.is_ok());
+        let role = state
+            .local
+            .roles
+            .get(&object_id("", "member"))
+            .expect("member role");
+        let RoleOverlay::Present(role) = role else {
+            panic!("member role unexpectedly dropped");
+        };
+        assert!(role.member_of.is_empty());
+        assert!(role.can_set_role_to.is_empty());
+    }
+
+    #[test]
+    fn role_grant_rejects_cycles_before_mutating_the_batch() {
+        let engine = setup_engine();
+        let mut cache = DbCache::new();
+        for name in ["role_a", "role_b"] {
+            let id = object_id("", name);
+            cache.roles.insert(
+                id.clone(),
+                RoleState {
+                    id,
+                    can_login: false,
+                    is_superuser: false,
+                    inherits: true,
+                    member_of: Vec::new(),
+                    can_set_role_to: Vec::new(),
+                },
+            );
+        }
+        let mut state = safe_migrate::AnalysisState::new(cache);
+        let _ = engine
+            .analyze("GRANT role_a, role_b TO role_b, role_a;", &mut state)
+            .unwrap();
+        for name in ["role_a", "role_b"] {
+            let role = state.local.roles.get(&object_id("", name)).unwrap();
+            let RoleOverlay::Present(role) = role else {
+                panic!("role unexpectedly dropped");
+            };
+            assert!(role.member_of.is_empty());
+        }
+    }
 }

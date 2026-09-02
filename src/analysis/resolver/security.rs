@@ -23,6 +23,9 @@ impl Resolver {
             GrantTarget::AllTablesInSchema(schemas) => {
                 ResolvedGrantTarget::AllTablesInSchema(schemas.clone())
             }
+            GrantTarget::Roles(names) => ResolvedGrantTarget::Roles(
+                names.iter().map(|name| ObjectId::new("", name)).collect(),
+            ),
         }
     }
 
@@ -54,6 +57,7 @@ impl Resolver {
             target: Self::resolve_grant_target(&fact.target, state),
             grantees: fact.grantees.clone(),
             with_grant_option: fact.with_grant_option,
+            role_options: fact.role_options.clone(),
             granted_by: fact.granted_by.clone(),
         })
     }
@@ -61,6 +65,7 @@ impl Resolver {
     pub(super) fn resolve_revoke(fact: &RevokeFact, state: &AnalysisState) -> Mutation {
         Mutation::Revoke(RevokeMutation {
             grant_option_only: fact.grant_option_only,
+            role_option: fact.role_option.clone(),
             privileges: fact.privileges.clone(),
             target: Self::resolve_grant_target(&fact.target, state),
             revokees: fact.revokees.clone(),

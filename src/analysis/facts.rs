@@ -662,17 +662,29 @@ pub struct GrantFact {
     pub target: GrantTarget,
     pub grantees: Vec<RoleFact>,
     pub with_grant_option: bool,
+    pub role_options: Vec<RoleMembershipOptionFact>,
     pub granted_by: Option<RoleFact>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RevokeFact {
     pub grant_option_only: bool,
+    pub role_option: Option<RoleMembershipOptionFact>,
     pub privileges: PrivilegeSpec,
     pub target: GrantTarget,
     pub revokees: Vec<RoleFact>,
     pub granted_by: Option<RoleFact>,
     pub cascade: bool,
+}
+
+/// Per-membership option supported by PostgreSQL 16+ role grants. The option
+/// name and value are kept typed at extraction time so state transitions never
+/// need to infer semantics from raw SQL text.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RoleMembershipOptionFact {
+    Admin(bool),
+    Inherit(bool),
+    Set(bool),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -705,6 +717,7 @@ pub enum PrivilegeFact {
 pub enum GrantTarget {
     Tables(Vec<QualifiedName>),
     AllTablesInSchema(Vec<String>),
+    Roles(Vec<String>),
 }
 
 #[derive(Clone, Debug, PartialEq)]

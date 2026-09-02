@@ -509,6 +509,7 @@ pub struct DropRoleMutation {
 pub enum ResolvedGrantTarget {
     Tables(Vec<ObjectId>),
     AllTablesInSchema(Vec<String>),
+    Roles(Vec<ObjectId>),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -517,12 +518,14 @@ pub struct GrantMutation {
     pub target: ResolvedGrantTarget,
     pub grantees: Vec<crate::analysis::facts::RoleFact>,
     pub with_grant_option: bool,
+    pub role_options: Vec<crate::analysis::facts::RoleMembershipOptionFact>,
     pub granted_by: Option<crate::analysis::facts::RoleFact>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RevokeMutation {
     pub grant_option_only: bool,
+    pub role_option: Option<crate::analysis::facts::RoleMembershipOptionFact>,
     pub privileges: crate::analysis::facts::PrivilegeSpec,
     pub target: ResolvedGrantTarget,
     pub revokees: Vec<crate::analysis::facts::RoleFact>,

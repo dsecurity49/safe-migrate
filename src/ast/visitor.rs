@@ -3127,6 +3127,14 @@ impl AstVisitor {
             crate::analysis::facts::PrivilegeFact::AlterSystem
         } else if cmd.all_token().is_some() {
             crate::analysis::facts::PrivilegeFact::All
+        } else if let Some(ident) = cmd.ident_token() {
+            let raw = ident.text().to_string();
+            let name = Self::resolve_identifier_token(&raw);
+            if !Self::identifier_from_token(&raw).quoted && name == "maintain" {
+                crate::analysis::facts::PrivilegeFact::Maintain
+            } else {
+                crate::analysis::facts::PrivilegeFact::RoleMembership(name)
+            }
         } else if let Some(role_ref) = cmd.role_ref() {
             // Squawk 2.63.0 exposes PostgreSQL 17 MAINTAIN through the
             // grammar's generic identifier branch (there is no
@@ -3207,6 +3215,35 @@ impl AstVisitor {
         }
     }
 
+    fn extract_role_membership_option(
+        option: &squawk_syntax::ast::GrantRoleOption,
+    ) -> Option<crate::analysis::facts::RoleMembershipOptionFact> {
+        let name = option
+            .grant_role_option_name()?
+            .syntax()
+            .text()
+            .to_string()
+            .trim()
+            .to_ascii_lowercase();
+        let value = if option.false_token().is_some() {
+            false
+        } else if option.true_token().is_some() || option.option_token().is_some() {
+            true
+        } else {
+            return None;
+        };
+        match name.as_str() {
+            "admin" => Some(crate::analysis::facts::RoleMembershipOptionFact::Admin(
+                value,
+            )),
+            "inherit" => Some(crate::analysis::facts::RoleMembershipOptionFact::Inherit(
+                value,
+            )),
+            "set" => Some(crate::analysis::facts::RoleMembershipOptionFact::Set(value)),
+            _ => None,
+        }
+    }
+
     fn extract_grant(node: &Grant) -> Option<StatementFact> {
         let privileges = match node.privileges() {
             Some(ast::Privileges::AllPrivileges(_)) => crate::analysis::facts::PrivilegeSpec::All,
@@ -3221,17 +3258,46 @@ impl AstVisitor {
             None => crate::analysis::facts::PrivilegeSpec::List(Vec::new()),
         };
 
-        let target = Self::extract_grant_target_from_privilege_objects(
-            node.on_privilege_objects_clause()
-                .and_then(|clause| clause.privilege_objects()),
-            node.syntax(),
-        )?;
+        let target = if let Some(objects) = node
+            .on_privilege_objects_clause()
+            .and_then(|clause| clause.privilege_objects())
+        {
+            Self::extract_grant_target_from_privilege_objects(Some(objects), node.syntax())?
+        } else {
+            let crate::analysis::facts::PrivilegeSpec::List(items) = &privileges else {
+                return None;
+            };
+            let roles = items
+                .iter()
+                .map(|item| match item {
+                    crate::analysis::facts::PrivilegeFact::RoleMembership(name) => {
+                        Some(name.clone())
+                    }
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()?;
+            if roles.is_empty() {
+                return None;
+            }
+            crate::analysis::facts::GrantTarget::Roles(roles)
+        };
 
         let grantees = node
             .role_ref_list()
             .map(|rrl| rrl.role_refs().map(|r| Self::extract_role(&r)).collect())
             .unwrap_or_default();
-        let with_grant_option = node.grant_with_clause().is_some();
+        let (with_grant_option, role_options) = match node.grant_with_clause() {
+            None => (false, Vec::new()),
+            Some(clause) if clause.grant_option().is_some() => (true, Vec::new()),
+            Some(clause) => {
+                let list = clause.grant_role_option_list()?;
+                let options = list
+                    .grant_role_options()
+                    .map(|option| Self::extract_role_membership_option(&option))
+                    .collect::<Option<Vec<_>>>()?;
+                (false, options)
+            }
+        };
         let granted_by = node
             .granted_by_clause()
             .and_then(|clause| clause.role_ref())
@@ -3242,15 +3308,32 @@ impl AstVisitor {
             target,
             grantees,
             with_grant_option,
+            role_options,
             granted_by,
         }))
     }
 
     fn extract_revoke(node: &Revoke) -> Option<StatementFact> {
-        let grant_option_only = matches!(
-            node.revoke_option_for(),
-            Some(ast::RevokeOptionFor::GrantOptionFor(_))
-        );
+        let (grant_option_only, role_option) = match node.revoke_option_for() {
+            None => (false, None),
+            Some(ast::RevokeOptionFor::GrantOptionFor(_)) => (true, None),
+            Some(ast::RevokeOptionFor::AdminOptionFor(_)) => (
+                false,
+                Some(crate::analysis::facts::RoleMembershipOptionFact::Admin(
+                    false,
+                )),
+            ),
+            Some(ast::RevokeOptionFor::InheritOptionFor(_)) => (
+                false,
+                Some(crate::analysis::facts::RoleMembershipOptionFact::Inherit(
+                    false,
+                )),
+            ),
+            Some(ast::RevokeOptionFor::SetOptionFor(_)) => (
+                false,
+                Some(crate::analysis::facts::RoleMembershipOptionFact::Set(false)),
+            ),
+        };
 
         let privileges = match node.privileges() {
             Some(ast::Privileges::AllPrivileges(_)) => crate::analysis::facts::PrivilegeSpec::All,
@@ -3265,11 +3348,29 @@ impl AstVisitor {
             None => crate::analysis::facts::PrivilegeSpec::List(Vec::new()),
         };
 
-        let target = Self::extract_grant_target_from_privilege_objects(
-            node.on_privilege_objects_clause()
-                .and_then(|clause| clause.privilege_objects()),
-            node.syntax(),
-        )?;
+        let target = if let Some(objects) = node
+            .on_privilege_objects_clause()
+            .and_then(|clause| clause.privilege_objects())
+        {
+            Self::extract_grant_target_from_privilege_objects(Some(objects), node.syntax())?
+        } else {
+            let ast::Privileges::RevokeCommandList(commands) = node.privileges()? else {
+                return None;
+            };
+            let roles = commands
+                .revoke_commands()
+                .map(
+                    |command| match Self::extract_privilege_from_revoke_command(&command) {
+                        crate::analysis::facts::PrivilegeFact::RoleMembership(name) => Some(name),
+                        _ => None,
+                    },
+                )
+                .collect::<Option<Vec<_>>>()?;
+            if roles.is_empty() {
+                return None;
+            }
+            crate::analysis::facts::GrantTarget::Roles(roles)
+        };
 
         let revokees = node
             .role_ref_list()
@@ -3283,6 +3384,7 @@ impl AstVisitor {
 
         Some(StatementFact::Revoke(crate::analysis::facts::RevokeFact {
             grant_option_only,
+            role_option,
             privileges,
             target,
             revokees,

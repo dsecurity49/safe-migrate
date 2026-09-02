@@ -77,6 +77,57 @@ mod tests {
     }
 
     #[test]
+    fn role_membership_set_option_is_extracted() {
+        let fact =
+            { parse_and_extract_statement("GRANT parent_role TO member_role WITH SET TRUE;") }
+                .expect("role grant fact");
+        let StatementFact::Grant(grant) = fact else {
+            panic!("expected grant fact");
+        };
+        assert_eq!(
+            grant.target,
+            crate::analysis::facts::GrantTarget::Roles(vec!["parent_role".into()])
+        );
+        assert_eq!(
+            grant.role_options,
+            vec![crate::analysis::facts::RoleMembershipOptionFact::Set(true)]
+        );
+
+        let fact =
+            parse_and_extract_statement("REVOKE SET OPTION FOR parent_role FROM member_role;")
+                .expect("role revoke fact");
+        let StatementFact::Revoke(revoke) = fact else {
+            panic!("expected revoke fact");
+        };
+        assert_eq!(
+            revoke.target,
+            crate::analysis::facts::GrantTarget::Roles(vec!["parent_role".into()])
+        );
+        assert_eq!(
+            revoke.role_option,
+            Some(crate::analysis::facts::RoleMembershipOptionFact::Set(false))
+        );
+
+        for (sql, expected) in [
+            (
+                "GRANT parent_role TO member_role WITH ADMIN TRUE;",
+                crate::analysis::facts::RoleMembershipOptionFact::Admin(true),
+            ),
+            (
+                "GRANT parent_role TO member_role WITH INHERIT FALSE;",
+                crate::analysis::facts::RoleMembershipOptionFact::Inherit(false),
+            ),
+        ] {
+            let StatementFact::Grant(grant) =
+                parse_and_extract_statement(sql).expect("role option grant fact")
+            else {
+                panic!("expected grant fact");
+            };
+            assert_eq!(grant.role_options, vec![expected]);
+        }
+    }
+
+    #[test]
     fn test_create_table_with_columns() {
         let sql = "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(255) NOT NULL);";
         let facts = parse_and_extract_statement(sql);
