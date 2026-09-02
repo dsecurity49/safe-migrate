@@ -1790,11 +1790,12 @@ fn load_generated_column_dependencies(
          AND d.objid = ad.oid
          AND d.refclassid = 'pg_class'::regclass
          AND d.refobjsubid > 0
-         AND d.deptype = 'n'
         JOIN pg_attribute source_a
           ON source_a.attrelid = d.refobjid
          AND source_a.attnum = d.refobjsubid
          AND NOT source_a.attisdropped
+         AND source_a.attrelid = a.attrelid
+         AND source_a.attnum <> a.attnum
         WHERE a.attnum > 0
           AND NOT a.attisdropped
           AND a.attgenerated = 's'
