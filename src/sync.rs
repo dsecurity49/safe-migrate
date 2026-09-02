@@ -2203,11 +2203,9 @@ fn load_indexes(
         // index shape.  Those columns are nevertheless guaranteed dependencies
         // for a simple index; make that invariant explicit at hydration rather
         // than allowing an incomplete vector to reach the state machine.
-        if !has_expression_keys && !has_predicate {
-            for column in key_columns.iter().chain(&included_columns) {
-                if !dependency_columns.contains(column) {
-                    dependency_columns.push(column.clone());
-                }
+        for column in key_columns.iter().chain(&included_columns) {
+            if !dependency_columns.contains(column) {
+                dependency_columns.push(column.clone());
             }
         }
         indexes.push(IndexCache {

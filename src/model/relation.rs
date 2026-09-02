@@ -236,7 +236,16 @@ impl PrivilegeMatrix {
             .cloned()
             .collect();
         for key in option_keys {
-            self.grant_option_grantors.remove(&key);
+            if let Some(sources) = self.grant_option_grantors.get_mut(&key) {
+                if let Some(grantor) = grantor {
+                    sources.remove(grantor);
+                } else {
+                    sources.clear();
+                }
+                if sources.is_empty() {
+                    self.grant_option_grantors.remove(&key);
+                }
+            }
         }
     }
 
@@ -251,10 +260,18 @@ impl PrivilegeMatrix {
             return;
         }
         let grantor = grantor.expect("checked above");
-        for privilege in privileges {
-            if *privilege == Privilege::All {
-                continue;
-            }
+        let expanded = if privileges.contains(&Privilege::All) {
+            self.grants
+                .get(role)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|privilege| *privilege != Privilege::All)
+                .collect()
+        } else {
+            privileges.clone()
+        };
+        for privilege in &expanded {
             let key = (role.clone(), *privilege);
             let remove_effective = if let Some(sources) = self.grantors.get_mut(&key) {
                 sources.remove(grantor);
@@ -287,9 +304,6 @@ impl PrivilegeMatrix {
                     options.remove(privilege);
                 }
             }
-        }
-        if privileges.contains(&Privilege::All) {
-            self.revoke(role, privileges);
         }
     }
 

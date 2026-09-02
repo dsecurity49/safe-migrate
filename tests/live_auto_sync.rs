@@ -83,13 +83,13 @@ fn run_auto_sync_case(
     decoder
         .read_to_end(&mut payload)
         .expect("read decoded cache payload");
-    let v6_payload = payload
+    let v7_payload = payload
         .strip_prefix(CACHE_V7_MAGIC)
         .expect("auto-sync must write a V7 cache");
     let config = bincode::config::standard().with_variable_int_encoding();
     let (versioned, bytes_read): (DbCacheVersioned, usize) =
-        bincode::serde::decode_from_slice(v6_payload, config).expect("decode V7 cache");
-    assert_eq!(bytes_read, v6_payload.len());
+        bincode::serde::decode_from_slice(v7_payload, config).expect("decode V7 cache");
+    assert_eq!(bytes_read, v7_payload.len());
     let DbCacheVersioned::V7(cache) = versioned else {
         panic!("auto-sync must encode the V7 cache variant");
     };

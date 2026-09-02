@@ -4039,6 +4039,20 @@ mod state_mutation_tests {
                 },
             );
         }
+        let delegated = object_id("", "delegated_user");
+        cache.roles.insert(
+            delegated.clone(),
+            RoleState {
+                id: delegated,
+                can_login: true,
+                is_superuser: false,
+                inherits: true,
+                member_of: Vec::new(),
+                can_administer_membership: Vec::new(),
+                can_inherit_from: Vec::new(),
+                can_set_role_to: Vec::new(),
+            },
+        );
         let mut relation = RelationState::new(
             table_id.clone(),
             object_id("", "owner"),

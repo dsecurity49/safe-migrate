@@ -137,12 +137,6 @@ impl AnalysisState {
                 _ => unreachable!("filtered default dependency"),
             })
             .collect::<Vec<_>>();
-        let has_typed_default_evidence = self
-            .local
-            .graph
-            .edges()
-            .iter()
-            .any(|edge| matches!(edge.kind, DependencyKind::ColumnDefaultOnSequence { .. }));
 
         let relation_ids = self
             .local
@@ -166,7 +160,7 @@ impl AnalysisState {
                 let typed_dependency = typed_default_columns
                     .iter()
                     .any(|(table, name)| *table == &relation_id && name == &column.name);
-                let references_sequence = !has_typed_default_evidence
+                let references_sequence = typed_default_columns.is_empty()
                     && (column.default.as_ref().is_some_and(|default| {
                         Self::expression_references_sequence(default, sequence)
                     }) || column.default_expr_text.as_deref().is_some_and(|default| {

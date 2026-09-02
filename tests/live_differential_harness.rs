@@ -2482,8 +2482,8 @@ fn compare_states(
                 category: MismatchCategory::MissingPrivilegeInSimulator,
                 root_cause: RootCauseClassification::SimulatorBug,
                 note: format!(
-                    "live PostgreSQL kept {} on {} for {}",
-                    privilege.privilege, privilege.table, privilege.grantee
+                    "live PostgreSQL kept {} on {} for {} (grantable={})",
+                    privilege.privilege, privilege.table, privilege.grantee, privilege.grantable
                 ),
             });
         }
@@ -2494,8 +2494,8 @@ fn compare_states(
                 category: MismatchCategory::ExtraPrivilegeInSimulator,
                 root_cause: RootCauseClassification::SimulatorBug,
                 note: format!(
-                    "simulator kept {} on {} for {}",
-                    privilege.privilege, privilege.table, privilege.grantee
+                    "simulator kept {} on {} for {} (grantable={})",
+                    privilege.privilege, privilege.table, privilege.grantee, privilege.grantable
                 ),
             });
         }
