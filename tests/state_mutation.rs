@@ -5766,7 +5766,9 @@ mod state_mutation_tests {
 
         engine
             .analyze(
-                "GRANT parent TO child GRANTED BY member; REVOKE parent FROM member CASCADE;",
+                "GRANT parent TO child GRANTED BY member; \
+                 GRANT parent TO child GRANTED BY admin; \
+                 REVOKE parent FROM member CASCADE;",
                 &mut state,
             )
             .unwrap();

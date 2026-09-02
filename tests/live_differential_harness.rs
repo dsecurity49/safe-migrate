@@ -44,6 +44,8 @@ struct RuleManifest {
     #[serde(default)]
     fixture_transactional: BTreeMap<String, bool>,
     #[serde(default)]
+    fixture_min_pg_version: BTreeMap<String, u32>,
+    #[serde(default)]
     excluded_fixtures: Vec<FixtureExclusion>,
     schemas: Vec<String>,
     scope: Vec<ComparisonScope>,
@@ -370,6 +372,12 @@ fn live_postgres_differential_harness() {
     let manifest = load_manifest(&manifest_path);
     let baseline_sql = fs::read_to_string(&baseline_path)
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", baseline_path.display()));
+    let server_version_num: u32 = client
+        .query_one("SHOW server_version_num", &[])
+        .expect("failed to inspect PostgreSQL version")
+        .get::<_, String>(0)
+        .parse()
+        .expect("server_version_num must be numeric");
     let engine = SafeMigrateEngine::new(Config::default());
     let mut mismatches = Vec::new();
     let rule_filter = std::env::var(RULE_FILTER_ENV).ok();
@@ -387,7 +395,13 @@ fn live_postgres_differential_harness() {
         .map(|rule| {
             rule.fixtures
                 .iter()
-                .filter(|fixture| fixture_is_selected(&fixture_filter, &rule.rule_dir, fixture))
+                .filter(|fixture| {
+                    fixture_is_selected(&fixture_filter, &rule.rule_dir, fixture)
+                        && rule
+                            .fixture_min_pg_version
+                            .get(*fixture)
+                            .is_none_or(|minimum| server_version_num >= *minimum)
+                })
                 .count()
         })
         .sum::<usize>();
@@ -441,11 +455,13 @@ fn live_postgres_differential_harness() {
                 );
             }
         }
-        for fixture in rule
-            .fixtures
-            .iter()
-            .filter(|fixture| fixture_is_selected(&fixture_filter, &rule.rule_dir, fixture))
-        {
+        for fixture in rule.fixtures.iter().filter(|fixture| {
+            fixture_is_selected(&fixture_filter, &rule.rule_dir, fixture)
+                && rule
+                    .fixture_min_pg_version
+                    .get(*fixture)
+                    .is_none_or(|minimum| server_version_num >= *minimum)
+        }) {
             let transactional = rule
                 .fixture_transactional
                 .get(fixture)
@@ -940,6 +956,14 @@ fn validate_manifest(manifest: &DifferentialManifest, path: &Path) {
                 fixture
             );
         }
+        for fixture in rule.fixture_min_pg_version.keys() {
+            assert!(
+                included.contains(fixture),
+                "fixture minimum version references a non-included fixture: {}/{}",
+                rule.rule_dir,
+                fixture
+            );
+        }
 
         validate_expected_live_errors(rule, &included, &valid_rule_ids);
 
@@ -1017,6 +1041,7 @@ fn expected_live_error_must_reference_an_included_fixture() {
         fixtures: Vec::new(),
         transactional: true,
         fixture_transactional: BTreeMap::new(),
+        fixture_min_pg_version: BTreeMap::new(),
         excluded_fixtures: Vec::new(),
         schemas: Vec::new(),
         scope: Vec::new(),
@@ -1044,6 +1069,7 @@ fn expected_live_error_must_reference_a_known_simulator_rule() {
         fixtures: vec!["case.sql".to_string()],
         transactional: true,
         fixture_transactional: BTreeMap::new(),
+        fixture_min_pg_version: BTreeMap::new(),
         excluded_fixtures: Vec::new(),
         schemas: Vec::new(),
         scope: Vec::new(),

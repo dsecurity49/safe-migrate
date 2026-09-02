@@ -437,6 +437,23 @@ impl AnalysisState {
                     self.snapshot_role_membership_grantors();
                     for member in &grantees {
                         for parent in parents {
+                            let already_member =
+                                self.local.roles.get(member).is_some_and(|overlay| {
+                                    matches!(overlay, RoleOverlay::Present(role) if role
+                                        .member_of
+                                        .contains(parent))
+                                });
+                            if already_member
+                                && self
+                                    .local
+                                    .role_membership_grantors
+                                    .iter()
+                                    .any(|provenance| {
+                                        provenance.member == *member && provenance.role == *parent
+                                    })
+                            {
+                                continue;
+                            }
                             self.local.role_membership_grantors.retain(|provenance| {
                                 provenance.member != *member || provenance.role != *parent
                             });
