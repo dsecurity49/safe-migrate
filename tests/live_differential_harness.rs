@@ -100,6 +100,7 @@ fn default_transactional() -> bool {
 #[serde(rename_all = "snake_case")]
 enum ComparisonScope {
     Schemas,
+    Roles,
     Sequences,
     Relations,
     Columns,
@@ -118,6 +119,7 @@ enum ComparisonScope {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct NormalizedState {
     schemas: BTreeMap<String, String>,
+    roles: BTreeSet<NormalizedRoleMembership>,
     sequences: BTreeMap<String, NormalizedSequence>,
     relations: BTreeMap<String, NormalizedRelation>,
     indexes: BTreeSet<NormalizedIndex>,
@@ -130,6 +132,16 @@ struct NormalizedState {
     triggers: BTreeMap<(String, String), NormalizedTrigger>,
     partition_edges: BTreeSet<(String, String)>,
     view_dependencies: BTreeSet<(String, String)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct NormalizedRoleMembership {
+    member: String,
+    role: String,
+    admin: bool,
+    inherit: bool,
+    set: bool,
+    grantor: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1342,6 +1354,26 @@ fn snapshot_live_state(
         }
     }
 
+    if scope.contains(&ComparisonScope::Roles) {
+        for (member, role) in &cache.roles {
+            for parent in &role.member_of {
+                let grantor = cache
+                    .role_membership_grantors
+                    .iter()
+                    .find(|provenance| provenance.member == *member && provenance.role == *parent)
+                    .map(|provenance| provenance.grantor.name.clone());
+                state.roles.insert(NormalizedRoleMembership {
+                    member: member.name.clone(),
+                    role: parent.name.clone(),
+                    admin: role.can_administer_membership.contains(parent),
+                    inherit: role.can_inherit_from.contains(parent),
+                    set: role.can_set_role_to.contains(parent),
+                    grantor,
+                });
+            }
+        }
+    }
+
     if scope.contains(&ComparisonScope::Sequences) {
         for (id, sequence) in &cache.sequences {
             state.sequences.insert(
@@ -1585,6 +1617,30 @@ fn snapshot_simulator_state(
         }
     }
 
+    if scope.contains(&ComparisonScope::Roles) {
+        for (member, overlay) in &state.local.roles {
+            let safe_migrate::model::role::RoleOverlay::Present(role) = overlay else {
+                continue;
+            };
+            for parent in &role.member_of {
+                let grantor = state
+                    .local
+                    .role_membership_grantors
+                    .iter()
+                    .find(|provenance| provenance.member == *member && provenance.role == *parent)
+                    .map(|provenance| provenance.grantor.name.clone());
+                projection.roles.insert(NormalizedRoleMembership {
+                    member: member.name.clone(),
+                    role: parent.name.clone(),
+                    admin: role.can_administer_membership.contains(parent),
+                    inherit: role.can_inherit_from.contains(parent),
+                    set: role.can_set_role_to.contains(parent),
+                    grantor,
+                });
+            }
+        }
+    }
+
     if scope.contains(&ComparisonScope::Sequences) {
         for (id, overlay) in &state.local.sequences {
             let SequenceOverlay::Present(sequence) = overlay else {
@@ -1781,6 +1837,43 @@ fn compare_states(
     simulator: &NormalizedState,
 ) -> Vec<Mismatch> {
     let mut mismatches = Vec::new();
+
+    if scope.contains(&ComparisonScope::Roles) {
+        for membership in live.roles.difference(&simulator.roles) {
+            mismatches.push(Mismatch {
+                rule_dir: rule_dir.to_string(),
+                fixture: fixture.to_string(),
+                category: MismatchCategory::RoleMembershipMismatch,
+                root_cause: RootCauseClassification::SimulatorBug,
+                note: format!(
+                    "live PostgreSQL kept role membership {} -> {} with ADMIN={}, INHERIT={}, SET={}, grantor={:?}",
+                    membership.member,
+                    membership.role,
+                    membership.admin,
+                    membership.inherit,
+                    membership.set,
+                    membership.grantor
+                ),
+            });
+        }
+        for membership in simulator.roles.difference(&live.roles) {
+            mismatches.push(Mismatch {
+                rule_dir: rule_dir.to_string(),
+                fixture: fixture.to_string(),
+                category: MismatchCategory::RoleMembershipMismatch,
+                root_cause: RootCauseClassification::SimulatorBug,
+                note: format!(
+                    "simulator kept role membership {} -> {} with ADMIN={}, INHERIT={}, SET={}, grantor={:?}",
+                    membership.member,
+                    membership.role,
+                    membership.admin,
+                    membership.inherit,
+                    membership.set,
+                    membership.grantor
+                ),
+            });
+        }
+    }
 
     if scope.contains(&ComparisonScope::Schemas) {
         for (name, live_owner) in &live.schemas {
