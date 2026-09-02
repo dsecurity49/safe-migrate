@@ -28,6 +28,14 @@ pub struct PrivilegeMatrix {
     /// separate from effective privileges because PostgreSQL can revoke the
     /// grant option while retaining the privilege itself.
     pub grant_options: HashMap<ObjectId, HashSet<Privilege>>,
+    /// Grant provenance keyed by `(grantee, privilege)`.  PostgreSQL uses the
+    /// grantor identity when processing targeted REVOKE/CASCADE operations;
+    /// retaining it prevents those transitions from silently removing an
+    /// unrelated grant.
+    #[serde(default)]
+    pub grantors: HashMap<(ObjectId, Privilege), HashSet<ObjectId>>,
+    #[serde(default)]
+    pub grant_option_grantors: HashMap<(ObjectId, Privilege), HashSet<ObjectId>>,
 }
 
 impl PrivilegeMatrix {
@@ -41,6 +49,34 @@ impl PrivilegeMatrix {
             .entry(role)
             .or_default()
             .extend(privileges);
+    }
+
+    pub fn grant_from(
+        &mut self,
+        role: ObjectId,
+        privileges: HashSet<Privilege>,
+        grantor: Option<ObjectId>,
+        with_grant_option: bool,
+    ) {
+        if with_grant_option {
+            self.grant_with_option(role.clone(), privileges.clone());
+        } else {
+            self.grant(role.clone(), privileges.clone());
+        }
+        if let Some(grantor) = grantor {
+            for privilege in privileges {
+                self.grantors
+                    .entry((role.clone(), privilege))
+                    .or_default()
+                    .insert(grantor.clone());
+                if with_grant_option {
+                    self.grant_option_grantors
+                        .entry((role.clone(), privilege))
+                        .or_default()
+                        .insert(grantor.clone());
+                }
+            }
+        }
     }
 
     pub fn revoke(&mut self, role: &ObjectId, privileges: &HashSet<Privilege>) {
@@ -57,6 +93,7 @@ impl PrivilegeMatrix {
         // privilege is revoked. Keep the two maps coherent for direct model
         // callers as well as the migration state transition helper.
         self.revoke_grant_option(role, privileges);
+        self.remove_grant_provenance(role, privileges, None);
     }
 
     pub fn has_privilege(&self, role: &ObjectId, privilege: Privilege) -> bool {
@@ -73,6 +110,20 @@ impl PrivilegeMatrix {
         })
     }
 
+    /// Return whether `role` has a direct privilege that can be used as an
+    /// authorization input.  Role inheritance is resolved by the analysis
+    /// state, because the relation matrix intentionally stores only direct
+    /// ACL entries.
+    pub fn has_direct_privilege(&self, role: &ObjectId, privilege: Privilege) -> bool {
+        self.has_privilege(role, privilege)
+            || self.has_privilege(&ObjectId::new("", "public"), privilege)
+    }
+
+    pub fn has_direct_grant_option(&self, role: &ObjectId, privilege: Privilege) -> bool {
+        self.has_grant_option(role, privilege)
+            || self.has_grant_option(&ObjectId::new("", "public"), privilege)
+    }
+
     pub fn revoke_grant_option(&mut self, role: &ObjectId, privileges: &HashSet<Privilege>) {
         if let Some(options) = self.grant_options.get_mut(role) {
             if privileges.contains(&Privilege::All) {
@@ -81,6 +132,185 @@ impl PrivilegeMatrix {
                 for privilege in privileges {
                     options.remove(privilege);
                 }
+            }
+        }
+    }
+
+    /// Remove provenance for a revoke.  `grantor = Some(x)` limits the
+    /// operation to grants made by x; `None` removes all known sources.
+    pub fn remove_grant_provenance(
+        &mut self,
+        role: &ObjectId,
+        privileges: &HashSet<Privilege>,
+        grantor: Option<&ObjectId>,
+    ) {
+        let keys: Vec<_> = self
+            .grantors
+            .keys()
+            .filter(|(grantee, privilege)| {
+                grantee == role
+                    && (privileges.contains(&Privilege::All) || privileges.contains(privilege))
+            })
+            .cloned()
+            .collect();
+        for key in keys {
+            if let Some(sources) = self.grantors.get_mut(&key) {
+                if let Some(grantor) = grantor {
+                    sources.remove(grantor);
+                } else {
+                    sources.clear();
+                }
+                if sources.is_empty() {
+                    self.grantors.remove(&key);
+                }
+            }
+        }
+        let option_keys: Vec<_> = self
+            .grant_option_grantors
+            .keys()
+            .filter(|(grantee, privilege)| {
+                grantee == role
+                    && (privileges.contains(&Privilege::All) || privileges.contains(privilege))
+            })
+            .cloned()
+            .collect();
+        for key in option_keys {
+            self.grant_option_grantors.remove(&key);
+        }
+    }
+
+    pub fn revoke_from(
+        &mut self,
+        role: &ObjectId,
+        privileges: &HashSet<Privilege>,
+        grantor: Option<&ObjectId>,
+    ) {
+        if grantor.is_none() {
+            self.revoke(role, privileges);
+            return;
+        }
+        let grantor = grantor.expect("checked above");
+        for privilege in privileges {
+            if *privilege == Privilege::All {
+                continue;
+            }
+            let key = (role.clone(), *privilege);
+            let remove_effective = if let Some(sources) = self.grantors.get_mut(&key) {
+                sources.remove(grantor);
+                let remove_effective = sources.is_empty();
+                if remove_effective {
+                    self.grantors.remove(&key);
+                }
+                remove_effective
+            } else {
+                // Provenance-free V7 rows are legacy/hand-built evidence. A
+                // targeted revoke cannot prove another source exists.
+                true
+            };
+            if let Some(sources) = self.grant_option_grantors.get_mut(&key) {
+                sources.remove(grantor);
+                if sources.is_empty() {
+                    self.grant_option_grantors.remove(&key);
+                    if let Some(options) = self.grant_options.get_mut(role) {
+                        options.remove(privilege);
+                    }
+                }
+            }
+            if remove_effective {
+                if let Some(owned) = self.grants.get_mut(role) {
+                    owned.remove(privilege);
+                }
+                if !self.grant_option_grantors.contains_key(&key)
+                    && let Some(options) = self.grant_options.get_mut(role)
+                {
+                    options.remove(privilege);
+                }
+            }
+        }
+        if privileges.contains(&Privilege::All) {
+            self.revoke(role, privileges);
+        }
+    }
+
+    /// Revoke a grant and, when requested, recursively remove grants whose
+    /// grantor lost its last known grant option for the same privilege.
+    pub fn revoke_from_cascade(
+        &mut self,
+        role: &ObjectId,
+        privileges: &HashSet<Privilege>,
+        grantor: Option<&ObjectId>,
+        cascade: bool,
+    ) {
+        self.revoke_from(role, privileges, grantor);
+        if !cascade {
+            return;
+        }
+        let mut pending: Vec<(ObjectId, Privilege)> = privileges
+            .iter()
+            .filter(|privilege| **privilege != Privilege::All)
+            .map(|privilege| (role.clone(), *privilege))
+            .collect();
+        let mut visited = HashSet::new();
+        while let Some((lost_grantor, privilege)) = pending.pop() {
+            if !visited.insert((lost_grantor.clone(), privilege)) {
+                continue;
+            }
+            if self.has_grant_option(&lost_grantor, privilege) {
+                continue;
+            }
+            let downstream: Vec<ObjectId> = self
+                .grantors
+                .iter()
+                .filter_map(|((grantee, candidate), sources)| {
+                    (*candidate == privilege && sources.contains(&lost_grantor))
+                        .then_some(grantee.clone())
+                })
+                .collect();
+            let single = [privilege].into_iter().collect();
+            for grantee in downstream {
+                self.revoke_from(&grantee, &single, Some(&lost_grantor));
+                pending.push((grantee, privilege));
+            }
+        }
+    }
+
+    pub fn revoke_grant_option_from(
+        &mut self,
+        role: &ObjectId,
+        privileges: &HashSet<Privilege>,
+        grantor: Option<&ObjectId>,
+    ) {
+        let Some(grantor) = grantor else {
+            self.revoke_grant_option(role, privileges);
+            for key in self
+                .grant_option_grantors
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+            {
+                if &key.0 == role
+                    && (privileges.contains(&Privilege::All) || privileges.contains(&key.1))
+                {
+                    self.grant_option_grantors.remove(&key);
+                }
+            }
+            return;
+        };
+        for privilege in privileges {
+            if *privilege == Privilege::All {
+                continue;
+            }
+            let key = (role.clone(), *privilege);
+            if let Some(sources) = self.grant_option_grantors.get_mut(&key) {
+                sources.remove(grantor);
+                if sources.is_empty() {
+                    self.grant_option_grantors.remove(&key);
+                    if let Some(options) = self.grant_options.get_mut(role) {
+                        options.remove(privilege);
+                    }
+                }
+            } else if let Some(options) = self.grant_options.get_mut(role) {
+                options.remove(privilege);
             }
         }
     }
@@ -336,6 +566,30 @@ mod tests {
         assert_eq!(column.type_id, None);
         assert_eq!(column.type_modifier, None);
         assert_eq!(column.avg_width, None);
+    }
+
+    #[test]
+    fn targeted_revoke_preserves_a_privilege_from_another_grantor() {
+        let role = ObjectId::new("", "reader");
+        let first = ObjectId::new("", "owner");
+        let second = ObjectId::new("", "delegate");
+        let mut matrix = PrivilegeMatrix::default();
+        let select: HashSet<_> = [Privilege::Select].into_iter().collect();
+        matrix.grant_from(role.clone(), select.clone(), Some(first.clone()), false);
+        matrix.grant_from(role.clone(), select.clone(), Some(second.clone()), false);
+
+        matrix.revoke_from(&role, &select, Some(&first));
+        assert!(matrix.has_privilege(&role, Privilege::Select));
+        assert_eq!(
+            matrix
+                .grantors
+                .get(&(role.clone(), Privilege::Select))
+                .map(|sources| sources.len()),
+            Some(1)
+        );
+
+        matrix.revoke_from(&role, &select, Some(&second));
+        assert!(!matrix.has_privilege(&role, Privilege::Select));
     }
 }
 

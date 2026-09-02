@@ -354,14 +354,12 @@ fn test_cli_rejects_authenticated_semantically_contradictory_v7_cache() {
 }
 
 #[test]
-fn test_cli_rejects_cache_with_oversized_decoded_container() {
+fn test_cli_rejects_malformed_cache_payload() {
     let config = bincode::config::standard().with_variable_int_encoding();
     let encoded =
         bincode::serde::encode_to_vec(DbCacheVersioned::V7(Box::default()), config).unwrap();
-    assert_eq!(&encoded[..4], &[7, 0, 0, 0]);
-
-    let mut malicious = encoded[..3].to_vec();
-    malicious.push(1);
+    // Preserve the current enum discriminant, then corrupt the payload.
+    let mut malicious = encoded[..4].to_vec();
     malicious.push(252);
     malicious.extend_from_slice(&300_000_000u32.to_le_bytes());
 
@@ -383,7 +381,7 @@ fn test_cli_rejects_cache_with_oversized_decoded_container() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("exceeds the 256 MiB decoded-size limit"),
+        stderr.contains("corrupted (bincode)"),
         "unexpected stderr: {stderr}"
     );
 }

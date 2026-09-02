@@ -138,16 +138,10 @@ impl AnalysisState {
             Ok(roles) => roles,
             Err(result) => return result,
         };
-        if let Some(granted_by) = grant.granted_by.as_ref() {
-            if let Err(result) = self.validate_role_facts(std::slice::from_ref(granted_by)) {
-                return result;
-            }
-            // GRANTED BY changes the authorization check, which is not part
-            // of the privilege matrix.  Keep the matrix untouched rather
-            // than silently treating an authorization-sensitive statement as
-            // exact.
-            self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
-            return MutationResult::Skipped;
+        if let Some(granted_by) = grant.granted_by.as_ref()
+            && let Err(result) = self.validate_role_facts(std::slice::from_ref(granted_by))
+        {
+            return result;
         }
         if grant.with_grant_option {
             // The matrix records the effective privilege and the local grant
@@ -161,12 +155,46 @@ impl AnalysisState {
         let privileges = self.resolve_grant_privileges(&grant.privileges);
         match &grant.target {
             ResolvedGrantTarget::Tables(ids) => {
+                let grantor = self.grantor_identity(grant.granted_by.as_ref());
                 for id in ids {
+                    let authorization =
+                        self.local
+                            .relations
+                            .get(id)
+                            .and_then(|overlay| match overlay {
+                                crate::model::relation::RelationOverlay::Present(relation) => self
+                                    .authorize_relation_grant(
+                                        relation,
+                                        &privileges,
+                                        grantor.as_ref(),
+                                    ),
+                                crate::model::relation::RelationOverlay::Dropped => Some(false),
+                            });
+                    match authorization {
+                        Some(true) => {}
+                        Some(false) => {
+                            return MutationResult::Conflict {
+                                reason: format!(
+                                    "role '{}' lacks grant option on relation '{}'",
+                                    grantor
+                                        .as_ref()
+                                        .map_or_else(|| "unknown".to_string(), |r| r.name.clone()),
+                                    id
+                                ),
+                            };
+                        }
+                        None if grantor.is_some() => self.taint(
+                            EvidenceCode::CatalogCoverageIncomplete,
+                            EvidenceScope::Chain,
+                        ),
+                        None => {}
+                    }
                     self.apply_grant_to_relation(
                         id,
                         &privileges,
                         &grantees,
                         grant.with_grant_option,
+                        grantor.clone(),
                     );
                 }
             }
@@ -198,10 +226,39 @@ impl AnalysisState {
                         &privileges,
                         &grantees,
                         grant.with_grant_option,
+                        self.grantor_identity(grant.granted_by.as_ref()),
                     );
                 }
             }
             ResolvedGrantTarget::Roles(parents) => {
+                if let Some(grantor) = self.grantor_identity(grant.granted_by.as_ref()) {
+                    if self.local.roles_known {
+                        let can_administer = self.present_role(&grantor.name).is_some_and(|role| {
+                            role.is_superuser
+                                || parents
+                                    .iter()
+                                    .all(|parent| role.can_administer_membership.contains(parent))
+                        });
+                        if !can_administer {
+                            return MutationResult::Conflict {
+                                reason: format!(
+                                    "role '{}' lacks ADMIN OPTION for the granted membership",
+                                    grantor.name
+                                ),
+                            };
+                        }
+                    } else {
+                        self.taint(
+                            EvidenceCode::CatalogCoverageIncomplete,
+                            EvidenceScope::Chain,
+                        );
+                    }
+                } else if grant.granted_by.is_some() || self.local.current_role_known {
+                    self.taint(
+                        EvidenceCode::CatalogCoverageIncomplete,
+                        EvidenceScope::Chain,
+                    );
+                }
                 let mut admin_value = None;
                 let mut inherit_value = None;
                 let mut set_value = None;
@@ -229,9 +286,7 @@ impl AnalysisState {
                 let inherit_value =
                     inherit_value.or_else(|| grant.role_options.is_empty().then_some(true));
                 let set_value = set_value.or_else(|| grant.role_options.is_empty().then_some(true));
-                if (grant.role_options.is_empty() && grant.with_grant_option)
-                    || grant.granted_by.is_some()
-                {
+                if grant.role_options.is_empty() && grant.with_grant_option {
                     self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
                     return MutationResult::Skipped;
                 }
@@ -333,18 +388,10 @@ impl AnalysisState {
             Ok(roles) => roles,
             Err(result) => return result,
         };
-        if let Some(granted_by) = revoke.granted_by.as_ref() {
-            if let Err(result) = self.validate_role_facts(std::slice::from_ref(granted_by)) {
-                return result;
-            }
-            self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
-            return MutationResult::Skipped;
-        }
-        if revoke.cascade {
-            // CASCADE can remove privileges inherited through other grantors;
-            // that dependency chain is not represented locally.
-            self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
-            return MutationResult::Skipped;
+        if let Some(granted_by) = revoke.granted_by.as_ref()
+            && let Err(result) = self.validate_role_facts(std::slice::from_ref(granted_by))
+        {
+            return result;
         }
         if revoke.grant_option_only {
             // Revoke only the re-grant capability; the effective privilege
@@ -358,12 +405,47 @@ impl AnalysisState {
         let privileges = self.resolve_grant_privileges(&revoke.privileges);
         match &revoke.target {
             ResolvedGrantTarget::Tables(ids) => {
+                let grantor = self.grantor_identity(revoke.granted_by.as_ref());
                 for id in ids {
+                    let authorization =
+                        self.local
+                            .relations
+                            .get(id)
+                            .and_then(|overlay| match overlay {
+                                crate::model::relation::RelationOverlay::Present(relation) => self
+                                    .authorize_relation_grant(
+                                        relation,
+                                        &privileges,
+                                        grantor.as_ref(),
+                                    ),
+                                crate::model::relation::RelationOverlay::Dropped => Some(false),
+                            });
+                    match authorization {
+                        Some(true) => {}
+                        Some(false) => {
+                            return MutationResult::Conflict {
+                                reason: format!(
+                                    "role '{}' lacks grant option on relation '{}'",
+                                    grantor
+                                        .as_ref()
+                                        .map_or_else(|| "unknown".to_string(), |r| r.name.clone()),
+                                    id
+                                ),
+                            };
+                        }
+                        None if grantor.is_some() => self.taint(
+                            EvidenceCode::CatalogCoverageIncomplete,
+                            EvidenceScope::Chain,
+                        ),
+                        None => {}
+                    }
                     self.apply_revoke_to_relation(
                         id,
                         &privileges,
                         &revokees,
                         revoke.grant_option_only,
+                        grantor.as_ref(),
+                        revoke.cascade,
                     );
                 }
             }
@@ -391,13 +473,43 @@ impl AnalysisState {
                         &privileges,
                         &revokees,
                         revoke.grant_option_only,
+                        self.grantor_identity(revoke.granted_by.as_ref()).as_ref(),
+                        revoke.cascade,
                     );
                 }
             }
             ResolvedGrantTarget::Roles(parents) => {
-                if revoke.granted_by.is_some() || revoke.grant_option_only || revoke.cascade {
+                if revoke.grant_option_only || revoke.cascade {
                     self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
                     return MutationResult::Skipped;
+                }
+                if let Some(grantor) = self.grantor_identity(revoke.granted_by.as_ref()) {
+                    if self.local.roles_known {
+                        let can_administer = self.present_role(&grantor.name).is_some_and(|role| {
+                            role.is_superuser
+                                || parents
+                                    .iter()
+                                    .all(|parent| role.can_administer_membership.contains(parent))
+                        });
+                        if !can_administer {
+                            return MutationResult::Conflict {
+                                reason: format!(
+                                    "role '{}' lacks ADMIN OPTION for the revoked membership",
+                                    grantor.name
+                                ),
+                            };
+                        }
+                    } else {
+                        self.taint(
+                            EvidenceCode::CatalogCoverageIncomplete,
+                            EvidenceScope::Chain,
+                        );
+                    }
+                } else if revoke.granted_by.is_some() || self.local.current_role_known {
+                    self.taint(
+                        EvidenceCode::CatalogCoverageIncomplete,
+                        EvidenceScope::Chain,
+                    );
                 }
                 let revoke_option = match revoke.role_option.as_ref() {
                     None => None,

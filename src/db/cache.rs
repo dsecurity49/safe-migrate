@@ -704,6 +704,58 @@ impl DbCache {
                     ));
                 }
             }
+            for ((grantee, privilege), grantors) in &relation.privileges.grantors {
+                validate_id("relation privilege provenance grantee", grantee, false)?;
+                if !grantee.schema.is_empty() {
+                    return Err(format!(
+                        "relation '{}' privilege provenance grantee '{}' must use the cluster role namespace",
+                        id, grantee
+                    ));
+                }
+                if !relation.privileges.has_privilege(grantee, *privilege) {
+                    return Err(format!(
+                        "relation '{}' privilege provenance exists without the effective '{}' privilege for '{}'",
+                        id,
+                        format_args!("{privilege:?}"),
+                        grantee
+                    ));
+                }
+                for grantor in grantors {
+                    validate_id("relation privilege provenance grantor", grantor, false)?;
+                    if !grantor.schema.is_empty() {
+                        return Err(format!(
+                            "relation '{}' privilege provenance grantor '{}' must use the cluster role namespace",
+                            id, grantor
+                        ));
+                    }
+                    if grantor.name != "public" && !self.roles.contains_key(grantor) {
+                        return Err(format!(
+                            "relation '{}' privilege provenance references missing grantor role '{}'",
+                            id, grantor
+                        ));
+                    }
+                }
+            }
+            for ((grantee, privilege), grantors) in &relation.privileges.grant_option_grantors {
+                validate_id("relation grant-option provenance grantee", grantee, false)?;
+                if !relation.privileges.has_grant_option(grantee, *privilege) {
+                    return Err(format!(
+                        "relation '{}' grant-option provenance exists without the grant option for '{}'",
+                        id, grantee
+                    ));
+                }
+                for grantor in grantors {
+                    validate_id("relation grant-option provenance grantor", grantor, false)?;
+                    if !grantor.schema.is_empty()
+                        || (grantor.name != "public" && !self.roles.contains_key(grantor))
+                    {
+                        return Err(format!(
+                            "relation '{}' grant-option provenance references invalid grantor role '{}'",
+                            id, grantor
+                        ));
+                    }
+                }
+            }
         }
         for (id, function) in &self.functions {
             validate_id("routine cache identity", id, true)?;

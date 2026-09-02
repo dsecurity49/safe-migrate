@@ -2146,6 +2146,86 @@ impl AnalysisState {
         Some(false)
     }
 
+    /// Resolve a direct or inherited relation privilege for a role.  ACL
+    /// rows are direct grants; PostgreSQL only exposes them through a role's
+    /// membership edges when the role has INHERIT and that edge carries the
+    /// INHERIT option.  Unknown role catalogs deliberately return `None` so
+    /// callers cannot turn an incomplete cache into an exact authorization
+    /// decision.
+    fn effective_relation_privilege(
+        &self,
+        relation: &crate::model::relation::RelationState,
+        role: &ObjectId,
+        privilege: Privilege,
+        grant_option: bool,
+    ) -> Option<bool> {
+        if !self.local.roles_known {
+            return None;
+        }
+        let mut pending = vec![role.clone()];
+        let mut visited = HashSet::new();
+        while let Some(candidate) = pending.pop() {
+            if !visited.insert(candidate.clone()) {
+                continue;
+            }
+            if if grant_option {
+                relation
+                    .privileges
+                    .has_direct_grant_option(&candidate, privilege)
+            } else {
+                relation
+                    .privileges
+                    .has_direct_privilege(&candidate, privilege)
+            } {
+                return Some(true);
+            }
+            let role_state = self.present_role(&candidate.name)?;
+            if !role_state.inherits && candidate == *role {
+                continue;
+            }
+            if role_state.inherits {
+                pending.extend(role_state.can_inherit_from.iter().cloned());
+            }
+        }
+        Some(false)
+    }
+
+    fn grantor_identity(
+        &self,
+        granted_by: Option<&crate::analysis::facts::RoleFact>,
+    ) -> Option<ObjectId> {
+        granted_by
+            .and_then(|fact| {
+                self.role_fact_identity(fact)
+                    .map(|(name, _)| ObjectId::new("", name))
+            })
+            .or_else(|| {
+                self.local
+                    .current_role_known
+                    .then(|| ObjectId::new("", self.local.current_role.clone()))
+            })
+    }
+
+    fn authorize_relation_grant(
+        &self,
+        relation: &crate::model::relation::RelationState,
+        privileges: &HashSet<Privilege>,
+        grantor: Option<&ObjectId>,
+    ) -> Option<bool> {
+        let grantor = grantor?;
+        let role = self.present_role(&grantor.name)?;
+        if role.is_superuser || relation.owner == *grantor {
+            return Some(true);
+        }
+        for privilege in privileges {
+            if self.effective_relation_privilege(relation, grantor, *privilege, true) != Some(true)
+            {
+                return Some(false);
+            }
+        }
+        Some(true)
+    }
+
     fn can_set_session_authorization_to(&self, target: &str) -> Option<bool> {
         if !self.local.roles_known || !self.local.authenticated_role_known {
             return None;
@@ -2430,15 +2510,25 @@ impl AnalysisState {
         privileges: &HashSet<Privilege>,
         grantees: &[ObjectId],
         with_grant_option: bool,
+        grantor: Option<ObjectId>,
     ) {
         self.snapshot_relation(id);
         if let Some(RelationOverlay::Present(rel)) = self.local.relations.get_mut(id) {
             for grantee in grantees {
                 if with_grant_option {
-                    rel.privileges
-                        .grant_with_option(grantee.clone(), privileges.clone());
+                    rel.privileges.grant_from(
+                        grantee.clone(),
+                        privileges.clone(),
+                        grantor.clone(),
+                        true,
+                    );
                 } else {
-                    rel.privileges.grant(grantee.clone(), privileges.clone());
+                    rel.privileges.grant_from(
+                        grantee.clone(),
+                        privileges.clone(),
+                        grantor.clone(),
+                        false,
+                    );
                 }
             }
         }
@@ -2450,15 +2540,18 @@ impl AnalysisState {
         privileges: &HashSet<Privilege>,
         revokees: &[ObjectId],
         grant_option_only: bool,
+        grantor: Option<&ObjectId>,
+        cascade: bool,
     ) {
         self.snapshot_relation(id);
         if let Some(RelationOverlay::Present(rel)) = self.local.relations.get_mut(id) {
             for revokee in revokees {
                 if grant_option_only {
-                    rel.privileges.revoke_grant_option(revokee, privileges);
+                    rel.privileges
+                        .revoke_grant_option_from(revokee, privileges, grantor);
                 } else {
-                    rel.privileges.revoke(revokee, privileges);
-                    rel.privileges.revoke_grant_option(revokee, privileges);
+                    rel.privileges
+                        .revoke_from_cascade(revokee, privileges, grantor, cascade);
                 }
             }
         }

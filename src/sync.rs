@@ -1379,6 +1379,7 @@ struct RelationDecoration {
 
 struct RelationGrant {
     relation_id: ObjectId,
+    grantor: ObjectId,
     grantee: ObjectId,
     privilege: crate::model::relation::Privilege,
     is_grantable: bool,
@@ -1432,6 +1433,7 @@ fn load_relation_decorations(
                 WHEN acl.grantee = 0 THEN 'public'
                 ELSE pg_catalog.pg_get_userbyid(acl.grantee)
             END AS grantee,
+            pg_catalog.pg_get_userbyid(acl.grantor) AS grantor,
             acl.privilege_type,
             acl.is_grantable
         FROM pg_class c
@@ -1468,6 +1470,11 @@ fn load_relation_decorations(
                         .context("privileged relation schema")?,
                     row.try_get::<_, String>("relation_name")
                         .context("privileged relation name")?,
+                ),
+                grantor: ObjectId::new(
+                    "",
+                    row.try_get::<_, String>("grantor")
+                        .context("relation privilege grantor")?,
                 ),
                 grantee: ObjectId::new(
                     "",
@@ -2816,9 +2823,11 @@ fn populate_cache_from_client(
         if grant.is_grantable {
             relation
                 .privileges
-                .grant_with_option(grant.grantee, privileges);
+                .grant_from(grant.grantee, privileges, Some(grant.grantor), true);
         } else {
-            relation.privileges.grant(grant.grantee, privileges);
+            relation
+                .privileges
+                .grant_from(grant.grantee, privileges, Some(grant.grantor), false);
         }
     }
 

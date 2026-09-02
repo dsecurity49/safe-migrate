@@ -3794,6 +3794,227 @@ mod state_mutation_tests {
     }
 
     #[test]
+    fn inherited_grant_option_authorizes_a_delegated_grant() {
+        let engine = setup_engine();
+        let table_id = object_id("public", "inherited_grant_table");
+        let parent = object_id("", "grant_parent");
+        let member = object_id("", "grant_member");
+        let mut cache = DbCache::new();
+        cache.metadata.source_role = Some("grant_member".into());
+        cache.metadata.source_session_role = Some("grant_member".into());
+        cache.roles.insert(
+            parent.clone(),
+            RoleState {
+                id: parent.clone(),
+                can_login: false,
+                is_superuser: false,
+                inherits: true,
+                member_of: Vec::new(),
+                can_administer_membership: Vec::new(),
+                can_inherit_from: Vec::new(),
+                can_set_role_to: Vec::new(),
+            },
+        );
+        cache.roles.insert(
+            member.clone(),
+            RoleState {
+                id: member.clone(),
+                can_login: true,
+                is_superuser: false,
+                inherits: true,
+                member_of: vec![parent.clone()],
+                can_administer_membership: Vec::new(),
+                can_inherit_from: vec![parent.clone()],
+                can_set_role_to: Vec::new(),
+            },
+        );
+        let delegated = object_id("", "delegated_user");
+        cache.roles.insert(
+            delegated.clone(),
+            RoleState {
+                id: delegated,
+                can_login: true,
+                is_superuser: false,
+                inherits: true,
+                member_of: Vec::new(),
+                can_administer_membership: Vec::new(),
+                can_inherit_from: Vec::new(),
+                can_set_role_to: Vec::new(),
+            },
+        );
+        let mut relation = RelationState::new(
+            table_id.clone(),
+            object_id("", "owner"),
+            0,
+            Some(1),
+            RelationKind::Table,
+            Persistence::Permanent,
+            0,
+        );
+        relation
+            .privileges
+            .grant_with_option(parent, [Privilege::Select].into_iter().collect());
+        cache.insert_baseline(table_id, relation);
+        let mut state = safe_migrate::AnalysisState::new(cache);
+
+        let violations = engine
+            .analyze(
+                "GRANT SELECT ON inherited_grant_table TO delegated_user;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(!violations.iter().any(|v| v.rule_id == "chain-conflict"));
+        let RelationOverlay::Present(relation) = state
+            .get_relation(&object_id("public", "inherited_grant_table"))
+            .unwrap()
+        else {
+            panic!("relation missing");
+        };
+        assert!(
+            relation
+                .privileges
+                .has_privilege(&object_id("", "delegated_user"), Privilege::Select)
+        );
+    }
+
+    #[test]
+    fn membership_without_inherit_option_cannot_delegate_grants() {
+        let engine = setup_engine();
+        let table_id = object_id("public", "non_inherited_grant_table");
+        let parent = object_id("", "grant_parent");
+        let member = object_id("", "grant_member");
+        let mut cache = DbCache::new();
+        cache.metadata.source_role = Some("grant_member".into());
+        cache.metadata.source_session_role = Some("grant_member".into());
+        for (id, can_inherit_from) in [(parent.clone(), Vec::new()), (member.clone(), Vec::new())] {
+            let is_member = id == member;
+            cache.roles.insert(
+                id.clone(),
+                RoleState {
+                    id,
+                    can_login: true,
+                    is_superuser: false,
+                    inherits: true,
+                    member_of: if is_member {
+                        vec![parent.clone()]
+                    } else {
+                        Vec::new()
+                    },
+                    can_administer_membership: Vec::new(),
+                    can_inherit_from,
+                    can_set_role_to: Vec::new(),
+                },
+            );
+        }
+        let mut relation = RelationState::new(
+            table_id.clone(),
+            object_id("", "owner"),
+            0,
+            Some(1),
+            RelationKind::Table,
+            Persistence::Permanent,
+            0,
+        );
+        relation
+            .privileges
+            .grant_with_option(parent, [Privilege::Select].into_iter().collect());
+        cache.insert_baseline(table_id, relation);
+        let mut state = safe_migrate::AnalysisState::new(cache);
+
+        let violations = engine
+            .analyze(
+                "GRANT SELECT ON non_inherited_grant_table TO delegated_user;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(violations.iter().any(|v| v.rule_id == "chain-conflict"));
+        let RelationOverlay::Present(relation) = state
+            .get_relation(&object_id("public", "non_inherited_grant_table"))
+            .unwrap()
+        else {
+            panic!("relation missing");
+        };
+        assert!(
+            !relation
+                .privileges
+                .has_privilege(&object_id("", "delegated_user"), Privilege::Select)
+        );
+    }
+
+    #[test]
+    fn revoke_cascade_removes_grants_delegated_by_the_revoked_role() {
+        let engine = setup_engine();
+        let table_id = object_id("public", "cascade_grant_table");
+        let owner = object_id("", "grant_owner");
+        let delegate = object_id("", "grant_delegate");
+        let reader = object_id("", "grant_reader");
+        let mut cache = DbCache::new();
+        cache.metadata.source_role = Some("grant_owner".into());
+        cache.metadata.source_session_role = Some("grant_owner".into());
+        for (id, can_set_role_to) in [
+            (owner.clone(), vec![delegate.clone()]),
+            (delegate.clone(), vec![owner.clone()]),
+            (reader.clone(), Vec::new()),
+        ] {
+            cache.roles.insert(
+                id.clone(),
+                RoleState {
+                    id,
+                    can_login: true,
+                    is_superuser: false,
+                    inherits: true,
+                    member_of: Vec::new(),
+                    can_administer_membership: Vec::new(),
+                    can_inherit_from: Vec::new(),
+                    can_set_role_to,
+                },
+            );
+        }
+        cache.insert_baseline(
+            table_id.clone(),
+            RelationState::new(
+                table_id,
+                owner.clone(),
+                0,
+                Some(1),
+                RelationKind::Table,
+                Persistence::Permanent,
+                0,
+            ),
+        );
+        let mut state = safe_migrate::AnalysisState::new(cache);
+        engine
+            .analyze(
+                "GRANT SELECT ON cascade_grant_table TO grant_delegate WITH GRANT OPTION; SET ROLE grant_delegate; GRANT SELECT ON cascade_grant_table TO grant_reader WITH GRANT OPTION; SET ROLE grant_owner;",
+                &mut state,
+            )
+            .unwrap();
+        let violations = engine
+            .analyze(
+                "REVOKE SELECT ON cascade_grant_table FROM grant_delegate CASCADE;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(!violations.iter().any(|v| v.rule_id == "chain-conflict"));
+        let RelationOverlay::Present(relation) = state
+            .get_relation(&object_id("public", "cascade_grant_table"))
+            .unwrap()
+        else {
+            panic!("relation missing");
+        };
+        assert!(
+            !relation
+                .privileges
+                .has_privilege(&delegate, Privilege::Select)
+        );
+        assert!(
+            !relation
+                .privileges
+                .has_privilege(&reader, Privilege::Select)
+        );
+    }
+
+    #[test]
     fn test_state_hydrates_and_disables_trigger() {
         use safe_migrate::db::cache::TriggerCache;
         use safe_migrate::model::trigger::{TriggerEnableMode, TriggerOverlay};
@@ -5325,7 +5546,7 @@ mod state_mutation_tests {
                     is_superuser: false,
                     inherits: true,
                     member_of: Vec::new(),
-                    can_administer_membership: Vec::new(),
+                    can_administer_membership: vec![object_id("", "parent")],
                     can_inherit_from: Vec::new(),
                     can_set_role_to: Vec::new(),
                 },

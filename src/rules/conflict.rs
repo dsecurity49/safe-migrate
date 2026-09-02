@@ -15,6 +15,15 @@ impl ConflictRule {
             _ => None,
         }
     }
+
+    fn is_dedicated_transaction_conflict(reason: &str) -> bool {
+        matches!(
+            reason,
+            "CREATE INDEX CONCURRENTLY cannot run inside a transaction"
+                | "DROP INDEX CONCURRENTLY cannot run inside a transaction"
+                | "REFRESH MATERIALIZED VIEW CONCURRENTLY cannot run inside a transaction"
+        )
+    }
 }
 
 impl Rule for ConflictRule {
@@ -32,6 +41,7 @@ impl Rule for ConflictRule {
 
     fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
         match Self::extract_conflict_reason(context.result()) {
+            Some(reason) if Self::is_dedicated_transaction_conflict(reason) => Vec::new(),
             Some(reason) => vec![Violation {
                 source_range: None,
                 rule_id: Self::ID,

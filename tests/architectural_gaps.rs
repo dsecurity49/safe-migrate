@@ -530,25 +530,48 @@ mod architectural_gap_tests {
     fn test_tablespace_access_method_rewrite() {
         let engine = setup_engine();
         let mut cache = safe_migrate::db::cache::DbCache::new();
+        cache.metadata.schemas = Some(vec!["public".to_string()]);
+        cache.search_path = vec!["public".to_string()];
+        cache.schemas.insert(
+            "public".to_string(),
+            safe_migrate::model::schema::SchemaState {
+                name: "public".to_string(),
+                owner: ObjectId::new("", "postgres"),
+                generation: 0,
+            },
+        );
 
         // Force Tier 1 by giving the table 150,000 rows
-        cache.insert_baseline(
-            object_id("public", "massive_table"),
-            safe_migrate::model::relation::RelationState::new(
-                object_id("public", "massive_table"),
-                ObjectId::new("public", "postgres"),
-                0,
-                Some(150_000),
-                RelationKind::Table,
-                Persistence::Permanent,
-                0,
-            ),
+        let table_id = object_id("public", "massive_table");
+        let mut table = safe_migrate::model::relation::RelationState::new(
+            table_id.clone(),
+            ObjectId::new("public", "postgres"),
+            0,
+            Some(150_000),
+            RelationKind::Table,
+            Persistence::Permanent,
+            0,
         );
-        let mut state = safe_migrate::analysis::state::AnalysisState::new(cache);
+        table.columns.push(safe_migrate::model::column::Column {
+            name: "id".to_string(),
+            data_type: Some("integer".to_string()),
+            type_id: None,
+            is_nullable: true,
+            default: None,
+            avg_width: None,
+            default_expr_text: None,
+            type_modifier: Some(-1),
+        });
+        table.last_analyze = Some("2026-09-01 00:00:00+00".to_string());
+        cache.insert_baseline(table_id.clone(), table);
+        let mut state =
+            safe_migrate::analysis::state::AnalysisState::with_baseline(cache.clone(), true);
+        let mut storage_state =
+            safe_migrate::analysis::state::AnalysisState::with_baseline(cache, true);
 
         let v1 = engine
             .analyze(
-                "ALTER TABLE massive_table SET ACCESS METHOD columnar;",
+                "ALTER TABLE public.massive_table SET ACCESS METHOD columnar;",
                 &mut state,
             )
             .unwrap();
@@ -557,11 +580,10 @@ mod architectural_gap_tests {
                 .any(|v| v.rule_id == "table-rewrite-access-method"
                     && v.tier == ViolationTier::Tier1)
         );
-
         let v2 = engine
             .analyze(
-                "ALTER TABLE massive_table ALTER COLUMN id SET STORAGE MAIN;",
-                &mut state,
+                "ALTER TABLE public.massive_table ALTER COLUMN id SET STORAGE MAIN;",
+                &mut storage_state,
             )
             .unwrap();
         assert!(
