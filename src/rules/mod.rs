@@ -117,6 +117,13 @@ impl RuleCapability {
         match mutation {
             crate::analysis::mutations::Mutation::AlterTable(alter) => {
                 targets.push(&alter.id);
+                if let crate::analysis::mutations::AlterTableActionMutation::AddForeignKey {
+                    to_table,
+                    ..
+                } = &alter.action
+                {
+                    targets.push(to_table);
+                }
             }
             crate::analysis::mutations::Mutation::CreateIndex(create) => {
                 targets.push(&create.table);
@@ -178,6 +185,15 @@ pub(crate) const BASELINE_STATS_CAPABILITIES: &[RuleCapability] = &[
 pub(crate) const BASELINE_RELATION_CAPABILITIES: &[RuleCapability] =
     &[RuleCapability::BaselineRelations];
 pub(crate) const FUNCTION_CAPABILITIES: &[RuleCapability] = &[RuleCapability::FunctionCatalog];
+pub(crate) const FUNCTION_DEPENDENCY_CAPABILITIES: &[RuleCapability] = &[
+    RuleCapability::FunctionCatalog,
+    RuleCapability::CatalogDependencies,
+];
+pub(crate) const BASELINE_STATS_DEPENDENCY_CAPABILITIES: &[RuleCapability] = &[
+    RuleCapability::BaselineRelations,
+    RuleCapability::CatalogDependencies,
+    RuleCapability::RowStatistics,
+];
 pub(crate) const TRANSACTION_CAPABILITIES: &[RuleCapability] = &[RuleCapability::TransactionState];
 
 impl<'a> RuleContext<'a> {

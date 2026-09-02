@@ -479,8 +479,7 @@ impl DependencyGraph {
                 | DependencyKind::InheritanceOf
                 | DependencyKind::PartitionOf
                 | DependencyKind::ConstraintDependency { .. }
-                | DependencyKind::ColumnGeneratedFrom { .. }
-                | DependencyKind::ColumnDefaultOnSequence { .. } => {
+                | DependencyKind::ColumnGeneratedFrom { .. } => {
                     if edge.dependent == *old_id {
                         edge.dependent = new_id.clone();
                     }
@@ -490,7 +489,8 @@ impl DependencyGraph {
                 }
                 DependencyKind::IndexOnRelation { .. }
                 | DependencyKind::SequenceOwnedBy { .. }
-                | DependencyKind::TriggerOnTable { .. } => {
+                | DependencyKind::TriggerOnTable { .. }
+                | DependencyKind::ColumnDefaultOnSequence { .. } => {
                     if edge.referenced == *old_id {
                         edge.referenced = new_id.clone();
                     }

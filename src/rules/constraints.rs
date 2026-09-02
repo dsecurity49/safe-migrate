@@ -77,6 +77,9 @@ impl Rule for BlockingConstraintRule {
             let max_locked_rows = match &alter.action {
                 AlterTableActionMutation::AddForeignKey { to_table, .. } => {
                     // Foreign keys can lock both sides; classify by the larger table.
+                    // Require statistics for both endpoints before using the
+                    // size-based tier; a missing parent estimate must not be
+                    // silently replaced by the default child estimate.
                     let parent_rows = match context.pre_state().relations.get(to_table) {
                         Some(parent_rel) => {
                             if parent_rel.is_stale()

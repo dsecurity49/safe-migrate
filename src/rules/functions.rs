@@ -1,7 +1,9 @@
 use crate::analysis::mutations::Mutation;
 use crate::analysis::state::MutationResult;
 use crate::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
-use crate::rules::{FUNCTION_CAPABILITIES, Rule, RuleCapability, RuleContext};
+use crate::rules::{
+    FUNCTION_CAPABILITIES, FUNCTION_DEPENDENCY_CAPABILITIES, Rule, RuleCapability, RuleContext,
+};
 
 pub struct FunctionVolatilityRule;
 
@@ -84,7 +86,7 @@ impl Rule for BrokenComputeRule {
     }
 
     fn required_capabilities(&self) -> &'static [RuleCapability] {
-        FUNCTION_CAPABILITIES
+        FUNCTION_DEPENDENCY_CAPABILITIES
     }
 
     fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {

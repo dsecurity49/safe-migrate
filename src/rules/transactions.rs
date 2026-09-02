@@ -141,7 +141,7 @@ impl Rule for VacuumFullRule {
     }
 
     fn required_capabilities(&self) -> &'static [RuleCapability] {
-        TRANSACTION_CAPABILITIES
+        &[]
     }
 
     fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {

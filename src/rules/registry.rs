@@ -433,7 +433,6 @@ mod tests {
             "broken-compute",
             "concurrent-in-transaction",
             "alter-type-add-value-txn",
-            "vacuum-full",
             "schema-drift",
         ]
         .into_iter()

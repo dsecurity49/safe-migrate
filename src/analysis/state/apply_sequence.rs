@@ -8,6 +8,7 @@ use crate::analysis::mutations::{
 };
 use crate::ast::identifiers::ObjectId;
 use crate::model::sequence::{SequenceKind, SequenceOverlay, SequenceState};
+use std::collections::HashSet;
 
 type SequenceLookup = ObjectLookup;
 
@@ -137,6 +138,19 @@ impl AnalysisState {
                 _ => unreachable!("filtered default dependency"),
             })
             .collect::<Vec<_>>();
+        let typed_default_relation_columns = self
+            .local
+            .graph
+            .edges()
+            .iter()
+            .filter_map(|edge| match &edge.kind {
+                DependencyKind::ColumnDefaultOnSequence { column } => Some((
+                    self.local.graph.resolve_rename(&edge.dependent).clone(),
+                    column.clone(),
+                )),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
 
         let relation_ids = self
             .local
@@ -160,7 +174,8 @@ impl AnalysisState {
                 let typed_dependency = typed_default_columns
                     .iter()
                     .any(|(table, name)| *table == &relation_id && name == &column.name);
-                let references_sequence = typed_default_columns.is_empty()
+                let references_sequence = !typed_default_relation_columns
+                    .contains(&(relation_id.clone(), column.name.clone()))
                     && (column.default.as_ref().is_some_and(|default| {
                         Self::expression_references_sequence(default, sequence)
                     }) || column.default_expr_text.as_deref().is_some_and(|default| {

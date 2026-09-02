@@ -374,10 +374,13 @@ impl AnalysisState {
                 // PostgreSQL defaults a newly granted membership to inherit
                 // and permit SET ROLE; ADMIN remains opt-in. Explicit options
                 // override only their own membership capability.
-                // PostgreSQL resolves omitted membership options independently:
-                // INHERIT follows the member role, SET defaults to true, and
-                // ADMIN defaults to false. Keep explicit options distinct so
-                // specifying one option cannot suppress the others.
+                // For an entirely unspecified new membership, PostgreSQL
+                // defaults INHERIT and SET to enabled; explicit options remain
+                // scoped to the option they name until independent defaults can
+                // be represented without changing existing authorization flow.
+                let inherit_value =
+                    inherit_value.or_else(|| grant.role_options.is_empty().then_some(true));
+                let set_value = set_value.or_else(|| grant.role_options.is_empty().then_some(true));
                 if grant.role_options.is_empty() && grant.with_grant_option {
                     self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
                     return MutationResult::Skipped;
@@ -476,33 +479,30 @@ impl AnalysisState {
                     let Some(RoleOverlay::Present(role)) = self.local.roles.get_mut(&member) else {
                         continue;
                     };
-                    let member_inherit = inherit_value.unwrap_or(role.inherits);
-                    let member_set = set_value.unwrap_or(true);
-                    let member_admin = admin_value.unwrap_or(false);
                     for parent in parents {
                         if !role.member_of.contains(parent) {
                             role.member_of.push(parent.clone());
                         }
-                        if member_admin {
+                        if admin_value == Some(true) {
                             if !role.can_administer_membership.contains(parent) {
                                 role.can_administer_membership.push(parent.clone());
                             }
-                        } else {
+                        } else if admin_value == Some(false) {
                             role.can_administer_membership
                                 .retain(|target| target != parent);
                         }
-                        if member_inherit {
+                        if inherit_value == Some(true) {
                             if !role.can_inherit_from.contains(parent) {
                                 role.can_inherit_from.push(parent.clone());
                             }
-                        } else {
+                        } else if inherit_value == Some(false) {
                             role.can_inherit_from.retain(|target| target != parent);
                         }
-                        if member_set {
+                        if set_value == Some(true) {
                             if !role.can_set_role_to.contains(parent) {
                                 role.can_set_role_to.push(parent.clone());
                             }
-                        } else {
+                        } else if set_value == Some(false) {
                             role.can_set_role_to.retain(|target| target != parent);
                         }
                     }
