@@ -161,7 +161,8 @@
         "safe_009_drop_matview_if_exists.sql",
         "safe_010_drop_view_restrict.sql",
         "007_drop_pub_cascade.sql",
-        "safe_006_drop_pub.sql"
+        "safe_006_drop_pub.sql",
+        "safe_011_alter_pub_options.sql"
       ],
       "excluded_fixtures": [
         {
@@ -216,7 +217,8 @@
       ],
       "fixture_scopes": {
         "007_drop_pub_cascade.sql": ["publications"],
-        "safe_006_drop_pub.sql": ["publications"]
+        "safe_006_drop_pub.sql": ["publications"],
+        "safe_011_alter_pub_options.sql": ["publications"]
       },
       "required_relations": [
         "sm_core.myview",

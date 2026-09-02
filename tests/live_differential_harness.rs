@@ -1421,8 +1421,7 @@ fn snapshot_live_state(
                     owner: publication.owner.clone(),
                     scope: serde_json::to_string(&publication.scope)
                         .expect("publication scope must be serializable"),
-                    params: serde_json::to_string(&publication.params)
-                        .expect("publication parameters must be serializable"),
+                    params: normalize_attributes(&publication.params),
                 },
             );
         }
@@ -1708,8 +1707,7 @@ fn snapshot_simulator_state(
                     owner: publication.owner.clone(),
                     scope: serde_json::to_string(&publication.scope)
                         .expect("publication scope must be serializable"),
-                    params: serde_json::to_string(&publication.params)
-                        .expect("publication parameters must be serializable"),
+                    params: normalize_attributes(&publication.params),
                 },
             );
         }
@@ -2467,6 +2465,16 @@ fn normalize_relation_kind(kind: RelationKind) -> NormalizedRelationKind {
         RelationKind::View => NormalizedRelationKind::View,
         RelationKind::MaterializedView => NormalizedRelationKind::MaterializedView,
     }
+}
+
+fn normalize_attributes(attributes: &[safe_migrate::analysis::facts::AttributeFact]) -> String {
+    let mut normalized = attributes.to_vec();
+    normalized.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.value.cmp(&right.value))
+    });
+    serde_json::to_string(&normalized).expect("attribute facts must be serializable")
 }
 
 fn normalize_trigger_mode(mode: safe_migrate::model::trigger::TriggerEnableMode) -> String {
