@@ -1024,6 +1024,31 @@ fn load_roles(
     Ok(roles)
 }
 
+fn load_role_membership_grantors(
+    client: &mut impl GenericClient,
+) -> Result<Vec<crate::model::role::RoleMembershipGrantor>> {
+    let rows = client
+        .query(
+            "SELECT member.rolname, parent.rolname, grantor.rolname
+             FROM pg_auth_members membership
+             JOIN pg_roles member ON member.oid = membership.member
+             JOIN pg_roles parent ON parent.oid = membership.roleid
+             JOIN pg_roles grantor ON grantor.oid = membership.grantor
+             ORDER BY member.rolname, parent.rolname, grantor.rolname;",
+            &[],
+        )
+        .context("Failed to load role membership grantors")?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(crate::model::role::RoleMembershipGrantor {
+                member: ObjectId::new("", row.try_get::<_, String>(0)?),
+                role: ObjectId::new("", row.try_get::<_, String>(1)?),
+                grantor: ObjectId::new("", row.try_get::<_, String>(2)?),
+            })
+        })
+        .collect()
+}
+
 struct ProvenanceCatalog {
     pg_version_num: u32,
     metadata: crate::db::cache::CacheMetadata,
@@ -2877,6 +2902,8 @@ fn populate_cache_from_client(
     // `SET ROLE` from a migration that PostgreSQL would reject. pg_roles does
     // not expose password hashes or other credentials.
     cache.roles = load_roles(client, cache.pg_version_num.unwrap_or_default())?;
+    cache.role_membership_grantors = load_role_membership_grantors(client)?;
+    cache.role_membership_grantors_complete = true;
 
     cache
         .validate_semantics()

@@ -5716,6 +5716,68 @@ mod state_mutation_tests {
     }
 
     #[test]
+    fn role_membership_revoke_cascade_removes_dependent_grants() {
+        let engine = setup_engine();
+        let mut cache = DbCache::new();
+        cache.metadata.source_role = Some("admin".into());
+        cache.metadata.source_session_role = Some("admin".into());
+        for name in ["admin", "parent", "member", "child"] {
+            let id = object_id("", name);
+            cache.roles.insert(
+                id.clone(),
+                RoleState {
+                    id,
+                    can_login: true,
+                    is_superuser: false,
+                    inherits: true,
+                    member_of: Vec::new(),
+                    can_administer_membership: Vec::new(),
+                    can_inherit_from: Vec::new(),
+                    can_set_role_to: Vec::new(),
+                },
+            );
+        }
+        let parent = object_id("", "parent");
+        let member = object_id("", "member");
+        cache
+            .roles
+            .get_mut(&object_id("", "admin"))
+            .unwrap()
+            .member_of = vec![parent.clone()];
+        cache
+            .roles
+            .get_mut(&object_id("", "admin"))
+            .unwrap()
+            .can_administer_membership = vec![parent.clone()];
+        cache.roles.get_mut(&member).unwrap().member_of = vec![parent.clone()];
+        cache
+            .roles
+            .get_mut(&member)
+            .unwrap()
+            .can_administer_membership = vec![parent.clone()];
+        cache
+            .role_membership_grantors
+            .push(safe_migrate::model::role::RoleMembershipGrantor {
+                member: member.clone(),
+                role: parent.clone(),
+                grantor: object_id("", "admin"),
+            });
+        let mut state = safe_migrate::AnalysisState::new(cache);
+
+        engine
+            .analyze(
+                "GRANT parent TO child GRANTED BY member; REVOKE parent FROM member CASCADE;",
+                &mut state,
+            )
+            .unwrap();
+        let RoleOverlay::Present(child) = state.local.roles.get(&object_id("", "child")).unwrap()
+        else {
+            panic!("child role unexpectedly dropped");
+        };
+        assert!(!child.member_of.contains(&parent));
+    }
+
+    #[test]
     fn role_grant_to_public_is_rejected_before_partial_mutation() {
         let engine = setup_engine();
         let mut cache = DbCache::new();

@@ -3,7 +3,7 @@ use crate::model::constraint::{ConstraintKind, ConstraintState};
 use crate::model::function::FunctionState;
 use crate::model::relation::{RelationKind, RelationState};
 use crate::model::replication::{PublicationState, SubscriptionState};
-use crate::model::role::RoleState;
+use crate::model::role::{RoleMembershipGrantor, RoleState};
 use crate::model::schema::SchemaState;
 use crate::model::sequence::SequenceState;
 use crate::model::trigger::TriggerEnableMode;
@@ -336,6 +336,12 @@ pub struct DbCache {
     pub functions: HashMap<ObjectId, FunctionState>,
     pub types: HashMap<ObjectId, TypeState>,
     pub roles: HashMap<ObjectId, RoleState>,
+    /// Grantor provenance for role memberships, used by membership CASCADE.
+    #[serde(default)]
+    pub role_membership_grantors: Vec<RoleMembershipGrantor>,
+    /// True only when the synchronizer queried every membership grantor row.
+    #[serde(default)]
+    pub role_membership_grantors_complete: bool,
     pub schemas: HashMap<String, SchemaState>,
     pub sequences: HashMap<ObjectId, SequenceState>,
     pub dependencies: Vec<ViewDependencyCache>,
@@ -428,6 +434,8 @@ impl DbCache {
             functions: HashMap::new(),
             types: HashMap::new(),
             roles: HashMap::new(),
+            role_membership_grantors: Vec::new(),
+            role_membership_grantors_complete: false,
             schemas: HashMap::new(),
             sequences: HashMap::new(),
             dependencies: Vec::new(),
@@ -1098,6 +1106,54 @@ impl DbCache {
                         "role '{}' contains duplicate INHERIT target '{}'",
                         id.name, target.name
                     ));
+                }
+            }
+        }
+
+        let mut membership_grantors = HashSet::new();
+        for provenance in &self.role_membership_grantors {
+            validate_id("role membership grantee", &provenance.member, false)?;
+            validate_id("role membership role", &provenance.role, false)?;
+            validate_id("role membership grantor", &provenance.grantor, false)?;
+            for id in [&provenance.member, &provenance.role, &provenance.grantor] {
+                if !id.schema.is_empty() {
+                    return Err(format!(
+                        "role membership provenance '{}' must use the cluster role namespace",
+                        id
+                    ));
+                }
+                if !self.roles.contains_key(id) {
+                    return Err(format!(
+                        "role membership provenance references missing role '{}'",
+                        id
+                    ));
+                }
+            }
+            let Some(member) = self.roles.get(&provenance.member) else {
+                unreachable!("validated role provenance member disappeared")
+            };
+            if !member.member_of.contains(&provenance.role) {
+                return Err(format!(
+                    "role membership provenance '{}' -> '{}' has no membership edge",
+                    provenance.member, provenance.role
+                ));
+            }
+            if !membership_grantors.insert((provenance.member.clone(), provenance.role.clone())) {
+                return Err(format!(
+                    "duplicate role membership provenance for '{}' -> '{}'",
+                    provenance.member, provenance.role
+                ));
+            }
+        }
+        if self.role_membership_grantors_complete {
+            for (member_id, role) in &self.roles {
+                for role_id in &role.member_of {
+                    if !membership_grantors.contains(&(member_id.clone(), role_id.clone())) {
+                        return Err(format!(
+                            "complete role membership provenance is missing for '{}' -> '{}'",
+                            member_id, role_id
+                        ));
+                    }
                 }
             }
         }

@@ -88,6 +88,10 @@ pub enum StateChange {
         id: ObjectId,
         previous: Option<crate::model::role::RoleOverlay>,
     },
+    RoleMembershipGrantorsSnapshot {
+        previous: Vec<crate::model::role::RoleMembershipGrantor>,
+        previous_complete: bool,
+    },
     TriggerSnapshot {
         id: ObjectId,
         previous: Option<crate::model::trigger::TriggerOverlay>,

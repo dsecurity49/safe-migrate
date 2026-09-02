@@ -101,6 +101,8 @@ pub struct LocalState {
     pub publications: HashMap<String, crate::model::replication::PublicationOverlay>,
     pub subscriptions: HashMap<String, crate::model::replication::SubscriptionOverlay>,
     pub roles: HashMap<ObjectId, crate::model::role::RoleOverlay>,
+    pub role_membership_grantors: Vec<crate::model::role::RoleMembershipGrantor>,
+    pub role_membership_grantors_complete: bool,
     pub triggers: HashMap<ObjectId, TriggerOverlay>,
     pub constraints: HashMap<(ObjectId, String), ConstraintState>,
     pub graph: DependencyGraph,
@@ -1127,6 +1129,8 @@ impl AnalysisState {
                     .into_iter()
                     .map(|(id, role)| (id, crate::model::role::RoleOverlay::Present(role)))
                     .collect(),
+                role_membership_grantors: cache.role_membership_grantors,
+                role_membership_grantors_complete: cache.role_membership_grantors_complete,
                 triggers,
                 constraints,
                 graph,
@@ -2839,6 +2843,17 @@ impl AnalysisState {
         }
     }
 
+    pub(super) fn snapshot_role_membership_grantors(&mut self) {
+        if let Some(frame) = self.local.transactions.last_mut() {
+            frame
+                .undo_log
+                .push(StateChange::RoleMembershipGrantorsSnapshot {
+                    previous: self.local.role_membership_grantors.clone(),
+                    previous_complete: self.local.role_membership_grantors_complete,
+                });
+        }
+    }
+
     fn snapshot_trigger(&mut self, id: &ObjectId) {
         if let Some(frame) = self.local.transactions.last_mut() {
             let previous = self.local.triggers.get(id).cloned();
@@ -3066,6 +3081,13 @@ impl AnalysisState {
                     } else {
                         self.local.roles.remove(&id);
                     }
+                }
+                StateChange::RoleMembershipGrantorsSnapshot {
+                    previous,
+                    previous_complete,
+                } => {
+                    self.local.role_membership_grantors = previous;
+                    self.local.role_membership_grantors_complete = previous_complete;
                 }
                 StateChange::TriggerSnapshot { id, previous } => {
                     if let Some(prev) = previous {

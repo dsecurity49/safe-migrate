@@ -20,6 +20,16 @@ pub struct RoleState {
     pub can_set_role_to: Vec<ObjectId>,
 }
 
+/// PostgreSQL records the role that granted each membership.  Keeping this
+/// provenance separate from the option vectors lets revoke-CASCADE remove only
+/// memberships delegated by a grantor whose authority was withdrawn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleMembershipGrantor {
+    pub member: ObjectId,
+    pub role: ObjectId,
+    pub grantor: ObjectId,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum RoleOverlay {
     Present(RoleState),
