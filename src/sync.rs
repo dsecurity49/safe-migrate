@@ -1381,6 +1381,7 @@ struct RelationGrant {
     relation_id: ObjectId,
     grantee: ObjectId,
     privilege: crate::model::relation::Privilege,
+    is_grantable: bool,
 }
 
 fn load_relation_decorations(
@@ -1431,7 +1432,8 @@ fn load_relation_decorations(
                 WHEN acl.grantee = 0 THEN 'public'
                 ELSE pg_catalog.pg_get_userbyid(acl.grantee)
             END AS grantee,
-            acl.privilege_type
+            acl.privilege_type,
+            acl.is_grantable
         FROM pg_class c
         JOIN pg_namespace n ON n.oid = c.relnamespace
         CROSS JOIN LATERAL pg_catalog.aclexplode(c.relacl) acl
@@ -1473,6 +1475,9 @@ fn load_relation_decorations(
                         .context("relation privilege grantee")?,
                 ),
                 privilege,
+                is_grantable: row
+                    .try_get("is_grantable")
+                    .context("relation privilege grant option")?,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -2807,9 +2812,14 @@ fn populate_cache_from_client(
                     grant.relation_id
                 )
             })?;
-        relation
-            .privileges
-            .grant(grant.grantee, [grant.privilege].into_iter().collect());
+        let privileges = [grant.privilege].into_iter().collect();
+        if grant.is_grantable {
+            relation
+                .privileges
+                .grant_with_option(grant.grantee, privileges);
+        } else {
+            relation.privileges.grant(grant.grantee, privileges);
+        }
     }
 
     cache.triggers = load_triggers(client, &schema_values, schema_filter_with_fk)?;
