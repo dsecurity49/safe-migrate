@@ -737,7 +737,7 @@ impl AnalysisState {
     pub fn with_baseline(cache: DbCache, baseline_available: bool) -> Self {
         let baseline_coverage = cache.coverage.clone();
         let baseline_boundary_queries_complete =
-            baseline_available && cache.metadata.created_at_unix_secs.is_some();
+            baseline_available && cache.metadata.boundary_queries_complete;
         let source_lock_timeout =
             baseline_available.then_some(cache.metadata.source_lock_timeout_ms);
         let source_statement_timeout =
@@ -3336,6 +3336,35 @@ mod evidence_tests {
                 .evidence()
                 .iter()
                 .any(|record| { record.code == EvidenceCode::CatalogCoverageIncomplete })
+        );
+    }
+
+    #[test]
+    fn scoped_boundary_authority_requires_explicit_completion_marker() {
+        let table_id = ObjectId::new("app", "known_table");
+        let mut cache = DbCache::new();
+        cache.metadata.schemas = Some(vec!["app".to_string()]);
+        cache.metadata.created_at_unix_secs = Some(1);
+        cache.insert_baseline(
+            table_id.clone(),
+            table_with_columns(table_id.clone(), &["id"]),
+        );
+
+        let state = AnalysisState::with_baseline(cache.clone(), true);
+        assert!(
+            state.baseline_scoped_family_object(
+                &table_id,
+                crate::db::cache::CatalogFamily::Relations
+            )
+        );
+
+        cache.metadata.boundary_queries_complete = true;
+        let state = AnalysisState::with_baseline(cache, true);
+        assert!(
+            !state.baseline_scoped_family_object(
+                &table_id,
+                crate::db::cache::CatalogFamily::Relations
+            )
         );
     }
 

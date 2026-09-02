@@ -309,6 +309,7 @@ caches, and encrypted mode rejects plaintext caches. Changing modes requires a
 fresh `safe-migrate sync`.
 
 V7 cache payloads carry an explicit format header, explicit catalog coverage,
+and an explicit scope-boundary-query completion marker,
 and effective/session role provenance, the unexpanded search-path setting, effective lock and
 statement timeouts in milliseconds, PostgreSQL role membership, authoritative
 synchronized schemas, sequence ownership/kind, all routine kinds,

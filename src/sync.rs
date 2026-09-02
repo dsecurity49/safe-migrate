@@ -1081,6 +1081,7 @@ fn load_provenance(
                     .unwrap_or_default()
                     .as_secs(),
             ),
+            boundary_queries_complete: false,
             source_database: Some(
                 row.try_get(0)
                     .context("synchronization provenance database field")?,
@@ -2847,6 +2848,11 @@ fn populate_cache_from_client(
         load_scoped_external_type_dependencies(client, &schema_values)?;
     cache.scoped_external_routine_dependencies =
         load_scoped_external_routine_dependencies(client, &schema_values)?;
+    // All scope-boundary queries above completed inside the same repeatable
+    // read transaction. Mark this only after every query succeeds; a cache
+    // that was assembled programmatically or by a partial loader remains
+    // conservative even if it has a timestamp.
+    cache.metadata.boundary_queries_complete = true;
 
     // Role identity and membership are required to distinguish a valid
     // `SET ROLE` from a migration that PostgreSQL would reject. pg_roles does

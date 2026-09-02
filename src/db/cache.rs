@@ -289,6 +289,11 @@ pub struct CacheMetadata {
     /// Seconds since the Unix epoch when `safe-migrate sync` assembled this
     /// baseline. `None` represents a cache written before provenance support.
     pub created_at_unix_secs: Option<u64>,
+    /// Whether all scope-boundary dependency queries completed in the same
+    /// repeatable-read synchronization transaction. This is deliberately
+    /// explicit: timestamps identify age, not catalog-query completeness.
+    #[serde(default)]
+    pub boundary_queries_complete: bool,
     /// PostgreSQL database name only; connection credentials and host details
     /// are deliberately never stored in a cache.
     pub source_database: Option<String>,
