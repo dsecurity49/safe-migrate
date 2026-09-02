@@ -895,6 +895,23 @@ fn differential_manifest_accounts_for_every_sql_fixture() {
     load_manifest(&repo_path("live_tests/differential_manifest.json"));
 }
 
+#[test]
+fn publication_option_normalization_ignores_catalog_order() {
+    let first = vec![
+        safe_migrate::analysis::facts::AttributeFact {
+            name: "publish".into(),
+            value: "insert".into(),
+        },
+        safe_migrate::analysis::facts::AttributeFact {
+            name: "publish_via_partition_root".into(),
+            value: "false".into(),
+        },
+    ];
+    let mut second = first.clone();
+    second.reverse();
+    assert_eq!(normalize_attributes(&first), normalize_attributes(&second));
+}
+
 fn load_manifest(path: &Path) -> DifferentialManifest {
     let raw = fs::read_to_string(path)
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
