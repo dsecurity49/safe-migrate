@@ -2182,6 +2182,31 @@ fn load_indexes(
         if is_system_schema(&index_schema) || is_system_schema(&table_schema) {
             continue;
         }
+        let key_columns: Vec<String> = row.try_get("key_columns").context("index key columns")?;
+        let included_columns: Vec<String> = row
+            .try_get("included_columns")
+            .context("index included columns")?;
+        let has_expression_keys: bool = row
+            .try_get("has_expression_keys")
+            .context("index expression key flag")?;
+        let has_predicate: bool = row
+            .try_get("has_predicate")
+            .context("index predicate flag")?;
+        let mut dependency_columns: Vec<String> = row
+            .try_get("dependency_columns")
+            .context("index dependency columns")?;
+        // pg_depend records expression/predicate references, but PostgreSQL
+        // does not consistently emit ordinary key/include columns for every
+        // index shape.  Those columns are nevertheless guaranteed dependencies
+        // for a simple index; make that invariant explicit at hydration rather
+        // than allowing an incomplete vector to reach the state machine.
+        if !has_expression_keys && !has_predicate {
+            for column in key_columns.iter().chain(&included_columns) {
+                if !dependency_columns.contains(column) {
+                    dependency_columns.push(column.clone());
+                }
+            }
+        }
         indexes.push(IndexCache {
             index_id: ObjectId::new(
                 index_schema,
@@ -2194,20 +2219,12 @@ fn load_indexes(
                     .context("indexed table name")?,
             ),
             using_method: row.try_get("using_method").context("index access method")?,
-            key_columns: row.try_get("key_columns").context("index key columns")?,
-            included_columns: row
-                .try_get("included_columns")
-                .context("index included columns")?,
-            dependency_columns: row
-                .try_get("dependency_columns")
-                .context("index dependency columns")?,
+            key_columns,
+            included_columns,
+            dependency_columns,
             dependency_columns_known: true,
-            has_expression_keys: row
-                .try_get("has_expression_keys")
-                .context("index expression key flag")?,
-            has_predicate: row
-                .try_get("has_predicate")
-                .context("index predicate flag")?,
+            has_expression_keys,
+            has_predicate,
             is_unique: row.try_get("is_unique").context("index uniqueness flag")?,
             is_valid: row.try_get("is_valid").context("index validity flag")?,
             is_ready: row.try_get("is_ready").context("index readiness flag")?,

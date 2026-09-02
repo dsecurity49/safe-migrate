@@ -105,17 +105,11 @@
         "safe_006_set_default.sql",
         "safe_007_add_not_null.sql",
         "safe_008_rename_table.sql",
-        "safe_009_add_index.sql"
+        "safe_009_add_index.sql",
+        "002_drop_column.sql",
+        "006_drop_column_if_exists.sql"
       ],
       "excluded_fixtures": [
-        {
-          "fixture": "002_drop_column.sql",
-          "reason": "Cache V6 does not retain all foreign-key, index, view, and expression dependency column lists. The simulator conservatively skips a drop when those dependencies are unknown; exact column-aware replay is a 0.8.0 cache-evidence TODO."
-        },
-        {
-          "fixture": "006_drop_column_if_exists.sql",
-          "reason": "IF EXISTS only suppresses an absent-column error; it does not make Cache V6's unknown foreign-key, index, view, and expression column dependencies exact. Exact column-aware replay is a 0.8.0 cache-evidence TODO."
-        },
         {
           "fixture": "safe_005_create_table.sql",
           "reason": "The cumulative canonical baseline contains sm_core.t for rule_18 drop/idempotency cases, so PostgreSQL correctly rejects this unqualified duplicate CREATE TABLE."
@@ -141,6 +135,10 @@
         "indexes",
         "foreign_keys"
       ],
+      "fixture_scopes": {
+        "002_drop_column.sql": ["relations", "columns", "foreign_keys", "view_dependencies"],
+        "006_drop_column_if_exists.sql": ["relations", "columns", "foreign_keys", "view_dependencies"]
+      },
       "required_relations": [
         "public.test_table",
         "public.child_table"
@@ -167,7 +165,7 @@
       "excluded_fixtures": [
         {
           "fixture": "003_drop_seq_cascade.sql",
-          "reason": "Cache V6 synchronizes sequences, but this rule does not compare sequence state."
+          "reason": "Cache V7 synchronizes sequences, but this rule does not compare sequence state."
         },
         {
           "fixture": "004_drop_domain_cascade.sql",
@@ -175,27 +173,27 @@
         },
         {
           "fixture": "005_drop_func_cascade.sql",
-          "reason": "Cache V6 synchronizes routine identity and kind, but this rule does not compare routine state."
+          "reason": "Cache V7 synchronizes routine identity and kind, but this rule does not compare routine state."
         },
         {
           "fixture": "006_drop_proc_cascade.sql",
-          "reason": "Cache V6 synchronizes routine identity and kind, but this rule does not compare routine state."
+          "reason": "Cache V7 synchronizes routine identity and kind, but this rule does not compare routine state."
         },
         {
           "fixture": "010_drop_seq_if_exists_cascade.sql",
-          "reason": "Cache V6 synchronizes sequences, but this rule does not compare sequence state."
+          "reason": "Cache V7 synchronizes sequences, but this rule does not compare sequence state."
         },
         {
           "fixture": "safe_003_drop_seq.sql",
-          "reason": "Cache V6 synchronizes sequences, but this rule does not compare sequence state."
+          "reason": "Cache V7 synchronizes sequences, but this rule does not compare sequence state."
         },
         {
           "fixture": "safe_004_drop_func.sql",
-          "reason": "Cache V6 synchronizes routine identity and kind, but this rule does not compare routine state."
+          "reason": "Cache V7 synchronizes routine identity and kind, but this rule does not compare routine state."
         },
         {
           "fixture": "safe_005_drop_proc.sql",
-          "reason": "Cache V6 synchronizes routine identity and kind, but this rule does not compare routine state."
+          "reason": "Cache V7 synchronizes routine identity and kind, but this rule does not compare routine state."
         },
         {
           "fixture": "safe_007_drop_domain.sql",
@@ -715,7 +713,7 @@
         },
         {
           "fixture": "005_drop_sequence.sql",
-          "reason": "Cache V6 synchronizes sequences, but this rule does not compare sequence state."
+          "reason": "Cache V7 synchronizes sequences, but this rule does not compare sequence state."
         },
         {
           "fixture": "008_add_column.sql",
@@ -739,7 +737,7 @@
         },
         {
           "fixture": "013_create_sequence.sql",
-          "reason": "Cache V6 synchronizes sequences, but this rule does not compare sequence state."
+          "reason": "Cache V7 synchronizes sequences, but this rule does not compare sequence state."
         },
         {
           "fixture": "016_create_schema.sql",
@@ -759,7 +757,7 @@
         },
         {
           "fixture": "safe_005_drop_sequence_if_exists.sql",
-          "reason": "Cache V6 synchronizes sequences, but this rule does not compare sequence state."
+          "reason": "Cache V7 synchronizes sequences, but this rule does not compare sequence state."
         },
         {
           "fixture": "safe_008_add_column_if_not_exists.sql",
@@ -1171,14 +1169,12 @@
         "safe_007_create_index.sql",
         "safe_008_drop_constraint.sql",
         "safe_009_alter_set_default.sql",
+        "safe_005_drop_column.sql",
+        "safe_013_unique_using_index.sql",
         "safe_011_foreign_key_not_valid.sql",
         "safe_012_foreign_key_validate_later.sql"
       ],
       "excluded_fixtures": [
-        {
-          "fixture": "safe_005_drop_column.sql",
-          "reason": "Cache V6 foreign-key edges do not retain conkey/confkey column lists. The simulator conservatively skips a drop when dependency columns are unknown; exact column-aware replay is a 0.8.0 cache-evidence TODO."
-        },
         {
           "fixture": "006_set_storage.sql",
           "reason": "Column storage strategy is not synchronized or normalized by the differential harness."
@@ -1190,10 +1186,6 @@
         {
           "fixture": "safe_010_drop_index.sql",
           "reason": "DROP INDEX IF EXISTS idx is a no-op against the canonical baseline."
-        },
-        {
-          "fixture": "safe_013_unique_using_index.sql",
-          "reason": "Cache V6 index edges do not retain uniqueness, predicate, or eligibility metadata. The simulator conservatively skips USING INDEX until the 0.8.0 cache-evidence TODO is proved."
         }
       ],
       "schemas": [
@@ -1255,6 +1247,17 @@
         "safe_012_foreign_key_validate_later.sql": [
           "constraints",
           "foreign_keys"
+        ],
+        "safe_005_drop_column.sql": [
+          "relations",
+          "columns",
+          "foreign_keys",
+          "constraints"
+        ],
+        "safe_013_unique_using_index.sql": [
+          "relations",
+          "indexes",
+          "constraints"
         ]
       },
       "required_relations": [
@@ -1335,7 +1338,7 @@
         },
         {
           "fixture": "safe_012_create_sequence.sql",
-          "reason": "Cache V6 synchronizes sequences, but this rule does not compare sequence state."
+          "reason": "Cache V7 synchronizes sequences, but this rule does not compare sequence state."
         }
       ],
       "schemas": [
@@ -1704,6 +1707,7 @@
         "016_missing_set_role.sql",
         "017_unauthorized_set_role.sql",
         "018_identifier_truncation_collision.sql",
+        "004_conflict.sql",
         "safe_001_chain.sql",
         "safe_001_create_table.sql",
         "safe_002_create_index.sql",
@@ -1773,10 +1777,6 @@
         }
       },
       "excluded_fixtures": [
-        {
-          "fixture": "004_conflict.sql",
-          "reason": "The chain drops a column whose dependency-column evidence is absent from Cache V6; the simulator conservatively retains it after a skipped transition. Exact column-aware replay is a 0.8.0 cache-evidence TODO."
-        },
         {
           "fixture": "001_chain.sql",
           "reason": "PostgreSQL rejects the second incompatible duplicate column definition, leaving no committed resulting state."
@@ -1853,6 +1853,10 @@
         "columns"
       ],
       "fixture_scopes": {
+        "004_conflict.sql": [
+          "relations",
+          "columns"
+        ],
         "010_conflict.sql": [
           "relations",
           "columns"

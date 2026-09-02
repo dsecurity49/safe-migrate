@@ -2412,20 +2412,29 @@ impl AnalysisState {
                     continue;
                 }
                 let represented = self.local.graph.edges().iter().any(|edge| {
-                    edge.dependent == resolved_table
+                    (edge.dependent == resolved_table
                         && matches!(
                             &edge.kind,
                             DependencyKind::ConstraintOnRelation {
                                 constraint_name: name,
                                 ..
                             } if name == constraint_name
-                        )
+                        ))
                         || matches!(
                             &edge.kind,
                             DependencyKind::ConstraintDependency {
                                 constraint_name: name,
                                 ..
-                            } if name == constraint_name
+                            } if edge.dependent == resolved_table && name == constraint_name
+                        )
+                        || matches!(
+                            &edge.kind,
+                            DependencyKind::ForeignKey {
+                                constraint_name: Some(name),
+                                ..
+                            } if (edge.dependent == resolved_table
+                                || edge.referenced == resolved_table)
+                                && name == constraint_name
                         )
                 });
                 if !represented {
