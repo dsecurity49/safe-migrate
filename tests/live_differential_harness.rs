@@ -862,7 +862,7 @@ fn verbose(verbosity: u8, level: u8, message: impl std::fmt::Display) {
 
 fn state_counts(state: &NormalizedState) -> String {
     format!(
-        "schemas:{} sequences:{} relations:{} indexes:{} constraints:{} foreign_keys:{} functions:{} types:{} privileges:{} policies:{} triggers:{} partitions:{} view_dependencies:{} publications:{}",
+        "schemas:{} sequences:{} relations:{} indexes:{} constraints:{} foreign_keys:{} functions:{} types:{} privileges:{} policies:{} triggers:{} partitions:{} view_dependencies:{} publications:{} subscriptions:{}",
         state.schemas.len(),
         state.sequences.len(),
         state.relations.len(),
@@ -876,7 +876,8 @@ fn state_counts(state: &NormalizedState) -> String {
         state.triggers.len(),
         state.partition_edges.len(),
         state.view_dependencies.len(),
-        state.publications.len()
+        state.publications.len(),
+        state.subscriptions.len()
     )
 }
 
@@ -1003,6 +1004,23 @@ fn subscription_scope_reports_semantic_mismatch_without_connection_metadata() {
         mismatches[0].category,
         MismatchCategory::SubscriptionDefinitionMismatch
     );
+}
+
+#[test]
+fn state_counts_include_every_replication_family() {
+    let mut state = NormalizedState::default();
+    state.subscriptions.insert(
+        "sub".into(),
+        NormalizedSubscription {
+            owner: None,
+            publications: Vec::new(),
+            params: String::new(),
+            enabled: false,
+            slot_name: None,
+        },
+    );
+    let counts = state_counts(&state);
+    assert!(counts.ends_with("publications:0 subscriptions:1"));
 }
 
 fn load_manifest(path: &Path) -> DifferentialManifest {
