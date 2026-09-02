@@ -912,6 +912,27 @@ fn publication_option_normalization_ignores_catalog_order() {
     assert_eq!(normalize_attributes(&first), normalize_attributes(&second));
 }
 
+#[test]
+fn publication_scope_normalization_ignores_catalog_order() {
+    use safe_migrate::analysis::facts::{PublicationObjectFact, PublicationScope};
+    use safe_migrate::ast::identifiers::{Ident, QualifiedName};
+
+    let table = |name: &str, columns: Vec<&str>| PublicationObjectFact::Table {
+        name: QualifiedName::new(None, Ident::new(name.to_string(), true)),
+        only: true,
+        include_partitions: false,
+        columns: Some(columns.into_iter().map(str::to_string).collect()),
+        row_filter: None,
+    };
+    let first = PublicationScope::Explicit(vec![table("b", vec!["z", "a"]), table("a", vec!["x"])]);
+    let second =
+        PublicationScope::Explicit(vec![table("a", vec!["x"]), table("b", vec!["a", "z"])]);
+    assert_eq!(
+        normalize_publication_scope(&first),
+        normalize_publication_scope(&second)
+    );
+}
+
 fn load_manifest(path: &Path) -> DifferentialManifest {
     let raw = fs::read_to_string(path)
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
@@ -1436,8 +1457,7 @@ fn snapshot_live_state(
                 name.clone(),
                 NormalizedPublication {
                     owner: publication.owner.clone(),
-                    scope: serde_json::to_string(&publication.scope)
-                        .expect("publication scope must be serializable"),
+                    scope: normalize_publication_scope(&publication.scope),
                     params: normalize_attributes(&publication.params),
                 },
             );
@@ -1722,8 +1742,7 @@ fn snapshot_simulator_state(
                 name.clone(),
                 NormalizedPublication {
                     owner: publication.owner.clone(),
-                    scope: serde_json::to_string(&publication.scope)
-                        .expect("publication scope must be serializable"),
+                    scope: normalize_publication_scope(&publication.scope),
                     params: normalize_attributes(&publication.params),
                 },
             );
@@ -2492,6 +2511,34 @@ fn normalize_attributes(attributes: &[safe_migrate::analysis::facts::AttributeFa
             .then_with(|| left.value.cmp(&right.value))
     });
     serde_json::to_string(&normalized).expect("attribute facts must be serializable")
+}
+
+fn normalize_publication_scope(scope: &safe_migrate::analysis::facts::PublicationScope) -> String {
+    use safe_migrate::analysis::facts::{PublicationObjectFact, PublicationScope};
+
+    let mut normalized = scope.clone();
+    match &mut normalized {
+        PublicationScope::AllTables { except } => except.sort(),
+        PublicationScope::Explicit(objects) => {
+            for object in objects.iter_mut() {
+                if let PublicationObjectFact::Table {
+                    columns: Some(columns),
+                    ..
+                } = object
+                {
+                    columns.sort();
+                }
+            }
+            objects.sort_by(|left, right| {
+                let left =
+                    serde_json::to_string(left).expect("publication object must be serializable");
+                let right =
+                    serde_json::to_string(right).expect("publication object must be serializable");
+                left.cmp(&right)
+            });
+        }
+    }
+    serde_json::to_string(&normalized).expect("publication scope must be serializable")
 }
 
 fn normalize_trigger_mode(mode: safe_migrate::model::trigger::TriggerEnableMode) -> String {
