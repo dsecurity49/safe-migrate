@@ -117,6 +117,7 @@ enum ComparisonScope {
     ViewDependencies,
     Partitions,
     Publications,
+    Subscriptions,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -136,6 +137,7 @@ struct NormalizedState {
     partition_edges: BTreeSet<(String, String)>,
     view_dependencies: BTreeSet<(String, String)>,
     publications: BTreeMap<String, NormalizedPublication>,
+    subscriptions: BTreeMap<String, NormalizedSubscription>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -235,6 +237,15 @@ struct NormalizedPublication {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct NormalizedSubscription {
+    owner: Option<String>,
+    publications: Vec<String>,
+    params: String,
+    enabled: bool,
+    slot_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum MismatchCategory {
     MissingSchemaInSimulator,
     ExtraSchemaInSimulator,
@@ -275,6 +286,9 @@ enum MismatchCategory {
     MissingPublicationInSimulator,
     ExtraPublicationInSimulator,
     PublicationDefinitionMismatch,
+    MissingSubscriptionInSimulator,
+    ExtraSubscriptionInSimulator,
+    SubscriptionDefinitionMismatch,
     RoleMembershipMismatch,
     BaselineObjectAbsent,
     LiveExecutionFailed,
@@ -933,6 +947,64 @@ fn publication_scope_normalization_ignores_catalog_order() {
     );
 }
 
+#[test]
+fn subscription_normalization_redacts_connection_and_orders_publications() {
+    use safe_migrate::analysis::facts::ConnectionTarget;
+    use safe_migrate::model::replication::SubscriptionState;
+
+    let first = SubscriptionState {
+        name: "sub".into(),
+        owner: Some("owner".into()),
+        connection: ConnectionTarget::Redacted,
+        publications: vec!["z_pub".into(), "a_pub".into()],
+        params: None,
+        enabled: false,
+        slot_name: None,
+        generation: 0,
+    };
+    let mut second = first.clone();
+    second.connection = ConnectionTarget::Server(Some("publisher".into()));
+    second.publications.reverse();
+    assert_eq!(
+        normalize_subscription(&first),
+        normalize_subscription(&second)
+    );
+}
+
+#[test]
+fn subscription_scope_reports_semantic_mismatch_without_connection_metadata() {
+    let mut live = NormalizedState::default();
+    let mut simulator = NormalizedState::default();
+    live.subscriptions.insert(
+        "sub".into(),
+        NormalizedSubscription {
+            owner: Some("owner".into()),
+            publications: vec!["pub".into()],
+            params: "[]".into(),
+            enabled: false,
+            slot_name: None,
+        },
+    );
+    simulator.subscriptions = live.subscriptions.clone();
+    simulator
+        .subscriptions
+        .get_mut("sub")
+        .expect("subscription inserted")
+        .enabled = true;
+    let mismatches = compare_states(
+        "rule",
+        "fixture.sql",
+        &[ComparisonScope::Subscriptions],
+        &live,
+        &simulator,
+    );
+    assert_eq!(mismatches.len(), 1);
+    assert_eq!(
+        mismatches[0].category,
+        MismatchCategory::SubscriptionDefinitionMismatch
+    );
+}
+
 fn load_manifest(path: &Path) -> DifferentialManifest {
     let raw = fs::read_to_string(path)
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
@@ -1464,6 +1536,14 @@ fn snapshot_live_state(
         }
     }
 
+    if scope.contains(&ComparisonScope::Subscriptions) {
+        for (name, subscription) in &cache.subscriptions {
+            state
+                .subscriptions
+                .insert(name.clone(), normalize_subscription(subscription));
+        }
+    }
+
     if scope.contains(&ComparisonScope::Sequences) {
         for (id, sequence) in &cache.sequences {
             state.sequences.insert(
@@ -1749,6 +1829,19 @@ fn snapshot_simulator_state(
         }
     }
 
+    if scope.contains(&ComparisonScope::Subscriptions) {
+        for (name, overlay) in &state.local.subscriptions {
+            let safe_migrate::model::replication::SubscriptionOverlay::Present(subscription) =
+                overlay
+            else {
+                continue;
+            };
+            projection
+                .subscriptions
+                .insert(name.clone(), normalize_subscription(subscription));
+        }
+    }
+
     if scope.contains(&ComparisonScope::Sequences) {
         for (id, overlay) in &state.local.sequences {
             let SequenceOverlay::Present(sequence) = overlay else {
@@ -1978,6 +2071,43 @@ fn compare_states(
                     category: MismatchCategory::ExtraPublicationInSimulator,
                     root_cause: RootCauseClassification::SimulatorBug,
                     note: format!("simulator kept publication '{name}'"),
+                });
+            }
+        }
+    }
+
+    if scope.contains(&ComparisonScope::Subscriptions) {
+        for (name, live_subscription) in &live.subscriptions {
+            let Some(simulator_subscription) = simulator.subscriptions.get(name) else {
+                mismatches.push(Mismatch {
+                    rule_dir: rule_dir.to_string(),
+                    fixture: fixture.to_string(),
+                    category: MismatchCategory::MissingSubscriptionInSimulator,
+                    root_cause: RootCauseClassification::SimulatorBug,
+                    note: format!("live PostgreSQL kept subscription '{name}'"),
+                });
+                continue;
+            };
+            if live_subscription != simulator_subscription {
+                mismatches.push(Mismatch {
+                    rule_dir: rule_dir.to_string(),
+                    fixture: fixture.to_string(),
+                    category: MismatchCategory::SubscriptionDefinitionMismatch,
+                    root_cause: RootCauseClassification::SimulatorBug,
+                    note: format!(
+                        "subscription '{name}' differs (connection metadata intentionally excluded): live={live_subscription:?}, simulator={simulator_subscription:?}"
+                    ),
+                });
+            }
+        }
+        for name in simulator.subscriptions.keys() {
+            if !live.subscriptions.contains_key(name) {
+                mismatches.push(Mismatch {
+                    rule_dir: rule_dir.to_string(),
+                    fixture: fixture.to_string(),
+                    category: MismatchCategory::ExtraSubscriptionInSimulator,
+                    root_cause: RootCauseClassification::SimulatorBug,
+                    note: format!("simulator kept subscription '{name}'"),
                 });
             }
         }
@@ -2539,6 +2669,24 @@ fn normalize_publication_scope(scope: &safe_migrate::analysis::facts::Publicatio
         }
     }
     serde_json::to_string(&normalized).expect("publication scope must be serializable")
+}
+
+fn normalize_subscription(
+    subscription: &safe_migrate::model::replication::SubscriptionState,
+) -> NormalizedSubscription {
+    let mut publications = subscription.publications.clone();
+    publications.sort();
+    NormalizedSubscription {
+        owner: subscription.owner.clone(),
+        publications,
+        params: subscription
+            .params
+            .as_deref()
+            .map(normalize_attributes)
+            .unwrap_or_default(),
+        enabled: subscription.enabled,
+        slot_name: subscription.slot_name.clone(),
+    }
 }
 
 fn normalize_trigger_mode(mode: safe_migrate::model::trigger::TriggerEnableMode) -> String {
