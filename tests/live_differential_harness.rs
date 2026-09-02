@@ -208,6 +208,7 @@ struct NormalizedPrivilege {
     table: String,
     grantee: String,
     privilege: String,
+    grantable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1393,6 +1394,7 @@ fn snapshot_live_state(
                         table: qualified_name(&id.schema, &id.name),
                         grantee: grantee.name.clone(),
                         privilege: normalize_privilege(*privilege),
+                        grantable: relation.privileges.has_grant_option(grantee, *privilege),
                     });
                 }
             }
@@ -1650,6 +1652,7 @@ fn snapshot_simulator_state(
                         table: qualified_name(&id.schema, &id.name),
                         grantee: grantee.name.clone(),
                         privilege: normalize_privilege(*privilege),
+                        grantable: relation.privileges.has_grant_option(grantee, *privilege),
                     });
                 }
             }
