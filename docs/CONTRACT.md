@@ -1,6 +1,6 @@
 # CLI and Report Contract
 
-This document defines safe-migrate v0.7.0's CLI, report, cache, and GitHub
+This document defines safe-migrate v0.8.0's CLI, report, cache, and GitHub
 Action behavior.
 
 If you are learning safe-migrate, start with the [README](../README.md). This
