@@ -192,7 +192,7 @@ an absent cache does not lower a finding by itself. A stale cache taints
 confidence and emits a warning on standard error. `stale_stats_days` uses the
 timestamp inside the cache, not file modification time.
 
-Cache V8 records explicit catalog coverage, ordered foreign-key column
+Cache V7 records explicit catalog coverage, ordered foreign-key column
 identities, primary/unique constraint keys, stable direct inheritance topology
 (with traditional inheritance distinct from declarative partitioning),
 stable view-dependency relation/column identities, and typed index definitions
@@ -243,7 +243,7 @@ Unknown `RESET` parameters are opaque; only modeled timeout/search-path values
 are exact, and explicitly schema-neutral settings such as `application_name`
 remain no-ops.
 
-Cache V8 synchronizes all `pg_proc.prokind` values in PostgreSQL's shared
+Cache V7 synchronizes all `pg_proc.prokind` values in PostgreSQL's shared
 routine namespace. Function, procedure, aggregate, and window-function
 lifecycle operations use that baseline. Routine DDL without a typed Squawk
 extractor remains opaque.
@@ -251,7 +251,7 @@ extractor remains opaque.
 Publication synchronization is database-wide even when relation sync is
 schema-scoped. It records owners, publication options, explicit tables, schema
 membership, column lists, and row filters where the connected PostgreSQL
-version provides them. Cache V8 stores stable direct `pg_inherits` rows, marked
+version provides them. Cache V7 stores stable direct `pg_inherits` rows, marked
 as traditional inheritance or declarative partitioning, for dependency
 reasoning; only the latter participates in partition lifecycle checks.
 Publication table edits without
@@ -279,7 +279,7 @@ lock-timeout rule also reports a positive `lock_timeout` that is greater than
 or equal to a positive `statement_timeout`, because PostgreSQL reaches the
 statement timeout first in that ordering.
 
-Analysis initializes both settings from Cache V8, or as unknown when no cache
+Analysis initializes both settings from Cache V7, or as unknown when no cache
 is available. Ordered `SET`, `SET LOCAL`, `SET ... DEFAULT`, `RESET`, and
 `RESET ALL` statements update modeled values. Transaction commit, rollback,
 and savepoint rollback must match PostgreSQL session-versus-local behavior.
@@ -298,7 +298,7 @@ These conditions exit `1` instead of producing a clean report:
 - internal serialization or analysis failure.
 
 Automatic refresh failure prints the error and continues with the old readable
-V8 cache, or with no baseline if none exists. A fresh retained cache keeps its
+V7 cache, or with no baseline if none exists. A fresh retained cache keeps its
 confidence; an unavailable or stale baseline is `Tainted`. JSON records the
 failed refresh.
 
@@ -308,14 +308,14 @@ Encrypted caches require `cache_encryption = true` and a valid
 caches, and encrypted mode rejects plaintext caches. Changing modes requires a
 fresh `safe-migrate sync`.
 
-V8 cache payloads carry an explicit format header, explicit catalog coverage,
+V7 cache payloads carry an explicit format header, explicit catalog coverage,
 and effective/session role provenance, the unexpanded search-path setting, effective lock and
 statement timeouts in milliseconds, PostgreSQL role membership, authoritative
 synchronized schemas, sequence ownership/kind, all routine kinds,
 publications, and redacted subscriptions. They never include password hashes
-or subscription connection strings. V1–V7 and unheadered payloads are rejected
+or subscription connection strings. V1–V6 and unheadered payloads are rejected
 with guidance to run `safe-migrate sync`. A failed automatic refresh may reuse
-a readable V8 cache, but never an older format.
+a readable V7 cache, but never an older format.
 
 ### GitHub Action
 

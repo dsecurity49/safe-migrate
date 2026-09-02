@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// Catalog families whose completeness is independently meaningful to the
-/// analyzer. The V8 cache records this explicitly instead of treating one
+/// analyzer. The V7 cache records this explicitly instead of treating one
 /// optional schema list as evidence for every object class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -129,7 +129,7 @@ impl Default for CatalogCoverage {
     fn default() -> Self {
         // Programmatic test baselines retain the historical all-schema
         // assumption. Production sync always overwrites this with its actual
-        // requested scope before a V8 cache can be written.
+        // requested scope before a V7 cache can be written.
         Self::from_sync_scope(None)
     }
 }
@@ -140,7 +140,7 @@ pub struct ForeignKeyCache {
     pub from_table: ObjectId,
     pub to_table: ObjectId,
     /// Ordered `pg_constraint.conkey` identities resolved through
-    /// `pg_attribute`. Empty vectors are invalid for V8 FK records.
+    /// `pg_attribute`. Empty vectors are invalid for V7 FK records.
     pub from_columns: Vec<String>,
     /// Ordered `pg_constraint.confkey` identities resolved through
     /// `pg_attribute`. Position pairs with `from_columns`.
@@ -175,7 +175,7 @@ impl ForeignKeyCache {
 
 /// Ordered key columns for a primary or unique constraint. This is separate
 /// from `ConstraintState` so the runtime state model remains focused on the
-/// mutable constraint lifecycle while Cache V8 can preserve catalog proof.
+/// mutable constraint lifecycle while Cache V7 can preserve catalog proof.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConstraintKeyCache {
     pub table_id: ObjectId,
@@ -346,12 +346,10 @@ pub struct DbCache {
     pub subscriptions: HashMap<String, SubscriptionState>,
 }
 
-pub const CACHE_FORMAT_VERSION: u32 = 8;
+pub const CACHE_FORMAT_VERSION: u32 = 7;
 
-/// Current durable cache header. V8 adds PostgreSQL-selected FK equality
+/// Current durable cache header. V7 adds PostgreSQL-selected FK equality
 /// operator evidence to the normalized catalog snapshot.
-pub const CACHE_V8_MAGIC: &[u8] = b"SMCACHE08";
-/// Retained for decoding fixtures and reporting actionable legacy-cache errors.
 pub const CACHE_V7_MAGIC: &[u8] = b"SMCACHE07";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -366,7 +364,6 @@ pub enum DbCacheVersioned {
     V5(Box<DbCache>),
     V6(Box<DbCache>),
     V7(Box<DbCache>),
-    V8(Box<DbCache>),
 }
 
 impl DbCacheVersioned {
@@ -379,7 +376,6 @@ impl DbCacheVersioned {
             DbCacheVersioned::V5(_) => 5,
             DbCacheVersioned::V6(_) => 6,
             DbCacheVersioned::V7(_) => 7,
-            DbCacheVersioned::V8(_) => 8,
         }
     }
 
@@ -390,12 +386,11 @@ impl DbCacheVersioned {
             | DbCacheVersioned::V3
             | DbCacheVersioned::V4
             | DbCacheVersioned::V5(_)
-            | DbCacheVersioned::V6(_)
-            | DbCacheVersioned::V7(_) => Err(
+            | DbCacheVersioned::V6(_) => Err(
                 "This cache format is unsupported. Run `safe-migrate sync` to rebuild it."
                     .to_string(),
             ),
-            DbCacheVersioned::V8(c) => {
+            DbCacheVersioned::V7(c) => {
                 c.validate_semantics()?;
                 Ok(*c)
             }
@@ -578,7 +573,7 @@ impl DbCache {
         for family in required_families {
             if !self.coverage.has(family) {
                 return Err(format!(
-                    "Cache V8 coverage is missing the required '{}' catalog family",
+                    "Cache V7 coverage is missing the required '{}' catalog family",
                     family.as_str(),
                 ));
             }
@@ -647,7 +642,7 @@ impl DbCache {
             .map(|schemas| schemas.iter().cloned().collect::<BTreeSet<_>>());
         if coverage_scope != metadata_scope {
             return Err(
-                "Cache V8 schema coverage disagrees with legacy metadata schema scope".to_string(),
+                "Cache V7 schema coverage disagrees with legacy metadata schema scope".to_string(),
             );
         }
         for (id, relation) in &self.relations {
@@ -1719,19 +1714,13 @@ mod tests {
             v6.into_cache().unwrap_err(),
             "This cache format is unsupported. Run `safe-migrate sync` to rebuild it."
         );
-        let v7 = DbCacheVersioned::V7(Box::default());
-        assert_eq!(v7.format_version(), 7);
-        assert_eq!(
-            v7.into_cache().unwrap_err(),
-            "This cache format is unsupported. Run `safe-migrate sync` to rebuild it."
-        );
     }
 
     #[test]
-    fn current_cache_format_is_v8() {
-        assert_eq!(CACHE_FORMAT_VERSION, 8);
-        assert_eq!(DbCacheVersioned::V8(Box::default()).format_version(), 8);
-        assert_eq!(CACHE_V8_MAGIC, b"SMCACHE08");
+    fn current_cache_format_is_v7() {
+        assert_eq!(CACHE_FORMAT_VERSION, 7);
+        assert_eq!(DbCacheVersioned::V7(Box::default()).format_version(), 7);
+        assert_eq!(CACHE_V7_MAGIC, b"SMCACHE07");
     }
 
     #[test]
@@ -1760,7 +1749,7 @@ mod tests {
             },
         );
 
-        let error = DbCacheVersioned::V8(Box::new(cache))
+        let error = DbCacheVersioned::V7(Box::new(cache))
             .into_cache()
             .unwrap_err();
         assert!(error.contains("schema cache key 'app'"));
@@ -1771,7 +1760,7 @@ mod tests {
         let mut cache = DbCache::new();
         cache.metadata.schemas = Some(vec!["app".to_string()]);
 
-        let error = DbCacheVersioned::V8(Box::new(cache))
+        let error = DbCacheVersioned::V7(Box::new(cache))
             .into_cache()
             .unwrap_err();
         assert!(error.contains("schema coverage disagrees"));
@@ -2175,7 +2164,7 @@ mod tests {
             },
         );
 
-        let error = DbCacheVersioned::V8(Box::new(cache))
+        let error = DbCacheVersioned::V7(Box::new(cache))
             .into_cache()
             .unwrap_err();
         assert!(error.contains("empty or duplicate table column"));
@@ -2209,7 +2198,7 @@ mod tests {
             },
         );
 
-        let error = DbCacheVersioned::V8(Box::new(cache))
+        let error = DbCacheVersioned::V7(Box::new(cache))
             .into_cache()
             .unwrap_err();
         assert!(error.contains("owner 'missing_owner' is absent"));
@@ -2500,7 +2489,7 @@ mod tests {
             has_default_collations: true,
         });
 
-        let error = DbCacheVersioned::V8(Box::new(cache))
+        let error = DbCacheVersioned::V7(Box::new(cache))
             .into_cache()
             .unwrap_err();
         assert!(error.contains("references missing relation 'public.items'"));
@@ -2530,7 +2519,7 @@ mod tests {
             has_default_collations: true,
         });
 
-        let error = DbCacheVersioned::V8(Box::new(cache))
+        let error = DbCacheVersioned::V7(Box::new(cache))
             .into_cache()
             .unwrap_err();
         assert!(error.contains("must be in the same schema as indexed relation"));
@@ -2562,7 +2551,7 @@ mod tests {
             has_default_collations: true,
         });
 
-        let error = DbCacheVersioned::V8(Box::new(cache))
+        let error = DbCacheVersioned::V7(Box::new(cache))
             .into_cache()
             .unwrap_err();
         assert!(error.contains("collides with another relation-namespace object"));
@@ -2586,7 +2575,7 @@ mod tests {
             },
         );
 
-        let error = DbCacheVersioned::V8(Box::new(cache))
+        let error = DbCacheVersioned::V7(Box::new(cache))
             .into_cache()
             .unwrap_err();
         assert!(error.contains("collides with another relation-namespace object"));
@@ -2604,7 +2593,7 @@ mod tests {
             enabled_mode: TriggerEnableMode::Origin,
         });
 
-        let error = DbCacheVersioned::V8(Box::new(cache))
+        let error = DbCacheVersioned::V7(Box::new(cache))
             .into_cache()
             .unwrap_err();
         assert!(error.contains("must be in the same schema as trigger table"));
@@ -2635,7 +2624,7 @@ mod tests {
         });
 
         assert!(
-            DbCacheVersioned::V8(Box::new(cache))
+            DbCacheVersioned::V7(Box::new(cache))
                 .into_cache()
                 .unwrap_err()
                 .contains("missing complete dependency-column evidence")
@@ -2658,13 +2647,13 @@ mod tests {
             detach_pending: false,
         });
         assert!(
-            DbCacheVersioned::V8(Box::new(cache.clone()))
+            DbCacheVersioned::V7(Box::new(cache.clone()))
                 .into_cache()
                 .is_ok()
         );
 
         cache.inheritances[0].detach_pending = true;
-        let error = DbCacheVersioned::V8(Box::new(cache))
+        let error = DbCacheVersioned::V7(Box::new(cache))
             .into_cache()
             .unwrap_err();
         assert!(error.contains("being detached"));

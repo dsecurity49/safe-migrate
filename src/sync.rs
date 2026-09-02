@@ -1,6 +1,6 @@
 use crate::ast::identifiers::ObjectId;
 use crate::db::cache::{
-    CACHE_V8_MAGIC, CatalogCoverage, ConstraintDependencyCache, ConstraintKeyCache, DbCache,
+    CACHE_V7_MAGIC, CatalogCoverage, ConstraintDependencyCache, ConstraintKeyCache, DbCache,
     DbCacheVersioned, DefaultSequenceDependencyCache, ForeignKeyCache,
     GeneratedColumnDependencyCache, IndexCache, InheritanceCache, ViewDependencyCache,
 };
@@ -271,7 +271,7 @@ fn write_cache_with_protection_and_limits(
     cache
         .validate_semantics()
         .map_err(anyhow::Error::msg)
-        .context("Refusing to write a semantically invalid Cache V8 baseline")?;
+        .context("Refusing to write a semantically invalid Cache V7 baseline")?;
     let parent = cache_parent(out_path);
     let mut temp_file = NamedTempFile::new_in(parent).with_context(|| {
         format!(
@@ -284,17 +284,17 @@ fn write_cache_with_protection_and_limits(
         .context("Failed to init zstd compression")?;
     let mut encoder = SizeLimitedWriter::new(encoder, max_decode_bytes);
 
-    if let Err(error) = encoder.write_all(CACHE_V8_MAGIC) {
+    if let Err(error) = encoder.write_all(CACHE_V7_MAGIC) {
         if encoder.limit_exceeded() {
             anyhow::bail!(
                 "Cache payload exceeds the {} MiB decoded-size limit",
                 max_decode_bytes / (1024 * 1024)
             );
         }
-        return Err(error).context("Failed to write cache V8 payload header");
+        return Err(error).context("Failed to write cache V7 payload header");
     }
 
-    let versioned = DbCacheVersioned::V8(Box::new(cache));
+    let versioned = DbCacheVersioned::V7(Box::new(cache));
     let bincode_config = bincode::config::standard().with_variable_int_encoding();
 
     let encode_result =
@@ -1572,7 +1572,7 @@ fn load_constraints(
             // foreign key stores the referenced key index.  ConstraintState's
             // backing index is intentionally only the former; retaining the
             // FK's referenced index here would make a valid cross-table cache
-            // look internally inconsistent during V8 validation.
+            // look internally inconsistent during V7 validation.
             let backing_index = if matches!(
                 kind,
                 crate::model::constraint::ConstraintKind::PrimaryKey
@@ -2827,7 +2827,7 @@ fn populate_cache_from_client(
 
     // Only view dependencies are consumed by cache hydration. Generic
     // pg_depend rows use PostgreSQL dependency codes (n/a/i) and were ignored
-    // after synchronization, so avoid loading them into Cache V8.
+    // after synchronization, so avoid loading them into Cache V7.
     cache.dependencies = load_view_dependencies(client, &schema_values)?;
     cache.scoped_external_relation_dependencies =
         load_scoped_external_relation_dependencies(client, &schema_values)?;
@@ -2844,7 +2844,7 @@ fn populate_cache_from_client(
     cache
         .validate_semantics()
         .map_err(anyhow::Error::msg)
-        .context("PostgreSQL catalogs produced a semantically invalid Cache V8 baseline")?;
+        .context("PostgreSQL catalogs produced a semantically invalid Cache V7 baseline")?;
     Ok(cache)
 }
 
@@ -2971,8 +2971,8 @@ mod atomic_write_tests {
         let mut payload = Vec::new();
         decoder.read_to_end(&mut payload).unwrap();
         let payload = payload
-            .strip_prefix(CACHE_V8_MAGIC)
-            .expect("writer must prefix V8 cache payloads");
+            .strip_prefix(CACHE_V7_MAGIC)
+            .expect("writer must prefix V7 cache payloads");
         let config = bincode::config::standard().with_variable_int_encoding();
         let versioned: DbCacheVersioned = bincode::serde::decode_from_slice(payload, config)
             .unwrap()
@@ -3067,7 +3067,7 @@ mod atomic_write_tests {
             DbCache::new(),
             Ok,
             MAX_CACHE_FILE_BYTES,
-            CACHE_V8_MAGIC.len(),
+            CACHE_V7_MAGIC.len(),
         )
         .unwrap_err();
 

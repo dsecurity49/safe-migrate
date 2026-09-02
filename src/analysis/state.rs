@@ -246,7 +246,7 @@ pub struct AnalysisState {
     /// synchronizer. Programmatic caches lack this provenance and remain
     /// conservative for destructive scoped transitions.
     pub baseline_boundary_queries_complete: bool,
-    /// V8 catalog completeness used for authoritative absence decisions.
+    /// V7 catalog completeness used for authoritative absence decisions.
     /// Family-specific legacy fields remain only while their consumers migrate.
     pub baseline_coverage: CatalogCoverage,
     /// `None` means the cache covered all non-system schemas. A populated set
@@ -1246,7 +1246,7 @@ impl AnalysisState {
     /// A scoped cache only establishes absence in the schemas it actually
     /// synchronized.
     pub fn baseline_covers_object(&self, id: &ObjectId) -> bool {
-        // V8 validation requires these scopes to agree. Keep the legacy
+        // V7 validation requires these scopes to agree. Keep the legacy
         // metadata intersection while direct in-process cache construction is
         // supported, so a caller cannot accidentally turn an explicitly
         // scoped baseline into global absence knowledge by omitting coverage.
@@ -1259,7 +1259,7 @@ impl AnalysisState {
     }
 
     /// Returns whether the requested catalog family can authoritatively
-    /// answer about an object. Schema scope alone is insufficient: a V8 cache
+    /// answer about an object. Schema scope alone is insufficient: a V7 cache
     /// may intentionally omit one family while retaining rows from another.
     pub(crate) fn baseline_covers_family_object(
         &self,

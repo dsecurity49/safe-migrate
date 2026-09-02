@@ -297,8 +297,8 @@ mod tests {
             },
         );
 
-        // Cache V8 uses bincode.
-        let versioned = crate::db::cache::DbCacheVersioned::V8(Box::new(cache));
+        // Cache V7 uses bincode.
+        let versioned = crate::db::cache::DbCacheVersioned::V7(Box::new(cache));
         let config = bincode::config::standard().with_variable_int_encoding();
         let encoded = bincode::serde::encode_to_vec(&versioned, config).unwrap();
 
@@ -306,8 +306,8 @@ mod tests {
             bincode::serde::decode_from_slice(&encoded, config)
                 .unwrap()
                 .0;
-        let crate::db::cache::DbCacheVersioned::V8(deserialized) = decoded else {
-            panic!("Expected V8");
+        let crate::db::cache::DbCacheVersioned::V7(deserialized) = decoded else {
+            panic!("Expected V7");
         };
         assert_eq!(deserialized.pg_version_num, Some(160000));
         assert_eq!(
@@ -395,15 +395,15 @@ mod tests {
         });
         cache.insert_baseline(id.clone(), rel);
 
-        let versioned = crate::db::cache::DbCacheVersioned::V8(Box::new(cache));
+        let versioned = crate::db::cache::DbCacheVersioned::V7(Box::new(cache));
         let config = bincode::config::standard().with_variable_int_encoding();
         let encoded = bincode::serde::encode_to_vec(&versioned, config).unwrap();
         let decoded: crate::db::cache::DbCacheVersioned =
             bincode::serde::decode_from_slice(&encoded, config)
                 .unwrap()
                 .0;
-        let crate::db::cache::DbCacheVersioned::V8(deserialized) = decoded else {
-            panic!("Expected V8");
+        let crate::db::cache::DbCacheVersioned::V7(deserialized) = decoded else {
+            panic!("Expected V7");
         };
         let rel = deserialized.relations.get(&id).unwrap();
         assert_eq!(rel.columns[0].default_expr_text, Some("now()".into()));
@@ -481,7 +481,7 @@ mod tests {
                 config,
             )
             .is_err(),
-            "the pre-release routine layout must require a fresh V8 sync"
+            "the pre-release routine layout must require a fresh V7 sync"
         );
     }
 
@@ -508,7 +508,7 @@ mod tests {
         assert!(
             bincode::serde::decode_from_slice::<crate::model::column::Column, _>(&bytes, config)
                 .is_err(),
-            "cache payloads without default/type evidence must require a fresh V8 sync"
+            "cache payloads without default/type evidence must require a fresh V7 sync"
         );
     }
 

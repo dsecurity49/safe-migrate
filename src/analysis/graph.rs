@@ -40,7 +40,7 @@ pub enum DependencyKind {
         eligibility_known: bool,
     },
     /// A primary-key/unique constraint whose ordered key columns are known.
-    /// V8 hydration and local mutations share this edge; legacy or incomplete
+    /// V7 hydration and local mutations share this edge; legacy or incomplete
     /// cache construction must still remain conservative.
     ConstraintOnRelation {
         constraint_name: String,

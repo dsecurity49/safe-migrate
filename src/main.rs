@@ -2,7 +2,7 @@ use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use safe_migrate::analysis::evidence::{EvidenceCode, EvidenceRecord, EvidenceScope};
 use safe_migrate::analysis::outcome::AnalysisOutcome;
-use safe_migrate::db::cache::{CACHE_V8_MAGIC, CacheMetadata, CatalogCoverage, DbCacheVersioned};
+use safe_migrate::db::cache::{CACHE_V7_MAGIC, CacheMetadata, CatalogCoverage, DbCacheVersioned};
 use safe_migrate::db::cache_file::{
     MAX_CACHE_DECODE_BYTES, is_encrypted_cache_bytes, read_cache_bytes, unprotect_cache_bytes,
 };
@@ -883,7 +883,7 @@ fn decode_cache(cache_path: &Path, cache_encryption: bool) -> Result<(DbCache, u
         )
     })?;
     let mut decoder = decoder.take(MAX_CACHE_DECODE_BYTES as u64 + 1);
-    let mut header = vec![0; CACHE_V8_MAGIC.len()];
+    let mut header = vec![0; CACHE_V7_MAGIC.len()];
     let mut header_len = 0;
     while header_len < header.len() {
         let read = decoder.read(&mut header[header_len..]).map_err(|error| {
@@ -898,7 +898,7 @@ fn decode_cache(cache_path: &Path, cache_encryption: bool) -> Result<(DbCache, u
         }
         header_len += read;
     }
-    if header_len != CACHE_V8_MAGIC.len() || header != CACHE_V8_MAGIC {
+    if header_len != CACHE_V7_MAGIC.len() || header != CACHE_V7_MAGIC {
         anyhow::bail!(
             "Cache file '{}' uses an unsupported cache format. Run `safe-migrate sync` to rebuild it.",
             cache_path.display()

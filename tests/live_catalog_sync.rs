@@ -9,7 +9,7 @@ use safe_migrate::analysis::facts::{
 };
 use safe_migrate::analysis::state::AnalysisState;
 use safe_migrate::ast::identifiers::ObjectId;
-use safe_migrate::db::cache::{CACHE_V8_MAGIC, DbCacheVersioned};
+use safe_migrate::db::cache::{CACHE_V7_MAGIC, DbCacheVersioned};
 use safe_migrate::engine::config::Config;
 use safe_migrate::engine::engine::SafeMigrateEngine;
 use safe_migrate::model::function::{FunctionOverlay, RoutineKind, SecurityMode, Volatility};
@@ -68,13 +68,13 @@ fn decode_cache(path: &std::path::Path) -> (safe_migrate::DbCache, Vec<u8>) {
         .read_to_end(&mut payload)
         .expect("read decoded cache payload");
     let v6_payload = payload
-        .strip_prefix(CACHE_V8_MAGIC)
+        .strip_prefix(CACHE_V7_MAGIC)
         .expect("catalog sync must write a V7 cache");
     let config = bincode::config::standard().with_variable_int_encoding();
     let (versioned, bytes_read): (DbCacheVersioned, usize) =
         bincode::serde::decode_from_slice(v6_payload, config).expect("decode V7 cache");
     assert_eq!(bytes_read, v6_payload.len());
-    let DbCacheVersioned::V8(cache) = versioned else {
+    let DbCacheVersioned::V7(cache) = versioned else {
         panic!("catalog sync must encode the V7 cache variant");
     };
     (*cache, payload)

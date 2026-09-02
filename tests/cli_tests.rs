@@ -7,7 +7,7 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit},
 };
 use safe_migrate::ast::identifiers::ObjectId;
-use safe_migrate::db::cache::{CACHE_V8_MAGIC, DbCache, DbCacheVersioned};
+use safe_migrate::db::cache::{CACHE_V7_MAGIC, DbCache, DbCacheVersioned};
 use safe_migrate::model::relation::{Persistence, RelationKind, RelationState};
 use safe_migrate::model::schema::SchemaState;
 
@@ -44,9 +44,9 @@ fn write_cache_with_timestamp(path: &std::path::Path, created_at_unix_secs: u64)
     let mut compressed = Vec::new();
     let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3).unwrap();
     let config = bincode::config::standard().with_variable_int_encoding();
-    encoder.write_all(CACHE_V8_MAGIC).unwrap();
+    encoder.write_all(CACHE_V7_MAGIC).unwrap();
     bincode::serde::encode_into_std_write(
-        DbCacheVersioned::V8(Box::new(cache)),
+        DbCacheVersioned::V7(Box::new(cache)),
         &mut encoder,
         config,
     )
@@ -276,10 +276,10 @@ fn test_cli_rejects_semantically_contradictory_v7_cache() {
     );
     let config = bincode::config::standard().with_variable_int_encoding();
     let encoded =
-        bincode::serde::encode_to_vec(DbCacheVersioned::V8(Box::new(invalid)), config).unwrap();
+        bincode::serde::encode_to_vec(DbCacheVersioned::V7(Box::new(invalid)), config).unwrap();
     let mut compressed = Vec::new();
     let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3).unwrap();
-    encoder.write_all(CACHE_V8_MAGIC).unwrap();
+    encoder.write_all(CACHE_V7_MAGIC).unwrap();
     encoder.write_all(&encoded).unwrap();
     encoder.finish().unwrap();
     let cache = tempfile::NamedTempFile::new().unwrap();
@@ -313,10 +313,10 @@ fn test_cli_rejects_authenticated_semantically_contradictory_v7_cache() {
     );
     let config = bincode::config::standard().with_variable_int_encoding();
     let encoded =
-        bincode::serde::encode_to_vec(DbCacheVersioned::V8(Box::new(invalid)), config).unwrap();
+        bincode::serde::encode_to_vec(DbCacheVersioned::V7(Box::new(invalid)), config).unwrap();
     let mut compressed = Vec::new();
     let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3).unwrap();
-    encoder.write_all(CACHE_V8_MAGIC).unwrap();
+    encoder.write_all(CACHE_V7_MAGIC).unwrap();
     encoder.write_all(&encoded).unwrap();
     encoder.finish().unwrap();
 
@@ -357,7 +357,7 @@ fn test_cli_rejects_authenticated_semantically_contradictory_v7_cache() {
 fn test_cli_rejects_cache_with_oversized_decoded_container() {
     let config = bincode::config::standard().with_variable_int_encoding();
     let encoded =
-        bincode::serde::encode_to_vec(DbCacheVersioned::V8(Box::default()), config).unwrap();
+        bincode::serde::encode_to_vec(DbCacheVersioned::V7(Box::default()), config).unwrap();
     assert_eq!(&encoded[..4], &[7, 0, 0, 0]);
 
     let mut malicious = encoded[..3].to_vec();
@@ -367,7 +367,7 @@ fn test_cli_rejects_cache_with_oversized_decoded_container() {
 
     let mut compressed = Vec::new();
     let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3).unwrap();
-    encoder.write_all(CACHE_V8_MAGIC).unwrap();
+    encoder.write_all(CACHE_V7_MAGIC).unwrap();
     encoder.write_all(&malicious).unwrap();
     encoder.finish().unwrap();
 
@@ -392,11 +392,11 @@ fn test_cli_rejects_cache_with_oversized_decoded_container() {
 fn test_cli_rejects_trailing_data_after_streamed_cache_decode() {
     let config = bincode::config::standard().with_variable_int_encoding();
     let encoded =
-        bincode::serde::encode_to_vec(DbCacheVersioned::V8(Box::default()), config).unwrap();
+        bincode::serde::encode_to_vec(DbCacheVersioned::V7(Box::default()), config).unwrap();
 
     let mut compressed = Vec::new();
     let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3).unwrap();
-    encoder.write_all(CACHE_V8_MAGIC).unwrap();
+    encoder.write_all(CACHE_V7_MAGIC).unwrap();
     encoder.write_all(&encoded).unwrap();
     encoder.write_all(b"trailing-data").unwrap();
     encoder.finish().unwrap();
@@ -525,7 +525,7 @@ fn test_cache_inspect_outputs_a_redacted_json_summary() {
     let report = parse_json_stdout(assert.get_output());
 
     assert_eq!(report["path"], cache_path.display().to_string());
-    assert_eq!(report["format_version"], 8);
+    assert_eq!(report["format_version"], 7);
     assert_eq!(report["encrypted"], false);
     assert_eq!(report["coverage"]["schema_scope"], "all_non_system");
     assert!(report["coverage"]["families"].is_array());

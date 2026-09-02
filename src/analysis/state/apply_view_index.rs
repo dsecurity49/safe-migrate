@@ -581,7 +581,7 @@ impl AnalysisState {
             // Scoped index rows do not yet carry a complete backing-constraint
             // identity or every external dependency, so PostgreSQL's DROP
             // INDEX conflict semantics cannot be proven from the partial
-            // graph. Leave the baseline unchanged until V8 index ownership
+            // graph. Leave the baseline unchanged until V7 index ownership
             // coverage is object-complete.
             self.taint(
                 EvidenceCode::CatalogCoverageIncomplete,
