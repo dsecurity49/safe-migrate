@@ -124,6 +124,52 @@ impl PrivilegeMatrix {
             || self.has_grant_option(&ObjectId::new("", "public"), privilege)
     }
 
+    /// Returns whether a targeted revoke can identify every known source for
+    /// the requested privilege(s). A missing entry is meaningful only for a
+    /// privilege that is actually present; absent privileges need no
+    /// provenance to revoke.
+    pub fn targeted_revoke_provenance_is_known(
+        &self,
+        role: &ObjectId,
+        privileges: &HashSet<Privilege>,
+    ) -> bool {
+        self.grants.get(role).is_none_or(|grants| {
+            grants.iter().all(|privilege| {
+                let requested = privileges.contains(&Privilege::All)
+                    || privileges.contains(privilege)
+                    || (*privilege == Privilege::All
+                        && privileges
+                            .iter()
+                            .any(|requested| *requested != Privilege::All));
+                !requested || self.grantors.contains_key(&(role.clone(), *privilege))
+            })
+        })
+    }
+
+    /// Equivalent provenance check for `REVOKE ... GRANT OPTION FOR`, which
+    /// changes only the grant-option map and therefore uses its separate
+    /// source index.
+    pub fn targeted_grant_option_revoke_provenance_is_known(
+        &self,
+        role: &ObjectId,
+        privileges: &HashSet<Privilege>,
+    ) -> bool {
+        self.grant_options.get(role).is_none_or(|options| {
+            options.iter().all(|privilege| {
+                let requested = privileges.contains(&Privilege::All)
+                    || privileges.contains(privilege)
+                    || (*privilege == Privilege::All
+                        && privileges
+                            .iter()
+                            .any(|requested| *requested != Privilege::All));
+                !requested
+                    || self
+                        .grant_option_grantors
+                        .contains_key(&(role.clone(), *privilege))
+            })
+        })
+    }
+
     pub fn revoke_grant_option(&mut self, role: &ObjectId, privileges: &HashSet<Privilege>) {
         if let Some(options) = self.grant_options.get_mut(role) {
             if privileges.contains(&Privilege::All) {
@@ -133,6 +179,21 @@ impl PrivilegeMatrix {
                     options.remove(privilege);
                 }
             }
+        }
+        // Keep grant-option provenance synchronized with the capability set.
+        // Leaving these sources behind would let later targeted revoke or
+        // CASCADE logic observe a capability that was already removed.
+        let keys: Vec<_> = self
+            .grant_option_grantors
+            .keys()
+            .filter(|(grantee, privilege)| {
+                grantee == role
+                    && (privileges.contains(&Privilege::All) || privileges.contains(privilege))
+            })
+            .cloned()
+            .collect();
+        for key in keys {
+            self.grant_option_grantors.remove(&key);
         }
     }
 
@@ -282,18 +343,6 @@ impl PrivilegeMatrix {
     ) {
         let Some(grantor) = grantor else {
             self.revoke_grant_option(role, privileges);
-            for key in self
-                .grant_option_grantors
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>()
-            {
-                if &key.0 == role
-                    && (privileges.contains(&Privilege::All) || privileges.contains(&key.1))
-                {
-                    self.grant_option_grantors.remove(&key);
-                }
-            }
             return;
         };
         for privilege in privileges {
@@ -312,6 +361,22 @@ impl PrivilegeMatrix {
             } else if let Some(options) = self.grant_options.get_mut(role) {
                 options.remove(privilege);
             }
+        }
+        // Grant-option provenance is part of the same invariant as the
+        // option set.  Clearing only `grant_options` leaves stale sources
+        // that targeted revoke/cascade logic could later mistake for a live
+        // delegation.
+        let keys: Vec<_> = self
+            .grant_option_grantors
+            .keys()
+            .filter(|(grantee, privilege)| {
+                grantee == role
+                    && (privileges.contains(&Privilege::All) || privileges.contains(privilege))
+            })
+            .cloned()
+            .collect();
+        for key in keys {
+            self.grant_option_grantors.remove(&key);
         }
     }
 }
@@ -590,6 +655,40 @@ mod tests {
 
         matrix.revoke_from(&role, &select, Some(&second));
         assert!(!matrix.has_privilege(&role, Privilege::Select));
+    }
+
+    #[test]
+    fn direct_grant_option_revoke_removes_provenance() {
+        let role = ObjectId::new("", "reader");
+        let grantor = ObjectId::new("", "owner");
+        let select: HashSet<_> = [Privilege::Select].into_iter().collect();
+        let mut matrix = PrivilegeMatrix::default();
+        matrix.grant_from(role.clone(), select.clone(), Some(grantor), true);
+
+        matrix.revoke_grant_option(&role, &select);
+
+        assert!(!matrix.has_grant_option(&role, Privilege::Select));
+        assert!(matrix.grant_option_grantors.is_empty());
+    }
+
+    #[test]
+    fn targeted_revoke_detects_missing_grantor_provenance() {
+        let role = ObjectId::new("", "reader");
+        let select: HashSet<_> = [Privilege::Select].into_iter().collect();
+        let mut matrix = PrivilegeMatrix::default();
+        matrix.grant(role.clone(), select.clone());
+
+        assert!(!matrix.targeted_revoke_provenance_is_known(&role, &select));
+    }
+
+    #[test]
+    fn targeted_grant_option_revoke_detects_missing_provenance() {
+        let role = ObjectId::new("", "reader");
+        let select: HashSet<_> = [Privilege::Select].into_iter().collect();
+        let mut matrix = PrivilegeMatrix::default();
+        matrix.grant_with_option(role.clone(), select.clone());
+
+        assert!(!matrix.targeted_grant_option_revoke_provenance_is_known(&role, &select));
     }
 }
 

@@ -3794,6 +3794,64 @@ mod state_mutation_tests {
     }
 
     #[test]
+    fn targeted_revoke_without_acl_provenance_is_tainted() {
+        let engine = setup_engine();
+        let table_id = object_id("public", "provenance_table");
+        let reader = object_id("", "reader");
+        let owner = object_id("", "owner");
+        let mut cache = cache_with_table("public", "provenance_table", None);
+        cache.metadata.source_role = Some(owner.name.clone());
+        cache.metadata.source_session_role = Some(owner.name.clone());
+        cache.roles.insert(
+            owner.clone(),
+            RoleState {
+                id: owner.clone(),
+                can_login: true,
+                is_superuser: false,
+                inherits: true,
+                member_of: Vec::new(),
+                can_administer_membership: Vec::new(),
+                can_inherit_from: Vec::new(),
+                can_set_role_to: Vec::new(),
+            },
+        );
+        cache.roles.insert(
+            reader.clone(),
+            RoleState {
+                id: reader.clone(),
+                can_login: true,
+                is_superuser: false,
+                inherits: true,
+                member_of: Vec::new(),
+                can_administer_membership: Vec::new(),
+                can_inherit_from: Vec::new(),
+                can_set_role_to: Vec::new(),
+            },
+        );
+        if let Some(relation) = cache.relations.get_mut(&table_id) {
+            // The helper's default owner is schema-qualified; use the
+            // cluster role that executes the targeted revoke.
+            relation.owner = owner.clone();
+            let privileges = &mut relation.privileges;
+            let select: std::collections::HashSet<_> = [Privilege::Select].into_iter().collect();
+            // Deliberately model a legacy/hand-built ACL: the privilege and
+            // grant option exist, but their grantor provenance is absent.
+            privileges.grant(reader.clone(), select.clone());
+            privileges.grant_options.insert(reader.clone(), select);
+        }
+        let mut state = safe_migrate::AnalysisState::new(cache);
+
+        let _findings = engine
+            .analyze(
+                "REVOKE SELECT ON provenance_table FROM reader GRANTED BY owner;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert_eq!(state.local.confidence, Confidence::Tainted);
+    }
+
+    #[test]
     fn object_granted_by_must_match_the_current_role() {
         let engine = setup_engine();
         let table_id = object_id("public", "explicit_grantor_table");

@@ -572,6 +572,26 @@ impl AnalysisState {
                         ),
                         None => {}
                     }
+                    if grantor.is_some()
+                        && self.local.relations.get(id).is_some_and(|overlay| {
+                            matches!(
+                                overlay,
+                                crate::model::relation::RelationOverlay::Present(relation)
+                                    if revokees.iter().any(|revokee| {
+                                        if revoke.grant_option_only {
+                                            !relation.privileges.targeted_grant_option_revoke_provenance_is_known(revokee, &privileges)
+                                        } else {
+                                            !relation.privileges.targeted_revoke_provenance_is_known(revokee, &privileges)
+                                        }
+                                    })
+                            )
+                        })
+                    {
+                        self.taint(
+                            EvidenceCode::CatalogCoverageIncomplete,
+                            EvidenceScope::Chain,
+                        );
+                    }
                     self.apply_revoke_to_relation(
                         id,
                         &privileges,
@@ -607,6 +627,26 @@ impl AnalysisState {
                     })
                     .collect();
                 for id in &target_ids {
+                    if grantor.is_some()
+                        && self.local.relations.get(id).is_some_and(|overlay| {
+                            matches!(
+                                overlay,
+                                crate::model::relation::RelationOverlay::Present(relation)
+                                    if revokees.iter().any(|revokee| {
+                                        if revoke.grant_option_only {
+                                            !relation.privileges.targeted_grant_option_revoke_provenance_is_known(revokee, &privileges)
+                                        } else {
+                                            !relation.privileges.targeted_revoke_provenance_is_known(revokee, &privileges)
+                                        }
+                                    })
+                            )
+                        })
+                    {
+                        self.taint(
+                            EvidenceCode::CatalogCoverageIncomplete,
+                            EvidenceScope::Chain,
+                        );
+                    }
                     self.apply_revoke_to_relation(
                         id,
                         &privileges,
