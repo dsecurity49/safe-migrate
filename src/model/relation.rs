@@ -53,6 +53,10 @@ impl PrivilegeMatrix {
                 }
             }
         }
+        // PostgreSQL cannot retain a re-grant capability after the underlying
+        // privilege is revoked. Keep the two maps coherent for direct model
+        // callers as well as the migration state transition helper.
+        self.revoke_grant_option(role, privileges);
     }
 
     pub fn has_privilege(&self, role: &ObjectId, privilege: Privilege) -> bool {
