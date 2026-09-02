@@ -130,6 +130,34 @@ impl AnalysisState {
         MutationResult::Applied
     }
 
+    fn validate_object_grantor(
+        &mut self,
+        explicit: bool,
+        grantor: Option<&ObjectId>,
+    ) -> Result<(), MutationResult> {
+        if !explicit {
+            return Ok(());
+        }
+        match (grantor, self.local.current_role_known) {
+            (Some(grantor), true) if grantor.name != self.local.current_role => {
+                Err(MutationResult::Conflict {
+                    reason: format!(
+                        "object privilege GRANTED BY '{}' must name current role '{}'",
+                        grantor.name, self.local.current_role
+                    ),
+                })
+            }
+            (Some(_), false) | (None, _) => {
+                self.taint(
+                    EvidenceCode::CatalogCoverageIncomplete,
+                    EvidenceScope::Chain,
+                );
+                Ok(())
+            }
+            (Some(_), true) => Ok(()),
+        }
+    }
+
     pub(super) fn apply_grant(&mut self, grant: &GrantMutation) -> MutationResult {
         if let Err(result) = self.validate_grant_targets(&grant.target) {
             return result;
@@ -156,6 +184,11 @@ impl AnalysisState {
         match &grant.target {
             ResolvedGrantTarget::Tables(ids) => {
                 let grantor = self.grantor_identity(grant.granted_by.as_ref());
+                if let Err(result) =
+                    self.validate_object_grantor(grant.granted_by.is_some(), grantor.as_ref())
+                {
+                    return result;
+                }
                 for id in ids {
                     let authorization =
                         self.local
@@ -199,6 +232,12 @@ impl AnalysisState {
                 }
             }
             ResolvedGrantTarget::AllTablesInSchema(schemas) => {
+                let grantor = self.grantor_identity(grant.granted_by.as_ref());
+                if let Err(result) =
+                    self.validate_object_grantor(grant.granted_by.is_some(), grantor.as_ref())
+                {
+                    return result;
+                }
                 // The cache does not retain every PostgreSQL relation kind
                 // eligible for ALL TABLES IN SCHEMA. Apply the modeled subset
                 // but do not claim that the resulting privilege matrix is
@@ -226,7 +265,7 @@ impl AnalysisState {
                         &privileges,
                         &grantees,
                         grant.with_grant_option,
-                        self.grantor_identity(grant.granted_by.as_ref()),
+                        grantor.clone(),
                     );
                 }
             }
@@ -406,6 +445,11 @@ impl AnalysisState {
         match &revoke.target {
             ResolvedGrantTarget::Tables(ids) => {
                 let grantor = self.grantor_identity(revoke.granted_by.as_ref());
+                if let Err(result) =
+                    self.validate_object_grantor(revoke.granted_by.is_some(), grantor.as_ref())
+                {
+                    return result;
+                }
                 for id in ids {
                     let authorization =
                         self.local
@@ -450,6 +494,12 @@ impl AnalysisState {
                 }
             }
             ResolvedGrantTarget::AllTablesInSchema(schemas) => {
+                let grantor = self.grantor_identity(revoke.granted_by.as_ref());
+                if let Err(result) =
+                    self.validate_object_grantor(revoke.granted_by.is_some(), grantor.as_ref())
+                {
+                    return result;
+                }
                 self.taint(
                     EvidenceCode::CatalogCoverageIncomplete,
                     EvidenceScope::Chain,
@@ -473,7 +523,7 @@ impl AnalysisState {
                         &privileges,
                         &revokees,
                         revoke.grant_option_only,
-                        self.grantor_identity(revoke.granted_by.as_ref()).as_ref(),
+                        grantor.as_ref(),
                         revoke.cascade,
                     );
                 }

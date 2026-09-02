@@ -2575,21 +2575,7 @@ impl AnalysisState {
             return MutationResult::NotExecuted;
         }
 
-        let confidence_before = self.local.confidence.clone();
-        let evidence_before = self.local.evidence.records().len();
-        let undo_start = self
-            .local
-            .transactions
-            .last()
-            .map(|frame| frame.undo_log.len());
         let result = self.apply_inner(mutation, precomputed_cascade);
-        if confidence_before == Confidence::Exact
-            && self.local.confidence == Confidence::Tainted
-            && self.local.evidence.records().len() == evidence_before
-        {
-            self.record_existing_taint(EvidenceCode::LegacyStateUncertainty, EvidenceScope::Chain);
-            self.ensure_confidence_rollback(confidence_before, undo_start);
-        }
         if matches!(result, MutationResult::Conflict { .. }) && !self.local.transactions.is_empty()
         {
             self.local.transaction_aborted = true;
@@ -2962,32 +2948,6 @@ impl AnalysisState {
         self.record_evidence(EvidenceRecord::new(code, scope));
     }
 
-    fn record_existing_taint(&mut self, code: EvidenceCode, scope: EvidenceScope) {
-        let mut record = EvidenceRecord::new(code, scope);
-        record.location = self.local.current_evidence_location.clone();
-        if !self.local.evidence.contains(&record) {
-            self.snapshot_evidence();
-            self.local.evidence.insert(record);
-        }
-    }
-
-    fn ensure_confidence_rollback(&mut self, previous: Confidence, undo_start: Option<usize>) {
-        let Some(undo_start) = undo_start else {
-            return;
-        };
-        let Some(frame) = self.local.transactions.last_mut() else {
-            return;
-        };
-        let has_snapshot = frame.undo_log[undo_start..]
-            .iter()
-            .any(|change| matches!(change, StateChange::ConfidenceSnapshot { .. }));
-        if !has_snapshot {
-            frame
-                .undo_log
-                .push(StateChange::ConfidenceSnapshot { previous });
-        }
-    }
-
     pub(crate) fn set_evidence_location(&mut self, location: Option<EvidenceLocation>) {
         self.local.current_evidence_location = location;
     }
@@ -3279,12 +3239,6 @@ mod evidence_tests {
                 .evidence()
                 .iter()
                 .any(|record| record.code == EvidenceCode::TransactionStateUnknown)
-        );
-        assert!(
-            !state
-                .evidence()
-                .iter()
-                .any(|record| record.code == EvidenceCode::LegacyStateUncertainty)
         );
     }
 

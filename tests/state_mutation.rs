@@ -3794,6 +3794,81 @@ mod state_mutation_tests {
     }
 
     #[test]
+    fn object_granted_by_must_match_the_current_role() {
+        let engine = setup_engine();
+        let table_id = object_id("public", "explicit_grantor_table");
+        let mut cache = DbCache::new();
+        cache.metadata.source_role = Some("current_user".into());
+        cache.metadata.source_session_role = Some("current_user".into());
+        for name in ["current_user", "other_grantor", "reader"] {
+            let id = object_id("", name);
+            cache.roles.insert(
+                id.clone(),
+                RoleState {
+                    id,
+                    can_login: true,
+                    is_superuser: false,
+                    inherits: true,
+                    member_of: Vec::new(),
+                    can_administer_membership: Vec::new(),
+                    can_inherit_from: Vec::new(),
+                    can_set_role_to: Vec::new(),
+                },
+            );
+        }
+        let mut relation = RelationState::new(
+            table_id.clone(),
+            object_id("", "owner"),
+            0,
+            Some(1),
+            RelationKind::Table,
+            Persistence::Permanent,
+            0,
+        );
+        relation.privileges.grant_with_option(
+            object_id("", "other_grantor"),
+            [Privilege::Select].into_iter().collect(),
+        );
+        cache.insert_baseline(table_id, relation);
+        let mut state = safe_migrate::AnalysisState::new(cache);
+
+        let findings = engine
+            .analyze(
+                "GRANT SELECT ON explicit_grantor_table TO reader GRANTED BY other_grantor;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict")
+        );
+        let RelationOverlay::Present(relation) = state
+            .get_relation(&object_id("public", "explicit_grantor_table"))
+            .unwrap()
+        else {
+            panic!("relation missing");
+        };
+        assert!(
+            !relation
+                .privileges
+                .has_privilege(&object_id("", "reader"), Privilege::Select)
+        );
+
+        let findings = engine
+            .analyze(
+                "GRANT SELECT ON ALL TABLES IN SCHEMA public TO reader GRANTED BY other_grantor;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict")
+        );
+    }
+
+    #[test]
     fn inherited_grant_option_authorizes_a_delegated_grant() {
         let engine = setup_engine();
         let table_id = object_id("public", "inherited_grant_table");

@@ -60,12 +60,6 @@ fn foreign_key_type_compatibility_gap_has_catalog_evidence_not_legacy_taint() {
         outcome.evidence,
         outcome.findings
     );
-    assert!(
-        !outcome
-            .evidence
-            .iter()
-            .any(|record| record.code == EvidenceCode::LegacyStateUncertainty)
-    );
 }
 
 #[test]
@@ -86,12 +80,6 @@ fn unknown_sequence_target_has_typed_object_state_evidence() {
             .evidence
             .iter()
             .any(|record| record.code == EvidenceCode::UnknownObjectState)
-    );
-    assert!(
-        !outcome
-            .evidence
-            .iter()
-            .any(|record| record.code == EvidenceCode::LegacyStateUncertainty)
     );
 }
 

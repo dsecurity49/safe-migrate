@@ -16,7 +16,6 @@ pub enum EvidenceCode {
     UnknownObjectState,
     TransactionStateUnknown,
     UnmodeledState,
-    LegacyStateUncertainty,
 }
 
 impl EvidenceCode {
@@ -31,7 +30,6 @@ impl EvidenceCode {
             Self::UnknownObjectState => "unknown_object_state",
             Self::TransactionStateUnknown => "transaction_state_unknown",
             Self::UnmodeledState => "unmodeled_state",
-            Self::LegacyStateUncertainty => "legacy_state_uncertainty",
         }
     }
 
@@ -49,9 +47,6 @@ impl EvidenceCode {
             Self::TransactionStateUnknown => "transaction state cannot be modeled exactly",
             Self::UnmodeledState => {
                 "required PostgreSQL state is deliberately outside the semantic model"
-            }
-            Self::LegacyStateUncertainty => {
-                "a state transition became uncertain without a categorized reason"
             }
         }
     }
