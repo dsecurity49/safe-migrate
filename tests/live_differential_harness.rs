@@ -116,6 +116,7 @@ enum ComparisonScope {
     Triggers,
     ViewDependencies,
     Partitions,
+    Publications,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -134,6 +135,7 @@ struct NormalizedState {
     triggers: BTreeMap<(String, String), NormalizedTrigger>,
     partition_edges: BTreeSet<(String, String)>,
     view_dependencies: BTreeSet<(String, String)>,
+    publications: BTreeMap<String, NormalizedPublication>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -226,6 +228,13 @@ struct NormalizedPrivilege {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct NormalizedPublication {
+    owner: Option<String>,
+    scope: String,
+    params: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum MismatchCategory {
     MissingSchemaInSimulator,
     ExtraSchemaInSimulator,
@@ -263,6 +272,9 @@ enum MismatchCategory {
     ExtraPartitionEdgeInSimulator,
     MissingViewDependencyInSimulator,
     ExtraViewDependencyInSimulator,
+    MissingPublicationInSimulator,
+    ExtraPublicationInSimulator,
+    PublicationDefinitionMismatch,
     RoleMembershipMismatch,
     BaselineObjectAbsent,
     LiveExecutionFailed,
@@ -836,7 +848,7 @@ fn verbose(verbosity: u8, level: u8, message: impl std::fmt::Display) {
 
 fn state_counts(state: &NormalizedState) -> String {
     format!(
-        "schemas:{} sequences:{} relations:{} indexes:{} constraints:{} foreign_keys:{} functions:{} types:{} privileges:{} policies:{} triggers:{} partitions:{} view_dependencies:{}",
+        "schemas:{} sequences:{} relations:{} indexes:{} constraints:{} foreign_keys:{} functions:{} types:{} privileges:{} policies:{} triggers:{} partitions:{} view_dependencies:{} publications:{}",
         state.schemas.len(),
         state.sequences.len(),
         state.relations.len(),
@@ -849,7 +861,8 @@ fn state_counts(state: &NormalizedState) -> String {
         state.policies.len(),
         state.triggers.len(),
         state.partition_edges.len(),
-        state.view_dependencies.len()
+        state.view_dependencies.len(),
+        state.publications.len()
     )
 }
 
@@ -1400,6 +1413,21 @@ fn snapshot_live_state(
         }
     }
 
+    if scope.contains(&ComparisonScope::Publications) {
+        for (name, publication) in &cache.publications {
+            state.publications.insert(
+                name.clone(),
+                NormalizedPublication {
+                    owner: publication.owner.clone(),
+                    scope: serde_json::to_string(&publication.scope)
+                        .expect("publication scope must be serializable"),
+                    params: serde_json::to_string(&publication.params)
+                        .expect("publication parameters must be serializable"),
+                },
+            );
+        }
+    }
+
     if scope.contains(&ComparisonScope::Sequences) {
         for (id, sequence) in &cache.sequences {
             state.sequences.insert(
@@ -1667,6 +1695,26 @@ fn snapshot_simulator_state(
         }
     }
 
+    if scope.contains(&ComparisonScope::Publications) {
+        for (name, overlay) in &state.local.publications {
+            let safe_migrate::model::replication::PublicationOverlay::Present(publication) =
+                overlay
+            else {
+                continue;
+            };
+            projection.publications.insert(
+                name.clone(),
+                NormalizedPublication {
+                    owner: publication.owner.clone(),
+                    scope: serde_json::to_string(&publication.scope)
+                        .expect("publication scope must be serializable"),
+                    params: serde_json::to_string(&publication.params)
+                        .expect("publication parameters must be serializable"),
+                },
+            );
+        }
+    }
+
     if scope.contains(&ComparisonScope::Sequences) {
         for (id, overlay) in &state.local.sequences {
             let SequenceOverlay::Present(sequence) = overlay else {
@@ -1863,6 +1911,43 @@ fn compare_states(
     simulator: &NormalizedState,
 ) -> Vec<Mismatch> {
     let mut mismatches = Vec::new();
+
+    if scope.contains(&ComparisonScope::Publications) {
+        for (name, live_publication) in &live.publications {
+            let Some(simulator_publication) = simulator.publications.get(name) else {
+                mismatches.push(Mismatch {
+                    rule_dir: rule_dir.to_string(),
+                    fixture: fixture.to_string(),
+                    category: MismatchCategory::MissingPublicationInSimulator,
+                    root_cause: RootCauseClassification::SimulatorBug,
+                    note: format!("live PostgreSQL kept publication '{name}'"),
+                });
+                continue;
+            };
+            if live_publication != simulator_publication {
+                mismatches.push(Mismatch {
+                    rule_dir: rule_dir.to_string(),
+                    fixture: fixture.to_string(),
+                    category: MismatchCategory::PublicationDefinitionMismatch,
+                    root_cause: RootCauseClassification::SimulatorBug,
+                    note: format!(
+                        "publication '{name}' differs: live={live_publication:?}, simulator={simulator_publication:?}"
+                    ),
+                });
+            }
+        }
+        for name in simulator.publications.keys() {
+            if !live.publications.contains_key(name) {
+                mismatches.push(Mismatch {
+                    rule_dir: rule_dir.to_string(),
+                    fixture: fixture.to_string(),
+                    category: MismatchCategory::ExtraPublicationInSimulator,
+                    root_cause: RootCauseClassification::SimulatorBug,
+                    note: format!("simulator kept publication '{name}'"),
+                });
+            }
+        }
+    }
 
     if scope.contains(&ComparisonScope::Roles) {
         for membership in live.roles.difference(&simulator.roles) {

@@ -159,7 +159,9 @@
         "safe_002_drop_matview.sql",
         "safe_008_drop_view_if_exists.sql",
         "safe_009_drop_matview_if_exists.sql",
-        "safe_010_drop_view_restrict.sql"
+        "safe_010_drop_view_restrict.sql",
+        "007_drop_pub_cascade.sql",
+        "safe_006_drop_pub.sql"
       ],
       "excluded_fixtures": [
         {
@@ -179,10 +181,6 @@
           "reason": "Cache V6 synchronizes routine identity and kind, but this rule does not compare routine state."
         },
         {
-          "fixture": "007_drop_pub_cascade.sql",
-          "reason": "Cache V6 synchronizes publications, but the differential harness does not compare publication state."
-        },
-        {
           "fixture": "010_drop_seq_if_exists_cascade.sql",
           "reason": "Cache V6 synchronizes sequences, but this rule does not compare sequence state."
         },
@@ -197,10 +195,6 @@
         {
           "fixture": "safe_005_drop_proc.sql",
           "reason": "Cache V6 synchronizes routine identity and kind, but this rule does not compare routine state."
-        },
-        {
-          "fixture": "safe_006_drop_pub.sql",
-          "reason": "Cache V6 synchronizes publications, but the differential harness does not compare publication state."
         },
         {
           "fixture": "safe_007_drop_domain.sql",
@@ -220,6 +214,10 @@
       "scope": [
         "relations"
       ],
+      "fixture_scopes": {
+        "007_drop_pub_cascade.sql": ["publications"],
+        "safe_006_drop_pub.sql": ["publications"]
+      },
       "required_relations": [
         "sm_core.myview",
         "sm_core.mymat"

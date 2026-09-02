@@ -26,6 +26,7 @@ DROP TABLE IF EXISTS public.list_parent CASCADE;
 DROP TABLE IF EXISTS public.range_parent CASCADE;
 DROP TABLE IF EXISTS public.hash_parent CASCADE;
 DROP TABLE IF EXISTS public.test_table CASCADE;
+DROP PUBLICATION IF EXISTS mypub;
 
 CREATE SCHEMA IF NOT EXISTS public;
 DO $baseline_role$
@@ -261,6 +262,7 @@ CREATE TABLE public.test_table (
     data text,
     ts timestamptz
 );
+CREATE PUBLICATION mypub FOR TABLE public.test_table;
 CREATE INDEX test_table_note_idx ON public.test_table (note);
 
 CREATE TABLE public.child_table (
