@@ -1934,6 +1934,30 @@
           "kind": "can_set_role_to"
         },
         {
+          "member": "sm_option_member",
+          "role": "sm_option_parent",
+          "kind": "can_administer_membership",
+          "min_pg_version_num": 160000
+        },
+        {
+          "member": "sm_option_member",
+          "role": "sm_option_parent",
+          "kind": "member_of_without_set",
+          "min_pg_version_num": 160000
+        },
+        {
+          "member": "sm_inherit_member",
+          "role": "sm_inherit_parent",
+          "kind": "can_inherit_from",
+          "min_pg_version_num": 160000
+        },
+        {
+          "member": "sm_inherit_member",
+          "role": "sm_inherit_parent",
+          "kind": "member_of_without_set",
+          "min_pg_version_num": 160000
+        },
+        {
           "member": "sm_set_member",
           "role": "sm_no_set_target",
           "kind": "member_of_without_set",

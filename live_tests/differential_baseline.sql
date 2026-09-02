@@ -50,7 +50,11 @@ BEGIN
         'sm_set_member',
         'sm_set_bridge',
         'sm_set_target',
-        'sm_no_set_target'
+        'sm_no_set_target',
+        'sm_option_member',
+        'sm_option_parent',
+        'sm_inherit_member',
+        'sm_inherit_parent'
     ] LOOP
         IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = role_name) THEN
             EXECUTE format('CREATE ROLE %I NOLOGIN', role_name);
@@ -68,6 +72,20 @@ BEGIN
     END IF;
 END
 $set_option_membership$;
+DO $membership_option_membership$
+BEGIN
+    IF current_setting('server_version_num')::integer >= 160000 THEN
+        EXECUTE 'GRANT sm_option_parent TO sm_option_member WITH ADMIN TRUE, INHERIT FALSE, SET FALSE';
+    END IF;
+END
+$membership_option_membership$;
+DO $inherit_option_membership$
+BEGIN
+    IF current_setting('server_version_num')::integer >= 160000 THEN
+        EXECUTE 'GRANT sm_inherit_parent TO sm_inherit_member WITH INHERIT TRUE, SET FALSE';
+    END IF;
+END
+$inherit_option_membership$;
 
 CREATE SCHEMA sm_identity;
 CREATE SCHEMA sm_core;

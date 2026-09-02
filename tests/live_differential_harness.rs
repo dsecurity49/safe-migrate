@@ -73,6 +73,8 @@ struct RequiredRoleEdge {
 #[serde(rename_all = "snake_case")]
 enum RequiredRoleEdgeKind {
     CanSetRoleTo,
+    CanAdministerMembership,
+    CanInheritFrom,
     MemberOfWithoutSet,
 }
 
@@ -1194,6 +1196,10 @@ fn check_role_membership_cache(
         };
         let matches = match required.kind {
             RequiredRoleEdgeKind::CanSetRoleTo => edge(&member.can_set_role_to, &required.role),
+            RequiredRoleEdgeKind::CanAdministerMembership => {
+                edge(&member.can_administer_membership, &required.role)
+            }
+            RequiredRoleEdgeKind::CanInheritFrom => edge(&member.can_inherit_from, &required.role),
             RequiredRoleEdgeKind::MemberOfWithoutSet => {
                 edge(&member.member_of, &required.role)
                     && !edge(&member.can_set_role_to, &required.role)
