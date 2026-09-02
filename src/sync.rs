@@ -1786,8 +1786,10 @@ fn load_generated_column_dependencies(
         JOIN pg_namespace n ON n.oid = c.relnamespace
         JOIN pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum
         JOIN pg_depend d
-          ON d.classid = 'pg_attrdef'::regclass
-         AND d.objid = ad.oid
+          ON ((d.classid = 'pg_attrdef'::regclass AND d.objid = ad.oid)
+              OR (d.classid = 'pg_class'::regclass
+                  AND d.objid = a.attrelid
+                  AND d.objsubid = a.attnum))
          AND d.refclassid = 'pg_class'::regclass
          AND d.refobjsubid > 0
         JOIN pg_attribute source_a
