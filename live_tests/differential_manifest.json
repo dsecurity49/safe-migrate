@@ -1728,7 +1728,9 @@
         "safe_019_routine_namespace_resolution.sql",
         "safe_020_generated_name_truncation.sql",
         "safe_021_routine_type_aliases.sql",
-        "safe_022_role_membership_cascade.sql"
+        "safe_022_role_membership_cascade.sql",
+        "safe_023_role_options.sql",
+        "safe_024_logical_replication.sql"
       ],
       "fixture_transactional": {
         "safe_010_role_transaction_semantics.sql": false,
@@ -1740,7 +1742,8 @@
         "safe_016_transitive_set_role_membership.sql": false
       },
       "fixture_min_pg_version": {
-        "safe_022_role_membership_cascade.sql": 160000
+        "safe_022_role_membership_cascade.sql": 160000,
+        "safe_024_logical_replication.sql": 150000
       },
       "expected_live_errors": {
         "011_missing_fk_source_column.sql": {
@@ -1902,6 +1905,13 @@
       ],
       "safe_022_role_membership_cascade.sql": [
           "roles"
+      ],
+      "safe_023_role_options.sql": [
+          "roles"
+      ],
+      "safe_024_logical_replication.sql": [
+          "publications",
+          "subscriptions"
       ],
         "safe_017_relation_namespace_resolution.sql": [
           "schemas",
