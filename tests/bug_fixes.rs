@@ -2,17 +2,17 @@ mod common;
 
 mod phase10_bug_fixes_and_sorting_tests {
     use crate::common::*;
-    use safe_migrate::analysis::state::{AnalysisState, Confidence};
-    use safe_migrate::ast::identifiers::ObjectId;
-    use safe_migrate::db::cache::DbCache;
-    use safe_migrate::model::relation::{Persistence, RelationKind};
-    use safe_migrate::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
+    use safe_migrate::_internal::analysis::state::{AnalysisState, Confidence};
+    use safe_migrate::_internal::ast::identifiers::ObjectId;
+    use safe_migrate::_internal::db::cache::DbCache;
+    use safe_migrate::_internal::model::relation::{Persistence, RelationKind};
+    use safe_migrate::_internal::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
 
     fn baseline_index(
         index_id: ObjectId,
         table_id: ObjectId,
-    ) -> safe_migrate::db::cache::IndexCache {
-        safe_migrate::db::cache::IndexCache {
+    ) -> safe_migrate::_internal::db::cache::IndexCache {
+        safe_migrate::_internal::db::cache::IndexCache {
             index_id,
             table_id,
             using_method: "btree".into(),
@@ -122,7 +122,7 @@ mod phase10_bug_fixes_and_sorting_tests {
         let mut cache = DbCache::new();
         cache.insert_baseline(
             object_id("public", "accounts"),
-            safe_migrate::model::relation::RelationState::new(
+            safe_migrate::_internal::model::relation::RelationState::new(
                 object_id("public", "accounts"),
                 ObjectId::new("public", "postgres"),
                 0,
@@ -159,7 +159,7 @@ mod phase10_bug_fixes_and_sorting_tests {
         let mut cache = DbCache::new();
         cache.insert_baseline(
             object_id("public", "accounts"),
-            safe_migrate::model::relation::RelationState::new(
+            safe_migrate::_internal::model::relation::RelationState::new(
                 object_id("public", "accounts"),
                 ObjectId::new("public", "postgres"),
                 0,
@@ -192,7 +192,7 @@ mod phase10_bug_fixes_and_sorting_tests {
         cache.pg_version_num = Some(110000);
         cache.insert_baseline(
             object_id("public", "t"),
-            safe_migrate::model::relation::RelationState::new(
+            safe_migrate::_internal::model::relation::RelationState::new(
                 object_id("public", "t"),
                 ObjectId::new("public", "postgres"),
                 0,
@@ -227,7 +227,7 @@ mod phase10_bug_fixes_and_sorting_tests {
         let mut cache = DbCache::new();
         cache.insert_baseline(
             object_id("public", "t"),
-            safe_migrate::model::relation::RelationState::new(
+            safe_migrate::_internal::model::relation::RelationState::new(
                 object_id("public", "t"),
                 ObjectId::new("public", "postgres"),
                 0,
@@ -269,7 +269,7 @@ mod phase10_bug_fixes_and_sorting_tests {
         let mut cache = DbCache::new();
         cache.insert_baseline(
             object_id("public", "t"),
-            safe_migrate::model::relation::RelationState::new(
+            safe_migrate::_internal::model::relation::RelationState::new(
                 object_id("public", "t"),
                 ObjectId::new("public", "postgres"),
                 0,
@@ -501,17 +501,17 @@ mod phase10_bug_fixes_and_sorting_tests {
     #[test]
     fn test_bug013_confidence_restored_on_rollback() {
         let engine = setup_engine();
-        let mut cache = safe_migrate::db::cache::DbCache::new();
+        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
         let tid = object_id("public", "t");
         cache.insert_baseline(
             tid.clone(),
-            safe_migrate::model::relation::RelationState::new(
+            safe_migrate::_internal::model::relation::RelationState::new(
                 tid.clone(),
                 object_id("public", "postgres"),
                 0,
                 Some(10),
-                safe_migrate::model::relation::RelationKind::Table,
-                safe_migrate::model::relation::Persistence::Permanent,
+                safe_migrate::_internal::model::relation::RelationKind::Table,
+                safe_migrate::_internal::model::relation::Persistence::Permanent,
                 0,
             ),
         );
@@ -532,7 +532,7 @@ mod phase10_bug_fixes_and_sorting_tests {
 
         assert!(
             v.iter().any(|violation| violation.tier
-                == safe_migrate::report::violations::ViolationTier::Tier1),
+                == safe_migrate::_internal::report::violations::ViolationTier::Tier1),
             "Expected Tier1 because confidence should be restored to Exact after rollback"
         );
     }
@@ -563,7 +563,7 @@ mod phase10_bug_fixes_and_sorting_tests {
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
-                    safe_migrate::analysis::graph::DependencyKind::TriggerOnTable { .. }
+                    safe_migrate::_internal::analysis::graph::DependencyKind::TriggerOnTable { .. }
                 ))
                 .count()
                 != 0
@@ -576,7 +576,7 @@ mod phase10_bug_fixes_and_sorting_tests {
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
-                    safe_migrate::analysis::graph::DependencyKind::PublicationIncludes { .. }
+                    safe_migrate::_internal::analysis::graph::DependencyKind::PublicationIncludes { .. }
                 ))
                 .count()
                 != 0
@@ -596,7 +596,7 @@ mod phase10_bug_fixes_and_sorting_tests {
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
-                    safe_migrate::analysis::graph::DependencyKind::TriggerOnTable { .. }
+                    safe_migrate::_internal::analysis::graph::DependencyKind::TriggerOnTable { .. }
                 ))
                 .count()
                 == 0
@@ -609,7 +609,7 @@ mod phase10_bug_fixes_and_sorting_tests {
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
-                    safe_migrate::analysis::graph::DependencyKind::PublicationIncludes { .. }
+                    safe_migrate::_internal::analysis::graph::DependencyKind::PublicationIncludes { .. }
                 ))
                 .count()
                 == 0
@@ -655,28 +655,28 @@ mod phase10_bug_fixes_and_sorting_tests {
     #[test]
     fn test_finding2_partition_strategy_mismatch_silent_on_regular_child() {
         let engine = setup_engine();
-        let mut cache = safe_migrate::db::cache::DbCache::new();
+        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
         let parent_id = object_id("public", "parent");
-        let mut parent = safe_migrate::model::relation::RelationState::new(
+        let mut parent = safe_migrate::_internal::model::relation::RelationState::new(
             parent_id.clone(),
             object_id("public", "postgres"),
             0,
             Some(0),
-            safe_migrate::model::relation::RelationKind::Table,
-            safe_migrate::model::relation::Persistence::Permanent,
+            safe_migrate::_internal::model::relation::RelationKind::Table,
+            safe_migrate::_internal::model::relation::Persistence::Permanent,
             0,
         );
         parent.partition_type = Some("RANGE".to_string());
         cache.insert_baseline(parent_id, parent);
 
         let child_id = object_id("public", "child");
-        let child = safe_migrate::model::relation::RelationState::new(
+        let child = safe_migrate::_internal::model::relation::RelationState::new(
             child_id,
             object_id("public", "postgres"),
             0,
             Some(0),
-            safe_migrate::model::relation::RelationKind::Table,
-            safe_migrate::model::relation::Persistence::Permanent,
+            safe_migrate::_internal::model::relation::RelationKind::Table,
+            safe_migrate::_internal::model::relation::Persistence::Permanent,
             0,
         );
         cache.insert_baseline(object_id("public", "child"), child);
@@ -701,28 +701,28 @@ mod phase10_bug_fixes_and_sorting_tests {
     #[test]
     fn test_finding2_partition_strategy_mismatch_fires_on_mismatch() {
         let engine = setup_engine();
-        let mut cache = safe_migrate::db::cache::DbCache::new();
+        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
         let parent_id = object_id("public", "parent");
-        let mut parent = safe_migrate::model::relation::RelationState::new(
+        let mut parent = safe_migrate::_internal::model::relation::RelationState::new(
             parent_id.clone(),
             object_id("public", "postgres"),
             0,
             Some(10),
-            safe_migrate::model::relation::RelationKind::Table,
-            safe_migrate::model::relation::Persistence::Permanent,
+            safe_migrate::_internal::model::relation::RelationKind::Table,
+            safe_migrate::_internal::model::relation::Persistence::Permanent,
             0,
         );
         parent.partition_type = Some("RANGE".to_string());
         cache.insert_baseline(parent_id, parent);
 
         let child_id = object_id("public", "child");
-        let mut child = safe_migrate::model::relation::RelationState::new(
+        let mut child = safe_migrate::_internal::model::relation::RelationState::new(
             child_id,
             object_id("public", "postgres"),
             0,
             Some(0),
-            safe_migrate::model::relation::RelationKind::Table,
-            safe_migrate::model::relation::Persistence::Permanent,
+            safe_migrate::_internal::model::relation::RelationKind::Table,
+            safe_migrate::_internal::model::relation::Persistence::Permanent,
             0,
         );
         child.partition_type = Some("LIST".to_string());
@@ -902,7 +902,7 @@ mod phase10_bug_fixes_and_sorting_tests {
         );
         assert_eq!(
             state.local.confidence,
-            safe_migrate::analysis::state::Confidence::Exact,
+            safe_migrate::_internal::analysis::state::Confidence::Exact,
             "A known PostgreSQL column conflict does not make simulation uncertain"
         );
     }
@@ -912,9 +912,9 @@ mod phase10_bug_fixes_and_sorting_tests {
     // ─────────────────────────────────────────────
     #[test]
     fn test_bug016_rename_prevents_duplicate_column_name() {
-        use safe_migrate::model::column::Column;
-        use safe_migrate::model::relation::ColumnAction;
-        use safe_migrate::model::relation::RelationState;
+        use safe_migrate::_internal::model::column::Column;
+        use safe_migrate::_internal::model::relation::ColumnAction;
+        use safe_migrate::_internal::model::relation::RelationState;
 
         let mut rel = RelationState::new(
             ObjectId::new("public", "t"),
@@ -1026,7 +1026,7 @@ mod phase10_bug_fixes_and_sorting_tests {
         // Confidence should remain Exact since the column exists
         assert_eq!(
             state.local.confidence,
-            safe_migrate::analysis::state::Confidence::Exact,
+            safe_migrate::_internal::analysis::state::Confidence::Exact,
             "Confidence should remain Exact when SET TYPE on existing column"
         );
     }
@@ -1051,8 +1051,8 @@ mod phase10_bug_fixes_and_sorting_tests {
     // ─────────────────────────────────────────────
     #[test]
     fn test_bug009_privilege_all_variant_consistency() {
-        use safe_migrate::model::relation::Privilege;
-        use safe_migrate::model::relation::PrivilegeMatrix;
+        use safe_migrate::_internal::model::relation::Privilege;
+        use safe_migrate::_internal::model::relation::PrivilegeMatrix;
         use std::collections::HashSet;
 
         // 1. Both enums now have All (compile-time check — relation::Privilege::All exists)
@@ -1087,7 +1087,7 @@ mod phase10_bug_fixes_and_sorting_tests {
 
     #[test]
     fn postgres17_all_grant_tracks_maintain_without_leaking_to_older_versions() {
-        use safe_migrate::model::relation::{Privilege, RelationOverlay};
+        use safe_migrate::_internal::model::relation::{Privilege, RelationOverlay};
 
         let engine = setup_engine();
         for (version, expected) in [(170_000, true), (160_000, false)] {
@@ -1239,41 +1239,41 @@ mod phase10_bug_fixes_and_sorting_tests {
     // ─────────────────────────────────────────────
     #[test]
     fn test_bug012_partition_threshold_floor_at_one() {
-        let config = safe_migrate::engine::config::Config {
+        let config = safe_migrate::_internal::engine::config::Config {
             tier1_threshold_rows: 1,
             tier2_threshold_rows: 1,
             ..Default::default()
         };
-        let engine = safe_migrate::engine::engine::SafeMigrateEngine::new(config);
-        let mut cache = safe_migrate::db::cache::DbCache::new();
+        let engine = safe_migrate::_internal::engine::engine::SafeMigrateEngine::new(config);
+        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
 
         let parent_id = object_id("public", "parent");
         let child_id = object_id("public", "child");
-        let mut parent = safe_migrate::model::relation::RelationState::new(
+        let mut parent = safe_migrate::_internal::model::relation::RelationState::new(
             parent_id.clone(),
             object_id("public", "postgres"),
             0,
             Some(0),
-            safe_migrate::model::relation::RelationKind::Table,
-            safe_migrate::model::relation::Persistence::Permanent,
+            safe_migrate::_internal::model::relation::RelationKind::Table,
+            safe_migrate::_internal::model::relation::Persistence::Permanent,
             0,
         );
         parent.partition_type = Some("RANGE".to_string());
         cache.insert_baseline(parent_id, parent);
 
-        let mut child = safe_migrate::model::relation::RelationState::new(
+        let mut child = safe_migrate::_internal::model::relation::RelationState::new(
             child_id.clone(),
             object_id("public", "postgres"),
             0,
             Some(0),
-            safe_migrate::model::relation::RelationKind::Table,
-            safe_migrate::model::relation::Persistence::Permanent,
+            safe_migrate::_internal::model::relation::RelationKind::Table,
+            safe_migrate::_internal::model::relation::Persistence::Permanent,
             0,
         );
         child.partition_type = Some("RANGE".to_string());
         cache.insert_baseline(child_id, child);
 
-        let mut state = safe_migrate::AnalysisState::new(cache);
+        let mut state = safe_migrate::api::AnalysisState::new(cache);
 
         let violations = engine
             .analyze(
@@ -1282,10 +1282,10 @@ mod phase10_bug_fixes_and_sorting_tests {
             )
             .unwrap();
 
-        let tier1_violations: Vec<&safe_migrate::report::violations::Violation> = violations
+        let tier1_violations: Vec<&safe_migrate::_internal::report::violations::Violation> = violations
             .iter()
             .filter(|v| {
-                v.tier == safe_migrate::report::violations::ViolationTier::Tier1
+                v.tier == safe_migrate::_internal::report::violations::ViolationTier::Tier1
                     && v.rule_id == "blocking-constraint"
             })
             .collect();

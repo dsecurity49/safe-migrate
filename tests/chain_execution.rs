@@ -2,8 +2,8 @@ mod common;
 
 mod chain_execution_tests {
     use crate::common::*;
-    use safe_migrate::model::relation::RelationOverlay;
-    use safe_migrate::report::violations::ViolationTier;
+    use safe_migrate::_internal::model::relation::RelationOverlay;
+    use safe_migrate::_internal::report::violations::ViolationTier;
 
     #[test]
     fn test_chain_state_persists_across_files() {

@@ -2,7 +2,7 @@ mod common;
 
 mod transaction_lifecycle_tests {
     use crate::common::*;
-    use safe_migrate::analysis::state::AnalysisState;
+    use safe_migrate::_internal::analysis::state::AnalysisState;
 
     #[test]
     fn test_txn_commit() {
@@ -273,8 +273,8 @@ mod transaction_lifecycle_tests {
             .relations
             .get(&object_id("public", "t"))
             .and_then(|overlay| match overlay {
-                safe_migrate::analysis::state::RelationOverlay::Present(relation) => Some(relation),
-                safe_migrate::analysis::state::RelationOverlay::Dropped => None,
+                safe_migrate::_internal::analysis::state::RelationOverlay::Present(relation) => Some(relation),
+                safe_migrate::_internal::analysis::state::RelationOverlay::Dropped => None,
             })
             .expect("table should remain present");
         let column = relation
@@ -522,8 +522,8 @@ mod transaction_lifecycle_tests {
             .relations
             .get(&object_id("public", "t"))
             .and_then(|overlay| match overlay {
-                safe_migrate::analysis::state::RelationOverlay::Present(relation) => Some(relation),
-                safe_migrate::analysis::state::RelationOverlay::Dropped => None,
+                safe_migrate::_internal::analysis::state::RelationOverlay::Present(relation) => Some(relation),
+                safe_migrate::_internal::analysis::state::RelationOverlay::Dropped => None,
             })
             .expect("table should remain present");
         let column = relation
@@ -561,8 +561,8 @@ mod transaction_lifecycle_tests {
             .relations
             .get(&object_id("public", "t"))
             .and_then(|overlay| match overlay {
-                safe_migrate::analysis::state::RelationOverlay::Present(relation) => Some(relation),
-                safe_migrate::analysis::state::RelationOverlay::Dropped => None,
+                safe_migrate::_internal::analysis::state::RelationOverlay::Present(relation) => Some(relation),
+                safe_migrate::_internal::analysis::state::RelationOverlay::Dropped => None,
             })
             .expect("failed compound statement must preserve the table");
         assert!(relation.has_column("id"));
@@ -571,32 +571,32 @@ mod transaction_lifecycle_tests {
     #[test]
     fn test_rename_propagation_rollback() {
         let engine = setup_engine();
-        let mut cache = safe_migrate::db::cache::DbCache::new();
+        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
 
         let t1_id = object_id("public", "t1");
         let v1_id = object_id("public", "v1");
 
         cache.insert_baseline(
             t1_id.clone(),
-            safe_migrate::model::relation::RelationState::new(
+            safe_migrate::_internal::model::relation::RelationState::new(
                 t1_id.clone(),
                 object_id("public", "postgres"),
                 0,
                 Some(10),
-                safe_migrate::model::relation::RelationKind::Table,
-                safe_migrate::model::relation::Persistence::Permanent,
+                safe_migrate::_internal::model::relation::RelationKind::Table,
+                safe_migrate::_internal::model::relation::Persistence::Permanent,
                 0,
             ),
         );
         cache.insert_baseline(
             v1_id.clone(),
-            safe_migrate::model::relation::RelationState::new(
+            safe_migrate::_internal::model::relation::RelationState::new(
                 v1_id.clone(),
                 object_id("public", "postgres"),
                 0,
                 Some(1),
-                safe_migrate::model::relation::RelationKind::View,
-                safe_migrate::model::relation::Persistence::Permanent,
+                safe_migrate::_internal::model::relation::RelationKind::View,
+                safe_migrate::_internal::model::relation::Persistence::Permanent,
                 0,
             ),
         );
@@ -606,10 +606,10 @@ mod transaction_lifecycle_tests {
         state
             .local
             .graph
-            .add_edge(safe_migrate::analysis::graph::DependencyEdge {
+            .add_edge(safe_migrate::_internal::analysis::graph::DependencyEdge {
                 dependent: v1_id.clone(),
                 referenced: t1_id.clone(),
-                kind: safe_migrate::analysis::graph::DependencyKind::ViewDependency {
+                kind: safe_migrate::_internal::analysis::graph::DependencyKind::ViewDependency {
                     view_generation: 0,
                     referenced_column: None,
                 },

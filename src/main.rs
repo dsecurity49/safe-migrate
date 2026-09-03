@@ -1,18 +1,18 @@
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
-use safe_migrate::analysis::evidence::{EvidenceCode, EvidenceRecord, EvidenceScope};
-use safe_migrate::analysis::outcome::AnalysisOutcome;
-use safe_migrate::db::cache::{
+use safe_migrate::_internal::analysis::evidence::{EvidenceCode, EvidenceRecord, EvidenceScope};
+use safe_migrate::_internal::analysis::outcome::AnalysisOutcome;
+use safe_migrate::_internal::db::cache::{
     CACHE_FORMAT_VERSION, CACHE_V7_MAGIC, CacheMetadata, CatalogCoverage, DbCacheVersioned,
 };
-use safe_migrate::db::cache_file::{
+use safe_migrate::_internal::db::cache_file::{
     MAX_CACHE_DECODE_BYTES, is_encrypted_cache_bytes, read_cache_bytes, unprotect_cache_bytes,
 };
-use safe_migrate::model::relation::RelationKind;
-use safe_migrate::report::violations::{ReportFinding, Violation};
-use safe_migrate::rules::registry::{self, RuleDescriptor};
-use safe_migrate::sync;
-use safe_migrate::{AnalysisState, Config, DbCache, Reporter, SafeMigrateEngine};
+use safe_migrate::_internal::model::relation::RelationKind;
+use safe_migrate::_internal::report::violations::{ReportFinding, Violation};
+use safe_migrate::_internal::rules::registry::{self, RuleDescriptor};
+use safe_migrate::_internal::sync;
+use safe_migrate::api::{AnalysisState, Config, DbCache, Reporter, SafeMigrateEngine};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -306,7 +306,7 @@ fn main() -> Result<()> {
 }
 
 fn rule_descriptor_json(descriptor: &RuleDescriptor, config: &Config) -> serde_json::Value {
-    use safe_migrate::rules::registry::RuleConfigurationField;
+    use safe_migrate::_internal::rules::registry::RuleConfigurationField;
 
     let mut effective = serde_json::json!({
         "enabled": !config.is_rule_disabled(descriptor.id),
@@ -325,9 +325,9 @@ fn rule_descriptor_json(descriptor: &RuleDescriptor, config: &Config) -> serde_j
         "summary": descriptor.summary,
         "impact": descriptor.impact,
         "default_tier": match descriptor.default_tier() {
-            safe_migrate::report::violations::ViolationTier::Tier1 => "Tier1",
-            safe_migrate::report::violations::ViolationTier::Tier2 => "Tier2",
-            safe_migrate::report::violations::ViolationTier::Tier3 => "Tier3",
+            safe_migrate::_internal::report::violations::ViolationTier::Tier1 => "Tier1",
+            safe_migrate::_internal::report::violations::ViolationTier::Tier2 => "Tier2",
+            safe_migrate::_internal::report::violations::ViolationTier::Tier3 => "Tier3",
         },
         "remediation": descriptor.recipe(),
         "supported_configuration_fields": descriptor
@@ -395,7 +395,7 @@ fn run_rules(rule_id: Option<&str>, json: bool, config_path: Option<&Path>) -> R
             "enabled={}",
             !config.is_rule_disabled(descriptor.id)
         )];
-        use safe_migrate::rules::registry::RuleConfigurationField;
+        use safe_migrate::_internal::rules::registry::RuleConfigurationField;
         if descriptor.supports(RuleConfigurationField::Tier1ThresholdRows) {
             effective.push(format!(
                 "tier1_threshold_rows={}",
@@ -584,10 +584,10 @@ fn summarize_cache(cache: &DbCache) -> CacheContentsSummary {
     let mut window_functions = 0;
     for routine in cache.functions.values() {
         match routine.routine_kind {
-            safe_migrate::model::function::RoutineKind::Function => functions += 1,
-            safe_migrate::model::function::RoutineKind::Procedure => procedures += 1,
-            safe_migrate::model::function::RoutineKind::Aggregate => aggregates += 1,
-            safe_migrate::model::function::RoutineKind::Window => window_functions += 1,
+            safe_migrate::_internal::model::function::RoutineKind::Function => functions += 1,
+            safe_migrate::_internal::model::function::RoutineKind::Procedure => procedures += 1,
+            safe_migrate::_internal::model::function::RoutineKind::Aggregate => aggregates += 1,
+            safe_migrate::_internal::model::function::RoutineKind::Window => window_functions += 1,
         }
     }
     CacheContentsSummary {
@@ -1041,7 +1041,7 @@ fn finish_analysis(
             println!("{report}");
         }
         OutputMode::Interactive => {
-            safe_migrate::run_interactive(&violations, &outcome.confidence)?;
+            safe_migrate::_internal::report::interactive::run_interactive(&violations, &outcome.confidence)?;
         }
     }
 

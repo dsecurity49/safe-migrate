@@ -2,19 +2,19 @@ mod common;
 
 use crate::common::database_hosts_are_local;
 use postgres::{Client, Config as PostgresConfig, NoTls};
-use safe_migrate::analysis::graph::DependencyKind;
-use safe_migrate::analysis::state::AnalysisState;
-use safe_migrate::db::cache::DbCache;
-use safe_migrate::engine::config::Config;
-use safe_migrate::engine::engine::SafeMigrateEngine;
-use safe_migrate::model::constraint::ConstraintKind;
-use safe_migrate::model::function::{FunctionOverlay, Volatility};
-use safe_migrate::model::relation::{Privilege, RelationKind, RelationOverlay};
-use safe_migrate::model::schema::SchemaOverlay;
-use safe_migrate::model::sequence::{SequenceKind, SequenceOverlay};
-use safe_migrate::model::trigger::TriggerOverlay;
-use safe_migrate::model::types::{TypeKind, TypeOverlay};
-use safe_migrate::sync::{populate_cache, populate_cache_in_current_transaction};
+use safe_migrate::_internal::analysis::graph::DependencyKind;
+use safe_migrate::_internal::analysis::state::AnalysisState;
+use safe_migrate::_internal::db::cache::DbCache;
+use safe_migrate::_internal::engine::config::Config;
+use safe_migrate::_internal::engine::engine::SafeMigrateEngine;
+use safe_migrate::_internal::model::constraint::ConstraintKind;
+use safe_migrate::_internal::model::function::{FunctionOverlay, Volatility};
+use safe_migrate::_internal::model::relation::{Privilege, RelationKind, RelationOverlay};
+use safe_migrate::_internal::model::schema::SchemaOverlay;
+use safe_migrate::_internal::model::sequence::{SequenceKind, SequenceOverlay};
+use safe_migrate::_internal::model::trigger::TriggerOverlay;
+use safe_migrate::_internal::model::types::{TypeKind, TypeOverlay};
+use safe_migrate::_internal::sync::{populate_cache, populate_cache_in_current_transaction};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -913,11 +913,11 @@ fn differential_manifest_accounts_for_every_sql_fixture() {
 #[test]
 fn publication_option_normalization_ignores_catalog_order() {
     let first = vec![
-        safe_migrate::analysis::facts::AttributeFact {
+        safe_migrate::_internal::analysis::facts::AttributeFact {
             name: "publish".into(),
             value: "insert".into(),
         },
-        safe_migrate::analysis::facts::AttributeFact {
+        safe_migrate::_internal::analysis::facts::AttributeFact {
             name: "publish_via_partition_root".into(),
             value: "false".into(),
         },
@@ -929,8 +929,8 @@ fn publication_option_normalization_ignores_catalog_order() {
 
 #[test]
 fn publication_scope_normalization_ignores_catalog_order() {
-    use safe_migrate::analysis::facts::{PublicationObjectFact, PublicationScope};
-    use safe_migrate::ast::identifiers::{Ident, QualifiedName};
+    use safe_migrate::_internal::analysis::facts::{PublicationObjectFact, PublicationScope};
+    use safe_migrate::_internal::ast::identifiers::{Ident, QualifiedName};
 
     let table = |name: &str, columns: Vec<&str>| PublicationObjectFact::Table {
         name: QualifiedName::new(None, Ident::new(name.to_string(), true)),
@@ -950,8 +950,8 @@ fn publication_scope_normalization_ignores_catalog_order() {
 
 #[test]
 fn subscription_normalization_redacts_connection_and_orders_publications() {
-    use safe_migrate::analysis::facts::ConnectionTarget;
-    use safe_migrate::model::replication::SubscriptionState;
+    use safe_migrate::_internal::analysis::facts::ConnectionTarget;
+    use safe_migrate::_internal::model::replication::SubscriptionState;
 
     let first = SubscriptionState {
         name: "sub".into(),
@@ -1311,7 +1311,7 @@ fn check_required_relations(rule: &RuleManifest, fixture: &str, cache: &DbCache)
     let mut mismatches = Vec::new();
     for relation in &rule.required_relations {
         let (schema, name) = split_qualified_name(relation);
-        let object_id = safe_migrate::ast::identifiers::ObjectId::new(schema, name);
+        let object_id = safe_migrate::_internal::ast::identifiers::ObjectId::new(schema, name);
         if !cache.relations.contains_key(&object_id) {
             mismatches.push(Mismatch {
                 rule_dir: rule.rule_dir.clone(),
@@ -1335,9 +1335,9 @@ fn check_role_membership_cache(
     let role = |name: &str| {
         cache
             .roles
-            .get(&safe_migrate::ast::identifiers::ObjectId::new("", name))
+            .get(&safe_migrate::_internal::ast::identifiers::ObjectId::new("", name))
     };
-    let edge = |ids: &[safe_migrate::ast::identifiers::ObjectId], target: &str| {
+    let edge = |ids: &[safe_migrate::_internal::ast::identifiers::ObjectId], target: &str| {
         ids.iter()
             .any(|id| id.schema.is_empty() && id.name == target)
     };
@@ -1430,10 +1430,10 @@ fn required_role_edges_distinguish_missing_roles_from_incorrect_edges() {
 
     let mut cache = DbCache::new();
     for name in ["member", "target"] {
-        let id = safe_migrate::ast::identifiers::ObjectId::new("", name);
+        let id = safe_migrate::_internal::ast::identifiers::ObjectId::new("", name);
         cache.roles.insert(
             id.clone(),
-            safe_migrate::model::role::RoleState {
+            safe_migrate::_internal::model::role::RoleState {
                 id,
                 can_login: false,
                 is_superuser: false,
@@ -1807,7 +1807,7 @@ fn snapshot_simulator_state(
 
     if scope.contains(&ComparisonScope::Roles) {
         for (member, overlay) in &state.local.roles {
-            let safe_migrate::model::role::RoleOverlay::Present(role) = overlay else {
+            let safe_migrate::_internal::model::role::RoleOverlay::Present(role) = overlay else {
                 continue;
             };
             for parent in &role.member_of {
@@ -1831,7 +1831,7 @@ fn snapshot_simulator_state(
 
     if scope.contains(&ComparisonScope::Publications) {
         for (name, overlay) in &state.local.publications {
-            let safe_migrate::model::replication::PublicationOverlay::Present(publication) =
+            let safe_migrate::_internal::model::replication::PublicationOverlay::Present(publication) =
                 overlay
             else {
                 continue;
@@ -1849,7 +1849,7 @@ fn snapshot_simulator_state(
 
     if scope.contains(&ComparisonScope::Subscriptions) {
         for (name, overlay) in &state.local.subscriptions {
-            let safe_migrate::model::replication::SubscriptionOverlay::Present(subscription) =
+            let safe_migrate::_internal::model::replication::SubscriptionOverlay::Present(subscription) =
                 overlay
             else {
                 continue;
@@ -2651,7 +2651,7 @@ fn normalize_relation_kind(kind: RelationKind) -> NormalizedRelationKind {
     }
 }
 
-fn normalize_attributes(attributes: &[safe_migrate::analysis::facts::AttributeFact]) -> String {
+fn normalize_attributes(attributes: &[safe_migrate::_internal::analysis::facts::AttributeFact]) -> String {
     let mut normalized = attributes.to_vec();
     normalized.sort_by(|left, right| {
         left.name
@@ -2661,8 +2661,8 @@ fn normalize_attributes(attributes: &[safe_migrate::analysis::facts::AttributeFa
     serde_json::to_string(&normalized).expect("attribute facts must be serializable")
 }
 
-fn normalize_publication_scope(scope: &safe_migrate::analysis::facts::PublicationScope) -> String {
-    use safe_migrate::analysis::facts::{PublicationObjectFact, PublicationScope};
+fn normalize_publication_scope(scope: &safe_migrate::_internal::analysis::facts::PublicationScope) -> String {
+    use safe_migrate::_internal::analysis::facts::{PublicationObjectFact, PublicationScope};
 
     let mut normalized = scope.clone();
     match &mut normalized {
@@ -2690,7 +2690,7 @@ fn normalize_publication_scope(scope: &safe_migrate::analysis::facts::Publicatio
 }
 
 fn normalize_subscription(
-    subscription: &safe_migrate::model::replication::SubscriptionState,
+    subscription: &safe_migrate::_internal::model::replication::SubscriptionState,
 ) -> NormalizedSubscription {
     let mut publications = subscription.publications.clone();
     publications.sort();
@@ -2707,12 +2707,12 @@ fn normalize_subscription(
     }
 }
 
-fn normalize_trigger_mode(mode: safe_migrate::model::trigger::TriggerEnableMode) -> String {
+fn normalize_trigger_mode(mode: safe_migrate::_internal::model::trigger::TriggerEnableMode) -> String {
     match mode {
-        safe_migrate::model::trigger::TriggerEnableMode::Disabled => "disabled",
-        safe_migrate::model::trigger::TriggerEnableMode::Origin => "origin",
-        safe_migrate::model::trigger::TriggerEnableMode::Replica => "replica",
-        safe_migrate::model::trigger::TriggerEnableMode::Always => "always",
+        safe_migrate::_internal::model::trigger::TriggerEnableMode::Disabled => "disabled",
+        safe_migrate::_internal::model::trigger::TriggerEnableMode::Origin => "origin",
+        safe_migrate::_internal::model::trigger::TriggerEnableMode::Replica => "replica",
+        safe_migrate::_internal::model::trigger::TriggerEnableMode::Always => "always",
     }
     .to_string()
 }
@@ -2791,7 +2791,7 @@ fn normalize_data_type(data_type: &str) -> String {
 
 fn normalize_data_type_with_identity(
     data_type: &str,
-    type_id: Option<&safe_migrate::ast::identifiers::ObjectId>,
+    type_id: Option<&safe_migrate::_internal::ast::identifiers::ObjectId>,
 ) -> String {
     let normalized = normalize_data_type(data_type);
     let Some(type_id) = type_id else {
@@ -2809,7 +2809,7 @@ fn normalize_data_type_with_identity(
 
 #[test]
 fn normalized_type_identity_preserves_modifiers_and_arrays() {
-    let type_id = safe_migrate::ast::identifiers::ObjectId::new("public", "amount");
+    let type_id = safe_migrate::_internal::ast::identifiers::ObjectId::new("public", "amount");
     assert_eq!(
         normalize_data_type_with_identity("numeric(10,2)[]", Some(&type_id)),
         "public.amount(10,2)[]"

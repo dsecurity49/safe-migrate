@@ -6,10 +6,10 @@ use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
     aead::{Aead, KeyInit},
 };
-use safe_migrate::ast::identifiers::ObjectId;
-use safe_migrate::db::cache::{CACHE_V7_MAGIC, DbCache, DbCacheVersioned};
-use safe_migrate::model::relation::{Persistence, RelationKind, RelationState};
-use safe_migrate::model::schema::SchemaState;
+use safe_migrate::_internal::ast::identifiers::ObjectId;
+use safe_migrate::_internal::db::cache::{CACHE_V7_MAGIC, DbCache, DbCacheVersioned};
+use safe_migrate::_internal::model::relation::{Persistence, RelationKind, RelationState};
+use safe_migrate::_internal::model::schema::SchemaState;
 
 fn parse_json_stdout(output: &std::process::Output) -> serde_json::Value {
     serde_json::from_slice(&output.stdout).expect("stdout must contain exactly one JSON document")

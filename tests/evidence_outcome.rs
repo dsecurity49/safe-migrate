@@ -1,6 +1,6 @@
 mod common;
 
-use safe_migrate::analysis::evidence::EvidenceCode;
+use safe_migrate::_internal::analysis::evidence::EvidenceCode;
 
 #[test]
 fn opaque_statement_outcome_has_typed_location_aware_evidence() {
@@ -66,7 +66,7 @@ fn foreign_key_type_compatibility_gap_has_catalog_evidence_not_legacy_taint() {
 fn unknown_sequence_target_has_typed_object_state_evidence() {
     let engine = common::setup_engine();
     let mut state =
-        safe_migrate::AnalysisState::with_baseline(safe_migrate::db::cache::DbCache::new(), false);
+        safe_migrate::api::AnalysisState::with_baseline(safe_migrate::_internal::db::cache::DbCache::new(), false);
     let outcome = engine
         .analyze_outcome_with_locations(
             "migrations/003.sql".to_string(),
@@ -87,7 +87,7 @@ fn unknown_sequence_target_has_typed_object_state_evidence() {
 fn unavailable_rule_capability_is_recorded_before_rule_evaluation() {
     let engine = common::setup_engine();
     let mut state =
-        safe_migrate::AnalysisState::with_baseline(safe_migrate::db::cache::DbCache::new(), false);
+        safe_migrate::api::AnalysisState::with_baseline(safe_migrate::_internal::db::cache::DbCache::new(), false);
     let outcome = engine
         .analyze_outcome_with_locations(
             "migrations/004.sql".to_string(),

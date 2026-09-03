@@ -2,7 +2,7 @@ use std::fs;
 use std::io::Read;
 use std::path::Path;
 
-use safe_migrate::db::cache::{CACHE_V7_MAGIC, DbCacheVersioned};
+use safe_migrate::_internal::db::cache::{CACHE_V7_MAGIC, DbCacheVersioned};
 
 fn run_auto_sync_case(
     database_url: &str,

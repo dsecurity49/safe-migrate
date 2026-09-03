@@ -2,9 +2,9 @@ mod common;
 
 mod reversibility_tests {
     use crate::common::*;
-    use safe_migrate::analysis::state::AnalysisState;
-    use safe_migrate::model::relation::{Persistence, RelationKind, RelationState};
-    use safe_migrate::report::violations::ViolationTier;
+    use safe_migrate::_internal::analysis::state::AnalysisState;
+    use safe_migrate::_internal::model::relation::{Persistence, RelationKind, RelationState};
+    use safe_migrate::_internal::report::violations::ViolationTier;
 
     #[test]
     fn test_reversibility_drop_column_empty_table() {
@@ -25,7 +25,7 @@ mod reversibility_tests {
     #[test]
     fn test_reversibility_drop_column_nonempty_table() {
         let engine = setup_engine();
-        let mut cache = safe_migrate::db::cache::DbCache::new();
+        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
         let tid = object_id("public", "t");
         let mut rel = RelationState::new(
             tid.clone(),
@@ -36,7 +36,7 @@ mod reversibility_tests {
             Persistence::Permanent,
             0,
         );
-        rel.apply_column_action(&safe_migrate::model::relation::ColumnAction::Add {
+        rel.apply_column_action(&safe_migrate::_internal::model::relation::ColumnAction::Add {
             name: "id".to_string(),
             data_type: Some("int".to_string()),
             not_null: false,
@@ -56,7 +56,7 @@ mod reversibility_tests {
     #[test]
     fn test_reversibility_drop_column_added_in_transaction() {
         let engine = setup_engine();
-        let mut cache = safe_migrate::db::cache::DbCache::new();
+        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
         let tid = object_id("public", "t");
         cache.insert_baseline(
             tid.clone(),
@@ -91,7 +91,7 @@ mod reversibility_tests {
     #[test]
     fn test_reversibility_drop_table() {
         let engine = setup_engine();
-        let mut cache = safe_migrate::db::cache::DbCache::new();
+        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
         let tid = object_id("public", "t");
         cache.insert_baseline(
             tid.clone(),
@@ -149,7 +149,7 @@ mod reversibility_tests {
     #[test]
     fn test_reversibility_type_widen() {
         let engine = setup_engine();
-        let mut cache = safe_migrate::db::cache::DbCache::new();
+        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
         let tid = object_id("public", "t");
         let mut rel = RelationState::new(
             tid.clone(),
@@ -160,7 +160,7 @@ mod reversibility_tests {
             Persistence::Permanent,
             0,
         );
-        rel.apply_column_action(&safe_migrate::model::relation::ColumnAction::Add {
+        rel.apply_column_action(&safe_migrate::_internal::model::relation::ColumnAction::Add {
             name: "val".to_string(),
             data_type: Some("int".to_string()),
             not_null: false,
@@ -182,7 +182,7 @@ mod reversibility_tests {
     #[test]
     fn test_reversibility_type_narrow() {
         let engine = setup_engine();
-        let mut cache = safe_migrate::db::cache::DbCache::new();
+        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
         let tid = object_id("public", "t");
         let mut rel = RelationState::new(
             tid.clone(),
@@ -193,7 +193,7 @@ mod reversibility_tests {
             Persistence::Permanent,
             0,
         );
-        rel.apply_column_action(&safe_migrate::model::relation::ColumnAction::Add {
+        rel.apply_column_action(&safe_migrate::_internal::model::relation::ColumnAction::Add {
             name: "val".to_string(),
             data_type: Some("bigint".to_string()),
             not_null: false,
@@ -216,7 +216,7 @@ mod reversibility_tests {
     #[test]
     fn test_reversibility_text_to_varchar_narrowing() {
         let engine = setup_engine();
-        let mut cache = safe_migrate::db::cache::DbCache::new();
+        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
         let tid = object_id("public", "t");
         let mut rel = RelationState::new(
             tid.clone(),
@@ -227,7 +227,7 @@ mod reversibility_tests {
             Persistence::Permanent,
             0,
         );
-        rel.apply_column_action(&safe_migrate::model::relation::ColumnAction::Add {
+        rel.apply_column_action(&safe_migrate::_internal::model::relation::ColumnAction::Add {
             name: "data".to_string(),
             data_type: Some("text".to_string()),
             not_null: false,

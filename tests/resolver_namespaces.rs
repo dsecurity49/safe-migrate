@@ -3,10 +3,10 @@ mod common;
 #[cfg(test)]
 mod resolver_namespace_tests {
     use super::common::{object_id, setup_engine, setup_state};
-    use safe_migrate::model::function::FunctionOverlay;
-    use safe_migrate::model::relation::RelationOverlay;
+    use safe_migrate::_internal::model::function::FunctionOverlay;
+    use safe_migrate::_internal::model::relation::RelationOverlay;
 
-    fn assert_no_conflict(findings: &[safe_migrate::report::violations::Violation]) {
+    fn assert_no_conflict(findings: &[safe_migrate::_internal::report::violations::Violation]) {
         assert!(
             findings
                 .iter()

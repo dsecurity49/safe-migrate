@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 
-use safe_migrate::analysis::state::{AnalysisState, Confidence};
-use safe_migrate::db::cache::DbCache;
-use safe_migrate::engine::config::{Config, RuleConfig};
-use safe_migrate::engine::engine::SafeMigrateEngine;
-use safe_migrate::report::violations::Violation;
+use safe_migrate::_internal::analysis::state::{AnalysisState, Confidence};
+use safe_migrate::_internal::db::cache::DbCache;
+use safe_migrate::_internal::engine::config::{Config, RuleConfig};
+use safe_migrate::_internal::engine::engine::SafeMigrateEngine;
+use safe_migrate::_internal::report::violations::Violation;
 
 fn cache_with_timeouts(lock_timeout_ms: u64, statement_timeout_ms: u64) -> DbCache {
     let mut cache = DbCache::new();

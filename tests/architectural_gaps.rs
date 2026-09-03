@@ -2,11 +2,11 @@ mod common;
 
 mod architectural_gap_tests {
     use crate::common::*;
-    use safe_migrate::analysis::state::Confidence;
-    use safe_migrate::ast::identifiers::ObjectId;
-    use safe_migrate::model::relation::{Persistence, RelationKind, RelationOverlay};
-    use safe_migrate::model::types::TypeOverlay;
-    use safe_migrate::report::violations::ViolationTier;
+    use safe_migrate::_internal::analysis::state::Confidence;
+    use safe_migrate::_internal::ast::identifiers::ObjectId;
+    use safe_migrate::_internal::model::relation::{Persistence, RelationKind, RelationOverlay};
+    use safe_migrate::_internal::model::types::TypeOverlay;
+    use safe_migrate::_internal::report::violations::ViolationTier;
 
     // 1. Foreign-key parent-table escalation
     #[test]
@@ -117,7 +117,7 @@ mod architectural_gap_tests {
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
-                    safe_migrate::analysis::graph::DependencyKind::RenameTo
+                    safe_migrate::_internal::analysis::graph::DependencyKind::RenameTo
                 ))
                 .count()
                 != 0
@@ -134,7 +134,7 @@ mod architectural_gap_tests {
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
-                    safe_migrate::analysis::graph::DependencyKind::RenameTo
+                    safe_migrate::_internal::analysis::graph::DependencyKind::RenameTo
                 ))
                 .count()
                 == 0,
@@ -228,13 +228,13 @@ mod architectural_gap_tests {
 
         assert!(state.local.graph.edges().iter().any(|e| matches!(
             e.kind,
-            safe_migrate::analysis::graph::DependencyKind::ViewDependency { .. }
+            safe_migrate::_internal::analysis::graph::DependencyKind::ViewDependency { .. }
         ) && e.dependent
             == object_id("public", "v")
             && e.referenced == object_id("public", "base_table")));
         assert!(!state.local.graph.edges().iter().any(|e| matches!(
             e.kind,
-            safe_migrate::analysis::graph::DependencyKind::ViewDependency { .. }
+            safe_migrate::_internal::analysis::graph::DependencyKind::ViewDependency { .. }
         ) && e.dependent
             == object_id("public", "v")
             && e.referenced == object_id("public", "my_cte")));
@@ -253,7 +253,7 @@ mod architectural_gap_tests {
 
         assert!(state.local.graph.edges().iter().any(|e| matches!(
             e.kind,
-            safe_migrate::analysis::graph::DependencyKind::ViewDependency { .. }
+            safe_migrate::_internal::analysis::graph::DependencyKind::ViewDependency { .. }
         ) && e.dependent
             == object_id("public", "v")
             && e.referenced == object_id("public", "app_sessions")));
@@ -276,7 +276,7 @@ mod architectural_gap_tests {
         assert!(
             state.local.graph.edges().iter().any(|e| matches!(
                 e.kind,
-                safe_migrate::analysis::graph::DependencyKind::ViewDependency { .. }
+                safe_migrate::_internal::analysis::graph::DependencyKind::ViewDependency { .. }
             ) && e.dependent == object_id("public", "v")
                 && e.referenced == object_id("app", "sessions")),
             "Schema-qualified table should produce qualified depends_on entry"
@@ -285,7 +285,7 @@ mod architectural_gap_tests {
         assert!(
             !state.local.graph.edges().iter().any(|e| matches!(
                 e.kind,
-                safe_migrate::analysis::graph::DependencyKind::ViewDependency { .. }
+                safe_migrate::_internal::analysis::graph::DependencyKind::ViewDependency { .. }
             ) && e.dependent == object_id("public", "v")
                 && e.referenced == object_id("public", "app")),
             "Schema segment should not appear as a phantom dependency"
@@ -307,7 +307,7 @@ mod architectural_gap_tests {
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
-                    safe_migrate::analysis::graph::DependencyKind::PartitionOf
+                    safe_migrate::_internal::analysis::graph::DependencyKind::PartitionOf
                 ))
                 .count()
                 == 0,
@@ -337,7 +337,7 @@ mod architectural_gap_tests {
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
-                    safe_migrate::analysis::graph::DependencyKind::IndexOnRelation { .. }
+                    safe_migrate::_internal::analysis::graph::DependencyKind::IndexOnRelation { .. }
                 ))
                 .count()
                 == 0
@@ -416,7 +416,7 @@ mod architectural_gap_tests {
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
-                    safe_migrate::analysis::graph::DependencyKind::ViewDependency { .. }
+                    safe_migrate::_internal::analysis::graph::DependencyKind::ViewDependency { .. }
                 ))
                 .count(),
             1,
@@ -525,8 +525,8 @@ mod architectural_gap_tests {
         );
         // The rejected attach must leave the partition graph unchanged: 'a'
         // must not appear as a child of 'b' after the cycle is detected.
-        let a_id = safe_migrate::ast::identifiers::ObjectId::new("public", "a");
-        let b_id = safe_migrate::ast::identifiers::ObjectId::new("public", "b");
+        let a_id = safe_migrate::_internal::ast::identifiers::ObjectId::new("public", "a");
+        let b_id = safe_migrate::_internal::ast::identifiers::ObjectId::new("public", "b");
         assert!(
             !state.local.graph.partitions_of(&b_id).contains(&&a_id),
             "cycle rejection must not insert 'a' as a partition of 'b'"
@@ -537,12 +537,12 @@ mod architectural_gap_tests {
     #[test]
     fn test_tablespace_access_method_rewrite() {
         let engine = setup_engine();
-        let mut cache = safe_migrate::db::cache::DbCache::new();
+        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
         cache.metadata.schemas = Some(vec!["public".to_string()]);
         cache.search_path = vec!["public".to_string()];
         cache.schemas.insert(
             "public".to_string(),
-            safe_migrate::model::schema::SchemaState {
+            safe_migrate::_internal::model::schema::SchemaState {
                 name: "public".to_string(),
                 owner: ObjectId::new("", "postgres"),
                 generation: 0,
@@ -551,7 +551,7 @@ mod architectural_gap_tests {
 
         // Force Tier 1 by giving the table 150,000 rows
         let table_id = object_id("public", "massive_table");
-        let mut table = safe_migrate::model::relation::RelationState::new(
+        let mut table = safe_migrate::_internal::model::relation::RelationState::new(
             table_id.clone(),
             ObjectId::new("public", "postgres"),
             0,
@@ -560,7 +560,7 @@ mod architectural_gap_tests {
             Persistence::Permanent,
             0,
         );
-        table.columns.push(safe_migrate::model::column::Column {
+        table.columns.push(safe_migrate::_internal::model::column::Column {
             name: "id".to_string(),
             data_type: Some("integer".to_string()),
             type_id: None,
@@ -573,9 +573,9 @@ mod architectural_gap_tests {
         table.last_analyze = Some("2026-09-01 00:00:00+00".to_string());
         cache.insert_baseline(table_id.clone(), table);
         let mut state =
-            safe_migrate::analysis::state::AnalysisState::with_baseline(cache.clone(), true);
+            safe_migrate::_internal::analysis::state::AnalysisState::with_baseline(cache.clone(), true);
         let mut storage_state =
-            safe_migrate::analysis::state::AnalysisState::with_baseline(cache, true);
+            safe_migrate::_internal::analysis::state::AnalysisState::with_baseline(cache, true);
 
         let v1 = engine
             .analyze(
@@ -701,7 +701,7 @@ mod architectural_gap_tests {
         let rel = state
             .get_relation(&object_id("actual_schema", "my_table"))
             .unwrap();
-        if let safe_migrate::model::relation::RelationOverlay::Present(r) = rel {
+        if let safe_migrate::_internal::model::relation::RelationOverlay::Present(r) = rel {
             assert!(
                 r.has_column("new_col"),
                 "Should resolve to actual_schema bypassing nonexistent_schema"
@@ -757,7 +757,7 @@ mod architectural_gap_tests {
         let result = engine.analyze("ALTER TABLE t SET ACCESS METHOD heap;", &mut state);
         assert!(result.is_ok(), "SetAccessMethod should not crash");
         assert!(state.evidence().iter().any(|record| {
-            record.code == safe_migrate::analysis::evidence::EvidenceCode::UnsupportedSemantics
+            record.code == safe_migrate::_internal::analysis::evidence::EvidenceCode::UnsupportedSemantics
         }));
 
         let mut state2 = setup_state();
@@ -771,7 +771,7 @@ mod architectural_gap_tests {
         assert!(result2.is_ok(), "SetStorage should not crash");
         assert!(
             state2.evidence().iter().any(|record| {
-                record.code == safe_migrate::analysis::evidence::EvidenceCode::UnsupportedSemantics
+                record.code == safe_migrate::_internal::analysis::evidence::EvidenceCode::UnsupportedSemantics
             }),
             "SetStorage must produce UnsupportedSemantics evidence"
         );

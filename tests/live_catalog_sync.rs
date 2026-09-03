@@ -4,17 +4,17 @@ use crate::common::database_hosts_are_local;
 use std::fs;
 use std::io::Read;
 
-use safe_migrate::analysis::facts::{
+use safe_migrate::_internal::analysis::facts::{
     ConnectionTarget, PublicationObjectFact, PublicationRowFilter, PublicationScope,
 };
-use safe_migrate::analysis::state::AnalysisState;
-use safe_migrate::ast::identifiers::ObjectId;
-use safe_migrate::db::cache::{CACHE_V7_MAGIC, DbCacheVersioned};
-use safe_migrate::engine::config::Config;
-use safe_migrate::engine::engine::SafeMigrateEngine;
-use safe_migrate::model::function::{FunctionOverlay, RoutineKind, SecurityMode, Volatility};
-use safe_migrate::model::replication::{PublicationOverlay, SubscriptionOverlay};
-use safe_migrate::sync::sync_cache;
+use safe_migrate::_internal::analysis::state::AnalysisState;
+use safe_migrate::_internal::ast::identifiers::ObjectId;
+use safe_migrate::_internal::db::cache::{CACHE_V7_MAGIC, DbCacheVersioned};
+use safe_migrate::_internal::engine::config::Config;
+use safe_migrate::_internal::engine::engine::SafeMigrateEngine;
+use safe_migrate::_internal::model::function::{FunctionOverlay, RoutineKind, SecurityMode, Volatility};
+use safe_migrate::_internal::model::replication::{PublicationOverlay, SubscriptionOverlay};
+use safe_migrate::_internal::sync::sync_cache;
 
 const SCHEMA: &str = "sm_v6_catalog";
 const SECOND_SCHEMA: &str = "sm_v6_catalog_extra";
@@ -60,7 +60,7 @@ impl Drop for CatalogCleanup {
     }
 }
 
-fn decode_cache(path: &std::path::Path) -> (safe_migrate::DbCache, Vec<u8>) {
+fn decode_cache(path: &std::path::Path) -> (safe_migrate::api::DbCache, Vec<u8>) {
     let encoded = fs::read(path).expect("read synchronized cache");
     let mut decoder = zstd::stream::Decoder::new(encoded.as_slice()).expect("decode cache zstd");
     let mut payload = Vec::new();
@@ -237,7 +237,7 @@ fn inspect_cache(path: &std::path::Path) -> serde_json::Value {
 }
 
 fn attributes(
-    values: &[safe_migrate::analysis::facts::AttributeFact],
+    values: &[safe_migrate::_internal::analysis::facts::AttributeFact],
 ) -> std::collections::BTreeMap<&str, &str> {
     values
         .iter()
@@ -245,7 +245,7 @@ fn attributes(
         .collect()
 }
 
-fn assert_routine_matches(state: &AnalysisState, cache: &safe_migrate::DbCache, id: &ObjectId) {
+fn assert_routine_matches(state: &AnalysisState, cache: &safe_migrate::api::DbCache, id: &ObjectId) {
     let Some(FunctionOverlay::Present(simulated)) = state.local.functions.get(id) else {
         panic!("simulator routine {id} is not present");
     };
@@ -259,7 +259,7 @@ fn assert_routine_matches(state: &AnalysisState, cache: &safe_migrate::DbCache, 
     assert_eq!(&simulated, synchronized, "routine state differs for {id}");
 }
 
-fn assert_publication_matches(state: &AnalysisState, cache: &safe_migrate::DbCache, name: &str) {
+fn assert_publication_matches(state: &AnalysisState, cache: &safe_migrate::api::DbCache, name: &str) {
     let Some(PublicationOverlay::Present(simulated)) = state.local.publications.get(name) else {
         panic!("simulator publication {name} is not present");
     };
@@ -282,7 +282,7 @@ fn assert_publication_matches(state: &AnalysisState, cache: &safe_migrate::DbCac
     );
 }
 
-fn assert_subscription_matches(state: &AnalysisState, cache: &safe_migrate::DbCache, name: &str) {
+fn assert_subscription_matches(state: &AnalysisState, cache: &safe_migrate::api::DbCache, name: &str) {
     let Some(SubscriptionOverlay::Present(simulated)) = state.local.subscriptions.get(name) else {
         panic!("simulator subscription {name} is not present");
     };
@@ -342,8 +342,8 @@ fn live_sync_preserves_routine_and_replication_catalogs_without_connection_secre
     sync_cache(&cache_path, None, false).expect("sync seeded live catalog");
     let (cache, decoded_payload) = decode_cache(&cache_path);
 
-    let entry_id = safe_migrate::ast::identifiers::ObjectId::new(SCHEMA, "entries");
-    let entry_ref_id = safe_migrate::ast::identifiers::ObjectId::new(SCHEMA, "entry_refs");
+    let entry_id = safe_migrate::_internal::ast::identifiers::ObjectId::new(SCHEMA, "entries");
+    let entry_ref_id = safe_migrate::_internal::ast::identifiers::ObjectId::new(SCHEMA, "entry_refs");
     let view_source_id = ObjectId::new(SCHEMA, "view_source");
     let foreign_key = cache
         .foreign_keys
@@ -447,14 +447,14 @@ fn live_sync_preserves_routine_and_replication_catalogs_without_connection_secre
     assert!(hydrated_state.local.graph.edges().iter().any(|edge| {
         matches!(
             edge.kind,
-            safe_migrate::analysis::graph::DependencyKind::InheritanceOf
+            safe_migrate::_internal::analysis::graph::DependencyKind::InheritanceOf
         ) && edge.dependent == ObjectId::new(SCHEMA, "inheritance_child")
             && edge.referenced == ObjectId::new(SCHEMA, "inheritance_parent")
     }));
     assert!(hydrated_state.local.graph.edges().iter().any(|edge| {
         matches!(
             edge.kind,
-            safe_migrate::analysis::graph::DependencyKind::PartitionOf
+            safe_migrate::_internal::analysis::graph::DependencyKind::PartitionOf
         ) && edge.dependent == ObjectId::new(SCHEMA, "partition_leaf")
             && edge.referenced == ObjectId::new(SCHEMA, "partition_root")
     }));
@@ -472,7 +472,7 @@ fn live_sync_preserves_routine_and_replication_catalogs_without_connection_secre
     );
     assert_eq!(
         hydrated_state.local.confidence,
-        safe_migrate::analysis::state::Confidence::Exact,
+        safe_migrate::_internal::analysis::state::Confidence::Exact,
         "unrelated synchronized view column drop tainted state: {:?}",
         hydrated_state.evidence()
     );
@@ -480,10 +480,10 @@ fn live_sync_preserves_routine_and_replication_catalogs_without_connection_secre
         hydrated_state
             .get_relation(&view_source_id)
             .is_some_and(|relation| match relation {
-                safe_migrate::model::relation::RelationOverlay::Present(table) => {
+                safe_migrate::_internal::model::relation::RelationOverlay::Present(table) => {
                     !table.has_column("unused")
                 }
-                safe_migrate::model::relation::RelationOverlay::Dropped => false,
+                safe_migrate::_internal::model::relation::RelationOverlay::Dropped => false,
             })
     );
 
@@ -502,7 +502,7 @@ fn live_sync_preserves_routine_and_replication_catalogs_without_connection_secre
     );
     assert!(matches!(
         cascade_state.get_relation(&ObjectId::new(SCHEMA, "entry_projection")),
-        Some(safe_migrate::model::relation::RelationOverlay::Dropped)
+        Some(safe_migrate::_internal::model::relation::RelationOverlay::Dropped)
     ));
 
     let routine_kinds = cache
@@ -525,7 +525,7 @@ fn live_sync_preserves_routine_and_replication_catalogs_without_connection_secre
     assert!(
         cache
             .functions
-            .contains_key(&safe_migrate::ast::identifiers::ObjectId::new(
+            .contains_key(&safe_migrate::_internal::ast::identifiers::ObjectId::new(
                 SCHEMA,
                 "with_out(integer)"
             ))

@@ -1,15 +1,15 @@
 mod common;
 
 use common::{object_id, setup_engine};
-use safe_migrate::AnalysisState;
-use safe_migrate::analysis::facts::{PublicationObjectFact, PublicationScope};
-use safe_migrate::analysis::graph::DependencyKind;
-use safe_migrate::db::cache::{DbCache, IndexCache};
-use safe_migrate::model::relation::{Persistence, RelationKind, RelationState};
-use safe_migrate::model::role::RoleState;
-use safe_migrate::model::schema::{SchemaOverlay, SchemaState};
-use safe_migrate::model::sequence::{SequenceKind, SequenceOverlay, SequenceState};
-use safe_migrate::model::types::{TypeKind, TypeState};
+use safe_migrate::api::AnalysisState;
+use safe_migrate::_internal::analysis::facts::{PublicationObjectFact, PublicationScope};
+use safe_migrate::_internal::analysis::graph::DependencyKind;
+use safe_migrate::_internal::db::cache::{DbCache, IndexCache};
+use safe_migrate::_internal::model::relation::{Persistence, RelationKind, RelationState};
+use safe_migrate::_internal::model::role::RoleState;
+use safe_migrate::_internal::model::schema::{SchemaOverlay, SchemaState};
+use safe_migrate::_internal::model::sequence::{SequenceKind, SequenceOverlay, SequenceState};
+use safe_migrate::_internal::model::types::{TypeKind, TypeState};
 
 fn cache_with_public_schema() -> DbCache {
     let mut cache = DbCache::new();
@@ -211,7 +211,7 @@ fn schema_rename_remaps_namespace_and_rolls_back_atomically() {
     assert_eq!(state.local.search_path, ["public"]);
     assert!(matches!(
         state.local.publications.get("app_publication"),
-        Some(safe_migrate::model::replication::PublicationOverlay::Present(publication))
+        Some(safe_migrate::_internal::model::replication::PublicationOverlay::Present(publication))
             if matches!(
                 &publication.scope,
                 PublicationScope::Explicit(objects)
@@ -249,7 +249,7 @@ fn schema_rename_remaps_namespace_and_rolls_back_atomically() {
     );
     assert!(matches!(
         state.local.publications.get("app_publication"),
-        Some(safe_migrate::model::replication::PublicationOverlay::Present(publication))
+        Some(safe_migrate::_internal::model::replication::PublicationOverlay::Present(publication))
             if matches!(
                 &publication.scope,
                 PublicationScope::Explicit(objects)
@@ -266,7 +266,7 @@ fn schema_rename_remaps_namespace_and_rolls_back_atomically() {
         .unwrap();
     assert!(matches!(
         state.local.publications.get("app_publication"),
-        Some(safe_migrate::model::replication::PublicationOverlay::Present(publication))
+        Some(safe_migrate::_internal::model::replication::PublicationOverlay::Present(publication))
             if matches!(
                 &publication.scope,
                 PublicationScope::Explicit(objects) if objects.is_empty()
