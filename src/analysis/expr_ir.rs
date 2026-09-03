@@ -17,6 +17,7 @@ pub enum ExprIr {
         expr: Box<ExprIr>,
         target_type: String,
     },
+    Sentinel(String),
     Omitted,
 }
 
@@ -47,7 +48,8 @@ impl ExprIr {
         ];
         let is_sentinel = |value: &str| SENTINELS.contains(&value);
         match self {
-            Self::Literal(value) => is_sentinel(value),
+            Self::Sentinel(_) => true,
+            Self::Literal(_) | Self::ColumnRef(_) => false,
             Self::FunctionCall { name, args } => {
                 is_sentinel(name) || args.iter().any(Self::contains_opaque)
             }
@@ -55,7 +57,6 @@ impl ExprIr {
                 is_sentinel(op) || left.contains_opaque() || right.contains_opaque()
             }
             Self::Cast { expr, target_type } => is_sentinel(target_type) || expr.contains_opaque(),
-            Self::ColumnRef(_) => false,
             Self::Omitted => true,
         }
     }
@@ -94,7 +95,7 @@ impl ExprIr {
             }
             ExprIr::BinaryOp { left, right, .. } => left.is_volatile() || right.is_volatile(),
             ExprIr::Cast { expr, .. } => expr.is_volatile(),
-            ExprIr::Literal(_) | ExprIr::ColumnRef(_) | ExprIr::Omitted => false,
+            ExprIr::Sentinel(_) | ExprIr::Literal(_) | ExprIr::ColumnRef(_) | ExprIr::Omitted => false,
         }
     }
 }

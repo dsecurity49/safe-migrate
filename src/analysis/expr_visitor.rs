@@ -14,11 +14,11 @@ impl ExprVisitor {
             Expr::PrefixExpr(pe) => pe
                 .expr()
                 .map(Self::convert)
-                .unwrap_or(ExprIr::Literal("<prefix>".into())),
+                .unwrap_or(ExprIr::Sentinel("<prefix>".into())),
             Expr::ParenExpr(pe) => pe
                 .expr()
                 .map(Self::convert)
-                .unwrap_or(ExprIr::Literal("<paren>".into())),
+                .unwrap_or(ExprIr::Sentinel("<paren>".into())),
             Expr::CaseExpr(ce) => Self::convert_case_expr(ce),
             Expr::ArrayExpr(ae) => Self::convert_array_expr(ae),
             Expr::BetweenExpr(be) => Self::convert_between_expr(be),
@@ -30,7 +30,7 @@ impl ExprVisitor {
                 let left = ce
                     .expr()
                     .map(Self::convert)
-                    .unwrap_or(ExprIr::Literal("<lhs>".into()));
+                    .unwrap_or(ExprIr::Sentinel("<lhs>".into()));
                 let right = ce
                     .collation_ref()
                     .map(|c| c.syntax().text().to_string())
@@ -41,7 +41,7 @@ impl ExprVisitor {
                     right: Box::new(ExprIr::Literal(right)),
                 }
             }
-            _ => ExprIr::Literal("<complex>".into()),
+            _ => ExprIr::Sentinel("<complex>".into()),
         }
     }
 
@@ -80,11 +80,11 @@ impl ExprVisitor {
         let left = be
             .lhs()
             .map(Self::convert)
-            .unwrap_or(ExprIr::Literal("<lhs>".into()));
+            .unwrap_or(ExprIr::Sentinel("<lhs>".into()));
         let right = be
             .rhs()
             .map(Self::convert)
-            .unwrap_or(ExprIr::Literal("<rhs>".into()));
+            .unwrap_or(ExprIr::Sentinel("<rhs>".into()));
 
         use squawk_syntax::ast::BinOp;
         let op = be
@@ -139,7 +139,7 @@ impl ExprVisitor {
         let inner = ce
             .expr()
             .map(Self::convert)
-            .unwrap_or(ExprIr::Literal("<cast_inner>".into()));
+            .unwrap_or(ExprIr::Sentinel("<cast_inner>".into()));
         let target_type = ce
             .ty()
             .map(|t| t.syntax().text().to_string())

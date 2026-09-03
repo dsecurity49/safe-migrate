@@ -1694,7 +1694,8 @@ mod tests {
 
     #[test]
     fn test_expr_ir_opaque_sentinel_is_not_dependency_proof() {
-        assert!(ExprIr::Literal("<case>".into()).contains_opaque());
+        assert!(ExprIr::Sentinel("<complex>".into()).contains_opaque());
+        assert!(!ExprIr::Literal("<case>".into()).contains_opaque());
         assert!(!ExprIr::Literal("'<'".into()).contains_opaque());
     }
 
@@ -1703,7 +1704,7 @@ mod tests {
         let expr = ExprIr::BinaryOp {
             left: Box::new(ExprIr::ColumnRef("id".into())),
             op: "=".into(),
-            right: Box::new(ExprIr::Literal("<complex>".into())),
+            right: Box::new(ExprIr::Sentinel("<complex>".into())),
         };
         assert!(expr.contains_opaque());
     }

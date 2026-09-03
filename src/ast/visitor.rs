@@ -39,7 +39,7 @@ impl AstVisitor {
                     walk(*right, columns);
                 }
                 ExprIr::Cast { expr, .. } => walk(*expr, columns),
-                ExprIr::Literal(_) | ExprIr::Omitted => {}
+                ExprIr::Literal(_) | ExprIr::Sentinel(_) | ExprIr::Omitted => {}
             }
         }
         let mut columns = Vec::new();

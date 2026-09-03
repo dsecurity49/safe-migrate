@@ -487,10 +487,14 @@ impl DependencyGraph {
                         edge.referenced = new_id.clone();
                     }
                 }
+                DependencyKind::ColumnDefaultOnSequence { .. } => {
+                    if edge.dependent == *old_id {
+                        edge.dependent = new_id.clone();
+                    }
+                }
                 DependencyKind::IndexOnRelation { .. }
                 | DependencyKind::SequenceOwnedBy { .. }
-                | DependencyKind::TriggerOnTable { .. }
-                | DependencyKind::ColumnDefaultOnSequence { .. } => {
+                | DependencyKind::TriggerOnTable { .. } => {
                     if edge.referenced == *old_id {
                         edge.referenced = new_id.clone();
                     }

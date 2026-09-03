@@ -249,6 +249,20 @@ impl PrivilegeMatrix {
         }
     }
 
+    pub fn expand_privileges(&self, role: &ObjectId, privileges: &HashSet<Privilege>) -> HashSet<Privilege> {
+        if privileges.contains(&Privilege::All) {
+            self.grants
+                .get(role)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|privilege| *privilege != Privilege::All)
+                .collect()
+        } else {
+            privileges.clone()
+        }
+    }
+
     pub fn revoke_from(
         &mut self,
         role: &ObjectId,
@@ -260,17 +274,7 @@ impl PrivilegeMatrix {
             return;
         }
         let grantor = grantor.expect("checked above");
-        let expanded = if privileges.contains(&Privilege::All) {
-            self.grants
-                .get(role)
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|privilege| *privilege != Privilege::All)
-                .collect()
-        } else {
-            privileges.clone()
-        };
+        let expanded = self.expand_privileges(role, privileges);
         for privilege in &expanded {
             let key = (role.clone(), *privilege);
             let remove_effective = if let Some(sources) = self.grantors.get_mut(&key) {
@@ -316,13 +320,13 @@ impl PrivilegeMatrix {
         grantor: Option<&ObjectId>,
         cascade: bool,
     ) {
-        self.revoke_from(role, privileges, grantor);
+        let expanded = self.expand_privileges(role, privileges);
+        self.revoke_from(role, &expanded, grantor);
         if !cascade {
             return;
         }
-        let mut pending: Vec<(ObjectId, Privilege)> = privileges
+        let mut pending: Vec<(ObjectId, Privilege)> = expanded
             .iter()
-            .filter(|privilege| **privilege != Privilege::All)
             .map(|privilege| (role.clone(), *privilege))
             .collect();
         let mut visited = HashSet::new();
@@ -359,10 +363,8 @@ impl PrivilegeMatrix {
             self.revoke_grant_option(role, privileges);
             return;
         };
-        for privilege in privileges {
-            if *privilege == Privilege::All {
-                continue;
-            }
+        let expanded = self.expand_privileges(role, privileges);
+        for privilege in &expanded {
             let key = (role.clone(), *privilege);
             if let Some(sources) = self.grant_option_grantors.get_mut(&key) {
                 sources.remove(grantor);

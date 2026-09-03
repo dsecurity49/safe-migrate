@@ -4162,6 +4162,83 @@ mod state_mutation_tests {
     }
 
     #[test]
+    fn test_revoke_all_cascade_removes_privileges_and_downstream_grants() {
+        use safe_migrate::model::role::RoleState;
+
+        let engine = setup_engine();
+        let mut cache = safe_migrate::DbCache::new();
+        let table_id = object_id("public", "revoke_all_table");
+        let owner = object_id("", "owner");
+        let intermediate = object_id("", "intermediate");
+        let leaf = object_id("", "leaf");
+        
+        cache.metadata.source_session_role = Some("owner".into());
+        for (id, can_set_role_to) in [
+            (owner.clone(), vec![intermediate.clone()]),
+            (intermediate.clone(), vec![owner.clone()]),
+            (leaf.clone(), Vec::new()),
+        ] {
+            cache.roles.insert(
+                id.clone(),
+                RoleState {
+                    id,
+                    can_login: true,
+                    is_superuser: false,
+                    inherits: true,
+                    member_of: Vec::new(),
+                    can_administer_membership: Vec::new(),
+                    can_inherit_from: Vec::new(),
+                    can_set_role_to,
+                },
+            );
+        }
+        cache.insert_baseline(
+            table_id.clone(),
+            RelationState::new(
+                table_id.clone(),
+                owner.clone(),
+                0,
+                Some(1),
+                RelationKind::Table,
+                Persistence::Permanent,
+                0,
+            ),
+        );
+        let mut state = safe_migrate::AnalysisState::new(cache);
+        engine
+            .analyze(
+                "GRANT SELECT, UPDATE ON revoke_all_table TO intermediate WITH GRANT OPTION; SET ROLE intermediate; GRANT SELECT ON revoke_all_table TO leaf; SET ROLE owner;",
+                &mut state,
+            )
+            .unwrap();
+        
+        let relation = match state.get_relation(&table_id).unwrap() {
+            RelationOverlay::Present(r) => r,
+            _ => panic!("relation missing"),
+        };
+        assert!(relation.privileges.has_privilege(&intermediate, Privilege::Select));
+        assert!(relation.privileges.has_privilege(&intermediate, Privilege::Update));
+        assert!(relation.privileges.has_privilege(&leaf, Privilege::Select));
+
+        let violations = engine
+            .analyze(
+                "REVOKE ALL ON revoke_all_table FROM intermediate CASCADE;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(!violations.iter().any(|v| v.rule_id == "chain-conflict"));
+        
+        let relation = match state.get_relation(&table_id).unwrap() {
+            RelationOverlay::Present(r) => r,
+            _ => panic!("relation missing"),
+        };
+        
+        assert!(!relation.privileges.has_privilege(&intermediate, Privilege::Select));
+        assert!(!relation.privileges.has_privilege(&intermediate, Privilege::Update));
+        assert!(!relation.privileges.has_privilege(&leaf, Privilege::Select));
+    }
+
+    #[test]
     fn test_state_hydrates_and_disables_trigger() {
         use safe_migrate::db::cache::TriggerCache;
         use safe_migrate::model::trigger::{TriggerEnableMode, TriggerOverlay};
@@ -4707,6 +4784,56 @@ mod state_mutation_tests {
                 && edge.referenced == sequence
         }));
     }
+    #[test]
+    fn rename_table_updates_column_default_sequence_dependency() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let seq_id = object_id("public", "test_seq");
+        engine
+            .analyze("CREATE SEQUENCE public.test_seq;", &mut state)
+            .unwrap();
+        let table_id = object_id("public", "test_table");
+        engine
+            .analyze(
+                "CREATE TABLE public.test_table (id INT);",
+                &mut state,
+            )
+            .unwrap();
+        
+        state.local.graph.add_edge(DependencyEdge {
+            dependent: table_id.clone(),
+            referenced: seq_id.clone(),
+            kind: DependencyKind::ColumnDefaultOnSequence { column: "id".to_string() }
+        });
+
+        assert!(state.local.graph.edges().iter().any(|edge| {
+            matches!(edge.kind, DependencyKind::ColumnDefaultOnSequence { .. })
+                && edge.dependent == table_id
+                && edge.referenced == seq_id
+        }));
+
+        let new_table_id = object_id("public", "new_table");
+        engine
+            .analyze(
+                "ALTER TABLE public.test_table RENAME TO new_table;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(state.local.graph.edges().iter().any(|edge| {
+            matches!(edge.kind, DependencyKind::ColumnDefaultOnSequence { .. })
+                && edge.dependent == new_table_id
+                && edge.referenced == seq_id
+        }));
+        
+        // Assert the old table is no longer present as dependent
+        assert!(!state.local.graph.edges().iter().any(|edge| {
+            matches!(edge.kind, DependencyKind::ColumnDefaultOnSequence { .. })
+                && edge.dependent == table_id
+                && edge.referenced == seq_id
+        }));
+    }
+
     #[test]
     fn test_state_adds_named_unique_constraint() {
         use safe_migrate::model::constraint::ConstraintKind;
