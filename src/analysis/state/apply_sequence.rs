@@ -86,7 +86,9 @@ impl AnalysisState {
                 Self::expression_contains_nextval(left) || Self::expression_contains_nextval(right)
             }
             ExprIr::Cast { expr, .. } => Self::expression_contains_nextval(expr),
-            ExprIr::Literal(_) | ExprIr::ColumnRef(_) | ExprIr::Sentinel(_) | ExprIr::Omitted => false,
+            ExprIr::Literal(_) | ExprIr::ColumnRef(_) | ExprIr::Sentinel(_) | ExprIr::Omitted => {
+                false
+            }
         }
     }
 

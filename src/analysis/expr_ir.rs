@@ -95,7 +95,9 @@ impl ExprIr {
             }
             ExprIr::BinaryOp { left, right, .. } => left.is_volatile() || right.is_volatile(),
             ExprIr::Cast { expr, .. } => expr.is_volatile(),
-            ExprIr::Sentinel(_) | ExprIr::Literal(_) | ExprIr::ColumnRef(_) | ExprIr::Omitted => false,
+            ExprIr::Sentinel(_) | ExprIr::Literal(_) | ExprIr::ColumnRef(_) | ExprIr::Omitted => {
+                false
+            }
         }
     }
 }

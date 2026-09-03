@@ -249,7 +249,11 @@ impl PrivilegeMatrix {
         }
     }
 
-    pub fn expand_privileges(&self, role: &ObjectId, privileges: &HashSet<Privilege>) -> HashSet<Privilege> {
+    pub fn expand_privileges(
+        &self,
+        role: &ObjectId,
+        privileges: &HashSet<Privilege>,
+    ) -> HashSet<Privilege> {
         if privileges.contains(&Privilege::All) {
             self.grants
                 .get(role)

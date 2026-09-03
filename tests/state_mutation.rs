@@ -4171,7 +4171,7 @@ mod state_mutation_tests {
         let owner = object_id("", "owner");
         let intermediate = object_id("", "intermediate");
         let leaf = object_id("", "leaf");
-        
+
         cache.metadata.source_session_role = Some("owner".into());
         for (id, can_set_role_to) in [
             (owner.clone(), vec![intermediate.clone()]),
@@ -4211,13 +4211,21 @@ mod state_mutation_tests {
                 &mut state,
             )
             .unwrap();
-        
+
         let relation = match state.get_relation(&table_id).unwrap() {
             RelationOverlay::Present(r) => r,
             _ => panic!("relation missing"),
         };
-        assert!(relation.privileges.has_privilege(&intermediate, Privilege::Select));
-        assert!(relation.privileges.has_privilege(&intermediate, Privilege::Update));
+        assert!(
+            relation
+                .privileges
+                .has_privilege(&intermediate, Privilege::Select)
+        );
+        assert!(
+            relation
+                .privileges
+                .has_privilege(&intermediate, Privilege::Update)
+        );
         assert!(relation.privileges.has_privilege(&leaf, Privilege::Select));
 
         let violations = engine
@@ -4227,14 +4235,22 @@ mod state_mutation_tests {
             )
             .unwrap();
         assert!(!violations.iter().any(|v| v.rule_id == "chain-conflict"));
-        
+
         let relation = match state.get_relation(&table_id).unwrap() {
             RelationOverlay::Present(r) => r,
             _ => panic!("relation missing"),
         };
-        
-        assert!(!relation.privileges.has_privilege(&intermediate, Privilege::Select));
-        assert!(!relation.privileges.has_privilege(&intermediate, Privilege::Update));
+
+        assert!(
+            !relation
+                .privileges
+                .has_privilege(&intermediate, Privilege::Select)
+        );
+        assert!(
+            !relation
+                .privileges
+                .has_privilege(&intermediate, Privilege::Update)
+        );
         assert!(!relation.privileges.has_privilege(&leaf, Privilege::Select));
     }
 
@@ -4794,16 +4810,15 @@ mod state_mutation_tests {
             .unwrap();
         let table_id = object_id("public", "test_table");
         engine
-            .analyze(
-                "CREATE TABLE public.test_table (id INT);",
-                &mut state,
-            )
+            .analyze("CREATE TABLE public.test_table (id INT);", &mut state)
             .unwrap();
-        
+
         state.local.graph.add_edge(DependencyEdge {
             dependent: table_id.clone(),
             referenced: seq_id.clone(),
-            kind: DependencyKind::ColumnDefaultOnSequence { column: "id".to_string() }
+            kind: DependencyKind::ColumnDefaultOnSequence {
+                column: "id".to_string(),
+            },
         });
 
         assert!(state.local.graph.edges().iter().any(|edge| {
@@ -4825,7 +4840,7 @@ mod state_mutation_tests {
                 && edge.dependent == new_table_id
                 && edge.referenced == seq_id
         }));
-        
+
         // Assert the old table is no longer present as dependent
         assert!(!state.local.graph.edges().iter().any(|edge| {
             matches!(edge.kind, DependencyKind::ColumnDefaultOnSequence { .. })
@@ -5869,10 +5884,14 @@ mod state_mutation_tests {
 
         let violations = engine
             .analyze(
-                "SET ROLE member; REVOKE SET OPTION FOR parent FROM member; SET ROLE parent;",
+                "SET ROLE member; REVOKE SET OPTION FOR parent FROM member;",
                 &mut state,
             )
             .unwrap();
+        assert!(!violations.iter().any(|v| v.rule_id == "chain-conflict"));
+        assert_eq!(state.local.current_role, "member");
+
+        let violations = engine.analyze("SET ROLE parent;", &mut state).unwrap();
         assert!(violations.iter().any(|v| v.rule_id == "chain-conflict"));
         assert_eq!(state.local.current_role, "member");
 

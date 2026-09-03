@@ -350,14 +350,14 @@ impl AnalysisState {
                         EvidenceScope::Chain,
                     );
                 }
-                let mut admin_value = None;
-                let mut inherit_value = None;
-                let mut set_value = None;
+                let mut explicit_admin = None;
+                let mut explicit_inherit = None;
+                let mut explicit_set = None;
                 for option in &grant.role_options {
                     let slot = match option {
-                        RoleMembershipOptionFact::Admin(_) => &mut admin_value,
-                        RoleMembershipOptionFact::Inherit(_) => &mut inherit_value,
-                        RoleMembershipOptionFact::Set(_) => &mut set_value,
+                        RoleMembershipOptionFact::Admin(_) => &mut explicit_admin,
+                        RoleMembershipOptionFact::Inherit(_) => &mut explicit_inherit,
+                        RoleMembershipOptionFact::Set(_) => &mut explicit_set,
                     };
                     if slot
                         .replace(match option {
@@ -371,28 +371,9 @@ impl AnalysisState {
                         return MutationResult::Skipped;
                     }
                 }
-                // PostgreSQL defaults a newly granted membership to inherit
-                // and permit SET ROLE; ADMIN remains opt-in. Explicit options
-                // override only their own membership capability.
-                // For an entirely unspecified new membership, PostgreSQL
-                // defaults INHERIT and SET to enabled; explicit options remain
-                // scoped to the option they name until independent defaults can
-                // be represented without changing existing authorization flow.
-                let inherit_value =
-                    inherit_value.or_else(|| grant.role_options.is_empty().then_some(true));
-                let set_value = set_value.or_else(|| grant.role_options.is_empty().then_some(true));
                 if grant.role_options.is_empty() && grant.with_grant_option {
                     self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
                     return MutationResult::Skipped;
-                }
-                if admin_value.is_some()
-                    || inherit_value.is_some() && !grant.role_options.is_empty()
-                {
-                    // The normalized option state is retained for future
-                    // authorization/inherited-privilege consumers, but the
-                    // current privilege engine cannot yet prove those
-                    // transitive effects exactly.
-                    self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
                 }
                 if grantees.iter().any(|member| member.name == "public") {
                     self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
@@ -480,29 +461,36 @@ impl AnalysisState {
                         continue;
                     };
                     for parent in parents {
-                        if !role.member_of.contains(parent) {
+                        let is_new = !role.member_of.contains(parent);
+                        if is_new {
                             role.member_of.push(parent.clone());
                         }
-                        if admin_value == Some(true) {
+
+                        if explicit_admin == Some(true) {
                             if !role.can_administer_membership.contains(parent) {
                                 role.can_administer_membership.push(parent.clone());
                             }
-                        } else if admin_value == Some(false) {
+                        } else if explicit_admin == Some(false) {
                             role.can_administer_membership
                                 .retain(|target| target != parent);
                         }
-                        if inherit_value == Some(true) {
+
+                        let inherit_opt =
+                            explicit_inherit.or_else(|| is_new.then_some(role.inherits));
+                        if inherit_opt == Some(true) {
                             if !role.can_inherit_from.contains(parent) {
                                 role.can_inherit_from.push(parent.clone());
                             }
-                        } else if inherit_value == Some(false) {
+                        } else if inherit_opt == Some(false) {
                             role.can_inherit_from.retain(|target| target != parent);
                         }
-                        if set_value == Some(true) {
+
+                        let set_opt = explicit_set.or_else(|| is_new.then_some(true));
+                        if set_opt == Some(true) {
                             if !role.can_set_role_to.contains(parent) {
                                 role.can_set_role_to.push(parent.clone());
                             }
-                        } else if set_value == Some(false) {
+                        } else if set_opt == Some(false) {
                             role.can_set_role_to.retain(|target| target != parent);
                         }
                     }
@@ -712,21 +700,14 @@ impl AnalysisState {
                         return MutationResult::Skipped;
                     }
                 };
-                if matches!(
-                    revoke_option,
-                    Some(RoleMembershipOptionFact::Admin(false))
-                        | Some(RoleMembershipOptionFact::Inherit(false))
-                ) {
-                    if revoke.cascade
-                        && matches!(revoke_option, Some(RoleMembershipOptionFact::Admin(false)))
-                    {
-                        self.taint(
-                            EvidenceCode::CatalogCoverageIncomplete,
-                            EvidenceScope::Chain,
-                        );
-                    } else {
-                        self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
-                    }
+                if matches!(revoke_option, Some(RoleMembershipOptionFact::Admin(false)))
+                    && revoke.cascade
+                    && !self.local.role_membership_grantors_complete
+                {
+                    self.taint(
+                        EvidenceCode::CatalogCoverageIncomplete,
+                        EvidenceScope::Chain,
+                    );
                 }
                 if revokees.iter().any(|member| member.name == "public") {
                     self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
