@@ -2669,9 +2669,22 @@ impl AnalysisState {
                 }
                 AlterTableActionMutation::DropConstraint { name, .. } => {
                     self.snapshot_constraint(&alter.id, name);
-                    self.local
+                    let removed_constraint = self
+                        .local
                         .constraints
                         .remove(&(alter.id.clone(), name.clone()));
+                    if let Some(ref c) = removed_constraint
+                        && c.kind == crate::model::constraint::ConstraintKind::NotNull
+                    {
+                        self.snapshot_relation(&alter.id);
+                        if let Some(RelationOverlay::Present(rel)) =
+                            self.local.relations.get_mut(&alter.id)
+                        {
+                            if let Some(col) = rel.columns.iter_mut().find(|c| c.name == *name) {
+                                col.is_nullable = true;
+                            }
+                        }
+                    }
                     if self
                         .local
                         .pending_validation

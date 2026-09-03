@@ -8,6 +8,7 @@ pub enum ConstraintKind {
     PrimaryKey,
     Unique,
     Exclusion,
+    NotNull,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

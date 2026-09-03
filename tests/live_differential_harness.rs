@@ -2762,6 +2762,7 @@ fn normalize_constraint_kind(kind: ConstraintKind) -> String {
         ConstraintKind::PrimaryKey => "primary_key",
         ConstraintKind::Unique => "unique",
         ConstraintKind::Exclusion => "exclusion",
+        ConstraintKind::NotNull => "not_null",
     }
     .to_string()
 }

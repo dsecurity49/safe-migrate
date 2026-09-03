@@ -1596,7 +1596,7 @@ fn load_constraints(
         JOIN pg_namespace n ON n.oid = c.relnamespace
         LEFT JOIN pg_class backing ON backing.oid = con.conindid
         LEFT JOIN pg_namespace backing_n ON backing_n.oid = backing.relnamespace
-        WHERE con.contype IN ('c', 'f', 'p', 'u', 'x')
+        WHERE con.contype IN ('c', 'f', 'p', 'u', 'x', 'n')
           AND c.relkind IN ('r', 'p', 'v', 'm')
           AND n.nspname NOT IN ('pg_catalog', 'information_schema')
           {schema_filter_with_fk};
@@ -1615,6 +1615,7 @@ fn load_constraints(
                 "p" => crate::model::constraint::ConstraintKind::PrimaryKey,
                 "u" => crate::model::constraint::ConstraintKind::Unique,
                 "x" => crate::model::constraint::ConstraintKind::Exclusion,
+                "n" => crate::model::constraint::ConstraintKind::NotNull,
                 other => anyhow::bail!("unsupported pg_constraint.contype '{other}'"),
             };
             // `conindid` has two different PostgreSQL meanings: key and
