@@ -2502,7 +2502,9 @@ impl AnalysisState {
             _ => None,
         };
         let rel_overlay = self.local.relations.get_mut(&alter.id);
-        if let Some(RelationOverlay::Present(rel)) = rel_overlay {
+        #[allow(clippy::collapsible_if)]
+                        #[allow(clippy::collapsible_if)]
+                        if let Some(RelationOverlay::Present(rel)) = rel_overlay {
             let generation = rel.generation;
             match &alter.action {
                 AlterTableActionMutation::AddColumn {
@@ -2677,6 +2679,7 @@ impl AnalysisState {
                         && c.kind == crate::model::constraint::ConstraintKind::NotNull
                     {
                         self.snapshot_relation(&alter.id);
+                        #[allow(clippy::collapsible_if)]
                         if let Some(RelationOverlay::Present(rel)) =
                             self.local.relations.get_mut(&alter.id)
                         {
