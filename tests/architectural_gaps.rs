@@ -523,6 +523,14 @@ mod architectural_gap_tests {
                 .iter()
                 .any(|finding| finding.rule_id == "chain-conflict")
         );
+        // The rejected attach must leave the partition graph unchanged: 'a'
+        // must not appear as a child of 'b' after the cycle is detected.
+        let a_id = safe_migrate::ast::identifiers::ObjectId::new("public", "a");
+        let b_id = safe_migrate::ast::identifiers::ObjectId::new("public", "b");
+        assert!(
+            !state.local.graph.partitions_of(&b_id).contains(&&a_id),
+            "cycle rejection must not insert 'a' as a partition of 'b'"
+        );
     }
 
     // 18. Tablespace and Access Method Rewrite Rule
@@ -752,14 +760,21 @@ mod architectural_gap_tests {
             record.code == safe_migrate::analysis::evidence::EvidenceCode::UnsupportedSemantics
         }));
 
-        let result = engine.analyze(
+        let mut state2 = setup_state();
+        engine
+            .analyze("CREATE TABLE t(id int);", &mut state2)
+            .unwrap();
+        let result2 = engine.analyze(
             "ALTER TABLE t ALTER COLUMN id SET STORAGE PLAIN;",
-            &mut state,
+            &mut state2,
         );
-        assert!(result.is_ok(), "SetStorage should not crash");
-        assert!(state.evidence().iter().any(|record| {
-            record.code == safe_migrate::analysis::evidence::EvidenceCode::UnsupportedSemantics
-        }));
+        assert!(result2.is_ok(), "SetStorage should not crash");
+        assert!(
+            state2.evidence().iter().any(|record| {
+                record.code == safe_migrate::analysis::evidence::EvidenceCode::UnsupportedSemantics
+            }),
+            "SetStorage must produce UnsupportedSemantics evidence"
+        );
     }
 
     #[test]

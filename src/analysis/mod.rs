@@ -6,6 +6,6 @@ pub mod graph;
 pub mod mutations;
 pub mod outcome;
 pub(crate) mod resolver;
-pub(crate) mod settings;
+pub mod settings;
 pub mod state;
 pub mod transaction;
