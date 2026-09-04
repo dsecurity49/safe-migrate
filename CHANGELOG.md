@@ -5,7 +5,7 @@ commits and pull requests. Published binaries, checksums, and generated release
 notes are available on the
 [GitHub Releases page](https://github.com/dsecurity49/safe-migrate/releases).
 
-## v0.8.0 — 2026-09-03
+## v0.8.0 — 2026-09-04
 
 - Rule evaluation now uses one immutable context with explicit capability
   declarations and scoped evidence for missing catalog or transaction state.
