@@ -35,12 +35,6 @@ target options.
 
 ## Quick start
 
-`sync` captures the connected role and its session defaults. Use the migration
-role when exact role-sensitive analysis matters, or a dedicated catalog-reading
-login when minimizing credential impact matters more. Database access is needed
-only while refreshing the baseline; the [Action guide](docs/GITHUB_ACTIONS.md)
-explains this tradeoff in more detail.
-
 ```bash
 export DATABASE_URL='postgres://readonly_user@localhost:5432/app'
 safe-migrate sync
@@ -51,6 +45,10 @@ safe-migrate lint-chain --dir migrations
 `sync` reads PostgreSQL metadata and writes `.safe-migrate.cache`; it does not
 execute migration SQL. Later lint runs are offline unless you explicitly enable
 automatic synchronization.
+
+The snapshot reflects the connected role and its session defaults. See the
+[Action guide](docs/GITHUB_ACTIONS.md#database-role-and-runner-security) when
+choosing between a restricted catalog reader and the actual migration role.
 
 Direct remote database connections are rejected. Use localhost, a Unix socket,
 or a trusted tunnel:
@@ -67,42 +65,23 @@ but it is still infrastructure metadata and should be treated as sensitive.
 
 ## Add it to GitHub Actions
 
-Generate separate trusted-refresh and pull-request workflows:
-
-```bash
-safe-migrate init github-actions --path migrations
-```
-
-This is one-time repository setup. Once the baseline exists, ordinary pull
-requests need no database connection and no per-PR synchronization.
-
-After creating the `safe-migrate-baseline` GitHub environment, the initializer
-can also configure the two secrets through an authenticated GitHub CLI:
+Create a protected GitHub environment named `safe-migrate-baseline`, then run:
 
 ```bash
 safe-migrate init github-actions \
   --path migrations \
-  --force \
   --configure-secrets
 ```
 
-`SAFE_MIGRATE_DATABASE_URL` is stored only in the baseline environment;
-`SAFE_MIGRATE_CACHE_KEY` is a repository secret so trusted pull-request jobs can
-decrypt the snapshot. Configure the refresh runner's localhost, Unix-socket, or
-tunnel access, then run **Refresh safe-migrate baseline** once. Pull-request
-jobs never receive the database URL and never save or refresh the baseline.
+This creates a trusted baseline-refresh workflow and an offline PR-analysis
+workflow. Configure the refresh runner's local or tunneled database access,
+then run **Refresh safe-migrate baseline** once.
 
 A missing baseline or encryption key is an operational error. This prevents a
 normal CI run from silently degrading into broad conservative findings.
 
-To create a cache key without configuring GitHub, run
-`safe-migrate init cache-key`. Add `--set-github-secret` to send a new key to
-the current repository through an authenticated GitHub CLI. The plain command
-writes the secret to standard output, so do not run it in public CI logs.
-
-See the [GitHub Action guide](docs/GITHUB_ACTIONS.md) for the manual workflow,
-fork behavior, multiple databases, custom configuration, and the complete
-security model.
+See the [GitHub Action guide](docs/GITHUB_ACTIONS.md) for manual secret setup,
+runner access, forks, multiple databases, and the security model.
 
 ## Commands
 

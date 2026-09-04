@@ -21,12 +21,9 @@ notes are available on the
   that validate caches before hydration.
 - Cache validation now rejects circular or internally inconsistent role
   membership edges before synchronized state can be treated as authoritative.
-- GitHub Actions now separate trusted, sync-only baseline refresh from offline
-  PR analysis, require the encrypted baseline unless no-cache mode is explicit,
-  and keep database credentials in a dedicated environment. `safe-migrate init`
-  generates both workflows and can configure their cache key; existing
-  plaintext workflows must add a key or explicitly set
-  `encrypted-cache: "false"`.
+- Split GitHub Actions into trusted baseline refresh and offline PR analysis.
+  The initializer generates both, environment-scopes database credentials, and
+  makes the encrypted baseline mandatory for normal analysis.
 
 ## v0.7.0 — 2026-08-30
 
