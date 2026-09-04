@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 192 192" role="img" aria-labelledby="title description">
+  <title id="title">safe-migrate</title>
+  <desc id="description">A protected database with a check mark</desc>
+  <defs>
+    <linearGradient id="background" x1="24" y1="16" x2="168" y2="176" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#172554"/>
+      <stop offset="1" stop-color="#0F172A"/>
+    </linearGradient>
+    <linearGradient id="database" x1="42" y1="49" x2="116" y2="130" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#60A5FA"/>
+      <stop offset="1" stop-color="#2563EB"/>
+    </linearGradient>
+    <linearGradient id="shield" x1="103" y1="78" x2="151" y2="158" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#2DD4BF"/>
+      <stop offset="1" stop-color="#0D9488"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="8" y="8" width="176" height="176" rx="42" fill="url(#background)"/>
+  <rect x="9" y="9" width="174" height="174" rx="41" fill="none" stroke="#60A5FA" stroke-opacity=".28" stroke-width="2"/>
+
+  <path d="M39 59v57c0 11 19 20 43 20s43-9 43-20V59" fill="url(#database)"/>
+  <ellipse cx="82" cy="59" rx="43" ry="20" fill="#93C5FD"/>
+  <ellipse cx="82" cy="59" rx="34" ry="12" fill="#1E3A8A"/>
+  <path d="M39 86c0 11 19 20 43 20s43-9 43-20M39 110c0 11 19 20 43 20 8 0 16-1 22-3" fill="none" stroke="#BFDBFE" stroke-opacity=".75" stroke-width="5"/>
+
+  <path d="M126 74c10 8 20 11 31 13v27c0 24-13 39-31 48-19-9-32-24-32-48V87c12-2 22-5 32-13Z" fill="url(#shield)" stroke="#99F6E4" stroke-width="4" stroke-linejoin="round"/>
+  <path d="m108 116 12 12 25-27" fill="none" stroke="#F0FDFA" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

@@ -1,4 +1,14 @@
-# safe-migrate
+<p align="center">
+  <img src="docs/logo.svg" width="120" alt="safe-migrate logo">
+</p>
+
+<h1 align="center">safe-migrate</h1>
+
+<p align="center">
+  <a href="https://github.com/dsecurity49/safe-migrate/actions/workflows/ci.yml"><img src="https://github.com/dsecurity49/safe-migrate/actions/workflows/ci.yml/badge.svg" alt="CI status"></a>
+  <a href="https://crates.io/crates/safe-migrate"><img src="https://img.shields.io/crates/v/safe-migrate.svg" alt="crates.io version"></a>
+  <a href="https://docs.rs/safe-migrate"><img src="https://docs.rs/safe-migrate/badge.svg" alt="docs.rs"></a>
+</p>
 
 safe-migrate finds risky PostgreSQL migrations before they reach production.
 It parses SQL, simulates schema changes, and checks the result against a
