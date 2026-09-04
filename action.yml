@@ -206,7 +206,7 @@ runs:
 
     - name: Install Rust
       if: ${{ steps.action-install.outputs.install-mode == 'source' }}
-      uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable 2026-07-16
+      uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable 2026-09-03
       env:
         DATABASE_URL: ""
         SAFE_MIGRATE_CACHE_KEY: ""
@@ -506,7 +506,7 @@ runs:
 
     - name: Publish summary and annotations
       if: ${{ always() }}
-      uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
       env:
         DATABASE_URL: ""
         JSON_REPORT: ${{ steps.analysis.outputs.json-report }}

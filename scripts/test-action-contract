@@ -173,7 +173,7 @@ grep -F 'uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9' "$ma
 grep -F "inputs.sync != 'true'" "$manifest" >/dev/null
 grep -F 'cache_prefix="safe-migrate-v7-${RUNNER_OS}-${cache_mode}-${INPUT_BASELINE}-"' "$manifest" >/dev/null
 grep -F '[[ ! "$SAFE_MIGRATE_CACHE_KEY" =~ ^[0-9A-Fa-f]{64}$ ]]' "$manifest" >/dev/null
-test "$(grep -Ec '^[[:space:]]+SAFE_MIGRATE_CACHE_KEY: "[0-9A-Fa-f]{64}"$' "$workflow")" -eq 4
+test "$(grep -Ec '^[[:space:]]+SAFE_MIGRATE_CACHE_KEY: "[0-9A-Fa-f]{64}"$' "$workflow")" -eq 5
 if grep -Eq '^[[:space:]]+SAFE_MIGRATE_CACHE_KEY: [0-9A-Fa-f]{64}$' "$workflow"; then
   printf '%s\n' 'workflow contains an unquoted hexadecimal cache key' >&2
   exit 1
@@ -186,7 +186,7 @@ grep -F 'core.error(message, properties);' "$manifest" >/dev/null
 grep -F 'core.warning(message, properties);' "$manifest" >/dev/null
 grep -F "finding.rule_title || finding.rule_id" "$manifest" >/dev/null
 grep -F "finding.rule_summary" "$manifest" >/dev/null
-grep -E 'actions/github-script@[0-9a-f]{40}' "$manifest" >/dev/null
+grep -F 'actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0' "$manifest" >/dev/null
 grep -F 'env -u DATABASE_URL' "$manifest" >/dev/null
 grep -F "printf '::add-mask::%s\\n'" "$manifest" >/dev/null
 grep -F 'analysis-mode=${analysis_mode}' "$manifest" >/dev/null

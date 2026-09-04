@@ -86,6 +86,10 @@ The generated refresh job uses `ubuntu-latest` as a placeholder. Add a trusted
 tunnel or proxy step, or select an isolated runner that can reach PostgreSQL
 through localhost or a Unix socket.
 
+Self-hosted runners must be version 2.327.1 or newer. The Action's pinned cache
+and reporting dependencies use the current Node.js 24 Action runtime; GitHub-
+hosted runners already satisfy this requirement.
+
 Synchronization records `current_user`, `session_user`, role membership,
 search path, and timeout defaults. A dedicated catalog-reading login minimizes
 credential impact, but role-sensitive findings then describe that login. If you
