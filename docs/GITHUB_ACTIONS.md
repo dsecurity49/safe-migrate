@@ -15,6 +15,79 @@ We recommend cache encryption because a baseline contains schema and role
 metadata and GitHub cache contents are not signed. A baseline is optional: on a
 cache miss, linting runs with `Tainted` confidence.
 
+## 2-minute quickstart
+
+Most repositories need just two workflows — one that builds a baseline where the
+database is reachable, and one that lints every pull request from that baseline.
+
+**1. Lint pull requests** (`lint-chain` needs no database access):
+
+```yaml
+on:
+  pull_request:
+    paths: ["migrations/**"]
+permissions:
+  contents: read
+jobs:
+  safe-migrate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dsecurity49/safe-migrate@v0.8.0
+        env:
+          SAFE_MIGRATE_CACHE_KEY: ${{ secrets.SAFE_MIGRATE_CACHE_KEY }}
+        with:
+          path: migrations
+          encrypted-cache: "true"
+```
+
+**2. Refresh the baseline from your default branch** (has `DATABASE_URL`):
+
+```yaml
+on:
+  push:
+    branches: [main]
+    paths: ["migrations/**"]
+permissions:
+  contents: read
+jobs:
+  refresh:
+    runs-on: self-hosted   # or ubuntu-latest with an SSH tunnel
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dsecurity49/safe-migrate@v0.8.0
+        env:
+          DATABASE_URL: ${{ secrets.SAFE_MIGRATE_DATABASE_URL }}
+          SAFE_MIGRATE_CACHE_KEY: ${{ secrets.SAFE_MIGRATE_CACHE_KEY }}
+        with:
+          path: migrations
+          sync: "true"
+          schemas: public
+          encrypted-cache: "true"
+```
+
+That is the whole setup: the baseline is cached on `main`, pull requests restore
+it and lint offline, and `DATABASE_URL` never reaches the lint job. Add
+`SAFE_MIGRATE_DATABASE_URL` and `SAFE_MIGRATE_CACHE_KEY` as secrets (see
+[Cache encryption](#cache-encryption)).
+
+The lifecycle in one picture:
+
+```
+   refresh job (default branch, has DATABASE_URL)
+        │  sync ──────────────► baseline cache file (encrypted)
+        ▼                                    │  saved to GitHub cache
+   lint job (pull request, no DATABASE_URL)  ▼
+        │  restore baseline ◄────────────────┘
+        ▼
+   lint --no-cache  (cache miss)  ►  Tainted confidence (still fails Tier 1)
+        ▼
+   lint baseline             ►  precise confidence (recommendations only when clear)
+```
+
+On a cache miss the pull-request job lints without a baseline (`--no-cache`) and
+reports `Tainted` confidence, which still blocks Tier 1 findings.
+
 ## Setup order
 
 1. Add `SAFE_MIGRATE_DATABASE_URL` as a secret. Generate an encryption key as

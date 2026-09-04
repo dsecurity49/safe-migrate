@@ -419,6 +419,35 @@ runs:
             > "$markdown_report"
         fi
 
+        # Redact likely secret values from the published diagnostic log so a
+        # failing sync or lint cannot leak a connection string, cache key, or
+        # runner token into the uploaded artifact. Lint runs with DATABASE_URL
+        # unset; sync is the main vector. Masking is literal and value-gated.
+        if [ -f "$diagnostic_log" ] && [ -s "$diagnostic_log" ]; then
+          redact_input="$diagnostic_log"
+          for secret_name in \
+              DATABASE_URL \
+              SAFE_MIGRATE_CACHE_KEY \
+              GITHUB_TOKEN \
+              ACTIONS_RUNTIME_TOKEN \
+              ACTIONS_ID_TOKEN_REQUEST_TOKEN; do
+            secret_value="${!secret_name-}"
+            [ -n "$secret_value" ] || continue
+            [ "${#secret_value}" -ge 8 ] || continue
+            redaction_out="${RUNNER_TEMP}/safe-migrate-redacted.$$"
+            : > "$redaction_out"
+            while IFS= read -r -u 9 line || [ -n "$line" ]; do
+              case "$line" in
+                *"$secret_value"*) line="${line//"$secret_value"/***}" ;;
+              esac
+              printf '%s\n' "$line" >> "$redaction_out"
+            done 9< "$redact_input"
+            mv "$redaction_out" "$redact_input"
+          done
+          rm -f -- "${RUNNER_TEMP}/safe-migrate-redacted."*
+          redact_input=
+        fi
+
         printf '%s\n' "json-report=${json_report}" >> "$GITHUB_OUTPUT"
         printf '%s\n' "markdown-report=${markdown_report}" >> "$GITHUB_OUTPUT"
         printf '%s\n' "diagnostic-log=${diagnostic_log}" >> "$GITHUB_OUTPUT"
@@ -460,16 +489,17 @@ runs:
             core.error(`Could not parse safe-migrate JSON report: ${error.message}`);
             return;
           }
+          const sanitize = (s) => (s || '').toString().replace(/::/g, '::\u200B');
           for (const finding of report.violations || []) {
             if (finding.tier !== 'Tier1' && finding.tier !== 'Tier2') continue;
             const location = finding.location || {};
             const properties = {
-              title: `safe-migrate: ${finding.rule_title || finding.rule_id || 'finding'}${finding.rule_title && finding.rule_id ? ` (${finding.rule_id})` : ''}`,
+              title: sanitize(`safe-migrate: ${finding.rule_title || finding.rule_id || 'finding'}${finding.rule_title && finding.rule_id ? ` (${finding.rule_id})` : ''}`),
               file: location.file,
               startLine: location.line,
               startColumn: location.column,
             };
-            const message = `${finding.rule_summary ? `${finding.rule_summary} ` : ''}${finding.reason || 'Migration finding'}${finding.recipe ? ` — ${finding.recipe}` : ''}`;
+            const message = sanitize(`${finding.rule_summary ? `${finding.rule_summary} ` : ''}${finding.reason || 'Migration finding'}${finding.recipe ? ` — ${finding.recipe}` : ''}`);
             if (finding.tier === 'Tier1') core.error(message, properties);
             else core.warning(message, properties);
           }
