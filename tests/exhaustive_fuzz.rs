@@ -2,8 +2,8 @@ mod common;
 
 mod exhaustive_fuzz_tests {
     use crate::common::*;
-    use safe_migrate::analysis::state::AnalysisState;
-    use safe_migrate::report::violations::ObjectKind;
+    use safe_migrate::_internal::analysis::state::AnalysisState;
+    use safe_migrate::_internal::report::violations::ObjectKind;
 
     // DDL in isolation.
 
@@ -188,10 +188,9 @@ mod exhaustive_fuzz_tests {
         let v = engine
             .analyze("DROP TABLE IF EXISTS nonexistent;", &mut state)
             .unwrap();
-        assert!(v.iter().all(
-            |v| v.tier == safe_migrate::report::violations::ViolationTier::Tier3
-                || v.rule_id == "schema-drift"
-        ));
+        assert!(v.iter().all(|v| v.tier
+            == safe_migrate::_internal::report::violations::ViolationTier::Tier3
+            || v.rule_id == "schema-drift"));
     }
 
     #[test]
@@ -405,7 +404,7 @@ mod exhaustive_fuzz_tests {
             .unwrap();
         assert_eq!(
             state.local.confidence,
-            safe_migrate::analysis::state::Confidence::Exact
+            safe_migrate::_internal::analysis::state::Confidence::Exact
         );
     }
 
@@ -418,7 +417,7 @@ mod exhaustive_fuzz_tests {
             .unwrap();
         assert_eq!(
             state.local.confidence,
-            safe_migrate::analysis::state::Confidence::Tainted
+            safe_migrate::_internal::analysis::state::Confidence::Tainted
         );
     }
 
@@ -509,7 +508,7 @@ mod exhaustive_fuzz_tests {
             .analyze("DO $$ BEGIN NULL; END $$; DROP TABLE users;", &mut state)
             .unwrap();
         for violation in &v {
-            if violation.tier == safe_migrate::report::violations::ViolationTier::Tier1 {
+            if violation.tier == safe_migrate::_internal::report::violations::ViolationTier::Tier1 {
                 panic!(
                     "Expected no Tier1 after DO block taint, got: {} ({})",
                     violation.rule_id, violation.reason
@@ -526,8 +525,9 @@ mod exhaustive_fuzz_tests {
 
         let v = engine.analyze("DROP TABLE users;", &mut state).unwrap();
         assert!(
-            v.iter()
-                .any(|v| v.tier == safe_migrate::report::violations::ViolationTier::Tier1)
+            v.iter().any(
+                |v| v.tier == safe_migrate::_internal::report::violations::ViolationTier::Tier1
+            )
         );
     }
 
@@ -543,12 +543,13 @@ mod exhaustive_fuzz_tests {
             .unwrap();
         assert_eq!(
             state.local.confidence,
-            safe_migrate::analysis::state::Confidence::Exact
+            safe_migrate::_internal::analysis::state::Confidence::Exact
         );
         let v = engine.analyze("DROP TABLE users;", &mut state).unwrap();
         assert!(
-            v.iter()
-                .any(|v| v.tier == safe_migrate::report::violations::ViolationTier::Tier1)
+            v.iter().any(
+                |v| v.tier == safe_migrate::_internal::report::violations::ViolationTier::Tier1
+            )
         );
     }
 
@@ -566,8 +567,9 @@ mod exhaustive_fuzz_tests {
             .unwrap();
         let v = engine.analyze("DROP TABLE users;", &mut state).unwrap();
         assert!(
-            !v.iter()
-                .any(|v| v.tier == safe_migrate::report::violations::ViolationTier::Tier1)
+            !v.iter().any(
+                |v| v.tier == safe_migrate::_internal::report::violations::ViolationTier::Tier1
+            )
         );
     }
 
@@ -650,7 +652,7 @@ mod exhaustive_fuzz_tests {
         assert!(!v.is_empty());
         assert_eq!(
             state.local.confidence,
-            safe_migrate::analysis::state::Confidence::Tainted
+            safe_migrate::_internal::analysis::state::Confidence::Tainted
         );
     }
 
@@ -733,8 +735,8 @@ mod exhaustive_fuzz_tests {
                 .iter()
                 .all(|violation| violation.rule_id != "opaque-dynamic-sql")
         );
-        let Some(safe_migrate::model::relation::RelationOverlay::Present(relation)) = state
-            .get_relation(&safe_migrate::ast::identifiers::ObjectId::new(
+        let Some(safe_migrate::_internal::model::relation::RelationOverlay::Present(relation)) =
+            state.get_relation(&safe_migrate::_internal::ast::identifiers::ObjectId::new(
                 "public", "users",
             ))
         else {
@@ -794,8 +796,9 @@ mod exhaustive_fuzz_tests {
         let mut state = AnalysisState::new(cache);
         let v = engine.analyze("DROP TABLE big_table;", &mut state).unwrap();
         assert!(
-            v.iter()
-                .any(|v| v.tier == safe_migrate::report::violations::ViolationTier::Tier1)
+            v.iter().any(
+                |v| v.tier == safe_migrate::_internal::report::violations::ViolationTier::Tier1
+            )
         );
     }
 

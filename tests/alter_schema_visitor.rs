@@ -3,8 +3,8 @@ mod common;
 mod alter_schema_visitor_test {
     #[test]
     fn test_alter_schema_pipeline() {
-        use safe_migrate::analysis::facts::{AlterSchemaActionFact, StatementFact};
-        use safe_migrate::ast::visitor::AstVisitor;
+        use safe_migrate::_internal::analysis::facts::{AlterSchemaActionFact, StatementFact};
+        use safe_migrate::_internal::ast::visitor::AstVisitor;
         use squawk_syntax::ast::SourceFile;
 
         let sql = "ALTER SCHEMA old_name RENAME TO new_name";

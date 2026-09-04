@@ -6,10 +6,10 @@ use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
     aead::{Aead, KeyInit},
 };
-use safe_migrate::ast::identifiers::ObjectId;
-use safe_migrate::db::cache::{CACHE_V6_MAGIC, DbCache, DbCacheVersioned};
-use safe_migrate::model::relation::{Persistence, RelationKind, RelationState};
-use safe_migrate::model::schema::SchemaState;
+use safe_migrate::_internal::ast::identifiers::ObjectId;
+use safe_migrate::_internal::db::cache::{CACHE_V7_MAGIC, DbCache, DbCacheVersioned};
+use safe_migrate::_internal::model::relation::{Persistence, RelationKind, RelationState};
+use safe_migrate::_internal::model::schema::SchemaState;
 
 fn parse_json_stdout(output: &std::process::Output) -> serde_json::Value {
     serde_json::from_slice(&output.stdout).expect("stdout must contain exactly one JSON document")
@@ -44,9 +44,9 @@ fn write_cache_with_timestamp(path: &std::path::Path, created_at_unix_secs: u64)
     let mut compressed = Vec::new();
     let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3).unwrap();
     let config = bincode::config::standard().with_variable_int_encoding();
-    encoder.write_all(CACHE_V6_MAGIC).unwrap();
+    encoder.write_all(CACHE_V7_MAGIC).unwrap();
     bincode::serde::encode_into_std_write(
-        DbCacheVersioned::V6(Box::new(cache)),
+        DbCacheVersioned::V7(Box::new(cache)),
         &mut encoder,
         config,
     )
@@ -62,10 +62,171 @@ fn test_cli_help() {
     let output = cmd.output().unwrap();
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("Sync PostgreSQL metadata, then lint migrations offline"));
+    assert!(
+        stdout.contains("Check PostgreSQL migrations against a synchronized database baseline")
+    );
     assert!(!stdout.contains("prevent blocking locks"));
     assert!(stdout.contains("Sync PostgreSQL schema metadata and statistics into a local cache"));
     assert!(!stdout.contains("Sync database table statistics"));
+    assert!(stdout.contains("init"));
+}
+
+#[test]
+fn init_cache_key_generates_expected_secret_format() {
+    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let output = cmd.args(["init", "cache-key"]).output().unwrap();
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let key = String::from_utf8(output.stdout).unwrap();
+    let key = key.trim_end();
+    assert_eq!(key.len(), 64);
+    assert!(key.bytes().all(|byte| byte.is_ascii_hexdigit()));
+}
+
+#[cfg(unix)]
+#[test]
+fn init_cache_key_sends_secret_to_github_cli_over_stdin() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let test_dir = tempfile::tempdir().unwrap();
+    let fake_gh = test_dir.path().join("gh");
+    let captured = test_dir.path().join("captured-secret");
+    fs::write(
+        &fake_gh,
+        "#!/bin/sh\nset -eu\ntest \"$#\" -eq 3\ntest \"$1:$2:$3\" = secret:set:SAFE_MIGRATE_CACHE_KEY\ncat > \"$CAPTURED_SECRET\"\n",
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&fake_gh).unwrap().permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&fake_gh, permissions).unwrap();
+    let existing_path = std::env::var("PATH").unwrap_or_default();
+
+    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    cmd.args(["init", "cache-key", "--set-github-secret"])
+        .env("CAPTURED_SECRET", &captured)
+        .env(
+            "PATH",
+            format!("{}:{existing_path}", test_dir.path().display()),
+        )
+        .assert()
+        .success();
+
+    let key = fs::read_to_string(captured).unwrap();
+    assert_eq!(key.len(), 64);
+    assert!(key.bytes().all(|byte| byte.is_ascii_hexdigit()));
+}
+
+#[test]
+fn init_github_actions_creates_separate_analysis_and_baseline_workflows() {
+    let project = tempfile::tempdir().unwrap();
+    fs::create_dir(project.path().join("migrations")).unwrap();
+
+    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    cmd.current_dir(project.path())
+        .args(["init", "github-actions", "--path", "migrations"])
+        .assert()
+        .success();
+
+    let analysis =
+        fs::read_to_string(project.path().join(".github/workflows/safe-migrate.yml")).unwrap();
+    let baseline = fs::read_to_string(
+        project
+            .path()
+            .join(".github/workflows/safe-migrate-baseline.yml"),
+    )
+    .unwrap();
+    assert!(analysis.contains("\n  pull_request:\n    branches: ['main']"));
+    assert!(analysis.contains("\n  merge_group:"));
+    assert!(analysis.contains("\n  lint:\n    runs-on: ubuntu-latest"));
+    assert!(analysis.contains("\n    timeout-minutes: 15"));
+    assert!(analysis.contains("\n          path: 'migrations'"));
+    assert!(analysis.contains("SAFE_MIGRATE_CACHE_KEY"));
+    assert!(!analysis.contains("DATABASE_URL"));
+    assert!(!analysis.contains("sync: 'true'"));
+
+    assert!(baseline.contains("\n  workflow_dispatch:"));
+    assert!(baseline.contains("\n  schedule:\n    - cron: '23 3 * * 1,4'"));
+    assert!(baseline.contains("\npermissions: {}"));
+    assert!(baseline.contains("\n      name: safe-migrate-baseline"));
+    assert!(baseline.contains("\n      deployment: false"));
+    assert!(baseline.contains("\n    timeout-minutes: 15"));
+    assert!(baseline.contains("DATABASE_URL: ${{ secrets.SAFE_MIGRATE_DATABASE_URL }}"));
+    assert!(baseline.contains("\n          sync: 'true'"));
+    assert!(!baseline.contains("actions/checkout"));
+    assert!(!baseline.contains("\n          path:"));
+
+    let mut overwrite = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let assertion = overwrite
+        .current_dir(project.path())
+        .args(["init", "github-actions", "--path", "migrations"])
+        .assert()
+        .failure();
+    assert!(
+        String::from_utf8_lossy(&assertion.get_output().stderr)
+            .contains("use --force to replace both workflows")
+    );
+}
+
+#[test]
+fn init_github_actions_supports_a_custom_default_branch_and_output_directory() {
+    let project = tempfile::tempdir().unwrap();
+    fs::create_dir(project.path().join("db [migrations]")).unwrap();
+
+    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    cmd.current_dir(project.path())
+        .args([
+            "init",
+            "github-actions",
+            "--path",
+            "db [migrations]",
+            "--branch",
+            "trunk",
+            "--output-dir",
+            "ci",
+        ])
+        .assert()
+        .success();
+
+    let analysis = fs::read_to_string(project.path().join("ci/safe-migrate.yml")).unwrap();
+    let baseline = fs::read_to_string(project.path().join("ci/safe-migrate-baseline.yml")).unwrap();
+    assert!(analysis.contains("\n    branches: ['trunk']"));
+    assert!(analysis.contains("\n          path: 'db [migrations]'"));
+    assert!(baseline.contains("\n    if: github.ref == 'refs/heads/trunk'"));
+}
+
+#[test]
+fn init_github_actions_does_not_read_secrets_from_noninteractive_input() {
+    let project = tempfile::tempdir().unwrap();
+    fs::create_dir(project.path().join("migrations")).unwrap();
+
+    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let assertion = cmd
+        .current_dir(project.path())
+        .args([
+            "init",
+            "github-actions",
+            "--path",
+            "migrations",
+            "--configure-secrets",
+        ])
+        .assert()
+        .failure();
+    assert!(
+        String::from_utf8_lossy(&assertion.get_output().stderr)
+            .contains("requires an interactive terminal")
+    );
+    assert!(
+        !project
+            .path()
+            .join(".github/workflows/safe-migrate.yml")
+            .exists()
+    );
+    assert!(
+        !project
+            .path()
+            .join(".github/workflows/safe-migrate-baseline.yml")
+            .exists()
+    );
 }
 
 #[test]
@@ -264,7 +425,7 @@ fn test_cli_lint_invalid_cache() {
 }
 
 #[test]
-fn test_cli_rejects_semantically_contradictory_v6_cache() {
+fn test_cli_rejects_semantically_contradictory_v7_cache() {
     let mut invalid = DbCache::new();
     invalid.schemas.insert(
         "app".to_string(),
@@ -276,10 +437,10 @@ fn test_cli_rejects_semantically_contradictory_v6_cache() {
     );
     let config = bincode::config::standard().with_variable_int_encoding();
     let encoded =
-        bincode::serde::encode_to_vec(DbCacheVersioned::V6(Box::new(invalid)), config).unwrap();
+        bincode::serde::encode_to_vec(DbCacheVersioned::V7(Box::new(invalid)), config).unwrap();
     let mut compressed = Vec::new();
     let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3).unwrap();
-    encoder.write_all(CACHE_V6_MAGIC).unwrap();
+    encoder.write_all(CACHE_V7_MAGIC).unwrap();
     encoder.write_all(&encoded).unwrap();
     encoder.finish().unwrap();
     let cache = tempfile::NamedTempFile::new().unwrap();
@@ -301,7 +462,7 @@ fn test_cli_rejects_semantically_contradictory_v6_cache() {
 }
 
 #[test]
-fn test_cli_rejects_authenticated_semantically_contradictory_v6_cache() {
+fn test_cli_rejects_authenticated_semantically_contradictory_v7_cache() {
     let mut invalid = DbCache::new();
     invalid.schemas.insert(
         "app".to_string(),
@@ -313,10 +474,10 @@ fn test_cli_rejects_authenticated_semantically_contradictory_v6_cache() {
     );
     let config = bincode::config::standard().with_variable_int_encoding();
     let encoded =
-        bincode::serde::encode_to_vec(DbCacheVersioned::V6(Box::new(invalid)), config).unwrap();
+        bincode::serde::encode_to_vec(DbCacheVersioned::V7(Box::new(invalid)), config).unwrap();
     let mut compressed = Vec::new();
     let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3).unwrap();
-    encoder.write_all(CACHE_V6_MAGIC).unwrap();
+    encoder.write_all(CACHE_V7_MAGIC).unwrap();
     encoder.write_all(&encoded).unwrap();
     encoder.finish().unwrap();
 
@@ -354,20 +515,18 @@ fn test_cli_rejects_authenticated_semantically_contradictory_v6_cache() {
 }
 
 #[test]
-fn test_cli_rejects_cache_with_oversized_decoded_container() {
+fn test_cli_rejects_malformed_cache_payload() {
     let config = bincode::config::standard().with_variable_int_encoding();
     let encoded =
-        bincode::serde::encode_to_vec(DbCacheVersioned::V6(Box::default()), config).unwrap();
-    assert_eq!(&encoded[..4], &[5, 0, 0, 0]);
-
-    let mut malicious = encoded[..3].to_vec();
-    malicious.push(1);
+        bincode::serde::encode_to_vec(DbCacheVersioned::V7(Box::default()), config).unwrap();
+    // Preserve the current enum discriminant, then corrupt the payload.
+    let mut malicious = encoded[..4].to_vec();
     malicious.push(252);
     malicious.extend_from_slice(&300_000_000u32.to_le_bytes());
 
     let mut compressed = Vec::new();
     let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3).unwrap();
-    encoder.write_all(CACHE_V6_MAGIC).unwrap();
+    encoder.write_all(CACHE_V7_MAGIC).unwrap();
     encoder.write_all(&malicious).unwrap();
     encoder.finish().unwrap();
 
@@ -383,7 +542,7 @@ fn test_cli_rejects_cache_with_oversized_decoded_container() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("exceeds the 256 MiB decoded-size limit"),
+        stderr.contains("corrupted (bincode)"),
         "unexpected stderr: {stderr}"
     );
 }
@@ -392,11 +551,11 @@ fn test_cli_rejects_cache_with_oversized_decoded_container() {
 fn test_cli_rejects_trailing_data_after_streamed_cache_decode() {
     let config = bincode::config::standard().with_variable_int_encoding();
     let encoded =
-        bincode::serde::encode_to_vec(DbCacheVersioned::V6(Box::default()), config).unwrap();
+        bincode::serde::encode_to_vec(DbCacheVersioned::V7(Box::default()), config).unwrap();
 
     let mut compressed = Vec::new();
     let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3).unwrap();
-    encoder.write_all(CACHE_V6_MAGIC).unwrap();
+    encoder.write_all(CACHE_V7_MAGIC).unwrap();
     encoder.write_all(&encoded).unwrap();
     encoder.write_all(b"trailing-data").unwrap();
     encoder.finish().unwrap();
@@ -525,14 +684,22 @@ fn test_cache_inspect_outputs_a_redacted_json_summary() {
     let report = parse_json_stdout(assert.get_output());
 
     assert_eq!(report["path"], cache_path.display().to_string());
-    assert_eq!(report["format_version"], 6);
+    assert_eq!(report["format_version"], 7);
     assert_eq!(report["encrypted"], false);
+    assert_eq!(report["coverage"]["schema_scope"], "all_non_system");
+    assert!(report["coverage"]["families"].is_array());
+    assert!(
+        report["coverage"]["families"]
+            .as_array()
+            .is_some_and(|families| families.iter().any(|family| family == "relations"))
+    );
     assert_eq!(report["observed_settings"]["lock_timeout_ms"], 0);
     assert_eq!(report["observed_settings"]["statement_timeout_ms"], 0);
     assert!(report["contents"]["relations"].is_number());
     assert!(report["contents"]["columns"].is_number());
     assert!(report["contents"]["roles"].is_number());
     assert!(report["contents"]["schemas"].is_number());
+    assert!(report["contents"]["constraint_keys"].is_number());
     assert!(report["contents"]["sequences"].is_number());
     assert!(report["contents"]["functions"].is_number());
     assert!(report["contents"]["procedures"].is_number());
@@ -562,6 +729,7 @@ fn test_cache_inspect_human_summary_discloses_redaction() {
 
     assert!(stdout.contains("Observed lock_timeout: 0 ms"));
     assert!(stdout.contains("Observed statement_timeout: 0 ms"));
+    assert!(stdout.contains("Catalog coverage: schemas, relations"));
     assert!(stdout.contains("Contents (counts only):\n  Database objects\n"));
     assert!(stdout.contains("\n  Routines\n"));
     assert!(stdout.contains("\n  Replication\n"));
@@ -591,7 +759,7 @@ fn test_cli_json_is_machine_clean_and_marks_missing_baseline_tainted() {
     let output = assert.get_output();
     let report = parse_json_stdout(output);
 
-    assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["schema_version"], 2);
     assert_eq!(report["confidence"], "Tainted");
     assert_eq!(report["baseline"]["status"], "unavailable");
     assert!(report["baseline"]["observed_settings"]["lock_timeout_ms"].is_null());
@@ -1046,7 +1214,7 @@ fn test_cli_chain_json_is_machine_clean() {
     let output = assert.get_output();
     let report = parse_json_stdout(output);
 
-    assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["schema_version"], 2);
     assert_eq!(report["confidence"], "Tainted");
     assert!(!String::from_utf8_lossy(&output.stdout).contains("Analyzing migration"));
 }

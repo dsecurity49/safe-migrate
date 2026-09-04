@@ -1,6 +1,6 @@
 # CLI and Report Contract
 
-This document defines safe-migrate v0.7.0's CLI, report, cache, and GitHub
+This document defines safe-migrate v0.8.0's CLI, report, cache, and GitHub
 Action behavior.
 
 If you are learning safe-migrate, start with the [README](../README.md). This
@@ -13,28 +13,28 @@ database.
 
 ## Commands
 
-- `safe-migrate lint --file <path>` analyzes one SQL migration.
-- `safe-migrate lint-chain --dir <path>` analyzes `.sql` files in filename
-  order while preserving state across files.
-- `safe-migrate sync` reads PostgreSQL catalog metadata, statistics, role and
-  search-path context, and effective `lock_timeout` and `statement_timeout`
-  values, then writes a local cache. It requires `DATABASE_URL` and accepts
-  only localhost or Unix-socket connections in this build; remote databases
-  must be reached through an SSH tunnel.
-- `safe-migrate cache inspect` reads a local cache without connecting to
-  PostgreSQL and prints provenance plus a redacted contents summary. `--json`
-  emits that same summary as one JSON document.
-- `safe-migrate rules` lists primary-rule descriptors. `--rule <id>`
-  selects one descriptor and `--json` emits the stable discovery schema.
+| Command | Contract |
+| --- | --- |
+| `lint --file <path>` | Analyze one migration. |
+| `lint-chain --dir <path>` | Analyze `.sql` files in filename order with state carried forward. |
+| `sync` | Read PostgreSQL metadata and settings into a local cache. Requires `DATABASE_URL` and a local, Unix-socket, or tunneled connection. |
+| `cache inspect` | Show cache provenance and redacted counts without a database connection. Supports `--json`. |
+| `rules` | List primary rules; `--rule <id>` selects one and `--json` emits the discovery schema. |
+| `init github-actions --path <dir>` | Generate separate PR-analysis and trusted-refresh workflows. |
+| `init cache-key` | Generate a random 32-byte key as 64 lowercase hexadecimal characters. |
+
+`init github-actions --configure-secrets` sends the database URL and generated
+key through authenticated GitHub CLI without printing them. It detects the
+default branch from `origin/HEAD`, falls back to `main`, and accepts `--branch`.
+`init cache-key --set-github-secret` sends the key instead of printing it.
 
 `lint` and `lint-chain` use an explicit cache, the default cache path, or
 `--no-cache`. When `auto_sync = true` is set in configuration, they may refresh
 the cache before analysis. `--no-auto-sync` suppresses that refresh for one
 run; `--no-cache` also bypasses it.
 
-Without `--config`, CLI commands read `safe-migrate.toml` from the current
-directory when it exists and otherwise use built-in defaults. A path passed
-with `--config` must exist and pass validation.
+Commands load `safe-migrate.toml` from the current directory when present.
+`--config` selects another file and requires it to exist and validate.
 
 `cache inspect` omits object, column, role, membership, and dependency names.
 It still includes database and schema provenance, versions, timeout values, and
@@ -42,64 +42,42 @@ object counts. Treat that output as infrastructure metadata.
 
 ## Output channels
 
-Human-readable reports are written to standard output. Diagnostics about
-configuration, cache age, missing cache, parsing, and internal failures are
-written to standard error.
+| Mode | Standard output |
+| --- | --- |
+| Human | The human-readable report. |
+| `--json` | Exactly one JSON document, without progress text, ANSI escapes, or a preamble. |
+| `--markdown` | One deterministic Markdown report, with source locations when available. |
 
-When `--json` is selected:
-
-- standard output contains exactly one valid JSON document;
-- standard output contains no progress text, ANSI escapes, or human preamble;
-- diagnostics remain on standard error;
-- the JSON report is produced for both `lint` and `lint-chain`.
-
-When `--markdown` is selected:
-
-- standard output contains one deterministic Markdown report;
-- diagnostics remain on standard error;
-- findings include file, line, and column when the parser produced a source
-  range;
-- JSON and Markdown modes are mutually exclusive.
-
-Interactive output is mutually exclusive with `--json` and `--markdown`.
-Conflicting output modes exit `1`.
+Diagnostics always use standard error. JSON, Markdown, and interactive output
+are mutually exclusive; conflicts exit `1`. Both lint commands support JSON.
 
 ## JSON report
 
-The v1 JSON report has these top-level fields:
+The report schema is version 2:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "confidence": "Exact",
   "verdict": "HALT",
+  "evidence": [],
   "violations": []
 }
 ```
 
-Each violation includes:
+Each violation includes `rule_id`, `operation_kind`, `object_kind`,
+`object_name`, `tier`, `reason`, `recipe`, `dedup_key`, `sql`, and
+`fk_dependency_related`. `rule_id` is the stable identifier.
 
-- `rule_id`
-- `operation_kind`
-- `object_kind`
-- `object_name`
-- `tier`
-- `reason`
-- `recipe`
-- `dedup_key`
-- `sql`
-- `fk_dependency_related`
+Additional top-level objects are:
 
-Location-aware lint output additionally includes a one-based
-`statement_index` when the source range belongs to a parsed statement. Known
-primary rules add `rule_title`, `rule_summary`, and `impact`. These are
-additive fields; `rule_id` remains the stable identifier.
+| Field | Contents |
+| --- | --- |
+| `summary` | `total`, `tier1`, `tier2`, and `tier3` counts. |
+| `evidence` | Ordered, deduplicated reasons for conservative analysis. Each has a stable snake-case `code`, `statement` or `chain` scope, summary, and optional file/index. It contains no SQL or credentials. |
+| `baseline` | Cache status, provenance, observed settings, and automatic-sync result. |
 
-The additive top-level `summary` object contains `total`, `tier1`, `tier2`,
-and `tier3` counts.
-
-The additive `baseline` object records cache/baseline status, cache provenance,
-and automatic-sync outcome:
+The `baseline` shape is:
 
 ```json
 {
@@ -120,141 +98,93 @@ and automatic-sync outcome:
 are `null` when no cache is available. Missing creation provenance makes an
 otherwise readable baseline stale.
 
-Each JSON violation may include this additive location object:
+Violations may also include a one-based `statement_index`, known-rule metadata
+(`rule_title`, `rule_summary`, and `impact`), and this location object:
 
 ```json
 "location": { "file": "migrations/001_add_status.sql", "line": 12, "column": 1 }
 ```
 
-`rules --json` uses schema version 2. Descriptors include ID, title, summary,
-impact, default tier, remediation, supported configuration fields, and the
-effective values for those fields. Every primary rule supports `disabled`;
-row thresholds are accepted only when listed by the descriptor. Unknown rule
-IDs and unsupported fields are operational errors.
+`rules --json` has its own version 2 schema. Descriptors expose identity,
+guidance, tier, supported settings, and effective values. Every primary rule
+supports `disabled`; other settings are accepted only when advertised.
+Unknown rule IDs and unsupported fields are operational errors.
 
-Fields may be added compatibly. Removing a field, renaming a field, changing its
-type, or changing the meaning of an existing enum value is a report-contract
-change and must be documented in `CHANGELOG.md`.
-
-Violation ordering must be deterministic for the same SQL, configuration,
-cache, and safe-migrate version.
+Consumers must branch on `schema_version`. Additive fields are compatible;
+removal, renaming, type changes, and changed enum meanings require a changelog
+entry. Violation ordering is deterministic for identical inputs and version.
 
 ## Verdict and exit status
 
-The report verdict is derived from findings:
+| Verdict | Condition |
+| --- | --- |
+| `HALT` | At least one Tier 1 finding. |
+| `CAUTIOUS` | Tier 2, but no Tier 1. |
+| `SAFE WITH RISK` | Irreversible Tier 3, but no Tier 1 or Tier 2. |
+| `SAFE` | No higher verdict applies. |
 
-- `HALT`: at least one Tier 1 finding.
-- `CAUTIOUS`: at least one Tier 2 finding and no Tier 1 finding.
-- `SAFE WITH RISK`: an irreversible Tier 3 finding and no Tier 1 or Tier 2
-  finding.
-- `SAFE`: no higher verdict applies.
-
-The exit-status contract is:
-
-- `0`: analysis completed without a Tier 1 finding;
-- `1`: invocation, configuration, I/O, cache, parser, or internal failure;
-- `2`: analysis completed and found at least one Tier 1 finding.
+| Exit | Meaning |
+| --- | --- |
+| `0` | Analysis completed without Tier 1. |
+| `1` | Invocation, configuration, I/O, cache, parser, or internal failure. |
+| `2` | Analysis completed with Tier 1. |
 
 Human, JSON, and Markdown modes must use the same exit-status policy.
 
 ## Confidence
 
-`Exact` and `Tainted` describe consistency of the simulator relative to the
-evidence available to it. They are not guarantees about production runtime,
-lock wait duration, application compatibility, or data backfills.
+Confidence describes the simulator's consistency with its available evidence,
+not production runtime, lock duration, application compatibility, or backfills.
 
-- `Exact`: every state transition was either applied, skipped, or rejected with
-  a deterministic outcome relative to the supplied baseline.
-- `Tainted`: at least one transition or reference could not be resolved
-  confidently.
+| Value | Meaning |
+| --- | --- |
+| `Exact` | Every transition had a deterministic outcome against the supplied baseline. |
+| `Tainted` | At least one transition or reference could not be resolved confidently. |
 
-An execution conflict that PostgreSQL would deterministically reject—such as
-dropping a missing column or dropping a referenced table without `CASCADE`—is
-reported as a Tier 1 `chain-conflict`, leaves simulated state unchanged, and
-does not taint confidence by itself. This applies to both `lint` and
-`lint-chain`; “chain” describes retained migration state, not a restriction to
-the multi-file command.
+No cache means `Tainted`; rules retain their conservative defaults. A stale
+cache also taints confidence and warns on standard error.
+`stale_stats_days` uses the cache timestamp, not file modification time.
 
-Analysis without a database cache is `Tainted` because existing schema and
-dependency state are unknown. Rules keep their default worst-case assumptions;
-an absent cache does not lower a finding by itself. A stale cache taints
-confidence and emits a warning on standard error. `stale_stats_days` uses the
-timestamp inside the cache, not file modification time.
+PostgreSQL conflicts such as dropping a missing column produce a Tier 1
+`chain-conflict`, leave state unchanged, and do not taint confidence by
+themselves. This applies to both `lint` and `lint-chain`.
 
-Cache V6 does not carry foreign-key column-number lists or index eligibility
-metadata. A transition whose correctness depends on either fact is skipped and
-taints confidence rather than inventing state; syntax-level findings that are
-independent of the skipped state update (for example `DROP COLUMN` being
-irreversible or `WITH GRANT OPTION`) remain reportable. Multi-target view drops
-with an unresolved target are likewise treated atomically, preserving known
-targets in the simulated state.
+Cache V7 supplies typed evidence for:
 
-`GRANT` and `REVOKE` on `ALL TABLES IN SCHEMA` update the modeled relations but
-are `Tainted`: the cache does not represent every PostgreSQL relation kind that
-the server may include in that target set.
+- catalog coverage, schema scope, roles, privileges, and session settings;
+- constraint keys and expressions, generated-column sources, and PostgreSQL's
+  foreign-key equality operators;
+- indexes, including included and expression/predicate dependency columns;
+- inheritance and partition topology, view dependencies, sequence ownership,
+  and standalone sequence references;
+- every `pg_proc.prokind`, publications, and redacted subscriptions.
 
-Parser-valid DDL whose semantics are not represented by the state model is
-handled as opaque and taints confidence. This includes copied or inherited
-tables, CTAS transaction-lifecycle actions, unsupported role attributes, and
-unmodeled type, view, or materialized-view alterations; these statements are never
-silently recorded as exact no-ops.
-The same rule applies to view options/check options, unpopulated materialized
-views, and domain constraints or collations. CTAS `WITH NO DATA` and expression
-indexes remain typed so their dedicated safety rules can report them; expression
-index key/dependency metadata is not used to claim exact later constraint
-adoption. Policy mutations remain available to security rules, but
-policy role lists and expressions taint confidence because relation state does
-not store them.
-Aggregate creation retains its routine identity but is tainted because
-transition-function and implementation-option dependencies are not modeled.
-Composite, range, and base type creation is opaque because their attributes,
-subtypes, and implementation dependencies are not represented.
-Database create/alter/drop mutations remain available to their syntax rules but
-taint confidence because database-level state is outside the current-database
-schema model.
-Unknown `RESET` parameters are opaque; only modeled timeout/search-path values
-are exact, and explicitly schema-neutral settings such as `application_name`
-remain no-ops.
+Missing required evidence never becomes invented state: the transition is
+skipped and confidence is tainted. Independent syntax findings still report,
+and multi-target view drops remain atomic.
 
-Cache V6 synchronizes all `pg_proc.prokind` values in PostgreSQL's shared
-routine namespace. Function, procedure, aggregate, and window-function
-lifecycle operations use that baseline. Routine DDL without a typed Squawk
-extractor remains opaque.
+The principal precision boundaries are:
 
-Publication synchronization is database-wide even when relation sync is
-schema-scoped. It records owners, publication options, explicit tables, schema
-membership, column lists, and row filters where the connected PostgreSQL
-version provides them. Cache V6 does not store `pg_inherits`, so a later
-publication table edit without `ONLY` is `Tainted`; `ONLY` edits do not require
-inheritance evidence.
-
-Subscription synchronization is limited to the current database and selects
-only non-secret catalog fields. It records owner, enabled state, slot name,
-publication names, and supported settings. It never selects or serializes
-`pg_subscription.subconninfo`; the cached connection target is `Redacted`.
-Creating a connected subscription, refreshing publisher metadata, and dropping
-a subscription remain `Tainted` because their outcome depends on remote state.
-
-On PostgreSQL 17 and newer, relation ACL synchronization and grant/revoke
-analysis recognize the table `MAINTAIN` privilege. `GRANT ALL` expands to that
-privilege only when the cache identifies PostgreSQL 17 or newer; older or
-version-unknown baselines retain the pre-17 expansion conservatively.
+| Area | Contract |
+| --- | --- |
+| Unsupported DDL | Parser-valid but unmodeled semantics are opaque and `Tainted`, never exact no-ops. This includes copied/inherited tables, CTAS lifecycle actions, unsupported role attributes, and unmodeled database, type, view, materialized-view, domain, or aggregate details. |
+| Indexes | Synchronized complex-index dependencies support exact cleanup. Locally parsed complex indexes do not claim that precision. CTAS `WITH NO DATA` and expression indexes remain available to safety rules. |
+| Grants and policies | `ALL TABLES IN SCHEMA` and policy role/expression changes are `Tainted`; their useful modeled effects remain available to security rules. PostgreSQL 17+ `MAINTAIN` is recognized only with a versioned baseline. |
+| Routines and settings | All synchronized routine kinds are modeled; routine DDL without a typed Squawk extractor is opaque. Unknown `RESET` parameters are opaque, while modeled timeouts/search path and schema-neutral settings remain exact. |
+| Publications | Sync is database-wide. Table edits without `ONLY` are `Tainted` until effective partition scope is proven. |
+| Subscriptions | Only non-secret fields are cached; connection targets are `Redacted`. Connected create, refresh, and drop operations are `Tainted` because they depend on remote state. |
 
 ## Timeout evidence
 
 `require-lock-timeout` and `require-statement-timeout` are Tier 2 primary rules.
-For statements that Squawk's pinned `possibly_slow_stmt` classifier identifies
-as potentially disruptive, they require known positive effective values. The
-lock-timeout rule also reports a positive `lock_timeout` that is greater than
-or equal to a positive `statement_timeout`, because PostgreSQL reaches the
-statement timeout first in that ordering.
+They require positive effective values for statements identified by Squawk's
+pinned `possibly_slow_stmt` classifier. `lock_timeout` must also be shorter than
+a positive `statement_timeout`.
 
-Analysis initializes both settings from Cache V6, or as unknown when no cache
-is available. Ordered `SET`, `SET LOCAL`, `SET ... DEFAULT`, `RESET`, and
-`RESET ALL` statements update modeled values. Transaction commit, rollback,
-and savepoint rollback must match PostgreSQL session-versus-local behavior.
-`SET LOCAL` outside an explicit transaction has no modeled effect. Each timeout
-rule reports at most once per input file.
+Values begin from Cache V7, or unknown without a cache. Ordered `SET`, local
+settings, resets, commits, and rollbacks follow PostgreSQL session/local
+behavior. `SET LOCAL` outside a transaction has no modeled effect. Each rule
+reports at most once per input file.
 
 ## Failure behavior
 
@@ -267,41 +197,27 @@ These conditions exit `1` instead of producing a clean report:
 - unsupported command-line combinations;
 - internal serialization or analysis failure.
 
-Automatic refresh failure prints the error and continues with the old readable
-V6 cache, or with no baseline if none exists. A fresh retained cache keeps its
-confidence; an unavailable or stale baseline is `Tainted`. JSON records the
-failed refresh.
+Sync replaces a cache only after its new payload is complete. An automatic
+refresh failure is recorded in JSON and may reuse a readable V7 cache; otherwise
+analysis continues without a baseline and is `Tainted`.
 
-Sync replaces an existing cache only after the new payload is complete.
-Encrypted caches require `cache_encryption = true` and a valid
-`SAFE_MIGRATE_CACHE_KEY` from the environment. Plaintext mode rejects encrypted
-caches, and encrypted mode rejects plaintext caches. Changing modes requires a
-fresh `safe-migrate sync`.
-
-V6 cache payloads carry an explicit format header and record effective/session
-role provenance, the unexpanded search-path setting, effective lock and
-statement timeouts in milliseconds, PostgreSQL role membership, authoritative
-synchronized schemas, sequence ownership/kind, all routine kinds,
-publications, and redacted subscriptions. They never include password hashes
-or subscription connection strings. V1–V5 and unheadered payloads are rejected
-with guidance to run `safe-migrate sync`. A failed automatic refresh may reuse
-a readable V6 cache, but never an older format.
+Encrypted mode requires `cache_encryption = true` and a valid
+`SAFE_MIGRATE_CACHE_KEY`. Cache modes cannot be mixed; switching requires a new
+`sync`. V7 carries an explicit header, coverage and scope-completion markers,
+role/session provenance, schemas, settings, dependencies, and redacted catalog
+metadata. It never contains password hashes or subscription connection strings.
+V1–V6 and unheadered caches are rejected with resync guidance.
 
 ### GitHub Action
 
-- A managed-cache miss runs `--no-cache` with `Tainted` confidence. A missing
-  explicit cache is an error.
-- `sync: "true"` refreshes the baseline before linting. Lint always suppresses
-  config-driven `auto_sync`, and database access is removed after the
-  Action-controlled refresh.
-- An explicit config path must exist, and its `cache_encryption` setting must
-  match `encrypted-cache`.
-- An encrypted sync without a valid key fails before database access. A lint
-  job without the key runs without the encrypted baseline.
-- Exit `2` fails unless `advisory: "true"` is set. Exit `1` always fails.
-- Exact release tags install checksum-verified release assets. Full
-  40-character SHAs and local source invocations build the checked-out source.
-  Mutable branch references are rejected.
+| Concern | Contract |
+| --- | --- |
+| Mode | Analysis requires `path`. `mode: auto` uses `lint` for a file and `lint-chain` for a directory. `sync: "true"` without `path` is refresh-only; with `path`, analysis follows. |
+| Baseline | Normal analysis requires a managed or explicit baseline. Only `no-cache: "true"` enables degraded analysis. |
+| Configuration | An explicit config must exist. Caches are encrypted by default; plaintext requires `encrypted-cache: "false"`, and the config must agree. A missing/invalid key fails before database access or parsing. |
+| Isolation | Analysis disables config-driven `auto_sync` and removes database access after refresh. `output-dir` must remain inside the workspace, without dot segments or symlink traversal. |
+| Result | Exit `2` fails unless advisory; exit `1` always fails. Refresh-only success returns empty reports, `sync-status=refreshed`, and `baseline-source=synced`. |
+| Source | Exact tags use checksum-verified assets. Full 40-character SHAs and local invocations build source. Mutable branch references are rejected. |
 
 Errors must identify the failed input or subsystem without printing
 `DATABASE_URL`, credentials, or migration contents not already requested in the
@@ -309,9 +225,5 @@ report.
 
 ## Compatibility
 
-Before v1.0, the CLI may evolve, but user-visible changes still require:
-
-1. regression tests;
-2. a `CHANGELOG.md` entry;
-3. an update to this contract;
-4. an explicit migration note for scripts or CI consumers.
+Before v1.0 the CLI may evolve. User-visible changes still require regression
+tests, a changelog and contract update, and a migration note for automation.

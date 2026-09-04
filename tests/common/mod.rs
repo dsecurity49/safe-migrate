@@ -2,18 +2,18 @@
 
 pub mod invariants;
 
-use safe_migrate::ast::identifiers::ObjectId;
-use safe_migrate::db::cache::DbCache;
-use safe_migrate::engine::config::Config;
-use safe_migrate::engine::engine::SafeMigrateEngine;
-use safe_migrate::model::relation::{Persistence, RelationKind, RelationState};
+use safe_migrate::_internal::ast::identifiers::ObjectId;
+use safe_migrate::_internal::db::cache::DbCache;
+use safe_migrate::_internal::engine::config::Config;
+use safe_migrate::_internal::engine::engine::SafeMigrateEngine;
+use safe_migrate::_internal::model::relation::{Persistence, RelationKind, RelationState};
 
 pub fn setup_engine() -> SafeMigrateEngine {
     SafeMigrateEngine::new(Config::default())
 }
 
-pub fn setup_state() -> safe_migrate::AnalysisState {
-    safe_migrate::AnalysisState::new(cache_with_safe_timeouts())
+pub fn setup_state() -> safe_migrate::api::AnalysisState {
+    safe_migrate::api::AnalysisState::new(cache_with_safe_timeouts())
 }
 
 fn cache_with_safe_timeouts() -> DbCache {

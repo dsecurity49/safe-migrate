@@ -1,15 +1,15 @@
 mod common;
 
 use common::{object_id, setup_engine};
-use safe_migrate::AnalysisState;
-use safe_migrate::analysis::facts::{PublicationObjectFact, PublicationScope};
-use safe_migrate::analysis::graph::DependencyKind;
-use safe_migrate::db::cache::DbCache;
-use safe_migrate::model::relation::{Persistence, RelationKind, RelationState};
-use safe_migrate::model::role::RoleState;
-use safe_migrate::model::schema::{SchemaOverlay, SchemaState};
-use safe_migrate::model::sequence::{SequenceKind, SequenceOverlay, SequenceState};
-use safe_migrate::model::types::{TypeKind, TypeState};
+use safe_migrate::_internal::analysis::facts::{PublicationObjectFact, PublicationScope};
+use safe_migrate::_internal::analysis::graph::DependencyKind;
+use safe_migrate::_internal::db::cache::{DbCache, IndexCache};
+use safe_migrate::_internal::model::relation::{Persistence, RelationKind, RelationState};
+use safe_migrate::_internal::model::role::RoleState;
+use safe_migrate::_internal::model::schema::{SchemaOverlay, SchemaState};
+use safe_migrate::_internal::model::sequence::{SequenceKind, SequenceOverlay, SequenceState};
+use safe_migrate::_internal::model::types::{TypeKind, TypeState};
+use safe_migrate::api::AnalysisState;
 
 fn cache_with_public_schema() -> DbCache {
     let mut cache = DbCache::new();
@@ -22,9 +22,11 @@ fn cache_with_public_schema() -> DbCache {
             id: owner.clone(),
             can_login: true,
             is_superuser: true,
+            inherits: true,
             member_of: Vec::new(),
+            can_administer_membership: Vec::new(),
+            can_inherit_from: Vec::new(),
             can_set_role_to: Vec::new(),
-            granted_privileges: Vec::new(),
         },
     );
     cache.schemas.insert(
@@ -112,6 +114,19 @@ fn schema_rename_remaps_namespace_and_rolls_back_atomically() {
             generation: 0,
         },
     );
+    cache.schemas.insert(
+        "schema_new".into(),
+        SchemaState {
+            name: "schema_new".into(),
+            owner: owner.clone(),
+            generation: 0,
+        },
+    );
+    cache.metadata.schemas = Some(vec![
+        "public".into(),
+        "schema_old".into(),
+        "schema_new".into(),
+    ]);
     let table = object_id("schema_old", "t");
     cache.insert_baseline(
         table.clone(),
@@ -157,6 +172,11 @@ fn schema_rename_remaps_namespace_and_rolls_back_atomically() {
             &mut state,
         )
         .unwrap();
+    // Make the target a locally authoritative tombstone. A scoped baseline
+    // cannot prove that an entirely unseen schema name is absent.
+    engine
+        .analyze("DROP SCHEMA schema_new CASCADE;", &mut state)
+        .unwrap();
 
     let rename_findings = engine
         .analyze(
@@ -191,7 +211,7 @@ fn schema_rename_remaps_namespace_and_rolls_back_atomically() {
     assert_eq!(state.local.search_path, ["public"]);
     assert!(matches!(
         state.local.publications.get("app_publication"),
-        Some(safe_migrate::model::replication::PublicationOverlay::Present(publication))
+        Some(safe_migrate::_internal::model::replication::PublicationOverlay::Present(publication))
             if matches!(
                 &publication.scope,
                 PublicationScope::Explicit(objects)
@@ -218,9 +238,18 @@ fn schema_rename_remaps_namespace_and_rolls_back_atomically() {
             .contains_key(&object_id("schema_old", "t_id_seq"))
     );
     assert_eq!(state.local.search_path, ["schema_old", "public"]);
+    assert_eq!(
+        state.baseline_schemas.as_ref(),
+        Some(&std::collections::HashSet::from([
+            "public".to_string(),
+            "schema_old".to_string(),
+            "schema_new".to_string(),
+        ])),
+        "rollback must restore authoritative schema scope as well as local objects"
+    );
     assert!(matches!(
         state.local.publications.get("app_publication"),
-        Some(safe_migrate::model::replication::PublicationOverlay::Present(publication))
+        Some(safe_migrate::_internal::model::replication::PublicationOverlay::Present(publication))
             if matches!(
                 &publication.scope,
                 PublicationScope::Explicit(objects)
@@ -237,7 +266,7 @@ fn schema_rename_remaps_namespace_and_rolls_back_atomically() {
         .unwrap();
     assert!(matches!(
         state.local.publications.get("app_publication"),
-        Some(safe_migrate::model::replication::PublicationOverlay::Present(publication))
+        Some(safe_migrate::_internal::model::replication::PublicationOverlay::Present(publication))
             if matches!(
                 &publication.scope,
                 PublicationScope::Explicit(objects) if objects.is_empty()
@@ -271,6 +300,36 @@ fn table_set_schema_moves_the_relation_and_preserves_baseline_origin() {
             0,
         ),
     );
+    let sequence_id = object_id("public", "accounts_id_seq");
+    cache.sequences.insert(
+        sequence_id.clone(),
+        SequenceState {
+            id: sequence_id.clone(),
+            owner: object_id("", "owner"),
+            owned_by: Some((old_id.clone(), "id".into())),
+            kind: SequenceKind::SerialLike,
+            generation: 0,
+        },
+    );
+    let index_id = object_id("public", "accounts_id_idx");
+    cache.indexes.push(IndexCache {
+        index_id: index_id.clone(),
+        table_id: old_id.clone(),
+        using_method: "btree".into(),
+        key_columns: vec!["id".into()],
+        included_columns: Vec::new(),
+        dependency_columns: vec!["id".into()],
+        dependency_columns_known: true,
+        has_expression_keys: false,
+        has_predicate: false,
+        is_unique: false,
+        is_valid: true,
+        is_ready: true,
+        is_live: true,
+        has_default_sort_order: true,
+        has_default_opclasses: true,
+        has_default_collations: true,
+    });
     let mut state = AnalysisState::new(cache);
 
     engine
@@ -282,6 +341,33 @@ fn table_set_schema_moves_the_relation_and_preserves_baseline_origin() {
     assert!(!state.relation_is_present(&old_id));
     assert!(state.baseline_relations.contains(&new_id));
     assert!(!state.baseline_relations.contains(&old_id));
+
+    let new_sequence_id = object_id("app", "accounts_id_seq");
+    assert!(matches!(
+        state.local.sequences.get(&new_sequence_id),
+        Some(SequenceOverlay::Present(sequence))
+            if sequence.id == new_sequence_id
+                && sequence.owned_by == Some((new_id.clone(), "id".into()))
+    ));
+    assert!(!state.local.sequences.contains_key(&sequence_id));
+    assert!(state.baseline_sequences.contains(&new_sequence_id));
+    assert!(!state.baseline_sequences.contains(&sequence_id));
+
+    let new_index_id = object_id("app", "accounts_id_idx");
+    assert!(!state.local.graph.edges().iter().any(|edge| {
+        edge.dependent == index_id && matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
+    }));
+    assert!(state.local.graph.edges().iter().any(|edge| {
+        edge.dependent == new_index_id
+            && matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
+    }));
+    assert!(state.baseline_indexes.contains(&new_index_id));
+    assert!(!state.baseline_indexes.contains(&index_id));
+    assert!(state.local.graph.edges().iter().any(|edge| {
+        edge.dependent == new_index_id
+            && edge.referenced == new_id
+            && matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
+    }));
 }
 
 #[test]

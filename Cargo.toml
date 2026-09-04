@@ -1,9 +1,9 @@
 [package]
 name = "safe-migrate"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 rust-version = "1.94"
-description = "Sync PostgreSQL metadata, then lint migrations offline"
+description = "Check PostgreSQL migrations against a synchronized database baseline"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/dsecurity49/safe-migrate"
 homepage = "https://github.com/dsecurity49/safe-migrate"

@@ -2,16 +2,16 @@ mod common;
 
 mod rule_evaluation_tests {
     use crate::common::*;
-    use safe_migrate::analysis::state::{AnalysisState, Confidence};
-    use safe_migrate::ast::identifiers::ObjectId;
-    use safe_migrate::engine::config::{Config, RuleConfig};
-    use safe_migrate::engine::engine::SafeMigrateEngine;
-    use safe_migrate::model::column::Column;
-    use safe_migrate::model::function::{
+    use safe_migrate::_internal::analysis::state::{AnalysisState, Confidence};
+    use safe_migrate::_internal::ast::identifiers::ObjectId;
+    use safe_migrate::_internal::engine::config::{Config, RuleConfig};
+    use safe_migrate::_internal::engine::engine::SafeMigrateEngine;
+    use safe_migrate::_internal::model::column::Column;
+    use safe_migrate::_internal::model::function::{
         FunctionOverlay, FunctionState, RoutineKind, SecurityMode, Volatility,
     };
-    use safe_migrate::model::relation::{Persistence, RelationKind, RelationState};
-    use safe_migrate::report::violations::ViolationTier;
+    use safe_migrate::_internal::model::relation::{Persistence, RelationKind, RelationState};
+    use safe_migrate::_internal::report::violations::ViolationTier;
 
     #[test]
     fn test_rule_idempotency() {
@@ -55,7 +55,7 @@ mod rule_evaluation_tests {
     fn test_rule_size_aware_toast_escalation() {
         let engine = setup_engine();
 
-        let mut cache = safe_migrate::db::cache::DbCache::new();
+        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
 
         let tid = object_id("public", "t_toast");
 
@@ -103,7 +103,7 @@ mod rule_evaluation_tests {
     fn test_rule_blocking_constraint_check_and_not_valid_fast_path() {
         let engine = setup_engine();
 
-        let mut cache = safe_migrate::db::cache::DbCache::new();
+        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
 
         cache.insert_baseline(
             object_id("public", "t"),
@@ -149,7 +149,7 @@ mod rule_evaluation_tests {
     fn test_rule_blocking_constraint_pk_and_unique() {
         let engine = setup_engine();
 
-        let mut cache = safe_migrate::db::cache::DbCache::new();
+        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
 
         cache.insert_baseline(
             object_id("public", "t"),
@@ -210,7 +210,7 @@ mod rule_evaluation_tests {
     fn test_rule_mat_view_refresh() {
         let engine = setup_engine();
 
-        let mut cache = safe_migrate::db::cache::DbCache::new();
+        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
 
         cache.insert_baseline(
             object_id("public", "mv"),
@@ -247,7 +247,7 @@ mod rule_evaluation_tests {
     fn test_rule_partition_attach_detach() {
         let engine = setup_engine();
 
-        let mut cache = safe_migrate::db::cache::DbCache::new();
+        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
 
         cache.insert_baseline(
             object_id("public", "p"),
@@ -335,7 +335,7 @@ mod rule_evaluation_tests {
     #[test]
     fn test_tainted_confidence_downgrades_tier1_to_tier2() {
         let engine = setup_engine();
-        let mut cache = safe_migrate::db::cache::DbCache::new();
+        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
         let tid = object_id("public", "t");
         cache.insert_baseline(
             tid.clone(),
@@ -380,9 +380,54 @@ mod rule_evaluation_tests {
     }
 
     #[test]
+    fn missing_relation_statistics_taint_only_statistics_based_findings() {
+        let engine = setup_engine();
+        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        let table_id = object_id("public", "stats_unknown");
+        let mut relation = RelationState::new(
+            table_id.clone(),
+            object_id("public", "postgres"),
+            0,
+            None,
+            RelationKind::Table,
+            Persistence::Permanent,
+            0,
+        );
+        relation.columns.push(Column {
+            name: "id".into(),
+            data_type: Some("integer".into()),
+            type_id: None,
+            is_nullable: false,
+            default: None,
+            avg_width: Some(4),
+            default_expr_text: None,
+            type_modifier: None,
+        });
+        cache.insert_baseline(table_id, relation);
+        let mut state = AnalysisState::new(cache);
+
+        let findings = engine
+            .analyze(
+                "CREATE INDEX stats_unknown_idx ON stats_unknown(id);",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(
+            findings
+                .iter()
+                .any(|finding| { finding.rule_id == "require-concurrent-index" })
+        );
+        assert_eq!(state.local.confidence, Confidence::Tainted);
+        assert!(state.evidence().iter().any(|record| {
+            record.code == safe_migrate::_internal::analysis::evidence::EvidenceCode::CatalogCoverageIncomplete
+        }));
+    }
+
+    #[test]
     fn test_confidence_taint_does_not_affect_prior_violations() {
         let engine = setup_engine();
-        let mut cache = safe_migrate::db::cache::DbCache::new();
+        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
         let tid = object_id("public", "t");
         cache.insert_baseline(
             tid.clone(),
@@ -431,7 +476,7 @@ mod rule_evaluation_tests {
     #[test]
     fn test_exact_confidence_keeps_tier1() {
         let engine = setup_engine();
-        let mut cache = safe_migrate::db::cache::DbCache::new();
+        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
         let tid = object_id("public", "t");
         cache.insert_baseline(
             tid.clone(),
@@ -529,7 +574,7 @@ mod rule_evaluation_tests {
     fn grant_all_owner_exemption_requires_every_grantee_to_own_every_table() {
         let engine = setup_engine();
         let table_id = object_id("public", "owned_table");
-        let mut cache = safe_migrate::db::cache::DbCache::new();
+        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
         cache.insert_baseline(
             table_id.clone(),
             RelationState::new(
@@ -595,15 +640,15 @@ mod rule_evaluation_tests {
     #[test]
     fn test_rule_volatile_default_alter() {
         let engine = setup_engine();
-        let mut cache = safe_migrate::db::cache::DbCache::new();
+        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
         let tid = object_id("public", "t");
         let rel = RelationState::new(
             tid.clone(),
             object_id("public", "postgres"),
             0,
             Some(10),
-            safe_migrate::model::relation::RelationKind::Table,
-            safe_migrate::model::relation::Persistence::Permanent,
+            safe_migrate::_internal::model::relation::RelationKind::Table,
+            safe_migrate::_internal::model::relation::Persistence::Permanent,
             0,
         );
         cache.insert_baseline(tid, rel);
@@ -835,6 +880,9 @@ mod rule_evaluation_tests {
         let v = engine.analyze("VACUUM FULL t;", &mut state).unwrap();
 
         assert!(v.iter().any(|v| v.rule_id.contains("vacuum")));
+        assert!(state.evidence().iter().any(|record| {
+            record.code == safe_migrate::_internal::analysis::evidence::EvidenceCode::UnsupportedSemantics
+        }));
     }
 
     #[test]
@@ -849,7 +897,7 @@ mod rule_evaluation_tests {
 
         // 2. Force the table to be "massive" and originate from an old transaction
         // to bypass the same-transaction exemption logic we introduced.
-        if let Some(safe_migrate::model::relation::RelationOverlay::Present(rel)) =
+        if let Some(safe_migrate::_internal::model::relation::RelationOverlay::Present(rel)) =
             state.local.relations.get_mut(&object_id("public", "t"))
         {
             rel.estimated_rows = Some(500_000);
@@ -882,14 +930,14 @@ mod rule_evaluation_tests {
         state.baseline_relations.insert(object_id("public", "t"));
         state.local.relations.insert(
             object_id("public", "t"),
-            safe_migrate::model::relation::RelationOverlay::Present(
-                safe_migrate::model::relation::RelationState::new(
+            safe_migrate::_internal::model::relation::RelationOverlay::Present(
+                safe_migrate::_internal::model::relation::RelationState::new(
                     object_id("public", "t"),
                     object_id("public", "postgres"),
                     0,
                     Some(500_000),
-                    safe_migrate::model::relation::RelationKind::Table,
-                    safe_migrate::model::relation::Persistence::Permanent,
+                    safe_migrate::_internal::model::relation::RelationKind::Table,
+                    safe_migrate::_internal::model::relation::Persistence::Permanent,
                     0,
                 ),
             ),
@@ -915,10 +963,10 @@ mod rule_evaluation_tests {
         );
         let engine = SafeMigrateEngine::new(config);
 
-        let mut cache = safe_migrate::db::cache::DbCache::new();
+        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
         cache.insert_baseline(
             object_id("public", "t"),
-            safe_migrate::model::relation::RelationState::new(
+            safe_migrate::_internal::model::relation::RelationState::new(
                 object_id("public", "t"),
                 ObjectId::new("public", "postgres"),
                 0,
@@ -948,10 +996,10 @@ mod rule_evaluation_tests {
     fn test_rule_concurrent_drop_index_small() {
         let engine = setup_engine();
 
-        let mut cache = safe_migrate::db::cache::DbCache::new();
+        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
         cache.insert_baseline(
             object_id("public", "t"),
-            safe_migrate::model::relation::RelationState::new(
+            safe_migrate::_internal::model::relation::RelationState::new(
                 object_id("public", "t"),
                 ObjectId::new("public", "postgres"),
                 0,
@@ -980,7 +1028,7 @@ mod rule_evaluation_tests {
     #[test]
     fn scoped_cache_reports_unknown_schema_as_coverage_not_drift() {
         let engine = setup_engine();
-        let mut cache = safe_migrate::db::cache::DbCache::new();
+        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
         cache.metadata.schemas = Some(vec!["app".to_string()]);
         let mut state = AnalysisState::new(cache);
 
@@ -1039,7 +1087,7 @@ mod rule_evaluation_tests {
                 violations.iter().any(|violation| {
                     violation.rule_id == "schema-drift"
                         && violation.object_kind
-                            == safe_migrate::report::violations::ObjectKind::Procedure
+                            == safe_migrate::_internal::report::violations::ObjectKind::Procedure
                 }),
                 "{sql}"
             );
@@ -1052,7 +1100,7 @@ mod rule_evaluation_tests {
         let routine_id = object_id("public", "work(integer)");
 
         for routine_kind in [RoutineKind::Function, RoutineKind::Procedure] {
-            let mut cache = safe_migrate::db::cache::DbCache::new();
+            let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
             cache.functions.insert(
                 routine_id.clone(),
                 FunctionState {

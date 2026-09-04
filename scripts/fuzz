@@ -63,7 +63,7 @@ for migration in "$corpus_dir"/*.sql; do
         0|2)
             if ! verdict=$(
                 jq -er '
-                    select(.schema_version == 1)
+                    select(.schema_version == 2)
                     | .verdict
                     | select(
                         . == "SAFE"

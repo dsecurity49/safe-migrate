@@ -1,15 +1,18 @@
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
-use safe_migrate::analysis::state::Confidence;
-use safe_migrate::db::cache::{CACHE_V6_MAGIC, CacheMetadata, DbCacheVersioned};
-use safe_migrate::db::cache_file::{
+use safe_migrate::_internal::analysis::evidence::{EvidenceCode, EvidenceRecord, EvidenceScope};
+use safe_migrate::_internal::analysis::outcome::AnalysisOutcome;
+use safe_migrate::_internal::db::cache::{
+    CACHE_FORMAT_VERSION, CACHE_V7_MAGIC, CacheMetadata, CatalogCoverage, DbCacheVersioned,
+};
+use safe_migrate::_internal::db::cache_file::{
     MAX_CACHE_DECODE_BYTES, is_encrypted_cache_bytes, read_cache_bytes, unprotect_cache_bytes,
 };
-use safe_migrate::model::relation::RelationKind;
-use safe_migrate::report::violations::{ReportFinding, Violation};
-use safe_migrate::rules::registry::{self, RuleDescriptor};
-use safe_migrate::sync;
-use safe_migrate::{AnalysisState, Config, DbCache, Reporter, SafeMigrateEngine};
+use safe_migrate::_internal::model::relation::RelationKind;
+use safe_migrate::_internal::report::violations::{ReportFinding, Violation};
+use safe_migrate::_internal::rules::registry::{self, RuleDescriptor};
+use safe_migrate::_internal::sync;
+use safe_migrate::api::{AnalysisState, Config, DbCache, Reporter, SafeMigrateEngine};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -17,11 +20,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const EXIT_BLOCKING_FINDINGS: i32 = 2;
 
+mod cli_init;
+use cli_init::InitCommands;
+
 #[derive(Parser, Debug)]
 #[command(name = "safe-migrate")]
 #[command(version)]
 #[command(
-    about = "Sync PostgreSQL metadata, then lint migrations offline",
+    about = "Check PostgreSQL migrations against a synchronized database baseline",
     long_about = None
 )]
 struct Cli {
@@ -35,6 +41,11 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Create reviewed project integration files
+    Init {
+        #[command(subcommand)]
+        command: InitCommands,
+    },
     /// Lint a SQL migration file
     Lint {
         #[arg(short, long)]
@@ -188,6 +199,7 @@ struct CacheInspection {
     age_seconds: Option<u64>,
     source_database: Option<String>,
     schemas: Option<Vec<String>>,
+    coverage: CatalogCoverage,
     search_path: Vec<String>,
     postgresql_version_num: Option<u32>,
     observed_settings: ObservedSettings,
@@ -212,6 +224,7 @@ struct CacheContentsSummary {
     indexes: usize,
     foreign_keys: usize,
     constraints: usize,
+    constraint_keys: usize,
     triggers: usize,
     functions: usize,
     procedures: usize,
@@ -222,6 +235,7 @@ struct CacheContentsSummary {
     types: usize,
     roles: usize,
     dependencies: usize,
+    inheritances: usize,
 }
 
 impl OutputMode {
@@ -247,6 +261,7 @@ fn main() -> Result<()> {
     }
 
     match cli.command {
+        Commands::Init { command } => cli_init::run(command),
         Commands::Lint {
             file,
             config,
@@ -300,7 +315,7 @@ fn main() -> Result<()> {
 }
 
 fn rule_descriptor_json(descriptor: &RuleDescriptor, config: &Config) -> serde_json::Value {
-    use safe_migrate::rules::registry::RuleConfigurationField;
+    use safe_migrate::_internal::rules::registry::RuleConfigurationField;
 
     let mut effective = serde_json::json!({
         "enabled": !config.is_rule_disabled(descriptor.id),
@@ -319,9 +334,9 @@ fn rule_descriptor_json(descriptor: &RuleDescriptor, config: &Config) -> serde_j
         "summary": descriptor.summary,
         "impact": descriptor.impact,
         "default_tier": match descriptor.default_tier() {
-            safe_migrate::report::violations::ViolationTier::Tier1 => "Tier1",
-            safe_migrate::report::violations::ViolationTier::Tier2 => "Tier2",
-            safe_migrate::report::violations::ViolationTier::Tier3 => "Tier3",
+            safe_migrate::_internal::report::violations::ViolationTier::Tier1 => "Tier1",
+            safe_migrate::_internal::report::violations::ViolationTier::Tier2 => "Tier2",
+            safe_migrate::_internal::report::violations::ViolationTier::Tier3 => "Tier3",
         },
         "remediation": descriptor.recipe(),
         "supported_configuration_fields": descriptor
@@ -389,7 +404,7 @@ fn run_rules(rule_id: Option<&str>, json: bool, config_path: Option<&Path>) -> R
             "enabled={}",
             !config.is_rule_disabled(descriptor.id)
         )];
-        use safe_migrate::rules::registry::RuleConfigurationField;
+        use safe_migrate::_internal::rules::registry::RuleConfigurationField;
         if descriptor.supports(RuleConfigurationField::Tier1ThresholdRows) {
             effective.push(format!(
                 "tier1_threshold_rows={}",
@@ -430,13 +445,13 @@ fn run_lint(
 
     let engine = SafeMigrateEngine::new(config);
     let mut state = AnalysisState::with_baseline(db_cache, !baseline_unknown);
-    let findings = engine
-        .analyze_with_locations(file.display().to_string(), sql, &mut state)
+    let outcome = engine
+        .analyze_outcome_with_locations(file.display().to_string(), sql, &mut state)
         .map_err(analysis_error)?;
+    let outcome = attach_baseline_evidence(outcome, baseline_unknown, baseline_stale);
 
     finish_analysis(
-        findings,
-        &mut state,
+        outcome,
         baseline_unknown,
         baseline_stale,
         auto_sync,
@@ -495,13 +510,13 @@ fn run_lint_chain(
 
     let engine = SafeMigrateEngine::new(config);
     let mut state = AnalysisState::with_baseline(db_cache, !baseline_unknown);
-    let findings = engine
-        .analyze_chain_with_locations(&migrations, &mut state)
+    let outcome = engine
+        .analyze_chain_outcome_with_locations(&migrations, &mut state)
         .map_err(analysis_error)?;
+    let outcome = attach_baseline_evidence(outcome, baseline_unknown, baseline_stale);
 
     finish_analysis(
-        findings,
-        &mut state,
+        outcome,
         baseline_unknown,
         baseline_stale,
         auto_sync,
@@ -541,6 +556,7 @@ fn run_cache_inspect(cache_path: &Path, config_path: Option<&Path>, json: bool) 
             .map(|created_at| now.saturating_sub(created_at)),
         source_database: cache.metadata.source_database.clone(),
         schemas: cache.metadata.schemas.clone(),
+        coverage: cache.coverage.clone(),
         search_path: cache.search_path.clone(),
         postgresql_version_num: cache.pg_version_num,
         observed_settings: ObservedSettings {
@@ -577,10 +593,10 @@ fn summarize_cache(cache: &DbCache) -> CacheContentsSummary {
     let mut window_functions = 0;
     for routine in cache.functions.values() {
         match routine.routine_kind {
-            safe_migrate::model::function::RoutineKind::Function => functions += 1,
-            safe_migrate::model::function::RoutineKind::Procedure => procedures += 1,
-            safe_migrate::model::function::RoutineKind::Aggregate => aggregates += 1,
-            safe_migrate::model::function::RoutineKind::Window => window_functions += 1,
+            safe_migrate::_internal::model::function::RoutineKind::Function => functions += 1,
+            safe_migrate::_internal::model::function::RoutineKind::Procedure => procedures += 1,
+            safe_migrate::_internal::model::function::RoutineKind::Aggregate => aggregates += 1,
+            safe_migrate::_internal::model::function::RoutineKind::Window => window_functions += 1,
         }
     }
     CacheContentsSummary {
@@ -594,6 +610,7 @@ fn summarize_cache(cache: &DbCache) -> CacheContentsSummary {
         indexes: cache.indexes.len(),
         foreign_keys: cache.foreign_keys.len(),
         constraints: cache.constraints.len(),
+        constraint_keys: cache.constraint_keys.len(),
         triggers: cache.triggers.len(),
         functions,
         procedures,
@@ -604,6 +621,7 @@ fn summarize_cache(cache: &DbCache) -> CacheContentsSummary {
         types: cache.types.len(),
         roles: cache.roles.len(),
         dependencies: cache.dependencies.len(),
+        inheritances: cache.inheritances.len(),
     }
 }
 
@@ -643,6 +661,14 @@ fn print_cache_inspection(inspection: &CacheInspection) {
             .map(|schemas| schemas.join(", "))
             .unwrap_or_else(|| "all non-system schemas".to_string())
     );
+    println!(
+        "Catalog coverage: {}",
+        inspection
+            .coverage
+            .family_names()
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     println!("Search path: {}", inspection.search_path.join(", "));
     println!(
         "PostgreSQL version: {}",
@@ -680,6 +706,10 @@ fn print_cache_inspection(inspection: &CacheInspection) {
     println!("    {:<22} {}", "Columns:", contents.columns);
     println!("    {:<22} {}", "Indexes:", contents.indexes);
     println!("    {:<22} {}", "Constraints:", contents.constraints);
+    println!(
+        "    {:<22} {}",
+        "Constraint keys:", contents.constraint_keys
+    );
     println!("    {:<22} {}", "Foreign keys:", contents.foreign_keys);
     println!("    {:<22} {}", "Triggers:", contents.triggers);
     println!("    {:<22} {}", "Types:", contents.types);
@@ -700,6 +730,7 @@ fn print_cache_inspection(inspection: &CacheInspection) {
     println!("  Security and graph");
     println!("    {:<22} {}", "Roles:", contents.roles);
     println!("    {:<22} {}", "Dependencies:", contents.dependencies);
+    println!("    {:<22} {}", "Inheritance edges:", contents.inheritances);
     println!();
     println!(
         "Redaction: this summary intentionally omits object, column, role, and dependency names; cache files still contain that metadata and must be handled as sensitive."
@@ -863,7 +894,7 @@ fn decode_cache(cache_path: &Path, cache_encryption: bool) -> Result<(DbCache, u
         )
     })?;
     let mut decoder = decoder.take(MAX_CACHE_DECODE_BYTES as u64 + 1);
-    let mut header = vec![0; CACHE_V6_MAGIC.len()];
+    let mut header = vec![0; CACHE_V7_MAGIC.len()];
     let mut header_len = 0;
     while header_len < header.len() {
         let read = decoder.read(&mut header[header_len..]).map_err(|error| {
@@ -878,7 +909,7 @@ fn decode_cache(cache_path: &Path, cache_encryption: bool) -> Result<(DbCache, u
         }
         header_len += read;
     }
-    if header_len != CACHE_V6_MAGIC.len() || header != CACHE_V6_MAGIC {
+    if header_len != CACHE_V7_MAGIC.len() || header != CACHE_V7_MAGIC {
         anyhow::bail!(
             "Cache file '{}' uses an unsupported cache format. Run `safe-migrate sync` to rebuild it.",
             cache_path.display()
@@ -925,7 +956,7 @@ fn decode_cache(cache_path: &Path, cache_encryption: bool) -> Result<(DbCache, u
             cache_path.display()
         );
     }
-    let header_version = 6;
+    let header_version = CACHE_FORMAT_VERSION;
     let format_version = versioned.format_version();
     if format_version != header_version {
         anyhow::bail!(
@@ -951,23 +982,15 @@ fn analysis_error(errors: Vec<String>) -> anyhow::Error {
 }
 
 fn finish_analysis(
-    findings: Vec<ReportFinding>,
-    state: &mut AnalysisState,
+    outcome: AnalysisOutcome<ReportFinding>,
     baseline_unknown: bool,
     baseline_stale: bool,
     auto_sync: AutoSyncOutcome,
     metadata: CacheMetadata,
     output_mode: OutputMode,
 ) -> Result<()> {
-    // Preserve worst-case rule evaluation for an empty baseline, then disclose
-    // that the final report has no verified database baseline. A failed
-    // automatic refresh does not invalidate an otherwise fresh cache; its
-    // outcome remains visible in the report's baseline metadata.
-    if baseline_unknown || baseline_stale {
-        state.local.confidence = Confidence::Tainted;
-    }
-
-    let violations: Vec<Violation> = findings
+    let violations: Vec<Violation> = outcome
+        .findings
         .iter()
         .map(|finding| finding.violation.clone())
         .collect();
@@ -986,16 +1009,15 @@ fn finish_analysis(
     });
     match output_mode {
         OutputMode::Human => {
-            Reporter::print_report(&violations, &state.local.confidence);
+            Reporter::print_outcome(&outcome);
         }
         OutputMode::Json => {
-            let mut report =
-                Reporter::json_report_with_locations(&findings, &state.local.confidence);
+            let mut report = Reporter::json_outcome_with_locations(&outcome);
             report["baseline"] = baseline.clone();
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         OutputMode::Markdown => {
-            let mut report = Reporter::markdown_report(&findings, &state.local.confidence);
+            let mut report = Reporter::markdown_outcome(&outcome);
             report.push_str("\n## Baseline\n\n");
             report.push_str(&format!(
                 "- **Status:** `{}`\n- **Automatic sync:** `{}`\n",
@@ -1028,7 +1050,10 @@ fn finish_analysis(
             println!("{report}");
         }
         OutputMode::Interactive => {
-            safe_migrate::run_interactive(&violations, &state.local.confidence)?;
+            safe_migrate::_internal::report::interactive::run_interactive(
+                &violations,
+                &outcome.confidence,
+            )?;
         }
     }
 
@@ -1037,4 +1062,24 @@ fn finish_analysis(
     }
 
     Ok(())
+}
+
+fn attach_baseline_evidence(
+    mut outcome: AnalysisOutcome<ReportFinding>,
+    baseline_unknown: bool,
+    baseline_stale: bool,
+) -> AnalysisOutcome<ReportFinding> {
+    if baseline_unknown {
+        outcome = outcome.with_evidence(EvidenceRecord::new(
+            EvidenceCode::BaselineUnavailable,
+            EvidenceScope::Chain,
+        ));
+    }
+    if baseline_stale {
+        outcome = outcome.with_evidence(EvidenceRecord::new(
+            EvidenceCode::BaselineStale,
+            EvidenceScope::Chain,
+        ));
+    }
+    outcome
 }

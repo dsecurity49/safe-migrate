@@ -105,17 +105,11 @@
         "safe_006_set_default.sql",
         "safe_007_add_not_null.sql",
         "safe_008_rename_table.sql",
-        "safe_009_add_index.sql"
+        "safe_009_add_index.sql",
+        "002_drop_column.sql",
+        "006_drop_column_if_exists.sql"
       ],
       "excluded_fixtures": [
-        {
-          "fixture": "002_drop_column.sql",
-          "reason": "Cache V6 does not retain all foreign-key, index, view, and expression dependency column lists. The simulator conservatively skips a drop when those dependencies are unknown; exact column-aware replay is a 0.8.0 cache-evidence TODO."
-        },
-        {
-          "fixture": "006_drop_column_if_exists.sql",
-          "reason": "IF EXISTS only suppresses an absent-column error; it does not make Cache V6's unknown foreign-key, index, view, and expression column dependencies exact. Exact column-aware replay is a 0.8.0 cache-evidence TODO."
-        },
         {
           "fixture": "safe_005_create_table.sql",
           "reason": "The cumulative canonical baseline contains sm_core.t for rule_18 drop/idempotency cases, so PostgreSQL correctly rejects this unqualified duplicate CREATE TABLE."
@@ -141,6 +135,20 @@
         "indexes",
         "foreign_keys"
       ],
+      "fixture_scopes": {
+        "002_drop_column.sql": [
+          "relations",
+          "columns",
+          "foreign_keys",
+          "view_dependencies"
+        ],
+        "006_drop_column_if_exists.sql": [
+          "relations",
+          "columns",
+          "foreign_keys",
+          "view_dependencies"
+        ]
+      },
       "required_relations": [
         "public.test_table",
         "public.child_table"
@@ -159,12 +167,15 @@
         "safe_002_drop_matview.sql",
         "safe_008_drop_view_if_exists.sql",
         "safe_009_drop_matview_if_exists.sql",
-        "safe_010_drop_view_restrict.sql"
+        "safe_010_drop_view_restrict.sql",
+        "007_drop_pub_cascade.sql",
+        "safe_006_drop_pub.sql",
+        "safe_011_alter_pub_options.sql"
       ],
       "excluded_fixtures": [
         {
           "fixture": "003_drop_seq_cascade.sql",
-          "reason": "Cache V6 synchronizes sequences, but this rule does not compare sequence state."
+          "reason": "Cache V7 synchronizes sequences, but this rule does not compare sequence state."
         },
         {
           "fixture": "004_drop_domain_cascade.sql",
@@ -172,35 +183,27 @@
         },
         {
           "fixture": "005_drop_func_cascade.sql",
-          "reason": "Cache V6 synchronizes routine identity and kind, but this rule does not compare routine state."
+          "reason": "Cache V7 synchronizes routine identity and kind, but this rule does not compare routine state."
         },
         {
           "fixture": "006_drop_proc_cascade.sql",
-          "reason": "Cache V6 synchronizes routine identity and kind, but this rule does not compare routine state."
-        },
-        {
-          "fixture": "007_drop_pub_cascade.sql",
-          "reason": "Cache V6 synchronizes publications, but the differential harness does not compare publication state."
+          "reason": "Cache V7 synchronizes routine identity and kind, but this rule does not compare routine state."
         },
         {
           "fixture": "010_drop_seq_if_exists_cascade.sql",
-          "reason": "Cache V6 synchronizes sequences, but this rule does not compare sequence state."
+          "reason": "Cache V7 synchronizes sequences, but this rule does not compare sequence state."
         },
         {
           "fixture": "safe_003_drop_seq.sql",
-          "reason": "Cache V6 synchronizes sequences, but this rule does not compare sequence state."
+          "reason": "Cache V7 synchronizes sequences, but this rule does not compare sequence state."
         },
         {
           "fixture": "safe_004_drop_func.sql",
-          "reason": "Cache V6 synchronizes routine identity and kind, but this rule does not compare routine state."
+          "reason": "Cache V7 synchronizes routine identity and kind, but this rule does not compare routine state."
         },
         {
           "fixture": "safe_005_drop_proc.sql",
-          "reason": "Cache V6 synchronizes routine identity and kind, but this rule does not compare routine state."
-        },
-        {
-          "fixture": "safe_006_drop_pub.sql",
-          "reason": "Cache V6 synchronizes publications, but the differential harness does not compare publication state."
+          "reason": "Cache V7 synchronizes routine identity and kind, but this rule does not compare routine state."
         },
         {
           "fixture": "safe_007_drop_domain.sql",
@@ -220,6 +223,17 @@
       "scope": [
         "relations"
       ],
+      "fixture_scopes": {
+        "007_drop_pub_cascade.sql": [
+          "publications"
+        ],
+        "safe_006_drop_pub.sql": [
+          "publications"
+        ],
+        "safe_011_alter_pub_options.sql": [
+          "publications"
+        ]
+      },
       "required_relations": [
         "sm_core.myview",
         "sm_core.mymat"
@@ -715,7 +729,7 @@
         },
         {
           "fixture": "005_drop_sequence.sql",
-          "reason": "Cache V6 synchronizes sequences, but this rule does not compare sequence state."
+          "reason": "Cache V7 synchronizes sequences, but this rule does not compare sequence state."
         },
         {
           "fixture": "008_add_column.sql",
@@ -739,7 +753,7 @@
         },
         {
           "fixture": "013_create_sequence.sql",
-          "reason": "Cache V6 synchronizes sequences, but this rule does not compare sequence state."
+          "reason": "Cache V7 synchronizes sequences, but this rule does not compare sequence state."
         },
         {
           "fixture": "016_create_schema.sql",
@@ -759,7 +773,7 @@
         },
         {
           "fixture": "safe_005_drop_sequence_if_exists.sql",
-          "reason": "Cache V6 synchronizes sequences, but this rule does not compare sequence state."
+          "reason": "Cache V7 synchronizes sequences, but this rule does not compare sequence state."
         },
         {
           "fixture": "safe_008_add_column_if_not_exists.sql",
@@ -1171,14 +1185,12 @@
         "safe_007_create_index.sql",
         "safe_008_drop_constraint.sql",
         "safe_009_alter_set_default.sql",
+        "safe_005_drop_column.sql",
+        "safe_013_unique_using_index.sql",
         "safe_011_foreign_key_not_valid.sql",
         "safe_012_foreign_key_validate_later.sql"
       ],
       "excluded_fixtures": [
-        {
-          "fixture": "safe_005_drop_column.sql",
-          "reason": "Cache V6 foreign-key edges do not retain conkey/confkey column lists. The simulator conservatively skips a drop when dependency columns are unknown; exact column-aware replay is a 0.8.0 cache-evidence TODO."
-        },
         {
           "fixture": "006_set_storage.sql",
           "reason": "Column storage strategy is not synchronized or normalized by the differential harness."
@@ -1190,10 +1202,6 @@
         {
           "fixture": "safe_010_drop_index.sql",
           "reason": "DROP INDEX IF EXISTS idx is a no-op against the canonical baseline."
-        },
-        {
-          "fixture": "safe_013_unique_using_index.sql",
-          "reason": "Cache V6 index edges do not retain uniqueness, predicate, or eligibility metadata. The simulator conservatively skips USING INDEX until the 0.8.0 cache-evidence TODO is proved."
         }
       ],
       "schemas": [
@@ -1255,6 +1263,17 @@
         "safe_012_foreign_key_validate_later.sql": [
           "constraints",
           "foreign_keys"
+        ],
+        "safe_005_drop_column.sql": [
+          "relations",
+          "columns",
+          "foreign_keys",
+          "constraints"
+        ],
+        "safe_013_unique_using_index.sql": [
+          "relations",
+          "indexes",
+          "constraints"
         ]
       },
       "required_relations": [
@@ -1335,7 +1354,7 @@
         },
         {
           "fixture": "safe_012_create_sequence.sql",
-          "reason": "Cache V6 synchronizes sequences, but this rule does not compare sequence state."
+          "reason": "Cache V7 synchronizes sequences, but this rule does not compare sequence state."
         }
       ],
       "schemas": [
@@ -1564,6 +1583,7 @@
       "fixtures": [
         "001_grant_public.sql",
         "002_grant_all.sql",
+        "003_grant_with_option.sql",
         "004_grant_all_public.sql",
         "005_grant_all_in_schema.sql",
         "006_grant_insert_public.sql",
@@ -1577,12 +1597,8 @@
       ],
       "excluded_fixtures": [
         {
-          "fixture": "003_grant_with_option.sql",
-          "reason": "Grant-option identity is not yet represented in RelationState privilege entries."
-        },
-        {
           "fixture": "009_grant_select_with_grant_option.sql",
-          "reason": "Grant-option identity is not yet represented in RelationState privilege entries."
+          "reason": "PostgreSQL rejects GRANT OPTION for PUBLIC (SQLSTATE 0LP01); the fixture is not executable against the live oracle."
         },
         {
           "fixture": "safe_006_grant_select_columns.sql",
@@ -1707,6 +1723,7 @@
         "016_missing_set_role.sql",
         "017_unauthorized_set_role.sql",
         "018_identifier_truncation_collision.sql",
+        "004_conflict.sql",
         "safe_001_chain.sql",
         "safe_001_create_table.sql",
         "safe_002_create_index.sql",
@@ -1726,7 +1743,10 @@
         "safe_018_type_namespace_resolution.sql",
         "safe_019_routine_namespace_resolution.sql",
         "safe_020_generated_name_truncation.sql",
-        "safe_021_routine_type_aliases.sql"
+        "safe_021_routine_type_aliases.sql",
+        "safe_022_role_membership_cascade.sql",
+        "safe_023_role_options.sql",
+        "safe_024_logical_replication.sql"
       ],
       "fixture_transactional": {
         "safe_010_role_transaction_semantics.sql": false,
@@ -1736,6 +1756,11 @@
         "safe_014_session_authorization_rollback.sql": false,
         "safe_015_session_authorization_default.sql": false,
         "safe_016_transitive_set_role_membership.sql": false
+      },
+      "fixture_min_pg_version": {
+        "safe_022_role_membership_cascade.sql": 160000,
+        "safe_024_logical_replication.sql": 150000,
+        "safe_023_role_options.sql": 160000
       },
       "expected_live_errors": {
         "011_missing_fk_source_column.sql": {
@@ -1772,10 +1797,6 @@
         }
       },
       "excluded_fixtures": [
-        {
-          "fixture": "004_conflict.sql",
-          "reason": "The chain drops a column whose dependency-column evidence is absent from Cache V6; the simulator conservatively retains it after a skipped transition. Exact column-aware replay is a 0.8.0 cache-evidence TODO."
-        },
         {
           "fixture": "001_chain.sql",
           "reason": "PostgreSQL rejects the second incompatible duplicate column definition, leaving no committed resulting state."
@@ -1852,6 +1873,10 @@
         "columns"
       ],
       "fixture_scopes": {
+        "004_conflict.sql": [
+          "relations",
+          "columns"
+        ],
         "010_conflict.sql": [
           "relations",
           "columns"
@@ -1892,7 +1917,18 @@
           "relations"
         ],
         "safe_016_transitive_set_role_membership.sql": [
-          "relations"
+          "relations",
+          "roles"
+        ],
+        "safe_022_role_membership_cascade.sql": [
+          "roles"
+        ],
+        "safe_023_role_options.sql": [
+          "roles"
+        ],
+        "safe_024_logical_replication.sql": [
+          "publications",
+          "subscriptions"
         ],
         "safe_017_relation_namespace_resolution.sql": [
           "schemas",
@@ -1932,6 +1968,30 @@
           "member": "sm_set_bridge",
           "role": "sm_set_target",
           "kind": "can_set_role_to"
+        },
+        {
+          "member": "sm_option_member",
+          "role": "sm_option_parent",
+          "kind": "can_administer_membership",
+          "min_pg_version_num": 160000
+        },
+        {
+          "member": "sm_option_member",
+          "role": "sm_option_parent",
+          "kind": "member_of_without_set",
+          "min_pg_version_num": 160000
+        },
+        {
+          "member": "sm_inherit_member",
+          "role": "sm_inherit_parent",
+          "kind": "can_inherit_from",
+          "min_pg_version_num": 160000
+        },
+        {
+          "member": "sm_inherit_member",
+          "role": "sm_inherit_parent",
+          "kind": "member_of_without_set",
+          "min_pg_version_num": 160000
         },
         {
           "member": "sm_set_member",

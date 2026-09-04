@@ -9,7 +9,7 @@ baseline="$repo_root/scripts/action-baseline"
 manifest="$repo_root/action.yml"
 workflow="$repo_root/.github/workflows/ci.yml"
 
-test "$(/bin/sh "$resolver" v0.7.0 "$repo_root/Cargo.toml")" = v0.7.0
+test "$(/bin/sh "$resolver" v0.8.0 "$repo_root/Cargo.toml")" = v0.8.0
 test "$(/bin/sh "$resolver" 0123456789abcdef0123456789abcdef01234567 "$repo_root/Cargo.toml")" = source
 
 if /bin/sh "$resolver" main "$repo_root/Cargo.toml" >/dev/null 2>&1; then
@@ -36,16 +36,21 @@ tmp_dir=$(mktemp -d)
 trap 'rm -rf "$tmp_dir"' EXIT HUP INT TERM
 migration_file="$tmp_dir/migration.sql"
 migration_dir="$tmp_dir/migrations"
-output_dir="$tmp_dir/artifacts"
+output_dir=artifacts
 printf '%s\n' 'SELECT 1;' > "$migration_file"
 mkdir -p "$migration_dir"
+cd "$tmp_dir"
 
-/bin/sh "$baseline" validate false false false false '' '' default \
-  lint false "$migration_file" '' "$output_dir"
-/bin/sh "$baseline" validate true false true true '' public production \
-  lint-chain true "$migration_dir" '' "$output_dir"
-/bin/sh "$baseline" validate false false false false reviewed.cache '' default \
-  lint false "$migration_file" '' '-artifacts'
+test "$(/bin/sh "$baseline" validate false false false false '' '' default \
+  auto false "$migration_file" '' "$output_dir")" = lint
+test "$(/bin/sh "$baseline" validate true false true true '' public production \
+  auto true "$migration_dir" '' "$output_dir")" = lint-chain
+test "$(/bin/sh "$baseline" validate true false true true '' '' production \
+  auto false '' '' "$output_dir")" = sync-only
+test "$(/bin/sh "$baseline" validate false false false false reviewed.cache '' default \
+  lint false "$migration_file" '' '-artifacts')" = lint
+test "$(/bin/sh "$baseline" validate false true true false '' '' default \
+  lint false "$migration_file" '' "$output_dir")" = lint
 
 assert_baseline_rejected() {
   if /bin/sh "$baseline" validate "$@" >/dev/null 2>&1; then
@@ -62,9 +67,9 @@ assert_baseline_rejected false false false false '' public default \
   lint false "$migration_file" '' "$output_dir"
 assert_baseline_rejected true false true false '' '' default \
   lint false "$migration_file" '' "$output_dir"
-assert_baseline_rejected false true false false reviewed.cache '' default \
+assert_baseline_rejected false false true false '' '' default \
   lint false "$migration_file" '' "$output_dir"
-assert_baseline_rejected false true true false '' '' default \
+assert_baseline_rejected false true false false reviewed.cache '' default \
   lint false "$migration_file" '' "$output_dir"
 assert_baseline_rejected false false false false '' '' '' \
   lint false "$migration_file" '' "$output_dir"
@@ -86,6 +91,16 @@ assert_baseline_rejected false false false false '' '' default \
   lint-chain false "$migration_file" '' "$output_dir"
 assert_baseline_rejected false false false false '' '' default \
   lint false "$migration_file" '' ''
+assert_baseline_rejected false false false false '' '' default \
+  lint false "$migration_file" '' "$tmp_dir/absolute-artifacts"
+assert_baseline_rejected false false false false '' '' default \
+  lint false "$migration_file" '' '../artifacts'
+assert_baseline_rejected false false false false '' '' default \
+  lint false "$migration_file" '' 'nested/./artifacts'
+mkdir -p output-target
+ln -s output-target output-link
+assert_baseline_rejected false false false false '' '' default \
+  lint false "$migration_file" '' 'output-link/artifacts'
 line_feed_value=$(printf 'first\nsecond')
 carriage_return_value=$(printf 'first\rsecond')
 assert_baseline_rejected false false false false "$line_feed_value" '' default \
@@ -99,18 +114,19 @@ quoted_encrypted_config="$tmp_dir/quoted-encrypted.toml"
 printf '%s\n' 'cache_encryption = false' > "$plain_config"
 printf '%s\n' 'cache_encryption = true # reviewed' > "$encrypted_config"
 printf '%s\n' '"cache_encryption" = true' > "$quoted_encrypted_config"
-/bin/sh "$baseline" validate-config "$plain_config" false
-/bin/sh "$baseline" validate-config "$encrypted_config" true
-/bin/sh "$baseline" validate-config "$quoted_encrypted_config" true
-if /bin/sh "$baseline" validate-config "$plain_config" true >/dev/null 2>&1; then
+/bin/sh "$baseline" validate-config "$plain_config" false false
+/bin/sh "$baseline" validate-config "$encrypted_config" true false
+/bin/sh "$baseline" validate-config "$quoted_encrypted_config" true false
+/bin/sh "$baseline" validate-config "$plain_config" true true
+if /bin/sh "$baseline" validate-config "$plain_config" true false >/dev/null 2>&1; then
   printf '%s\n' 'plaintext config was accepted for encrypted Action mode' >&2
   exit 1
 fi
-if /bin/sh "$baseline" validate-config "$encrypted_config" false >/dev/null 2>&1; then
+if /bin/sh "$baseline" validate-config "$encrypted_config" false false >/dev/null 2>&1; then
   printf '%s\n' 'encrypted config was accepted for plaintext Action mode' >&2
   exit 1
 fi
-if /bin/sh "$baseline" validate-config "$tmp_dir/missing.toml" false >/dev/null 2>&1; then
+if /bin/sh "$baseline" validate-config "$tmp_dir/missing.toml" false false >/dev/null 2>&1; then
   printf '%s\n' 'missing explicit Action config was accepted' >&2
   exit 1
 fi
@@ -131,13 +147,15 @@ cmp "$tmp_dir/expected-arguments" "$argument_log"
 
 grep -A4 '^  sync:$' "$manifest" | grep -F 'default: "false"' >/dev/null
 grep -A4 '^  baseline:$' "$manifest" | grep -F 'default: default' >/dev/null
-grep -A4 '^  encrypted-cache:$' "$manifest" | grep -F 'default: "false"' >/dev/null
+grep -A4 '^  mode:$' "$manifest" | grep -F 'default: auto' >/dev/null
+grep -A5 '^  path:$' "$manifest" | grep -F 'required: false' >/dev/null
+grep -A4 '^  encrypted-cache:$' "$manifest" | grep -F 'default: "true"' >/dev/null
 grep -A4 '^  no-cache:$' "$manifest" | grep -F 'default: "false"' >/dev/null
 grep -F 'cache_dir="$(mktemp -d "${cache_root}/invocation.XXXXXX")"' "$manifest" >/dev/null
 grep -F 'managed_root="${HOME}/.cache/safe-migrate-action"' "$manifest" >/dev/null
 grep -F 'baseline_root="${managed_root}/baselines"' "$manifest" >/dev/null
 grep -F 'cache_dir="${baseline_root}/${INPUT_BASELINE}"' "$manifest" >/dev/null
-grep -F 'cache_transport_path="~/.cache/safe-migrate-action/baselines/${INPUT_BASELINE}/baseline-v6.cache"' "$manifest" >/dev/null
+grep -F 'cache_transport_path="~/.cache/safe-migrate-action/baselines/${INPUT_BASELINE}/baseline-v7.cache"' "$manifest" >/dev/null
 test "$(grep -Fc 'path: ${{ steps.baseline.outputs.cache-transport-path }}' "$manifest")" -eq 2
 if grep -F '../.safe-migrate-action-cache' "$manifest" >/dev/null; then
   printf '%s\n' "Action cache paths cannot contain '..'" >&2
@@ -152,9 +170,10 @@ if grep -F 'rm -rf -- "$managed_root"' "$manifest" >/dev/null; then
 fi
 grep -F 'uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9' "$manifest" >/dev/null
 grep -F 'uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9' "$manifest" >/dev/null
-grep -F 'cache_prefix="safe-migrate-v6-${RUNNER_OS}-${cache_mode}-${INPUT_BASELINE}-"' "$manifest" >/dev/null
+grep -F "inputs.sync != 'true'" "$manifest" >/dev/null
+grep -F 'cache_prefix="safe-migrate-v7-${RUNNER_OS}-${cache_mode}-${INPUT_BASELINE}-"' "$manifest" >/dev/null
 grep -F '[[ ! "$SAFE_MIGRATE_CACHE_KEY" =~ ^[0-9A-Fa-f]{64}$ ]]' "$manifest" >/dev/null
-test "$(grep -Ec '^[[:space:]]+SAFE_MIGRATE_CACHE_KEY: "[0-9A-Fa-f]{64}"$' "$workflow")" -eq 3
+test "$(grep -Ec '^[[:space:]]+SAFE_MIGRATE_CACHE_KEY: "[0-9A-Fa-f]{64}"$' "$workflow")" -eq 5
 if grep -Eq '^[[:space:]]+SAFE_MIGRATE_CACHE_KEY: [0-9A-Fa-f]{64}$' "$workflow"; then
   printf '%s\n' 'workflow contains an unquoted hexadecimal cache key' >&2
   exit 1
@@ -167,15 +186,28 @@ grep -F 'core.error(message, properties);' "$manifest" >/dev/null
 grep -F 'core.warning(message, properties);' "$manifest" >/dev/null
 grep -F "finding.rule_title || finding.rule_id" "$manifest" >/dev/null
 grep -F "finding.rule_summary" "$manifest" >/dev/null
-grep -E 'actions/github-script@[0-9a-f]{40}' "$manifest" >/dev/null
+grep -F 'actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0' "$manifest" >/dev/null
 grep -F 'env -u DATABASE_URL' "$manifest" >/dev/null
+grep -F "printf '::add-mask::%s\\n'" "$manifest" >/dev/null
+grep -F 'analysis-mode=${analysis_mode}' "$manifest" >/dev/null
 grep -F -- 'command+=(--cache "$RESOLVED_CACHE" --config "$config_path" --no-auto-sync)' "$manifest" >/dev/null
 grep -F 'mkdir -p -- "$INPUT_OUTPUT_DIR"' "$manifest" >/dev/null
+grep -F 'mktemp "${RUNNER_TEMP}/safe-migrate-redacted.XXXXXX"' "$manifest" >/dev/null
+if grep -F 'safe-migrate-redacted."*' "$manifest" >/dev/null; then
+  printf '%s\n' 'Action still removes other redaction temporary files' >&2
+  exit 1
+fi
 grep -F "steps.action-install.outputs.install-mode == 'source'" "$manifest" >/dev/null
 grep -F 'Windows ARM64 runners are not supported' "$manifest" >/dev/null
 if grep -F 'aarch64-pc-windows-msvc' "$manifest" >/dev/null; then
   printf '%s\n' 'Action still advertises an unpublished Windows ARM64 artifact' >&2
   exit 1
 fi
-grep -F '{ [ -z "$INPUT_CACHE" ] && [ ! -f "$RESOLVED_CACHE" ]; }' "$manifest" >/dev/null
+grep -F 'No synchronized baseline was restored' "$manifest" >/dev/null
+grep -F 'if [ "$preflight_failed" != true ] && [ "$operational_failed" != true ]; then' "$manifest" >/dev/null
+grep -F 'if [ "$INPUT_NO_CACHE" = "true" ]; then' "$manifest" >/dev/null
+if grep -F 'running Tainted analysis without the baseline' "$manifest" >/dev/null; then
+  printf '%s\n' 'Action still silently falls back to degraded analysis' >&2
+  exit 1
+fi
 grep -F 'Explicit cache does not exist or is not a file' "$manifest" >/dev/null

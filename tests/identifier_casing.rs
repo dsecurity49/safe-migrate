@@ -2,7 +2,7 @@ mod common;
 
 mod identifier_casing_tests {
     use crate::common::*;
-    use safe_migrate::model::relation::RelationOverlay;
+    use safe_migrate::_internal::model::relation::RelationOverlay;
 
     #[test]
     fn test_ident_unquoted_lowercase() {

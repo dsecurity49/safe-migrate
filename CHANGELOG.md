@@ -5,6 +5,26 @@ commits and pull requests. Published binaries, checksums, and generated release
 notes are available on the
 [GitHub Releases page](https://github.com/dsecurity49/safe-migrate/releases).
 
+## v0.8.0 — 2026-09-03
+
+- Rule evaluation now uses one immutable context with explicit capability
+  declarations and scoped evidence for missing catalog or transaction state.
+- Cache hydration preserves namespace evidence across typed dependencies,
+  publications, constraints, indexes, triggers, and generated/default links.
+- Cache V7 records PostgreSQL-selected foreign-key equality operators and
+  rejects incomplete proof; validated cache/state constructors keep malformed
+  programmatic baselines conservative.
+- Large dependency graphs reuse indexed rename and reverse-dependency lookups
+  while preserving the existing small-graph behavior.
+- Added the supported `safe_migrate::api` Rust façade for configuration, cache,
+  analysis, findings, and evidence consumers, including managed analysis helpers
+  that validate caches before hydration.
+- Cache validation now rejects circular or internally inconsistent role
+  membership edges before synchronized state can be treated as authoritative.
+- Split GitHub Actions into trusted baseline refresh and offline PR analysis.
+  The initializer generates both, environment-scopes database credentials, and
+  makes the encrypted baseline mandatory for normal analysis.
+
 ## v0.7.0 — 2026-08-30
 
 - Fixed `sync --out <filename>` for bare relative cache filenames and made the

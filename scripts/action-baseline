@@ -4,7 +4,7 @@ set -eu
 usage() {
     printf '%s\n' \
         'usage: action-baseline validate <sync> <no-cache> <encrypted-cache> <key-available> <cache> <schemas> <baseline> <mode> <advisory> <path> <config> <output-dir>' \
-        '       action-baseline validate-config <config> <encrypted-cache>' \
+        '       action-baseline validate-config <config> <encrypted-cache> <no-cache>' \
         '       action-baseline sync <binary> <cache> <config> <schemas>' >&2
     exit 2
 }
@@ -66,9 +66,29 @@ case "$command" in
         validate_single_line output-dir "$output_dir"
 
         case "$mode" in
+            auto)
+                if [ -z "$path" ] && [ "$sync" = true ]; then
+                    mode='sync-only'
+                elif [ -f "$path" ]; then
+                    mode=lint
+                elif [ -d "$path" ]; then
+                    mode=lint-chain
+                else
+                    printf 'path does not exist or is not a file or directory: %s\n' \
+                        "$path" >&2
+                    exit 1
+                fi
+                ;;
             lint)
                 [ -f "$path" ] || {
                     printf 'lint path does not exist or is not a file: %s\n' "$path" >&2
+                    exit 1
+                }
+                ;;
+            sync-only)
+                [ "$sync" = true ] && [ -z "$path" ] || {
+                    printf '%s\n' \
+                        'sync-only requires sync to be true and path to be empty' >&2
                     exit 1
                 }
                 ;;
@@ -88,23 +108,67 @@ case "$command" in
             printf '%s\n' 'output-dir must not be empty' >&2
             exit 1
         }
+        case "$output_dir" in
+            /*|[A-Za-z]:[\\/]*|*\\*)
+                printf '%s\n' 'output-dir must be a relative path inside the workspace' >&2
+                exit 1
+                ;;
+            .|..|./*|../*|*/.|*/..|*/./*|*/../*|*//*|*/)
+                printf '%s\n' \
+                    'output-dir must not contain empty, dot, or parent path segments' >&2
+                exit 1
+                ;;
+        esac
+        old_ifs=$IFS
+        IFS=/
+        set -f
+        # Intentional IFS split after glob expansion is disabled.
+        # shellcheck disable=SC2086
+        set -- $output_dir
+        set +f
+        IFS=$old_ifs
+        for segment do
+            case "$segment" in
+                ''|.|..)
+                    printf '%s\n' \
+                        'output-dir must not contain empty, dot, or parent path segments' >&2
+                    exit 1
+                    ;;
+            esac
+        done
+        output_cursor=.
+        old_ifs=$IFS
+        IFS=/
+        set -f
+        # Intentional IFS split after glob expansion is disabled.
+        # shellcheck disable=SC2086
+        set -- $output_dir
+        set +f
+        IFS=$old_ifs
+        for segment do
+            output_cursor="$output_cursor/$segment"
+            if [ -L "$output_cursor" ]; then
+                printf 'output-dir must not traverse a symlink: %s\n' \
+                    "$output_cursor" >&2
+                exit 1
+            fi
+        done
 
         if [ "$no_cache" = true ] && {
-            [ "$sync" = true ] || [ "$encrypted_cache" = true ] ||
-                [ -n "$cache" ] || [ -n "$schemas" ];
+            [ "$sync" = true ] || [ -n "$cache" ] || [ -n "$schemas" ];
         }; then
             printf '%s\n' \
-                'no-cache cannot be combined with cache, sync, schemas, or encrypted-cache' >&2
+                'no-cache cannot be combined with cache, sync, or schemas' >&2
             exit 1
         fi
         if [ -n "$schemas" ] && [ "$sync" != true ]; then
             printf '%s\n' 'schemas requires sync to be true' >&2
             exit 1
         fi
-        if [ "$sync" = true ] && [ "$encrypted_cache" = true ] && \
+        if [ "$no_cache" != true ] && [ "$encrypted_cache" = true ] && \
             [ "$key_available" != true ]; then
             printf '%s\n' \
-                'sync with encrypted-cache requires SAFE_MIGRATE_CACHE_KEY' >&2
+                'encrypted-cache requires SAFE_MIGRATE_CACHE_KEY; use no-cache only for an explicit degraded analysis' >&2
             exit 1
         fi
         [ -n "$baseline" ] || {
@@ -128,12 +192,15 @@ case "$command" in
             printf '%s\n' 'baseline must be at most 100 characters' >&2
             exit 1
         }
+        printf '%s\n' "$mode"
         ;;
     validate-config)
-        [ "$#" -eq 3 ] || usage
+        [ "$#" -eq 4 ] || usage
         config=$2
         encrypted_cache=$3
+        no_cache=$4
         validate_boolean encrypted-cache "$encrypted_cache"
+        validate_boolean no-cache "$no_cache"
         validate_single_line config "$config"
 
         if [ ! -f "$config" ]; then
@@ -142,13 +209,13 @@ case "$command" in
             exit 1
         fi
         encryption_true_pattern="^[[:space:]]*(cache_encryption|\"cache_encryption\"|'cache_encryption')[[:space:]]*=[[:space:]]*true([[:space:]]*(#.*)?)?$"
-        if [ "$encrypted_cache" = true ] && \
+        if [ "$no_cache" != true ] && [ "$encrypted_cache" = true ] && \
             ! grep -Eq -- "$encryption_true_pattern" "$config"; then
             printf '%s\n' \
                 'encrypted-cache requires cache_encryption = true in the explicit config' >&2
             exit 1
         fi
-        if [ "$encrypted_cache" != true ] && \
+        if [ "$no_cache" != true ] && [ "$encrypted_cache" != true ] && \
             grep -Eq -- "$encryption_true_pattern" "$config"; then
             printf '%s\n' \
                 'explicit config enables cache encryption; set encrypted-cache to true' >&2

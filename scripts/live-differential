@@ -7,7 +7,8 @@ fixture_filter=""
 
 usage() {
     printf '%s\n' "Usage: scripts/live-differential [-v|-vv|-vvv] [--rule RULE_DIRECTORY] [--fixture RULE_DIRECTORY/FILE.sql[,RULE_DIRECTORY/FILE.sql...]]"
-    printf '%s\n' "Requires DATABASE_URL for a disposable PostgreSQL database."
+    printf '%s\n' "Requires DATABASE_URL for a disposable PostgreSQL database (defaults to database safe_migrate)."
+    printf '%s\n' "Set SAFE_MIGRATE_DIFF_DATABASE when using a different local database name."
 }
 
 while [ "$#" -gt 0 ]; do

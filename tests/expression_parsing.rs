@@ -2,7 +2,7 @@ mod common;
 
 mod expression_parsing_tests {
     use crate::common::*;
-    use safe_migrate::analysis::state::AnalysisState;
+    use safe_migrate::_internal::analysis::state::AnalysisState;
 
     fn assert_expr(expr: &str) {
         let engine = setup_engine();
@@ -77,7 +77,7 @@ mod expression_parsing_tests {
     #[test]
     fn test_parser_syntax_error_rejection() {
         let engine = setup_engine();
-        let mut state = AnalysisState::new(safe_migrate::db::cache::DbCache::new());
+        let mut state = AnalysisState::new(safe_migrate::_internal::db::cache::DbCache::new());
         assert!(engine.analyze("CREATE TABLE (;", &mut state).is_err());
     }
 }

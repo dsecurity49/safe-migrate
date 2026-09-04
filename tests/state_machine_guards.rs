@@ -2,8 +2,8 @@ mod common;
 
 mod state_machine_guards_tests {
     use crate::common::*;
-    use safe_migrate::analysis::state::AnalysisState;
-    use safe_migrate::model::relation::{
+    use safe_migrate::_internal::analysis::state::AnalysisState;
+    use safe_migrate::_internal::model::relation::{
         Persistence, RelationKind, RelationOverlay, RelationState,
     };
 
@@ -31,7 +31,7 @@ mod state_machine_guards_tests {
     #[test]
     fn test_reversibility_type_widen() {
         let engine = setup_engine();
-        let mut cache = safe_migrate::db::cache::DbCache::new();
+        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
         let tid = object_id("public", "t");
         let mut rel = RelationState::new(
             tid.clone(),
@@ -42,12 +42,14 @@ mod state_machine_guards_tests {
             Persistence::Permanent,
             0,
         );
-        rel.apply_column_action(&safe_migrate::model::relation::ColumnAction::Add {
-            name: "val".to_string(),
-            data_type: Some("int".to_string()),
-            not_null: false,
-            default: None,
-        });
+        rel.apply_column_action(
+            &safe_migrate::_internal::model::relation::ColumnAction::Add {
+                name: "val".to_string(),
+                data_type: Some("int".to_string()),
+                not_null: false,
+                default: None,
+            },
+        );
         cache.insert_baseline(tid, rel);
         let mut state = AnalysisState::new(cache);
 
@@ -133,14 +135,14 @@ mod state_machine_guards_tests {
         assert!(violations.is_empty());
         assert_eq!(
             state.local.confidence,
-            safe_migrate::analysis::state::Confidence::Exact
+            safe_migrate::_internal::analysis::state::Confidence::Exact
         );
     }
 
     #[test]
     fn unknown_scoped_target_in_multi_drop_preserves_known_targets() {
         let engine = setup_engine();
-        let mut cache = safe_migrate::db::cache::DbCache::new();
+        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
         cache.metadata.schemas = Some(vec!["app".to_string()]);
         let table_id = object_id("app", "known_table");
         let view_id = object_id("app", "known_view");
@@ -204,7 +206,7 @@ mod state_machine_guards_tests {
         assert!(state.relation_is_present(&materialized_view_id));
         assert_eq!(
             state.local.confidence,
-            safe_migrate::analysis::state::Confidence::Tainted
+            safe_migrate::_internal::analysis::state::Confidence::Tainted
         );
     }
 
@@ -225,7 +227,7 @@ mod state_machine_guards_tests {
 
         assert_eq!(
             state.local.confidence,
-            safe_migrate::analysis::state::Confidence::Tainted
+            safe_migrate::_internal::analysis::state::Confidence::Tainted
         );
     }
 
@@ -243,7 +245,7 @@ mod state_machine_guards_tests {
 
         assert_eq!(
             state.local.confidence,
-            safe_migrate::analysis::state::Confidence::Tainted
+            safe_migrate::_internal::analysis::state::Confidence::Tainted
         );
     }
 
@@ -261,7 +263,7 @@ mod state_machine_guards_tests {
 
         assert!(matches!(
             state.local.schemas.get("app"),
-            Some(safe_migrate::model::schema::SchemaOverlay::Dropped)
+            Some(safe_migrate::_internal::model::schema::SchemaOverlay::Dropped)
         ));
     }
 
@@ -352,7 +354,7 @@ mod state_machine_guards_tests {
             .filter(|e| {
                 matches!(
                     e.kind,
-                    safe_migrate::analysis::graph::DependencyKind::IndexOnRelation { .. }
+                    safe_migrate::_internal::analysis::graph::DependencyKind::IndexOnRelation { .. }
                 )
             })
             .count();
@@ -368,7 +370,7 @@ mod state_machine_guards_tests {
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
-                    safe_migrate::analysis::graph::DependencyKind::IndexOnRelation { .. }
+                    safe_migrate::_internal::analysis::graph::DependencyKind::IndexOnRelation { .. }
                 ))
                 .count(),
             edge_count
@@ -389,7 +391,7 @@ mod state_machine_guards_tests {
             .filter(|e| {
                 matches!(
                     e.kind,
-                    safe_migrate::analysis::graph::DependencyKind::SequenceOwnedBy { .. }
+                    safe_migrate::_internal::analysis::graph::DependencyKind::SequenceOwnedBy { .. }
                 )
             })
             .count();
@@ -407,7 +409,7 @@ mod state_machine_guards_tests {
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
-                    safe_migrate::analysis::graph::DependencyKind::SequenceOwnedBy { .. }
+                    safe_migrate::_internal::analysis::graph::DependencyKind::SequenceOwnedBy { .. }
                 ))
                 .count(),
             before

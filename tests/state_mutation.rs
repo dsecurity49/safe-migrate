@@ -2,25 +2,30 @@ mod common;
 
 mod state_mutation_tests {
     use crate::common::*;
-    use safe_migrate::analysis::facts::FunctionSigFact;
-    use safe_migrate::analysis::graph::{DependencyEdge, DependencyGraph, DependencyKind};
-    use safe_migrate::analysis::mutations::{
+    use safe_migrate::_internal::analysis::facts::FunctionSigFact;
+    use safe_migrate::_internal::analysis::graph::{
+        DependencyEdge, DependencyGraph, DependencyKind,
+    };
+    use safe_migrate::_internal::analysis::mutations::{
         DropAggregateMutation, DropFunctionMutation, DropProcedureMutation, Mutation,
     };
-    use safe_migrate::analysis::state::{Confidence, MutationResult};
-    use safe_migrate::ast::identifiers::{Ident, ObjectId, QualifiedName};
-    use safe_migrate::db::cache::{DbCache, DependencyCache};
-    use safe_migrate::model::constraint::ConstraintKind;
-    use safe_migrate::model::function::{
+    use safe_migrate::_internal::analysis::state::{Confidence, MutationResult};
+    use safe_migrate::_internal::ast::identifiers::{Ident, ObjectId, QualifiedName};
+    use safe_migrate::_internal::db::cache::{
+        ConstraintDependencyCache, DbCache, GeneratedColumnDependencyCache, ViewDependencyCache,
+    };
+    use safe_migrate::_internal::model::column::Column;
+    use safe_migrate::_internal::model::constraint::ConstraintKind;
+    use safe_migrate::_internal::model::function::{
         FunctionOverlay, FunctionState, RoutineKind, SecurityMode, Volatility,
     };
-    use safe_migrate::model::relation::{
-        Persistence, RelationKind, RelationOverlay, RelationState,
+    use safe_migrate::_internal::model::relation::{
+        ColumnAction, Persistence, Privilege, RelationKind, RelationOverlay, RelationState,
     };
-    use safe_migrate::model::role::RoleState;
-    use safe_migrate::model::schema::SchemaState;
-    use safe_migrate::model::sequence::SequenceOverlay;
-    use safe_migrate::model::types::{TypeKind, TypeOverlay, TypeState};
+    use safe_migrate::_internal::model::role::{RoleOverlay, RoleState};
+    use safe_migrate::_internal::model::schema::SchemaState;
+    use safe_migrate::_internal::model::sequence::{SequenceKind, SequenceOverlay, SequenceState};
+    use safe_migrate::_internal::model::types::{TypeKind, TypeOverlay, TypeState};
 
     #[test]
     fn test_topology_table_basic() {
@@ -42,6 +47,95 @@ mod state_mutation_tests {
         } else {
             panic!("relation should be present");
         }
+    }
+
+    #[test]
+    fn index_column_identities_follow_rename_and_drop_cleanup() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE TABLE t(id int, name text); \
+                 CREATE INDEX t_name_idx ON t(name) INCLUDE (id); \
+                 ALTER TABLE t RENAME COLUMN name TO full_name; \
+                 ALTER TABLE t DROP COLUMN full_name;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(
+            !state
+                .local
+                .graph
+                .edges()
+                .iter()
+                .any(|edge| edge.dependent == object_id("public", "t_name_idx")),
+            "dropping an indexed column must remove PostgreSQL's implicit index dependency"
+        );
+    }
+
+    #[test]
+    fn simple_unique_btree_index_can_be_adopted_as_a_constraint() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let findings = engine
+            .analyze(
+                "CREATE TABLE t(id int); \
+                 CREATE UNIQUE INDEX t_id_idx ON t(id); \
+                 ALTER TABLE t ADD CONSTRAINT t_id_key UNIQUE USING INDEX t_id_idx;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict"),
+            "a catalog-equivalent unique btree index should be adoptable: {findings:?}"
+        );
+        assert!(state.local.graph.edges().iter().any(|edge| {
+            matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
+                && edge.dependent == object_id("public", "t_id_key")
+        }));
+        assert!(!state.local.graph.edges().iter().any(|edge| {
+            matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
+                && edge.dependent == object_id("public", "t_id_idx")
+        }));
+    }
+
+    #[test]
+    fn local_expression_index_separates_eligibility_from_dependency_proof() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE TABLE t(name text); CREATE INDEX t_lower_name_idx ON t ((lower(name)));",
+                &mut state,
+            )
+            .unwrap();
+
+        let edge = state
+            .local
+            .graph
+            .edges()
+            .iter()
+            .find(|edge| {
+                edge.dependent == object_id("public", "t_lower_name_idx")
+                    && matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
+            })
+            .expect("expression index edge should be retained");
+        assert!(matches!(
+            edge.kind,
+            DependencyKind::IndexOnRelation {
+                has_expression_keys: true,
+                dependency_columns_known: false,
+                eligibility_known: true,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -79,7 +173,7 @@ mod state_mutation_tests {
             edge.dependent == object_id("public", "child")
                 || (matches!(
                     edge.kind,
-                    safe_migrate::analysis::graph::DependencyKind::IndexOnRelation { .. }
+                    safe_migrate::_internal::analysis::graph::DependencyKind::IndexOnRelation { .. }
                 ) && edge.referenced == object_id("public", "child"))
         }));
     }
@@ -124,7 +218,7 @@ mod state_mutation_tests {
             .filter(|edge| {
                 matches!(
                     edge.kind,
-                    safe_migrate::analysis::graph::DependencyKind::ViewDependency { .. }
+                    safe_migrate::_internal::analysis::graph::DependencyKind::ViewDependency { .. }
                 ) && edge.dependent == object_id("public", "v")
             })
             .map(|edge| edge.referenced.clone())
@@ -205,6 +299,30 @@ mod state_mutation_tests {
         }
         assert!(state.local.graph.edges().is_empty());
         assert!(state.local.types.is_empty());
+    }
+
+    #[test]
+    fn unavailable_baseline_never_claims_schema_coverage() {
+        let engine = setup_engine();
+        let mut state = safe_migrate::api::AnalysisState::with_baseline(
+            safe_migrate::_internal::db::cache::DbCache::new(),
+            false,
+        );
+        let missing = object_id("public", "not_loaded");
+
+        assert!(!state.baseline_covers_object(&missing));
+        let findings = engine
+            .analyze("ALTER TABLE not_loaded RENAME TO moved;", &mut state)
+            .unwrap();
+
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict"),
+            "unknown baseline must not become a deterministic conflict: {findings:?}"
+        );
+        assert_eq!(state.confidence(), &Confidence::Tainted);
+        assert!(!state.relation_is_present(&object_id("public", "moved")));
     }
 
     #[test]
@@ -325,23 +443,15 @@ mod state_mutation_tests {
             );
         }
 
-        let dependency = |referenced: &ObjectId| DependencyCache {
-            classid: 0,
-            objid: 0,
-            objsubid: 0,
-            refclassid: 0,
-            refobjid: 0,
-            refobjsubid: 0,
-            deptype: "view".to_string(),
-            obj_schema: Some(view_id.schema.clone()),
-            obj_name: Some(view_id.name.clone()),
-            ref_schema: Some(referenced.schema.clone()),
-            ref_name: Some(referenced.name.clone()),
+        let dependency = |referenced: &ObjectId| ViewDependencyCache {
+            dependent: view_id.clone(),
+            referenced: referenced.clone(),
+            referenced_column: None,
         };
         cache.dependencies.push(dependency(&view_id));
         cache.dependencies.push(dependency(&table_id));
 
-        let state = safe_migrate::AnalysisState::new(cache);
+        let state = safe_migrate::api::AnalysisState::new(cache);
         assert!(!state.local.graph.edges().iter().any(|edge| {
             matches!(edge.kind, DependencyKind::ViewDependency { .. })
                 && edge.dependent == view_id
@@ -351,6 +461,169 @@ mod state_mutation_tests {
             matches!(edge.kind, DependencyKind::ViewDependency { .. })
                 && edge.dependent == view_id
                 && edge.referenced == table_id
+        }));
+    }
+
+    #[test]
+    fn cached_view_column_dependencies_allow_dropping_an_unreferenced_column() {
+        let table_id = object_id("public", "t");
+        let view_id = object_id("public", "v");
+        let mut cache = DbCache::new();
+        let mut table = RelationState::new(
+            table_id.clone(),
+            object_id("public", "owner"),
+            0,
+            None,
+            RelationKind::Table,
+            Persistence::Permanent,
+            0,
+        );
+        for name in ["id", "unused"] {
+            table.apply_column_action(&ColumnAction::Add {
+                name: name.to_string(),
+                data_type: Some("integer".to_string()),
+                not_null: false,
+                default: None,
+            });
+        }
+        cache.insert_baseline(table_id.clone(), table);
+        cache.insert_baseline(
+            view_id.clone(),
+            RelationState::new(
+                view_id.clone(),
+                object_id("public", "owner"),
+                0,
+                None,
+                RelationKind::View,
+                Persistence::Permanent,
+                0,
+            ),
+        );
+        cache.dependencies.push(ViewDependencyCache {
+            dependent: view_id.clone(),
+            referenced: table_id.clone(),
+            referenced_column: Some("id".to_string()),
+        });
+
+        let engine = setup_engine();
+        let mut state = safe_migrate::api::AnalysisState::new(cache.clone());
+        let findings = engine
+            .analyze("ALTER TABLE t DROP COLUMN unused;", &mut state)
+            .unwrap();
+
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict"),
+            "unrelated column drop must not conflict: {findings:?}"
+        );
+        assert_eq!(state.local.confidence, Confidence::Exact);
+        assert!(
+            state
+                .get_relation(&table_id)
+                .is_some_and(|relation| match relation {
+                    RelationOverlay::Present(table) => !table.has_column("unused"),
+                    RelationOverlay::Dropped => false,
+                })
+        );
+        let mut blocked_state = safe_migrate::api::AnalysisState::new(cache.clone());
+        let findings = engine
+            .analyze("ALTER TABLE t DROP COLUMN id;", &mut blocked_state)
+            .unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict")
+        );
+
+        let mut cascade_state = safe_migrate::api::AnalysisState::new(cache);
+        let findings = engine
+            .analyze("ALTER TABLE t DROP COLUMN id CASCADE;", &mut cascade_state)
+            .unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict")
+        );
+        assert!(matches!(
+            cascade_state.get_relation(&view_id),
+            Some(RelationOverlay::Dropped)
+        ));
+    }
+    #[test]
+    fn cached_expression_index_dependencies_follow_the_referenced_columns() {
+        let table_id = object_id("public", "t");
+        let index_id = object_id("public", "t_lower_note_idx");
+        let mut cache = DbCache::new();
+        let mut table = RelationState::new(
+            table_id.clone(),
+            object_id("public", "owner"),
+            0,
+            None,
+            RelationKind::Table,
+            Persistence::Permanent,
+            0,
+        );
+        for name in ["id", "note", "unused"] {
+            table.apply_column_action(&ColumnAction::Add {
+                name: name.to_string(),
+                data_type: Some("text".to_string()),
+                not_null: false,
+                default: None,
+            });
+        }
+        cache.insert_baseline(table_id.clone(), table);
+        cache
+            .indexes
+            .push(safe_migrate::_internal::db::cache::IndexCache {
+                index_id: index_id.clone(),
+                table_id: table_id.clone(),
+                using_method: "btree".to_string(),
+                key_columns: Vec::new(),
+                included_columns: Vec::new(),
+                dependency_columns: vec!["note".to_string()],
+                dependency_columns_known: true,
+                has_expression_keys: true,
+                has_predicate: false,
+                is_unique: false,
+                is_valid: true,
+                is_ready: true,
+                is_live: true,
+                has_default_sort_order: true,
+                has_default_opclasses: true,
+                has_default_collations: true,
+            });
+
+        let engine = setup_engine();
+        let mut state = safe_migrate::api::AnalysisState::new(cache);
+        let unrelated = engine
+            .analyze("ALTER TABLE t DROP COLUMN unused;", &mut state)
+            .unwrap();
+        assert!(
+            !unrelated
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict"),
+            "unrelated expression-index column drop must not conflict: {unrelated:?}"
+        );
+        assert_eq!(state.local.confidence, Confidence::Exact);
+        assert!(state.local.graph.edges().iter().any(|edge| {
+            matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
+                && edge.dependent == index_id
+        }));
+
+        let referenced = engine
+            .analyze("ALTER TABLE t DROP COLUMN note;", &mut state)
+            .unwrap();
+        assert!(
+            !referenced
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict"),
+            "dependent expression-index column drop must match PostgreSQL cleanup: {referenced:?}"
+        );
+        assert_eq!(state.local.confidence, Confidence::Exact);
+        assert!(!state.local.graph.edges().iter().any(|edge| {
+            matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
+                && edge.dependent == index_id
         }));
     }
 
@@ -372,21 +645,13 @@ mod state_mutation_tests {
                 0,
             ),
         );
-        cache.dependencies.push(DependencyCache {
-            classid: 0,
-            objid: 0,
-            objsubid: 0,
-            refclassid: 0,
-            refobjid: 0,
-            refobjsubid: 0,
-            deptype: "view".to_string(),
-            obj_schema: Some(view_id.schema.clone()),
-            obj_name: Some(view_id.name.clone()),
-            ref_schema: Some(external_table.schema.clone()),
-            ref_name: Some(external_table.name.clone()),
+        cache.dependencies.push(ViewDependencyCache {
+            dependent: view_id.clone(),
+            referenced: external_table.clone(),
+            referenced_column: None,
         });
 
-        let state = safe_migrate::AnalysisState::new(cache);
+        let state = safe_migrate::api::AnalysisState::new(cache);
         assert!(state.local.graph.edges().iter().any(|edge| {
             matches!(edge.kind, DependencyKind::ViewDependency { .. })
                 && edge.dependent == view_id
@@ -412,21 +677,13 @@ mod state_mutation_tests {
                 0,
             ),
         );
-        cache.dependencies.push(DependencyCache {
-            classid: 0,
-            objid: 0,
-            objsubid: 0,
-            refclassid: 0,
-            refobjid: 0,
-            refobjsubid: 0,
-            deptype: "view".to_string(),
-            obj_schema: Some(omitted_view.schema.clone()),
-            obj_name: Some(omitted_view.name.clone()),
-            ref_schema: Some(in_scope_table.schema.clone()),
-            ref_name: Some(in_scope_table.name.clone()),
+        cache.dependencies.push(ViewDependencyCache {
+            dependent: omitted_view.clone(),
+            referenced: in_scope_table.clone(),
+            referenced_column: None,
         });
 
-        let state = safe_migrate::AnalysisState::new(cache);
+        let state = safe_migrate::api::AnalysisState::new(cache);
         assert!(state.local.graph.edges().iter().any(|edge| {
             matches!(edge.kind, DependencyKind::ViewDependency { .. })
                 && edge.dependent == omitted_view
@@ -435,7 +692,7 @@ mod state_mutation_tests {
     }
 
     #[test]
-    fn cascades_taint_when_a_scoped_dependent_is_omitted() {
+    fn scoped_drop_with_incomplete_dependency_coverage_stays_unchanged() {
         let in_scope_table = object_id("app", "base");
         let omitted_view = object_id("tenant", "v");
         let mut cache = DbCache::new();
@@ -452,22 +709,14 @@ mod state_mutation_tests {
                 0,
             ),
         );
-        cache.dependencies.push(DependencyCache {
-            classid: 0,
-            objid: 0,
-            objsubid: 0,
-            refclassid: 0,
-            refobjid: 0,
-            refobjsubid: 0,
-            deptype: "view".to_string(),
-            obj_schema: Some(omitted_view.schema),
-            obj_name: Some(omitted_view.name),
-            ref_schema: Some(in_scope_table.schema.clone()),
-            ref_name: Some(in_scope_table.name.clone()),
+        cache.dependencies.push(ViewDependencyCache {
+            dependent: omitted_view,
+            referenced: in_scope_table.clone(),
+            referenced_column: None,
         });
 
         let engine = setup_engine();
-        let mut state = safe_migrate::AnalysisState::new(cache);
+        let mut state = safe_migrate::api::AnalysisState::new(cache);
         let violations = engine
             .analyze("DROP TABLE app.base CASCADE;", &mut state)
             .unwrap();
@@ -476,14 +725,14 @@ mod state_mutation_tests {
             !violations
                 .iter()
                 .any(|violation| violation.rule_id == "chain-conflict"),
-            "known cascade should execute: {violations:?}"
+            "coverage uncertainty should skip without inventing a conflict: {violations:?}"
         );
         assert_eq!(state.local.confidence, Confidence::Tainted);
-        assert!(!state.relation_is_present(&in_scope_table));
+        assert!(state.relation_is_present(&in_scope_table));
     }
 
     #[test]
-    fn non_view_catalog_dependencies_do_not_enter_the_modeled_graph() {
+    fn empty_typed_view_dependency_cache_does_not_create_graph_edges() {
         let view_id = object_id("public", "v");
         let table_id = object_id("public", "t");
         let mut cache = DbCache::new();
@@ -504,21 +753,7 @@ mod state_mutation_tests {
                 ),
             );
         }
-        cache.dependencies.push(DependencyCache {
-            classid: 0,
-            objid: 0,
-            objsubid: 0,
-            refclassid: 0,
-            refobjid: 0,
-            refobjsubid: 0,
-            deptype: "n".to_string(),
-            obj_schema: Some(view_id.schema.clone()),
-            obj_name: Some(view_id.name.clone()),
-            ref_schema: Some(table_id.schema.clone()),
-            ref_name: Some(table_id.name.clone()),
-        });
-
-        let state = safe_migrate::AnalysisState::new(cache);
+        let state = safe_migrate::api::AnalysisState::new(cache);
         assert!(
             !state
                 .local
@@ -624,7 +859,7 @@ mod state_mutation_tests {
 
     #[test]
     fn cascade_drop_marks_triggers_on_partition_children_as_dropped() {
-        use safe_migrate::model::trigger::TriggerOverlay;
+        use safe_migrate::_internal::model::trigger::TriggerOverlay;
 
         let engine = setup_engine();
         let mut state = setup_state();
@@ -779,7 +1014,7 @@ mod state_mutation_tests {
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
-                    safe_migrate::analysis::graph::DependencyKind::RenameTo
+                    safe_migrate::_internal::analysis::graph::DependencyKind::RenameTo
                 ))
                 .any(|e| e.dependent == object_id("public", "a")
                     && e.referenced == object_id("public", "b"))
@@ -871,7 +1106,7 @@ mod state_mutation_tests {
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
-                    safe_migrate::analysis::graph::DependencyKind::IndexOnRelation { .. }
+                    safe_migrate::_internal::analysis::graph::DependencyKind::IndexOnRelation { .. }
                 ))
                 .any(|i| i.dependent == object_id("public", "i2"))
         );
@@ -883,7 +1118,7 @@ mod state_mutation_tests {
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
-                    safe_migrate::analysis::graph::DependencyKind::IndexOnRelation { .. }
+                    safe_migrate::_internal::analysis::graph::DependencyKind::IndexOnRelation { .. }
                 ))
                 .any(|i| i.dependent == object_id("public", "i"))
         );
@@ -909,7 +1144,7 @@ mod state_mutation_tests {
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
-                    safe_migrate::analysis::graph::DependencyKind::ForeignKey { .. }
+                    safe_migrate::_internal::analysis::graph::DependencyKind::ForeignKey { .. }
                 ))
                 .any(|fk| fk.dependent == object_id("public", "c")
                     && fk.referenced == object_id("public", "p"))
@@ -926,7 +1161,7 @@ mod state_mutation_tests {
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
-                    safe_migrate::analysis::graph::DependencyKind::ForeignKey { .. }
+                    safe_migrate::_internal::analysis::graph::DependencyKind::ForeignKey { .. }
                 ))
                 .count()
                 == 0
@@ -953,7 +1188,7 @@ mod state_mutation_tests {
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
-                    safe_migrate::analysis::graph::DependencyKind::ViewDependency { .. }
+                    safe_migrate::_internal::analysis::graph::DependencyKind::ViewDependency { .. }
                 ))
                 .any(|v| v.dependent == object_id("public", "v")
                     && v.referenced == object_id("public", "t"))
@@ -968,7 +1203,7 @@ mod state_mutation_tests {
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
-                    safe_migrate::analysis::graph::DependencyKind::ViewDependency { .. }
+                    safe_migrate::_internal::analysis::graph::DependencyKind::ViewDependency { .. }
                 ))
                 .count()
                 == 0
@@ -995,7 +1230,7 @@ mod state_mutation_tests {
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
-                    safe_migrate::analysis::graph::DependencyKind::ViewDependency { .. }
+                    safe_migrate::_internal::analysis::graph::DependencyKind::ViewDependency { .. }
                 ))
                 .any(|v| v.dependent == object_id("public", "mv")
                     && v.referenced == object_id("public", "t"))
@@ -1022,7 +1257,7 @@ mod state_mutation_tests {
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
-                    safe_migrate::analysis::graph::DependencyKind::SequenceOwnedBy { .. }
+                    safe_migrate::_internal::analysis::graph::DependencyKind::SequenceOwnedBy { .. }
                 ))
                 .any(|s| s.dependent == object_id("public", "s")
                     && s.referenced == object_id("public", "t"))
@@ -1041,7 +1276,7 @@ mod state_mutation_tests {
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
-                    safe_migrate::analysis::graph::DependencyKind::SequenceOwnedBy { .. }
+                    safe_migrate::_internal::analysis::graph::DependencyKind::SequenceOwnedBy { .. }
                 ))
                 .count()
                 == 0
@@ -1059,6 +1294,14 @@ mod state_mutation_tests {
                 &mut state,
             )
             .unwrap();
+
+        let findings = engine.analyze("DROP SEQUENCE s;", &mut state).unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict"),
+            "migration-local nextval default must block a non-CASCADE sequence drop: {findings:?}"
+        );
 
         engine
             .analyze("DROP SEQUENCE s CASCADE;", &mut state)
@@ -1089,6 +1332,99 @@ mod state_mutation_tests {
     }
 
     #[test]
+    fn migration_local_default_blocks_standalone_sequence_drop() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE TABLE local_defaults(id int); CREATE SEQUENCE local_defaults_id_seq; ALTER TABLE local_defaults ALTER COLUMN id SET DEFAULT nextval('local_defaults_id_seq');",
+                &mut state,
+            )
+            .unwrap();
+
+        let findings = engine
+            .analyze("DROP SEQUENCE local_defaults_id_seq;", &mut state)
+            .unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict"),
+            "migration-local default must block a standalone sequence drop: {findings:?}"
+        );
+
+        engine
+            .analyze("DROP SEQUENCE local_defaults_id_seq CASCADE;", &mut state)
+            .unwrap();
+        let table = object_id("public", "local_defaults");
+        assert!(matches!(
+            state.get_relation(&table),
+            Some(RelationOverlay::Present(relation))
+                if relation.get_column("id").is_some_and(|column| column.default.is_none())
+        ));
+    }
+
+    #[test]
+    fn dropping_migration_local_default_removes_sequence_dependency() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE TABLE local_default_reset(id int); CREATE SEQUENCE local_default_reset_seq; ALTER TABLE local_default_reset ALTER COLUMN id SET DEFAULT nextval('local_default_reset_seq'); ALTER TABLE local_default_reset ALTER COLUMN id DROP DEFAULT;",
+                &mut state,
+            )
+            .unwrap();
+
+        let findings = engine
+            .analyze("DROP SEQUENCE local_default_reset_seq;", &mut state)
+            .unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict"),
+            "DROP DEFAULT must remove the local sequence dependency: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn sequence_rename_preserves_default_dependency() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TABLE local_default_reset(id int); CREATE SEQUENCE local_default_reset_seq; ALTER TABLE local_default_reset ALTER COLUMN id SET DEFAULT nextval('local_default_reset_seq'); ALTER SEQUENCE local_default_reset_seq RENAME TO local_default_reset_seq_renamed;",
+                &mut state,
+            )
+            .unwrap();
+        let findings = engine
+            .analyze("DROP SEQUENCE local_default_reset_seq_renamed;", &mut state)
+            .unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict"),
+            "renaming must preserve the default dependency: {findings:?}"
+        );
+
+        engine
+            .analyze(
+                "ALTER TABLE local_default_reset ALTER COLUMN id DROP DEFAULT;",
+                &mut state,
+            )
+            .unwrap();
+        let findings = engine
+            .analyze("DROP SEQUENCE local_default_reset_seq_renamed;", &mut state)
+            .unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict"),
+            "DROP DEFAULT must remove the renamed sequence dependency: {findings:?}"
+        );
+    }
+
+    #[test]
     fn dropping_schema_cascade_removes_cross_schema_sequence_defaults() {
         let engine = setup_engine();
         let mut cache = {
@@ -1106,7 +1442,7 @@ mod state_mutation_tests {
                 generation: 0,
             },
         );
-        let mut state = safe_migrate::AnalysisState::new(cache);
+        let mut state = safe_migrate::api::AnalysisState::new(cache);
 
         engine
             .analyze(
@@ -1121,7 +1457,7 @@ mod state_mutation_tests {
 
         assert!(matches!(
             state.local.schemas.get("seq_schema"),
-            Some(safe_migrate::model::schema::SchemaOverlay::Dropped)
+            Some(safe_migrate::_internal::model::schema::SchemaOverlay::Dropped)
         ));
 
         assert!(matches!(
@@ -1194,7 +1530,7 @@ mod state_mutation_tests {
     #[test]
     fn test_enum_add_value_preserves_postgres_ordering() {
         let engine = setup_engine();
-        let mut cache = safe_migrate::db::cache::DbCache::new();
+        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
         let id = object_id("public", "e");
         cache.types.insert(
             id.clone(),
@@ -1206,7 +1542,7 @@ mod state_mutation_tests {
                 },
             },
         );
-        let mut state = safe_migrate::AnalysisState::new(cache);
+        let mut state = safe_migrate::api::AnalysisState::new(cache);
 
         engine
             .analyze(
@@ -1358,7 +1694,7 @@ mod state_mutation_tests {
         };
         assert_eq!(base_type, "emotion");
         let function_id = object_id("public", "accepts_mood(emotion)");
-        let Some(safe_migrate::model::function::FunctionOverlay::Present(function)) =
+        let Some(safe_migrate::_internal::model::function::FunctionOverlay::Present(function)) =
             state.local.functions.get(&function_id)
         else {
             panic!("remapped function missing");
@@ -1536,7 +1872,7 @@ mod state_mutation_tests {
             function_id.clone(),
             FunctionState {
                 id: function_id.clone(),
-                routine_kind: safe_migrate::model::function::RoutineKind::Function,
+                routine_kind: safe_migrate::_internal::model::function::RoutineKind::Function,
                 arg_types: vec!["mood".into()],
                 arg_type_ids: Vec::new(),
                 return_type: "mood".into(),
@@ -1546,7 +1882,7 @@ mod state_mutation_tests {
                 security: SecurityMode::Invoker,
             },
         );
-        let mut state = safe_migrate::AnalysisState::new(cache);
+        let mut state = safe_migrate::api::AnalysisState::new(cache);
 
         engine
             .analyze(
@@ -1681,7 +2017,7 @@ mod state_mutation_tests {
     #[test]
     fn enum_value_rename_obeys_cached_explicit_and_default_search_path_order() {
         let engine = setup_engine();
-        let mut cache = safe_migrate::db::cache::DbCache::new();
+        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
         cache.search_path = vec!["sm_core".into(), "public".into()];
         for schema in ["sm_core", "public"] {
             let id = object_id(schema, "mood");
@@ -1696,7 +2032,7 @@ mod state_mutation_tests {
                 },
             );
         }
-        let mut state = safe_migrate::AnalysisState::new(cache);
+        let mut state = safe_migrate::api::AnalysisState::new(cache);
 
         engine
             .analyze(
@@ -1743,7 +2079,7 @@ mod state_mutation_tests {
                 },
             );
         }
-        let mut state = safe_migrate::AnalysisState::new(cache);
+        let mut state = safe_migrate::api::AnalysisState::new(cache);
 
         engine
             .analyze(
@@ -1785,7 +2121,7 @@ mod state_mutation_tests {
                 },
             },
         );
-        let mut state = safe_migrate::AnalysisState::new(cache);
+        let mut state = safe_migrate::api::AnalysisState::new(cache);
 
         engine
             .analyze(
@@ -1803,7 +2139,7 @@ mod state_mutation_tests {
     #[test]
     fn enum_value_rename_skips_dropped_type_tombstones_in_the_search_path() {
         let engine = setup_engine();
-        let mut cache = safe_migrate::db::cache::DbCache::new();
+        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
         cache.search_path = vec!["first".into(), "second".into()];
         for schema in ["first", "second"] {
             let id = object_id(schema, "mood");
@@ -1818,7 +2154,7 @@ mod state_mutation_tests {
                 },
             );
         }
-        let mut state = safe_migrate::AnalysisState::new(cache);
+        let mut state = safe_migrate::api::AnalysisState::new(cache);
 
         let violations = engine
             .analyze(
@@ -1867,7 +2203,7 @@ mod state_mutation_tests {
             ),
         ] {
             let engine = setup_engine();
-            let mut cache = safe_migrate::db::cache::DbCache::new();
+            let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
             let id = object_id("public", "mood");
             cache.types.insert(
                 id.clone(),
@@ -1879,7 +2215,7 @@ mod state_mutation_tests {
                     },
                 },
             );
-            let mut state = safe_migrate::AnalysisState::new(cache);
+            let mut state = safe_migrate::api::AnalysisState::new(cache);
             let violations = engine.analyze(sql, &mut state).unwrap();
 
             assert!(violations.iter().any(|violation| {
@@ -1970,11 +2306,11 @@ mod state_mutation_tests {
 
         assert!(matches!(
             state.local.publications.get("p"),
-            Some(safe_migrate::model::replication::PublicationOverlay::Dropped)
+            Some(safe_migrate::_internal::model::replication::PublicationOverlay::Dropped)
         ));
         assert!(matches!(
             state.local.subscriptions.get("s"),
-            Some(safe_migrate::model::replication::SubscriptionOverlay::Dropped)
+            Some(safe_migrate::_internal::model::replication::SubscriptionOverlay::Dropped)
         ));
     }
 
@@ -2061,7 +2397,7 @@ mod state_mutation_tests {
         assert!(!relation.triggers.contains("old_trigger"));
         assert!(relation.triggers.contains("new_trigger"));
         assert!(state.local.triggers.values().any(|overlay| matches!(overlay,
-            safe_migrate::model::trigger::TriggerOverlay::Present(trigger) if trigger.name == "new_trigger"
+            safe_migrate::_internal::model::trigger::TriggerOverlay::Present(trigger) if trigger.name == "new_trigger"
         )));
 
         engine.analyze("ROLLBACK;", &mut state).unwrap();
@@ -2149,7 +2485,7 @@ mod state_mutation_tests {
         engine
             .analyze("ALTER ROLE app_user WITH INHERIT;", &mut state)
             .unwrap();
-        if let Some(safe_migrate::model::role::RoleOverlay::Present(role)) =
+        if let Some(safe_migrate::_internal::model::role::RoleOverlay::Present(role)) =
             state.local.roles.get(&role_id)
         {
             assert!(!role.can_login);
@@ -2161,7 +2497,7 @@ mod state_mutation_tests {
         engine.analyze("DROP ROLE app_user;", &mut state).unwrap();
         assert!(matches!(
             state.local.roles.get(&role_id),
-            Some(safe_migrate::model::role::RoleOverlay::Dropped)
+            Some(safe_migrate::_internal::model::role::RoleOverlay::Dropped)
         ));
     }
 
@@ -2176,21 +2512,21 @@ mod state_mutation_tests {
             )
             .unwrap();
 
-        let Some(safe_migrate::model::role::RoleOverlay::Present(user)) =
+        let Some(safe_migrate::_internal::model::role::RoleOverlay::Present(user)) =
             state.local.roles.get(&ObjectId::new("", "web_user"))
         else {
             panic!("user missing");
         };
         assert!(user.can_login);
 
-        let Some(safe_migrate::model::role::RoleOverlay::Present(role)) =
+        let Some(safe_migrate::_internal::model::role::RoleOverlay::Present(role)) =
             state.local.roles.get(&ObjectId::new("", "worker"))
         else {
             panic!("role missing");
         };
         assert!(role.can_login);
 
-        let Some(safe_migrate::model::role::RoleOverlay::Present(batch)) =
+        let Some(safe_migrate::_internal::model::role::RoleOverlay::Present(batch)) =
             state.local.roles.get(&ObjectId::new("", "batch"))
         else {
             panic!("plain role missing");
@@ -2289,9 +2625,9 @@ mod state_mutation_tests {
     #[test]
     fn test_synced_search_path_is_initial_and_default_path() {
         let engine = setup_engine();
-        let mut cache = safe_migrate::db::cache::DbCache::new();
+        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
         cache.search_path = vec!["tenant_app".to_string(), "shared".to_string()];
-        let mut state = safe_migrate::AnalysisState::new(cache);
+        let mut state = safe_migrate::api::AnalysisState::new(cache);
 
         engine
             .analyze("CREATE TABLE first(id int);", &mut state)
@@ -2325,7 +2661,7 @@ mod state_mutation_tests {
                 && edge.referenced == object_id("public", "indexed_table")
                 && matches!(
                     edge.kind,
-                    safe_migrate::analysis::graph::DependencyKind::IndexOnRelation { .. }
+                    safe_migrate::_internal::analysis::graph::DependencyKind::IndexOnRelation { .. }
                 )
         }));
     }
@@ -2458,7 +2794,7 @@ mod state_mutation_tests {
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
-                    safe_migrate::analysis::graph::DependencyKind::IndexOnRelation { .. }
+                    safe_migrate::_internal::analysis::graph::DependencyKind::IndexOnRelation { .. }
                 ))
                 .any(|i| i.referenced == object_id("public", "mv"))
         );
@@ -2545,7 +2881,7 @@ mod state_mutation_tests {
                     security: SecurityMode::Invoker,
                 },
             );
-            let mut state = safe_migrate::AnalysisState::new(cache);
+            let mut state = safe_migrate::api::AnalysisState::new(cache);
 
             for sql in [
                 "CREATE FUNCTION work(integer) RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$;",
@@ -2679,7 +3015,7 @@ mod state_mutation_tests {
                 },
             );
         }
-        let mut state = safe_migrate::AnalysisState::new(cache);
+        let mut state = safe_migrate::api::AnalysisState::new(cache);
 
         engine
             .analyze(
@@ -2724,15 +3060,15 @@ mod state_mutation_tests {
 
         for (routine_kind, sql) in [
             (
-                safe_migrate::model::function::RoutineKind::Function,
+                safe_migrate::_internal::model::function::RoutineKind::Function,
                 "DROP PROCEDURE IF EXISTS work(int);",
             ),
             (
-                safe_migrate::model::function::RoutineKind::Procedure,
+                safe_migrate::_internal::model::function::RoutineKind::Procedure,
                 "DROP FUNCTION IF EXISTS work(int);",
             ),
         ] {
-            let mut cache = safe_migrate::db::cache::DbCache::new();
+            let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
             cache.functions.insert(
                 routine_id.clone(),
                 FunctionState {
@@ -2747,7 +3083,7 @@ mod state_mutation_tests {
                     security: SecurityMode::Invoker,
                 },
             );
-            let mut state = safe_migrate::AnalysisState::new(cache);
+            let mut state = safe_migrate::api::AnalysisState::new(cache);
             let violations = engine.analyze(sql, &mut state).unwrap();
 
             assert!(
@@ -2816,7 +3152,7 @@ mod state_mutation_tests {
             cache
                 .functions
                 .insert(object_id("public", "work(integer)"), routine(kind));
-            let mut state = safe_migrate::AnalysisState::new(cache);
+            let mut state = safe_migrate::api::AnalysisState::new(cache);
             assert!(matches!(
                 state.apply(&drop, None),
                 MutationResult::Conflict { .. }
@@ -2829,7 +3165,7 @@ mod state_mutation_tests {
             object_id("public", "work(integer)"),
             routine(RoutineKind::Function),
         );
-        let mut wrong_kind_state = safe_migrate::AnalysisState::new(wrong_kind_cache);
+        let mut wrong_kind_state = safe_migrate::api::AnalysisState::new(wrong_kind_cache);
         assert!(matches!(
             wrong_kind_state.apply(&aggregate_drop("public", true), None),
             MutationResult::Conflict { .. }
@@ -2853,14 +3189,14 @@ mod state_mutation_tests {
         ] {
             let mut cache = DbCache::new();
             cache.metadata.schemas = Some(vec!["public".into()]);
-            let mut state = safe_migrate::AnalysisState::new(cache);
+            let mut state = safe_migrate::api::AnalysisState::new(cache);
             assert_eq!(state.apply(&drop, None), MutationResult::Skipped);
             assert_eq!(state.local.confidence, Confidence::Tainted);
         }
 
         let mut cache = DbCache::new();
         cache.metadata.schemas = Some(vec!["public".into()]);
-        let mut state = safe_migrate::AnalysisState::new(cache);
+        let mut state = safe_migrate::api::AnalysisState::new(cache);
         assert_eq!(
             state.apply(&function_drop("tenant", true), None),
             MutationResult::Skipped
@@ -2890,7 +3226,7 @@ mod state_mutation_tests {
         };
         assert_eq!(
             routine.routine_kind,
-            safe_migrate::model::function::RoutineKind::Procedure
+            safe_migrate::_internal::model::function::RoutineKind::Procedure
         );
 
         let wrong_kind = engine
@@ -2986,7 +3322,7 @@ mod state_mutation_tests {
 
         let mut scoped_cache = DbCache::new();
         scoped_cache.metadata.schemas = Some(vec!["public".into()]);
-        let mut scoped_state = safe_migrate::AnalysisState::new(scoped_cache);
+        let mut scoped_state = safe_migrate::api::AnalysisState::new(scoped_cache);
         let violations = engine
             .analyze(
                 "CREATE PUBLICATION external_pub FOR TABLE tenant.entries;",
@@ -3001,7 +3337,7 @@ mod state_mutation_tests {
         assert_eq!(scoped_state.local.confidence, Confidence::Tainted);
         assert!(matches!(
             scoped_state.local.publications.get("external_pub"),
-            Some(safe_migrate::model::replication::PublicationOverlay::Present(_))
+            Some(safe_migrate::_internal::model::replication::PublicationOverlay::Present(_))
         ));
     }
 
@@ -3024,14 +3360,16 @@ mod state_mutation_tests {
         );
         cache.publications.insert(
             "changes".into(),
-            safe_migrate::model::replication::PublicationState {
+            safe_migrate::_internal::model::replication::PublicationState {
                 name: "changes".into(),
                 owner: Some("postgres".into()),
-                scope: safe_migrate::analysis::facts::PublicationScope::Explicit(vec![
-                    safe_migrate::analysis::facts::PublicationObjectFact::Table {
-                        name: safe_migrate::ast::identifiers::QualifiedName::new(
-                            Some(safe_migrate::ast::identifiers::Ident::new("public", true)),
-                            safe_migrate::ast::identifiers::Ident::new("first", true),
+                scope: safe_migrate::_internal::analysis::facts::PublicationScope::Explicit(vec![
+                    safe_migrate::_internal::analysis::facts::PublicationObjectFact::Table {
+                        name: safe_migrate::_internal::ast::identifiers::QualifiedName::new(
+                            Some(safe_migrate::_internal::ast::identifiers::Ident::new(
+                                "public", true,
+                            )),
+                            safe_migrate::_internal::ast::identifiers::Ident::new("first", true),
                         ),
                         only: true,
                         include_partitions: false,
@@ -3045,10 +3383,10 @@ mod state_mutation_tests {
         );
         cache.subscriptions.insert(
             "subscriber".into(),
-            safe_migrate::model::replication::SubscriptionState {
+            safe_migrate::_internal::model::replication::SubscriptionState {
                 name: "subscriber".into(),
                 owner: Some("postgres".into()),
-                connection: safe_migrate::analysis::facts::ConnectionTarget::Redacted,
+                connection: safe_migrate::_internal::analysis::facts::ConnectionTarget::Redacted,
                 publications: vec!["changes".into()],
                 params: Some(Vec::new()),
                 enabled: false,
@@ -3056,7 +3394,7 @@ mod state_mutation_tests {
                 generation: 0,
             },
         );
-        let mut state = safe_migrate::AnalysisState::new(cache);
+        let mut state = safe_migrate::api::AnalysisState::new(cache);
 
         let violations = engine
             .analyze(
@@ -3075,12 +3413,14 @@ mod state_mutation_tests {
                 .any(|violation| violation.rule_id == "chain-conflict")
         );
         assert_eq!(state.local.confidence, Confidence::Exact);
-        let Some(safe_migrate::model::replication::PublicationOverlay::Present(publication)) =
-            state.local.publications.get("renamed_changes")
+        let Some(safe_migrate::_internal::model::replication::PublicationOverlay::Present(
+            publication,
+        )) = state.local.publications.get("renamed_changes")
         else {
             panic!("renamed publication missing");
         };
-        let safe_migrate::analysis::facts::PublicationScope::Explicit(objects) = &publication.scope
+        let safe_migrate::_internal::analysis::facts::PublicationScope::Explicit(objects) =
+            &publication.scope
         else {
             panic!("expected explicit publication scope");
         };
@@ -3093,8 +3433,9 @@ mod state_mutation_tests {
             ) && edge.dependent == object_id("public", "second")
         }));
 
-        let Some(safe_migrate::model::replication::SubscriptionOverlay::Present(subscription)) =
-            state.local.subscriptions.get("renamed_subscriber")
+        let Some(safe_migrate::_internal::model::replication::SubscriptionOverlay::Present(
+            subscription,
+        )) = state.local.subscriptions.get("renamed_subscriber")
         else {
             panic!("renamed subscription missing");
         };
@@ -3106,12 +3447,14 @@ mod state_mutation_tests {
         }));
 
         engine.analyze("DROP TABLE second;", &mut state).unwrap();
-        let Some(safe_migrate::model::replication::PublicationOverlay::Present(publication)) =
-            state.local.publications.get("renamed_changes")
+        let Some(safe_migrate::_internal::model::replication::PublicationOverlay::Present(
+            publication,
+        )) = state.local.publications.get("renamed_changes")
         else {
             panic!("publication missing after table drop");
         };
-        let safe_migrate::analysis::facts::PublicationScope::Explicit(objects) = &publication.scope
+        let safe_migrate::_internal::analysis::facts::PublicationScope::Explicit(objects) =
+            &publication.scope
         else {
             panic!("expected explicit publication scope");
         };
@@ -3123,10 +3466,10 @@ mod state_mutation_tests {
         let mut cache = DbCache::new();
         cache.subscriptions.insert(
             "subscriber".into(),
-            safe_migrate::model::replication::SubscriptionState {
+            safe_migrate::_internal::model::replication::SubscriptionState {
                 name: "subscriber".into(),
                 owner: Some("postgres".into()),
-                connection: safe_migrate::analysis::facts::ConnectionTarget::Redacted,
+                connection: safe_migrate::_internal::analysis::facts::ConnectionTarget::Redacted,
                 publications: vec!["existing".into()],
                 params: Some(Vec::new()),
                 enabled: false,
@@ -3134,24 +3477,24 @@ mod state_mutation_tests {
                 generation: 0,
             },
         );
-        let mut state = safe_migrate::AnalysisState::new(cache);
+        let mut state = safe_migrate::api::AnalysisState::new(cache);
         let initial_generation = state.local.generation_counter;
 
         for (mode, publications) in [
             (
-                safe_migrate::analysis::facts::SubscriptionPublicationMode::Add,
+                safe_migrate::_internal::analysis::facts::SubscriptionPublicationMode::Add,
                 vec!["new".to_string(), "existing".to_string()],
             ),
             (
-                safe_migrate::analysis::facts::SubscriptionPublicationMode::Drop,
+                safe_migrate::_internal::analysis::facts::SubscriptionPublicationMode::Drop,
                 vec!["existing".to_string(), "missing".to_string()],
             ),
         ] {
-            let mutation = safe_migrate::analysis::mutations::Mutation::AlterSubscription(
-                safe_migrate::analysis::mutations::AlterSubscriptionMutation {
+            let mutation = safe_migrate::_internal::analysis::mutations::Mutation::AlterSubscription(
+                safe_migrate::_internal::analysis::mutations::AlterSubscriptionMutation {
                     name: "subscriber".into(),
                     action:
-                        safe_migrate::analysis::facts::AlterSubscriptionActionFact::Publications {
+                        safe_migrate::_internal::analysis::facts::AlterSubscriptionActionFact::Publications {
                             mode,
                             publications,
                             params: Vec::new(),
@@ -3160,10 +3503,11 @@ mod state_mutation_tests {
             );
             assert!(matches!(
                 state.apply(&mutation, None),
-                safe_migrate::analysis::state::MutationResult::Conflict { .. }
+                safe_migrate::_internal::analysis::state::MutationResult::Conflict { .. }
             ));
-            let Some(safe_migrate::model::replication::SubscriptionOverlay::Present(subscription)) =
-                state.local.subscriptions.get("subscriber")
+            let Some(safe_migrate::_internal::model::replication::SubscriptionOverlay::Present(
+                subscription,
+            )) = state.local.subscriptions.get("subscriber")
             else {
                 panic!("subscription missing");
             };
@@ -3180,14 +3524,14 @@ mod state_mutation_tests {
         cache.search_path = vec!["tenant".into()];
         cache.publications.insert(
             "changes".into(),
-            safe_migrate::model::replication::PublicationState {
+            safe_migrate::_internal::model::replication::PublicationState {
                 name: "changes".into(),
                 owner: Some("postgres".into()),
-                scope: safe_migrate::analysis::facts::PublicationScope::Explicit(vec![
-                    safe_migrate::analysis::facts::PublicationObjectFact::Table {
-                        name: safe_migrate::ast::identifiers::QualifiedName::new(
+                scope: safe_migrate::_internal::analysis::facts::PublicationScope::Explicit(vec![
+                    safe_migrate::_internal::analysis::facts::PublicationObjectFact::Table {
+                        name: safe_migrate::_internal::ast::identifiers::QualifiedName::new(
                             None,
-                            safe_migrate::ast::identifiers::Ident::new("entries", true),
+                            safe_migrate::_internal::ast::identifiers::Ident::new("entries", true),
                         ),
                         only: true,
                         include_partitions: false,
@@ -3199,18 +3543,19 @@ mod state_mutation_tests {
                 generation: 0,
             },
         );
-        let mut state = safe_migrate::AnalysisState::new(cache);
+        let mut state = safe_migrate::api::AnalysisState::new(cache);
 
         engine.analyze("DROP TABLE entries;", &mut state).unwrap();
 
-        let Some(safe_migrate::model::replication::PublicationOverlay::Present(publication)) =
-            state.local.publications.get("changes")
+        let Some(safe_migrate::_internal::model::replication::PublicationOverlay::Present(
+            publication,
+        )) = state.local.publications.get("changes")
         else {
             panic!("publication missing");
         };
         assert!(matches!(
             &publication.scope,
-            safe_migrate::analysis::facts::PublicationScope::Explicit(objects)
+            safe_migrate::_internal::analysis::facts::PublicationScope::Explicit(objects)
                 if objects.is_empty()
         ));
     }
@@ -3221,14 +3566,16 @@ mod state_mutation_tests {
         let mut cache = cache_with_table("public", "parent", None);
         cache.publications.insert(
             "changes".into(),
-            safe_migrate::model::replication::PublicationState {
+            safe_migrate::_internal::model::replication::PublicationState {
                 name: "changes".into(),
                 owner: Some("postgres".into()),
-                scope: safe_migrate::analysis::facts::PublicationScope::Explicit(vec![
-                    safe_migrate::analysis::facts::PublicationObjectFact::Table {
-                        name: safe_migrate::ast::identifiers::QualifiedName::new(
-                            Some(safe_migrate::ast::identifiers::Ident::new("public", true)),
-                            safe_migrate::ast::identifiers::Ident::new("parent", true),
+                scope: safe_migrate::_internal::analysis::facts::PublicationScope::Explicit(vec![
+                    safe_migrate::_internal::analysis::facts::PublicationObjectFact::Table {
+                        name: safe_migrate::_internal::ast::identifiers::QualifiedName::new(
+                            Some(safe_migrate::_internal::ast::identifiers::Ident::new(
+                                "public", true,
+                            )),
+                            safe_migrate::_internal::ast::identifiers::Ident::new("parent", true),
                         ),
                         only: true,
                         include_partitions: false,
@@ -3241,16 +3588,16 @@ mod state_mutation_tests {
             },
         );
 
-        let mut inherited_state = safe_migrate::AnalysisState::new(cache.clone());
+        let mut inherited_state = safe_migrate::api::AnalysisState::new(cache.clone());
         engine
             .analyze(
-                "ALTER PUBLICATION changes DROP TABLE parent;",
+                "ALTER PUBLICATION changes DROP TABLE parent *;",
                 &mut inherited_state,
             )
             .unwrap();
         assert_eq!(inherited_state.local.confidence, Confidence::Tainted);
 
-        let mut only_state = safe_migrate::AnalysisState::new(cache);
+        let mut only_state = safe_migrate::api::AnalysisState::new(cache);
         engine
             .analyze(
                 "ALTER PUBLICATION changes DROP TABLE ONLY parent;",
@@ -3271,8 +3618,9 @@ mod state_mutation_tests {
                 &mut state,
             )
             .unwrap();
-        let Some(safe_migrate::model::replication::SubscriptionOverlay::Present(subscription)) =
-            state.local.subscriptions.get("deferred")
+        let Some(safe_migrate::_internal::model::replication::SubscriptionOverlay::Present(
+            subscription,
+        )) = state.local.subscriptions.get("deferred")
         else {
             panic!(
                 "deferred subscription missing: keys={:?} violations={create_violations:?}",
@@ -3294,7 +3642,7 @@ mod state_mutation_tests {
         }));
         assert!(matches!(
             state.local.subscriptions.get("deferred"),
-            Some(safe_migrate::model::replication::SubscriptionOverlay::Present(_))
+            Some(safe_migrate::_internal::model::replication::SubscriptionOverlay::Present(_))
         ));
 
         engine
@@ -3307,7 +3655,7 @@ mod state_mutation_tests {
         assert_eq!(state.local.confidence, Confidence::Tainted);
         assert!(matches!(
             state.local.subscriptions.get("deferred"),
-            Some(safe_migrate::model::replication::SubscriptionOverlay::Dropped)
+            Some(safe_migrate::_internal::model::replication::SubscriptionOverlay::Dropped)
         ));
     }
 
@@ -3333,7 +3681,7 @@ mod state_mutation_tests {
             assert_eq!(state.local.confidence, Confidence::Exact, "{sql}");
             assert!(!matches!(
                 state.local.subscriptions.get("invalid"),
-                Some(safe_migrate::model::replication::SubscriptionOverlay::Present(_))
+                Some(safe_migrate::_internal::model::replication::SubscriptionOverlay::Present(_))
             ));
         }
 
@@ -3358,7 +3706,7 @@ mod state_mutation_tests {
         assert_eq!(boolean_state.local.confidence, Confidence::Exact);
         assert!(matches!(
             boolean_state.local.subscriptions.get("boolean_options"),
-            Some(safe_migrate::model::replication::SubscriptionOverlay::Present(
+            Some(safe_migrate::_internal::model::replication::SubscriptionOverlay::Present(
                 subscription
             )) if !subscription.enabled && subscription.slot_name.is_none()
         ));
@@ -3422,9 +3770,701 @@ mod state_mutation_tests {
     }
 
     #[test]
+    fn grant_option_changes_preserve_effective_privilege_state() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let role = object_id("", "app_user");
+        let table = object_id("public", "grant_option_table");
+
+        engine
+            .analyze(
+                "CREATE TABLE grant_option_table(id int); GRANT SELECT ON grant_option_table TO app_user WITH GRANT OPTION;",
+                &mut state,
+            )
+            .unwrap();
+        let RelationOverlay::Present(relation) = state.local.relations.get(&table).unwrap() else {
+            panic!("table missing");
+        };
+        assert!(relation.privileges.has_privilege(&role, Privilege::Select));
+        assert!(
+            relation
+                .privileges
+                .has_grant_option(&role, Privilege::Select)
+        );
+
+        engine
+            .analyze(
+                "REVOKE GRANT OPTION FOR SELECT ON grant_option_table FROM app_user;",
+                &mut state,
+            )
+            .unwrap();
+        let RelationOverlay::Present(relation) = state.local.relations.get(&table).unwrap() else {
+            panic!("table missing");
+        };
+        assert!(relation.privileges.has_privilege(&role, Privilege::Select));
+        assert!(
+            !relation
+                .privileges
+                .has_grant_option(&role, Privilege::Select)
+        );
+    }
+
+    #[test]
+    fn targeted_revoke_without_acl_provenance_is_tainted() {
+        let engine = setup_engine();
+        let table_id = object_id("public", "provenance_table");
+        let reader = object_id("", "reader");
+        let owner = object_id("", "owner");
+        let mut cache = cache_with_table("public", "provenance_table", None);
+        cache.metadata.source_role = Some(owner.name.clone());
+        cache.metadata.source_session_role = Some(owner.name.clone());
+        cache.roles.insert(
+            owner.clone(),
+            RoleState {
+                id: owner.clone(),
+                can_login: true,
+                is_superuser: false,
+                inherits: true,
+                member_of: Vec::new(),
+                can_administer_membership: Vec::new(),
+                can_inherit_from: Vec::new(),
+                can_set_role_to: Vec::new(),
+            },
+        );
+        cache.roles.insert(
+            reader.clone(),
+            RoleState {
+                id: reader.clone(),
+                can_login: true,
+                is_superuser: false,
+                inherits: true,
+                member_of: Vec::new(),
+                can_administer_membership: Vec::new(),
+                can_inherit_from: Vec::new(),
+                can_set_role_to: Vec::new(),
+            },
+        );
+        if let Some(relation) = cache.relations.get_mut(&table_id) {
+            // The helper's default owner is schema-qualified; use the
+            // cluster role that executes the targeted revoke.
+            relation.owner = owner.clone();
+            let privileges = &mut relation.privileges;
+            let select: std::collections::HashSet<_> = [Privilege::Select].into_iter().collect();
+            // Deliberately model a legacy/hand-built ACL: the privilege and
+            // grant option exist, but their grantor provenance is absent.
+            privileges.grant(reader.clone(), select.clone());
+            privileges.grant_options.insert(reader.clone(), select);
+        }
+        let mut state = safe_migrate::api::AnalysisState::new(cache);
+
+        let _findings = engine
+            .analyze(
+                "REVOKE SELECT ON provenance_table FROM reader GRANTED BY owner;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert_eq!(state.local.confidence, Confidence::Tainted);
+    }
+
+    #[test]
+    fn object_granted_by_must_match_the_current_role() {
+        let engine = setup_engine();
+        let table_id = object_id("public", "explicit_grantor_table");
+        let mut cache = DbCache::new();
+        cache.metadata.source_role = Some("current_user".into());
+        cache.metadata.source_session_role = Some("current_user".into());
+        for name in ["current_user", "other_grantor", "reader"] {
+            let id = object_id("", name);
+            cache.roles.insert(
+                id.clone(),
+                RoleState {
+                    id,
+                    can_login: true,
+                    is_superuser: false,
+                    inherits: true,
+                    member_of: Vec::new(),
+                    can_administer_membership: Vec::new(),
+                    can_inherit_from: Vec::new(),
+                    can_set_role_to: Vec::new(),
+                },
+            );
+        }
+        let mut relation = RelationState::new(
+            table_id.clone(),
+            object_id("", "owner"),
+            0,
+            Some(1),
+            RelationKind::Table,
+            Persistence::Permanent,
+            0,
+        );
+        relation.privileges.grant_with_option(
+            object_id("", "other_grantor"),
+            [Privilege::Select].into_iter().collect(),
+        );
+        cache.insert_baseline(table_id, relation);
+        let mut state = safe_migrate::api::AnalysisState::new(cache);
+
+        let findings = engine
+            .analyze(
+                "GRANT SELECT ON explicit_grantor_table TO reader GRANTED BY other_grantor;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict")
+        );
+        let RelationOverlay::Present(relation) = state
+            .get_relation(&object_id("public", "explicit_grantor_table"))
+            .unwrap()
+        else {
+            panic!("relation missing");
+        };
+        assert!(
+            !relation
+                .privileges
+                .has_privilege(&object_id("", "reader"), Privilege::Select)
+        );
+
+        let findings = engine
+            .analyze(
+                "GRANT SELECT ON ALL TABLES IN SCHEMA public TO reader GRANTED BY other_grantor;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict")
+        );
+    }
+
+    #[test]
+    fn inherited_grant_option_authorizes_a_delegated_grant() {
+        let engine = setup_engine();
+        let table_id = object_id("public", "inherited_grant_table");
+        let parent = object_id("", "grant_parent");
+        let member = object_id("", "grant_member");
+        let mut cache = DbCache::new();
+        cache.pg_version_num = Some(160_000);
+        cache.metadata.source_role = Some("grant_member".into());
+        cache.metadata.source_session_role = Some("grant_member".into());
+        cache.roles.insert(
+            parent.clone(),
+            RoleState {
+                id: parent.clone(),
+                can_login: false,
+                is_superuser: false,
+                inherits: true,
+                member_of: Vec::new(),
+                can_administer_membership: Vec::new(),
+                can_inherit_from: Vec::new(),
+                can_set_role_to: Vec::new(),
+            },
+        );
+        cache.roles.insert(
+            member.clone(),
+            RoleState {
+                id: member.clone(),
+                can_login: true,
+                is_superuser: false,
+                inherits: true,
+                member_of: vec![parent.clone()],
+                can_administer_membership: Vec::new(),
+                can_inherit_from: vec![parent.clone()],
+                can_set_role_to: Vec::new(),
+            },
+        );
+        let delegated = object_id("", "delegated_user");
+        cache.roles.insert(
+            delegated.clone(),
+            RoleState {
+                id: delegated,
+                can_login: true,
+                is_superuser: false,
+                inherits: true,
+                member_of: Vec::new(),
+                can_administer_membership: Vec::new(),
+                can_inherit_from: Vec::new(),
+                can_set_role_to: Vec::new(),
+            },
+        );
+        let mut relation = RelationState::new(
+            table_id.clone(),
+            object_id("", "owner"),
+            0,
+            Some(1),
+            RelationKind::Table,
+            Persistence::Permanent,
+            0,
+        );
+        relation
+            .privileges
+            .grant_with_option(parent, [Privilege::Select].into_iter().collect());
+        cache.insert_baseline(table_id, relation);
+        let mut state = safe_migrate::api::AnalysisState::new(cache);
+
+        let violations = engine
+            .analyze(
+                "GRANT SELECT ON inherited_grant_table TO delegated_user;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(!violations.iter().any(|v| v.rule_id == "chain-conflict"));
+        let RelationOverlay::Present(relation) = state
+            .get_relation(&object_id("public", "inherited_grant_table"))
+            .unwrap()
+        else {
+            panic!("relation missing");
+        };
+        assert!(
+            relation
+                .privileges
+                .has_privilege(&object_id("", "delegated_user"), Privilege::Select)
+        );
+    }
+
+    #[test]
+    fn membership_without_inherit_option_cannot_delegate_grants() {
+        let engine = setup_engine();
+        let table_id = object_id("public", "non_inherited_grant_table");
+        let parent = object_id("", "grant_parent");
+        let member = object_id("", "grant_member");
+        let mut cache = DbCache::new();
+        cache.pg_version_num = Some(160_000);
+        cache.metadata.source_role = Some("grant_member".into());
+        cache.metadata.source_session_role = Some("grant_member".into());
+        for (id, can_inherit_from) in [(parent.clone(), Vec::new()), (member.clone(), Vec::new())] {
+            let is_member = id == member;
+            cache.roles.insert(
+                id.clone(),
+                RoleState {
+                    id,
+                    can_login: true,
+                    is_superuser: false,
+                    inherits: true,
+                    member_of: if is_member {
+                        vec![parent.clone()]
+                    } else {
+                        Vec::new()
+                    },
+                    can_administer_membership: Vec::new(),
+                    can_inherit_from,
+                    can_set_role_to: Vec::new(),
+                },
+            );
+        }
+        let delegated = object_id("", "delegated_user");
+        cache.roles.insert(
+            delegated.clone(),
+            RoleState {
+                id: delegated,
+                can_login: true,
+                is_superuser: false,
+                inherits: true,
+                member_of: Vec::new(),
+                can_administer_membership: Vec::new(),
+                can_inherit_from: Vec::new(),
+                can_set_role_to: Vec::new(),
+            },
+        );
+        let mut relation = RelationState::new(
+            table_id.clone(),
+            object_id("", "owner"),
+            0,
+            Some(1),
+            RelationKind::Table,
+            Persistence::Permanent,
+            0,
+        );
+        relation
+            .privileges
+            .grant_with_option(parent, [Privilege::Select].into_iter().collect());
+        cache.insert_baseline(table_id, relation);
+        let mut state = safe_migrate::api::AnalysisState::new(cache);
+
+        let violations = engine
+            .analyze(
+                "GRANT SELECT ON non_inherited_grant_table TO delegated_user;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(violations.iter().any(|v| v.rule_id == "chain-conflict"));
+        let RelationOverlay::Present(relation) = state
+            .get_relation(&object_id("public", "non_inherited_grant_table"))
+            .unwrap()
+        else {
+            panic!("relation missing");
+        };
+        assert!(
+            !relation
+                .privileges
+                .has_privilege(&object_id("", "delegated_user"), Privilege::Select)
+        );
+    }
+
+    #[test]
+    fn pg16_membership_inherit_option_overrides_member_noinherit() {
+        let engine = setup_engine();
+        let table_id = object_id("public", "membership_option_table");
+        let parent = object_id("", "grant_parent");
+        let member = object_id("", "grant_member");
+        let delegated = object_id("", "delegated_user");
+        let mut cache = DbCache::new();
+        cache.pg_version_num = Some(160_000);
+        cache.metadata.source_role = Some(member.name.clone());
+        cache.metadata.source_session_role = Some(member.name.clone());
+        for (id, inherits, can_inherit_from) in [
+            (parent.clone(), true, Vec::new()),
+            (member.clone(), false, vec![parent.clone()]),
+            (delegated.clone(), true, Vec::new()),
+        ] {
+            cache.roles.insert(
+                id.clone(),
+                RoleState {
+                    id: id.clone(),
+                    can_login: true,
+                    is_superuser: false,
+                    inherits,
+                    member_of: (id == member)
+                        .then_some(parent.clone())
+                        .into_iter()
+                        .collect(),
+                    can_administer_membership: Vec::new(),
+                    can_inherit_from,
+                    can_set_role_to: Vec::new(),
+                },
+            );
+        }
+        let mut relation = RelationState::new(
+            table_id.clone(),
+            object_id("", "owner"),
+            0,
+            Some(1),
+            RelationKind::Table,
+            Persistence::Permanent,
+            0,
+        );
+        relation
+            .privileges
+            .grant_with_option(parent, [Privilege::Select].into_iter().collect());
+        cache.insert_baseline(table_id, relation);
+        let mut state = safe_migrate::api::AnalysisState::new(cache);
+
+        let findings = engine
+            .analyze(
+                "GRANT SELECT ON membership_option_table TO delegated_user;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict")
+        );
+    }
+
+    #[test]
+    fn pg15_alter_role_inherit_activates_existing_membership() {
+        let engine = setup_engine();
+        let table_id = object_id("public", "legacy_inherit_table");
+        let parent = object_id("", "grant_parent");
+        let member = object_id("", "grant_member");
+        let delegated = object_id("", "delegated_user");
+        let mut cache = DbCache::new();
+        cache.pg_version_num = Some(150_000);
+        cache.metadata.source_role = Some(member.name.clone());
+        cache.metadata.source_session_role = Some(member.name.clone());
+        for (id, inherits) in [
+            (parent.clone(), true),
+            (member.clone(), false),
+            (delegated.clone(), true),
+        ] {
+            cache.roles.insert(
+                id.clone(),
+                RoleState {
+                    id,
+                    can_login: true,
+                    is_superuser: false,
+                    inherits,
+                    member_of: Vec::new(),
+                    can_administer_membership: Vec::new(),
+                    can_inherit_from: Vec::new(),
+                    can_set_role_to: Vec::new(),
+                },
+            );
+        }
+        let member_state = cache.roles.get_mut(&member).expect("member role exists");
+        member_state.member_of.push(parent.clone());
+        member_state.can_inherit_from.push(parent.clone());
+
+        let mut relation = RelationState::new(
+            table_id.clone(),
+            object_id("", "owner"),
+            0,
+            Some(1),
+            RelationKind::Table,
+            Persistence::Permanent,
+            0,
+        );
+        relation
+            .privileges
+            .grant_with_option(parent, [Privilege::Select].into_iter().collect());
+        cache.insert_baseline(table_id, relation);
+        let mut state = safe_migrate::api::AnalysisState::new(cache);
+
+        let findings = engine
+            .analyze(
+                "ALTER ROLE grant_member INHERIT; \
+                 GRANT SELECT ON legacy_inherit_table TO delegated_user;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict")
+        );
+    }
+
+    #[test]
+    fn inherited_admin_option_authorizes_role_membership_grants() {
+        let engine = setup_engine();
+        let actor = object_id("", "membership_actor");
+        let delegator = object_id("", "membership_delegator");
+        let target = object_id("", "membership_target");
+        let recipient = object_id("", "membership_recipient");
+        let mut cache = DbCache::new();
+        cache.pg_version_num = Some(160_000);
+        cache.metadata.source_role = Some(actor.name.clone());
+        cache.metadata.source_session_role = Some(actor.name.clone());
+        for (id, member_of, can_inherit_from, can_administer_membership) in [
+            (
+                actor.clone(),
+                vec![delegator.clone()],
+                vec![delegator.clone()],
+                Vec::new(),
+            ),
+            (
+                delegator.clone(),
+                Vec::new(),
+                Vec::new(),
+                vec![target.clone()],
+            ),
+            (target.clone(), Vec::new(), Vec::new(), Vec::new()),
+            (recipient.clone(), Vec::new(), Vec::new(), Vec::new()),
+        ] {
+            cache.roles.insert(
+                id.clone(),
+                RoleState {
+                    id,
+                    can_login: true,
+                    is_superuser: false,
+                    inherits: false,
+                    member_of,
+                    can_administer_membership,
+                    can_inherit_from,
+                    can_set_role_to: Vec::new(),
+                },
+            );
+        }
+        let mut state = safe_migrate::api::AnalysisState::new(cache);
+
+        let findings = engine
+            .analyze(
+                "GRANT membership_target TO membership_recipient;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict")
+        );
+        let RoleOverlay::Present(recipient) = state
+            .local
+            .roles
+            .get(&object_id("", "membership_recipient"))
+            .unwrap()
+        else {
+            panic!("recipient role unexpectedly dropped");
+        };
+        assert_eq!(recipient.member_of, vec![target]);
+    }
+
+    #[test]
+    fn revoke_cascade_removes_grants_delegated_by_the_revoked_role() {
+        let engine = setup_engine();
+        let table_id = object_id("public", "cascade_grant_table");
+        let owner = object_id("", "grant_owner");
+        let delegate = object_id("", "grant_delegate");
+        let reader = object_id("", "grant_reader");
+        let mut cache = DbCache::new();
+        cache.metadata.source_role = Some("grant_owner".into());
+        cache.metadata.source_session_role = Some("grant_owner".into());
+        for (id, can_set_role_to) in [
+            (owner.clone(), vec![delegate.clone()]),
+            (delegate.clone(), vec![owner.clone()]),
+            (reader.clone(), Vec::new()),
+        ] {
+            cache.roles.insert(
+                id.clone(),
+                RoleState {
+                    id,
+                    can_login: true,
+                    is_superuser: false,
+                    inherits: true,
+                    member_of: Vec::new(),
+                    can_administer_membership: Vec::new(),
+                    can_inherit_from: Vec::new(),
+                    can_set_role_to,
+                },
+            );
+        }
+        cache.insert_baseline(
+            table_id.clone(),
+            RelationState::new(
+                table_id,
+                owner.clone(),
+                0,
+                Some(1),
+                RelationKind::Table,
+                Persistence::Permanent,
+                0,
+            ),
+        );
+        let mut state = safe_migrate::api::AnalysisState::new(cache);
+        engine
+            .analyze(
+                "GRANT SELECT ON cascade_grant_table TO grant_delegate WITH GRANT OPTION; SET ROLE grant_delegate; GRANT SELECT ON cascade_grant_table TO grant_reader WITH GRANT OPTION; SET ROLE grant_owner;",
+                &mut state,
+            )
+            .unwrap();
+        let violations = engine
+            .analyze(
+                "REVOKE SELECT ON cascade_grant_table FROM grant_delegate CASCADE;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(!violations.iter().any(|v| v.rule_id == "chain-conflict"));
+        let RelationOverlay::Present(relation) = state
+            .get_relation(&object_id("public", "cascade_grant_table"))
+            .unwrap()
+        else {
+            panic!("relation missing");
+        };
+        assert!(
+            !relation
+                .privileges
+                .has_privilege(&delegate, Privilege::Select)
+        );
+        assert!(
+            !relation
+                .privileges
+                .has_privilege(&reader, Privilege::Select)
+        );
+    }
+
+    #[test]
+    fn test_revoke_all_cascade_removes_privileges_and_downstream_grants() {
+        use safe_migrate::_internal::model::role::RoleState;
+
+        let engine = setup_engine();
+        let mut cache = safe_migrate::api::DbCache::new();
+        let table_id = object_id("public", "revoke_all_table");
+        let owner = object_id("", "owner");
+        let intermediate = object_id("", "intermediate");
+        let leaf = object_id("", "leaf");
+
+        cache.metadata.source_session_role = Some("owner".into());
+        for (id, can_set_role_to) in [
+            (owner.clone(), vec![intermediate.clone()]),
+            (intermediate.clone(), vec![owner.clone()]),
+            (leaf.clone(), Vec::new()),
+        ] {
+            cache.roles.insert(
+                id.clone(),
+                RoleState {
+                    id,
+                    can_login: true,
+                    is_superuser: false,
+                    inherits: true,
+                    member_of: Vec::new(),
+                    can_administer_membership: Vec::new(),
+                    can_inherit_from: Vec::new(),
+                    can_set_role_to,
+                },
+            );
+        }
+        cache.insert_baseline(
+            table_id.clone(),
+            RelationState::new(
+                table_id.clone(),
+                owner.clone(),
+                0,
+                Some(1),
+                RelationKind::Table,
+                Persistence::Permanent,
+                0,
+            ),
+        );
+        let mut state = safe_migrate::api::AnalysisState::new(cache);
+        engine
+            .analyze(
+                "GRANT SELECT, UPDATE ON revoke_all_table TO intermediate WITH GRANT OPTION; SET ROLE intermediate; GRANT SELECT ON revoke_all_table TO leaf; SET ROLE owner;",
+                &mut state,
+            )
+            .unwrap();
+
+        let relation = match state.get_relation(&table_id).unwrap() {
+            RelationOverlay::Present(r) => r,
+            _ => panic!("relation missing"),
+        };
+        assert!(
+            relation
+                .privileges
+                .has_privilege(&intermediate, Privilege::Select)
+        );
+        assert!(
+            relation
+                .privileges
+                .has_privilege(&intermediate, Privilege::Update)
+        );
+        assert!(relation.privileges.has_privilege(&leaf, Privilege::Select));
+
+        let violations = engine
+            .analyze(
+                "REVOKE ALL ON revoke_all_table FROM intermediate CASCADE;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(!violations.iter().any(|v| v.rule_id == "chain-conflict"));
+
+        let relation = match state.get_relation(&table_id).unwrap() {
+            RelationOverlay::Present(r) => r,
+            _ => panic!("relation missing"),
+        };
+
+        assert!(
+            !relation
+                .privileges
+                .has_privilege(&intermediate, Privilege::Select)
+        );
+        assert!(
+            !relation
+                .privileges
+                .has_privilege(&intermediate, Privilege::Update)
+        );
+        assert!(!relation.privileges.has_privilege(&leaf, Privilege::Select));
+    }
+
+    #[test]
     fn test_state_hydrates_and_disables_trigger() {
-        use safe_migrate::db::cache::TriggerCache;
-        use safe_migrate::model::trigger::{TriggerEnableMode, TriggerOverlay};
+        use safe_migrate::_internal::db::cache::TriggerCache;
+        use safe_migrate::_internal::model::trigger::{TriggerEnableMode, TriggerOverlay};
 
         let engine = setup_engine();
         let mut cache = cache_with_table("public", "test_table", None);
@@ -3434,7 +4474,7 @@ mod state_mutation_tests {
             function_id: object_id("public", "check_row()"),
             enabled_mode: TriggerEnableMode::Origin,
         });
-        let mut state = safe_migrate::AnalysisState::new(cache);
+        let mut state = safe_migrate::api::AnalysisState::new(cache);
 
         engine
             .analyze(
@@ -3456,7 +4496,7 @@ mod state_mutation_tests {
 
     #[test]
     fn test_state_alter_function_updates_volatility_and_identity() {
-        use safe_migrate::model::function::{FunctionOverlay, Volatility};
+        use safe_migrate::_internal::model::function::{FunctionOverlay, Volatility};
 
         let engine = setup_engine();
         let mut state = setup_state();
@@ -3494,11 +4534,26 @@ mod state_mutation_tests {
 
     #[test]
     fn test_state_adds_named_check_constraint() {
-        use safe_migrate::model::constraint::ConstraintKind;
+        use safe_migrate::_internal::model::constraint::ConstraintKind;
 
         let engine = setup_engine();
-        let mut state =
-            safe_migrate::AnalysisState::new(cache_with_table("public", "t_large", None));
+        let mut cache = cache_with_table("public", "t_large", None);
+        cache
+            .relations
+            .get_mut(&object_id("public", "t_large"))
+            .expect("baseline table")
+            .columns
+            .push(Column {
+                name: "id".to_string(),
+                data_type: Some("integer".to_string()),
+                type_id: None,
+                is_nullable: true,
+                default: None,
+                avg_width: None,
+                default_expr_text: None,
+                type_modifier: Some(-1),
+            });
+        let mut state = safe_migrate::api::AnalysisState::new(cache);
         engine
             .analyze(
                 "ALTER TABLE t_large ADD CONSTRAINT positive_id CHECK (id > 0);",
@@ -3513,15 +4568,503 @@ mod state_mutation_tests {
             .expect("check constraint should be represented");
         assert_eq!(constraint.kind, ConstraintKind::Check);
         assert!(constraint.validated);
+        assert!(state.local.graph.edges().iter().any(|edge| {
+            matches!(
+                &edge.kind,
+                safe_migrate::_internal::analysis::graph::DependencyKind::ConstraintDependency {
+                    constraint_name,
+                    columns,
+                } if constraint_name == "positive_id" && columns == &["id".to_string()]
+            )
+        }));
+    }
+
+    #[test]
+    fn cached_check_dependency_blocks_drop_without_cascade_and_cleans_up_with_cascade() {
+        let engine = setup_engine();
+        let table = object_id("public", "accounts");
+        let mut cache = cache_with_table("public", "accounts", None);
+        cache
+            .relations
+            .get_mut(&table)
+            .expect("baseline table")
+            .columns
+            .extend([
+                Column {
+                    name: "id".to_string(),
+                    data_type: Some("integer".to_string()),
+                    type_id: None,
+                    is_nullable: false,
+                    default: None,
+                    avg_width: None,
+                    default_expr_text: None,
+                    type_modifier: Some(-1),
+                },
+                Column {
+                    name: "note".to_string(),
+                    data_type: Some("text".to_string()),
+                    type_id: None,
+                    is_nullable: true,
+                    default: None,
+                    avg_width: None,
+                    default_expr_text: None,
+                    type_modifier: Some(-1),
+                },
+            ]);
+        cache.constraints.push(
+            safe_migrate::_internal::model::constraint::ConstraintState {
+                table_id: table.clone(),
+                name: "accounts_note_check".to_string(),
+                kind: ConstraintKind::Check,
+                validated: true,
+                backing_index: None,
+            },
+        );
+        cache
+            .constraint_dependencies
+            .push(ConstraintDependencyCache {
+                table_id: table.clone(),
+                constraint_name: "accounts_note_check".to_string(),
+                columns: vec!["note".to_string()],
+            });
+
+        let mut drop_constraint_state = safe_migrate::api::AnalysisState::new(cache.clone());
+        engine
+            .analyze(
+                "ALTER TABLE accounts DROP CONSTRAINT accounts_note_check;",
+                &mut drop_constraint_state,
+            )
+            .unwrap();
+        assert!(
+            !drop_constraint_state
+                .local
+                .graph
+                .edges()
+                .iter()
+                .any(|edge| {
+                    matches!(
+                        edge.kind,
+                        DependencyKind::ConstraintDependency { ref constraint_name, .. }
+                            if constraint_name == "accounts_note_check"
+                    )
+                })
+        );
+
+        let mut state = safe_migrate::api::AnalysisState::new(cache.clone());
+        let findings = engine
+            .analyze("ALTER TABLE accounts DROP COLUMN note;", &mut state)
+            .unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict")
+        );
+        assert!(matches!(
+            state.get_relation(&table),
+            Some(RelationOverlay::Present(relation)) if relation.has_column("note")
+        ));
+
+        let mut cascade_state = safe_migrate::api::AnalysisState::new(cache);
+        let findings = engine
+            .analyze(
+                "ALTER TABLE accounts DROP COLUMN note CASCADE;",
+                &mut cascade_state,
+            )
+            .unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict")
+        );
+        assert!(!matches!(
+            cascade_state.get_relation(&table),
+            Some(RelationOverlay::Present(relation)) if relation.has_column("note")
+        ));
+        assert!(
+            !cascade_state
+                .local
+                .constraints
+                .contains_key(&(table, "accounts_note_check".to_string()))
+        );
+    }
+
+    #[test]
+    fn cached_generated_column_drop_handles_transitive_cascade_closure() {
+        let engine = setup_engine();
+        let table = object_id("public", "metrics");
+        let mut cache = cache_with_table("public", "metrics", None);
+        cache
+            .relations
+            .get_mut(&table)
+            .expect("baseline table")
+            .columns
+            .extend([
+                Column {
+                    name: "source".to_string(),
+                    data_type: Some("integer".to_string()),
+                    type_id: None,
+                    is_nullable: true,
+                    default: None,
+                    avg_width: None,
+                    default_expr_text: None,
+                    type_modifier: Some(-1),
+                },
+                Column {
+                    name: "derived".to_string(),
+                    data_type: Some("integer".to_string()),
+                    type_id: None,
+                    is_nullable: true,
+                    default: None,
+                    avg_width: None,
+                    default_expr_text: None,
+                    type_modifier: Some(-1),
+                },
+                Column {
+                    name: "derived_twice".to_string(),
+                    data_type: Some("integer".to_string()),
+                    type_id: None,
+                    is_nullable: true,
+                    default: None,
+                    avg_width: None,
+                    default_expr_text: None,
+                    type_modifier: Some(-1),
+                },
+            ]);
+        cache
+            .generated_column_dependencies
+            .push(GeneratedColumnDependencyCache {
+                table_id: table.clone(),
+                column_name: "derived".to_string(),
+                depends_on_column: "source".to_string(),
+            });
+        cache
+            .generated_column_dependencies
+            .push(GeneratedColumnDependencyCache {
+                table_id: table.clone(),
+                column_name: "derived_twice".to_string(),
+                depends_on_column: "derived".to_string(),
+            });
+        cache.constraints.push(
+            safe_migrate::_internal::model::constraint::ConstraintState {
+                table_id: table.clone(),
+                name: "derived_twice_check".to_string(),
+                kind: ConstraintKind::Check,
+                validated: true,
+                backing_index: None,
+            },
+        );
+        cache
+            .constraint_dependencies
+            .push(ConstraintDependencyCache {
+                table_id: table.clone(),
+                constraint_name: "derived_twice_check".to_string(),
+                columns: vec!["derived_twice".to_string()],
+            });
+        let derived_index = object_id("public", "metrics_derived_idx");
+        cache
+            .indexes
+            .push(safe_migrate::_internal::db::cache::IndexCache {
+                index_id: derived_index.clone(),
+                table_id: table.clone(),
+                using_method: "btree".to_string(),
+                key_columns: vec!["derived".to_string()],
+                included_columns: Vec::new(),
+                dependency_columns: vec!["derived".to_string()],
+                dependency_columns_known: true,
+                has_expression_keys: false,
+                has_predicate: false,
+                is_unique: false,
+                is_valid: true,
+                is_ready: true,
+                is_live: true,
+                has_default_sort_order: true,
+                has_default_opclasses: true,
+                has_default_collations: true,
+            });
+        let mut state = safe_migrate::api::AnalysisState::new(cache.clone());
+
+        let findings = engine
+            .analyze("ALTER TABLE metrics DROP COLUMN derived;", &mut state)
+            .unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict")
+        );
+        assert!(
+            state
+                .local
+                .graph
+                .edges()
+                .iter()
+                .any(|edge| { matches!(edge.kind, DependencyKind::ColumnGeneratedFrom { .. }) })
+        );
+        assert!(matches!(
+            state.get_relation(&table),
+            Some(RelationOverlay::Present(relation)) if relation.has_column("derived")
+        ));
+
+        let mut derived_cascade_state = safe_migrate::api::AnalysisState::new(cache.clone());
+        let findings = engine
+            .analyze(
+                "ALTER TABLE metrics DROP COLUMN derived CASCADE;",
+                &mut derived_cascade_state,
+            )
+            .unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict")
+        );
+        assert!(matches!(
+            derived_cascade_state.get_relation(&table),
+            Some(RelationOverlay::Present(relation))
+                if !relation.has_column("derived") && !relation.has_column("derived_twice")
+        ));
+        assert!(
+            !derived_cascade_state
+                .local
+                .constraints
+                .contains_key(&(table.clone(), "derived_twice_check".to_string()))
+        );
+
+        let mut source_state = safe_migrate::api::AnalysisState::new(cache.clone());
+        let findings = engine
+            .analyze("ALTER TABLE metrics DROP COLUMN source;", &mut source_state)
+            .unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict")
+        );
+        let mut cascade_state = safe_migrate::api::AnalysisState::new(cache);
+        let findings = engine
+            .analyze(
+                "ALTER TABLE metrics DROP COLUMN source CASCADE;",
+                &mut cascade_state,
+            )
+            .unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict")
+        );
+        assert!(matches!(
+            cascade_state.get_relation(&table),
+            Some(RelationOverlay::Present(relation))
+                if !relation.has_column("source")
+                    && !relation.has_column("derived")
+                    && !relation.has_column("derived_twice")
+        ));
+        assert!(!cascade_state.local.graph.edges().iter().any(|edge| {
+            matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
+                && edge.dependent == derived_index
+        }));
+    }
+
+    #[test]
+    fn standalone_default_sequence_is_a_drop_dependency() {
+        let engine = setup_engine();
+        let table = object_id("public", "events");
+        let sequence = object_id("public", "event_seq");
+        let mut cache = cache_with_table("public", "events", None);
+        cache
+            .relations
+            .get_mut(&table)
+            .expect("baseline table")
+            .columns
+            .push(Column {
+                name: "event_id".to_string(),
+                data_type: Some("integer".to_string()),
+                type_id: None,
+                is_nullable: true,
+                default: None,
+                avg_width: None,
+                default_expr_text: Some("nextval('public.event_seq'::regclass)".to_string()),
+                type_modifier: Some(-1),
+            });
+        cache.sequences.insert(
+            sequence.clone(),
+            SequenceState {
+                id: sequence.clone(),
+                owner: object_id("public", "postgres"),
+                owned_by: None,
+                kind: SequenceKind::Standalone,
+                generation: 0,
+            },
+        );
+        cache.default_sequence_dependencies.push(
+            safe_migrate::_internal::db::cache::DefaultSequenceDependencyCache {
+                table_id: table.clone(),
+                column_name: "event_id".to_string(),
+                sequence_id: sequence.clone(),
+            },
+        );
+
+        let mut state = safe_migrate::api::AnalysisState::new(cache.clone());
+        let findings = engine
+            .analyze("DROP SEQUENCE event_seq;", &mut state)
+            .unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict")
+        );
+
+        let mut cascade_state = safe_migrate::api::AnalysisState::new(cache.clone());
+        let findings = engine
+            .analyze("DROP SEQUENCE event_seq CASCADE;", &mut cascade_state)
+            .unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict")
+        );
+        assert!(
+            !cascade_state.local.graph.edges().iter().any(|edge| {
+                matches!(edge.kind, DependencyKind::ColumnDefaultOnSequence { .. })
+            })
+        );
+        assert!(matches!(
+            cascade_state.get_relation(&table),
+            Some(RelationOverlay::Present(relation))
+                if relation
+                    .get_column("event_id")
+                    .is_some_and(|column| column.default_expr_text.is_none())
+        ));
+
+        let mut table_drop_state = safe_migrate::api::AnalysisState::new(cache.clone());
+        let findings = engine
+            .analyze("DROP TABLE events;", &mut table_drop_state)
+            .unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict")
+        );
+        assert!(matches!(
+            table_drop_state.local.sequences.get(&sequence),
+            Some(SequenceOverlay::Present(_))
+        ));
+        assert!(
+            !table_drop_state.local.graph.edges().iter().any(|edge| {
+                matches!(edge.kind, DependencyKind::ColumnDefaultOnSequence { .. })
+            })
+        );
+        // An unqualified regclass rendering is interpreted through PostgreSQL's
+        // search path. The typed catalog edge, rather than this text, must
+        // decide which same-named sequence owns the default.
+        let alternate_sequence = object_id("tenant", "event_seq");
+        let mut same_name_cache = cache.clone();
+        same_name_cache.sequences.insert(
+            alternate_sequence.clone(),
+            SequenceState {
+                id: alternate_sequence.clone(),
+                owner: object_id("public", "postgres"),
+                owned_by: None,
+                kind: SequenceKind::Standalone,
+                generation: 0,
+            },
+        );
+        same_name_cache.default_sequence_dependencies.clear();
+        same_name_cache.default_sequence_dependencies.push(
+            safe_migrate::_internal::db::cache::DefaultSequenceDependencyCache {
+                table_id: table.clone(),
+                column_name: "event_id".to_string(),
+                sequence_id: alternate_sequence,
+            },
+        );
+        let column = same_name_cache
+            .relations
+            .get_mut(&table)
+            .expect("baseline table")
+            .columns
+            .iter_mut()
+            .find(|column| column.name == "event_id")
+            .expect("baseline column");
+        column.default_expr_text = Some("nextval('event_seq'::regclass)".to_string());
+        let mut same_name_state = safe_migrate::api::AnalysisState::new(same_name_cache);
+        engine
+            .analyze(
+                "DROP SEQUENCE public.event_seq CASCADE;",
+                &mut same_name_state,
+            )
+            .unwrap();
+        assert!(matches!(
+            same_name_state.get_relation(&table),
+            Some(RelationOverlay::Present(relation))
+                if relation.get_column("event_id").is_some_and(|column| column.default_expr_text.is_some())
+        ));
+
+        let mut rollback_state = safe_migrate::api::AnalysisState::new(cache);
+        engine
+            .analyze("BEGIN; DROP TABLE events; ROLLBACK;", &mut rollback_state)
+            .unwrap();
+        assert!(rollback_state.relation_is_present(&table));
+        assert!(rollback_state.local.graph.edges().iter().any(|edge| {
+            matches!(
+                edge.kind,
+                DependencyKind::ColumnDefaultOnSequence { ref column } if column == "event_id"
+            ) && edge.dependent == table
+                && edge.referenced == sequence
+        }));
+    }
+    #[test]
+    fn rename_table_updates_column_default_sequence_dependency() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let seq_id = object_id("public", "test_seq");
+        engine
+            .analyze("CREATE SEQUENCE public.test_seq;", &mut state)
+            .unwrap();
+        let table_id = object_id("public", "test_table");
+        engine
+            .analyze("CREATE TABLE public.test_table (id INT);", &mut state)
+            .unwrap();
+
+        state.local.graph.add_edge(DependencyEdge {
+            dependent: table_id.clone(),
+            referenced: seq_id.clone(),
+            kind: DependencyKind::ColumnDefaultOnSequence {
+                column: "id".to_string(),
+            },
+        });
+
+        assert!(state.local.graph.edges().iter().any(|edge| {
+            matches!(edge.kind, DependencyKind::ColumnDefaultOnSequence { .. })
+                && edge.dependent == table_id
+                && edge.referenced == seq_id
+        }));
+
+        let new_table_id = object_id("public", "new_table");
+        engine
+            .analyze(
+                "ALTER TABLE public.test_table RENAME TO new_table;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(state.local.graph.edges().iter().any(|edge| {
+            matches!(edge.kind, DependencyKind::ColumnDefaultOnSequence { .. })
+                && edge.dependent == new_table_id
+                && edge.referenced == seq_id
+        }));
+
+        // Assert the old table is no longer present as dependent
+        assert!(!state.local.graph.edges().iter().any(|edge| {
+            matches!(edge.kind, DependencyKind::ColumnDefaultOnSequence { .. })
+                && edge.dependent == table_id
+                && edge.referenced == seq_id
+        }));
     }
 
     #[test]
     fn test_state_adds_named_unique_constraint() {
-        use safe_migrate::model::constraint::ConstraintKind;
+        use safe_migrate::_internal::model::constraint::ConstraintKind;
 
         let engine = setup_engine();
         let mut state =
-            safe_migrate::AnalysisState::new(cache_with_table("public", "t_large", None));
+            safe_migrate::api::AnalysisState::new(cache_with_table("public", "t_large", None));
         engine
             .analyze(
                 "ALTER TABLE t_large ADD CONSTRAINT unique_id UNIQUE (id);",
@@ -3540,8 +5083,8 @@ mod state_mutation_tests {
 
     #[test]
     fn test_drop_function_cascade_removes_dependent_trigger() {
-        use safe_migrate::model::function::FunctionOverlay;
-        use safe_migrate::model::trigger::TriggerOverlay;
+        use safe_migrate::_internal::model::function::FunctionOverlay;
+        use safe_migrate::_internal::model::trigger::TriggerOverlay;
 
         let engine = setup_engine();
         let mut state = setup_state();
@@ -3574,7 +5117,7 @@ mod state_mutation_tests {
 
     #[test]
     fn same_named_triggers_on_different_tables_remain_independent() {
-        use safe_migrate::model::trigger::{TriggerEnableMode, TriggerOverlay};
+        use safe_migrate::_internal::model::trigger::{TriggerEnableMode, TriggerOverlay};
 
         let engine = setup_engine();
         let mut state = setup_state();
@@ -3613,8 +5156,8 @@ mod state_mutation_tests {
 
     #[test]
     fn test_variadic_function_drop_normalizes_array_alias() {
-        use safe_migrate::db::cache::DbCache;
-        use safe_migrate::model::function::{
+        use safe_migrate::_internal::db::cache::DbCache;
+        use safe_migrate::_internal::model::function::{
             FunctionOverlay, FunctionState, SecurityMode, Volatility,
         };
 
@@ -3625,7 +5168,7 @@ mod state_mutation_tests {
             function_id.clone(),
             FunctionState {
                 id: function_id.clone(),
-                routine_kind: safe_migrate::model::function::RoutineKind::Function,
+                routine_kind: safe_migrate::_internal::model::function::RoutineKind::Function,
                 arg_types: vec!["integer[]".to_string()],
                 arg_type_ids: vec![None],
                 return_type: "integer".to_string(),
@@ -3635,7 +5178,7 @@ mod state_mutation_tests {
                 security: SecurityMode::Invoker,
             },
         );
-        let mut state = safe_migrate::AnalysisState::new(cache);
+        let mut state = safe_migrate::api::AnalysisState::new(cache);
         engine
             .analyze("DROP FUNCTION f_safe(VARIADIC INT[]);", &mut state)
             .unwrap();
@@ -3956,19 +5499,21 @@ mod state_mutation_tests {
             Persistence::Permanent,
             0,
         );
-        relation.columns.push(safe_migrate::model::column::Column {
-            name: "period".to_string(),
-            data_type: Some("int4range".to_string()),
-            type_id: None,
-            is_nullable: true,
-            default: None,
-            avg_width: None,
-            default_expr_text: None,
-            type_modifier: None,
-        });
+        relation
+            .columns
+            .push(safe_migrate::_internal::model::column::Column {
+                name: "period".to_string(),
+                data_type: Some("int4range".to_string()),
+                type_id: None,
+                is_nullable: true,
+                default: None,
+                avg_width: None,
+                default_expr_text: None,
+                type_modifier: None,
+            });
         let mut cache = DbCache::new();
         cache.insert_baseline(table_id, relation);
-        let mut state = safe_migrate::AnalysisState::new(cache);
+        let mut state = safe_migrate::api::AnalysisState::new(cache);
         let violations = engine
             .analyze(
                 "ALTER TABLE reservations ADD CONSTRAINT no_overlap
@@ -4025,6 +5570,26 @@ mod state_mutation_tests {
     }
 
     #[test]
+    fn role_inherit_option_is_preserved_across_create_and_alter() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE ROLE no_inherit NOINHERIT;
+                 ALTER ROLE no_inherit INHERIT;",
+                &mut state,
+            )
+            .unwrap();
+
+        let role_id = object_id("", "no_inherit");
+        let RoleOverlay::Present(role) = state.local.roles.get(&role_id).unwrap() else {
+            panic!("expected role to be present");
+        };
+        assert!(role.inherits);
+    }
+
+    #[test]
     fn set_session_authorization_updates_session_role_and_allows_reset() {
         let engine = setup_engine();
         let mut cache = DbCache::new();
@@ -4042,13 +5607,15 @@ mod state_mutation_tests {
                     id,
                     can_login: true,
                     is_superuser: superuser,
+                    inherits: true,
                     member_of: Vec::new(),
+                    can_administer_membership: Vec::new(),
+                    can_inherit_from: Vec::new(),
                     can_set_role_to: Vec::new(),
-                    granted_privileges: Vec::new(),
                 },
             );
         }
-        let mut state = safe_migrate::AnalysisState::new(cache);
+        let mut state = safe_migrate::api::AnalysisState::new(cache);
 
         assert_eq!(state.local.current_role, "app_user");
         assert_eq!(state.local.session_role, "app_user");
@@ -4261,9 +5828,11 @@ mod state_mutation_tests {
                     id,
                     can_login: true,
                     is_superuser: superuser,
+                    inherits: true,
                     member_of: Vec::new(),
+                    can_administer_membership: Vec::new(),
+                    can_inherit_from: Vec::new(),
                     can_set_role_to: Vec::new(),
-                    granted_privileges: Vec::new(),
                 },
             );
         }
@@ -4280,7 +5849,7 @@ mod state_mutation_tests {
                 0,
             ),
         );
-        let mut state = safe_migrate::AnalysisState::new(cache);
+        let mut state = safe_migrate::api::AnalysisState::new(cache);
 
         engine
             .analyze(
@@ -4314,7 +5883,7 @@ mod state_mutation_tests {
                 0,
             ),
         );
-        let mut state = safe_migrate::AnalysisState::new(cache);
+        let mut state = safe_migrate::api::AnalysisState::new(cache);
 
         engine
             .analyze(
@@ -4330,6 +5899,51 @@ mod state_mutation_tests {
     }
 
     #[test]
+    fn alter_table_owner_moves_owned_sequence_owner() {
+        let engine = setup_engine();
+        let mut cache = DbCache::new();
+        let table = object_id("public", "owned_table");
+        let sequence = object_id("public", "owned_table_id_seq");
+        cache.insert_baseline(
+            table.clone(),
+            RelationState::new(
+                table.clone(),
+                object_id("", "old_owner"),
+                0,
+                None,
+                RelationKind::Table,
+                Persistence::Permanent,
+                0,
+            ),
+        );
+        cache.sequences.insert(
+            sequence.clone(),
+            SequenceState {
+                id: sequence.clone(),
+                owner: object_id("", "old_owner"),
+                owned_by: Some((table.clone(), "id".into())),
+                kind: SequenceKind::Owned,
+                generation: 0,
+            },
+        );
+        let mut state = safe_migrate::api::AnalysisState::new(cache);
+
+        engine
+            .analyze(
+                "ALTER TABLE public.owned_table OWNER TO new_owner;",
+                &mut state,
+            )
+            .unwrap();
+
+        let SequenceOverlay::Present(sequence_state) =
+            state.local.sequences.get(&sequence).unwrap()
+        else {
+            panic!("owned sequence missing");
+        };
+        assert_eq!(sequence_state.owner, object_id("", "new_owner"));
+    }
+
+    #[test]
     fn complete_role_catalog_rejects_missing_role_switch() {
         let engine = setup_engine();
         let mut cache = DbCache::new();
@@ -4342,12 +5956,14 @@ mod state_mutation_tests {
                 id: login,
                 can_login: true,
                 is_superuser: false,
+                inherits: true,
                 member_of: Vec::new(),
+                can_administer_membership: Vec::new(),
+                can_inherit_from: Vec::new(),
                 can_set_role_to: Vec::new(),
-                granted_privileges: Vec::new(),
             },
         );
-        let mut state = safe_migrate::AnalysisState::new(cache);
+        let mut state = safe_migrate::api::AnalysisState::new(cache);
 
         let violations = engine
             .analyze("SET ROLE role_that_does_not_exist;", &mut state)
@@ -4378,13 +5994,15 @@ mod state_mutation_tests {
                     id,
                     can_login: name == "member",
                     is_superuser: false,
+                    inherits: true,
                     member_of: can_set_role_to.clone(),
+                    can_administer_membership: Vec::new(),
+                    can_inherit_from: Vec::new(),
                     can_set_role_to,
-                    granted_privileges: Vec::new(),
                 },
             );
         }
-        let mut state = safe_migrate::AnalysisState::new(cache);
+        let mut state = safe_migrate::api::AnalysisState::new(cache);
 
         let violations = engine
             .analyze(
@@ -4420,17 +6038,265 @@ mod state_mutation_tests {
                     id,
                     can_login: name == "member",
                     is_superuser: false,
+                    inherits: true,
                     member_of,
+                    can_administer_membership: Vec::new(),
+                    can_inherit_from: Vec::new(),
                     can_set_role_to: Vec::new(),
-                    granted_privileges: Vec::new(),
                 },
             );
         }
-        let mut state = safe_migrate::AnalysisState::new(cache);
+        let mut state = safe_migrate::api::AnalysisState::new(cache);
 
         let violations = engine.analyze("SET ROLE target;", &mut state).unwrap();
 
         assert!(violations.iter().any(|v| v.rule_id == "chain-conflict"));
         assert_eq!(state.local.current_role, "member");
+    }
+
+    #[test]
+    fn grant_set_option_authorizes_set_role_and_revoke_removes_it() {
+        let engine = setup_engine();
+        let mut cache = DbCache::new();
+        cache.metadata.source_role = Some("member".into());
+        cache.metadata.source_session_role = Some("member".into());
+        for name in ["member", "parent"] {
+            let id = object_id("", name);
+            cache.roles.insert(
+                id.clone(),
+                RoleState {
+                    id,
+                    can_login: name == "member",
+                    is_superuser: false,
+                    inherits: true,
+                    member_of: Vec::new(),
+                    can_administer_membership: vec![object_id("", "parent")],
+                    can_inherit_from: Vec::new(),
+                    can_set_role_to: Vec::new(),
+                },
+            );
+        }
+        let mut state = safe_migrate::api::AnalysisState::new(cache);
+
+        let violations = engine
+            .analyze("GRANT parent TO member; SET ROLE parent;", &mut state)
+            .unwrap();
+        assert!(!violations.iter().any(|v| v.rule_id == "chain-conflict"));
+        assert_eq!(state.local.current_role, "parent");
+
+        let violations = engine
+            .analyze(
+                "GRANT parent TO member WITH SET TRUE; SET ROLE parent;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(!violations.iter().any(|v| v.rule_id == "chain-conflict"));
+        assert_eq!(state.local.current_role, "parent");
+
+        let violations = engine
+            .analyze(
+                "SET ROLE member; REVOKE SET OPTION FOR parent FROM member;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(!violations.iter().any(|v| v.rule_id == "chain-conflict"));
+        assert_eq!(state.local.current_role, "member");
+
+        let violations = engine.analyze("SET ROLE parent;", &mut state).unwrap();
+        assert!(violations.iter().any(|v| v.rule_id == "chain-conflict"));
+        assert_eq!(state.local.current_role, "member");
+
+        let violations = engine
+            .analyze(
+                "BEGIN; GRANT parent TO member WITH SET TRUE; ROLLBACK; SET ROLE parent;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(violations.iter().any(|v| v.rule_id == "chain-conflict"));
+        assert_eq!(state.local.current_role, "member");
+    }
+
+    #[test]
+    fn role_membership_admin_and_inherit_options_round_trip() {
+        let engine = setup_engine();
+        let mut cache = DbCache::new();
+        for name in ["member", "parent"] {
+            let id = object_id("", name);
+            cache.roles.insert(
+                id.clone(),
+                RoleState {
+                    id,
+                    can_login: false,
+                    is_superuser: false,
+                    inherits: true,
+                    member_of: Vec::new(),
+                    can_administer_membership: Vec::new(),
+                    can_inherit_from: Vec::new(),
+                    can_set_role_to: Vec::new(),
+                },
+            );
+        }
+        let mut state = safe_migrate::api::AnalysisState::new(cache);
+
+        let violations = engine
+            .analyze(
+                "GRANT parent TO member WITH ADMIN TRUE, INHERIT FALSE, SET FALSE;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(!violations.iter().any(|v| v.rule_id == "chain-conflict"));
+        let RoleOverlay::Present(role) = state.local.roles.get(&object_id("", "member")).unwrap()
+        else {
+            panic!("member role unexpectedly dropped");
+        };
+        assert_eq!(role.member_of, vec![object_id("", "parent")]);
+        assert_eq!(
+            role.can_administer_membership,
+            vec![object_id("", "parent")]
+        );
+        assert!(role.can_inherit_from.is_empty());
+        assert!(role.can_set_role_to.is_empty());
+
+        engine
+            .analyze("REVOKE ADMIN OPTION FOR parent FROM member;", &mut state)
+            .unwrap();
+        let RoleOverlay::Present(role) = state.local.roles.get(&object_id("", "member")).unwrap()
+        else {
+            panic!("member role unexpectedly dropped");
+        };
+        assert!(role.can_administer_membership.is_empty());
+        assert_eq!(role.member_of, vec![object_id("", "parent")]);
+    }
+
+    #[test]
+    fn role_membership_revoke_cascade_removes_dependent_grants() {
+        let engine = setup_engine();
+        let mut cache = DbCache::new();
+        cache.metadata.source_role = Some("admin".into());
+        cache.metadata.source_session_role = Some("admin".into());
+        for name in ["admin", "parent", "member", "child"] {
+            let id = object_id("", name);
+            cache.roles.insert(
+                id.clone(),
+                RoleState {
+                    id,
+                    can_login: true,
+                    is_superuser: false,
+                    inherits: true,
+                    member_of: Vec::new(),
+                    can_administer_membership: Vec::new(),
+                    can_inherit_from: Vec::new(),
+                    can_set_role_to: Vec::new(),
+                },
+            );
+        }
+        let parent = object_id("", "parent");
+        let member = object_id("", "member");
+        cache
+            .roles
+            .get_mut(&object_id("", "admin"))
+            .unwrap()
+            .member_of = vec![parent.clone()];
+        cache
+            .roles
+            .get_mut(&object_id("", "admin"))
+            .unwrap()
+            .can_administer_membership = vec![parent.clone()];
+        cache.roles.get_mut(&member).unwrap().member_of = vec![parent.clone()];
+        cache
+            .roles
+            .get_mut(&member)
+            .unwrap()
+            .can_administer_membership = vec![parent.clone()];
+        cache.role_membership_grantors.push(
+            safe_migrate::_internal::model::role::RoleMembershipGrantor {
+                member: member.clone(),
+                role: parent.clone(),
+                grantor: object_id("", "admin"),
+            },
+        );
+        let mut state = safe_migrate::api::AnalysisState::new(cache);
+
+        engine
+            .analyze(
+                "GRANT parent TO child GRANTED BY member; \
+                 GRANT parent TO child GRANTED BY admin; \
+                 REVOKE parent FROM member CASCADE;",
+                &mut state,
+            )
+            .unwrap();
+        let RoleOverlay::Present(child) = state.local.roles.get(&object_id("", "child")).unwrap()
+        else {
+            panic!("child role unexpectedly dropped");
+        };
+        assert!(!child.member_of.contains(&parent));
+    }
+
+    #[test]
+    fn role_grant_to_public_is_rejected_before_partial_mutation() {
+        let engine = setup_engine();
+        let mut cache = DbCache::new();
+        for name in ["member", "parent"] {
+            let id = object_id("", name);
+            cache.roles.insert(
+                id.clone(),
+                RoleState {
+                    id,
+                    can_login: false,
+                    is_superuser: false,
+                    inherits: true,
+                    member_of: Vec::new(),
+                    can_administer_membership: Vec::new(),
+                    can_inherit_from: Vec::new(),
+                    can_set_role_to: Vec::new(),
+                },
+            );
+        }
+        let mut state = safe_migrate::api::AnalysisState::new(cache);
+        let result = engine.analyze("GRANT parent TO member, PUBLIC WITH SET TRUE;", &mut state);
+        assert!(result.is_ok());
+        let role = state
+            .local
+            .roles
+            .get(&object_id("", "member"))
+            .expect("member role");
+        let RoleOverlay::Present(role) = role else {
+            panic!("member role unexpectedly dropped");
+        };
+        assert!(role.member_of.is_empty());
+        assert!(role.can_set_role_to.is_empty());
+    }
+
+    #[test]
+    fn role_grant_rejects_cycles_before_mutating_the_batch() {
+        let engine = setup_engine();
+        let mut cache = DbCache::new();
+        for name in ["role_a", "role_b"] {
+            let id = object_id("", name);
+            cache.roles.insert(
+                id.clone(),
+                RoleState {
+                    id,
+                    can_login: false,
+                    is_superuser: false,
+                    inherits: true,
+                    member_of: Vec::new(),
+                    can_administer_membership: Vec::new(),
+                    can_inherit_from: Vec::new(),
+                    can_set_role_to: Vec::new(),
+                },
+            );
+        }
+        let mut state = safe_migrate::api::AnalysisState::new(cache);
+        let _ = engine
+            .analyze("GRANT role_a, role_b TO role_b, role_a;", &mut state)
+            .unwrap();
+        for name in ["role_a", "role_b"] {
+            let role = state.local.roles.get(&object_id("", name)).unwrap();
+            let RoleOverlay::Present(role) = role else {
+                panic!("role unexpectedly dropped");
+            };
+            assert!(role.member_of.is_empty());
+        }
     }
 }

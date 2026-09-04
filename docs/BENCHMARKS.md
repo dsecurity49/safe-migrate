@@ -1,7 +1,8 @@
 # Local benchmark baseline
 
 This document records reproducible, non-CI performance scenarios. The values
-are comparison points for the later `0.7.0` work, not performance guarantees.
+are comparison points for the current `0.8.0` hardening work, not performance
+guarantees.
 Run them with:
 
 ```sh
@@ -37,11 +38,11 @@ checkpoint-capture, and isolated dependency-query measurements require a
 profiler or allocator instrumentation and are deliberately not inferred from
 these wall-clock samples.
 
-## Optimized-profile `v0.7.0` structural baseline
+## Optimized-profile `v0.8.0` structural baseline
 
 Captured on 2026-08-28 from commit `b639b04` using Rust 1.98.0 on the same
 aarch64 Android Linux environment. This run uses Cargo's optimized `release`
-profile and is the comparison point for evidence-gated `v0.7.0` work; it is not
+profile and is the comparison point for evidence-gated `v0.8.0` work; it is not
 comparable to the debug timings above and is not a performance guarantee.
 
 | Scenario | Statements | Elapsed |
@@ -109,7 +110,7 @@ The returned public fields and values remain unchanged; an equivalence test
 compares incremental capture with a fresh capture after update, insertion, and
 removal mutations.
 
-Cache V6 decoding now streams decompressed bytes through the bounded bincode
+Cache V7 decoding streams decompressed bytes through the bounded bincode
 reader instead of retaining a second, fully decompressed byte vector. This is a
 structural peak-memory reduction, not an RSS claim: authenticated decryption
 still completes before decompression, the 256 MiB decoded-size bound remains

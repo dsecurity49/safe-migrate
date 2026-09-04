@@ -2,19 +2,19 @@ mod common;
 
 use crate::common::database_hosts_are_local;
 use postgres::{Client, Config as PostgresConfig, NoTls};
-use safe_migrate::analysis::graph::DependencyKind;
-use safe_migrate::analysis::state::AnalysisState;
-use safe_migrate::db::cache::DbCache;
-use safe_migrate::engine::config::Config;
-use safe_migrate::engine::engine::SafeMigrateEngine;
-use safe_migrate::model::constraint::ConstraintKind;
-use safe_migrate::model::function::{FunctionOverlay, Volatility};
-use safe_migrate::model::relation::{Privilege, RelationKind, RelationOverlay};
-use safe_migrate::model::schema::SchemaOverlay;
-use safe_migrate::model::sequence::{SequenceKind, SequenceOverlay};
-use safe_migrate::model::trigger::TriggerOverlay;
-use safe_migrate::model::types::{TypeKind, TypeOverlay};
-use safe_migrate::sync::{populate_cache, populate_cache_in_current_transaction};
+use safe_migrate::_internal::analysis::graph::DependencyKind;
+use safe_migrate::_internal::analysis::state::AnalysisState;
+use safe_migrate::_internal::db::cache::DbCache;
+use safe_migrate::_internal::engine::config::Config;
+use safe_migrate::_internal::engine::engine::SafeMigrateEngine;
+use safe_migrate::_internal::model::constraint::ConstraintKind;
+use safe_migrate::_internal::model::function::{FunctionOverlay, Volatility};
+use safe_migrate::_internal::model::relation::{Privilege, RelationKind, RelationOverlay};
+use safe_migrate::_internal::model::schema::SchemaOverlay;
+use safe_migrate::_internal::model::sequence::{SequenceKind, SequenceOverlay};
+use safe_migrate::_internal::model::trigger::TriggerOverlay;
+use safe_migrate::_internal::model::types::{TypeKind, TypeOverlay};
+use safe_migrate::_internal::sync::{populate_cache, populate_cache_in_current_transaction};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 const VERBOSITY_ENV: &str = "SAFE_MIGRATE_DIFF_VERBOSITY";
 const RULE_FILTER_ENV: &str = "SAFE_MIGRATE_DIFF_RULE";
 const FIXTURE_FILTER_ENV: &str = "SAFE_MIGRATE_DIFF_FIXTURE";
+const DATABASE_NAME_ENV: &str = "SAFE_MIGRATE_DIFF_DATABASE";
 const REQUIRE_LIVE_ENV: &str = "SAFE_MIGRATE_REQUIRE_LIVE";
 
 #[derive(Debug, Deserialize)]
@@ -42,6 +43,8 @@ struct RuleManifest {
     transactional: bool,
     #[serde(default)]
     fixture_transactional: BTreeMap<String, bool>,
+    #[serde(default)]
+    fixture_min_pg_version: BTreeMap<String, u32>,
     #[serde(default)]
     excluded_fixtures: Vec<FixtureExclusion>,
     schemas: Vec<String>,
@@ -72,6 +75,8 @@ struct RequiredRoleEdge {
 #[serde(rename_all = "snake_case")]
 enum RequiredRoleEdgeKind {
     CanSetRoleTo,
+    CanAdministerMembership,
+    CanInheritFrom,
     MemberOfWithoutSet,
 }
 
@@ -97,6 +102,7 @@ fn default_transactional() -> bool {
 #[serde(rename_all = "snake_case")]
 enum ComparisonScope {
     Schemas,
+    Roles,
     Sequences,
     Relations,
     Columns,
@@ -110,11 +116,14 @@ enum ComparisonScope {
     Triggers,
     ViewDependencies,
     Partitions,
+    Publications,
+    Subscriptions,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct NormalizedState {
     schemas: BTreeMap<String, String>,
+    roles: BTreeSet<NormalizedRoleMembership>,
     sequences: BTreeMap<String, NormalizedSequence>,
     relations: BTreeMap<String, NormalizedRelation>,
     indexes: BTreeSet<NormalizedIndex>,
@@ -127,6 +136,18 @@ struct NormalizedState {
     triggers: BTreeMap<(String, String), NormalizedTrigger>,
     partition_edges: BTreeSet<(String, String)>,
     view_dependencies: BTreeSet<(String, String)>,
+    publications: BTreeMap<String, NormalizedPublication>,
+    subscriptions: BTreeMap<String, NormalizedSubscription>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct NormalizedRoleMembership {
+    member: String,
+    role: String,
+    admin: bool,
+    inherit: bool,
+    set: bool,
+    grantor: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -205,6 +226,23 @@ struct NormalizedPrivilege {
     table: String,
     grantee: String,
     privilege: String,
+    grantable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NormalizedPublication {
+    owner: Option<String>,
+    scope: String,
+    params: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NormalizedSubscription {
+    owner: Option<String>,
+    publications: Vec<String>,
+    params: String,
+    enabled: bool,
+    slot_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -245,6 +283,12 @@ enum MismatchCategory {
     ExtraPartitionEdgeInSimulator,
     MissingViewDependencyInSimulator,
     ExtraViewDependencyInSimulator,
+    MissingPublicationInSimulator,
+    ExtraPublicationInSimulator,
+    PublicationDefinitionMismatch,
+    MissingSubscriptionInSimulator,
+    ExtraSubscriptionInSimulator,
+    SubscriptionDefinitionMismatch,
     RoleMembershipMismatch,
     BaselineObjectAbsent,
     LiveExecutionFailed,
@@ -316,9 +360,18 @@ fn live_postgres_differential_harness() {
         .query_one("SELECT current_database()", &[])
         .expect("failed to identify the live differential database")
         .get(0);
+    let expected_database =
+        std::env::var(DATABASE_NAME_ENV).unwrap_or_else(|_| "safe_migrate".to_string());
+    assert!(
+        !expected_database.trim().is_empty()
+            && expected_database
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '_'),
+        "{DATABASE_NAME_ENV} must be a nonempty unquoted database identifier"
+    );
     assert_eq!(
-        connected_database, "safe_migrate",
-        "live differential harness refuses to modify a database not named safe_migrate"
+        connected_database, expected_database,
+        "live differential harness refuses to modify an unexpected database; set {DATABASE_NAME_ENV} explicitly for a disposable local database"
     );
     if verbosity >= 1 {
         let row = client
@@ -345,6 +398,12 @@ fn live_postgres_differential_harness() {
     let manifest = load_manifest(&manifest_path);
     let baseline_sql = fs::read_to_string(&baseline_path)
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", baseline_path.display()));
+    let server_version_num: u32 = client
+        .query_one("SHOW server_version_num", &[])
+        .expect("failed to inspect PostgreSQL version")
+        .get::<_, String>(0)
+        .parse()
+        .expect("server_version_num must be numeric");
     let engine = SafeMigrateEngine::new(Config::default());
     let mut mismatches = Vec::new();
     let rule_filter = std::env::var(RULE_FILTER_ENV).ok();
@@ -362,7 +421,13 @@ fn live_postgres_differential_harness() {
         .map(|rule| {
             rule.fixtures
                 .iter()
-                .filter(|fixture| fixture_is_selected(&fixture_filter, &rule.rule_dir, fixture))
+                .filter(|fixture| {
+                    fixture_is_selected(&fixture_filter, &rule.rule_dir, fixture)
+                        && rule
+                            .fixture_min_pg_version
+                            .get(*fixture)
+                            .is_none_or(|minimum| server_version_num >= *minimum)
+                })
                 .count()
         })
         .sum::<usize>();
@@ -416,11 +481,13 @@ fn live_postgres_differential_harness() {
                 );
             }
         }
-        for fixture in rule
-            .fixtures
-            .iter()
-            .filter(|fixture| fixture_is_selected(&fixture_filter, &rule.rule_dir, fixture))
-        {
+        for fixture in rule.fixtures.iter().filter(|fixture| {
+            fixture_is_selected(&fixture_filter, &rule.rule_dir, fixture)
+                && rule
+                    .fixture_min_pg_version
+                    .get(*fixture)
+                    .is_none_or(|minimum| server_version_num >= *minimum)
+        }) {
             let transactional = rule
                 .fixture_transactional
                 .get(fixture)
@@ -697,7 +764,8 @@ fn live_postgres_differential_harness() {
                 }
             };
 
-            let simulator_projection = snapshot_simulator_state(&simulator_state, scope);
+            let simulator_projection =
+                snapshot_simulator_state(&simulator_state, &rule.schemas, scope);
             verbose(
                 verbosity,
                 2,
@@ -794,7 +862,7 @@ fn verbose(verbosity: u8, level: u8, message: impl std::fmt::Display) {
 
 fn state_counts(state: &NormalizedState) -> String {
     format!(
-        "schemas:{} sequences:{} relations:{} indexes:{} constraints:{} foreign_keys:{} functions:{} types:{} privileges:{} policies:{} triggers:{} partitions:{} view_dependencies:{}",
+        "schemas:{} sequences:{} relations:{} indexes:{} constraints:{} foreign_keys:{} functions:{} types:{} privileges:{} policies:{} triggers:{} partitions:{} view_dependencies:{} publications:{} subscriptions:{}",
         state.schemas.len(),
         state.sequences.len(),
         state.relations.len(),
@@ -807,7 +875,9 @@ fn state_counts(state: &NormalizedState) -> String {
         state.policies.len(),
         state.triggers.len(),
         state.partition_edges.len(),
-        state.view_dependencies.len()
+        state.view_dependencies.len(),
+        state.publications.len(),
+        state.subscriptions.len()
     )
 }
 
@@ -838,6 +908,119 @@ fn differential_database_guard_accepts_only_local_hosts() {
 #[test]
 fn differential_manifest_accounts_for_every_sql_fixture() {
     load_manifest(&repo_path("live_tests/differential_manifest.json"));
+}
+
+#[test]
+fn publication_option_normalization_ignores_catalog_order() {
+    let first = vec![
+        safe_migrate::_internal::analysis::facts::AttributeFact {
+            name: "publish".into(),
+            value: "insert".into(),
+        },
+        safe_migrate::_internal::analysis::facts::AttributeFact {
+            name: "publish_via_partition_root".into(),
+            value: "false".into(),
+        },
+    ];
+    let mut second = first.clone();
+    second.reverse();
+    assert_eq!(normalize_attributes(&first), normalize_attributes(&second));
+}
+
+#[test]
+fn publication_scope_normalization_ignores_catalog_order() {
+    use safe_migrate::_internal::analysis::facts::{PublicationObjectFact, PublicationScope};
+    use safe_migrate::_internal::ast::identifiers::{Ident, QualifiedName};
+
+    let table = |name: &str, columns: Vec<&str>| PublicationObjectFact::Table {
+        name: QualifiedName::new(None, Ident::new(name.to_string(), true)),
+        only: true,
+        include_partitions: false,
+        columns: Some(columns.into_iter().map(str::to_string).collect()),
+        row_filter: None,
+    };
+    let first = PublicationScope::Explicit(vec![table("b", vec!["z", "a"]), table("a", vec!["x"])]);
+    let second =
+        PublicationScope::Explicit(vec![table("a", vec!["x"]), table("b", vec!["a", "z"])]);
+    assert_eq!(
+        normalize_publication_scope(&first),
+        normalize_publication_scope(&second)
+    );
+}
+
+#[test]
+fn subscription_normalization_redacts_connection_and_orders_publications() {
+    use safe_migrate::_internal::analysis::facts::ConnectionTarget;
+    use safe_migrate::_internal::model::replication::SubscriptionState;
+
+    let first = SubscriptionState {
+        name: "sub".into(),
+        owner: Some("owner".into()),
+        connection: ConnectionTarget::Redacted,
+        publications: vec!["z_pub".into(), "a_pub".into()],
+        params: None,
+        enabled: false,
+        slot_name: None,
+        generation: 0,
+    };
+    let mut second = first.clone();
+    second.connection = ConnectionTarget::Server(Some("publisher".into()));
+    second.publications.reverse();
+    assert_eq!(
+        normalize_subscription(&first),
+        normalize_subscription(&second)
+    );
+}
+
+#[test]
+fn subscription_scope_reports_semantic_mismatch_without_connection_metadata() {
+    let mut live = NormalizedState::default();
+    let mut simulator = NormalizedState::default();
+    live.subscriptions.insert(
+        "sub".into(),
+        NormalizedSubscription {
+            owner: Some("owner".into()),
+            publications: vec!["pub".into()],
+            params: "[]".into(),
+            enabled: false,
+            slot_name: None,
+        },
+    );
+    simulator.subscriptions = live.subscriptions.clone();
+    simulator
+        .subscriptions
+        .get_mut("sub")
+        .expect("subscription inserted")
+        .enabled = true;
+    let mismatches = compare_states(
+        "rule",
+        "fixture.sql",
+        &[ComparisonScope::Subscriptions],
+        &live,
+        &simulator,
+    );
+    assert_eq!(mismatches.len(), 1);
+    assert_eq!(
+        mismatches[0].category,
+        MismatchCategory::SubscriptionDefinitionMismatch
+    );
+}
+
+#[test]
+fn state_counts_include_every_replication_family() {
+    let mut state = NormalizedState::default();
+    state.subscriptions.insert(
+        "sub".into(),
+        NormalizedSubscription {
+            owner: None,
+            publications: Vec::new(),
+            params: String::new(),
+            enabled: false,
+            slot_name: None,
+        },
+    );
+    let counts = state_counts(&state);
+    assert!(counts.ends_with("publications:0 subscriptions:1"));
 }
 
 fn load_manifest(path: &Path) -> DifferentialManifest {
@@ -910,6 +1093,14 @@ fn validate_manifest(manifest: &DifferentialManifest, path: &Path) {
             assert!(
                 included.contains(fixture),
                 "fixture transaction override references a non-included fixture: {}/{}",
+                rule.rule_dir,
+                fixture
+            );
+        }
+        for fixture in rule.fixture_min_pg_version.keys() {
+            assert!(
+                included.contains(fixture),
+                "fixture minimum version references a non-included fixture: {}/{}",
                 rule.rule_dir,
                 fixture
             );
@@ -991,6 +1182,7 @@ fn expected_live_error_must_reference_an_included_fixture() {
         fixtures: Vec::new(),
         transactional: true,
         fixture_transactional: BTreeMap::new(),
+        fixture_min_pg_version: BTreeMap::new(),
         excluded_fixtures: Vec::new(),
         schemas: Vec::new(),
         scope: Vec::new(),
@@ -1018,6 +1210,7 @@ fn expected_live_error_must_reference_a_known_simulator_rule() {
         fixtures: vec!["case.sql".to_string()],
         transactional: true,
         fixture_transactional: BTreeMap::new(),
+        fixture_min_pg_version: BTreeMap::new(),
         excluded_fixtures: Vec::new(),
         schemas: Vec::new(),
         scope: Vec::new(),
@@ -1118,7 +1311,7 @@ fn check_required_relations(rule: &RuleManifest, fixture: &str, cache: &DbCache)
     let mut mismatches = Vec::new();
     for relation in &rule.required_relations {
         let (schema, name) = split_qualified_name(relation);
-        let object_id = safe_migrate::ast::identifiers::ObjectId::new(schema, name);
+        let object_id = safe_migrate::_internal::ast::identifiers::ObjectId::new(schema, name);
         if !cache.relations.contains_key(&object_id) {
             mismatches.push(Mismatch {
                 rule_dir: rule.rule_dir.clone(),
@@ -1142,9 +1335,11 @@ fn check_role_membership_cache(
     let role = |name: &str| {
         cache
             .roles
-            .get(&safe_migrate::ast::identifiers::ObjectId::new("", name))
+            .get(&safe_migrate::_internal::ast::identifiers::ObjectId::new(
+                "", name,
+            ))
     };
-    let edge = |ids: &[safe_migrate::ast::identifiers::ObjectId], target: &str| {
+    let edge = |ids: &[safe_migrate::_internal::ast::identifiers::ObjectId], target: &str| {
         ids.iter()
             .any(|id| id.schema.is_empty() && id.name == target)
     };
@@ -1183,6 +1378,10 @@ fn check_role_membership_cache(
         };
         let matches = match required.kind {
             RequiredRoleEdgeKind::CanSetRoleTo => edge(&member.can_set_role_to, &required.role),
+            RequiredRoleEdgeKind::CanAdministerMembership => {
+                edge(&member.can_administer_membership, &required.role)
+            }
+            RequiredRoleEdgeKind::CanInheritFrom => edge(&member.can_inherit_from, &required.role),
             RequiredRoleEdgeKind::MemberOfWithoutSet => {
                 edge(&member.member_of, &required.role)
                     && !edge(&member.can_set_role_to, &required.role)
@@ -1233,16 +1432,18 @@ fn required_role_edges_distinguish_missing_roles_from_incorrect_edges() {
 
     let mut cache = DbCache::new();
     for name in ["member", "target"] {
-        let id = safe_migrate::ast::identifiers::ObjectId::new("", name);
+        let id = safe_migrate::_internal::ast::identifiers::ObjectId::new("", name);
         cache.roles.insert(
             id.clone(),
-            safe_migrate::model::role::RoleState {
+            safe_migrate::_internal::model::role::RoleState {
                 id,
                 can_login: false,
                 is_superuser: false,
+                inherits: true,
                 member_of: Vec::new(),
+                can_administer_membership: Vec::new(),
+                can_inherit_from: Vec::new(),
                 can_set_role_to: Vec::new(),
-                granted_privileges: Vec::new(),
             },
         );
     }
@@ -1322,6 +1523,47 @@ fn snapshot_live_state(
         }
     }
 
+    if scope.contains(&ComparisonScope::Roles) {
+        for (member, role) in &cache.roles {
+            for parent in &role.member_of {
+                let grantor = cache
+                    .role_membership_grantors
+                    .iter()
+                    .find(|provenance| provenance.member == *member && provenance.role == *parent)
+                    .map(|provenance| provenance.grantor.name.clone());
+                state.roles.insert(NormalizedRoleMembership {
+                    member: member.name.clone(),
+                    role: parent.name.clone(),
+                    admin: role.can_administer_membership.contains(parent),
+                    inherit: role.can_inherit_from.contains(parent),
+                    set: role.can_set_role_to.contains(parent),
+                    grantor,
+                });
+            }
+        }
+    }
+
+    if scope.contains(&ComparisonScope::Publications) {
+        for (name, publication) in &cache.publications {
+            state.publications.insert(
+                name.clone(),
+                NormalizedPublication {
+                    owner: publication.owner.clone(),
+                    scope: normalize_publication_scope(&publication.scope),
+                    params: normalize_attributes(&publication.params),
+                },
+            );
+        }
+    }
+
+    if scope.contains(&ComparisonScope::Subscriptions) {
+        for (name, subscription) in &cache.subscriptions {
+            state
+                .subscriptions
+                .insert(name.clone(), normalize_subscription(subscription));
+        }
+    }
+
     if scope.contains(&ComparisonScope::Sequences) {
         for (id, sequence) in &cache.sequences {
             state.sequences.insert(
@@ -1374,6 +1616,7 @@ fn snapshot_live_state(
                         table: qualified_name(&id.schema, &id.name),
                         grantee: grantee.name.clone(),
                         privilege: normalize_privilege(*privilege),
+                        grantable: relation.privileges.has_grant_option(grantee, *privilege),
                     });
                 }
             }
@@ -1539,7 +1782,11 @@ fn snapshot_live_state(
     Ok(state)
 }
 
-fn snapshot_simulator_state(state: &AnalysisState, scope: &[ComparisonScope]) -> NormalizedState {
+fn snapshot_simulator_state(
+    state: &AnalysisState,
+    schema_scope: &[String],
+    scope: &[ComparisonScope],
+) -> NormalizedState {
     let mut projection = NormalizedState::default();
 
     if scope.contains(&ComparisonScope::Schemas) {
@@ -1547,9 +1794,73 @@ fn snapshot_simulator_state(state: &AnalysisState, scope: &[ComparisonScope]) ->
             let SchemaOverlay::Present(schema) = overlay else {
                 continue;
             };
+            // The state hydrator may retain an inferred namespace for an
+            // out-of-scope relationship endpoint.  That evidence is needed
+            // internally for dependency resolution, but the differential
+            // projection must match the manifest's authoritative schema
+            // scope, just like the live catalog snapshot does.
+            if schema_scope.iter().any(|scoped| scoped == name) {
+                projection
+                    .schemas
+                    .insert(name.clone(), schema.owner.name.clone());
+            }
+        }
+    }
+
+    if scope.contains(&ComparisonScope::Roles) {
+        for (member, overlay) in &state.local.roles {
+            let safe_migrate::_internal::model::role::RoleOverlay::Present(role) = overlay else {
+                continue;
+            };
+            for parent in &role.member_of {
+                let grantor = state
+                    .local
+                    .role_membership_grantors
+                    .iter()
+                    .find(|provenance| provenance.member == *member && provenance.role == *parent)
+                    .map(|provenance| provenance.grantor.name.clone());
+                projection.roles.insert(NormalizedRoleMembership {
+                    member: member.name.clone(),
+                    role: parent.name.clone(),
+                    admin: role.can_administer_membership.contains(parent),
+                    inherit: role.can_inherit_from.contains(parent),
+                    set: role.can_set_role_to.contains(parent),
+                    grantor,
+                });
+            }
+        }
+    }
+
+    if scope.contains(&ComparisonScope::Publications) {
+        for (name, overlay) in &state.local.publications {
+            let safe_migrate::_internal::model::replication::PublicationOverlay::Present(
+                publication,
+            ) = overlay
+            else {
+                continue;
+            };
+            projection.publications.insert(
+                name.clone(),
+                NormalizedPublication {
+                    owner: publication.owner.clone(),
+                    scope: normalize_publication_scope(&publication.scope),
+                    params: normalize_attributes(&publication.params),
+                },
+            );
+        }
+    }
+
+    if scope.contains(&ComparisonScope::Subscriptions) {
+        for (name, overlay) in &state.local.subscriptions {
+            let safe_migrate::_internal::model::replication::SubscriptionOverlay::Present(
+                subscription,
+            ) = overlay
+            else {
+                continue;
+            };
             projection
-                .schemas
-                .insert(name.clone(), schema.owner.name.clone());
+                .subscriptions
+                .insert(name.clone(), normalize_subscription(subscription));
         }
     }
 
@@ -1620,6 +1931,7 @@ fn snapshot_simulator_state(state: &AnalysisState, scope: &[ComparisonScope]) ->
                         table: qualified_name(&id.schema, &id.name),
                         grantee: grantee.name.clone(),
                         privilege: normalize_privilege(*privilege),
+                        grantable: relation.privileges.has_grant_option(grantee, *privilege),
                     });
                 }
             }
@@ -1642,6 +1954,7 @@ fn snapshot_simulator_state(state: &AnalysisState, scope: &[ComparisonScope]) ->
             let DependencyKind::TriggerOnTable {
                 trigger_id,
                 function_id,
+                ..
             } = &edge.kind
             else {
                 continue;
@@ -1747,6 +2060,117 @@ fn compare_states(
     simulator: &NormalizedState,
 ) -> Vec<Mismatch> {
     let mut mismatches = Vec::new();
+
+    if scope.contains(&ComparisonScope::Publications) {
+        for (name, live_publication) in &live.publications {
+            let Some(simulator_publication) = simulator.publications.get(name) else {
+                mismatches.push(Mismatch {
+                    rule_dir: rule_dir.to_string(),
+                    fixture: fixture.to_string(),
+                    category: MismatchCategory::MissingPublicationInSimulator,
+                    root_cause: RootCauseClassification::SimulatorBug,
+                    note: format!("live PostgreSQL kept publication '{name}'"),
+                });
+                continue;
+            };
+            if live_publication != simulator_publication {
+                mismatches.push(Mismatch {
+                    rule_dir: rule_dir.to_string(),
+                    fixture: fixture.to_string(),
+                    category: MismatchCategory::PublicationDefinitionMismatch,
+                    root_cause: RootCauseClassification::SimulatorBug,
+                    note: format!(
+                        "publication '{name}' differs: live={live_publication:?}, simulator={simulator_publication:?}"
+                    ),
+                });
+            }
+        }
+        for name in simulator.publications.keys() {
+            if !live.publications.contains_key(name) {
+                mismatches.push(Mismatch {
+                    rule_dir: rule_dir.to_string(),
+                    fixture: fixture.to_string(),
+                    category: MismatchCategory::ExtraPublicationInSimulator,
+                    root_cause: RootCauseClassification::SimulatorBug,
+                    note: format!("simulator kept publication '{name}'"),
+                });
+            }
+        }
+    }
+
+    if scope.contains(&ComparisonScope::Subscriptions) {
+        for (name, live_subscription) in &live.subscriptions {
+            let Some(simulator_subscription) = simulator.subscriptions.get(name) else {
+                mismatches.push(Mismatch {
+                    rule_dir: rule_dir.to_string(),
+                    fixture: fixture.to_string(),
+                    category: MismatchCategory::MissingSubscriptionInSimulator,
+                    root_cause: RootCauseClassification::SimulatorBug,
+                    note: format!("live PostgreSQL kept subscription '{name}'"),
+                });
+                continue;
+            };
+            if live_subscription != simulator_subscription {
+                mismatches.push(Mismatch {
+                    rule_dir: rule_dir.to_string(),
+                    fixture: fixture.to_string(),
+                    category: MismatchCategory::SubscriptionDefinitionMismatch,
+                    root_cause: RootCauseClassification::SimulatorBug,
+                    note: format!(
+                        "subscription '{name}' differs (connection metadata intentionally excluded): live={live_subscription:?}, simulator={simulator_subscription:?}"
+                    ),
+                });
+            }
+        }
+        for name in simulator.subscriptions.keys() {
+            if !live.subscriptions.contains_key(name) {
+                mismatches.push(Mismatch {
+                    rule_dir: rule_dir.to_string(),
+                    fixture: fixture.to_string(),
+                    category: MismatchCategory::ExtraSubscriptionInSimulator,
+                    root_cause: RootCauseClassification::SimulatorBug,
+                    note: format!("simulator kept subscription '{name}'"),
+                });
+            }
+        }
+    }
+
+    if scope.contains(&ComparisonScope::Roles) {
+        for membership in live.roles.difference(&simulator.roles) {
+            mismatches.push(Mismatch {
+                rule_dir: rule_dir.to_string(),
+                fixture: fixture.to_string(),
+                category: MismatchCategory::RoleMembershipMismatch,
+                root_cause: RootCauseClassification::SimulatorBug,
+                note: format!(
+                    "live PostgreSQL kept role membership {} -> {} with ADMIN={}, INHERIT={}, SET={}, grantor={:?}",
+                    membership.member,
+                    membership.role,
+                    membership.admin,
+                    membership.inherit,
+                    membership.set,
+                    membership.grantor
+                ),
+            });
+        }
+        for membership in simulator.roles.difference(&live.roles) {
+            mismatches.push(Mismatch {
+                rule_dir: rule_dir.to_string(),
+                fixture: fixture.to_string(),
+                category: MismatchCategory::RoleMembershipMismatch,
+                root_cause: RootCauseClassification::SimulatorBug,
+                note: format!(
+                    "simulator kept role membership {} -> {} with ADMIN={}, INHERIT={}, SET={}, grantor={:?}",
+                    membership.member,
+                    membership.role,
+                    membership.admin,
+                    membership.inherit,
+                    membership.set,
+                    membership.grantor
+                ),
+            });
+        }
+    }
 
     if scope.contains(&ComparisonScope::Schemas) {
         for (name, live_owner) in &live.schemas {
@@ -2062,8 +2486,8 @@ fn compare_states(
                 category: MismatchCategory::MissingPrivilegeInSimulator,
                 root_cause: RootCauseClassification::SimulatorBug,
                 note: format!(
-                    "live PostgreSQL kept {} on {} for {}",
-                    privilege.privilege, privilege.table, privilege.grantee
+                    "live PostgreSQL kept {} on {} for {} (grantable={})",
+                    privilege.privilege, privilege.table, privilege.grantee, privilege.grantable
                 ),
             });
         }
@@ -2074,8 +2498,8 @@ fn compare_states(
                 category: MismatchCategory::ExtraPrivilegeInSimulator,
                 root_cause: RootCauseClassification::SimulatorBug,
                 note: format!(
-                    "simulator kept {} on {} for {}",
-                    privilege.privilege, privilege.table, privilege.grantee
+                    "simulator kept {} on {} for {} (grantable={})",
+                    privilege.privilege, privilege.table, privilege.grantee, privilege.grantable
                 ),
             });
         }
@@ -2231,12 +2655,74 @@ fn normalize_relation_kind(kind: RelationKind) -> NormalizedRelationKind {
     }
 }
 
-fn normalize_trigger_mode(mode: safe_migrate::model::trigger::TriggerEnableMode) -> String {
+fn normalize_attributes(
+    attributes: &[safe_migrate::_internal::analysis::facts::AttributeFact],
+) -> String {
+    let mut normalized = attributes.to_vec();
+    normalized.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.value.cmp(&right.value))
+    });
+    serde_json::to_string(&normalized).expect("attribute facts must be serializable")
+}
+
+fn normalize_publication_scope(
+    scope: &safe_migrate::_internal::analysis::facts::PublicationScope,
+) -> String {
+    use safe_migrate::_internal::analysis::facts::{PublicationObjectFact, PublicationScope};
+
+    let mut normalized = scope.clone();
+    match &mut normalized {
+        PublicationScope::AllTables { except } => except.sort(),
+        PublicationScope::Explicit(objects) => {
+            for object in objects.iter_mut() {
+                if let PublicationObjectFact::Table {
+                    columns: Some(columns),
+                    ..
+                } = object
+                {
+                    columns.sort();
+                }
+            }
+            objects.sort_by(|left, right| {
+                let left =
+                    serde_json::to_string(left).expect("publication object must be serializable");
+                let right =
+                    serde_json::to_string(right).expect("publication object must be serializable");
+                left.cmp(&right)
+            });
+        }
+    }
+    serde_json::to_string(&normalized).expect("publication scope must be serializable")
+}
+
+fn normalize_subscription(
+    subscription: &safe_migrate::_internal::model::replication::SubscriptionState,
+) -> NormalizedSubscription {
+    let mut publications = subscription.publications.clone();
+    publications.sort();
+    NormalizedSubscription {
+        owner: subscription.owner.clone(),
+        publications,
+        params: subscription
+            .params
+            .as_deref()
+            .map(normalize_attributes)
+            .unwrap_or_default(),
+        enabled: subscription.enabled,
+        slot_name: subscription.slot_name.clone(),
+    }
+}
+
+fn normalize_trigger_mode(
+    mode: safe_migrate::_internal::model::trigger::TriggerEnableMode,
+) -> String {
     match mode {
-        safe_migrate::model::trigger::TriggerEnableMode::Disabled => "disabled",
-        safe_migrate::model::trigger::TriggerEnableMode::Origin => "origin",
-        safe_migrate::model::trigger::TriggerEnableMode::Replica => "replica",
-        safe_migrate::model::trigger::TriggerEnableMode::Always => "always",
+        safe_migrate::_internal::model::trigger::TriggerEnableMode::Disabled => "disabled",
+        safe_migrate::_internal::model::trigger::TriggerEnableMode::Origin => "origin",
+        safe_migrate::_internal::model::trigger::TriggerEnableMode::Replica => "replica",
+        safe_migrate::_internal::model::trigger::TriggerEnableMode::Always => "always",
     }
     .to_string()
 }
@@ -2286,6 +2772,7 @@ fn normalize_constraint_kind(kind: ConstraintKind) -> String {
         ConstraintKind::PrimaryKey => "primary_key",
         ConstraintKind::Unique => "unique",
         ConstraintKind::Exclusion => "exclusion",
+        ConstraintKind::NotNull => "not_null",
     }
     .to_string()
 }
@@ -2314,7 +2801,7 @@ fn normalize_data_type(data_type: &str) -> String {
 
 fn normalize_data_type_with_identity(
     data_type: &str,
-    type_id: Option<&safe_migrate::ast::identifiers::ObjectId>,
+    type_id: Option<&safe_migrate::_internal::ast::identifiers::ObjectId>,
 ) -> String {
     let normalized = normalize_data_type(data_type);
     let Some(type_id) = type_id else {
@@ -2332,7 +2819,7 @@ fn normalize_data_type_with_identity(
 
 #[test]
 fn normalized_type_identity_preserves_modifiers_and_arrays() {
-    let type_id = safe_migrate::ast::identifiers::ObjectId::new("public", "amount");
+    let type_id = safe_migrate::_internal::ast::identifiers::ObjectId::new("public", "amount");
     assert_eq!(
         normalize_data_type_with_identity("numeric(10,2)[]", Some(&type_id)),
         "public.amount(10,2)[]"

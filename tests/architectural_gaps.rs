@@ -2,11 +2,11 @@ mod common;
 
 mod architectural_gap_tests {
     use crate::common::*;
-    use safe_migrate::analysis::state::Confidence;
-    use safe_migrate::ast::identifiers::ObjectId;
-    use safe_migrate::model::relation::{Persistence, RelationKind, RelationOverlay};
-    use safe_migrate::model::types::TypeOverlay;
-    use safe_migrate::report::violations::ViolationTier;
+    use safe_migrate::_internal::analysis::state::Confidence;
+    use safe_migrate::_internal::ast::identifiers::ObjectId;
+    use safe_migrate::_internal::model::relation::{Persistence, RelationKind, RelationOverlay};
+    use safe_migrate::_internal::model::types::TypeOverlay;
+    use safe_migrate::_internal::report::violations::ViolationTier;
 
     // 1. Foreign-key parent-table escalation
     #[test]
@@ -117,7 +117,7 @@ mod architectural_gap_tests {
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
-                    safe_migrate::analysis::graph::DependencyKind::RenameTo
+                    safe_migrate::_internal::analysis::graph::DependencyKind::RenameTo
                 ))
                 .count()
                 != 0
@@ -134,7 +134,7 @@ mod architectural_gap_tests {
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
-                    safe_migrate::analysis::graph::DependencyKind::RenameTo
+                    safe_migrate::_internal::analysis::graph::DependencyKind::RenameTo
                 ))
                 .count()
                 == 0,
@@ -228,13 +228,13 @@ mod architectural_gap_tests {
 
         assert!(state.local.graph.edges().iter().any(|e| matches!(
             e.kind,
-            safe_migrate::analysis::graph::DependencyKind::ViewDependency { .. }
+            safe_migrate::_internal::analysis::graph::DependencyKind::ViewDependency { .. }
         ) && e.dependent
             == object_id("public", "v")
             && e.referenced == object_id("public", "base_table")));
         assert!(!state.local.graph.edges().iter().any(|e| matches!(
             e.kind,
-            safe_migrate::analysis::graph::DependencyKind::ViewDependency { .. }
+            safe_migrate::_internal::analysis::graph::DependencyKind::ViewDependency { .. }
         ) && e.dependent
             == object_id("public", "v")
             && e.referenced == object_id("public", "my_cte")));
@@ -253,7 +253,7 @@ mod architectural_gap_tests {
 
         assert!(state.local.graph.edges().iter().any(|e| matches!(
             e.kind,
-            safe_migrate::analysis::graph::DependencyKind::ViewDependency { .. }
+            safe_migrate::_internal::analysis::graph::DependencyKind::ViewDependency { .. }
         ) && e.dependent
             == object_id("public", "v")
             && e.referenced == object_id("public", "app_sessions")));
@@ -276,7 +276,7 @@ mod architectural_gap_tests {
         assert!(
             state.local.graph.edges().iter().any(|e| matches!(
                 e.kind,
-                safe_migrate::analysis::graph::DependencyKind::ViewDependency { .. }
+                safe_migrate::_internal::analysis::graph::DependencyKind::ViewDependency { .. }
             ) && e.dependent == object_id("public", "v")
                 && e.referenced == object_id("app", "sessions")),
             "Schema-qualified table should produce qualified depends_on entry"
@@ -285,7 +285,7 @@ mod architectural_gap_tests {
         assert!(
             !state.local.graph.edges().iter().any(|e| matches!(
                 e.kind,
-                safe_migrate::analysis::graph::DependencyKind::ViewDependency { .. }
+                safe_migrate::_internal::analysis::graph::DependencyKind::ViewDependency { .. }
             ) && e.dependent == object_id("public", "v")
                 && e.referenced == object_id("public", "app")),
             "Schema segment should not appear as a phantom dependency"
@@ -307,7 +307,7 @@ mod architectural_gap_tests {
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
-                    safe_migrate::analysis::graph::DependencyKind::PartitionOf
+                    safe_migrate::_internal::analysis::graph::DependencyKind::PartitionOf
                 ))
                 .count()
                 == 0,
@@ -337,7 +337,7 @@ mod architectural_gap_tests {
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
-                    safe_migrate::analysis::graph::DependencyKind::IndexOnRelation { .. }
+                    safe_migrate::_internal::analysis::graph::DependencyKind::IndexOnRelation { .. }
                 ))
                 .count()
                 == 0
@@ -416,7 +416,7 @@ mod architectural_gap_tests {
                 .iter()
                 .filter(|e| matches!(
                     e.kind,
-                    safe_migrate::analysis::graph::DependencyKind::ViewDependency { .. }
+                    safe_migrate::_internal::analysis::graph::DependencyKind::ViewDependency { .. }
                 ))
                 .count(),
             1,
@@ -499,7 +499,7 @@ mod architectural_gap_tests {
         let mut state = setup_state();
 
         // Attempting to attach 'a' as a partition of 'b', while 'b' is a partition of 'a'
-        engine
+        let findings = engine
             .analyze(
                 "
             CREATE TABLE a(id int) PARTITION BY RANGE(id);
@@ -510,12 +510,26 @@ mod architectural_gap_tests {
             )
             .unwrap();
 
-        // The cycle detector should catch the infinite loop and gracefully degrade
-        // to an Opaque/DynamicSql mutation, tainting the engine rather than stack-overflowing.
+        // A modeled, impossible topology is a deterministic PostgreSQL-style
+        // conflict, not unknown semantics. It must neither apply nor taint the
+        // following chain state.
         assert_eq!(
             state.local.confidence,
-            Confidence::Tainted,
-            "Partition cycle should taint the engine"
+            Confidence::Exact,
+            "partition cycle conflict must not taint the engine"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict")
+        );
+        // The rejected attach must leave the partition graph unchanged: 'a'
+        // must not appear as a child of 'b' after the cycle is detected.
+        let a_id = safe_migrate::_internal::ast::identifiers::ObjectId::new("public", "a");
+        let b_id = safe_migrate::_internal::ast::identifiers::ObjectId::new("public", "b");
+        assert!(
+            !state.local.graph.partitions_of(&b_id).contains(&&a_id),
+            "cycle rejection must not insert 'a' as a partition of 'b'"
         );
     }
 
@@ -523,26 +537,53 @@ mod architectural_gap_tests {
     #[test]
     fn test_tablespace_access_method_rewrite() {
         let engine = setup_engine();
-        let mut cache = safe_migrate::db::cache::DbCache::new();
+        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        cache.metadata.schemas = Some(vec!["public".to_string()]);
+        cache.search_path = vec!["public".to_string()];
+        cache.schemas.insert(
+            "public".to_string(),
+            safe_migrate::_internal::model::schema::SchemaState {
+                name: "public".to_string(),
+                owner: ObjectId::new("", "postgres"),
+                generation: 0,
+            },
+        );
 
         // Force Tier 1 by giving the table 150,000 rows
-        cache.insert_baseline(
-            object_id("public", "massive_table"),
-            safe_migrate::model::relation::RelationState::new(
-                object_id("public", "massive_table"),
-                ObjectId::new("public", "postgres"),
-                0,
-                Some(150_000),
-                RelationKind::Table,
-                Persistence::Permanent,
-                0,
-            ),
+        let table_id = object_id("public", "massive_table");
+        let mut table = safe_migrate::_internal::model::relation::RelationState::new(
+            table_id.clone(),
+            ObjectId::new("public", "postgres"),
+            0,
+            Some(150_000),
+            RelationKind::Table,
+            Persistence::Permanent,
+            0,
         );
-        let mut state = safe_migrate::analysis::state::AnalysisState::new(cache);
+        table
+            .columns
+            .push(safe_migrate::_internal::model::column::Column {
+                name: "id".to_string(),
+                data_type: Some("integer".to_string()),
+                type_id: None,
+                is_nullable: true,
+                default: None,
+                avg_width: None,
+                default_expr_text: None,
+                type_modifier: Some(-1),
+            });
+        table.last_analyze = Some("2026-09-01 00:00:00+00".to_string());
+        cache.insert_baseline(table_id.clone(), table);
+        let mut state = safe_migrate::_internal::analysis::state::AnalysisState::with_baseline(
+            cache.clone(),
+            true,
+        );
+        let mut storage_state =
+            safe_migrate::_internal::analysis::state::AnalysisState::with_baseline(cache, true);
 
         let v1 = engine
             .analyze(
-                "ALTER TABLE massive_table SET ACCESS METHOD columnar;",
+                "ALTER TABLE public.massive_table SET ACCESS METHOD columnar;",
                 &mut state,
             )
             .unwrap();
@@ -551,11 +592,10 @@ mod architectural_gap_tests {
                 .any(|v| v.rule_id == "table-rewrite-access-method"
                     && v.tier == ViolationTier::Tier1)
         );
-
         let v2 = engine
             .analyze(
-                "ALTER TABLE massive_table ALTER COLUMN id SET STORAGE MAIN;",
-                &mut state,
+                "ALTER TABLE public.massive_table ALTER COLUMN id SET STORAGE MAIN;",
+                &mut storage_state,
             )
             .unwrap();
         assert!(
@@ -665,7 +705,7 @@ mod architectural_gap_tests {
         let rel = state
             .get_relation(&object_id("actual_schema", "my_table"))
             .unwrap();
-        if let safe_migrate::model::relation::RelationOverlay::Present(r) = rel {
+        if let safe_migrate::_internal::model::relation::RelationOverlay::Present(r) = rel {
             assert!(
                 r.has_column("new_col"),
                 "Should resolve to actual_schema bypassing nonexistent_schema"
@@ -720,6 +760,25 @@ mod architectural_gap_tests {
             .unwrap();
         let result = engine.analyze("ALTER TABLE t SET ACCESS METHOD heap;", &mut state);
         assert!(result.is_ok(), "SetAccessMethod should not crash");
+        assert!(state.evidence().iter().any(|record| {
+            record.code == safe_migrate::_internal::analysis::evidence::EvidenceCode::UnsupportedSemantics
+        }));
+
+        let mut state2 = setup_state();
+        engine
+            .analyze("CREATE TABLE t(id int);", &mut state2)
+            .unwrap();
+        let result2 = engine.analyze(
+            "ALTER TABLE t ALTER COLUMN id SET STORAGE PLAIN;",
+            &mut state2,
+        );
+        assert!(result2.is_ok(), "SetStorage should not crash");
+        assert!(
+            state2.evidence().iter().any(|record| {
+                record.code == safe_migrate::_internal::analysis::evidence::EvidenceCode::UnsupportedSemantics
+            }),
+            "SetStorage must produce UnsupportedSemantics evidence"
+        );
     }
 
     #[test]
