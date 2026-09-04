@@ -236,15 +236,13 @@ jobs:
           printf '%s\n' "auto-sync-encrypted-config=$auto_sync_encrypted_config" \
             >> "$GITHUB_OUTPUT"
 
-      - name: Synchronize and analyze through the Action
+      - name: Synchronize through the Action
         id: synchronized
         uses: ./
         env:
           DATABASE_URL: "host=localhost port=5432 user=safe_migrate password=safe_migrate dbname=safe_migrate options='-c lock_timeout=5s -c statement_timeout=15min'"
           SAFE_MIGRATE_CACHE_KEY: "1111111111111111111111111111111111111111111111111111111111111111"
         with:
-          mode: lint
-          path: ${{ steps.sync_fixture.outputs.migration }}
           config: ${{ steps.sync_fixture.outputs.auto-sync-encrypted-config }}
           sync: "true"
           schemas: public
@@ -259,15 +257,11 @@ jobs:
           SYNC_STATUS: ${{ steps.synchronized.outputs.sync-status }}
           BASELINE_SOURCE: ${{ steps.synchronized.outputs.baseline-source }}
           JSON_REPORT: ${{ steps.synchronized.outputs.json-report }}
-          DIAGNOSTIC_LOG: ${{ steps.synchronized.outputs.diagnostic-log }}
         run: |
           test "$SYNC_STATUS" = "refreshed"
           test "$BASELINE_SOURCE" = "synced"
           test "$CACHE_PATH" = "$HOME/.cache/safe-migrate-action/baselines/action-smoke/baseline-v7.cache"
-          jq -e '.baseline.auto_sync == "bypassed"' "$JSON_REPORT"
-          grep -q -- '--no-auto-sync bypasses configured automatic cache sync' \
-            "$DIAGNOSTIC_LOG"
-          ! grep -q 'Automatic cache sync enabled' "$DIAGNOSTIC_LOG"
+          test -z "$JSON_REPORT"
           rm -f -- "$CACHE_PATH"
 
       - name: Restore and analyze without database access
@@ -307,8 +301,9 @@ jobs:
             "$DIAGNOSTIC_LOG"
           ! grep -q 'Automatic cache sync enabled' "$DIAGNOSTIC_LOG"
 
-      - name: Verify encrypted baseline without a key falls back visibly
+      - name: Reject an encrypted baseline without its key
         id: encrypted_key_missing
+        continue-on-error: true
         uses: ./
         with:
           mode: lint
@@ -317,22 +312,19 @@ jobs:
           encrypted-cache: "true"
           output-dir: action-encrypted-key-missing-artifacts
 
-      - name: Assert encrypted fork-style fallback
+      - name: Assert encrypted baseline key is required
         shell: bash
         env:
-          JSON_REPORT: ${{ steps.encrypted_key_missing.outputs.json-report }}
-          EXIT_CODE: ${{ steps.encrypted_key_missing.outputs.exit-code }}
-          BASELINE_SOURCE: ${{ steps.encrypted_key_missing.outputs.baseline-source }}
+          OUTCOME: ${{ steps.encrypted_key_missing.outcome }}
         run: |
-          test "$EXIT_CODE" = "0"
-          test "$BASELINE_SOURCE" = "unavailable"
-          jq -e \
-            '.baseline.status == "unavailable" and .confidence == "Tainted"' \
-            "$JSON_REPORT"
+          test "$OUTCOME" = "failure"
 
-      - name: Verify a missing synchronized baseline falls back visibly
+      - name: Reject a missing synchronized baseline
         id: missing_baseline
+        continue-on-error: true
         uses: ./
+        env:
+          SAFE_MIGRATE_CACHE_KEY: "1111111111111111111111111111111111111111111111111111111111111111"
         with:
           mode: lint
           path: ${{ steps.sync_fixture.outputs.migration }}
@@ -340,23 +332,18 @@ jobs:
           baseline: action-missing-${{ github.run_id }}-${{ github.run_attempt }}
           output-dir: action-missing-baseline-artifacts
 
-      - name: Assert missing-baseline report contract
+      - name: Assert missing-baseline failure contract
         shell: bash
         env:
-          JSON_REPORT: ${{ steps.missing_baseline.outputs.json-report }}
           DIAGNOSTIC_LOG: ${{ steps.missing_baseline.outputs.diagnostic-log }}
           EXIT_CODE: ${{ steps.missing_baseline.outputs.exit-code }}
           BASELINE_SOURCE: ${{ steps.missing_baseline.outputs.baseline-source }}
+          OUTCOME: ${{ steps.missing_baseline.outcome }}
         run: |
-          test "$EXIT_CODE" = "0"
+          test "$OUTCOME" = "failure"
+          test "$EXIT_CODE" = "1"
           test "$BASELINE_SOURCE" = "unavailable"
-          jq -e \
-            '.baseline.status == "unavailable"
-             and .baseline.auto_sync == "bypassed"
-             and .confidence == "Tainted"' \
-            "$JSON_REPORT"
-          grep -q -- '--no-cache bypasses configured automatic cache sync' \
-            "$DIAGNOSTIC_LOG"
+          grep -q 'No synchronized baseline was restored' "$DIAGNOSTIC_LOG"
 
       - name: Generate review artifacts with the local Action
         id: safe_migrate

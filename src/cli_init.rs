@@ -9,6 +9,10 @@ use std::io::{IsTerminal, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 
+const ANALYSIS_WORKFLOW: &str = "safe-migrate.yml";
+const BASELINE_WORKFLOW: &str = "safe-migrate-baseline.yml";
+const BASELINE_ENVIRONMENT: &str = "safe-migrate-baseline";
+
 #[derive(Subcommand, Debug)]
 pub(crate) enum InitCommands {
     /// Generate a cryptographically random cache-encryption key
@@ -22,19 +26,16 @@ pub(crate) enum InitCommands {
         /// Migration directory checked by the generated workflow
         #[arg(long)]
         path: PathBuf,
-        /// Default branch that refreshes the database baseline
-        #[arg(long, default_value = "main")]
-        branch: String,
-        /// Workflow file to create
-        #[arg(long, default_value = ".github/workflows/safe-migrate.yml")]
-        output: PathBuf,
-        /// Replace an existing regular workflow file
+        /// Override the default branch detected from origin/HEAD
+        #[arg(long)]
+        branch: Option<String>,
+        /// Directory in which to create both workflow files
+        #[arg(long, default_value = ".github/workflows")]
+        output_dir: PathBuf,
+        /// Replace existing regular workflow files
         #[arg(long)]
         force: bool,
-        /// Add a trusted baseline-refresh job for database-aware analysis
-        #[arg(long)]
-        with_baseline: bool,
-        /// Configure repository secrets with the authenticated GitHub CLI
+        /// Configure the repository cache key and environment database URL with GitHub CLI
         #[arg(long)]
         configure_secrets: bool,
     },
@@ -48,18 +49,13 @@ pub(crate) fn run(command: InitCommands) -> Result<()> {
         InitCommands::GithubActions {
             path,
             branch,
-            output,
+            output_dir,
             force,
-            with_baseline,
             configure_secrets,
-        } => run_github_actions(
-            &path,
-            &branch,
-            &output,
-            force,
-            with_baseline || configure_secrets,
-            configure_secrets,
-        ),
+        } => {
+            let branch = branch.unwrap_or_else(detect_default_branch);
+            run_github_actions(&path, &branch, &output_dir, force, configure_secrets)
+        }
     }
 }
 
@@ -74,53 +70,53 @@ fn validate_single_line(name: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-fn github_actions_workflow(migration_path: &str, branch: &str, with_baseline: bool) -> String {
+fn detect_default_branch() -> String {
+    Command::new("git")
+        .args([
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ])
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|reference| {
+            reference
+                .trim()
+                .strip_prefix("origin/")
+                .filter(|branch| !branch.is_empty())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "main".to_string())
+}
+
+fn github_actions_workflows(migration_path: &str, branch: &str) -> (String, String) {
     let path = yaml_single_quoted(migration_path);
-    let path_filter = yaml_single_quoted(&format!("{migration_path}/**"));
-    let branch = yaml_single_quoted(branch);
+    let branch_filter = yaml_single_quoted(branch);
+    let branch_ref = yaml_single_quoted(&format!("refs/heads/{branch}"));
     let action_ref = format!("v{}", env!("CARGO_PKG_VERSION"));
-    if !with_baseline {
-        return format!(
-            r#"name: Check database migrations
-
-on:
-  pull_request:
-    paths: [{path_filter}]
-
-permissions:
-  contents: read
-
-jobs:
-  lint:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: dsecurity49/safe-migrate@{action_ref}
-        with:
-          path: {path}
-"#
-        );
-    }
-    format!(
+    let analysis = format!(
         r#"name: Check database migrations
 
 on:
   pull_request:
-    paths: [{path_filter}]
-  push:
-    branches: [{branch}]
-    paths: [{path_filter}]
-  workflow_dispatch:
+    branches: [{branch_filter}]
+  merge_group:
 
 permissions:
   contents: read
 
+concurrency:
+  group: safe-migrate-${{{{ github.workflow }}}}-${{{{ github.event.pull_request.number || github.ref }}}}
+  cancel-in-progress: true
+
 jobs:
   lint:
-    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -130,29 +126,53 @@ jobs:
           SAFE_MIGRATE_CACHE_KEY: ${{{{ secrets.SAFE_MIGRATE_CACHE_KEY }}}}
         with:
           path: {path}
+"#
+    );
+    let baseline = format!(
+        r#"name: Refresh safe-migrate baseline
 
-  refresh-baseline:
-    if: github.event_name != 'pull_request'
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 3 * * 1,4'
+
+permissions: {{}}
+
+concurrency:
+  group: safe-migrate-baseline
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    if: github.ref == {branch_ref}
     runs-on: ubuntu-latest
-    environment: safe-migrate-baseline
+    timeout-minutes: 15
+    environment:
+      name: {BASELINE_ENVIRONMENT}
+      deployment: false
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
       - uses: dsecurity49/safe-migrate@{action_ref}
         env:
           DATABASE_URL: ${{{{ secrets.SAFE_MIGRATE_DATABASE_URL }}}}
           SAFE_MIGRATE_CACHE_KEY: ${{{{ secrets.SAFE_MIGRATE_CACHE_KEY }}}}
         with:
-          path: {path}
           sync: 'true'
 "#
-    )
+    );
+    (analysis, baseline)
 }
 
-fn set_github_secret(name: &str, value: Option<&str>) -> Result<()> {
+fn github_secret_args(name: &str, environment: Option<&str>) -> Vec<String> {
+    let mut args = vec!["secret".to_string(), "set".to_string(), name.to_string()];
+    if let Some(environment) = environment {
+        args.extend(["--env".to_string(), environment.to_string()]);
+    }
+    args
+}
+
+fn set_github_secret(name: &str, value: Option<&str>, environment: Option<&str>) -> Result<()> {
     let mut command = Command::new("gh");
-    command.args(["secret", "set", name]);
+    command.args(github_secret_args(name, environment));
     command.stdin(if value.is_some() {
         Stdio::piped()
     } else {
@@ -186,7 +206,7 @@ fn generate_cache_key() -> Result<String> {
 fn run_cache_key(store_github_secret: bool) -> Result<()> {
     let key = generate_cache_key()?;
     if store_github_secret {
-        set_github_secret("SAFE_MIGRATE_CACHE_KEY", Some(&key))?;
+        set_github_secret("SAFE_MIGRATE_CACHE_KEY", Some(&key), None)?;
         println!("Configured SAFE_MIGRATE_CACHE_KEY for the current GitHub repository.");
     } else {
         println!("{key}");
@@ -197,9 +217,8 @@ fn run_cache_key(store_github_secret: bool) -> Result<()> {
 fn run_github_actions(
     migration_path: &Path,
     branch: &str,
-    output: &Path,
+    output_dir: &Path,
     force: bool,
-    with_baseline: bool,
     configure_secrets: bool,
 ) -> Result<()> {
     if configure_secrets && !std::io::stdin().is_terminal() {
@@ -226,76 +245,104 @@ fn run_github_actions(
         .to_str()
         .context("Migration path must be valid UTF-8")?;
     validate_single_line("migration path", migration_path)?;
-    if migration_path
-        .chars()
-        .any(|character| matches!(character, '\\' | '*' | '?' | '[' | ']'))
-    {
-        return Err(anyhow!(
-            "Migration path contains characters that are ambiguous in a GitHub path filter"
-        ));
-    }
     validate_single_line("branch", branch)?;
 
-    if output
+    if output_dir
         .symlink_metadata()
         .is_ok_and(|metadata| metadata.is_symlink())
     {
         return Err(anyhow!(
-            "Refusing to write through a symbolic link: {}",
-            output.display()
+            "Refusing to write workflows through a symbolic link: {}",
+            output_dir.display()
         ));
     }
-    if output.exists() && !force {
+    if output_dir.exists() && !output_dir.is_dir() {
         return Err(anyhow!(
-            "Workflow already exists: {} (use --force to replace it)",
-            output.display()
+            "Workflow output is not a directory: {}",
+            output_dir.display()
         ));
     }
-    if output.exists() && !output.is_file() {
-        return Err(anyhow!(
-            "Workflow output is not a regular file: {}",
-            output.display()
-        ));
+    let analysis_output = output_dir.join(ANALYSIS_WORKFLOW);
+    let baseline_output = output_dir.join(BASELINE_WORKFLOW);
+    for output in [&analysis_output, &baseline_output] {
+        if output
+            .symlink_metadata()
+            .is_ok_and(|metadata| metadata.is_symlink())
+        {
+            return Err(anyhow!(
+                "Refusing to write through a symbolic link: {}",
+                output.display()
+            ));
+        }
+        if output.exists() && !force {
+            return Err(anyhow!(
+                "Workflow already exists: {} (use --force to replace both workflows)",
+                output.display()
+            ));
+        }
+        if output.exists() && !output.is_file() {
+            return Err(anyhow!(
+                "Workflow output is not a regular file: {}",
+                output.display()
+            ));
+        }
     }
-    if let Some(parent) = output
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("Could not create {}", parent.display()))?;
-    }
-    fs::write(
-        output,
-        github_actions_workflow(migration_path, branch, with_baseline),
-    )
-    .with_context(|| format!("Could not write {}", output.display()))?;
+    fs::create_dir_all(output_dir)
+        .with_context(|| format!("Could not create {}", output_dir.display()))?;
 
-    println!("Created {}", output.display());
+    let (analysis_workflow, baseline_workflow) = github_actions_workflows(migration_path, branch);
+    fs::write(&analysis_output, analysis_workflow)
+        .with_context(|| format!("Could not write {}", analysis_output.display()))?;
+    fs::write(&baseline_output, baseline_workflow)
+        .with_context(|| format!("Could not write {}", baseline_output.display()))?;
+
+    println!("Created {}", analysis_output.display());
+    println!("Created {}", baseline_output.display());
     if configure_secrets {
-        println!("Enter SAFE_MIGRATE_DATABASE_URL when GitHub CLI prompts for it.");
-        set_github_secret("SAFE_MIGRATE_DATABASE_URL", None)?;
+        println!(
+            "Enter SAFE_MIGRATE_DATABASE_URL for the {BASELINE_ENVIRONMENT} environment when GitHub CLI prompts for it."
+        );
+        set_github_secret(
+            "SAFE_MIGRATE_DATABASE_URL",
+            None,
+            Some(BASELINE_ENVIRONMENT),
+        )?;
         let key = generate_cache_key()?;
-        set_github_secret("SAFE_MIGRATE_CACHE_KEY", Some(&key))?;
-        println!("Configured the database URL and a generated cache key as repository secrets.");
-    } else if with_baseline {
+        set_github_secret("SAFE_MIGRATE_CACHE_KEY", Some(&key), None)?;
         println!(
-            "Add SAFE_MIGRATE_DATABASE_URL and SAFE_MIGRATE_CACHE_KEY as repository secrets before merging this workflow."
+            "Configured the database URL as an environment secret and the generated cache key as a repository secret."
         );
-        println!(
-            "You can configure both safely with: safe-migrate init github-actions --path {} --force --with-baseline --configure-secrets",
-            migration_path
-        );
-        println!(
-            "Before the first refresh, give its runner trusted localhost or Unix-socket access to PostgreSQL."
-        );
-        println!("Then start the workflow once from GitHub's Actions tab to create the baseline.");
     } else {
         println!(
-            "This workflow can lint immediately without database access. Its first report will use Tainted confidence until a baseline is refreshed."
+            "Create the {BASELINE_ENVIRONMENT} environment, store SAFE_MIGRATE_DATABASE_URL in it, and store SAFE_MIGRATE_CACHE_KEY as a repository secret."
         );
-        println!(
-            "For database-aware results, rerun with --force --with-baseline --configure-secrets, then start the workflow once from GitHub's Actions tab."
+        println!("Or rerun with --force --configure-secrets after creating the environment.");
+    }
+    println!(
+        "Give the baseline runner trusted localhost or Unix-socket access to PostgreSQL, then run Refresh safe-migrate baseline once before enabling the PR check."
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn database_secret_is_scoped_to_the_baseline_environment() {
+        assert_eq!(
+            github_secret_args("SAFE_MIGRATE_DATABASE_URL", Some(BASELINE_ENVIRONMENT)),
+            [
+                "secret",
+                "set",
+                "SAFE_MIGRATE_DATABASE_URL",
+                "--env",
+                "safe-migrate-baseline",
+            ]
+        );
+        assert_eq!(
+            github_secret_args("SAFE_MIGRATE_CACHE_KEY", None),
+            ["secret", "set", "SAFE_MIGRATE_CACHE_KEY"]
         );
     }
-    Ok(())
 }

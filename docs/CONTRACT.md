@@ -26,10 +26,13 @@ database.
   emits that same summary as one JSON document.
 - `safe-migrate rules` lists primary-rule descriptors. `--rule <id>`
   selects one descriptor and `--json` emits the stable discovery schema.
-- `safe-migrate init github-actions --path <dir>` creates a pull-request
-  workflow without overwriting an existing file. `--with-baseline` adds a
-  trusted refresh job; `--configure-secrets` uses an authenticated GitHub CLI
-  to set the database URL and a generated cache key without printing either.
+- `safe-migrate init github-actions --path <dir>` creates separate
+  pull-request-analysis and trusted baseline-refresh workflows without
+  overwriting either file. `--configure-secrets` uses an authenticated GitHub
+  CLI to set the database URL in the `safe-migrate-baseline` environment and a
+  generated cache key at repository scope without printing either.
+  The default branch is detected from `origin/HEAD`, falling back to `main`, and
+  can be overridden with `--branch`.
 - `safe-migrate init cache-key` writes one randomly generated 32-byte key as
   64 lowercase hexadecimal characters. `--set-github-secret` sends it to the
   current repository through GitHub CLI instead of printing it.
@@ -327,22 +330,27 @@ a readable V7 cache, but never an older format.
 
 ### GitHub Action
 
-- `path` is the only required input. The default `mode: auto` selects `lint`
-  for a file and `lint-chain` for a directory.
-- A managed-cache miss runs `--no-cache` with `Tainted` confidence. A missing
-  explicit cache is an error.
+- `path` is required for analysis. The default `mode: auto` selects `lint` for
+  a file and `lint-chain` for a directory. When `sync: "true"` is supplied
+  without `path`, the Action refreshes and saves the baseline without running
+  migration analysis.
+- A missing managed or explicit baseline is an operational error during normal
+  analysis. Degraded analysis is entered only through explicit
+  `no-cache: "true"`.
 - Managed and explicit caches are encrypted by default. A reviewed plaintext
   workflow must explicitly set `encrypted-cache: "false"`.
-- `sync: "true"` refreshes the baseline before linting. Lint always suppresses
-  config-driven `auto_sync`, and database access is removed after the
-  Action-controlled refresh.
+- `sync: "true"` refreshes the baseline. When `path` is also present, analysis
+  follows the refresh. Lint always suppresses config-driven `auto_sync`, and
+  database access is removed before analysis.
 - An explicit config path must exist, and its `cache_encryption` setting must
   match `encrypted-cache`.
-- An encrypted sync without a valid key fails before database access. A lint
-  job without the key runs without the encrypted baseline.
+- Encrypted sync or analysis without a valid key fails before database access
+  or migration parsing.
 - `output-dir` must remain inside the workspace and cannot contain dot segments
   or traverse a symbolic link.
 - Exit `2` fails unless `advisory: "true"` is set. Exit `1` always fails.
+- Sync-only success leaves `json-report` and `markdown-report` empty, sets
+  `sync-status` to `refreshed`, and sets `baseline-source` to `synced`.
 - Exact release tags install checksum-verified release assets. Full
   40-character SHAs and local source invocations build the checked-out source.
   Mutable branch references are rejected.

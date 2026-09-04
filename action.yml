@@ -1,15 +1,16 @@
 name: safe-migrate
-description: Find risky PostgreSQL migrations, with an optional synchronized database baseline.
+description: Check PostgreSQL migrations offline against a synchronized database baseline.
 author: safe-migrate contributors
 
 inputs:
   mode:
-    description: Infer analysis from path (`auto`), or explicitly select `lint` or `lint-chain`.
+    description: Infer file or directory analysis from path. An empty path with sync enabled refreshes only the baseline.
     required: false
     default: auto
   path:
-    description: Migration file for `lint` or directory for `lint-chain`.
-    required: true
+    description: Migration file or directory to analyze. Required unless this invocation only synchronizes the baseline.
+    required: false
+    default: ""
   cache:
     description: Explicit trusted Cache V7 path; disables managed GitHub cache restore and save.
     required: false
@@ -19,7 +20,7 @@ inputs:
     required: false
     default: ""
   sync:
-    description: Refresh from DATABASE_URL in this trusted job, then remove database access before linting.
+    description: Refresh from DATABASE_URL in this trusted job. Leave path empty for sync-only baseline publication.
     required: false
     default: "false"
   schemas:
@@ -35,7 +36,7 @@ inputs:
     required: false
     default: "true"
   no-cache:
-    description: Bypass every baseline for a Tainted preview; incompatible with cache, sync, and schemas.
+    description: Explicit degraded SQL-only analysis with Tainted confidence; incompatible with cache, sync, and schemas.
     required: false
     default: "false"
   output-dir:
@@ -49,10 +50,10 @@ inputs:
 
 outputs:
   json-report:
-    description: Path to the generated JSON report.
+    description: Path to the generated JSON report; empty for a sync-only invocation.
     value: ${{ steps.analysis.outputs.json-report }}
   markdown-report:
-    description: Path to the generated Markdown report.
+    description: Path to the generated Markdown report; empty for a sync-only invocation.
     value: ${{ steps.analysis.outputs.markdown-report }}
   exit-code:
     description: "Analyzer exit status: 0 completed, 1 operational failure, 2 blocking findings."
@@ -193,7 +194,7 @@ runs:
 
     - name: Restore synchronized baseline
       id: restore-baseline
-      if: ${{ inputs.cache == '' && inputs.no-cache != 'true' && steps.baseline.outputs.baseline-readable == 'true' }}
+      if: ${{ inputs.sync != 'true' && inputs.cache == '' && inputs.no-cache != 'true' && steps.baseline.outputs.baseline-readable == 'true' }}
       uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       env:
         DATABASE_URL: ""
@@ -341,12 +342,19 @@ runs:
         fi
         if [ "$BASELINE_READABLE" != true ]; then
           baseline_source=unavailable
-          echo "Encrypted baseline key unavailable; running Tainted analysis without the baseline." \
+          echo "Encrypted baseline key unavailable. Set SAFE_MIGRATE_CACHE_KEY or explicitly choose no-cache mode." \
             | tee -a "$diagnostic_log" >&2
+          preflight_failed=true
         fi
         if [ -n "$INPUT_CACHE" ] && [ ! -f "$RESOLVED_CACHE" ] && \
             [ "$INPUT_SYNC" != true ]; then
           echo "Explicit cache does not exist or is not a file: $RESOLVED_CACHE" \
+            | tee -a "$diagnostic_log" >&2
+          preflight_failed=true
+        fi
+        if [ "$INPUT_NO_CACHE" != true ] && [ "$INPUT_SYNC" != true ] && \
+            [ "$baseline_source" = unavailable ]; then
+          echo "No synchronized baseline was restored. Run the trusted baseline workflow, or explicitly set no-cache to true for degraded analysis." \
             | tee -a "$diagnostic_log" >&2
           preflight_failed=true
         fi
@@ -378,8 +386,10 @@ runs:
         fi
 
         command=()
-        if [ "$preflight_failed" != true ]; then
+        if [ "$preflight_failed" != true ] && [ "$operational_failed" != true ]; then
           case "$INPUT_MODE" in
+            sync-only)
+              ;;
             lint)
               command=(lint --file "$INPUT_PATH")
               ;;
@@ -393,12 +403,15 @@ runs:
           esac
         fi
 
-        if [ "${#command[@]}" -eq 0 ]; then
+        if [ "$INPUT_MODE" = sync-only ] && [ "$operational_failed" != true ]; then
+          final_status=0
+          json_report=
+          markdown_report=
+        elif [ "${#command[@]}" -eq 0 ]; then
           final_status=1
         else
           command+=(--cache "$RESOLVED_CACHE" --config "$config_path" --no-auto-sync)
-          if [ "$INPUT_NO_CACHE" = "true" ] || [ "$BASELINE_READABLE" != true ] || \
-              { [ -z "$INPUT_CACHE" ] && [ ! -f "$RESOLVED_CACHE" ]; }; then
+          if [ "$INPUT_NO_CACHE" = "true" ]; then
             command+=(--no-cache)
           fi
 

@@ -62,7 +62,9 @@ fn test_cli_help() {
     let output = cmd.output().unwrap();
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("Find risky PostgreSQL migrations before they run"));
+    assert!(
+        stdout.contains("Check PostgreSQL migrations against a synchronized database baseline")
+    );
     assert!(!stdout.contains("prevent blocking locks"));
     assert!(stdout.contains("Sync PostgreSQL schema metadata and statistics into a local cache"));
     assert!(!stdout.contains("Sync database table statistics"));
@@ -115,7 +117,7 @@ fn init_cache_key_sends_secret_to_github_cli_over_stdin() {
 }
 
 #[test]
-fn init_github_actions_stages_trial_before_database_setup() {
+fn init_github_actions_creates_separate_analysis_and_baseline_workflows() {
     let project = tempfile::tempdir().unwrap();
     fs::create_dir(project.path().join("migrations")).unwrap();
 
@@ -125,13 +127,33 @@ fn init_github_actions_stages_trial_before_database_setup() {
         .assert()
         .success();
 
-    let workflow =
+    let analysis =
         fs::read_to_string(project.path().join(".github/workflows/safe-migrate.yml")).unwrap();
-    assert!(workflow.contains("\n  pull_request:\n    paths: ['migrations/**']"));
-    assert!(workflow.contains("\n  lint:\n    runs-on: ubuntu-latest"));
-    assert!(workflow.contains("\n          path: 'migrations'"));
-    assert!(!workflow.contains("DATABASE_URL"));
-    assert!(!workflow.contains("refresh-baseline"));
+    let baseline = fs::read_to_string(
+        project
+            .path()
+            .join(".github/workflows/safe-migrate-baseline.yml"),
+    )
+    .unwrap();
+    assert!(analysis.contains("\n  pull_request:\n    branches: ['main']"));
+    assert!(analysis.contains("\n  merge_group:"));
+    assert!(analysis.contains("\n  lint:\n    runs-on: ubuntu-latest"));
+    assert!(analysis.contains("\n    timeout-minutes: 15"));
+    assert!(analysis.contains("\n          path: 'migrations'"));
+    assert!(analysis.contains("SAFE_MIGRATE_CACHE_KEY"));
+    assert!(!analysis.contains("DATABASE_URL"));
+    assert!(!analysis.contains("sync: 'true'"));
+
+    assert!(baseline.contains("\n  workflow_dispatch:"));
+    assert!(baseline.contains("\n  schedule:\n    - cron: '23 3 * * 1,4'"));
+    assert!(baseline.contains("\npermissions: {}"));
+    assert!(baseline.contains("\n      name: safe-migrate-baseline"));
+    assert!(baseline.contains("\n      deployment: false"));
+    assert!(baseline.contains("\n    timeout-minutes: 15"));
+    assert!(baseline.contains("DATABASE_URL: ${{ secrets.SAFE_MIGRATE_DATABASE_URL }}"));
+    assert!(baseline.contains("\n          sync: 'true'"));
+    assert!(!baseline.contains("actions/checkout"));
+    assert!(!baseline.contains("\n          path:"));
 
     let mut overwrite = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
     let assertion = overwrite
@@ -141,14 +163,14 @@ fn init_github_actions_stages_trial_before_database_setup() {
         .failure();
     assert!(
         String::from_utf8_lossy(&assertion.get_output().stderr)
-            .contains("use --force to replace it")
+            .contains("use --force to replace both workflows")
     );
 }
 
 #[test]
-fn init_github_actions_can_add_isolated_baseline_refresh() {
+fn init_github_actions_supports_a_custom_default_branch_and_output_directory() {
     let project = tempfile::tempdir().unwrap();
-    fs::create_dir(project.path().join("db migrations")).unwrap();
+    fs::create_dir(project.path().join("db [migrations]")).unwrap();
 
     let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
     cmd.current_dir(project.path())
@@ -156,24 +178,20 @@ fn init_github_actions_can_add_isolated_baseline_refresh() {
             "init",
             "github-actions",
             "--path",
-            "db migrations",
+            "db [migrations]",
             "--branch",
             "trunk",
-            "--with-baseline",
+            "--output-dir",
+            "ci",
         ])
         .assert()
         .success();
 
-    let workflow =
-        fs::read_to_string(project.path().join(".github/workflows/safe-migrate.yml")).unwrap();
-    assert!(workflow.contains("\n    branches: ['trunk']"));
-    assert!(workflow.contains("\n    paths: ['db migrations/**']"));
-    assert!(workflow.contains("\n  refresh-baseline:"));
-    assert!(workflow.contains("\n    environment: safe-migrate-baseline"));
-    assert!(
-        workflow.contains("\n          DATABASE_URL: ${{ secrets.SAFE_MIGRATE_DATABASE_URL }}")
-    );
-    assert!(workflow.contains("\n          sync: 'true'"));
+    let analysis = fs::read_to_string(project.path().join("ci/safe-migrate.yml")).unwrap();
+    let baseline = fs::read_to_string(project.path().join("ci/safe-migrate-baseline.yml")).unwrap();
+    assert!(analysis.contains("\n    branches: ['trunk']"));
+    assert!(analysis.contains("\n          path: 'db [migrations]'"));
+    assert!(baseline.contains("\n    if: github.ref == 'refs/heads/trunk'"));
 }
 
 #[test]
@@ -201,6 +219,12 @@ fn init_github_actions_does_not_read_secrets_from_noninteractive_input() {
         !project
             .path()
             .join(".github/workflows/safe-migrate.yml")
+            .exists()
+    );
+    assert!(
+        !project
+            .path()
+            .join(".github/workflows/safe-migrate-baseline.yml")
             .exists()
     );
 }

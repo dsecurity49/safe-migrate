@@ -67,7 +67,9 @@ case "$command" in
 
         case "$mode" in
             auto)
-                if [ -f "$path" ]; then
+                if [ -z "$path" ] && [ "$sync" = true ]; then
+                    mode='sync-only'
+                elif [ -f "$path" ]; then
                     mode=lint
                 elif [ -d "$path" ]; then
                     mode=lint-chain
@@ -80,6 +82,13 @@ case "$command" in
             lint)
                 [ -f "$path" ] || {
                     printf 'lint path does not exist or is not a file: %s\n' "$path" >&2
+                    exit 1
+                }
+                ;;
+            sync-only)
+                [ "$sync" = true ] && [ -z "$path" ] || {
+                    printf '%s\n' \
+                        'sync-only requires sync to be true and path to be empty' >&2
                     exit 1
                 }
                 ;;
@@ -113,6 +122,8 @@ case "$command" in
         old_ifs=$IFS
         IFS=/
         set -f
+        # Intentional IFS split after glob expansion is disabled.
+        # shellcheck disable=SC2086
         set -- $output_dir
         set +f
         IFS=$old_ifs
@@ -129,6 +140,8 @@ case "$command" in
         old_ifs=$IFS
         IFS=/
         set -f
+        # Intentional IFS split after glob expansion is disabled.
+        # shellcheck disable=SC2086
         set -- $output_dir
         set +f
         IFS=$old_ifs
@@ -152,10 +165,10 @@ case "$command" in
             printf '%s\n' 'schemas requires sync to be true' >&2
             exit 1
         fi
-        if [ "$sync" = true ] && [ "$encrypted_cache" = true ] && \
+        if [ "$no_cache" != true ] && [ "$encrypted_cache" = true ] && \
             [ "$key_available" != true ]; then
             printf '%s\n' \
-                'sync with encrypted-cache requires SAFE_MIGRATE_CACHE_KEY' >&2
+                'encrypted-cache requires SAFE_MIGRATE_CACHE_KEY; use no-cache only for an explicit degraded analysis' >&2
             exit 1
         fi
         [ -n "$baseline" ] || {

@@ -45,6 +45,8 @@ test "$(/bin/sh "$baseline" validate false false false false '' '' default \
   auto false "$migration_file" '' "$output_dir")" = lint
 test "$(/bin/sh "$baseline" validate true false true true '' public production \
   auto true "$migration_dir" '' "$output_dir")" = lint-chain
+test "$(/bin/sh "$baseline" validate true false true true '' '' production \
+  auto false '' '' "$output_dir")" = sync-only
 test "$(/bin/sh "$baseline" validate false false false false reviewed.cache '' default \
   lint false "$migration_file" '' '-artifacts')" = lint
 test "$(/bin/sh "$baseline" validate false true true false '' '' default \
@@ -64,6 +66,8 @@ assert_baseline_rejected true true false false '' '' default \
 assert_baseline_rejected false false false false '' public default \
   lint false "$migration_file" '' "$output_dir"
 assert_baseline_rejected true false true false '' '' default \
+  lint false "$migration_file" '' "$output_dir"
+assert_baseline_rejected false false true false '' '' default \
   lint false "$migration_file" '' "$output_dir"
 assert_baseline_rejected false true false false reviewed.cache '' default \
   lint false "$migration_file" '' "$output_dir"
@@ -144,6 +148,7 @@ cmp "$tmp_dir/expected-arguments" "$argument_log"
 grep -A4 '^  sync:$' "$manifest" | grep -F 'default: "false"' >/dev/null
 grep -A4 '^  baseline:$' "$manifest" | grep -F 'default: default' >/dev/null
 grep -A4 '^  mode:$' "$manifest" | grep -F 'default: auto' >/dev/null
+grep -A5 '^  path:$' "$manifest" | grep -F 'required: false' >/dev/null
 grep -A4 '^  encrypted-cache:$' "$manifest" | grep -F 'default: "true"' >/dev/null
 grep -A4 '^  no-cache:$' "$manifest" | grep -F 'default: "false"' >/dev/null
 grep -F 'cache_dir="$(mktemp -d "${cache_root}/invocation.XXXXXX")"' "$manifest" >/dev/null
@@ -165,9 +170,10 @@ if grep -F 'rm -rf -- "$managed_root"' "$manifest" >/dev/null; then
 fi
 grep -F 'uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9' "$manifest" >/dev/null
 grep -F 'uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9' "$manifest" >/dev/null
+grep -F "inputs.sync != 'true'" "$manifest" >/dev/null
 grep -F 'cache_prefix="safe-migrate-v7-${RUNNER_OS}-${cache_mode}-${INPUT_BASELINE}-"' "$manifest" >/dev/null
 grep -F '[[ ! "$SAFE_MIGRATE_CACHE_KEY" =~ ^[0-9A-Fa-f]{64}$ ]]' "$manifest" >/dev/null
-test "$(grep -Ec '^[[:space:]]+SAFE_MIGRATE_CACHE_KEY: "[0-9A-Fa-f]{64}"$' "$workflow")" -eq 3
+test "$(grep -Ec '^[[:space:]]+SAFE_MIGRATE_CACHE_KEY: "[0-9A-Fa-f]{64}"$' "$workflow")" -eq 4
 if grep -Eq '^[[:space:]]+SAFE_MIGRATE_CACHE_KEY: [0-9A-Fa-f]{64}$' "$workflow"; then
   printf '%s\n' 'workflow contains an unquoted hexadecimal cache key' >&2
   exit 1
@@ -197,5 +203,11 @@ if grep -F 'aarch64-pc-windows-msvc' "$manifest" >/dev/null; then
   printf '%s\n' 'Action still advertises an unpublished Windows ARM64 artifact' >&2
   exit 1
 fi
-grep -F '{ [ -z "$INPUT_CACHE" ] && [ ! -f "$RESOLVED_CACHE" ]; }' "$manifest" >/dev/null
+grep -F 'No synchronized baseline was restored' "$manifest" >/dev/null
+grep -F 'if [ "$preflight_failed" != true ] && [ "$operational_failed" != true ]; then' "$manifest" >/dev/null
+grep -F 'if [ "$INPUT_NO_CACHE" = "true" ]; then' "$manifest" >/dev/null
+if grep -F 'running Tainted analysis without the baseline' "$manifest" >/dev/null; then
+  printf '%s\n' 'Action still silently falls back to degraded analysis' >&2
+  exit 1
+fi
 grep -F 'Explicit cache does not exist or is not a file' "$manifest" >/dev/null

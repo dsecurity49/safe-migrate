@@ -26,7 +26,10 @@ use cli_init::InitCommands;
 #[derive(Parser, Debug)]
 #[command(name = "safe-migrate")]
 #[command(version)]
-#[command(about = "Find risky PostgreSQL migrations before they run", long_about = None)]
+#[command(
+    about = "Check PostgreSQL migrations against a synchronized database baseline",
+    long_about = None
+)]
 struct Cli {
     /// Disable colored output
     #[arg(long, global = true)]

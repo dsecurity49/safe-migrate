@@ -5,9 +5,10 @@ parses a migration, simulates its schema changes, and explains blocking locks,
 unsafe constraints, dependency conflicts, privilege changes, and other rollout
 risks.
 
-You can try it without a database. For more accurate results, synchronize a
-read-only snapshot of the PostgreSQL catalog once and lint against it offline.
-safe-migrate never applies migration SQL.
+Its analysis is grounded in a synchronized snapshot of the database it protects.
+`sync` reads PostgreSQL catalogs in a read-only transaction; later checks use
+that encrypted or local baseline without database access. safe-migrate never
+executes migration SQL.
 
 ## Install
 
@@ -32,33 +33,18 @@ safe-migrate --version
 Download `install.sh` first and run `sh install.sh --help` for destination and
 target options.
 
-## Try it
+## Quick start
 
-Check an ordered migration directory without connecting to PostgreSQL:
-
-```bash
-safe-migrate lint-chain --dir migrations --no-cache
-```
-
-Or check one file:
-
-```bash
-safe-migrate lint --file migrations/001_add_status.sql --no-cache
-```
-
-This first run uses `Tainted` confidence because safe-migrate cannot see the
-existing database. It still reports risks that can be established from the SQL
-itself. A synchronized baseline adds table sizes, dependencies, privileges,
-PostgreSQL version, search path, and timeout settings.
-
-## Add a database baseline
-
-Use the database role and defaults that run your migrations. The role should
-have only the catalog-read access needed by `sync`.
+`sync` captures the connected role and its session defaults. Use the migration
+role when exact role-sensitive analysis matters, or a dedicated catalog-reading
+login when minimizing credential impact matters more. Database access is needed
+only while refreshing the baseline; the [Action guide](docs/GITHUB_ACTIONS.md)
+explains this tradeoff in more detail.
 
 ```bash
 export DATABASE_URL='postgres://readonly_user@localhost:5432/app'
 safe-migrate sync
+safe-migrate cache inspect
 safe-migrate lint-chain --dir migrations
 ```
 
@@ -76,36 +62,38 @@ safe-migrate sync
 ```
 
 The cache contains schema, role, privilege, dependency, and statistics metadata.
-It contains no credentials or password hashes, but you should still treat it as
-sensitive and avoid publishing it.
+It contains no credentials, password hashes, or subscription connection strings,
+but it is still infrastructure metadata and should be treated as sensitive.
 
 ## Add it to GitHub Actions
 
-Generate a PR workflow in the current repository:
+Generate separate trusted-refresh and pull-request workflows:
 
 ```bash
 safe-migrate init github-actions --path migrations
 ```
 
-That workflow works immediately without database access. On a cache miss it
-checks the migrations with `Tainted` confidence and explains that the baseline
-is unavailable.
+This is one-time repository setup. Once the baseline exists, ordinary pull
+requests need no database connection and no per-PR synchronization.
 
-When you are ready for database-aware CI, generate the trusted refresh job and
-configure its two secrets through the authenticated GitHub CLI:
+After creating the `safe-migrate-baseline` GitHub environment, the initializer
+can also configure the two secrets through an authenticated GitHub CLI:
 
 ```bash
 safe-migrate init github-actions \
   --path migrations \
   --force \
-  --with-baseline \
   --configure-secrets
 ```
 
-The generated workflow keeps `DATABASE_URL` out of pull-request jobs. Managed
-baselines are encrypted by default, restored automatically, and refreshed only
-from the default branch or a manual run. Review the runner and environment
-settings before committing the workflow.
+`SAFE_MIGRATE_DATABASE_URL` is stored only in the baseline environment;
+`SAFE_MIGRATE_CACHE_KEY` is a repository secret so trusted pull-request jobs can
+decrypt the snapshot. Configure the refresh runner's localhost, Unix-socket, or
+tunnel access, then run **Refresh safe-migrate baseline** once. Pull-request
+jobs never receive the database URL and never save or refresh the baseline.
+
+A missing baseline or encryption key is an operational error. This prevents a
+normal CI run from silently degrading into broad conservative findings.
 
 To create a cache key without configuring GitHub, run
 `safe-migrate init cache-key`. Add `--set-github-secret` to send a new key to
@@ -125,10 +113,15 @@ security model.
 | `sync` | Refresh the local database baseline. |
 | `cache inspect` | Show baseline provenance and redacted object counts. |
 | `rules` | Explore rules, remediation, and effective settings. |
-| `init github-actions --path migrations/` | Generate a safe GitHub Actions workflow. |
+| `init github-actions --path migrations/` | Generate isolated baseline-refresh and PR-analysis workflows. |
 | `init cache-key` | Generate a cache-encryption key. |
 
 Run `safe-migrate <command> --help` for all options.
+
+`--no-cache` is an explicit degraded mode for parser investigation and limited
+SQL-only checks. Because existing objects and database evidence are unknown,
+its findings are conservative and its confidence is `Tainted`; it is not the
+recommended CI configuration.
 
 ## Understand the result
 
