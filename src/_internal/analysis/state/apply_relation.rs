@@ -428,6 +428,16 @@ impl AnalysisState {
     /// harness and destructive-transition dependency checks agree with
     /// PostgreSQL.
     fn register_not_null_constraint(&mut self, table: &ObjectId, column: &str) {
+        // PostgreSQL only materializes NOT NULL columns as `pg_constraint`
+        // rows (`contype = 'n'`) on PG18+. On PG17 and earlier a NOT NULL
+        // column is tracked purely by its nullability attribute, so recording
+        // it as a distinct constraint would add normalized state that the live
+        // database never lists. Column nullability is still carried by the
+        // column itself; only this separate constraint representation is
+        // suppressed.
+        if self.effective_pg_version_num(0) < 180_000 {
+            return;
+        }
         if self.not_null_constraint_for_column(table, column).is_some() {
             return;
         }
