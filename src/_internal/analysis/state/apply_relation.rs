@@ -497,29 +497,25 @@ impl AnalysisState {
         column: &str,
     ) -> Option<(ObjectId, String)> {
         let resolution_graph = self.local.graph.clone();
-        self.local
-            .graph
-            .edges()
-            .iter()
-            .find_map(|edge| {
-                let dependent = resolution_graph.resolve_rename(&edge.dependent);
-                if dependent != table {
-                    return None;
-                }
-                if let DependencyKind::ConstraintOnRelation {
-                    constraint_name,
-                    columns,
-                    is_primary: false,
-                    ..
-                } = &edge.kind
-                    && columns.len() == 1
-                    && columns[0] == column
-                {
-                    Some((dependent.clone(), constraint_name.clone()))
-                } else {
-                    None
-                }
-            })
+        self.local.graph.edges().iter().find_map(|edge| {
+            let dependent = resolution_graph.resolve_rename(&edge.dependent);
+            if dependent != table {
+                return None;
+            }
+            if let DependencyKind::ConstraintOnRelation {
+                constraint_name,
+                columns,
+                is_primary: false,
+                ..
+            } = &edge.kind
+                && columns.len() == 1
+                && columns[0] == column
+            {
+                Some((dependent.clone(), constraint_name.clone()))
+            } else {
+                None
+            }
+        })
     }
 
     pub(super) fn apply_create_table(&mut self, create: &CreateTable) -> MutationResult {
@@ -2837,12 +2833,8 @@ impl AnalysisState {
                         // allows it to be dropped by name like any other
                         // constraint, which releases the column's nullability.
                         let resolution_graph = self.local.graph.clone();
-                        let guarded_column: Option<String> = self
-                            .local
-                            .graph
-                            .edges()
-                            .iter()
-                            .find_map(|edge| {
+                        let guarded_column: Option<String> =
+                            self.local.graph.edges().iter().find_map(|edge| {
                                 if resolution_graph.resolve_rename(&edge.dependent) != &alter.id {
                                     return None;
                                 }
