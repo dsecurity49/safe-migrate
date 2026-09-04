@@ -1,14 +1,10 @@
 # safe-migrate
 
-safe-migrate finds risky PostgreSQL migrations before they reach production. It
-parses a migration, simulates its schema changes, and explains blocking locks,
-unsafe constraints, dependency conflicts, privilege changes, and other rollout
-risks.
+safe-migrate finds risky PostgreSQL migrations before they reach production.
+It parses SQL, simulates schema changes, and checks the result against a
+synchronized database snapshot. It never executes migration SQL.
 
-Its analysis is grounded in a synchronized snapshot of the database it protects.
-`sync` reads PostgreSQL catalogs in a read-only transaction; later checks use
-that encrypted or local baseline without database access. safe-migrate never
-executes migration SQL.
+PostgreSQL 14–18 are supported.
 
 ## Install
 
@@ -16,42 +12,102 @@ With Rust installed:
 
 ```bash
 cargo install safe-migrate --locked
-safe-migrate --version
 ```
 
 Prebuilt binaries are available from
-[GitHub Releases](https://github.com/dsecurity49/safe-migrate/releases). To use
-the checksum-verifying installer, pin it to the release you want:
+[GitHub Releases](https://github.com/dsecurity49/safe-migrate/releases). The
+installer verifies release checksums:
 
 ```bash
 VERSION='v0.8.0'
 curl -fsSL "https://raw.githubusercontent.com/dsecurity49/safe-migrate/${VERSION}/install.sh" |
   bash -s -- --version "${VERSION}"
-safe-migrate --version
 ```
 
-Download `install.sh` first and run `sh install.sh --help` for destination and
-target options.
+Download `install.sh` first and run `sh install.sh --help` to review destination
+and target options.
 
 ## Quick start
 
 ```bash
 export DATABASE_URL='postgres://readonly_user@localhost:5432/app'
 safe-migrate sync
-safe-migrate cache inspect
 safe-migrate lint-chain --dir migrations
 ```
 
-`sync` reads PostgreSQL metadata and writes `.safe-migrate.cache`; it does not
-execute migration SQL. Later lint runs are offline unless you explicitly enable
-automatic synchronization.
+`sync` writes `.safe-migrate.cache`. Later checks use that snapshot offline.
+Run `safe-migrate cache inspect` to view its provenance and redacted contents.
 
-The snapshot reflects the connected role and its session defaults. See the
-[Action guide](docs/GITHUB_ACTIONS.md#database-role-and-runner-security) when
-choosing between a restricted catalog reader and the actual migration role.
+## What it checks
 
-Direct remote database connections are rejected. Use localhost, a Unix socket,
-or a trusted tunnel:
+The 28 built-in rules cover:
+
+- blocking locks, table rewrites, constraints, indexes, partitions, and
+  materialized-view refreshes;
+- destructive changes, cascades, schema drift, dependency breakage, and
+  migration ordering conflicts;
+- grants, policies, disabled triggers, roles, and privilege-sensitive changes;
+- missing timeouts, transaction-incompatible operations, dynamic SQL,
+  volatile defaults, and rerun safety.
+
+Run `safe-migrate rules` for the catalog or inspect one rule directly:
+
+```bash
+safe-migrate rules --rule require-concurrent-index
+```
+
+## GitHub Actions
+
+Create the `safe-migrate-baseline` GitHub environment, then run:
+
+```bash
+safe-migrate init github-actions --path migrations --configure-secrets
+```
+
+This generates a trusted baseline refresh and an offline PR check. Follow the
+[GitHub Action guide](docs/GITHUB_ACTIONS.md) to connect the runner and create
+the first baseline.
+
+## Results
+
+| Tier | Meaning | Default command result |
+| --- | --- | --- |
+| `Tier1` | Blocking safety problem | Exit `2` |
+| `Tier2` | Needs review | Exit `0` |
+| `Tier3` | Informational guidance | Exit `0` |
+
+Operational failures—such as invalid SQL, configuration, or cache data—exit
+`1`. Every finding includes a stable rule ID, a reason, and remediation:
+
+```text
+[HALT] Require concurrent index (require-concurrent-index)
+  reason : Creating this index can block writes on a large table.
+  recipe : Use CREATE INDEX CONCURRENTLY outside a transaction.
+```
+
+Use `--json` for automation or `--markdown` for review artifacts. See the
+[CLI and report contract](docs/CONTRACT.md) for schemas, confidence, verdicts,
+and compatibility guarantees.
+
+## Commands
+
+| Command | Purpose |
+| --- | --- |
+| `lint --file migration.sql` | Check one migration. |
+| `lint-chain --dir migrations/` | Check ordered migrations with state carried forward. |
+| `sync` | Refresh the database baseline. |
+| `cache inspect` | Show baseline provenance and redacted counts. |
+| `rules` | Browse rules and effective settings. |
+| `init github-actions --path migrations/` | Generate the GitHub integration. |
+| `init cache-key` | Generate a cache-encryption key. |
+
+Run `safe-migrate <command> --help` for every option.
+
+## Database baseline
+
+`sync` reads PostgreSQL catalogs in a read-only, repeatable-read transaction.
+Direct remote connections are rejected; use localhost, a Unix socket, or a
+trusted tunnel:
 
 ```bash
 ssh -N -L 5433:db.internal:5432 bastion
@@ -59,76 +115,24 @@ export DATABASE_URL='postgres://readonly_user@localhost:5433/app'
 safe-migrate sync
 ```
 
-The cache contains schema, role, privilege, dependency, and statistics metadata.
-It contains no credentials, password hashes, or subscription connection strings,
-but it is still infrastructure metadata and should be treated as sensitive.
+The snapshot reflects the connected role and its session defaults. Choose
+between a restricted catalog reader and the real migration role based on the
+accuracy and credential tradeoff described in the
+[Action guide](docs/GITHUB_ACTIONS.md#database-role-and-runner-security).
 
-## Add it to GitHub Actions
-
-Create a protected GitHub environment named `safe-migrate-baseline`, then run:
-
-```bash
-safe-migrate init github-actions \
-  --path migrations \
-  --configure-secrets
-```
-
-This creates a trusted baseline-refresh workflow and an offline PR-analysis
-workflow. Configure the refresh runner's local or tunneled database access,
-then run **Refresh safe-migrate baseline** once.
-
-A missing baseline or encryption key is an operational error. This prevents a
-normal CI run from silently degrading into broad conservative findings.
-
-See the [GitHub Action guide](docs/GITHUB_ACTIONS.md) for manual secret setup,
-runner access, forks, multiple databases, and the security model.
-
-## Commands
-
-| Command | Purpose |
-| --- | --- |
-| `lint --file migration.sql` | Check one migration. |
-| `lint-chain --dir migrations/` | Check ordered migrations while carrying schema state forward. |
-| `sync` | Refresh the local database baseline. |
-| `cache inspect` | Show baseline provenance and redacted object counts. |
-| `rules` | Explore rules, remediation, and effective settings. |
-| `init github-actions --path migrations/` | Generate isolated baseline-refresh and PR-analysis workflows. |
-| `init cache-key` | Generate a cache-encryption key. |
-
-Run `safe-migrate <command> --help` for all options.
+The cache contains infrastructure metadata, including schema, roles,
+privileges, dependencies, and statistics. It contains no credentials, password
+hashes, or subscription connection strings, but should still be treated as
+sensitive.
 
 `--no-cache` is an explicit degraded mode for parser investigation and limited
-SQL-only checks. Because existing objects and database evidence are unknown,
-its findings are conservative and its confidence is `Tainted`; it is not the
-recommended CI configuration.
-
-## Understand the result
-
-Findings are grouped by severity:
-
-- `Tier1` is a blocking safety problem.
-- `Tier2` needs review but does not fail the command by default.
-- `Tier3` is informational guidance.
-
-Every finding includes a stable rule ID, an explanation, and a remediation when
-one is available. Use `safe-migrate rules` to browse the rule catalog or
-`safe-migrate rules --rule require-concurrent-index` to inspect one rule.
-
-Exit statuses are stable for automation:
-
-- `0`: analysis completed without a Tier 1 finding.
-- `1`: configuration, parsing, cache, I/O, or another operational failure.
-- `2`: analysis completed with at least one Tier 1 finding.
-
-Use `--json` for machine-readable output or `--markdown` for a deterministic
-review report. The complete schema and confidence semantics are documented in
-the [CLI and report contract](docs/CONTRACT.md).
+SQL-only checks. Existing objects are unknown, so confidence is `Tainted` and
+many findings become conservative.
 
 ## Configuration
 
-safe-migrate uses `safe-migrate.toml` from the current directory when present.
-Most projects can begin with the built-in defaults. A small configuration might
-look like this:
+Most projects can start with the built-in defaults. Place overrides in
+`safe-migrate.toml`:
 
 ```toml
 schemas = ["public", "auth"]
@@ -139,41 +143,33 @@ disabled = true
 ```
 
 Unknown settings and rule IDs are rejected. `safe-migrate rules --json` lists
-the settings supported by each rule.
+the configuration supported by each rule.
 
-To suppress one finding where the operational tradeoff has been reviewed, use
-its primary rule ID:
+Suppress a reviewed finding with its primary rule ID:
 
 ```sql
 -- safe-migrate: ignore(require-concurrent-index)
 CREATE INDEX users_email_idx ON users (email);
 ```
 
-Keep suppressions narrow and explain the reason in the migration or its review.
-
-For thresholds, automatic sync, cache encryption, compatibility, and report
-fields, see the [CLI and report contract](docs/CONTRACT.md).
+Keep suppressions narrow and explain the reason in the migration review.
 
 ## Migration timeouts
 
-safe-migrate reports when lock-sensitive migrations do not establish suitable
-timeouts. If your migration runner does not already set them, add them to the
-migration:
+If the migration runner does not already set timeouts, add them before
+lock-sensitive changes:
 
 ```sql
 SET lock_timeout = '5s';
 SET statement_timeout = '15min';
 ```
 
-Keep a positive `lock_timeout` shorter than a positive `statement_timeout`, so
-lock acquisition fails before the whole migration reaches its statement limit.
+Keep a positive `lock_timeout` shorter than a positive `statement_timeout`.
 
-## Rust library API
+## Rust library
 
-Rust integrations should use the supported `safe_migrate::api` façade. It
-provides configuration, cache loading, analysis, findings, and evidence without
-exposing mutable parser or state-machine internals. API documentation is
-published on [docs.rs](https://docs.rs/safe-migrate).
+Rust integrations should use the supported `safe_migrate::api` façade.
+Documentation is published on [docs.rs](https://docs.rs/safe-migrate).
 
 ## Contributing
 
