@@ -20,13 +20,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const EXIT_BLOCKING_FINDINGS: i32 = 2;
 
+mod cli_init;
+use cli_init::InitCommands;
+
 #[derive(Parser, Debug)]
 #[command(name = "safe-migrate")]
 #[command(version)]
-#[command(
-    about = "Sync PostgreSQL metadata, then lint migrations offline",
-    long_about = None
-)]
+#[command(about = "Find risky PostgreSQL migrations before they run", long_about = None)]
 struct Cli {
     /// Disable colored output
     #[arg(long, global = true)]
@@ -38,6 +38,11 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Create reviewed project integration files
+    Init {
+        #[command(subcommand)]
+        command: InitCommands,
+    },
     /// Lint a SQL migration file
     Lint {
         #[arg(short, long)]
@@ -253,6 +258,7 @@ fn main() -> Result<()> {
     }
 
     match cli.command {
+        Commands::Init { command } => cli_init::run(command),
         Commands::Lint {
             file,
             config,

@@ -22,13 +22,14 @@ then add an integration test when behavior crosses into the next stage.
 ## Project structure
 
 ```text
-src/analysis/   facts, resolution, mutations, dependency graph, state, transactions
-src/ast/        extraction from the pinned Squawk typed AST
-src/db/         versioned database cache
-src/engine/     configuration, orchestration, and rule dispatch
-src/model/      modeled PostgreSQL objects
-src/report/     human, JSON, and interactive reporting
-src/rules/      safety rule implementations
+src/_internal/analysis/   facts, resolution, mutations, dependency graph, state, transactions
+src/_internal/ast/        extraction from the pinned Squawk typed AST
+src/_internal/db/         versioned database cache
+src/_internal/engine/     configuration, orchestration, and rule dispatch
+src/_internal/model/      modeled PostgreSQL objects
+src/_internal/report/     human, JSON, and interactive reporting
+src/_internal/rules/      safety rule implementations
+src/api.rs                supported Rust integration façade
 tests/          integration, state-machine, rule, CLI, and regression tests
 live_tests/     end-to-end SQL fixtures and frozen database cache
 docs/           Action guide and CLI/report contract
@@ -98,7 +99,7 @@ against PostgreSQL 14 through 18; excluded fixtures and their reasons live in
 
 ## Adding or changing a rule
 
-1. Implement one safety concept under `src/rules/`.
+1. Implement one safety concept under `src/_internal/rules/`.
 2. Register the rule in the primary rule registry.
 3. Add configuration only when the rule needs a user-controlled policy.
 4. Add focused regression tests.
@@ -123,9 +124,9 @@ Use the pinned Squawk source and grammar when changing AST extraction:
 
 1. confirm the exact Squawk versions in `Cargo.toml` and `Cargo.lock`;
 2. inspect the resolved dependency source and grammar;
-3. add an exact fact assertion in `src/ast/visitor_tests.rs`;
-4. implement extraction in `src/ast/visitor.rs` or expression conversion in
-   `src/analysis/expr_visitor.rs`;
+3. add an exact fact assertion in `src/_internal/ast/visitor_tests.rs`;
+4. implement extraction in `src/_internal/ast/visitor.rs` or expression
+   conversion in `src/_internal/analysis/expr_visitor.rs`;
 5. test resolver, state, and rule effects when behavior crosses layers;
 6. represent unsupported parser behavior explicitly.
 

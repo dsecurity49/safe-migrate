@@ -1,12 +1,12 @@
 name: safe-migrate
-description: Lint PostgreSQL migrations offline against a synchronized database baseline.
+description: Find risky PostgreSQL migrations, with an optional synchronized database baseline.
 author: safe-migrate contributors
 
 inputs:
   mode:
-    description: Analyze one migration (`lint`) or an ordered migration directory (`lint-chain`).
+    description: Infer analysis from path (`auto`), or explicitly select `lint` or `lint-chain`.
     required: false
-    default: lint-chain
+    default: auto
   path:
     description: Migration file for `lint` or directory for `lint-chain`.
     required: true
@@ -31,15 +31,15 @@ inputs:
     required: false
     default: default
   encrypted-cache:
-    description: Require authenticated cache encryption; missing keys fall back to Tainted linting and cannot sync.
+    description: Encrypt managed or explicit cache data; enabled by default. Disable only for a reviewed plaintext-cache workflow.
     required: false
-    default: "false"
+    default: "true"
   no-cache:
-    description: Bypass every baseline for a Tainted preview; incompatible with cache, sync, schemas, and encryption.
+    description: Bypass every baseline for a Tainted preview; incompatible with cache, sync, and schemas.
     required: false
     default: "false"
   output-dir:
-    description: Directory for `safe-migrate-report.json` and `safe-migrate-report.md`.
+    description: Relative workspace directory for reports and diagnostics.
     required: false
     default: safe-migrate-artifacts
   advisory:
@@ -104,11 +104,12 @@ runs:
         fi
 
         cd "$GITHUB_WORKSPACE"
-        /bin/sh "$GITHUB_ACTION_PATH/scripts/action-baseline" validate \
+        analysis_mode="$(/bin/sh "$GITHUB_ACTION_PATH/scripts/action-baseline" validate \
           "$INPUT_SYNC" "$INPUT_NO_CACHE" "$INPUT_ENCRYPTED_CACHE" \
           "$key_available" "$INPUT_CACHE" "$INPUT_SCHEMAS" \
           "$INPUT_BASELINE" "$INPUT_MODE" "$INPUT_ADVISORY" \
-          "$INPUT_PATH" "$INPUT_CONFIG" "$INPUT_OUTPUT_DIR"
+          "$INPUT_PATH" "$INPUT_CONFIG" "$INPUT_OUTPUT_DIR")"
+        printf '%s\n' "analysis-mode=${analysis_mode}" >> "$GITHUB_OUTPUT"
 
         cache_transport_path=""
         if [ -n "$INPUT_CACHE" ]; then
@@ -144,7 +145,8 @@ runs:
 
         printf '%s\n' "cache-path=${cache_path}" >> "$GITHUB_OUTPUT"
         printf '%s\n' "cache-transport-path=${cache_transport_path}" >> "$GITHUB_OUTPUT"
-        if [ "$INPUT_ENCRYPTED_CACHE" != true ] || [ "$key_available" = true ]; then
+        if [ "$INPUT_NO_CACHE" = true ] || [ "$INPUT_ENCRYPTED_CACHE" != true ] || \
+            [ "$key_available" = true ]; then
           printf '%s\n' 'baseline-readable=true' >> "$GITHUB_OUTPUT"
         else
           printf '%s\n' 'baseline-readable=false' >> "$GITHUB_OUTPUT"
@@ -262,7 +264,7 @@ runs:
       continue-on-error: true
       shell: bash
       env:
-        INPUT_MODE: ${{ inputs.mode }}
+        INPUT_MODE: ${{ steps.baseline.outputs.analysis-mode }}
         INPUT_PATH: ${{ inputs.path }}
         INPUT_CACHE: ${{ inputs.cache }}
         INPUT_CONFIG: ${{ inputs.config }}
@@ -278,6 +280,29 @@ runs:
       run: |
         set -euo pipefail
 
+        cleanup_files=()
+        cleanup() {
+          if [ "${#cleanup_files[@]}" -gt 0 ]; then
+            rm -f -- "${cleanup_files[@]}"
+          fi
+        }
+        trap cleanup EXIT
+
+        # Register exact values before any child process can write diagnostics.
+        # GitHub already masks repository secrets, but explicit registration also
+        # covers credentials supplied through another trusted workflow layer.
+        for secret_name in DATABASE_URL SAFE_MIGRATE_CACHE_KEY; do
+          secret_value="${!secret_name-}"
+          [ -n "$secret_value" ] || continue
+          [ "${#secret_value}" -ge 8 ] || continue
+          mask_value="${secret_value//'%'/'%25'}"
+          mask_value="${mask_value//$'\r'/'%0D'}"
+          mask_value="${mask_value//$'\n'/'%0A'}"
+          printf '::add-mask::%s\n' "$mask_value"
+        done
+        secret_value=
+        mask_value=
+
         cd "$GITHUB_WORKSPACE"
         mkdir -p -- "$INPUT_OUTPUT_DIR"
         binary="$SAFE_MIGRATE_BINARY"
@@ -290,12 +315,13 @@ runs:
         if [ -n "$INPUT_CONFIG" ]; then
           config_path="$INPUT_CONFIG"
           if ! /bin/sh "$GITHUB_ACTION_PATH/scripts/action-baseline" \
-              validate-config "$config_path" "$INPUT_ENCRYPTED_CACHE" \
+              validate-config "$config_path" "$INPUT_ENCRYPTED_CACHE" "$INPUT_NO_CACHE" \
               2> >(tee -a "$diagnostic_log" >&2); then
             preflight_failed=true
           fi
         else
           config_path="$(mktemp "${RUNNER_TEMP}/safe-migrate-default.XXXXXX")"
+          cleanup_files+=("$config_path")
           if [ "$INPUT_ENCRYPTED_CACHE" = true ]; then
             printf '%s\n' 'cache_encryption = true' > "$config_path"
           fi
@@ -434,8 +460,8 @@ runs:
             secret_value="${!secret_name-}"
             [ -n "$secret_value" ] || continue
             [ "${#secret_value}" -ge 8 ] || continue
-            redaction_out="${RUNNER_TEMP}/safe-migrate-redacted.$$"
-            : > "$redaction_out"
+            redaction_out="$(mktemp "${RUNNER_TEMP}/safe-migrate-redacted.XXXXXX")"
+            cleanup_files+=("$redaction_out")
             while IFS= read -r -u 9 line || [ -n "$line" ]; do
               case "$line" in
                 *"$secret_value"*) line="${line//"$secret_value"/***}" ;;
@@ -444,7 +470,6 @@ runs:
             done 9< "$redact_input"
             mv "$redaction_out" "$redact_input"
           done
-          rm -f -- "${RUNNER_TEMP}/safe-migrate-redacted."*
           redact_input=
         fi
 
@@ -515,3 +540,7 @@ runs:
       run: |
         /bin/sh "$GITHUB_ACTION_PATH/scripts/action-final-gate" \
           "${ANALYZER_STATUS:-1}" "$ADVISORY"
+
+branding:
+  icon: shield
+  color: blue

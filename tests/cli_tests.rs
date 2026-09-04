@@ -62,10 +62,147 @@ fn test_cli_help() {
     let output = cmd.output().unwrap();
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("Sync PostgreSQL metadata, then lint migrations offline"));
+    assert!(stdout.contains("Find risky PostgreSQL migrations before they run"));
     assert!(!stdout.contains("prevent blocking locks"));
     assert!(stdout.contains("Sync PostgreSQL schema metadata and statistics into a local cache"));
     assert!(!stdout.contains("Sync database table statistics"));
+    assert!(stdout.contains("init"));
+}
+
+#[test]
+fn init_cache_key_generates_expected_secret_format() {
+    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let output = cmd.args(["init", "cache-key"]).output().unwrap();
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let key = String::from_utf8(output.stdout).unwrap();
+    let key = key.trim_end();
+    assert_eq!(key.len(), 64);
+    assert!(key.bytes().all(|byte| byte.is_ascii_hexdigit()));
+}
+
+#[cfg(unix)]
+#[test]
+fn init_cache_key_sends_secret_to_github_cli_over_stdin() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let test_dir = tempfile::tempdir().unwrap();
+    let fake_gh = test_dir.path().join("gh");
+    let captured = test_dir.path().join("captured-secret");
+    fs::write(
+        &fake_gh,
+        "#!/bin/sh\nset -eu\ntest \"$#\" -eq 3\ntest \"$1:$2:$3\" = secret:set:SAFE_MIGRATE_CACHE_KEY\ncat > \"$CAPTURED_SECRET\"\n",
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&fake_gh).unwrap().permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&fake_gh, permissions).unwrap();
+    let existing_path = std::env::var("PATH").unwrap_or_default();
+
+    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    cmd.args(["init", "cache-key", "--set-github-secret"])
+        .env("CAPTURED_SECRET", &captured)
+        .env(
+            "PATH",
+            format!("{}:{existing_path}", test_dir.path().display()),
+        )
+        .assert()
+        .success();
+
+    let key = fs::read_to_string(captured).unwrap();
+    assert_eq!(key.len(), 64);
+    assert!(key.bytes().all(|byte| byte.is_ascii_hexdigit()));
+}
+
+#[test]
+fn init_github_actions_stages_trial_before_database_setup() {
+    let project = tempfile::tempdir().unwrap();
+    fs::create_dir(project.path().join("migrations")).unwrap();
+
+    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    cmd.current_dir(project.path())
+        .args(["init", "github-actions", "--path", "migrations"])
+        .assert()
+        .success();
+
+    let workflow =
+        fs::read_to_string(project.path().join(".github/workflows/safe-migrate.yml")).unwrap();
+    assert!(workflow.contains("\n  pull_request:\n    paths: ['migrations/**']"));
+    assert!(workflow.contains("\n  lint:\n    runs-on: ubuntu-latest"));
+    assert!(workflow.contains("\n          path: 'migrations'"));
+    assert!(!workflow.contains("DATABASE_URL"));
+    assert!(!workflow.contains("refresh-baseline"));
+
+    let mut overwrite = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let assertion = overwrite
+        .current_dir(project.path())
+        .args(["init", "github-actions", "--path", "migrations"])
+        .assert()
+        .failure();
+    assert!(
+        String::from_utf8_lossy(&assertion.get_output().stderr)
+            .contains("use --force to replace it")
+    );
+}
+
+#[test]
+fn init_github_actions_can_add_isolated_baseline_refresh() {
+    let project = tempfile::tempdir().unwrap();
+    fs::create_dir(project.path().join("db migrations")).unwrap();
+
+    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    cmd.current_dir(project.path())
+        .args([
+            "init",
+            "github-actions",
+            "--path",
+            "db migrations",
+            "--branch",
+            "trunk",
+            "--with-baseline",
+        ])
+        .assert()
+        .success();
+
+    let workflow =
+        fs::read_to_string(project.path().join(".github/workflows/safe-migrate.yml")).unwrap();
+    assert!(workflow.contains("\n    branches: ['trunk']"));
+    assert!(workflow.contains("\n    paths: ['db migrations/**']"));
+    assert!(workflow.contains("\n  refresh-baseline:"));
+    assert!(workflow.contains("\n    environment: safe-migrate-baseline"));
+    assert!(
+        workflow.contains("\n          DATABASE_URL: ${{ secrets.SAFE_MIGRATE_DATABASE_URL }}")
+    );
+    assert!(workflow.contains("\n          sync: 'true'"));
+}
+
+#[test]
+fn init_github_actions_does_not_read_secrets_from_noninteractive_input() {
+    let project = tempfile::tempdir().unwrap();
+    fs::create_dir(project.path().join("migrations")).unwrap();
+
+    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let assertion = cmd
+        .current_dir(project.path())
+        .args([
+            "init",
+            "github-actions",
+            "--path",
+            "migrations",
+            "--configure-secrets",
+        ])
+        .assert()
+        .failure();
+    assert!(
+        String::from_utf8_lossy(&assertion.get_output().stderr)
+            .contains("requires an interactive terminal")
+    );
+    assert!(
+        !project
+            .path()
+            .join(".github/workflows/safe-migrate.yml")
+            .exists()
+    );
 }
 
 #[test]

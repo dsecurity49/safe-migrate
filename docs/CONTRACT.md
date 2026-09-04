@@ -26,6 +26,13 @@ database.
   emits that same summary as one JSON document.
 - `safe-migrate rules` lists primary-rule descriptors. `--rule <id>`
   selects one descriptor and `--json` emits the stable discovery schema.
+- `safe-migrate init github-actions --path <dir>` creates a pull-request
+  workflow without overwriting an existing file. `--with-baseline` adds a
+  trusted refresh job; `--configure-secrets` uses an authenticated GitHub CLI
+  to set the database URL and a generated cache key without printing either.
+- `safe-migrate init cache-key` writes one randomly generated 32-byte key as
+  64 lowercase hexadecimal characters. `--set-github-secret` sends it to the
+  current repository through GitHub CLI instead of printing it.
 
 `lint` and `lint-chain` use an explicit cache, the default cache path, or
 `--no-cache`. When `auto_sync = true` is set in configuration, they may refresh
@@ -309,9 +316,9 @@ caches, and encrypted mode rejects plaintext caches. Changing modes requires a
 fresh `safe-migrate sync`.
 
 V7 cache payloads carry an explicit format header, explicit catalog coverage,
-and an explicit scope-boundary-query completion marker,
-and effective/session role provenance, the unexpanded search-path setting, effective lock and
-statement timeouts in milliseconds, PostgreSQL role membership, authoritative
+an explicit scope-boundary-query completion marker, effective/session role
+provenance, the unexpanded search-path setting, effective lock and statement
+timeouts in milliseconds, PostgreSQL role membership, authoritative
 synchronized schemas, sequence ownership/kind, all routine kinds,
 publications, and redacted subscriptions. They never include password hashes
 or subscription connection strings. V1–V6 and unheadered payloads are rejected
@@ -320,8 +327,12 @@ a readable V7 cache, but never an older format.
 
 ### GitHub Action
 
+- `path` is the only required input. The default `mode: auto` selects `lint`
+  for a file and `lint-chain` for a directory.
 - A managed-cache miss runs `--no-cache` with `Tainted` confidence. A missing
   explicit cache is an error.
+- Managed and explicit caches are encrypted by default. A reviewed plaintext
+  workflow must explicitly set `encrypted-cache: "false"`.
 - `sync: "true"` refreshes the baseline before linting. Lint always suppresses
   config-driven `auto_sync`, and database access is removed after the
   Action-controlled refresh.
@@ -329,6 +340,8 @@ a readable V7 cache, but never an older format.
   match `encrypted-cache`.
 - An encrypted sync without a valid key fails before database access. A lint
   job without the key runs without the encrypted baseline.
+- `output-dir` must remain inside the workspace and cannot contain dot segments
+  or traverse a symbolic link.
 - Exit `2` fails unless `advisory: "true"` is set. Exit `1` always fails.
 - Exact release tags install checksum-verified release assets. Full
   40-character SHAs and local source invocations build the checked-out source.

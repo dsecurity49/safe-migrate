@@ -336,7 +336,7 @@ jobs:
         with:
           mode: lint
           path: ${{ steps.sync_fixture.outputs.migration }}
-          config: ${{ steps.sync_fixture.outputs.auto-sync-config }}
+          config: ${{ steps.sync_fixture.outputs.auto-sync-encrypted-config }}
           baseline: action-missing-${{ github.run_id }}-${{ github.run_attempt }}
           output-dir: action-missing-baseline-artifacts
 
