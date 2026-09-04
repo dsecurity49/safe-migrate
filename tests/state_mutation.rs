@@ -3949,6 +3949,7 @@ mod state_mutation_tests {
         let parent = object_id("", "grant_parent");
         let member = object_id("", "grant_member");
         let mut cache = DbCache::new();
+        cache.pg_version_num = Some(160_000);
         cache.metadata.source_role = Some("grant_member".into());
         cache.metadata.source_session_role = Some("grant_member".into());
         cache.roles.insert(
@@ -4033,6 +4034,7 @@ mod state_mutation_tests {
         let parent = object_id("", "grant_parent");
         let member = object_id("", "grant_member");
         let mut cache = DbCache::new();
+        cache.pg_version_num = Some(160_000);
         cache.metadata.source_role = Some("grant_member".into());
         cache.metadata.source_session_role = Some("grant_member".into());
         for (id, can_inherit_from) in [(parent.clone(), Vec::new()), (member.clone(), Vec::new())] {
@@ -4102,6 +4104,195 @@ mod state_mutation_tests {
                 .privileges
                 .has_privilege(&object_id("", "delegated_user"), Privilege::Select)
         );
+    }
+
+    #[test]
+    fn pg16_membership_inherit_option_overrides_member_noinherit() {
+        let engine = setup_engine();
+        let table_id = object_id("public", "membership_option_table");
+        let parent = object_id("", "grant_parent");
+        let member = object_id("", "grant_member");
+        let delegated = object_id("", "delegated_user");
+        let mut cache = DbCache::new();
+        cache.pg_version_num = Some(160_000);
+        cache.metadata.source_role = Some(member.name.clone());
+        cache.metadata.source_session_role = Some(member.name.clone());
+        for (id, inherits, can_inherit_from) in [
+            (parent.clone(), true, Vec::new()),
+            (member.clone(), false, vec![parent.clone()]),
+            (delegated.clone(), true, Vec::new()),
+        ] {
+            cache.roles.insert(
+                id.clone(),
+                RoleState {
+                    id: id.clone(),
+                    can_login: true,
+                    is_superuser: false,
+                    inherits,
+                    member_of: (id == member)
+                        .then_some(parent.clone())
+                        .into_iter()
+                        .collect(),
+                    can_administer_membership: Vec::new(),
+                    can_inherit_from,
+                    can_set_role_to: Vec::new(),
+                },
+            );
+        }
+        let mut relation = RelationState::new(
+            table_id.clone(),
+            object_id("", "owner"),
+            0,
+            Some(1),
+            RelationKind::Table,
+            Persistence::Permanent,
+            0,
+        );
+        relation
+            .privileges
+            .grant_with_option(parent, [Privilege::Select].into_iter().collect());
+        cache.insert_baseline(table_id, relation);
+        let mut state = safe_migrate::api::AnalysisState::new(cache);
+
+        let findings = engine
+            .analyze(
+                "GRANT SELECT ON membership_option_table TO delegated_user;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict")
+        );
+    }
+
+    #[test]
+    fn pg15_alter_role_inherit_activates_existing_membership() {
+        let engine = setup_engine();
+        let table_id = object_id("public", "legacy_inherit_table");
+        let parent = object_id("", "grant_parent");
+        let member = object_id("", "grant_member");
+        let delegated = object_id("", "delegated_user");
+        let mut cache = DbCache::new();
+        cache.pg_version_num = Some(150_000);
+        cache.metadata.source_role = Some(member.name.clone());
+        cache.metadata.source_session_role = Some(member.name.clone());
+        for (id, inherits) in [
+            (parent.clone(), true),
+            (member.clone(), false),
+            (delegated.clone(), true),
+        ] {
+            cache.roles.insert(
+                id.clone(),
+                RoleState {
+                    id,
+                    can_login: true,
+                    is_superuser: false,
+                    inherits,
+                    member_of: Vec::new(),
+                    can_administer_membership: Vec::new(),
+                    can_inherit_from: Vec::new(),
+                    can_set_role_to: Vec::new(),
+                },
+            );
+        }
+        let member_state = cache.roles.get_mut(&member).expect("member role exists");
+        member_state.member_of.push(parent.clone());
+        member_state.can_inherit_from.push(parent.clone());
+
+        let mut relation = RelationState::new(
+            table_id.clone(),
+            object_id("", "owner"),
+            0,
+            Some(1),
+            RelationKind::Table,
+            Persistence::Permanent,
+            0,
+        );
+        relation
+            .privileges
+            .grant_with_option(parent, [Privilege::Select].into_iter().collect());
+        cache.insert_baseline(table_id, relation);
+        let mut state = safe_migrate::api::AnalysisState::new(cache);
+
+        let findings = engine
+            .analyze(
+                "ALTER ROLE grant_member INHERIT; \
+                 GRANT SELECT ON legacy_inherit_table TO delegated_user;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict")
+        );
+    }
+
+    #[test]
+    fn inherited_admin_option_authorizes_role_membership_grants() {
+        let engine = setup_engine();
+        let actor = object_id("", "membership_actor");
+        let delegator = object_id("", "membership_delegator");
+        let target = object_id("", "membership_target");
+        let recipient = object_id("", "membership_recipient");
+        let mut cache = DbCache::new();
+        cache.pg_version_num = Some(160_000);
+        cache.metadata.source_role = Some(actor.name.clone());
+        cache.metadata.source_session_role = Some(actor.name.clone());
+        for (id, member_of, can_inherit_from, can_administer_membership) in [
+            (
+                actor.clone(),
+                vec![delegator.clone()],
+                vec![delegator.clone()],
+                Vec::new(),
+            ),
+            (
+                delegator.clone(),
+                Vec::new(),
+                Vec::new(),
+                vec![target.clone()],
+            ),
+            (target.clone(), Vec::new(), Vec::new(), Vec::new()),
+            (recipient.clone(), Vec::new(), Vec::new(), Vec::new()),
+        ] {
+            cache.roles.insert(
+                id.clone(),
+                RoleState {
+                    id,
+                    can_login: true,
+                    is_superuser: false,
+                    inherits: false,
+                    member_of,
+                    can_administer_membership,
+                    can_inherit_from,
+                    can_set_role_to: Vec::new(),
+                },
+            );
+        }
+        let mut state = safe_migrate::api::AnalysisState::new(cache);
+
+        let findings = engine
+            .analyze(
+                "GRANT membership_target TO membership_recipient;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict")
+        );
+        let RoleOverlay::Present(recipient) = state
+            .local
+            .roles
+            .get(&object_id("", "membership_recipient"))
+            .unwrap()
+        else {
+            panic!("recipient role unexpectedly dropped");
+        };
+        assert_eq!(recipient.member_of, vec![target]);
     }
 
     #[test]

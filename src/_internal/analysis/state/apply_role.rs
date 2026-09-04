@@ -324,22 +324,49 @@ impl AnalysisState {
                 }
             }
             ResolvedGrantTarget::Roles(parents) => {
+                if self.pg_version_num.is_some_and(|version| version < 160_000)
+                    && grant
+                        .role_options
+                        .iter()
+                        .any(|option| !matches!(option, RoleMembershipOptionFact::Admin(true)))
+                {
+                    return MutationResult::Conflict {
+                        reason: "per-membership TRUE/FALSE options require PostgreSQL 16+"
+                            .to_string(),
+                    };
+                }
                 let grantor = self.grantor_identity(grant.granted_by.as_ref());
                 if let Some(grantor) = grantor.as_ref() {
                     if self.local.roles_known {
-                        let can_administer = self.present_role(&grantor.name).is_some_and(|role| {
-                            role.is_superuser
-                                || parents
-                                    .iter()
-                                    .all(|parent| role.can_administer_membership.contains(parent))
-                        });
-                        if !can_administer {
-                            return MutationResult::Conflict {
-                                reason: format!(
-                                    "role '{}' lacks ADMIN OPTION for the granted membership",
-                                    grantor.name
-                                ),
-                            };
+                        let can_administer = if grant.granted_by.is_some() {
+                            self.present_role(&grantor.name)
+                                .is_some_and(|role| {
+                                    role.is_superuser
+                                        || parents.iter().all(|parent| {
+                                            role.can_administer_membership.contains(parent)
+                                        })
+                                })
+                                .then_some(true)
+                        } else {
+                            parents.iter().try_fold(true, |allowed, parent| {
+                                self.has_admin_privileges_on_role(grantor, parent)
+                                    .map(|has_admin| allowed && has_admin)
+                            })
+                        };
+                        match can_administer {
+                            Some(true) => {}
+                            Some(false) => {
+                                return MutationResult::Conflict {
+                                    reason: format!(
+                                        "role '{}' lacks ADMIN OPTION for the granted membership",
+                                        grantor.name
+                                    ),
+                                };
+                            }
+                            None => self.taint(
+                                EvidenceCode::CatalogCoverageIncomplete,
+                                EvidenceScope::Chain,
+                            ),
                         }
                     } else {
                         self.taint(
@@ -478,8 +505,16 @@ impl AnalysisState {
                                 .retain(|target| target != parent);
                         }
 
+                        // PostgreSQL 15 and earlier record no per-membership
+                        // inheritance option: every edge exists and the role's
+                        // current INHERIT attribute controls traversal. From
+                        // PostgreSQL 16 onward the option belongs to the edge.
                         let inherit_opt =
-                            explicit_inherit.or_else(|| is_new.then_some(role.inherits));
+                            if self.pg_version_num.is_some_and(|version| version < 160_000) {
+                                is_new.then_some(true)
+                            } else {
+                                explicit_inherit.or_else(|| is_new.then_some(role.inherits))
+                            };
                         if inherit_opt == Some(true) {
                             if !role.can_inherit_from.contains(parent) {
                                 role.can_inherit_from.push(parent.clone());
@@ -656,6 +691,18 @@ impl AnalysisState {
                 }
             }
             ResolvedGrantTarget::Roles(parents) => {
+                if self.pg_version_num.is_some_and(|version| version < 160_000)
+                    && matches!(
+                        revoke.role_option,
+                        Some(RoleMembershipOptionFact::Inherit(_))
+                            | Some(RoleMembershipOptionFact::Set(_))
+                    )
+                {
+                    return MutationResult::Conflict {
+                        reason: "per-membership TRUE/FALSE options require PostgreSQL 16+"
+                            .to_string(),
+                    };
+                }
                 if revoke.cascade && !self.local.role_membership_grantors_complete {
                     self.taint(
                         EvidenceCode::CatalogCoverageIncomplete,
@@ -664,19 +711,35 @@ impl AnalysisState {
                 }
                 if let Some(grantor) = self.grantor_identity(revoke.granted_by.as_ref()) {
                     if self.local.roles_known {
-                        let can_administer = self.present_role(&grantor.name).is_some_and(|role| {
-                            role.is_superuser
-                                || parents
-                                    .iter()
-                                    .all(|parent| role.can_administer_membership.contains(parent))
-                        });
-                        if !can_administer {
-                            return MutationResult::Conflict {
-                                reason: format!(
-                                    "role '{}' lacks ADMIN OPTION for the revoked membership",
-                                    grantor.name
-                                ),
-                            };
+                        let can_administer = if revoke.granted_by.is_some() {
+                            self.present_role(&grantor.name)
+                                .is_some_and(|role| {
+                                    role.is_superuser
+                                        || parents.iter().all(|parent| {
+                                            role.can_administer_membership.contains(parent)
+                                        })
+                                })
+                                .then_some(true)
+                        } else {
+                            parents.iter().try_fold(true, |allowed, parent| {
+                                self.has_admin_privileges_on_role(&grantor, parent)
+                                    .map(|has_admin| allowed && has_admin)
+                            })
+                        };
+                        match can_administer {
+                            Some(true) => {}
+                            Some(false) => {
+                                return MutationResult::Conflict {
+                                    reason: format!(
+                                        "role '{}' lacks ADMIN OPTION for the revoked membership",
+                                        grantor.name
+                                    ),
+                                };
+                            }
+                            None => self.taint(
+                                EvidenceCode::CatalogCoverageIncomplete,
+                                EvidenceScope::Chain,
+                            ),
                         }
                     } else {
                         self.taint(

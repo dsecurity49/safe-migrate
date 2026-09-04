@@ -2239,12 +2239,12 @@ impl AnalysisState {
         Some(false)
     }
 
-    /// Resolve a direct or inherited relation privilege for a role.  ACL
-    /// rows are direct grants; PostgreSQL only exposes them through a role's
-    /// membership edges when the role has INHERIT and that edge carries the
-    /// INHERIT option.  Unknown role catalogs deliberately return `None` so
-    /// callers cannot turn an incomplete cache into an exact authorization
-    /// decision.
+    /// Resolve a direct or inherited relation privilege for a role. ACL rows
+    /// are direct grants. PostgreSQL 15 and earlier gate every membership
+    /// traversal on the member role's `INHERIT` attribute; PostgreSQL 16+
+    /// instead gates it on each membership's `INHERIT` option. Unknown role
+    /// catalogs or server versions deliberately return `None` rather than
+    /// turning incomplete authorization evidence into an exact decision.
     fn effective_relation_privilege(
         &self,
         relation: &crate::_internal::model::relation::RelationState,
@@ -2273,11 +2273,48 @@ impl AnalysisState {
                 return Some(true);
             }
             let role_state = self.present_role(&candidate.name)?;
-            if !role_state.inherits && candidate == *role {
+            match self.pg_version_num {
+                Some(version) if version >= 160_000 => {
+                    pending.extend(role_state.can_inherit_from.iter().cloned());
+                }
+                Some(_) if role_state.inherits => {
+                    pending.extend(role_state.can_inherit_from.iter().cloned());
+                }
+                Some(_) => {}
+                None => return None,
+            }
+        }
+        Some(false)
+    }
+
+    /// Determine whether a role can administer a target role through its
+    /// effective privilege path. PostgreSQL uses this check for role
+    /// membership GRANT and REVOKE authorization.
+    fn has_admin_privileges_on_role(&self, member: &ObjectId, target: &ObjectId) -> Option<bool> {
+        if !self.local.roles_known {
+            return None;
+        }
+        let mut pending = vec![member.clone()];
+        let mut visited = HashSet::new();
+        while let Some(candidate) = pending.pop() {
+            if !visited.insert(candidate.clone()) {
                 continue;
             }
-            if role_state.inherits {
-                pending.extend(role_state.can_inherit_from.iter().cloned());
+            let role = self.present_role(&candidate.name)?;
+            if (candidate == *member && role.is_superuser)
+                || role.can_administer_membership.contains(target)
+            {
+                return Some(true);
+            }
+            match self.pg_version_num {
+                Some(version) if version >= 160_000 => {
+                    pending.extend(role.can_inherit_from.iter().cloned());
+                }
+                Some(_) if role.inherits => {
+                    pending.extend(role.can_inherit_from.iter().cloned());
+                }
+                Some(_) => {}
+                None => return None,
             }
         }
         Some(false)
