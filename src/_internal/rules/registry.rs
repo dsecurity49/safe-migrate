@@ -314,7 +314,9 @@ pub fn find_primary_rule(id: &str) -> Option<&'static RuleDescriptor> {
     PRIMARY_RULES.iter().find(|rule| rule.id == id)
 }
 
-pub fn validate_rule_configuration(config: &crate::_internal::engine::config::Config) -> Result<(), String> {
+pub fn validate_rule_configuration(
+    config: &crate::_internal::engine::config::Config,
+) -> Result<(), String> {
     if config.tier1_threshold_rows < config.tier2_threshold_rows {
         return Err(format!(
             "tier1_threshold_rows ({}) must be greater than or equal to tier2_threshold_rows ({})",

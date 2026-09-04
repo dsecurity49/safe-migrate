@@ -20,8 +20,11 @@ impl AnalysisState {
             RelationLookup::Present
         } else if matches!(self.local.relations.get(id), Some(RelationOverlay::Dropped)) {
             RelationLookup::Tombstone
-        } else if self.baseline_covers_family_object(id, crate::_internal::db::cache::CatalogFamily::Relations)
-            || self.baseline_covers_family_object(id, crate::_internal::db::cache::CatalogFamily::Indexes)
+        } else if self.baseline_covers_family_object(
+            id,
+            crate::_internal::db::cache::CatalogFamily::Relations,
+        ) || self
+            .baseline_covers_family_object(id, crate::_internal::db::cache::CatalogFamily::Indexes)
         {
             RelationLookup::AuthoritativelyAbsent
         } else {
@@ -135,7 +138,10 @@ impl AnalysisState {
         // dependency was loaded. Keep a scoped baseline DROP TABLE
         // conservative until that object-class coverage is explicit.
         if present_targets.iter().any(|id| {
-            self.baseline_scoped_family_object(id, crate::_internal::db::cache::CatalogFamily::Relations)
+            self.baseline_scoped_family_object(
+                id,
+                crate::_internal::db::cache::CatalogFamily::Relations,
+            )
         }) {
             self.taint(
                 EvidenceCode::CatalogCoverageIncomplete,
@@ -167,7 +173,8 @@ impl AnalysisState {
                     .iter()
                     .any(|constraint| self.baseline_foreign_keys.contains(constraint));
             if closure_touches_baseline
-                && !self.baseline_has_coverage(crate::_internal::db::cache::CatalogFamily::Dependencies)
+                && !self
+                    .baseline_has_coverage(crate::_internal::db::cache::CatalogFamily::Dependencies)
             {
                 self.taint(
                     EvidenceCode::CatalogCoverageIncomplete,
@@ -366,7 +373,8 @@ impl AnalysisState {
             .publications
             .iter()
             .filter_map(|(name, overlay)| {
-                let crate::_internal::model::replication::PublicationOverlay::Present(publication) = overlay
+                let crate::_internal::model::replication::PublicationOverlay::Present(publication) =
+                    overlay
                 else {
                     return None;
                 };
@@ -378,8 +386,10 @@ impl AnalysisState {
                 let retained = objects
                     .iter()
                     .filter(|object| {
-                        let crate::_internal::analysis::facts::PublicationObjectFact::Table { name, .. } =
-                            object
+                        let crate::_internal::analysis::facts::PublicationObjectFact::Table {
+                            name,
+                            ..
+                        } = object
                         else {
                             return true;
                         };
@@ -392,8 +402,9 @@ impl AnalysisState {
             .collect();
         for (publication_name, retained) in publication_updates {
             self.snapshot_publication(&publication_name);
-            if let Some(crate::_internal::model::replication::PublicationOverlay::Present(publication)) =
-                self.local.publications.get_mut(&publication_name)
+            if let Some(crate::_internal::model::replication::PublicationOverlay::Present(
+                publication,
+            )) = self.local.publications.get_mut(&publication_name)
                 && let crate::_internal::analysis::facts::PublicationScope::Explicit(objects) =
                     &mut publication.scope
             {
@@ -407,6 +418,108 @@ impl AnalysisState {
         });
 
         MutationResult::Applied
+    }
+
+    /// PostgreSQL records every NOT NULL column (whether declared inline,
+    /// introduced by a PRIMARY KEY, or set later) as a `pg_constraint` row of
+    /// `contype = 'n'` on PG18+. The normalized catalog represents it as a
+    /// `ConstraintKind::NotNull` entry with its single column on a
+    /// `ConstraintOnRelation` edge, mirroring the live sync so the differential
+    /// harness and destructive-transition dependency checks agree with
+    /// PostgreSQL.
+    fn register_not_null_constraint(&mut self, table: &ObjectId, column: &str) {
+        if self.not_null_constraint_for_column(table, column).is_some() {
+            return;
+        }
+        let name = self.next_generated_constraint_name_avoiding(
+            table,
+            &table.name,
+            Some(column),
+            "not_null",
+            &HashSet::new(),
+        );
+        self.snapshot_constraint(table, &name);
+        self.local.constraints.insert(
+            (table.clone(), name.clone()),
+            ConstraintState {
+                table_id: table.clone(),
+                name: name.clone(),
+                kind: ConstraintKind::NotNull,
+                validated: true,
+                backing_index: None,
+            },
+        );
+        self.snapshot_graph();
+        self.local.graph.add_edge(DependencyEdge::new(
+            table.clone(),
+            table.clone(),
+            DependencyKind::ConstraintOnRelation {
+                constraint_name: name,
+                columns: vec![column.to_string()],
+                is_primary: false,
+            },
+        ));
+    }
+
+    fn drop_not_null_constraint(&mut self, table: &ObjectId, column: &str) {
+        let Some((table_id, name)) = self.not_null_constraint_for_column(table, column) else {
+            return;
+        };
+        self.snapshot_constraint(&table_id, &name);
+        self.local
+            .constraints
+            .remove(&(table_id.clone(), name.clone()));
+        self.snapshot_graph();
+        let resolution_graph = self.local.graph.clone();
+        let column_name = column.to_string();
+        self.local.graph.retain_edges(|edge| {
+            !matches!(
+                &edge.kind,
+                DependencyKind::ConstraintOnRelation {
+                    constraint_name,
+                    columns,
+                    is_primary: false,
+                    ..
+                } if resolution_graph.resolve_rename(&edge.dependent) == &table_id
+                    && constraint_name == &name
+                    && columns.len() == 1
+                    && columns[0] == column_name
+            )
+        });
+    }
+
+    /// Resolve the `ConstraintKind::NotNull` constraint (if any) that guards a
+    /// single column on `table`, returning its identity. Not-null constraints
+    /// carry exactly one column on a non-primary `ConstraintOnRelation` edge.
+    fn not_null_constraint_for_column(
+        &self,
+        table: &ObjectId,
+        column: &str,
+    ) -> Option<(ObjectId, String)> {
+        let resolution_graph = self.local.graph.clone();
+        self.local
+            .graph
+            .edges()
+            .iter()
+            .find_map(|edge| {
+                let dependent = resolution_graph.resolve_rename(&edge.dependent);
+                if dependent != table {
+                    return None;
+                }
+                if let DependencyKind::ConstraintOnRelation {
+                    constraint_name,
+                    columns,
+                    is_primary: false,
+                    ..
+                } = &edge.kind
+                    && columns.len() == 1
+                    && columns[0] == column
+                {
+                    Some((dependent.clone(), constraint_name.clone()))
+                } else {
+                    None
+                }
+            })
     }
 
     pub(super) fn apply_create_table(&mut self, create: &CreateTable) -> MutationResult {
@@ -787,8 +900,12 @@ impl AnalysisState {
         let mut implicit_sequences = Vec::new();
         for column in &create.columns {
             let kind = match column.generation {
-                crate::_internal::analysis::facts::ColumnGeneration::Serial => Some(SequenceKind::SerialLike),
-                crate::_internal::analysis::facts::ColumnGeneration::Identity => Some(SequenceKind::Identity),
+                crate::_internal::analysis::facts::ColumnGeneration::Serial => {
+                    Some(SequenceKind::SerialLike)
+                }
+                crate::_internal::analysis::facts::ColumnGeneration::Identity => {
+                    Some(SequenceKind::Identity)
+                }
                 crate::_internal::analysis::facts::ColumnGeneration::Ordinary => None,
             };
             if let Some(kind) = kind {
@@ -950,9 +1067,15 @@ impl AnalysisState {
         let generation = self.local.generation_counter;
 
         let resolved_persistence = match create.persistence {
-            PersistenceMutation::Permanent => crate::_internal::model::relation::Persistence::Permanent,
-            PersistenceMutation::Temporary => crate::_internal::model::relation::Persistence::Temporary,
-            PersistenceMutation::Unlogged => crate::_internal::model::relation::Persistence::Unlogged,
+            PersistenceMutation::Permanent => {
+                crate::_internal::model::relation::Persistence::Permanent
+            }
+            PersistenceMutation::Temporary => {
+                crate::_internal::model::relation::Persistence::Temporary
+            }
+            PersistenceMutation::Unlogged => {
+                crate::_internal::model::relation::Persistence::Unlogged
+            }
         };
 
         let mut rel_state = RelationState::new(
@@ -1006,8 +1129,12 @@ impl AnalysisState {
             .flatten()
             .collect();
 
+        let mut not_null_columns = Vec::new();
         for col in &create.columns {
             let is_pk = col.is_primary_key || pk_columns.contains(col.name.as_str());
+            if col.not_null || is_pk {
+                not_null_columns.push(col.name.clone());
+            }
             rel_state.apply_column_action(&ColumnAction::Add {
                 name: col.name.clone(),
                 data_type: col.ty.clone(),
@@ -1044,6 +1171,10 @@ impl AnalysisState {
         self.local
             .relations
             .insert(create.id.clone(), RelationOverlay::Present(rel_state));
+
+        for column in &not_null_columns {
+            self.register_not_null_constraint(&create.id, column);
+        }
 
         for (sequence_id, column_name, kind) in implicit_sequences {
             self.snapshot_sequence(&sequence_id);
@@ -2177,11 +2308,12 @@ impl AnalysisState {
         if let AlterTableActionMutation::DropColumn { name, cascade, .. } = &alter.action {
             let resolved_table = self.local.graph.resolve_rename(&alter.id).clone();
             if self.baseline_relation_is_known(&resolved_table)
-                && (!self.baseline_has_coverage(crate::_internal::db::cache::CatalogFamily::Dependencies)
-                    || self.baseline_scoped_family_object(
-                        &resolved_table,
-                        crate::_internal::db::cache::CatalogFamily::Relations,
-                    ))
+                && (!self.baseline_has_coverage(
+                    crate::_internal::db::cache::CatalogFamily::Dependencies,
+                ) || self.baseline_scoped_family_object(
+                    &resolved_table,
+                    crate::_internal::db::cache::CatalogFamily::Relations,
+                ))
             {
                 self.taint(
                     EvidenceCode::CatalogCoverageIncomplete,
@@ -2243,7 +2375,21 @@ impl AnalysisState {
                         columns,
                         ..
                     } if dependent == &resolved_table => {
-                        if columns.is_empty() {
+                        // A NOT NULL constraint is dropped implicitly with its
+                        // column in PostgreSQL; it is not a dependent object
+                        // that requires CASCADE on DROP COLUMN. The execution
+                        // path removes the constraint state along with the
+                        // column, so it must not gate or conflict here.
+                        let is_not_null = self
+                            .local
+                            .constraints
+                            .get(&(dependent.clone(), constraint_name.clone()))
+                            .is_some_and(|constraint| {
+                                matches!(constraint.kind, ConstraintKind::NotNull)
+                            });
+                        if is_not_null {
+                            // Auto-dropped with the column; nothing to gate on.
+                        } else if columns.is_empty() {
                             unknown_dependency = true;
                         } else if columns.iter().any(|column| column == name) {
                             known_dependency = true;
@@ -2501,6 +2647,11 @@ impl AnalysisState {
             AlterTableActionMutation::SetType { ty, .. } => self.resolve_type_reference(ty),
             _ => None,
         };
+        // Not-null constraint state lives in `self.local.constraints` and the
+        // graph, not the relation overlay. Collect the transitions applied to
+        // `rel` here and replay them once the `rel` borrow (below) is released
+        // so the `&mut self` calls do not contend with the overlay borrow.
+        let mut deferred_not_null: Vec<(String, bool)> = Vec::new();
         let rel_overlay = self.local.relations.get_mut(&alter.id);
         #[allow(clippy::collapsible_if)]
         if let Some(RelationOverlay::Present(rel)) = rel_overlay {
@@ -2534,6 +2685,9 @@ impl AnalysisState {
                         not_null: *not_null,
                         default: default.clone(),
                     });
+                    if *not_null {
+                        deferred_not_null.push((name.clone(), true));
+                    }
                     if let Some(column) = rel.columns.iter_mut().find(|column| column.name == *name)
                     {
                         column.type_id = action_type_id.clone();
@@ -2598,11 +2752,13 @@ impl AnalysisState {
                     rel.apply_column_action(&ColumnAction::SetNotNull {
                         name: column.clone(),
                     });
+                    deferred_not_null.push((column.clone(), true));
                 }
                 AlterTableActionMutation::DropNotNull { column } => {
                     rel.apply_column_action(&ColumnAction::DropNotNull {
                         name: column.clone(),
                     });
+                    deferred_not_null.push((column.clone(), false));
                 }
                 AlterTableActionMutation::SetType { column, ty, .. } => {
                     rel.apply_column_action(&ColumnAction::SetType {
@@ -2677,13 +2833,42 @@ impl AnalysisState {
                     if let Some(ref c) = removed_constraint
                         && c.kind == crate::_internal::model::constraint::ConstraintKind::NotNull
                     {
-                        self.snapshot_relation(&alter.id);
-                        #[allow(clippy::collapsible_if)]
-                        if let Some(RelationOverlay::Present(rel)) =
-                            self.local.relations.get_mut(&alter.id)
-                        {
-                            if let Some(col) = rel.columns.iter_mut().find(|c| c.name == *name) {
-                                col.is_nullable = true;
+                        // A not-null constraint guards exactly one column; PG18
+                        // allows it to be dropped by name like any other
+                        // constraint, which releases the column's nullability.
+                        let resolution_graph = self.local.graph.clone();
+                        let guarded_column: Option<String> = self
+                            .local
+                            .graph
+                            .edges()
+                            .iter()
+                            .find_map(|edge| {
+                                if resolution_graph.resolve_rename(&edge.dependent) != &alter.id {
+                                    return None;
+                                }
+                                if let DependencyKind::ConstraintOnRelation {
+                                    constraint_name,
+                                    columns,
+                                    is_primary: false,
+                                    ..
+                                } = &edge.kind
+                                    && constraint_name == name
+                                    && columns.len() == 1
+                                {
+                                    Some(columns[0].clone())
+                                } else {
+                                    None
+                                }
+                            });
+                        if let Some(column) = guarded_column {
+                            self.snapshot_relation(&alter.id);
+                            if let Some(RelationOverlay::Present(rel)) =
+                                self.local.relations.get_mut(&alter.id)
+                            {
+                                if let Some(col) = rel.columns.iter_mut().find(|c| c.name == column)
+                                {
+                                    col.is_nullable = true;
+                                }
                             }
                         }
                     }
@@ -2917,6 +3102,9 @@ impl AnalysisState {
                                 is_primary: true,
                             },
                         ));
+                        for column in columns.iter() {
+                            self.register_not_null_constraint(&alter.id, column);
+                        }
                     }
                 }
                 AlterTableActionMutation::AddExcludeConstraint {
@@ -3010,6 +3198,13 @@ impl AnalysisState {
                 _ => {}
             }
         }
+        for (column, register) in deferred_not_null {
+            if register {
+                self.register_not_null_constraint(&alter.id, &column);
+            } else {
+                self.drop_not_null_constraint(&alter.id, &column);
+            }
+        }
         if let AlterTableActionMutation::SetDefault { column, default } = &alter.action {
             self.snapshot_graph_full();
             self.local.graph.retain_edges(|edge| {
@@ -3092,16 +3287,19 @@ impl AnalysisState {
                 .collect();
             for (publication_name, object_indexes) in publication_updates {
                 self.snapshot_publication(&publication_name);
-                if let Some(crate::_internal::model::replication::PublicationOverlay::Present(publication)) =
-                    self.local.publications.get_mut(&publication_name)
+                if let Some(crate::_internal::model::replication::PublicationOverlay::Present(
+                    publication,
+                )) = self.local.publications.get_mut(&publication_name)
                     && let crate::_internal::analysis::facts::PublicationScope::Explicit(objects) =
                         &mut publication.scope
                 {
                     for index in object_indexes {
-                        if let Some(crate::_internal::analysis::facts::PublicationObjectFact::Table {
-                            columns: Some(columns),
-                            ..
-                        }) = objects.get_mut(index)
+                        if let Some(
+                            crate::_internal::analysis::facts::PublicationObjectFact::Table {
+                                columns: Some(columns),
+                                ..
+                            },
+                        ) = objects.get_mut(index)
                         {
                             for column in columns {
                                 if column == from {
@@ -3214,7 +3412,8 @@ impl AnalysisState {
             });
         }
         match &alter.action {
-            AlterTableActionMutation::DropColumn { .. } => {
+            AlterTableActionMutation::DropColumn { name, .. } => {
+                self.drop_not_null_constraint(&alter.id, name);
                 for sequence_id in owned_sequences_for_column {
                     self.snapshot_sequence(&sequence_id);
                     self.local
@@ -3421,7 +3620,8 @@ impl AnalysisState {
             .publications
             .iter()
             .filter_map(|(publication_name, overlay)| {
-                let crate::_internal::model::replication::PublicationOverlay::Present(publication) = overlay
+                let crate::_internal::model::replication::PublicationOverlay::Present(publication) =
+                    overlay
                 else {
                     return None;
                 };
@@ -3434,8 +3634,10 @@ impl AnalysisState {
                     .iter()
                     .enumerate()
                     .filter_map(|(index, object)| {
-                        let crate::_internal::analysis::facts::PublicationObjectFact::Table { name, .. } =
-                            object
+                        let crate::_internal::analysis::facts::PublicationObjectFact::Table {
+                            name,
+                            ..
+                        } = object
                         else {
                             return None;
                         };
@@ -3514,17 +3716,17 @@ impl AnalysisState {
                 DependencyKind::RenameTo,
             ));
         }
-        let triggers_to_move: Vec<(ObjectId, crate::_internal::model::trigger::TriggerState)> = self
-            .local
-            .triggers
-            .iter()
-            .filter_map(|(id, overlay)| match overlay {
-                TriggerOverlay::Present(trigger) if trigger.table_id == rename.old_id => {
-                    Some((id.clone(), trigger.clone()))
-                }
-                _ => None,
-            })
-            .collect();
+        let triggers_to_move: Vec<(ObjectId, crate::_internal::model::trigger::TriggerState)> =
+            self.local
+                .triggers
+                .iter()
+                .filter_map(|(id, overlay)| match overlay {
+                    TriggerOverlay::Present(trigger) if trigger.table_id == rename.old_id => {
+                        Some((id.clone(), trigger.clone()))
+                    }
+                    _ => None,
+                })
+                .collect();
         for (old_trigger_id, mut trigger) in triggers_to_move {
             let new_trigger_id = Self::trigger_key(&rename.new_id, &trigger.name);
             self.local.triggers.remove(&old_trigger_id);
@@ -3563,14 +3765,17 @@ impl AnalysisState {
 
         for (publication_name, object_indexes) in publication_scope_updates {
             self.snapshot_publication(&publication_name);
-            if let Some(crate::_internal::model::replication::PublicationOverlay::Present(publication)) =
-                self.local.publications.get_mut(&publication_name)
+            if let Some(crate::_internal::model::replication::PublicationOverlay::Present(
+                publication,
+            )) = self.local.publications.get_mut(&publication_name)
                 && let crate::_internal::analysis::facts::PublicationScope::Explicit(objects) =
                     &mut publication.scope
             {
                 for index in object_indexes {
-                    let Some(crate::_internal::analysis::facts::PublicationObjectFact::Table { name, .. }) =
-                        objects.get_mut(index)
+                    let Some(crate::_internal::analysis::facts::PublicationObjectFact::Table {
+                        name,
+                        ..
+                    }) = objects.get_mut(index)
                     else {
                         continue;
                     };

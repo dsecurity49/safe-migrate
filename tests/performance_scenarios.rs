@@ -48,7 +48,9 @@ mod performance_scenarios {
     use super::{ALLOCATED_BYTES, ALLOCATION_COUNT};
     use crate::common::{object_id, setup_engine, setup_state};
     use safe_migrate::_internal::db::cache::{DbCache, DbCacheVersioned};
-    use safe_migrate::_internal::db::cache_file::{CACHE_KEY_ENV, protect_cache_bytes, unprotect_cache_bytes};
+    use safe_migrate::_internal::db::cache_file::{
+        CACHE_KEY_ENV, protect_cache_bytes, unprotect_cache_bytes,
+    };
     use safe_migrate::_internal::model::relation::{Persistence, RelationKind, RelationState};
     use std::io::Cursor;
     use std::sync::atomic::Ordering;
@@ -165,7 +167,8 @@ mod performance_scenarios {
         let relation = state
             .get_relation(&object_id("public", "perf_baseline_49"))
             .expect("last baseline relation should remain present");
-        let safe_migrate::_internal::model::relation::RelationOverlay::Present(relation) = relation else {
+        let safe_migrate::_internal::model::relation::RelationOverlay::Present(relation) = relation
+        else {
             panic!("last baseline relation was dropped");
         };
         assert!(relation.has_column("measured_value"));
@@ -306,7 +309,9 @@ mod performance_scenarios {
     #[test]
     #[ignore = "manual graph-index scenario; run alone with --ignored --nocapture"]
     fn large_dependency_graph_lookup_index() {
-        use safe_migrate::_internal::analysis::graph::{DependencyEdge, DependencyGraph, DependencyKind};
+        use safe_migrate::_internal::analysis::graph::{
+            DependencyEdge, DependencyGraph, DependencyKind,
+        };
 
         const EDGES: usize = 10_000;
         const TARGETS: usize = 100;
@@ -377,9 +382,12 @@ mod performance_scenarios {
         let findings = engine
             .analyze_with_locations("performance.sql".to_string(), sql, &mut state)
             .expect("report scenario should analyze");
-        let json =
-            safe_migrate::api::Reporter::json_report_with_locations(&findings, &state.local.confidence);
-        let markdown = safe_migrate::api::Reporter::markdown_report(&findings, &state.local.confidence);
+        let json = safe_migrate::api::Reporter::json_report_with_locations(
+            &findings,
+            &state.local.confidence,
+        );
+        let markdown =
+            safe_migrate::api::Reporter::markdown_report(&findings, &state.local.confidence);
         let elapsed = started.elapsed();
 
         assert_eq!(findings.len(), REPORT_FINDINGS);
@@ -466,7 +474,8 @@ mod performance_scenarios {
             .relations
             .get(&object_id("public", "perf_multi_action"))
             .expect("baseline relation should remain modeled");
-        let safe_migrate::_internal::model::relation::RelationOverlay::Present(relation) = relation else {
+        let safe_migrate::_internal::model::relation::RelationOverlay::Present(relation) = relation
+        else {
             panic!("failed transaction must not drop the baseline relation");
         };
         assert!(

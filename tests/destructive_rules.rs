@@ -115,12 +115,14 @@ mod destructive_rule_tests {
             Persistence::Permanent,
             0,
         );
-        rel.apply_column_action(&safe_migrate::_internal::model::relation::ColumnAction::Add {
-            name: "val".to_string(),
-            data_type: Some("varchar".to_string()),
-            not_null: false,
-            default: None,
-        });
+        rel.apply_column_action(
+            &safe_migrate::_internal::model::relation::ColumnAction::Add {
+                name: "val".to_string(),
+                data_type: Some("varchar".to_string()),
+                not_null: false,
+                default: None,
+            },
+        );
         cache.insert_baseline(tid, rel);
         let mut state = AnalysisState::new(cache);
 

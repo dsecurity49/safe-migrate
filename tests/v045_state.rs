@@ -1,7 +1,6 @@
 mod common;
 
 use common::{object_id, setup_engine};
-use safe_migrate::api::AnalysisState;
 use safe_migrate::_internal::analysis::facts::{PublicationObjectFact, PublicationScope};
 use safe_migrate::_internal::analysis::graph::DependencyKind;
 use safe_migrate::_internal::db::cache::{DbCache, IndexCache};
@@ -10,6 +9,7 @@ use safe_migrate::_internal::model::role::RoleState;
 use safe_migrate::_internal::model::schema::{SchemaOverlay, SchemaState};
 use safe_migrate::_internal::model::sequence::{SequenceKind, SequenceOverlay, SequenceState};
 use safe_migrate::_internal::model::types::{TypeKind, TypeState};
+use safe_migrate::api::AnalysisState;
 
 fn cache_with_public_schema() -> DbCache {
     let mut cache = DbCache::new();

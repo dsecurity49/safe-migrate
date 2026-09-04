@@ -560,20 +560,24 @@ mod architectural_gap_tests {
             Persistence::Permanent,
             0,
         );
-        table.columns.push(safe_migrate::_internal::model::column::Column {
-            name: "id".to_string(),
-            data_type: Some("integer".to_string()),
-            type_id: None,
-            is_nullable: true,
-            default: None,
-            avg_width: None,
-            default_expr_text: None,
-            type_modifier: Some(-1),
-        });
+        table
+            .columns
+            .push(safe_migrate::_internal::model::column::Column {
+                name: "id".to_string(),
+                data_type: Some("integer".to_string()),
+                type_id: None,
+                is_nullable: true,
+                default: None,
+                avg_width: None,
+                default_expr_text: None,
+                type_modifier: Some(-1),
+            });
         table.last_analyze = Some("2026-09-01 00:00:00+00".to_string());
         cache.insert_baseline(table_id.clone(), table);
-        let mut state =
-            safe_migrate::_internal::analysis::state::AnalysisState::with_baseline(cache.clone(), true);
+        let mut state = safe_migrate::_internal::analysis::state::AnalysisState::with_baseline(
+            cache.clone(),
+            true,
+        );
         let mut storage_state =
             safe_migrate::_internal::analysis::state::AnalysisState::with_baseline(cache, true);
 

@@ -213,16 +213,18 @@ mod tests {
         cache.insert_baseline(id.clone(), rel);
 
         // Add foreign key
-        cache.foreign_keys.push(crate::_internal::db::cache::ForeignKeyCache {
-            constraint_name: "fk_test".into(),
-            from_table: ObjectId::new("public", "child"),
-            to_table: ObjectId::new("public", "parent"),
-            from_columns: vec!["parent_id".into()],
-            to_columns: vec!["id".into()],
-            pk_fk_equality_operators: vec!["=".into()],
-            pk_pk_equality_operators: vec!["=".into()],
-            fk_fk_equality_operators: vec!["=".into()],
-        });
+        cache
+            .foreign_keys
+            .push(crate::_internal::db::cache::ForeignKeyCache {
+                constraint_name: "fk_test".into(),
+                from_table: ObjectId::new("public", "child"),
+                to_table: ObjectId::new("public", "parent"),
+                from_columns: vec!["parent_id".into()],
+                to_columns: vec!["id".into()],
+                pk_fk_equality_operators: vec!["=".into()],
+                pk_pk_equality_operators: vec!["=".into()],
+                fk_fk_equality_operators: vec!["=".into()],
+            });
 
         // Add index
         cache.indexes.push(crate::_internal::db::cache::IndexCache {
@@ -262,15 +264,19 @@ mod tests {
                 scope: crate::_internal::analysis::facts::PublicationScope::Explicit(vec![
                     crate::_internal::analysis::facts::PublicationObjectFact::Table {
                         name: crate::_internal::ast::identifiers::QualifiedName::new(
-                            Some(crate::_internal::ast::identifiers::Ident::new("public", true)),
+                            Some(crate::_internal::ast::identifiers::Ident::new(
+                                "public", true,
+                            )),
                             crate::_internal::ast::identifiers::Ident::new("test_table", true),
                         ),
                         only: true,
                         include_partitions: false,
                         columns: Some(vec!["id".into()]),
-                        row_filter: Some(crate::_internal::analysis::facts::PublicationRowFilter::CatalogSql(
-                            "id > 0".into(),
-                        )),
+                        row_filter: Some(
+                            crate::_internal::analysis::facts::PublicationRowFilter::CatalogSql(
+                                "id > 0".into(),
+                            ),
+                        ),
                     },
                 ]),
                 params: vec![crate::_internal::analysis::facts::AttributeFact {
@@ -506,8 +512,10 @@ mod tests {
         let config = bincode::config::standard().with_variable_int_encoding();
         let bytes = bincode::serde::encode_to_vec(legacy, config).unwrap();
         assert!(
-            bincode::serde::decode_from_slice::<crate::_internal::model::column::Column, _>(&bytes, config)
-                .is_err(),
+            bincode::serde::decode_from_slice::<crate::_internal::model::column::Column, _>(
+                &bytes, config
+            )
+            .is_err(),
             "cache payloads without default/type evidence must require a fresh V7 sync"
         );
     }

@@ -3,7 +3,9 @@ use crate::_internal::analysis::evidence::{EvidenceCode, EvidenceScope};
 use crate::_internal::analysis::facts::{
     ResetSettingTarget, RoleFact, SearchPathTarget, TimeoutSetting, TimeoutSettingValue,
 };
-use crate::_internal::analysis::mutations::{OpaqueMutation, SearchPathChange, TimeoutSettingChange};
+use crate::_internal::analysis::mutations::{
+    OpaqueMutation, SearchPathChange, TimeoutSettingChange,
+};
 
 impl AnalysisState {
     pub(super) fn apply_search_path(&mut self, change: &SearchPathChange) -> MutationResult {

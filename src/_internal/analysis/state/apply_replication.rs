@@ -49,10 +49,11 @@ impl AnalysisState {
                 unreachable!("publication names have a dedicated namespace")
             }
         }
-        if let Err(reason) = self.validate_publication_scope(&p.scope) {
+        let scope = self.normalize_publication_scope(&p.scope);
+        if let Err(reason) = self.validate_publication_scope(&scope) {
             return MutationResult::Conflict { reason };
         }
-        self.taint_inheritance_sensitive_publication_scope(&p.scope);
+        self.taint_inheritance_sensitive_publication_scope(&scope);
         self.snapshot_publication(&p.name);
         self.snapshot_generation_counter();
         self.local.generation_counter += 1;
@@ -68,17 +69,21 @@ impl AnalysisState {
                 crate::_internal::model::replication::PublicationState {
                     name: p.name.clone(),
                     owner,
-                    scope: p.scope.clone(),
-                    params: p.params.clone(),
+                    scope: scope.clone(),
+                    params: self.effective_publication_params(&p.params),
                     generation,
                 },
             ),
         );
 
-        if let crate::_internal::analysis::facts::PublicationScope::Explicit(objects) = &p.scope {
+        if let crate::_internal::analysis::facts::PublicationScope::Explicit(objects) = &scope {
             self.snapshot_graph_full();
             for obj in objects {
-                if let crate::_internal::analysis::facts::PublicationObjectFact::Table { name, .. } = obj {
+                if let crate::_internal::analysis::facts::PublicationObjectFact::Table {
+                    name,
+                    ..
+                } = obj
+                {
                     let table_id = self.resolve_relation_id(name);
                     self.local.graph.add_edge(DependencyEdge::new(
                         table_id,
@@ -91,6 +96,58 @@ impl AnalysisState {
             }
         }
         MutationResult::Applied
+    }
+
+    /// Expand a publication's explicit `WITH (...)` params into the effective
+    /// parameter set PostgreSQL reports in `pg_publication`.  The differential
+    /// harness compares these effective values, so the simulator must model
+    /// the same defaults: `publish` (all four operations by default, kept in
+    /// canonical order), `publish_via_partition_root` (default false), and,
+    /// on PostgreSQL 18+, `publish_generated_columns` (default none).
+    fn effective_publication_params(
+        &self,
+        explicit: &[crate::_internal::analysis::facts::AttributeFact],
+    ) -> Vec<crate::_internal::analysis::facts::AttributeFact> {
+        use crate::_internal::analysis::facts::AttributeFact;
+        let canonical_operations = ["insert", "update", "delete", "truncate"];
+        let publish_value = match explicit.iter().find(|fact| fact.name == "publish") {
+            Some(fact) => canonical_operations
+                .iter()
+                .filter(|operation| {
+                    fact.value
+                        .split(',')
+                        .any(|part| part.trim().eq_ignore_ascii_case(operation))
+                })
+                .copied()
+                .collect::<Vec<_>>()
+                .join(", "),
+            None => canonical_operations.join(", "),
+        };
+        let mut params = vec![
+            AttributeFact {
+                name: "publish".to_string(),
+                value: publish_value,
+            },
+            AttributeFact {
+                name: "publish_via_partition_root".to_string(),
+                value: explicit
+                    .iter()
+                    .find(|fact| fact.name == "publish_via_partition_root")
+                    .map(|fact| fact.value.clone())
+                    .unwrap_or_else(|| "false".to_string()),
+            },
+        ];
+        if self.effective_pg_version_num(0) >= 180_000 {
+            params.push(AttributeFact {
+                name: "publish_generated_columns".to_string(),
+                value: explicit
+                    .iter()
+                    .find(|fact| fact.name == "publish_generated_columns")
+                    .map(|fact| fact.value.clone())
+                    .unwrap_or_else(|| "none".to_string()),
+            });
+        }
+        params
     }
 
     pub(super) fn apply_alter_publication(
@@ -116,7 +173,9 @@ impl AnalysisState {
         // advancing generation state.  In a scoped/incomplete catalog an
         // absent destination is not authoritative, so applying the rename
         // would hide a possible namespace collision.
-        if let crate::_internal::analysis::facts::AlterPublicationActionFact::Rename { to } = &p.action {
+        if let crate::_internal::analysis::facts::AlterPublicationActionFact::Rename { to } =
+            &p.action
+        {
             match self.publication_lookup(to) {
                 PublicationLookup::Present => {
                     return MutationResult::Conflict {
@@ -132,7 +191,8 @@ impl AnalysisState {
                 | PublicationLookup::WrongKind => {}
             }
         }
-        if let crate::_internal::analysis::facts::AlterPublicationActionFact::OwnerChange(role) = &p.action
+        if let crate::_internal::analysis::facts::AlterPublicationActionFact::OwnerChange(role) =
+            &p.action
             && let Some((owner, known)) = self.role_fact_identity(role)
             && known
             && self.local.roles_known
@@ -149,22 +209,24 @@ impl AnalysisState {
         use crate::_internal::analysis::facts::AlterPublicationActionFact;
 
         let current_scope = match self.local.publications.get(&p.name) {
-            Some(crate::_internal::model::replication::PublicationOverlay::Present(publication)) => {
-                publication.scope.clone()
-            }
+            Some(crate::_internal::model::replication::PublicationOverlay::Present(
+                publication,
+            )) => publication.scope.clone(),
             _ => unreachable!("publication existence checked above"),
         };
         let mut replacement_scope = None;
         let mut rename_to = None;
         match &p.action {
             AlterPublicationActionFact::AddObjects(additions) => {
-                let additions_scope =
-                    crate::_internal::analysis::facts::PublicationScope::Explicit(additions.clone());
+                let additions_scope = crate::_internal::analysis::facts::PublicationScope::Explicit(
+                    additions.clone(),
+                );
                 if let Err(reason) = self.validate_publication_scope(&additions_scope) {
                     return MutationResult::Conflict { reason };
                 }
                 self.taint_inheritance_sensitive_publication_scope(&additions_scope);
-                let crate::_internal::analysis::facts::PublicationScope::Explicit(mut objects) = current_scope
+                let crate::_internal::analysis::facts::PublicationScope::Explicit(mut objects) =
+                    current_scope
                 else {
                     return MutationResult::Conflict {
                         reason: format!("publication '{}' already includes all tables", p.name),
@@ -198,9 +260,12 @@ impl AnalysisState {
             }
             AlterPublicationActionFact::DropObjects(removals) => {
                 self.taint_inheritance_sensitive_publication_scope(
-                    &crate::_internal::analysis::facts::PublicationScope::Explicit(removals.clone()),
+                    &crate::_internal::analysis::facts::PublicationScope::Explicit(
+                        removals.clone(),
+                    ),
                 );
-                let crate::_internal::analysis::facts::PublicationScope::Explicit(mut objects) = current_scope
+                let crate::_internal::analysis::facts::PublicationScope::Explicit(mut objects) =
+                    current_scope
                 else {
                     return MutationResult::Conflict {
                         reason: format!("publication '{}' includes all tables", p.name),
@@ -225,15 +290,23 @@ impl AnalysisState {
                     Some(crate::_internal::analysis::facts::PublicationScope::Explicit(objects));
             }
             AlterPublicationActionFact::SetOptions(options) => {
-                if let Some(crate::_internal::model::replication::PublicationOverlay::Present(publication)) =
-                    self.local.publications.get_mut(&p.name)
+                let mut explicit = Vec::new();
+                if let Some(crate::_internal::model::replication::PublicationOverlay::Present(
+                    publication,
+                )) = self.local.publications.get(&p.name)
                 {
-                    for option in options {
-                        publication
-                            .params
-                            .retain(|existing| existing.name != option.name);
-                        publication.params.push(option.clone());
-                    }
+                    explicit = publication.params.clone();
+                }
+                for option in options {
+                    explicit.retain(|existing| existing.name != option.name);
+                    explicit.push(option.clone());
+                }
+                let effective = self.effective_publication_params(&explicit);
+                if let Some(crate::_internal::model::replication::PublicationOverlay::Present(
+                    publication,
+                )) = self.local.publications.get_mut(&p.name)
+                {
+                    publication.params = effective;
                 }
             }
             AlterPublicationActionFact::OwnerChange(role) => {
@@ -245,26 +318,32 @@ impl AnalysisState {
                                 EvidenceScope::Chain,
                             );
                         }
-                        if let Some(crate::_internal::model::replication::PublicationOverlay::Present(
-                            publication,
-                        )) = self.local.publications.get_mut(&p.name)
+                        if let Some(
+                            crate::_internal::model::replication::PublicationOverlay::Present(
+                                publication,
+                            ),
+                        ) = self.local.publications.get_mut(&p.name)
                         {
                             publication.owner = Some(owner);
                         }
                     } else {
                         self.taint(EvidenceCode::UnresolvedReference, EvidenceScope::Chain);
-                        if let Some(crate::_internal::model::replication::PublicationOverlay::Present(
-                            publication,
-                        )) = self.local.publications.get_mut(&p.name)
+                        if let Some(
+                            crate::_internal::model::replication::PublicationOverlay::Present(
+                                publication,
+                            ),
+                        ) = self.local.publications.get_mut(&p.name)
                         {
                             publication.owner = None;
                         }
                     }
                 } else {
                     self.taint(EvidenceCode::UnresolvedReference, EvidenceScope::Chain);
-                    if let Some(crate::_internal::model::replication::PublicationOverlay::Present(
-                        publication,
-                    )) = self.local.publications.get_mut(&p.name)
+                    if let Some(
+                        crate::_internal::model::replication::PublicationOverlay::Present(
+                            publication,
+                        ),
+                    ) = self.local.publications.get_mut(&p.name)
                     {
                         publication.owner = None;
                     }
@@ -276,22 +355,26 @@ impl AnalysisState {
         }
 
         if let Some(scope) = replacement_scope {
-            if let Some(crate::_internal::model::replication::PublicationOverlay::Present(publication)) =
-                self.local.publications.get_mut(&p.name)
+            let scope = self.normalize_publication_scope(&scope);
+            if let Some(crate::_internal::model::replication::PublicationOverlay::Present(
+                publication,
+            )) = self.local.publications.get_mut(&p.name)
             {
                 publication.scope = scope.clone();
             }
             self.replace_publication_edges(&p.name, &scope);
         }
-        if let Some(crate::_internal::model::replication::PublicationOverlay::Present(publication)) =
-            self.local.publications.get_mut(&p.name)
+        if let Some(crate::_internal::model::replication::PublicationOverlay::Present(
+            publication,
+        )) = self.local.publications.get_mut(&p.name)
         {
             publication.generation = new_gen;
         }
         if let Some(to) = rename_to {
             self.snapshot_publication(&to);
-            let Some(crate::_internal::model::replication::PublicationOverlay::Present(mut publication)) =
-                self.local.publications.remove(&p.name)
+            let Some(crate::_internal::model::replication::PublicationOverlay::Present(
+                mut publication,
+            )) = self.local.publications.remove(&p.name)
             else {
                 unreachable!("publication existence checked above");
             };
@@ -503,7 +586,9 @@ impl AnalysisState {
         }
         // As with publications, an unknown destination in an incomplete
         // catalog cannot be treated as free for a namespace rename.
-        if let crate::_internal::analysis::facts::AlterSubscriptionActionFact::Rename { to } = &s.action {
+        if let crate::_internal::analysis::facts::AlterSubscriptionActionFact::Rename { to } =
+            &s.action
+        {
             match self.subscription_lookup(to) {
                 SubscriptionLookup::Present => {
                     return MutationResult::Conflict {
@@ -519,7 +604,8 @@ impl AnalysisState {
                 | SubscriptionLookup::WrongKind => {}
             }
         }
-        if let crate::_internal::analysis::facts::AlterSubscriptionActionFact::OwnerChange(role) = &s.action
+        if let crate::_internal::analysis::facts::AlterSubscriptionActionFact::OwnerChange(role) =
+            &s.action
             && let Some((owner, known)) = self.role_fact_identity(role)
             && known
             && self.local.roles_known
@@ -530,9 +616,9 @@ impl AnalysisState {
             };
         }
         let existing = match self.local.subscriptions.get(&s.name) {
-            Some(crate::_internal::model::replication::SubscriptionOverlay::Present(subscription)) => {
-                subscription
-            }
+            Some(crate::_internal::model::replication::SubscriptionOverlay::Present(
+                subscription,
+            )) => subscription,
             _ => unreachable!("subscription existence checked above"),
         };
         let in_transaction = !self.local.transactions.is_empty();
@@ -604,9 +690,9 @@ impl AnalysisState {
                     }
                 }
             }
-            crate::_internal::analysis::facts::AlterSubscriptionActionFact::RefreshPublication(_)
-                if in_transaction =>
-            {
+            crate::_internal::analysis::facts::AlterSubscriptionActionFact::RefreshPublication(
+                _,
+            ) if in_transaction => {
                 return MutationResult::Conflict {
                     reason: format!(
                         "subscription '{}' cannot refresh publications inside a transaction",
@@ -682,19 +768,23 @@ impl AnalysisState {
         self.snapshot_generation_counter();
         self.local.generation_counter += 1;
         let new_gen = self.local.generation_counter;
-        use crate::_internal::analysis::facts::{AlterSubscriptionActionFact, SubscriptionPublicationMode};
+        use crate::_internal::analysis::facts::{
+            AlterSubscriptionActionFact, SubscriptionPublicationMode,
+        };
         let mut rename_to = None;
         match &s.action {
             AlterSubscriptionActionFact::SetConnection(connection) => {
-                if let Some(crate::_internal::model::replication::SubscriptionOverlay::Present(subscription)) =
-                    self.local.subscriptions.get_mut(&s.name)
+                if let Some(crate::_internal::model::replication::SubscriptionOverlay::Present(
+                    subscription,
+                )) = self.local.subscriptions.get_mut(&s.name)
                 {
                     subscription.connection = connection.clone();
                 }
             }
             AlterSubscriptionActionFact::SetServer(server) => {
-                if let Some(crate::_internal::model::replication::SubscriptionOverlay::Present(subscription)) =
-                    self.local.subscriptions.get_mut(&s.name)
+                if let Some(crate::_internal::model::replication::SubscriptionOverlay::Present(
+                    subscription,
+                )) = self.local.subscriptions.get_mut(&s.name)
                 {
                     subscription.connection =
                         crate::_internal::analysis::facts::ConnectionTarget::Server(server.clone());
@@ -711,8 +801,9 @@ impl AnalysisState {
                 if refreshes {
                     self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
                 }
-                if let Some(crate::_internal::model::replication::SubscriptionOverlay::Present(subscription)) =
-                    self.local.subscriptions.get_mut(&s.name)
+                if let Some(crate::_internal::model::replication::SubscriptionOverlay::Present(
+                    subscription,
+                )) = self.local.subscriptions.get_mut(&s.name)
                 {
                     match mode {
                         SubscriptionPublicationMode::Set => {
@@ -735,15 +826,17 @@ impl AnalysisState {
                 self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
             }
             AlterSubscriptionActionFact::SetEnabled(enabled) => {
-                if let Some(crate::_internal::model::replication::SubscriptionOverlay::Present(subscription)) =
-                    self.local.subscriptions.get_mut(&s.name)
+                if let Some(crate::_internal::model::replication::SubscriptionOverlay::Present(
+                    subscription,
+                )) = self.local.subscriptions.get_mut(&s.name)
                 {
                     subscription.enabled = *enabled;
                 }
             }
             AlterSubscriptionActionFact::SetOptions(options) => {
-                if let Some(crate::_internal::model::replication::SubscriptionOverlay::Present(subscription)) =
-                    self.local.subscriptions.get_mut(&s.name)
+                if let Some(crate::_internal::model::replication::SubscriptionOverlay::Present(
+                    subscription,
+                )) = self.local.subscriptions.get_mut(&s.name)
                 {
                     for option in options {
                         Self::set_subscription_option(subscription, option);
@@ -755,8 +848,9 @@ impl AnalysisState {
                 }
             }
             AlterSubscriptionActionFact::Skip(options) => {
-                if let Some(crate::_internal::model::replication::SubscriptionOverlay::Present(subscription)) =
-                    self.local.subscriptions.get_mut(&s.name)
+                if let Some(crate::_internal::model::replication::SubscriptionOverlay::Present(
+                    subscription,
+                )) = self.local.subscriptions.get_mut(&s.name)
                 {
                     for option in options {
                         let mut normalized = option.clone();
@@ -774,26 +868,32 @@ impl AnalysisState {
                                 EvidenceScope::Chain,
                             );
                         }
-                        if let Some(crate::_internal::model::replication::SubscriptionOverlay::Present(
-                            subscription,
-                        )) = self.local.subscriptions.get_mut(&s.name)
+                        if let Some(
+                            crate::_internal::model::replication::SubscriptionOverlay::Present(
+                                subscription,
+                            ),
+                        ) = self.local.subscriptions.get_mut(&s.name)
                         {
                             subscription.owner = Some(owner);
                         }
                     } else {
                         self.taint(EvidenceCode::UnresolvedReference, EvidenceScope::Chain);
-                        if let Some(crate::_internal::model::replication::SubscriptionOverlay::Present(
-                            subscription,
-                        )) = self.local.subscriptions.get_mut(&s.name)
+                        if let Some(
+                            crate::_internal::model::replication::SubscriptionOverlay::Present(
+                                subscription,
+                            ),
+                        ) = self.local.subscriptions.get_mut(&s.name)
                         {
                             subscription.owner = None;
                         }
                     }
                 } else {
                     self.taint(EvidenceCode::UnresolvedReference, EvidenceScope::Chain);
-                    if let Some(crate::_internal::model::replication::SubscriptionOverlay::Present(
-                        subscription,
-                    )) = self.local.subscriptions.get_mut(&s.name)
+                    if let Some(
+                        crate::_internal::model::replication::SubscriptionOverlay::Present(
+                            subscription,
+                        ),
+                    ) = self.local.subscriptions.get_mut(&s.name)
                     {
                         subscription.owner = None;
                     }
@@ -804,15 +904,17 @@ impl AnalysisState {
             }
         }
 
-        if let Some(crate::_internal::model::replication::SubscriptionOverlay::Present(subscription)) =
-            self.local.subscriptions.get_mut(&s.name)
+        if let Some(crate::_internal::model::replication::SubscriptionOverlay::Present(
+            subscription,
+        )) = self.local.subscriptions.get_mut(&s.name)
         {
             subscription.generation = new_gen;
         }
         if let Some(to) = rename_to {
             self.snapshot_subscription(&to);
-            let Some(crate::_internal::model::replication::SubscriptionOverlay::Present(mut subscription)) =
-                self.local.subscriptions.remove(&s.name)
+            let Some(crate::_internal::model::replication::SubscriptionOverlay::Present(
+                mut subscription,
+            )) = self.local.subscriptions.remove(&s.name)
             else {
                 unreachable!("subscription existence checked above");
             };

@@ -2,7 +2,9 @@ use crate::_internal::analysis::mutations::Mutation;
 use crate::_internal::analysis::state::MutationResult;
 use crate::_internal::model::relation::Persistence;
 use crate::_internal::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
-use crate::_internal::rules::{BASELINE_STATS_DEPENDENCY_CAPABILITIES, Rule, RuleCapability, RuleContext};
+use crate::_internal::rules::{
+    BASELINE_STATS_DEPENDENCY_CAPABILITIES, Rule, RuleCapability, RuleContext,
+};
 
 pub struct ConcurrentIndexRule;
 

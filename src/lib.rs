@@ -10,7 +10,7 @@ pub mod _internal {
     pub mod report;
     pub mod rules;
     pub mod sync;
-    
+
     #[cfg(test)]
     pub mod sync_tests;
     #[cfg(test)]

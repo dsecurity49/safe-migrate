@@ -1041,7 +1041,10 @@ fn finish_analysis(
             println!("{report}");
         }
         OutputMode::Interactive => {
-            safe_migrate::_internal::report::interactive::run_interactive(&violations, &outcome.confidence)?;
+            safe_migrate::_internal::report::interactive::run_interactive(
+                &violations,
+                &outcome.confidence,
+            )?;
         }
     }
 

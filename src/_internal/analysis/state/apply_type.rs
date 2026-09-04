@@ -375,7 +375,10 @@ impl AnalysisState {
             return MutationResult::Skipped;
         }
         if present.iter().any(|id| {
-            self.baseline_scoped_family_object(id, crate::_internal::db::cache::CatalogFamily::Types)
+            self.baseline_scoped_family_object(
+                id,
+                crate::_internal::db::cache::CatalogFamily::Types,
+            )
         }) {
             self.taint(
                 EvidenceCode::CatalogCoverageIncomplete,
@@ -425,7 +428,10 @@ impl AnalysisState {
             return MutationResult::Skipped;
         }
         if present.iter().any(|id| {
-            self.baseline_scoped_family_object(id, crate::_internal::db::cache::CatalogFamily::Types)
+            self.baseline_scoped_family_object(
+                id,
+                crate::_internal::db::cache::CatalogFamily::Types,
+            )
         }) {
             self.taint(
                 EvidenceCode::CatalogCoverageIncomplete,

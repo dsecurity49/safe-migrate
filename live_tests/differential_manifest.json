@@ -136,8 +136,18 @@
         "foreign_keys"
       ],
       "fixture_scopes": {
-        "002_drop_column.sql": ["relations", "columns", "foreign_keys", "view_dependencies"],
-        "006_drop_column_if_exists.sql": ["relations", "columns", "foreign_keys", "view_dependencies"]
+        "002_drop_column.sql": [
+          "relations",
+          "columns",
+          "foreign_keys",
+          "view_dependencies"
+        ],
+        "006_drop_column_if_exists.sql": [
+          "relations",
+          "columns",
+          "foreign_keys",
+          "view_dependencies"
+        ]
       },
       "required_relations": [
         "public.test_table",
@@ -214,9 +224,15 @@
         "relations"
       ],
       "fixture_scopes": {
-        "007_drop_pub_cascade.sql": ["publications"],
-        "safe_006_drop_pub.sql": ["publications"],
-        "safe_011_alter_pub_options.sql": ["publications"]
+        "007_drop_pub_cascade.sql": [
+          "publications"
+        ],
+        "safe_006_drop_pub.sql": [
+          "publications"
+        ],
+        "safe_011_alter_pub_options.sql": [
+          "publications"
+        ]
       },
       "required_relations": [
         "sm_core.myview",
@@ -1743,7 +1759,8 @@
       },
       "fixture_min_pg_version": {
         "safe_022_role_membership_cascade.sql": 160000,
-        "safe_024_logical_replication.sql": 150000
+        "safe_024_logical_replication.sql": 150000,
+        "safe_023_role_options.sql": 160000
       },
       "expected_live_errors": {
         "011_missing_fk_source_column.sql": {
@@ -1899,20 +1916,20 @@
         "safe_015_session_authorization_default.sql": [
           "relations"
         ],
-      "safe_016_transitive_set_role_membership.sql": [
+        "safe_016_transitive_set_role_membership.sql": [
           "relations",
           "roles"
-      ],
-      "safe_022_role_membership_cascade.sql": [
+        ],
+        "safe_022_role_membership_cascade.sql": [
           "roles"
-      ],
-      "safe_023_role_options.sql": [
+        ],
+        "safe_023_role_options.sql": [
           "roles"
-      ],
-      "safe_024_logical_replication.sql": [
+        ],
+        "safe_024_logical_replication.sql": [
           "publications",
           "subscriptions"
-      ],
+        ],
         "safe_017_relation_namespace_resolution.sql": [
           "schemas",
           "relations",

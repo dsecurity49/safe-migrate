@@ -329,7 +329,9 @@ impl AstVisitor {
             ast::CreateSchemaTarget::AuthorizationSchema(aus) => {
                 let role = aus.role()?;
                 let authorization = Self::extract_role_node(&role);
-                let crate::_internal::analysis::facts::RoleFact::Named { name, .. } = &authorization else {
+                let crate::_internal::analysis::facts::RoleFact::Named { name, .. } =
+                    &authorization
+                else {
                     return None;
                 };
                 (Ident::new(name.clone(), true), Some(authorization))
@@ -569,16 +571,15 @@ impl AstVisitor {
                     {
                         let mut not_null = false;
                         let mut default = None;
-                        let mut generation = crate::_internal::analysis::facts::ColumnGeneration::Ordinary;
+                        let mut generation =
+                            crate::_internal::analysis::facts::ColumnGeneration::Ordinary;
                         for c in add.constraints() {
                             match c {
                                 Constraint::NotNullConstraint(_) => not_null = true,
                                 Constraint::PrimaryKeyConstraint(_) => not_null = true,
-                                Constraint::DefaultConstraint(dc) => {
-                                    default = dc
-                                        .expr()
-                                        .map(crate::_internal::analysis::expr_visitor::ExprVisitor::convert)
-                                }
+                                Constraint::DefaultConstraint(dc) => default = dc.expr().map(
+                                    crate::_internal::analysis::expr_visitor::ExprVisitor::convert,
+                                ),
                                 Constraint::GeneratedConstraint(generated)
                                     if matches!(
                                         generated.generated_as(),
@@ -1005,9 +1006,7 @@ impl AstVisitor {
         let unique_constraint_name = unique_constraint_name.flatten();
         let default = col.constraints().find_map(|c| {
             if let ColumnConstraint::DefaultConstraint(dc) = c {
-                Some(crate::_internal::analysis::expr_visitor::ExprVisitor::convert(
-                    dc.expr()?,
-                ))
+                Some(crate::_internal::analysis::expr_visitor::ExprVisitor::convert(dc.expr()?))
             } else {
                 None
             }
@@ -1615,7 +1614,9 @@ impl AstVisitor {
                 let new_owner = Self::extract_role(&ot.role_ref()?);
                 Some(StatementFact::AlterView {
                     name,
-                    action: crate::_internal::analysis::facts::AlterViewAction::OwnerTo { new_owner },
+                    action: crate::_internal::analysis::facts::AlterViewAction::OwnerTo {
+                        new_owner,
+                    },
                 })
             }
             ast::AlterViewAction::SetSchema(ss) => {
@@ -1643,7 +1644,10 @@ impl AstVisitor {
 
                 Some(StatementFact::AlterView {
                     name,
-                    action: crate::_internal::analysis::facts::AlterViewAction::RenameColumn { from, to },
+                    action: crate::_internal::analysis::facts::AlterViewAction::RenameColumn {
+                        from,
+                        to,
+                    },
                 })
             }
             ast::AlterViewAction::SetOptions(_) | ast::AlterViewAction::ResetOptions(_) => None,
@@ -1832,16 +1836,18 @@ impl AstVisitor {
             Some(ast::AlterSequenceAction::OwnerTo(owner)) => owner
                 .role_ref()
                 .map(|role| {
-                    crate::_internal::analysis::facts::AlterSequenceActionFact::OwnerTo(Self::extract_role(
-                        &role,
-                    ))
+                    crate::_internal::analysis::facts::AlterSequenceActionFact::OwnerTo(
+                        Self::extract_role(&role),
+                    )
                 })
                 .unwrap_or(crate::_internal::analysis::facts::AlterSequenceActionFact::Other),
             Some(ast::AlterSequenceAction::SequenceRenameTo(rename)) => rename
                 .sequence()
                 .and_then(|sequence| sequence.path())
                 .and_then(|path| Self::path_to_qualified_name(&path))
-                .map(|name| crate::_internal::analysis::facts::AlterSequenceActionFact::RenameTo(name.name))
+                .map(|name| {
+                    crate::_internal::analysis::facts::AlterSequenceActionFact::RenameTo(name.name)
+                })
                 .unwrap_or(crate::_internal::analysis::facts::AlterSequenceActionFact::Other),
             Some(ast::AlterSequenceAction::SetSchema(set_schema)) => set_schema
                 .schema_ref()
@@ -2198,14 +2204,20 @@ impl AstVisitor {
         })
     }
 
-    fn extract_param(param: &squawk_syntax::ast::Param) -> crate::_internal::analysis::facts::ParamFact {
+    fn extract_param(
+        param: &squawk_syntax::ast::Param,
+    ) -> crate::_internal::analysis::facts::ParamFact {
         crate::_internal::analysis::facts::ParamFact {
             mode: match param.mode() {
                 Some(ast::ParamMode::ParamVariadic(_)) => {
                     crate::_internal::analysis::facts::ParamModeFact::Variadic
                 }
-                Some(ast::ParamMode::ParamInOut(_)) => crate::_internal::analysis::facts::ParamModeFact::InOut,
-                Some(ast::ParamMode::ParamOut(_)) => crate::_internal::analysis::facts::ParamModeFact::Out,
+                Some(ast::ParamMode::ParamInOut(_)) => {
+                    crate::_internal::analysis::facts::ParamModeFact::InOut
+                }
+                Some(ast::ParamMode::ParamOut(_)) => {
+                    crate::_internal::analysis::facts::ParamModeFact::Out
+                }
                 _ => crate::_internal::analysis::facts::ParamModeFact::In,
             },
             name: param
@@ -2223,7 +2235,9 @@ impl AstVisitor {
         }
     }
 
-    fn extract_ret_type(ret: &squawk_syntax::ast::RetType) -> crate::_internal::analysis::facts::RetTypeFact {
+    fn extract_ret_type(
+        ret: &squawk_syntax::ast::RetType,
+    ) -> crate::_internal::analysis::facts::RetTypeFact {
         if let Some(tal) = ret.table_arg_list() {
             let cols = tal
                 .args()
@@ -2278,9 +2292,11 @@ impl AstVisitor {
                     crate::_internal::analysis::facts::SecurityKind::Definer,
                 )
             }
-            ast::FuncOption::StrictFuncOption(_) => crate::_internal::analysis::facts::FuncOptionFact::Strict(
-                crate::_internal::analysis::facts::StrictKind::Strict,
-            ),
+            ast::FuncOption::StrictFuncOption(_) => {
+                crate::_internal::analysis::facts::FuncOptionFact::Strict(
+                    crate::_internal::analysis::facts::StrictKind::Strict,
+                )
+            }
             ast::FuncOption::CalledOnNullInputFuncOption(_) => {
                 crate::_internal::analysis::facts::FuncOptionFact::Strict(
                     crate::_internal::analysis::facts::StrictKind::CalledOnNull,
@@ -2305,15 +2321,21 @@ impl AstVisitor {
                         .unwrap_or_default(),
                 )
             }
-            ast::FuncOption::CostFuncOption(_) => crate::_internal::analysis::facts::FuncOptionFact::Cost,
-            ast::FuncOption::RowsFuncOption(_) => crate::_internal::analysis::facts::FuncOptionFact::Rows,
-            ast::FuncOption::ResetFuncOption(f) => crate::_internal::analysis::facts::FuncOptionFact::Reset(
-                f.config_parameter_ref()
-                    .and_then(|cpr| cpr.path_ref())
-                    .and_then(|pr| Self::path_ref_to_qualified_name(&pr))
-                    .map(|qn| qn.name.resolve())
-                    .unwrap_or_default(),
-            ),
+            ast::FuncOption::CostFuncOption(_) => {
+                crate::_internal::analysis::facts::FuncOptionFact::Cost
+            }
+            ast::FuncOption::RowsFuncOption(_) => {
+                crate::_internal::analysis::facts::FuncOptionFact::Rows
+            }
+            ast::FuncOption::ResetFuncOption(f) => {
+                crate::_internal::analysis::facts::FuncOptionFact::Reset(
+                    f.config_parameter_ref()
+                        .and_then(|cpr| cpr.path_ref())
+                        .and_then(|pr| Self::path_ref_to_qualified_name(&pr))
+                        .map(|qn| qn.name.resolve())
+                        .unwrap_or_default(),
+                )
+            }
             ast::FuncOption::AsFuncOption(f) => {
                 let (definition, obj_file, link_symbol) = match f.as_func_target() {
                     Some(ast::AsFuncTarget::AsDefinition(definition)) => (
@@ -2343,7 +2365,9 @@ impl AstVisitor {
             ast::FuncOption::TransformFuncOption(_) => {
                 crate::_internal::analysis::facts::FuncOptionFact::Transform
             }
-            ast::FuncOption::WindowFuncOption(_) => crate::_internal::analysis::facts::FuncOptionFact::Window,
+            ast::FuncOption::WindowFuncOption(_) => {
+                crate::_internal::analysis::facts::FuncOptionFact::Window
+            }
             ast::FuncOption::SupportFuncOption(_) => {
                 crate::_internal::analysis::facts::FuncOptionFact::Support
             }
@@ -2389,21 +2413,25 @@ impl AstVisitor {
         let action = node.action().and_then(|a| match a {
             ast::AlterFunctionAction::FunctionRenameTo(rt) => {
                 let new_name = Self::resolve_name(rt.function_name()?.path()?.segment()?);
-                Some(crate::_internal::analysis::facts::AlterFunctionAction::Rename {
-                    from: name.name.resolve(),
-                    to: new_name,
-                })
+                Some(
+                    crate::_internal::analysis::facts::AlterFunctionAction::Rename {
+                        from: name.name.resolve(),
+                        to: new_name,
+                    },
+                )
             }
-            ast::AlterFunctionAction::OwnerTo(ot) => {
-                Some(crate::_internal::analysis::facts::AlterFunctionAction::OwnerChange(
+            ast::AlterFunctionAction::OwnerTo(ot) => Some(
+                crate::_internal::analysis::facts::AlterFunctionAction::OwnerChange(
                     Self::extract_role(&ot.role_ref()?),
-                ))
-            }
+                ),
+            ),
             ast::AlterFunctionAction::SetSchema(ss) => {
                 let token = ss.schema_ref()?.ident_token()?;
-                Some(crate::_internal::analysis::facts::AlterFunctionAction::SchemaChange {
-                    new_schema: Self::resolve_identifier_token(token.text()),
-                })
+                Some(
+                    crate::_internal::analysis::facts::AlterFunctionAction::SchemaChange {
+                        new_schema: Self::resolve_identifier_token(token.text()),
+                    },
+                )
             }
             ast::AlterFunctionAction::DependsOnExtension(de) => {
                 let ext = Self::resolve_identifier_token(de.extension_ref()?.ident_token()?.text());
@@ -2422,13 +2450,13 @@ impl AstVisitor {
                     },
                 )
             }
-            ast::AlterFunctionAction::FuncOptionList(ol) => {
-                Some(crate::_internal::analysis::facts::AlterFunctionAction::OptionsChange(
+            ast::AlterFunctionAction::FuncOptionList(ol) => Some(
+                crate::_internal::analysis::facts::AlterFunctionAction::OptionsChange(
                     ol.options()
                         .map(|o| Self::extract_func_option(&o))
                         .collect(),
-                ))
-            }
+                ),
+            ),
         });
 
         Some(StatementFact::AlterFunction(
@@ -2505,23 +2533,25 @@ impl AstVisitor {
         let action = node.action().and_then(|a| match a {
             ast::AlterProcedureAction::ProcedureRenameTo(rt) => {
                 let new_name = Self::resolve_name(rt.procedure_name()?.path()?.segment()?);
-                Some(crate::_internal::analysis::facts::AlterFunctionAction::Rename {
-                    from: name.name.resolve(),
-                    to: new_name,
-                })
+                Some(
+                    crate::_internal::analysis::facts::AlterFunctionAction::Rename {
+                        from: name.name.resolve(),
+                        to: new_name,
+                    },
+                )
             }
-            ast::AlterProcedureAction::OwnerTo(ot) => {
-                Some(crate::_internal::analysis::facts::AlterFunctionAction::OwnerChange(
+            ast::AlterProcedureAction::OwnerTo(ot) => Some(
+                crate::_internal::analysis::facts::AlterFunctionAction::OwnerChange(
                     Self::extract_role(&ot.role_ref()?),
-                ))
-            }
-            ast::AlterProcedureAction::SetSchema(ss) => {
-                Some(crate::_internal::analysis::facts::AlterFunctionAction::SchemaChange {
+                ),
+            ),
+            ast::AlterProcedureAction::SetSchema(ss) => Some(
+                crate::_internal::analysis::facts::AlterFunctionAction::SchemaChange {
                     new_schema: Self::resolve_identifier_token(
                         ss.schema_ref()?.ident_token()?.text(),
                     ),
-                })
-            }
+                },
+            ),
             _ => None,
         });
 
@@ -2630,9 +2660,9 @@ impl AstVisitor {
                 }
             }
             ast::AlterAggregateAction::OwnerTo(owner) => {
-                crate::_internal::analysis::facts::AlterFunctionAction::OwnerChange(Self::extract_role(
-                    &owner.role_ref()?,
-                ))
+                crate::_internal::analysis::facts::AlterFunctionAction::OwnerChange(
+                    Self::extract_role(&owner.role_ref()?),
+                )
             }
             ast::AlterAggregateAction::SetSchema(set_schema) => {
                 crate::_internal::analysis::facts::AlterFunctionAction::SchemaChange {
@@ -2703,23 +2733,31 @@ impl AstVisitor {
         match object {
             ast::PublicationObject::PublicationObjectTable(object) => {
                 let path = object.table_name_ref()?.path_ref()?;
-                Some(crate::_internal::analysis::facts::PublicationObjectFact::Table {
-                    name: Self::path_ref_to_qualified_name(&path)?,
-                    only: object.only_token().is_some(),
-                    include_partitions: object.star_token().is_some(),
-                    columns: object.column_ref_list().map(|columns| {
-                        columns
-                            .column_name_refs()
-                            .map(|name| Self::resolve_ast_identifier(&name))
-                            .collect()
-                    }),
-                    row_filter: object.where_condition_clause().and_then(|where_clause| {
-                        where_clause
-                            .expr()
-                            .map(crate::_internal::analysis::expr_visitor::ExprVisitor::convert)
-                            .map(crate::_internal::analysis::facts::PublicationRowFilter::Parsed)
-                    }),
-                })
+                Some(
+                    crate::_internal::analysis::facts::PublicationObjectFact::Table {
+                        name: Self::path_ref_to_qualified_name(&path)?,
+                        // PostgreSQL always records published tables as ONLY rows
+                        // in pg_publication_rel; the `*` (include partitions)
+                        // form is only a difference in the number of rows, so
+                        // normalization treats every published table as ONLY.
+                        only: true,
+                        include_partitions: object.star_token().is_some(),
+                        columns: object.column_ref_list().map(|columns| {
+                            columns
+                                .column_name_refs()
+                                .map(|name| Self::resolve_ast_identifier(&name))
+                                .collect()
+                        }),
+                        row_filter: object.where_condition_clause().and_then(|where_clause| {
+                            where_clause
+                                .expr()
+                                .map(crate::_internal::analysis::expr_visitor::ExprVisitor::convert)
+                                .map(
+                                    crate::_internal::analysis::facts::PublicationRowFilter::Parsed,
+                                )
+                        }),
+                    },
+                )
             }
             ast::PublicationObject::PublicationObjectTablesInSchema(object) => {
                 object.schema_ref().map(|schema_ref| {
@@ -2729,14 +2767,16 @@ impl AstVisitor {
                             where_clause
                                 .expr()
                                 .map(crate::_internal::analysis::expr_visitor::ExprVisitor::convert)
-                                .map(crate::_internal::analysis::facts::PublicationRowFilter::Parsed)
+                                .map(
+                                    crate::_internal::analysis::facts::PublicationRowFilter::Parsed,
+                                )
                         }),
                     }
                 })
             }
-            ast::PublicationObject::PublicationObjectCurrentSchema(_) => {
-                Some(crate::_internal::analysis::facts::PublicationObjectFact::CurrentSchemaShorthand)
-            }
+            ast::PublicationObject::PublicationObjectCurrentSchema(_) => Some(
+                crate::_internal::analysis::facts::PublicationObjectFact::CurrentSchemaShorthand,
+            ),
         }
     }
 
@@ -2842,9 +2882,9 @@ impl AstVisitor {
                 )
             }
             ast::AlterPublicationAction::OwnerTo(action) => {
-                crate::_internal::analysis::facts::AlterPublicationActionFact::OwnerChange(Self::extract_role(
-                    &action.role_ref()?,
-                ))
+                crate::_internal::analysis::facts::AlterPublicationActionFact::OwnerChange(
+                    Self::extract_role(&action.role_ref()?),
+                )
             }
             ast::AlterPublicationAction::PublicationRenameTo(action) => {
                 crate::_internal::analysis::facts::AlterPublicationActionFact::Rename {
@@ -3030,7 +3070,9 @@ impl AstVisitor {
         ))
     }
 
-    fn extract_role(role_ref: &squawk_syntax::ast::RoleRef) -> crate::_internal::analysis::facts::RoleFact {
+    fn extract_role(
+        role_ref: &squawk_syntax::ast::RoleRef,
+    ) -> crate::_internal::analysis::facts::RoleFact {
         if let Some(token) = role_ref.ident_token() {
             let name = Self::resolve_identifier_token(token.text());
             return crate::_internal::analysis::facts::RoleFact::Named {
@@ -3063,7 +3105,9 @@ impl AstVisitor {
         crate::_internal::analysis::facts::RoleFact::Unknown
     }
 
-    fn extract_role_node(role: &squawk_syntax::ast::Role) -> crate::_internal::analysis::facts::RoleFact {
+    fn extract_role_node(
+        role: &squawk_syntax::ast::Role,
+    ) -> crate::_internal::analysis::facts::RoleFact {
         if let Some(token) = role.ident_token() {
             return crate::_internal::analysis::facts::RoleFact::Named {
                 name: Self::resolve_identifier_token(token.text()),
@@ -3235,10 +3279,18 @@ impl AstVisitor {
                 let name = Self::resolve_identifier_token(&raw);
                 if !Self::identifier_from_token(&raw).quoted {
                     match name.as_str() {
-                        "insert" => return crate::_internal::analysis::facts::PrivilegeFact::Insert,
-                        "update" => return crate::_internal::analysis::facts::PrivilegeFact::Update,
-                        "delete" => return crate::_internal::analysis::facts::PrivilegeFact::Delete,
-                        "maintain" => return crate::_internal::analysis::facts::PrivilegeFact::Maintain,
+                        "insert" => {
+                            return crate::_internal::analysis::facts::PrivilegeFact::Insert;
+                        }
+                        "update" => {
+                            return crate::_internal::analysis::facts::PrivilegeFact::Update;
+                        }
+                        "delete" => {
+                            return crate::_internal::analysis::facts::PrivilegeFact::Delete;
+                        }
+                        "maintain" => {
+                            return crate::_internal::analysis::facts::PrivilegeFact::Maintain;
+                        }
                         _ => {}
                     }
                 }
@@ -3291,9 +3343,7 @@ impl AstVisitor {
                 return if schemas.is_empty() {
                     None
                 } else {
-                    Some(crate::_internal::analysis::facts::GrantTarget::AllTablesInSchema(
-                        schemas,
-                    ))
+                    Some(crate::_internal::analysis::facts::GrantTarget::AllTablesInSchema(schemas))
                 };
             }
             _ => return None,
@@ -3301,7 +3351,9 @@ impl AstVisitor {
         if names.is_empty() {
             None
         } else {
-            Some(crate::_internal::analysis::facts::GrantTarget::Tables(names))
+            Some(crate::_internal::analysis::facts::GrantTarget::Tables(
+                names,
+            ))
         }
     }
 
@@ -3323,12 +3375,12 @@ impl AstVisitor {
             return None;
         };
         match name.as_str() {
-            "admin" => Some(crate::_internal::analysis::facts::RoleMembershipOptionFact::Admin(
-                value,
-            )),
-            "inherit" => Some(crate::_internal::analysis::facts::RoleMembershipOptionFact::Inherit(
-                value,
-            )),
+            "admin" => {
+                Some(crate::_internal::analysis::facts::RoleMembershipOptionFact::Admin(value))
+            }
+            "inherit" => {
+                Some(crate::_internal::analysis::facts::RoleMembershipOptionFact::Inherit(value))
+            }
             "set" => Some(crate::_internal::analysis::facts::RoleMembershipOptionFact::Set(value)),
             _ => None,
         }
@@ -3336,7 +3388,9 @@ impl AstVisitor {
 
     fn extract_grant(node: &Grant) -> Option<StatementFact> {
         let privileges = match node.privileges() {
-            Some(ast::Privileges::AllPrivileges(_)) => crate::_internal::analysis::facts::PrivilegeSpec::All,
+            Some(ast::Privileges::AllPrivileges(_)) => {
+                crate::_internal::analysis::facts::PrivilegeSpec::All
+            }
             Some(ast::Privileges::RevokeCommandList(commands)) => {
                 crate::_internal::analysis::facts::PrivilegeSpec::List(
                     commands
@@ -3393,14 +3447,16 @@ impl AstVisitor {
             .and_then(|clause| clause.role_ref())
             .map(|role| Self::extract_role(&role));
 
-        Some(StatementFact::Grant(crate::_internal::analysis::facts::GrantFact {
-            privileges,
-            target,
-            grantees,
-            with_grant_option,
-            role_options,
-            granted_by,
-        }))
+        Some(StatementFact::Grant(
+            crate::_internal::analysis::facts::GrantFact {
+                privileges,
+                target,
+                grantees,
+                with_grant_option,
+                role_options,
+                granted_by,
+            },
+        ))
     }
 
     fn extract_revoke(node: &Revoke) -> Option<StatementFact> {
@@ -3409,15 +3465,11 @@ impl AstVisitor {
             Some(ast::RevokeOptionFor::GrantOptionFor(_)) => (true, None),
             Some(ast::RevokeOptionFor::AdminOptionFor(_)) => (
                 false,
-                Some(crate::_internal::analysis::facts::RoleMembershipOptionFact::Admin(
-                    false,
-                )),
+                Some(crate::_internal::analysis::facts::RoleMembershipOptionFact::Admin(false)),
             ),
             Some(ast::RevokeOptionFor::InheritOptionFor(_)) => (
                 false,
-                Some(crate::_internal::analysis::facts::RoleMembershipOptionFact::Inherit(
-                    false,
-                )),
+                Some(crate::_internal::analysis::facts::RoleMembershipOptionFact::Inherit(false)),
             ),
             Some(ast::RevokeOptionFor::SetOptionFor(_)) => (
                 false,
@@ -3426,7 +3478,9 @@ impl AstVisitor {
         };
 
         let privileges = match node.privileges() {
-            Some(ast::Privileges::AllPrivileges(_)) => crate::_internal::analysis::facts::PrivilegeSpec::All,
+            Some(ast::Privileges::AllPrivileges(_)) => {
+                crate::_internal::analysis::facts::PrivilegeSpec::All
+            }
             Some(ast::Privileges::RevokeCommandList(commands)) => {
                 crate::_internal::analysis::facts::PrivilegeSpec::List(
                     commands
@@ -3451,7 +3505,9 @@ impl AstVisitor {
                 .revoke_commands()
                 .map(
                     |command| match Self::extract_privilege_from_revoke_command(&command) {
-                        crate::_internal::analysis::facts::PrivilegeFact::RoleMembership(name) => Some(name),
+                        crate::_internal::analysis::facts::PrivilegeFact::RoleMembership(name) => {
+                            Some(name)
+                        }
                         _ => None,
                     },
                 )
@@ -3472,15 +3528,17 @@ impl AstVisitor {
             .map(|role| Self::extract_role(&role));
         let cascade = Self::is_cascade(node.drop_behavior());
 
-        Some(StatementFact::Revoke(crate::_internal::analysis::facts::RevokeFact {
-            grant_option_only,
-            role_option,
-            privileges,
-            target,
-            revokees,
-            granted_by,
-            cascade,
-        }))
+        Some(StatementFact::Revoke(
+            crate::_internal::analysis::facts::RevokeFact {
+                grant_option_only,
+                role_option,
+                privileges,
+                target,
+                revokees,
+                granted_by,
+                cascade,
+            },
+        ))
     }
 
     fn extract_db_option(
@@ -3536,7 +3594,9 @@ impl AstVisitor {
                             value.clone(),
                         )
                     })
-                    .unwrap_or(crate::_internal::analysis::facts::DatabaseOptionFact::Unknown(value))
+                    .unwrap_or(
+                        crate::_internal::analysis::facts::DatabaseOptionFact::Unknown(value),
+                    )
             }
         }
     }
@@ -3576,9 +3636,9 @@ impl AstVisitor {
                 }
             }
             AlterDatabaseAction::OwnerTo(ot) => {
-                crate::_internal::analysis::facts::AlterDatabaseAction::OwnerChange(Self::extract_role(
-                    &ot.role_ref()?,
-                ))
+                crate::_internal::analysis::facts::AlterDatabaseAction::OwnerChange(
+                    Self::extract_role(&ot.role_ref()?),
+                )
             }
             AlterDatabaseAction::SetTablespace(st) => {
                 crate::_internal::analysis::facts::AlterDatabaseAction::TablespaceChange {
@@ -3716,7 +3776,8 @@ impl AstVisitor {
                         if values.len() != 1 {
                             TimeoutSettingValue::Invalid(sc.syntax().text().to_string())
                         } else {
-                            match crate::_internal::analysis::settings::parse_timeout_ms(&values[0]) {
+                            match crate::_internal::analysis::settings::parse_timeout_ms(&values[0])
+                            {
                                 Ok(milliseconds) => TimeoutSettingValue::Milliseconds(milliseconds),
                                 Err(error) => TimeoutSettingValue::Invalid(error),
                             }

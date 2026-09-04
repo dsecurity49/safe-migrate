@@ -52,7 +52,9 @@ impl Rule for OpaqueDynamicSqlRule {
                 crate::_internal::analysis::mutations::OpaqueMutation::StateCollision(msg) => {
                     (msg.as_str(), true, self.recipe())
                 }
-                crate::_internal::analysis::mutations::OpaqueMutation::UnresolvedReference { .. } => {
+                crate::_internal::analysis::mutations::OpaqueMutation::UnresolvedReference {
+                    ..
+                } => {
                     unreachable!()
                 }
             };

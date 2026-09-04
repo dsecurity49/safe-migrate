@@ -88,7 +88,10 @@ impl AnalysisState {
     ) -> MutationResult {
         let roots = present.iter().cloned().collect::<HashSet<_>>();
         if present.iter().any(|id| {
-            self.baseline_scoped_family_object(id, crate::_internal::db::cache::CatalogFamily::Relations)
+            self.baseline_scoped_family_object(
+                id,
+                crate::_internal::db::cache::CatalogFamily::Relations,
+            )
         }) {
             // View dependency rows are scope-aware, but expression and
             // extension-dependent objects outside the selected schemas are
@@ -157,7 +160,8 @@ impl AnalysisState {
             .triggers
             .iter()
             .filter_map(|(id, overlay)| {
-                let crate::_internal::model::trigger::TriggerOverlay::Present(trigger) = overlay else {
+                let crate::_internal::model::trigger::TriggerOverlay::Present(trigger) = overlay
+                else {
                     return None;
                 };
                 dropped_relations
@@ -167,9 +171,10 @@ impl AnalysisState {
             .collect::<Vec<_>>();
         for trigger_id in triggers_to_drop {
             self.snapshot_trigger(&trigger_id);
-            self.local
-                .triggers
-                .insert(trigger_id, crate::_internal::model::trigger::TriggerOverlay::Dropped);
+            self.local.triggers.insert(
+                trigger_id,
+                crate::_internal::model::trigger::TriggerOverlay::Dropped,
+            );
         }
         // Even when a scoped cache omitted a dependent view, its dependency
         // edge is known and PostgreSQL CASCADE removes that edge. Use the full
@@ -184,7 +189,9 @@ impl AnalysisState {
             matches!(edge.kind, DependencyKind::IndexOnRelation { .. }) && edge.dependent == *id
         }) {
             IndexLookup::Present
-        } else if self.baseline_covers_family_object(id, crate::_internal::db::cache::CatalogFamily::Indexes) {
+        } else if self
+            .baseline_covers_family_object(id, crate::_internal::db::cache::CatalogFamily::Indexes)
+        {
             IndexLookup::AuthoritativelyAbsent
         } else {
             IndexLookup::Unknown
@@ -576,7 +583,10 @@ impl AnalysisState {
         }
 
         if targets.iter().any(|id| {
-            self.baseline_scoped_family_object(id, crate::_internal::db::cache::CatalogFamily::Indexes)
+            self.baseline_scoped_family_object(
+                id,
+                crate::_internal::db::cache::CatalogFamily::Indexes,
+            )
         }) {
             // Scoped index rows do not yet carry a complete backing-constraint
             // identity or every external dependency, so PostgreSQL's DROP

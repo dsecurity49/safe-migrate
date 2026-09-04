@@ -282,7 +282,10 @@ impl AnalysisState {
             crate::_internal::analysis::facts::PublicationObjectFact::Table { name, .. } => {
                 format!("table\0{}", self.resolve_relation_id(name))
             }
-            crate::_internal::analysis::facts::PublicationObjectFact::SchemaTables { schema, .. } => {
+            crate::_internal::analysis::facts::PublicationObjectFact::SchemaTables {
+                schema,
+                ..
+            } => {
                 format!("schema\0{schema}")
             }
             crate::_internal::analysis::facts::PublicationObjectFact::CurrentSchemaShorthand => {
@@ -295,8 +298,42 @@ impl AnalysisState {
                         .unwrap_or("public")
                 )
             }
-            crate::_internal::analysis::facts::PublicationObjectFact::Unknown => "unknown".to_string(),
+            crate::_internal::analysis::facts::PublicationObjectFact::Unknown => {
+                "unknown".to_string()
+            }
         }
+    }
+
+    /// Recover squawk's misparse of `CREATE PUBLICATION ... FOR TABLES IN
+    /// SCHEMA s1, s2, ...`: the parser wraps every schema after the first as a
+    /// bare (unqualified) `Table`.  When a schema-scoped object is already
+    /// present and a following bare table names an actual schema, PostgreSQL
+    /// intends a schema-scoped object, so coerce it back.
+    fn normalize_publication_scope(
+        &self,
+        scope: &crate::_internal::analysis::facts::PublicationScope,
+    ) -> crate::_internal::analysis::facts::PublicationScope {
+        use crate::_internal::analysis::facts::{PublicationObjectFact, PublicationScope};
+        let crate::_internal::analysis::facts::PublicationScope::Explicit(objects) = scope else {
+            return scope.clone();
+        };
+        let mut normalized: Vec<PublicationObjectFact> = Vec::new();
+        for object in objects {
+            if let PublicationObjectFact::Table { name, .. } = object
+                && normalized
+                    .iter()
+                    .any(|prior| matches!(prior, PublicationObjectFact::SchemaTables { .. }))
+                && self.schema_is_present(&name.name.text)
+            {
+                normalized.push(PublicationObjectFact::SchemaTables {
+                    schema: name.name.text.clone(),
+                    row_filter: None,
+                });
+                continue;
+            }
+            normalized.push(object.clone());
+        }
+        PublicationScope::Explicit(normalized)
     }
 
     fn replace_publication_edges(
@@ -314,7 +351,11 @@ impl AnalysisState {
         });
         if let crate::_internal::analysis::facts::PublicationScope::Explicit(objects) = scope {
             for object in objects {
-                if let crate::_internal::analysis::facts::PublicationObjectFact::Table { name, .. } = object {
+                if let crate::_internal::analysis::facts::PublicationObjectFact::Table {
+                    name,
+                    ..
+                } = object
+                {
                     self.local.graph.add_edge(DependencyEdge::new(
                         self.resolve_relation_id(name),
                         ObjectId::new("public", publication_name),
@@ -654,7 +695,8 @@ impl AnalysisState {
         // Publication membership can retain an explicitly named table or
         // schema even when the corresponding relation rows are out of scope.
         for publication in cache.publications.values() {
-            if let crate::_internal::analysis::facts::PublicationScope::Explicit(objects) = &publication.scope
+            if let crate::_internal::analysis::facts::PublicationScope::Explicit(objects) =
+                &publication.scope
             {
                 for object in objects {
                     let schema = match object {
@@ -841,11 +883,13 @@ impl AnalysisState {
         for fk in cache.foreign_keys {
             baseline_foreign_keys.insert((fk.from_table.clone(), fk.constraint_name.clone()));
             let operator_evidence = if fk.has_complete_operator_evidence() {
-                Some(crate::_internal::analysis::graph::ForeignKeyOperatorEvidence {
-                    pk_fk: fk.pk_fk_equality_operators,
-                    pk_pk: fk.pk_pk_equality_operators,
-                    fk_fk: fk.fk_fk_equality_operators,
-                })
+                Some(
+                    crate::_internal::analysis::graph::ForeignKeyOperatorEvidence {
+                        pk_fk: fk.pk_fk_equality_operators,
+                        pk_pk: fk.pk_pk_equality_operators,
+                        fk_fk: fk.fk_fk_equality_operators,
+                    },
+                )
             } else {
                 incomplete_fk_operator_evidence = true;
                 None
@@ -1097,7 +1141,9 @@ impl AnalysisState {
             .map(|(name, subscription)| {
                 (
                     name,
-                    crate::_internal::model::replication::SubscriptionOverlay::Present(subscription),
+                    crate::_internal::model::replication::SubscriptionOverlay::Present(
+                        subscription,
+                    ),
                 )
             })
             .collect();
@@ -1127,7 +1173,12 @@ impl AnalysisState {
                 roles: cache
                     .roles
                     .into_iter()
-                    .map(|(id, role)| (id, crate::_internal::model::role::RoleOverlay::Present(role)))
+                    .map(|(id, role)| {
+                        (
+                            id,
+                            crate::_internal::model::role::RoleOverlay::Present(role),
+                        )
+                    })
                     .collect(),
                 role_membership_grantors: cache.role_membership_grantors,
                 role_membership_grantors_complete: cache.role_membership_grantors_complete,
@@ -1203,7 +1254,10 @@ impl AnalysisState {
             .unwrap_or_else(|| "public".to_string())
     }
 
-    pub fn resolve_relation_id(&self, name: &crate::_internal::ast::identifiers::QualifiedName) -> ObjectId {
+    pub fn resolve_relation_id(
+        &self,
+        name: &crate::_internal::ast::identifiers::QualifiedName,
+    ) -> ObjectId {
         if let Some(schema) = &name.schema {
             return ObjectId::new(schema.resolve(), name.name.resolve());
         }
@@ -1287,7 +1341,10 @@ impl AnalysisState {
         self.baseline_available
     }
 
-    pub(crate) fn baseline_has_coverage(&self, family: crate::_internal::db::cache::CatalogFamily) -> bool {
+    pub(crate) fn baseline_has_coverage(
+        &self,
+        family: crate::_internal::db::cache::CatalogFamily,
+    ) -> bool {
         self.baseline_coverage.has(family)
     }
 
@@ -1312,7 +1369,10 @@ impl AnalysisState {
         if !self.baseline_boundary_queries_complete {
             return true;
         }
-        if matches!(family, crate::_internal::db::cache::CatalogFamily::Relations) {
+        if matches!(
+            family,
+            crate::_internal::db::cache::CatalogFamily::Relations
+        ) {
             return self.scoped_external_relation_dependencies.contains(id);
         }
         if matches!(family, crate::_internal::db::cache::CatalogFamily::Types) {
@@ -1396,8 +1456,10 @@ impl AnalysisState {
             None if self.sequence_is_present(id) || self.index_is_present(id) => {
                 ObjectLookup::WrongKind
             }
-            None if self
-                .baseline_covers_family_object(id, crate::_internal::db::cache::CatalogFamily::Relations) =>
+            None if self.baseline_covers_family_object(
+                id,
+                crate::_internal::db::cache::CatalogFamily::Relations,
+            ) =>
             {
                 ObjectLookup::AuthoritativelyAbsent
             }
@@ -1440,8 +1502,10 @@ impl AnalysisState {
             Some(TypeOverlay::Present(state)) if expected(&state.kind) => ObjectLookup::Present,
             Some(TypeOverlay::Present(_)) => ObjectLookup::WrongKind,
             Some(TypeOverlay::Dropped) => ObjectLookup::Tombstone,
-            None if self
-                .baseline_covers_family_object(id, crate::_internal::db::cache::CatalogFamily::Types) =>
+            None if self.baseline_covers_family_object(
+                id,
+                crate::_internal::db::cache::CatalogFamily::Types,
+            ) =>
             {
                 ObjectLookup::AuthoritativelyAbsent
             }
@@ -1464,8 +1528,10 @@ impl AnalysisState {
             Some(FunctionOverlay::Dropped) => Err(MutationResult::Conflict {
                 reason: missing_reason,
             }),
-            None if self
-                .baseline_covers_family_object(id, crate::_internal::db::cache::CatalogFamily::Routines) =>
+            None if self.baseline_covers_family_object(
+                id,
+                crate::_internal::db::cache::CatalogFamily::Routines,
+            ) =>
             {
                 Err(MutationResult::Conflict {
                     reason: missing_reason,
@@ -1801,10 +1867,9 @@ impl AnalysisState {
     fn sequence_nextval_default(id: &ObjectId) -> crate::_internal::analysis::expr_ir::ExprIr {
         crate::_internal::analysis::expr_ir::ExprIr::FunctionCall {
             name: "nextval".to_string(),
-            args: vec![crate::_internal::analysis::expr_ir::ExprIr::Literal(format!(
-                "{}.{}",
-                id.schema, id.name
-            ))],
+            args: vec![crate::_internal::analysis::expr_ir::ExprIr::Literal(
+                format!("{}.{}", id.schema, id.name),
+            )],
         }
     }
 
@@ -1869,7 +1934,9 @@ impl AnalysisState {
             publications,
             &self.local.publications,
             |overlay| match overlay {
-                crate::_internal::model::replication::PublicationOverlay::Present(state) => Some(state),
+                crate::_internal::model::replication::PublicationOverlay::Present(state) => {
+                    Some(state)
+                }
                 crate::_internal::model::replication::PublicationOverlay::Dropped => None,
             },
         );
@@ -1877,7 +1944,9 @@ impl AnalysisState {
             subscriptions,
             &self.local.subscriptions,
             |overlay| match overlay {
-                crate::_internal::model::replication::SubscriptionOverlay::Present(state) => Some(state),
+                crate::_internal::model::replication::SubscriptionOverlay::Present(state) => {
+                    Some(state)
+                }
                 crate::_internal::model::replication::SubscriptionOverlay::Dropped => None,
             },
         );
@@ -2060,16 +2129,30 @@ impl AnalysisState {
             crate::_internal::analysis::facts::PrivilegeSpec::List(list) => list
                 .iter()
                 .filter_map(|p| match p {
-                    crate::_internal::analysis::facts::PrivilegeFact::Select => Some(Privilege::Select),
-                    crate::_internal::analysis::facts::PrivilegeFact::Insert => Some(Privilege::Insert),
-                    crate::_internal::analysis::facts::PrivilegeFact::Update => Some(Privilege::Update),
-                    crate::_internal::analysis::facts::PrivilegeFact::Delete => Some(Privilege::Delete),
-                    crate::_internal::analysis::facts::PrivilegeFact::Truncate => Some(Privilege::Truncate),
+                    crate::_internal::analysis::facts::PrivilegeFact::Select => {
+                        Some(Privilege::Select)
+                    }
+                    crate::_internal::analysis::facts::PrivilegeFact::Insert => {
+                        Some(Privilege::Insert)
+                    }
+                    crate::_internal::analysis::facts::PrivilegeFact::Update => {
+                        Some(Privilege::Update)
+                    }
+                    crate::_internal::analysis::facts::PrivilegeFact::Delete => {
+                        Some(Privilege::Delete)
+                    }
+                    crate::_internal::analysis::facts::PrivilegeFact::Truncate => {
+                        Some(Privilege::Truncate)
+                    }
                     crate::_internal::analysis::facts::PrivilegeFact::References => {
                         Some(Privilege::References)
                     }
-                    crate::_internal::analysis::facts::PrivilegeFact::Trigger => Some(Privilege::Trigger),
-                    crate::_internal::analysis::facts::PrivilegeFact::Maintain if supports_maintain => {
+                    crate::_internal::analysis::facts::PrivilegeFact::Trigger => {
+                        Some(Privilege::Trigger)
+                    }
+                    crate::_internal::analysis::facts::PrivilegeFact::Maintain
+                        if supports_maintain =>
+                    {
                         Some(Privilege::Maintain)
                     }
                     _ => None,
@@ -2086,8 +2169,12 @@ impl AnalysisState {
         let name = match role {
             crate::_internal::analysis::facts::RoleFact::Named { name, .. } => Some(name.clone()),
             crate::_internal::analysis::facts::RoleFact::CurrentUser
-            | crate::_internal::analysis::facts::RoleFact::CurrentRole => Some(current_role.to_string()),
-            crate::_internal::analysis::facts::RoleFact::SessionUser => Some(session_role.to_string()),
+            | crate::_internal::analysis::facts::RoleFact::CurrentRole => {
+                Some(current_role.to_string())
+            }
+            crate::_internal::analysis::facts::RoleFact::SessionUser => {
+                Some(session_role.to_string())
+            }
             crate::_internal::analysis::facts::RoleFact::Unknown => None,
         }?;
         Some(ObjectId::new("", name))
@@ -2098,7 +2185,9 @@ impl AnalysisState {
         role: &crate::_internal::analysis::facts::RoleFact,
     ) -> Option<(String, bool)> {
         match role {
-            crate::_internal::analysis::facts::RoleFact::Named { name, .. } => Some((name.clone(), true)),
+            crate::_internal::analysis::facts::RoleFact::Named { name, .. } => {
+                Some((name.clone(), true))
+            }
             crate::_internal::analysis::facts::RoleFact::CurrentUser
             | crate::_internal::analysis::facts::RoleFact::CurrentRole => Some((
                 self.local.current_role.clone(),
@@ -2356,7 +2445,8 @@ impl AnalysisState {
         for (mut id, mut overlay) in std::mem::take(&mut self.local.functions) {
             let old_id = id.clone();
             Self::remap_schema_id(&mut id, old_name, new_name);
-            if let crate::_internal::model::function::FunctionOverlay::Present(state) = &mut overlay {
+            if let crate::_internal::model::function::FunctionOverlay::Present(state) = &mut overlay
+            {
                 Self::remap_schema_id(&mut state.id, old_name, new_name);
             }
             if id != old_id {
@@ -2399,7 +2489,8 @@ impl AnalysisState {
         self.local.triggers = triggers;
 
         for overlay in self.local.publications.values_mut() {
-            let crate::_internal::model::replication::PublicationOverlay::Present(publication) = overlay
+            let crate::_internal::model::replication::PublicationOverlay::Present(publication) =
+                overlay
             else {
                 continue;
             };
@@ -2410,17 +2501,23 @@ impl AnalysisState {
             };
             for object in objects {
                 match object {
-                    crate::_internal::analysis::facts::PublicationObjectFact::Table { name, .. } => {
+                    crate::_internal::analysis::facts::PublicationObjectFact::Table {
+                        name,
+                        ..
+                    } => {
                         if name
                             .schema
                             .as_ref()
                             .is_some_and(|schema| schema.resolve() == old_name)
                         {
-                            name.schema = Some(crate::_internal::ast::identifiers::Ident::new(new_name, true));
+                            name.schema = Some(crate::_internal::ast::identifiers::Ident::new(
+                                new_name, true,
+                            ));
                         }
                     }
                     crate::_internal::analysis::facts::PublicationObjectFact::SchemaTables {
-                        schema, ..
+                        schema,
+                        ..
                     } if schema == old_name => *schema = new_name.to_string(),
                     _ => {}
                 }
@@ -3202,7 +3299,10 @@ mod evidence_tests {
     use super::*;
     use crate::_internal::analysis::evidence::{EvidenceCode, EvidenceRecord, EvidenceScope};
 
-    fn table_with_columns(id: ObjectId, columns: &[&str]) -> crate::_internal::model::relation::RelationState {
+    fn table_with_columns(
+        id: ObjectId,
+        columns: &[&str],
+    ) -> crate::_internal::model::relation::RelationState {
         let mut relation = crate::_internal::model::relation::RelationState::new(
             id,
             ObjectId::new("", "postgres"),
@@ -3271,11 +3371,13 @@ mod evidence_tests {
         cache.coverage = CatalogCoverage::from_sync_scope(cache.metadata.schemas.as_deref());
         let mut state = AnalysisState::new(cache);
         let result = state.apply(
-            &Mutation::CreateSchema(crate::_internal::analysis::mutations::CreateSchemaMutation {
-                name: "outside_scope".to_string(),
-                if_not_exists: false,
-                authorization: None,
-            }),
+            &Mutation::CreateSchema(
+                crate::_internal::analysis::mutations::CreateSchemaMutation {
+                    name: "outside_scope".to_string(),
+                    if_not_exists: false,
+                    authorization: None,
+                },
+            ),
             None,
         );
 
@@ -3300,11 +3402,13 @@ mod evidence_tests {
         let mut state = AnalysisState::new(cache);
 
         let result = state.apply(
-            &Mutation::CreateSchema(crate::_internal::analysis::mutations::CreateSchemaMutation {
-                name: "public".to_string(),
-                if_not_exists: false,
-                authorization: None,
-            }),
+            &Mutation::CreateSchema(
+                crate::_internal::analysis::mutations::CreateSchemaMutation {
+                    name: "public".to_string(),
+                    if_not_exists: false,
+                    authorization: None,
+                },
+            ),
             None,
         );
 
@@ -3321,13 +3425,15 @@ mod evidence_tests {
     fn role_inherit_option_is_preserved_across_mutations() {
         let mut state = AnalysisState::new(DbCache::new());
         let role_id = ObjectId::new("", "no_inherit");
-        let create = Mutation::CreateRole(crate::_internal::analysis::mutations::CreateRoleMutation {
-            name: role_id.name.clone(),
-            inherits: false,
-            can_login: false,
-        });
+        let create =
+            Mutation::CreateRole(crate::_internal::analysis::mutations::CreateRoleMutation {
+                name: role_id.name.clone(),
+                inherits: false,
+                can_login: false,
+            });
         assert_eq!(state.apply(&create, None), MutationResult::Applied);
-        let Some(crate::_internal::model::role::RoleOverlay::Present(role)) = state.local.roles.get(&role_id)
+        let Some(crate::_internal::model::role::RoleOverlay::Present(role)) =
+            state.local.roles.get(&role_id)
         else {
             panic!("expected role to be present");
         };
@@ -3341,7 +3447,8 @@ mod evidence_tests {
             inherits: Some(true),
         });
         assert_eq!(state.apply(&alter, None), MutationResult::Applied);
-        let Some(crate::_internal::model::role::RoleOverlay::Present(role)) = state.local.roles.get(&role_id)
+        let Some(crate::_internal::model::role::RoleOverlay::Present(role)) =
+            state.local.roles.get(&role_id)
         else {
             panic!("expected role to remain present");
         };
@@ -3420,21 +3527,17 @@ mod evidence_tests {
         );
 
         let state = AnalysisState::with_baseline(cache.clone(), true);
-        assert!(
-            state.baseline_scoped_family_object(
-                &table_id,
-                crate::_internal::db::cache::CatalogFamily::Relations
-            )
-        );
+        assert!(state.baseline_scoped_family_object(
+            &table_id,
+            crate::_internal::db::cache::CatalogFamily::Relations
+        ));
 
         cache.metadata.boundary_queries_complete = true;
         let state = AnalysisState::with_baseline(cache, true);
-        assert!(
-            !state.baseline_scoped_family_object(
-                &table_id,
-                crate::_internal::db::cache::CatalogFamily::Relations
-            )
-        );
+        assert!(!state.baseline_scoped_family_object(
+            &table_id,
+            crate::_internal::db::cache::CatalogFamily::Relations
+        ));
     }
 
     #[test]
@@ -3509,11 +3612,13 @@ mod evidence_tests {
         let mut state = AnalysisState::new(cache);
 
         let result = state.apply(
-            &Mutation::DropSequence(crate::_internal::analysis::mutations::DropSequenceMutation {
-                ids: vec![sequence_id.clone()],
-                if_exists: false,
-                cascade: false,
-            }),
+            &Mutation::DropSequence(
+                crate::_internal::analysis::mutations::DropSequenceMutation {
+                    ids: vec![sequence_id.clone()],
+                    if_exists: false,
+                    cascade: false,
+                },
+            ),
             None,
         );
         assert_eq!(result, MutationResult::Skipped);
@@ -3547,11 +3652,13 @@ mod evidence_tests {
         );
         let mut state = AnalysisState::new(cache);
         let result = state.apply(
-            &Mutation::DropSequence(crate::_internal::analysis::mutations::DropSequenceMutation {
-                ids: vec![sequence_id.clone()],
-                if_exists: false,
-                cascade: false,
-            }),
+            &Mutation::DropSequence(
+                crate::_internal::analysis::mutations::DropSequenceMutation {
+                    ids: vec![sequence_id.clone()],
+                    if_exists: false,
+                    cascade: false,
+                },
+            ),
             None,
         );
         assert_eq!(result, MutationResult::Skipped);
@@ -3584,11 +3691,12 @@ mod evidence_tests {
         let result = state.apply(
             &Mutation::AlterTable(crate::_internal::analysis::mutations::AlterTable {
                 id: table_id.clone(),
-                action: crate::_internal::analysis::mutations::AlterTableActionMutation::DropColumn {
-                    name: "id".to_string(),
-                    if_exists: false,
-                    cascade: false,
-                },
+                action:
+                    crate::_internal::analysis::mutations::AlterTableActionMutation::DropColumn {
+                        name: "id".to_string(),
+                        if_exists: false,
+                        cascade: false,
+                    },
             }),
             None,
         );
@@ -3662,23 +3770,29 @@ mod evidence_tests {
         );
         let mut state = AnalysisState::new(cache);
         let result = state.apply(
-            &Mutation::DropFunction(crate::_internal::analysis::mutations::DropFunctionMutation {
-                signatures: vec![crate::_internal::analysis::facts::FunctionSigFact {
-                    name: crate::_internal::ast::identifiers::QualifiedName::new(
-                        Some(crate::_internal::ast::identifiers::Ident::new("public", false)),
-                        crate::_internal::ast::identifiers::Ident::new("work", false),
-                    ),
-                    params: vec!["integer".to_string()],
-                }],
-                if_exists: false,
-                cascade: false,
-            }),
+            &Mutation::DropFunction(
+                crate::_internal::analysis::mutations::DropFunctionMutation {
+                    signatures: vec![crate::_internal::analysis::facts::FunctionSigFact {
+                        name: crate::_internal::ast::identifiers::QualifiedName::new(
+                            Some(crate::_internal::ast::identifiers::Ident::new(
+                                "public", false,
+                            )),
+                            crate::_internal::ast::identifiers::Ident::new("work", false),
+                        ),
+                        params: vec!["integer".to_string()],
+                    }],
+                    if_exists: false,
+                    cascade: false,
+                },
+            ),
             None,
         );
         assert_eq!(result, MutationResult::Skipped);
         assert!(matches!(
             state.local.functions.get(&function_id),
-            Some(crate::_internal::model::function::FunctionOverlay::Present(_))
+            Some(crate::_internal::model::function::FunctionOverlay::Present(
+                _
+            ))
         ));
         assert!(
             state
@@ -3704,7 +3818,9 @@ mod evidence_tests {
         };
         let signature = || crate::_internal::analysis::facts::FunctionSigFact {
             name: crate::_internal::ast::identifiers::QualifiedName::new(
-                Some(crate::_internal::ast::identifiers::Ident::new("public", false)),
+                Some(crate::_internal::ast::identifiers::Ident::new(
+                    "public", false,
+                )),
                 crate::_internal::ast::identifiers::Ident::new("work", false),
             ),
             params: vec!["integer".to_string()],
@@ -3718,11 +3834,13 @@ mod evidence_tests {
         let mut procedure_state = AnalysisState::new(procedure_cache);
         assert_eq!(
             procedure_state.apply(
-                &Mutation::DropProcedure(crate::_internal::analysis::mutations::DropProcedureMutation {
-                    signatures: vec![signature()],
-                    if_exists: false,
-                    cascade: true,
-                }),
+                &Mutation::DropProcedure(
+                    crate::_internal::analysis::mutations::DropProcedureMutation {
+                        signatures: vec![signature()],
+                        if_exists: false,
+                        cascade: true,
+                    }
+                ),
                 None,
             ),
             MutationResult::Skipped
@@ -3743,11 +3861,13 @@ mod evidence_tests {
         let mut aggregate_state = AnalysisState::new(aggregate_cache);
         assert_eq!(
             aggregate_state.apply(
-                &Mutation::DropAggregate(crate::_internal::analysis::mutations::DropAggregateMutation {
-                    signatures: vec![signature()],
-                    if_exists: false,
-                    cascade: true,
-                }),
+                &Mutation::DropAggregate(
+                    crate::_internal::analysis::mutations::DropAggregateMutation {
+                        signatures: vec![signature()],
+                        if_exists: false,
+                        cascade: true,
+                    }
+                ),
                 None,
             ),
             MutationResult::Skipped
@@ -3780,12 +3900,13 @@ mod evidence_tests {
         ));
 
         let mut state = AnalysisState::new(DbCache::new());
-        let concurrent_cascade = Mutation::DropIndex(crate::_internal::analysis::mutations::DropIndex {
-            ids: Vec::new(),
-            if_exists: true,
-            concurrently: true,
-            cascade: true,
-        });
+        let concurrent_cascade =
+            Mutation::DropIndex(crate::_internal::analysis::mutations::DropIndex {
+                ids: Vec::new(),
+                if_exists: true,
+                concurrently: true,
+                cascade: true,
+            });
         assert!(matches!(
             state.apply(&concurrent_cascade, None),
             MutationResult::Conflict { .. }
@@ -3796,21 +3917,22 @@ mod evidence_tests {
             state.apply(&Mutation::BeginTransaction, None),
             MutationResult::Applied
         );
-        let concurrent_create = Mutation::CreateIndex(crate::_internal::analysis::mutations::CreateIndex {
-            id: ObjectId::new("public", "idx"),
-            table: ObjectId::new("public", "table"),
-            if_not_exists: false,
-            concurrently: true,
-            using_method: None,
-            has_predicate: false,
-            unique: false,
-            key_columns: vec!["id".to_string()],
-            included_columns: Vec::new(),
-            has_expression_keys: false,
-            has_default_sort_order: true,
-            has_default_opclasses: true,
-            has_default_collations: true,
-        });
+        let concurrent_create =
+            Mutation::CreateIndex(crate::_internal::analysis::mutations::CreateIndex {
+                id: ObjectId::new("public", "idx"),
+                table: ObjectId::new("public", "table"),
+                if_not_exists: false,
+                concurrently: true,
+                using_method: None,
+                has_predicate: false,
+                unique: false,
+                key_columns: vec!["id".to_string()],
+                included_columns: Vec::new(),
+                has_expression_keys: false,
+                has_default_sort_order: true,
+                has_default_opclasses: true,
+                has_default_collations: true,
+            });
         assert!(matches!(
             state.apply(&concurrent_create, None),
             MutationResult::Conflict { .. }
@@ -4114,16 +4236,18 @@ mod evidence_tests {
             table_with_columns(child.clone(), &["parent_id"]),
         );
         cache.insert_baseline(parent.clone(), table_with_columns(parent.clone(), &["id"]));
-        cache.foreign_keys.push(crate::_internal::db::cache::ForeignKeyCache {
-            constraint_name: "child_parent_fkey".into(),
-            from_table: child.clone(),
-            to_table: parent.clone(),
-            from_columns: vec!["parent_id".into()],
-            to_columns: vec!["id".into()],
-            pk_fk_equality_operators: Vec::new(),
-            pk_pk_equality_operators: vec!["=".into()],
-            fk_fk_equality_operators: vec!["=".into()],
-        });
+        cache
+            .foreign_keys
+            .push(crate::_internal::db::cache::ForeignKeyCache {
+                constraint_name: "child_parent_fkey".into(),
+                from_table: child.clone(),
+                to_table: parent.clone(),
+                from_columns: vec!["parent_id".into()],
+                to_columns: vec!["id".into()],
+                pk_fk_equality_operators: Vec::new(),
+                pk_pk_equality_operators: vec!["=".into()],
+                fk_fk_equality_operators: vec!["=".into()],
+            });
 
         let state = AnalysisState::with_baseline(cache, true);
         assert_eq!(*state.confidence(), Confidence::Tainted);
@@ -4154,16 +4278,18 @@ mod evidence_tests {
             table_with_columns(child.clone(), &["parent_id"]),
         );
         cache.insert_baseline(parent.clone(), table_with_columns(parent.clone(), &["id"]));
-        cache.foreign_keys.push(crate::_internal::db::cache::ForeignKeyCache {
-            constraint_name: "child_parent_fkey".into(),
-            from_table: child.clone(),
-            to_table: parent.clone(),
-            from_columns: vec!["parent_id".into()],
-            to_columns: vec!["id".into()],
-            pk_fk_equality_operators: vec!["pg_catalog.=(integer,integer)".into()],
-            pk_pk_equality_operators: vec!["pg_catalog.=(integer,integer)".into()],
-            fk_fk_equality_operators: vec!["pg_catalog.=(integer,integer)".into()],
-        });
+        cache
+            .foreign_keys
+            .push(crate::_internal::db::cache::ForeignKeyCache {
+                constraint_name: "child_parent_fkey".into(),
+                from_table: child.clone(),
+                to_table: parent.clone(),
+                from_columns: vec!["parent_id".into()],
+                to_columns: vec!["id".into()],
+                pk_fk_equality_operators: vec!["pg_catalog.=(integer,integer)".into()],
+                pk_pk_equality_operators: vec!["pg_catalog.=(integer,integer)".into()],
+                fk_fk_equality_operators: vec!["pg_catalog.=(integer,integer)".into()],
+            });
 
         let state = AnalysisState::with_baseline(cache, true);
         assert_eq!(*state.confidence(), Confidence::Exact);

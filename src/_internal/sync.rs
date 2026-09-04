@@ -169,7 +169,9 @@ fn sequence_kind_from_pg(
 ) -> Result<crate::_internal::model::sequence::SequenceKind> {
     match dependency_type {
         Some("i") => Ok(crate::_internal::model::sequence::SequenceKind::Identity),
-        Some("a") if has_nextval_default => Ok(crate::_internal::model::sequence::SequenceKind::SerialLike),
+        Some("a") if has_nextval_default => {
+            Ok(crate::_internal::model::sequence::SequenceKind::SerialLike)
+        }
         Some("a") => Ok(crate::_internal::model::sequence::SequenceKind::Owned),
         None => Ok(crate::_internal::model::sequence::SequenceKind::Standalone),
         Some(other) => anyhow::bail!("unsupported pg_depend type '{other}'"),
@@ -943,7 +945,9 @@ fn load_scoped_external_routine_dependencies(
             let args: Vec<String> = row.try_get("arg_types")?;
             let args = args
                 .iter()
-                .map(|arg| crate::_internal::analysis::resolver::Resolver::normalize_function_arg_type(arg))
+                .map(|arg| {
+                    crate::_internal::analysis::resolver::Resolver::normalize_function_arg_type(arg)
+                })
                 .collect::<Vec<_>>();
             Ok(ObjectId::new(
                 row.try_get::<_, String>("ref_schema")?,
@@ -1376,22 +1380,24 @@ fn load_relations_and_columns(
                 relation_id
             )
         })?;
-        relation.columns.push(crate::_internal::model::column::Column {
-            name: row.try_get("column_name").context("column name")?,
-            data_type: Some(row.try_get("type_name").context("column type")?),
-            type_id: None,
-            is_nullable: !row
-                .try_get::<_, bool>("not_null")
-                .context("column nullability")?,
-            default: None,
-            avg_width: row.try_get("avg_width").context("column average width")?,
-            default_expr_text: row
-                .try_get("default_expr_text")
-                .context("column default expression")?,
-            type_modifier: row
-                .try_get("type_modifier")
-                .context("column type modifier")?,
-        });
+        relation
+            .columns
+            .push(crate::_internal::model::column::Column {
+                name: row.try_get("column_name").context("column name")?,
+                data_type: Some(row.try_get("type_name").context("column type")?),
+                type_id: None,
+                is_nullable: !row
+                    .try_get::<_, bool>("not_null")
+                    .context("column nullability")?,
+                default: None,
+                avg_width: row.try_get("avg_width").context("column average width")?,
+                default_expr_text: row
+                    .try_get("default_expr_text")
+                    .context("column default expression")?,
+                type_modifier: row
+                    .try_get("type_modifier")
+                    .context("column type modifier")?,
+            });
     }
     Ok(relations)
 }
@@ -1567,10 +1573,12 @@ fn load_triggers(
                     row.try_get::<_, String>("function_name")
                         .context("trigger function name")?,
                 ),
-                enabled_mode: crate::_internal::model::trigger::TriggerEnableMode::from_pg_code(&enabled_mode)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("unknown pg_trigger.tgenabled value {enabled_mode}")
-                    })?,
+                enabled_mode: crate::_internal::model::trigger::TriggerEnableMode::from_pg_code(
+                    &enabled_mode,
+                )
+                .ok_or_else(|| {
+                    anyhow::anyhow!("unknown pg_trigger.tgenabled value {enabled_mode}")
+                })?,
             })
         })
         .collect()
@@ -1682,7 +1690,7 @@ fn load_constraint_keys(
         FROM pg_constraint con
         JOIN pg_class c ON c.oid = con.conrelid
         JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE con.contype IN ('p', 'u')
+        WHERE con.contype IN ('p', 'u', 'n')
           AND c.relkind IN ('r', 'p')
           AND n.nspname NOT IN ('pg_catalog', 'information_schema')
           {schema_filter_with_fk};
@@ -2290,7 +2298,9 @@ fn load_routines(
             let arg_types = raw_arg_types
                 .iter()
                 .map(|arg_type| {
-                    crate::_internal::analysis::resolver::Resolver::normalize_function_arg_type(arg_type)
+                    crate::_internal::analysis::resolver::Resolver::normalize_function_arg_type(
+                        arg_type,
+                    )
                 })
                 .collect::<Vec<_>>();
             let id = ObjectId::new(
@@ -2393,7 +2403,8 @@ fn load_types(
 fn load_publications(
     client: &mut impl GenericClient,
     pg_version_num: u32,
-) -> Result<std::collections::HashMap<String, crate::_internal::model::replication::PublicationState>> {
+) -> Result<std::collections::HashMap<String, crate::_internal::model::replication::PublicationState>>
+{
     let publication_query = if pg_version_num >= 180_000 {
         r#"
             SELECT p.oid, p.pubname::text AS publication_name,
@@ -2526,33 +2537,36 @@ fn load_publications(
         let publication = publications
             .get_mut(name)
             .with_context(|| format!("publication '{name}' disappeared during assembly"))?;
-        let crate::_internal::analysis::facts::PublicationScope::Explicit(objects) = &mut publication.scope
+        let crate::_internal::analysis::facts::PublicationScope::Explicit(objects) =
+            &mut publication.scope
         else {
             continue;
         };
-        objects.push(crate::_internal::analysis::facts::PublicationObjectFact::Table {
-            name: crate::_internal::ast::identifiers::QualifiedName::new(
-                Some(crate::_internal::ast::identifiers::Ident::new(
-                    row.try_get::<_, String>("schema_name")
-                        .context("publication relation schema")?,
-                    true,
-                )),
-                crate::_internal::ast::identifiers::Ident::new(
-                    row.try_get::<_, String>("relation_name")
-                        .context("publication relation name")?,
-                    true,
+        objects.push(
+            crate::_internal::analysis::facts::PublicationObjectFact::Table {
+                name: crate::_internal::ast::identifiers::QualifiedName::new(
+                    Some(crate::_internal::ast::identifiers::Ident::new(
+                        row.try_get::<_, String>("schema_name")
+                            .context("publication relation schema")?,
+                        true,
+                    )),
+                    crate::_internal::ast::identifiers::Ident::new(
+                        row.try_get::<_, String>("relation_name")
+                            .context("publication relation name")?,
+                        true,
+                    ),
                 ),
-            ),
-            only: true,
-            include_partitions: false,
-            columns: row
-                .try_get("columns")
-                .context("publication relation column list")?,
-            row_filter: row
-                .try_get::<_, Option<String>>("row_filter")
-                .context("publication relation row filter")?
-                .map(crate::_internal::analysis::facts::PublicationRowFilter::CatalogSql),
-        });
+                only: true,
+                include_partitions: false,
+                columns: row
+                    .try_get("columns")
+                    .context("publication relation column list")?,
+                row_filter: row
+                    .try_get::<_, Option<String>>("row_filter")
+                    .context("publication relation row filter")?
+                    .map(crate::_internal::analysis::facts::PublicationRowFilter::CatalogSql),
+            },
+        );
     }
 
     if pg_version_num >= 150_000 {
@@ -2596,7 +2610,9 @@ fn load_publications(
 fn load_subscriptions(
     client: &mut impl GenericClient,
     pg_version_num: u32,
-) -> Result<std::collections::HashMap<String, crate::_internal::model::replication::SubscriptionState>> {
+) -> Result<
+    std::collections::HashMap<String, crate::_internal::model::replication::SubscriptionState>,
+> {
     // Every version-specific query deliberately omits pg_subscription.subconninfo.
     let query = match pg_version_num {
         170_000.. => {

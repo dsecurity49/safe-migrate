@@ -99,7 +99,8 @@ impl Rule for BrokenComputeRule {
             for sig in &drop.signatures {
                 let sig_str = format!("{}({})", sig.name.name.resolve(), sig.params.join(","));
                 let schema = context.state().resolve_function_schema(&sig.name, &sig_str);
-                let function_id = crate::_internal::ast::identifiers::ObjectId::new(schema, sig_str);
+                let function_id =
+                    crate::_internal::ast::identifiers::ObjectId::new(schema, sig_str);
 
                 let affected = context
                     .state()

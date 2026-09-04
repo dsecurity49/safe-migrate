@@ -29,8 +29,10 @@ impl AnalysisState {
             }
             Some(FunctionOverlay::Present(_)) => ObjectLookup::WrongKind,
             Some(FunctionOverlay::Dropped) => ObjectLookup::Tombstone,
-            None if self
-                .baseline_covers_family_object(id, crate::_internal::db::cache::CatalogFamily::Routines) =>
+            None if self.baseline_covers_family_object(
+                id,
+                crate::_internal::db::cache::CatalogFamily::Routines,
+            ) =>
             {
                 ObjectLookup::AuthoritativelyAbsent
             }
@@ -328,7 +330,10 @@ impl AnalysisState {
         }
 
         if targets.iter().any(|(id, _)| {
-            self.baseline_scoped_family_object(id, crate::_internal::db::cache::CatalogFamily::Routines)
+            self.baseline_scoped_family_object(
+                id,
+                crate::_internal::db::cache::CatalogFamily::Routines,
+            )
         }) {
             self.taint(
                 EvidenceCode::CatalogCoverageIncomplete,
@@ -570,7 +575,10 @@ impl AnalysisState {
             }
         }
         if targets.iter().any(|id| {
-            self.baseline_scoped_family_object(id, crate::_internal::db::cache::CatalogFamily::Routines)
+            self.baseline_scoped_family_object(
+                id,
+                crate::_internal::db::cache::CatalogFamily::Routines,
+            )
         }) {
             self.taint(
                 EvidenceCode::CatalogCoverageIncomplete,
@@ -739,7 +747,10 @@ impl AnalysisState {
             }
         }
         if targets.iter().any(|id| {
-            self.baseline_scoped_family_object(id, crate::_internal::db::cache::CatalogFamily::Routines)
+            self.baseline_scoped_family_object(
+                id,
+                crate::_internal::db::cache::CatalogFamily::Routines,
+            )
         }) {
             self.taint(
                 EvidenceCode::CatalogCoverageIncomplete,

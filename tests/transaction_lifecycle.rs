@@ -273,7 +273,9 @@ mod transaction_lifecycle_tests {
             .relations
             .get(&object_id("public", "t"))
             .and_then(|overlay| match overlay {
-                safe_migrate::_internal::analysis::state::RelationOverlay::Present(relation) => Some(relation),
+                safe_migrate::_internal::analysis::state::RelationOverlay::Present(relation) => {
+                    Some(relation)
+                }
                 safe_migrate::_internal::analysis::state::RelationOverlay::Dropped => None,
             })
             .expect("table should remain present");
@@ -522,7 +524,9 @@ mod transaction_lifecycle_tests {
             .relations
             .get(&object_id("public", "t"))
             .and_then(|overlay| match overlay {
-                safe_migrate::_internal::analysis::state::RelationOverlay::Present(relation) => Some(relation),
+                safe_migrate::_internal::analysis::state::RelationOverlay::Present(relation) => {
+                    Some(relation)
+                }
                 safe_migrate::_internal::analysis::state::RelationOverlay::Dropped => None,
             })
             .expect("table should remain present");
@@ -561,7 +565,9 @@ mod transaction_lifecycle_tests {
             .relations
             .get(&object_id("public", "t"))
             .and_then(|overlay| match overlay {
-                safe_migrate::_internal::analysis::state::RelationOverlay::Present(relation) => Some(relation),
+                safe_migrate::_internal::analysis::state::RelationOverlay::Present(relation) => {
+                    Some(relation)
+                }
                 safe_migrate::_internal::analysis::state::RelationOverlay::Dropped => None,
             })
             .expect("failed compound statement must preserve the table");

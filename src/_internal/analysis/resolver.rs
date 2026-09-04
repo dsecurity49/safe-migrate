@@ -110,7 +110,12 @@ impl Resolver {
         let base_id = Self::resolve_creation_name(name, state);
         let sig = params
             .iter()
-            .filter(|p| !matches!(&p.mode, crate::_internal::analysis::facts::ParamModeFact::Out))
+            .filter(|p| {
+                !matches!(
+                    &p.mode,
+                    crate::_internal::analysis::facts::ParamModeFact::Out
+                )
+            })
             .map(|p| p.ty.clone())
             .collect::<Vec<_>>()
             .join(",");

@@ -6,7 +6,9 @@ mod phase10_bug_fixes_and_sorting_tests {
     use safe_migrate::_internal::ast::identifiers::ObjectId;
     use safe_migrate::_internal::db::cache::DbCache;
     use safe_migrate::_internal::model::relation::{Persistence, RelationKind};
-    use safe_migrate::_internal::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
+    use safe_migrate::_internal::report::violations::{
+        ObjectKind, OperationKind, Violation, ViolationTier,
+    };
 
     fn baseline_index(
         index_id: ObjectId,
@@ -1282,13 +1284,14 @@ mod phase10_bug_fixes_and_sorting_tests {
             )
             .unwrap();
 
-        let tier1_violations: Vec<&safe_migrate::_internal::report::violations::Violation> = violations
-            .iter()
-            .filter(|v| {
-                v.tier == safe_migrate::_internal::report::violations::ViolationTier::Tier1
-                    && v.rule_id == "blocking-constraint"
-            })
-            .collect();
+        let tier1_violations: Vec<&safe_migrate::_internal::report::violations::Violation> =
+            violations
+                .iter()
+                .filter(|v| {
+                    v.tier == safe_migrate::_internal::report::violations::ViolationTier::Tier1
+                        && v.rule_id == "blocking-constraint"
+                })
+                .collect();
 
         assert!(
             tier1_violations.is_empty(),

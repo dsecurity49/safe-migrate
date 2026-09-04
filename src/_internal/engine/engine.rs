@@ -432,7 +432,8 @@ impl SafeMigrateEngine {
                         }
                         // A taint produced by this statement must not
                         // downgrade that same statement's findings.
-                        if statement_confidence == crate::_internal::analysis::state::Confidence::Tainted
+                        if statement_confidence
+                            == crate::_internal::analysis::state::Confidence::Tainted
                             && v.tier == crate::_internal::report::violations::ViolationTier::Tier1
                         {
                             v.tier = crate::_internal::report::violations::ViolationTier::Tier2;

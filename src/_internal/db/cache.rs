@@ -867,7 +867,8 @@ impl DbCache {
                 crate::_internal::analysis::facts::PublicationScope::AllTables { except } => {
                     let mut seen = HashSet::new();
                     for table in except {
-                        let resolved = crate::_internal::ast::identifiers::Ident::new(table, false).resolve();
+                        let resolved =
+                            crate::_internal::ast::identifiers::Ident::new(table, false).resolve();
                         if resolved.is_empty() || !seen.insert(resolved) {
                             return Err(format!(
                                 "publication '{}' has an empty or duplicate EXCEPT table",
@@ -1244,18 +1245,16 @@ impl DbCache {
                     key.table_id, key.constraint_name
                 ));
             }
-            let expected_kind = if key.is_primary {
-                ConstraintKind::PrimaryKey
-            } else {
-                ConstraintKind::Unique
-            };
-            if !self.constraints.iter().any(|constraint| {
+            let valid_target_kind = self.constraints.iter().any(|constraint| {
                 constraint.table_id == key.table_id
                     && constraint.name == key.constraint_name
-                    && constraint.kind == expected_kind
-            }) {
+                    && (constraint.kind == ConstraintKind::PrimaryKey
+                        || constraint.kind == ConstraintKind::Unique
+                        || constraint.kind == ConstraintKind::NotNull)
+            });
+            if !valid_target_kind {
                 return Err(format!(
-                    "constraint key '{}.{}' has no matching primary or unique constraint",
+                    "constraint key '{}.{}' has no matching primary, unique, or not-null constraint",
                     key.table_id, key.constraint_name
                 ));
             }
@@ -2336,7 +2335,9 @@ mod tests {
     fn current_cache_rejects_malformed_publication_scope_metadata() {
         let table = crate::_internal::analysis::facts::PublicationObjectFact::Table {
             name: crate::_internal::ast::identifiers::QualifiedName::new(
-                Some(crate::_internal::ast::identifiers::Ident::new("public", false)),
+                Some(crate::_internal::ast::identifiers::Ident::new(
+                    "public", false,
+                )),
                 crate::_internal::ast::identifiers::Ident::new("items", false),
             ),
             only: false,

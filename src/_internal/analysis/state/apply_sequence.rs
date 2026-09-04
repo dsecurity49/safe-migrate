@@ -207,8 +207,10 @@ impl AnalysisState {
         match self.local.sequences.get(id) {
             Some(SequenceOverlay::Present(_)) => SequenceLookup::Present,
             Some(SequenceOverlay::Dropped) => SequenceLookup::Tombstone,
-            None if self
-                .baseline_covers_family_object(id, crate::_internal::db::cache::CatalogFamily::Sequences) =>
+            None if self.baseline_covers_family_object(
+                id,
+                crate::_internal::db::cache::CatalogFamily::Sequences,
+            ) =>
             {
                 SequenceLookup::AuthoritativelyAbsent
             }
@@ -535,11 +537,12 @@ impl AnalysisState {
         }
         if present.iter().any(|id| {
             self.baseline_sequences.contains(id)
-                && (!self.baseline_has_coverage(crate::_internal::db::cache::CatalogFamily::Dependencies)
-                    || self.baseline_scoped_family_object(
-                        id,
-                        crate::_internal::db::cache::CatalogFamily::Sequences,
-                    ))
+                && (!self.baseline_has_coverage(
+                    crate::_internal::db::cache::CatalogFamily::Dependencies,
+                ) || self.baseline_scoped_family_object(
+                    id,
+                    crate::_internal::db::cache::CatalogFamily::Sequences,
+                ))
         }) {
             self.taint(
                 EvidenceCode::CatalogCoverageIncomplete,

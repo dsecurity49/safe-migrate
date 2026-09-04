@@ -34,10 +34,12 @@ impl Rule for DriftDetectionRule {
         let mut violations = Vec::new();
 
         match context.mutation() {
-            Mutation::Opaque(crate::_internal::analysis::mutations::OpaqueMutation::UnresolvedReference {
-                object_kind,
-                object_name,
-            }) => {
+            Mutation::Opaque(
+                crate::_internal::analysis::mutations::OpaqueMutation::UnresolvedReference {
+                    object_kind,
+                    object_name,
+                },
+            ) => {
                 violations.push(Violation { source_range: None,
                     rule_id: self.id(),
                         operation_kind: OperationKind::UnresolvedReference,
@@ -317,7 +319,8 @@ impl Rule for DriftDetectionRule {
                     let schema = state.resolve_function_schema(&signature.name, &signature_name);
                     let id = ObjectId::new(schema, signature_name);
                     let procedure_exists = pre_state.functions.get(&id).is_some_and(|routine| {
-                        routine.routine_kind == crate::_internal::model::function::RoutineKind::Procedure
+                        routine.routine_kind
+                            == crate::_internal::model::function::RoutineKind::Procedure
                     });
                     if !d.if_exists && !procedure_exists {
                         violations.push(Violation {
@@ -345,7 +348,8 @@ impl Rule for DriftDetectionRule {
                         .functions
                         .get(&procedure.id)
                         .is_some_and(|routine| {
-                            routine.routine_kind == crate::_internal::model::function::RoutineKind::Procedure
+                            routine.routine_kind
+                                == crate::_internal::model::function::RoutineKind::Procedure
                         });
                 if !procedure_exists {
                     violations.push(Violation {

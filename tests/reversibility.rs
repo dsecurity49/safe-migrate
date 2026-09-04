@@ -36,12 +36,14 @@ mod reversibility_tests {
             Persistence::Permanent,
             0,
         );
-        rel.apply_column_action(&safe_migrate::_internal::model::relation::ColumnAction::Add {
-            name: "id".to_string(),
-            data_type: Some("int".to_string()),
-            not_null: false,
-            default: None,
-        });
+        rel.apply_column_action(
+            &safe_migrate::_internal::model::relation::ColumnAction::Add {
+                name: "id".to_string(),
+                data_type: Some("int".to_string()),
+                not_null: false,
+                default: None,
+            },
+        );
         cache.insert_baseline(tid.clone(), rel);
         let mut state = AnalysisState::new(cache);
         let v = engine
@@ -160,12 +162,14 @@ mod reversibility_tests {
             Persistence::Permanent,
             0,
         );
-        rel.apply_column_action(&safe_migrate::_internal::model::relation::ColumnAction::Add {
-            name: "val".to_string(),
-            data_type: Some("int".to_string()),
-            not_null: false,
-            default: None,
-        });
+        rel.apply_column_action(
+            &safe_migrate::_internal::model::relation::ColumnAction::Add {
+                name: "val".to_string(),
+                data_type: Some("int".to_string()),
+                not_null: false,
+                default: None,
+            },
+        );
         cache.insert_baseline(tid, rel);
         let mut state = AnalysisState::new(cache);
 
@@ -193,12 +197,14 @@ mod reversibility_tests {
             Persistence::Permanent,
             0,
         );
-        rel.apply_column_action(&safe_migrate::_internal::model::relation::ColumnAction::Add {
-            name: "val".to_string(),
-            data_type: Some("bigint".to_string()),
-            not_null: false,
-            default: None,
-        });
+        rel.apply_column_action(
+            &safe_migrate::_internal::model::relation::ColumnAction::Add {
+                name: "val".to_string(),
+                data_type: Some("bigint".to_string()),
+                not_null: false,
+                default: None,
+            },
+        );
         cache.insert_baseline(tid, rel);
         let mut state = AnalysisState::new(cache);
         // Narrowing bigint -> int is unsafe
@@ -227,12 +233,14 @@ mod reversibility_tests {
             Persistence::Permanent,
             0,
         );
-        rel.apply_column_action(&safe_migrate::_internal::model::relation::ColumnAction::Add {
-            name: "data".to_string(),
-            data_type: Some("text".to_string()),
-            not_null: false,
-            default: None,
-        });
+        rel.apply_column_action(
+            &safe_migrate::_internal::model::relation::ColumnAction::Add {
+                name: "data".to_string(),
+                data_type: Some("text".to_string()),
+                not_null: false,
+                default: None,
+            },
+        );
         cache.insert_baseline(tid, rel);
         let mut state = AnalysisState::new(cache);
         // text -> varchar(50) is lossy narrowing

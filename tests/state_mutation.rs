@@ -3,7 +3,9 @@ mod common;
 mod state_mutation_tests {
     use crate::common::*;
     use safe_migrate::_internal::analysis::facts::FunctionSigFact;
-    use safe_migrate::_internal::analysis::graph::{DependencyEdge, DependencyGraph, DependencyKind};
+    use safe_migrate::_internal::analysis::graph::{
+        DependencyEdge, DependencyGraph, DependencyKind,
+    };
     use safe_migrate::_internal::analysis::mutations::{
         DropAggregateMutation, DropFunctionMutation, DropProcedureMutation, Mutation,
     };
@@ -571,24 +573,26 @@ mod state_mutation_tests {
             });
         }
         cache.insert_baseline(table_id.clone(), table);
-        cache.indexes.push(safe_migrate::_internal::db::cache::IndexCache {
-            index_id: index_id.clone(),
-            table_id: table_id.clone(),
-            using_method: "btree".to_string(),
-            key_columns: Vec::new(),
-            included_columns: Vec::new(),
-            dependency_columns: vec!["note".to_string()],
-            dependency_columns_known: true,
-            has_expression_keys: true,
-            has_predicate: false,
-            is_unique: false,
-            is_valid: true,
-            is_ready: true,
-            is_live: true,
-            has_default_sort_order: true,
-            has_default_opclasses: true,
-            has_default_collations: true,
-        });
+        cache
+            .indexes
+            .push(safe_migrate::_internal::db::cache::IndexCache {
+                index_id: index_id.clone(),
+                table_id: table_id.clone(),
+                using_method: "btree".to_string(),
+                key_columns: Vec::new(),
+                included_columns: Vec::new(),
+                dependency_columns: vec!["note".to_string()],
+                dependency_columns_known: true,
+                has_expression_keys: true,
+                has_predicate: false,
+                is_unique: false,
+                is_valid: true,
+                is_ready: true,
+                is_live: true,
+                has_default_sort_order: true,
+                has_default_opclasses: true,
+                has_default_collations: true,
+            });
 
         let engine = setup_engine();
         let mut state = safe_migrate::api::AnalysisState::new(cache);
@@ -3362,7 +3366,9 @@ mod state_mutation_tests {
                 scope: safe_migrate::_internal::analysis::facts::PublicationScope::Explicit(vec![
                     safe_migrate::_internal::analysis::facts::PublicationObjectFact::Table {
                         name: safe_migrate::_internal::ast::identifiers::QualifiedName::new(
-                            Some(safe_migrate::_internal::ast::identifiers::Ident::new("public", true)),
+                            Some(safe_migrate::_internal::ast::identifiers::Ident::new(
+                                "public", true,
+                            )),
                             safe_migrate::_internal::ast::identifiers::Ident::new("first", true),
                         ),
                         only: true,
@@ -3407,12 +3413,14 @@ mod state_mutation_tests {
                 .any(|violation| violation.rule_id == "chain-conflict")
         );
         assert_eq!(state.local.confidence, Confidence::Exact);
-        let Some(safe_migrate::_internal::model::replication::PublicationOverlay::Present(publication)) =
-            state.local.publications.get("renamed_changes")
+        let Some(safe_migrate::_internal::model::replication::PublicationOverlay::Present(
+            publication,
+        )) = state.local.publications.get("renamed_changes")
         else {
             panic!("renamed publication missing");
         };
-        let safe_migrate::_internal::analysis::facts::PublicationScope::Explicit(objects) = &publication.scope
+        let safe_migrate::_internal::analysis::facts::PublicationScope::Explicit(objects) =
+            &publication.scope
         else {
             panic!("expected explicit publication scope");
         };
@@ -3425,8 +3433,9 @@ mod state_mutation_tests {
             ) && edge.dependent == object_id("public", "second")
         }));
 
-        let Some(safe_migrate::_internal::model::replication::SubscriptionOverlay::Present(subscription)) =
-            state.local.subscriptions.get("renamed_subscriber")
+        let Some(safe_migrate::_internal::model::replication::SubscriptionOverlay::Present(
+            subscription,
+        )) = state.local.subscriptions.get("renamed_subscriber")
         else {
             panic!("renamed subscription missing");
         };
@@ -3438,12 +3447,14 @@ mod state_mutation_tests {
         }));
 
         engine.analyze("DROP TABLE second;", &mut state).unwrap();
-        let Some(safe_migrate::_internal::model::replication::PublicationOverlay::Present(publication)) =
-            state.local.publications.get("renamed_changes")
+        let Some(safe_migrate::_internal::model::replication::PublicationOverlay::Present(
+            publication,
+        )) = state.local.publications.get("renamed_changes")
         else {
             panic!("publication missing after table drop");
         };
-        let safe_migrate::_internal::analysis::facts::PublicationScope::Explicit(objects) = &publication.scope
+        let safe_migrate::_internal::analysis::facts::PublicationScope::Explicit(objects) =
+            &publication.scope
         else {
             panic!("expected explicit publication scope");
         };
@@ -3494,8 +3505,9 @@ mod state_mutation_tests {
                 state.apply(&mutation, None),
                 safe_migrate::_internal::analysis::state::MutationResult::Conflict { .. }
             ));
-            let Some(safe_migrate::_internal::model::replication::SubscriptionOverlay::Present(subscription)) =
-                state.local.subscriptions.get("subscriber")
+            let Some(safe_migrate::_internal::model::replication::SubscriptionOverlay::Present(
+                subscription,
+            )) = state.local.subscriptions.get("subscriber")
             else {
                 panic!("subscription missing");
             };
@@ -3535,8 +3547,9 @@ mod state_mutation_tests {
 
         engine.analyze("DROP TABLE entries;", &mut state).unwrap();
 
-        let Some(safe_migrate::_internal::model::replication::PublicationOverlay::Present(publication)) =
-            state.local.publications.get("changes")
+        let Some(safe_migrate::_internal::model::replication::PublicationOverlay::Present(
+            publication,
+        )) = state.local.publications.get("changes")
         else {
             panic!("publication missing");
         };
@@ -3559,7 +3572,9 @@ mod state_mutation_tests {
                 scope: safe_migrate::_internal::analysis::facts::PublicationScope::Explicit(vec![
                     safe_migrate::_internal::analysis::facts::PublicationObjectFact::Table {
                         name: safe_migrate::_internal::ast::identifiers::QualifiedName::new(
-                            Some(safe_migrate::_internal::ast::identifiers::Ident::new("public", true)),
+                            Some(safe_migrate::_internal::ast::identifiers::Ident::new(
+                                "public", true,
+                            )),
                             safe_migrate::_internal::ast::identifiers::Ident::new("parent", true),
                         ),
                         only: true,
@@ -3576,7 +3591,7 @@ mod state_mutation_tests {
         let mut inherited_state = safe_migrate::api::AnalysisState::new(cache.clone());
         engine
             .analyze(
-                "ALTER PUBLICATION changes DROP TABLE parent;",
+                "ALTER PUBLICATION changes DROP TABLE parent *;",
                 &mut inherited_state,
             )
             .unwrap();
@@ -3603,8 +3618,9 @@ mod state_mutation_tests {
                 &mut state,
             )
             .unwrap();
-        let Some(safe_migrate::_internal::model::replication::SubscriptionOverlay::Present(subscription)) =
-            state.local.subscriptions.get("deferred")
+        let Some(safe_migrate::_internal::model::replication::SubscriptionOverlay::Present(
+            subscription,
+        )) = state.local.subscriptions.get("deferred")
         else {
             panic!(
                 "deferred subscription missing: keys={:?} violations={create_violations:?}",
@@ -4404,15 +4420,15 @@ mod state_mutation_tests {
                     type_modifier: Some(-1),
                 },
             ]);
-        cache
-            .constraints
-            .push(safe_migrate::_internal::model::constraint::ConstraintState {
+        cache.constraints.push(
+            safe_migrate::_internal::model::constraint::ConstraintState {
                 table_id: table.clone(),
                 name: "accounts_note_check".to_string(),
                 kind: ConstraintKind::Check,
                 validated: true,
                 backing_index: None,
-            });
+            },
+        );
         cache
             .constraint_dependencies
             .push(ConstraintDependencyCache {
@@ -4537,15 +4553,15 @@ mod state_mutation_tests {
                 column_name: "derived_twice".to_string(),
                 depends_on_column: "derived".to_string(),
             });
-        cache
-            .constraints
-            .push(safe_migrate::_internal::model::constraint::ConstraintState {
+        cache.constraints.push(
+            safe_migrate::_internal::model::constraint::ConstraintState {
                 table_id: table.clone(),
                 name: "derived_twice_check".to_string(),
                 kind: ConstraintKind::Check,
                 validated: true,
                 backing_index: None,
-            });
+            },
+        );
         cache
             .constraint_dependencies
             .push(ConstraintDependencyCache {
@@ -4554,24 +4570,26 @@ mod state_mutation_tests {
                 columns: vec!["derived_twice".to_string()],
             });
         let derived_index = object_id("public", "metrics_derived_idx");
-        cache.indexes.push(safe_migrate::_internal::db::cache::IndexCache {
-            index_id: derived_index.clone(),
-            table_id: table.clone(),
-            using_method: "btree".to_string(),
-            key_columns: vec!["derived".to_string()],
-            included_columns: Vec::new(),
-            dependency_columns: vec!["derived".to_string()],
-            dependency_columns_known: true,
-            has_expression_keys: false,
-            has_predicate: false,
-            is_unique: false,
-            is_valid: true,
-            is_ready: true,
-            is_live: true,
-            has_default_sort_order: true,
-            has_default_opclasses: true,
-            has_default_collations: true,
-        });
+        cache
+            .indexes
+            .push(safe_migrate::_internal::db::cache::IndexCache {
+                index_id: derived_index.clone(),
+                table_id: table.clone(),
+                using_method: "btree".to_string(),
+                key_columns: vec!["derived".to_string()],
+                included_columns: Vec::new(),
+                dependency_columns: vec!["derived".to_string()],
+                dependency_columns_known: true,
+                has_expression_keys: false,
+                has_predicate: false,
+                is_unique: false,
+                is_valid: true,
+                is_ready: true,
+                is_live: true,
+                has_default_sort_order: true,
+                has_default_opclasses: true,
+                has_default_collations: true,
+            });
         let mut state = safe_migrate::api::AnalysisState::new(cache.clone());
 
         let findings = engine
@@ -5290,16 +5308,18 @@ mod state_mutation_tests {
             Persistence::Permanent,
             0,
         );
-        relation.columns.push(safe_migrate::_internal::model::column::Column {
-            name: "period".to_string(),
-            data_type: Some("int4range".to_string()),
-            type_id: None,
-            is_nullable: true,
-            default: None,
-            avg_width: None,
-            default_expr_text: None,
-            type_modifier: None,
-        });
+        relation
+            .columns
+            .push(safe_migrate::_internal::model::column::Column {
+                name: "period".to_string(),
+                data_type: Some("int4range".to_string()),
+                type_id: None,
+                is_nullable: true,
+                default: None,
+                avg_width: None,
+                default_expr_text: None,
+                type_modifier: None,
+            });
         let mut cache = DbCache::new();
         cache.insert_baseline(table_id, relation);
         let mut state = safe_migrate::api::AnalysisState::new(cache);
@@ -5997,13 +6017,13 @@ mod state_mutation_tests {
             .get_mut(&member)
             .unwrap()
             .can_administer_membership = vec![parent.clone()];
-        cache
-            .role_membership_grantors
-            .push(safe_migrate::_internal::model::role::RoleMembershipGrantor {
+        cache.role_membership_grantors.push(
+            safe_migrate::_internal::model::role::RoleMembershipGrantor {
                 member: member.clone(),
                 role: parent.clone(),
                 grantor: object_id("", "admin"),
-            });
+            },
+        );
         let mut state = safe_migrate::api::AnalysisState::new(cache);
 
         engine

@@ -1447,12 +1447,10 @@ mod tests {
         let StatementFact::CreateFunction(function) = fact else {
             panic!("expected create function fact");
         };
-        assert!(
-            function
-                .options
-                .iter()
-                .any(|option| matches!(option, crate::_internal::analysis::facts::FuncOptionFact::Window))
-        );
+        assert!(function.options.iter().any(|option| matches!(
+            option,
+            crate::_internal::analysis::facts::FuncOptionFact::Window
+        )));
     }
 
     #[test]
@@ -2093,7 +2091,10 @@ mod tests {
                 None
             }
         });
-        assert_eq!(owner, Some(crate::_internal::analysis::facts::RoleFact::SessionUser));
+        assert_eq!(
+            owner,
+            Some(crate::_internal::analysis::facts::RoleFact::SessionUser)
+        );
     }
 
     #[test]

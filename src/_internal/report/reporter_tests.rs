@@ -286,7 +286,8 @@ mod tests {
         unsafe {
             std::env::set_var("NO_COLOR", "1");
         }
-        let tier1_colored = crate::_internal::report::reporter::tier_label_colored(&ViolationTier::Tier1);
+        let tier1_colored =
+            crate::_internal::report::reporter::tier_label_colored(&ViolationTier::Tier1);
         assert_eq!(tier1_colored, "HALT");
 
         unsafe {
@@ -300,9 +301,9 @@ mod tests {
 
     #[test]
     fn test_inferred_schema_label() {
-        use crate::_internal::db::cache::DbCache;
         use crate::_internal::analysis::state::AnalysisState;
         use crate::_internal::ast::identifiers::{Ident, QualifiedName};
+        use crate::_internal::db::cache::DbCache;
 
         let state = AnalysisState::new(DbCache::new());
         // Resolve relation ID without schema

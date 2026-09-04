@@ -169,7 +169,9 @@ pub fn run_interactive(violations: &[Violation], confidence: &Confidence) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::_internal::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
+    use crate::_internal::report::violations::{
+        ObjectKind, OperationKind, Violation, ViolationTier,
+    };
 
     #[test]
     fn interactive_mode_explains_when_no_terminal_is_available() {

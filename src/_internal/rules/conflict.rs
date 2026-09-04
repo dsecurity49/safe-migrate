@@ -76,7 +76,8 @@ mod tests {
                 "column 'x' already added with type int, this file adds it again with type text"
                     .to_string(),
         };
-        let mutation = Mutation::Opaque(crate::_internal::analysis::mutations::OpaqueMutation::DynamicSql);
+        let mutation =
+            Mutation::Opaque(crate::_internal::analysis::mutations::OpaqueMutation::DynamicSql);
         let pre_state = crate::_internal::analysis::state::PreState {
             relations: HashMap::new(),
             functions: HashMap::new(),
@@ -88,7 +89,9 @@ mod tests {
             indexes: Vec::new(),
             baseline_foreign_keys: HashSet::new(),
         };
-        let state = crate::_internal::analysis::state::AnalysisState::new(crate::_internal::db::cache::DbCache::new());
+        let state = crate::_internal::analysis::state::AnalysisState::new(
+            crate::_internal::db::cache::DbCache::new(),
+        );
         let config = Config::default();
         let context = RuleContext::new(&mutation, &result, &pre_state, &state, &config, None);
         let violations = rule.evaluate(&context);
@@ -106,7 +109,8 @@ mod tests {
     fn test_conflict_rule_silent_on_applied() {
         let rule = ConflictRule;
         let result = MutationResult::Applied;
-        let mutation = Mutation::Opaque(crate::_internal::analysis::mutations::OpaqueMutation::DynamicSql);
+        let mutation =
+            Mutation::Opaque(crate::_internal::analysis::mutations::OpaqueMutation::DynamicSql);
         let pre_state = crate::_internal::analysis::state::PreState {
             relations: HashMap::new(),
             functions: HashMap::new(),
@@ -118,7 +122,9 @@ mod tests {
             indexes: Vec::new(),
             baseline_foreign_keys: HashSet::new(),
         };
-        let state = crate::_internal::analysis::state::AnalysisState::new(crate::_internal::db::cache::DbCache::new());
+        let state = crate::_internal::analysis::state::AnalysisState::new(
+            crate::_internal::db::cache::DbCache::new(),
+        );
         let config = Config::default();
         let context = RuleContext::new(&mutation, &result, &pre_state, &state, &config, None);
         let violations = rule.evaluate(&context);

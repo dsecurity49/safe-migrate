@@ -2,7 +2,9 @@ use super::{AnalysisState, MutationResult, ObjectLookup};
 use crate::_internal::analysis::evidence::{EvidenceCode, EvidenceScope};
 use crate::_internal::analysis::facts::{PublicationObjectFact, PublicationScope};
 use crate::_internal::analysis::graph::DependencyKind;
-use crate::_internal::analysis::mutations::{AlterSchemaMutation, CreateSchemaMutation, DropSchemaMutation};
+use crate::_internal::analysis::mutations::{
+    AlterSchemaMutation, CreateSchemaMutation, DropSchemaMutation,
+};
 use crate::_internal::ast::identifiers::ObjectId;
 use crate::_internal::model::function::FunctionOverlay;
 use crate::_internal::model::relation::RelationOverlay;

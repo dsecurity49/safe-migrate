@@ -15,7 +15,8 @@ pub struct NamespaceSnapshot {
     pub sequences: HashMap<ObjectId, SequenceOverlay>,
     pub publications: HashMap<String, crate::_internal::model::replication::PublicationOverlay>,
     pub triggers: HashMap<ObjectId, crate::_internal::model::trigger::TriggerOverlay>,
-    pub constraints: HashMap<(ObjectId, String), crate::_internal::model::constraint::ConstraintState>,
+    pub constraints:
+        HashMap<(ObjectId, String), crate::_internal::model::constraint::ConstraintState>,
     pub graph: Vec<DependencyEdge>,
     pub pending_validation: HashSet<(ObjectId, String)>,
     pub baseline_relations: HashSet<ObjectId>,

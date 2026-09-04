@@ -246,13 +246,16 @@ impl AnalysisState {
                             .relations
                             .get(id)
                             .and_then(|overlay| match overlay {
-                                crate::_internal::model::relation::RelationOverlay::Present(relation) => self
-                                    .authorize_relation_grant(
-                                        relation,
-                                        &privileges,
-                                        grantor.as_ref(),
-                                    ),
-                                crate::_internal::model::relation::RelationOverlay::Dropped => Some(false),
+                                crate::_internal::model::relation::RelationOverlay::Present(
+                                    relation,
+                                ) => self.authorize_relation_grant(
+                                    relation,
+                                    &privileges,
+                                    grantor.as_ref(),
+                                ),
+                                crate::_internal::model::relation::RelationOverlay::Dropped => {
+                                    Some(false)
+                                }
                             });
                     match authorization {
                         Some(true) => {}
@@ -537,13 +540,16 @@ impl AnalysisState {
                             .relations
                             .get(id)
                             .and_then(|overlay| match overlay {
-                                crate::_internal::model::relation::RelationOverlay::Present(relation) => self
-                                    .authorize_relation_grant(
-                                        relation,
-                                        &privileges,
-                                        grantor.as_ref(),
-                                    ),
-                                crate::_internal::model::relation::RelationOverlay::Dropped => Some(false),
+                                crate::_internal::model::relation::RelationOverlay::Present(
+                                    relation,
+                                ) => self.authorize_relation_grant(
+                                    relation,
+                                    &privileges,
+                                    grantor.as_ref(),
+                                ),
+                                crate::_internal::model::relation::RelationOverlay::Dropped => {
+                                    Some(false)
+                                }
                             });
                     match authorization {
                         Some(true) => {}

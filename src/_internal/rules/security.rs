@@ -41,9 +41,9 @@ impl Rule for OverbroadGrantRule {
                         .collect::<Vec<_>>()
                         .join(", "),
                 ),
-                crate::_internal::analysis::mutations::ResolvedGrantTarget::AllTablesInSchema(schemas) => {
-                    (ObjectKind::Schema, schemas.join(", "))
-                }
+                crate::_internal::analysis::mutations::ResolvedGrantTarget::AllTablesInSchema(
+                    schemas,
+                ) => (ObjectKind::Schema, schemas.join(", ")),
                 crate::_internal::analysis::mutations::ResolvedGrantTarget::Roles(roles) => (
                     ObjectKind::Role,
                     roles
@@ -90,7 +90,8 @@ impl Rule for OverbroadGrantRule {
                         if !tables.is_empty() && !grant.grantees.is_empty() =>
                     {
                         grant.grantees.iter().all(|grantee| {
-                            let crate::_internal::analysis::facts::RoleFact::Named { name, .. } = grantee
+                            let crate::_internal::analysis::facts::RoleFact::Named { name, .. } =
+                                grantee
                             else {
                                 return false;
                             };

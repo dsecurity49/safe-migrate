@@ -12,7 +12,9 @@ use safe_migrate::_internal::ast::identifiers::ObjectId;
 use safe_migrate::_internal::db::cache::{CACHE_V7_MAGIC, DbCacheVersioned};
 use safe_migrate::_internal::engine::config::Config;
 use safe_migrate::_internal::engine::engine::SafeMigrateEngine;
-use safe_migrate::_internal::model::function::{FunctionOverlay, RoutineKind, SecurityMode, Volatility};
+use safe_migrate::_internal::model::function::{
+    FunctionOverlay, RoutineKind, SecurityMode, Volatility,
+};
 use safe_migrate::_internal::model::replication::{PublicationOverlay, SubscriptionOverlay};
 use safe_migrate::_internal::sync::sync_cache;
 
@@ -245,7 +247,11 @@ fn attributes(
         .collect()
 }
 
-fn assert_routine_matches(state: &AnalysisState, cache: &safe_migrate::api::DbCache, id: &ObjectId) {
+fn assert_routine_matches(
+    state: &AnalysisState,
+    cache: &safe_migrate::api::DbCache,
+    id: &ObjectId,
+) {
     let Some(FunctionOverlay::Present(simulated)) = state.local.functions.get(id) else {
         panic!("simulator routine {id} is not present");
     };
@@ -259,7 +265,11 @@ fn assert_routine_matches(state: &AnalysisState, cache: &safe_migrate::api::DbCa
     assert_eq!(&simulated, synchronized, "routine state differs for {id}");
 }
 
-fn assert_publication_matches(state: &AnalysisState, cache: &safe_migrate::api::DbCache, name: &str) {
+fn assert_publication_matches(
+    state: &AnalysisState,
+    cache: &safe_migrate::api::DbCache,
+    name: &str,
+) {
     let Some(PublicationOverlay::Present(simulated)) = state.local.publications.get(name) else {
         panic!("simulator publication {name} is not present");
     };
@@ -282,7 +292,11 @@ fn assert_publication_matches(state: &AnalysisState, cache: &safe_migrate::api::
     );
 }
 
-fn assert_subscription_matches(state: &AnalysisState, cache: &safe_migrate::api::DbCache, name: &str) {
+fn assert_subscription_matches(
+    state: &AnalysisState,
+    cache: &safe_migrate::api::DbCache,
+    name: &str,
+) {
     let Some(SubscriptionOverlay::Present(simulated)) = state.local.subscriptions.get(name) else {
         panic!("simulator subscription {name} is not present");
     };
@@ -343,7 +357,8 @@ fn live_sync_preserves_routine_and_replication_catalogs_without_connection_secre
     let (cache, decoded_payload) = decode_cache(&cache_path);
 
     let entry_id = safe_migrate::_internal::ast::identifiers::ObjectId::new(SCHEMA, "entries");
-    let entry_ref_id = safe_migrate::_internal::ast::identifiers::ObjectId::new(SCHEMA, "entry_refs");
+    let entry_ref_id =
+        safe_migrate::_internal::ast::identifiers::ObjectId::new(SCHEMA, "entry_refs");
     let view_source_id = ObjectId::new(SCHEMA, "view_source");
     let foreign_key = cache
         .foreign_keys
@@ -522,14 +537,9 @@ fn live_sync_preserves_routine_and_replication_catalogs_without_connection_secre
             "synchronized routines omitted {expected:?} on PostgreSQL {version}"
         );
     }
-    assert!(
-        cache
-            .functions
-            .contains_key(&safe_migrate::_internal::ast::identifiers::ObjectId::new(
-                SCHEMA,
-                "with_out(integer)"
-            ))
-    );
+    assert!(cache.functions.contains_key(
+        &safe_migrate::_internal::ast::identifiers::ObjectId::new(SCHEMA, "with_out(integer)")
+    ));
     for (name, kind, args, result, volatility, language) in [
         (
             "with_out(integer)",

@@ -1335,7 +1335,9 @@ fn check_role_membership_cache(
     let role = |name: &str| {
         cache
             .roles
-            .get(&safe_migrate::_internal::ast::identifiers::ObjectId::new("", name))
+            .get(&safe_migrate::_internal::ast::identifiers::ObjectId::new(
+                "", name,
+            ))
     };
     let edge = |ids: &[safe_migrate::_internal::ast::identifiers::ObjectId], target: &str| {
         ids.iter()
@@ -1831,8 +1833,9 @@ fn snapshot_simulator_state(
 
     if scope.contains(&ComparisonScope::Publications) {
         for (name, overlay) in &state.local.publications {
-            let safe_migrate::_internal::model::replication::PublicationOverlay::Present(publication) =
-                overlay
+            let safe_migrate::_internal::model::replication::PublicationOverlay::Present(
+                publication,
+            ) = overlay
             else {
                 continue;
             };
@@ -1849,8 +1852,9 @@ fn snapshot_simulator_state(
 
     if scope.contains(&ComparisonScope::Subscriptions) {
         for (name, overlay) in &state.local.subscriptions {
-            let safe_migrate::_internal::model::replication::SubscriptionOverlay::Present(subscription) =
-                overlay
+            let safe_migrate::_internal::model::replication::SubscriptionOverlay::Present(
+                subscription,
+            ) = overlay
             else {
                 continue;
             };
@@ -2651,7 +2655,9 @@ fn normalize_relation_kind(kind: RelationKind) -> NormalizedRelationKind {
     }
 }
 
-fn normalize_attributes(attributes: &[safe_migrate::_internal::analysis::facts::AttributeFact]) -> String {
+fn normalize_attributes(
+    attributes: &[safe_migrate::_internal::analysis::facts::AttributeFact],
+) -> String {
     let mut normalized = attributes.to_vec();
     normalized.sort_by(|left, right| {
         left.name
@@ -2661,7 +2667,9 @@ fn normalize_attributes(attributes: &[safe_migrate::_internal::analysis::facts::
     serde_json::to_string(&normalized).expect("attribute facts must be serializable")
 }
 
-fn normalize_publication_scope(scope: &safe_migrate::_internal::analysis::facts::PublicationScope) -> String {
+fn normalize_publication_scope(
+    scope: &safe_migrate::_internal::analysis::facts::PublicationScope,
+) -> String {
     use safe_migrate::_internal::analysis::facts::{PublicationObjectFact, PublicationScope};
 
     let mut normalized = scope.clone();
@@ -2707,7 +2715,9 @@ fn normalize_subscription(
     }
 }
 
-fn normalize_trigger_mode(mode: safe_migrate::_internal::model::trigger::TriggerEnableMode) -> String {
+fn normalize_trigger_mode(
+    mode: safe_migrate::_internal::model::trigger::TriggerEnableMode,
+) -> String {
     match mode {
         safe_migrate::_internal::model::trigger::TriggerEnableMode::Disabled => "disabled",
         safe_migrate::_internal::model::trigger::TriggerEnableMode::Origin => "origin",

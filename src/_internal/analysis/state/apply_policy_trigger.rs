@@ -15,8 +15,10 @@ impl AnalysisState {
         match self.local.triggers.get(id) {
             Some(TriggerOverlay::Present(_)) => TriggerLookup::Present,
             Some(TriggerOverlay::Dropped) => TriggerLookup::Tombstone,
-            None if self
-                .baseline_covers_family_object(id, crate::_internal::db::cache::CatalogFamily::Triggers) =>
+            None if self.baseline_covers_family_object(
+                id,
+                crate::_internal::db::cache::CatalogFamily::Triggers,
+            ) =>
             {
                 TriggerLookup::AuthoritativelyAbsent
             }

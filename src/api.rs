@@ -4,13 +4,13 @@ pub use crate::_internal::analysis::evidence::{
     EvidenceCode, EvidenceLocation, EvidenceRecord, EvidenceScope,
 };
 pub use crate::_internal::analysis::outcome::AnalysisOutcome;
+pub use crate::_internal::analysis::state::AnalysisState;
+pub use crate::_internal::db::cache::DbCache;
 pub use crate::_internal::engine::config::Config;
 pub use crate::_internal::engine::engine::SafeMigrateEngine;
 pub use crate::_internal::report::reporter::Reporter;
 pub use crate::_internal::report::violations::ReportFinding;
 pub use crate::_internal::rules::RuleCapability;
-pub use crate::_internal::analysis::state::AnalysisState;
-pub use crate::_internal::db::cache::DbCache;
 
 /// Stable error boundary for high-level library analysis helpers.
 #[derive(Debug)]
@@ -49,8 +49,7 @@ pub fn analyze_chain(
     files: &[(String, String)],
     cache: DbCache,
 ) -> Result<AnalysisOutcome<ReportFinding>, AnalysisError> {
-    let mut state =
-        AnalysisState::try_new(cache).map_err(AnalysisError::InvalidCache)?;
+    let mut state = AnalysisState::try_new(cache).map_err(AnalysisError::InvalidCache)?;
     let engine = SafeMigrateEngine::new(config);
     engine
         .analyze_chain_outcome_with_locations(files, &mut state)
