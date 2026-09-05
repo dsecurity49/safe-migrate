@@ -4,8 +4,9 @@ mod tests {
     use crate::_internal::analysis::facts::{
         AlterDatabaseAction, AlterPublicationActionFact, AlterSubscriptionActionFact,
         AlterTableActionFact, AlterTypeActionFact, PublicationObjectFact, PublicationScope,
-        ResetSettingTarget, SearchPathTarget, StatementFact, SubscriptionPublicationMode,
-        TableConstraintFact, TimeoutSetting, TimeoutSettingValue, TypeCreationKind,
+        ResetSettingTarget, RetTypeFact, SearchPathTarget, StatementFact,
+        SubscriptionPublicationMode, TableConstraintFact, TimeoutSetting, TimeoutSettingValue,
+        TypeCreationKind,
     };
     use crate::_internal::ast::identifiers::{Ident, QualifiedName};
     use crate::_internal::ast::visitor::AstVisitor;
@@ -939,6 +940,20 @@ mod tests {
     }
 
     #[test]
+    fn prepared_transaction_completion_does_not_end_the_current_transaction() {
+        for sql in [
+            "COMMIT PREPARED 'migration';",
+            "ROLLBACK PREPARED 'migration';",
+        ] {
+            assert_eq!(
+                parse_and_extract_statement(sql),
+                Some(StatementFact::OpaqueBlock),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
     fn test_rollback_and_chain() {
         let facts = parse_and_extract_statement("ROLLBACK AND CHAIN;");
         assert!(matches!(facts, Some(StatementFact::RollbackAndChain)));
@@ -1105,6 +1120,14 @@ mod tests {
 
         assert!(matches!(
             parse_and_extract_statement("SET lock_timeout = 'forever';"),
+            Some(StatementFact::SetTimeout {
+                setting: TimeoutSetting::Lock,
+                value: TimeoutSettingValue::Invalid(_),
+                local: false,
+            })
+        ));
+        assert!(matches!(
+            parse_and_extract_statement("SET lock_timeout = -1;"),
             Some(StatementFact::SetTimeout {
                 setting: TimeoutSetting::Lock,
                 value: TimeoutSettingValue::Invalid(_),
@@ -1436,6 +1459,35 @@ mod tests {
         };
         assert_eq!(legacy.params.len(), 1);
         assert_eq!(legacy.params[0].ty, "integer");
+    }
+
+    #[test]
+    fn squawk_264_function_types_preserve_percent_and_table_signatures() {
+        let fact = parse_and_extract_statement(
+            "CREATE FUNCTION typed(value app.items.amount%TYPE)
+             RETURNS TABLE (label character varying(40), amount numeric, source app.items%TYPE)
+             LANGUAGE sql AS 'SELECT NULL, NULL, NULL';",
+        )
+        .expect("typed function fact");
+        let StatementFact::CreateFunction(function) = fact else {
+            panic!("expected create function fact");
+        };
+        assert_eq!(function.params.len(), 1);
+        assert_eq!(function.params[0].ty, "app.items.amount%TYPE");
+        let Some(RetTypeFact::Table(columns)) = function.return_type else {
+            panic!("expected table return type");
+        };
+        assert_eq!(
+            columns
+                .iter()
+                .map(|column| (column.name.as_str(), column.ty.as_deref()))
+                .collect::<Vec<_>>(),
+            [
+                ("label", Some("character varying(40)")),
+                ("amount", Some("numeric")),
+                ("source", Some("app.items%TYPE")),
+            ]
+        );
     }
 
     #[test]
@@ -2098,7 +2150,53 @@ mod tests {
     }
 
     #[test]
-    fn squawk_263_typed_alter_table_children_preserve_facts() {
+    fn squawk_264_alter_constraint_and_using_wrappers_preserve_facts() {
+        let facts = parse_and_extract(
+            "ALTER TABLE events ALTER CONSTRAINT events_parent_fk
+                 DEFERRABLE INITIALLY DEFERRED;
+             ALTER TABLE events ALTER CONSTRAINT events_parent_fk
+                 NOT DEFERRABLE INITIALLY IMMEDIATE;
+             ALTER TABLE events ALTER COLUMN payload TYPE jsonb USING payload::jsonb;",
+        );
+        assert_eq!(facts.len(), 3);
+        assert!(matches!(
+            &facts[0],
+            StatementFact::AlterTable { actions, .. }
+                if matches!(
+                    actions.as_slice(),
+                    [AlterTableActionFact::AlterConstraint {
+                        name: Some(name),
+                        deferrable: true,
+                    }] if name == "events_parent_fk"
+                )
+        ));
+        assert!(matches!(
+            &facts[1],
+            StatementFact::AlterTable { actions, .. }
+                if matches!(
+                    actions.as_slice(),
+                    [AlterTableActionFact::AlterConstraint {
+                        name: Some(name),
+                        deferrable: false,
+                    }] if name == "events_parent_fk"
+                )
+        ));
+        assert!(matches!(
+            &facts[2],
+            StatementFact::AlterTable { actions, .. }
+                if matches!(
+                    actions.as_slice(),
+                    [AlterTableActionFact::SetType {
+                        column,
+                        ty,
+                        has_using: true,
+                    }] if column == "payload" && ty == "jsonb"
+                )
+        ));
+    }
+
+    #[test]
+    fn squawk_264_typed_alter_table_children_preserve_facts() {
         let facts = parse_and_extract(
             "ALTER TABLE events ADD COLUMN generated_id bigint GENERATED ALWAYS AS IDENTITY;
              ALTER TABLE events ADD CONSTRAINT events_parent_fk
@@ -2392,7 +2490,7 @@ mod tests {
     }
 
     #[test]
-    fn squawk_263_typed_view_sequence_policy_and_function_children_preserve_facts() {
+    fn squawk_264_typed_view_sequence_policy_and_function_children_preserve_facts() {
         let facts = parse_and_extract(
             "CREATE SEQUENCE event_ids OWNED BY public.events.id;
              ALTER SEQUENCE event_ids OWNED BY NONE;
@@ -2469,7 +2567,7 @@ mod tests {
     }
 
     #[test]
-    fn squawk_263_typed_replication_and_privilege_children_preserve_facts() {
+    fn squawk_264_typed_replication_and_privilege_children_preserve_facts() {
         let facts = parse_and_extract(
             "CREATE PUBLICATION all_events FOR ALL TABLES EXCEPT TABLE audit_events;
              CREATE PUBLICATION selected_events FOR TABLE public.events;
@@ -2536,7 +2634,7 @@ mod tests {
     }
 
     #[test]
-    fn squawk_263_validation_matrix_rejects_invalid_expression_shapes() {
+    fn squawk_264_validation_matrix_rejects_invalid_expression_shapes() {
         for sql in [
             "SELECT * FROM t WHERE a NOT IN ();",
             "SELECT * FROM t WHERE a NOT IN ARRAY[1, 2];",

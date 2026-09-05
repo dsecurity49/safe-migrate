@@ -5,6 +5,16 @@ commits and pull requests. Published binaries, checksums, and generated release
 notes are available on the
 [GitHub Releases page](https://github.com/dsecurity49/safe-migrate/releases).
 
+## v0.8.1 — Unreleased
+
+- Upgraded Squawk's parser, lexer, syntax tree, and linter to 2.64.0, including
+  its stricter routine validation and more precise type and transaction nodes.
+- Preserved ordered-set aggregate and function signatures across the new AST,
+  and stopped prepared-transaction completion from ending the analyzed
+  migration transaction.
+- Warn before GitHub secret setup when the baseline environment is missing,
+  unverifiable, or lacks reviewer or deployment-branch protection.
+
 ## v0.8.0 — 2026-09-04
 
 - Rule evaluation now uses one immutable context with explicit capability

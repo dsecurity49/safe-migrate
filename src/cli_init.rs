@@ -170,6 +170,67 @@ fn github_secret_args(name: &str, environment: Option<&str>) -> Vec<String> {
     args
 }
 
+fn github_environment_api_args(environment: &str) -> Vec<String> {
+    vec![
+        "api".to_string(),
+        format!("repos/{{owner}}/{{repo}}/environments/{environment}"),
+    ]
+}
+
+fn github_environment_has_access_protection(response: &[u8]) -> Result<bool> {
+    let environment: serde_json::Value =
+        serde_json::from_slice(response).context("GitHub returned invalid environment metadata")?;
+    let protection_rules = environment
+        .get("protection_rules")
+        .and_then(serde_json::Value::as_array)
+        .context("GitHub environment metadata omitted protection_rules")?;
+    let has_review_or_branch_rule = protection_rules.iter().any(|rule| {
+        matches!(
+            rule.get("type").and_then(serde_json::Value::as_str),
+            Some("required_reviewers" | "branch_policy")
+        )
+    });
+    let has_deployment_branch_policy =
+        environment
+            .get("deployment_branch_policy")
+            .is_some_and(|policy| {
+                policy
+                    .get("protected_branches")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+                    || policy
+                        .get("custom_branch_policies")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false)
+            });
+    Ok(has_review_or_branch_rule || has_deployment_branch_policy)
+}
+
+fn warn_if_github_environment_is_unprotected(environment: &str) {
+    let output = Command::new("gh")
+        .args(github_environment_api_args(environment))
+        .output();
+    match output {
+        Ok(output) if output.status.success() => {
+            match github_environment_has_access_protection(&output.stdout) {
+                Ok(true) => {}
+                Ok(false) => eprintln!(
+                    "Warning: GitHub environment `{environment}` has no required reviewers or deployment-branch restriction. Protect it before relying on SAFE_MIGRATE_DATABASE_URL isolation."
+                ),
+                Err(error) => eprintln!(
+                    "Warning: could not verify protection for GitHub environment `{environment}`: {error}. Verify it before relying on SAFE_MIGRATE_DATABASE_URL isolation."
+                ),
+            }
+        }
+        Ok(_) => eprintln!(
+            "Warning: GitHub environment `{environment}` does not exist or could not be verified. `gh secret set --env` can create it without protection; create it and add required reviewers or a deployment-branch restriction before continuing."
+        ),
+        Err(error) => eprintln!(
+            "Warning: could not run `gh` to verify GitHub environment `{environment}`: {error}. Verify that it exists and is protected before continuing."
+        ),
+    }
+}
+
 fn set_github_secret(name: &str, value: Option<&str>, environment: Option<&str>) -> Result<()> {
     let mut command = Command::new("gh");
     command.args(github_secret_args(name, environment));
@@ -299,6 +360,7 @@ fn run_github_actions(
     println!("Created {}", analysis_output.display());
     println!("Created {}", baseline_output.display());
     if configure_secrets {
+        warn_if_github_environment_is_unprotected(BASELINE_ENVIRONMENT);
         println!(
             "Enter SAFE_MIGRATE_DATABASE_URL for the {BASELINE_ENVIRONMENT} environment when GitHub CLI prompts for it."
         );
@@ -343,6 +405,37 @@ mod tests {
         assert_eq!(
             github_secret_args("SAFE_MIGRATE_CACHE_KEY", None),
             ["secret", "set", "SAFE_MIGRATE_CACHE_KEY"]
+        );
+    }
+    #[test]
+    fn environment_protection_requires_an_access_gate() {
+        assert_eq!(
+            github_environment_api_args(BASELINE_ENVIRONMENT),
+            [
+                "api",
+                "repos/{owner}/{repo}/environments/safe-migrate-baseline"
+            ]
+        );
+
+        for protected in [
+            br#"{"protection_rules":[{"type":"required_reviewers"}],"deployment_branch_policy":null}"#.as_slice(),
+            br#"{"protection_rules":[],"deployment_branch_policy":{"protected_branches":true,"custom_branch_policies":false}}"#.as_slice(),
+            br#"{"protection_rules":[],"deployment_branch_policy":{"protected_branches":false,"custom_branch_policies":true}}"#.as_slice(),
+        ] {
+            assert!(github_environment_has_access_protection(protected).unwrap());
+        }
+
+        assert!(
+            !github_environment_has_access_protection(
+                br#"{"protection_rules":[],"deployment_branch_policy":{"protected_branches":false,"custom_branch_policies":false}}"#
+            )
+            .unwrap()
+        );
+        assert!(
+            !github_environment_has_access_protection(
+                br#"{"protection_rules":[{"type":"wait_timer"}],"deployment_branch_policy":null}"#
+            )
+            .unwrap()
         );
     }
 }

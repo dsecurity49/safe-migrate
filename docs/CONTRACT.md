@@ -20,7 +20,7 @@ database.
 | `sync` | Read PostgreSQL metadata and settings into a local cache. Requires `DATABASE_URL` and a local, Unix-socket, or tunneled connection. |
 | `cache inspect` | Show cache provenance and redacted counts without a database connection. Supports `--json`. |
 | `rules` | List primary rules; `--rule <id>` selects one and `--json` emits the discovery schema. |
-| `init github-actions --path <dir>` | Generate separate PR-analysis and trusted-refresh workflows. |
+| `init github-actions --path <dir>` | Generate separate PR-analysis and trusted-refresh workflows. With `--configure-secrets`, warn before secret setup when the baseline environment is missing, unverifiable, or lacks an access-protection rule. |
 | `init cache-key` | Generate a random 32-byte key as 64 lowercase hexadecimal characters. |
 
 `init github-actions --configure-secrets` sends the database URL and generated
