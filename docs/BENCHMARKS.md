@@ -1,7 +1,7 @@
 # Local benchmark baseline
 
 This document records reproducible, non-CI performance scenarios. The values
-are comparison points for the current `0.8.0` hardening work, not performance
+are comparison points for the recorded `0.8.0` hardening work, not performance
 guarantees.
 Run them with:
 

@@ -276,7 +276,7 @@ base commit:
     sparse-checkout: safe-migrate.toml
     persist-credentials: false
 
-- uses: dsecurity49/safe-migrate@v0.8.0
+- uses: dsecurity49/safe-migrate@v0.8.1
   env:
     SAFE_MIGRATE_CACHE_KEY: ${{ secrets.SAFE_MIGRATE_CACHE_KEY }}
   with:

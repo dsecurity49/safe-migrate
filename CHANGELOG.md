@@ -14,6 +14,8 @@ notes are available on the
   migration transaction.
 - Warn before GitHub secret setup when the baseline environment is missing,
   unverifiable, or lacks reviewer or deployment-branch protection.
+- Prevent `cargo test` from opening the interactive viewer when run from a
+  terminal.
 
 ## v0.8.0 — 2026-09-04
 
