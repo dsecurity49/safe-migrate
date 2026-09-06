@@ -301,6 +301,7 @@ impl DependencyGraph {
     }
 
     // Dependency lookups follow the current end of a rename chain.
+    #[cfg(test)]
     pub fn is_referenced_by_view(&self, id: &ObjectId) -> Vec<&ObjectId> {
         if self.edges.len() >= Self::CASCADE_INDEX_MIN_EDGES {
             return self
@@ -320,6 +321,7 @@ impl DependencyGraph {
             .collect()
     }
 
+    #[cfg(test)]
     pub fn is_referenced_by_fk(&self, id: &ObjectId) -> Vec<(&ObjectId, u64)> {
         if self.edges.len() >= Self::CASCADE_INDEX_MIN_EDGES {
             return self
@@ -353,6 +355,7 @@ impl DependencyGraph {
             .collect()
     }
 
+    #[cfg(test)]
     pub fn is_referenced_by_index(&self, id: &ObjectId) -> Vec<&ObjectId> {
         if self.edges.len() >= Self::CASCADE_INDEX_MIN_EDGES {
             return self
@@ -372,6 +375,7 @@ impl DependencyGraph {
             .collect()
     }
 
+    #[cfg(test)]
     pub fn partitions_of(&self, id: &ObjectId) -> Vec<&ObjectId> {
         if self.edges.len() >= Self::CASCADE_INDEX_MIN_EDGES {
             return self
@@ -741,17 +745,9 @@ impl DependencyGraph {
     /// New callers should use the typed helpers above.  Keeping this method
     /// relation-scoped prevents the old all-endpoints behavior from silently
     /// rewriting sequence, trigger, function, or publication identity data.
+    #[cfg(test)]
     pub fn propagate_rename(&mut self, old_id: &ObjectId, new_id: &ObjectId) {
         self.propagate_relation_rename(old_id, new_id);
-    }
-
-    pub fn triggers_on(&self, table_id: &ObjectId) -> Vec<&DependencyEdge> {
-        self.edges
-            .iter()
-            .filter(|e| {
-                matches!(e.kind, DependencyKind::TriggerOnTable { .. }) && &e.referenced == table_id
-            })
-            .collect()
     }
 
     pub fn triggers_for_function(&self, function_id: &ObjectId) -> Vec<&DependencyEdge> {

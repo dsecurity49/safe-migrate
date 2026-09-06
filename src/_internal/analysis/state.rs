@@ -581,11 +581,13 @@ impl AnalysisState {
         params.push(option.clone());
     }
 
+    #[cfg(test)]
     pub fn new(cache: DbCache) -> Self {
         Self::with_baseline(cache, true)
     }
 
     /// Construct an authoritative state only from a semantically valid cache.
+    #[cfg(test)]
     pub fn try_new(cache: DbCache) -> Result<Self, String> {
         Ok(Self::new(cache.validated()?))
     }
@@ -1229,6 +1231,7 @@ impl AnalysisState {
         Ok(Self::with_baseline(cache.validated()?, baseline_available))
     }
 
+    #[cfg(test)]
     pub fn get_relation(&self, id: &ObjectId) -> Option<&RelationOverlay> {
         self.local.relations.get(id)
     }
@@ -1899,6 +1902,7 @@ impl AnalysisState {
         false
     }
 
+    #[cfg(test)]
     pub fn capture_pre_state(&self) -> PreState {
         let mut pre_state = PreState::default();
         self.capture_pre_state_into(&mut pre_state);

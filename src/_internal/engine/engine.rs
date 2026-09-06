@@ -4,10 +4,10 @@ use crate::_internal::analysis::outcome::AnalysisOutcome;
 use crate::_internal::analysis::resolver::Resolver;
 use crate::_internal::analysis::state::{AnalysisState, PreState};
 use crate::_internal::ast::visitor::AstVisitor;
-use crate::_internal::engine::config::Config;
 use crate::_internal::report::violations::{ReportFinding, SourceLocation, Violation};
 use crate::_internal::rules::registry;
 use crate::_internal::rules::{Rule, RuleContext};
+use crate::api::config::Config;
 use squawk_syntax::{
     Parse, SyntaxKind,
     ast::{AstNode, SourceFile},
@@ -82,10 +82,12 @@ impl SafeMigrateEngine {
     }
 
     /// Returns primary rule IDs in evaluation order.
+    #[cfg(test)]
     pub fn primary_rule_ids(&self) -> Vec<&'static str> {
         registry::primary_rule_ids().collect()
     }
 
+    #[cfg(test)]
     pub fn analyze_chain(
         &self,
         files: &[(String, String)],
@@ -115,6 +117,7 @@ impl SafeMigrateEngine {
         Ok(all_violations)
     }
 
+    #[cfg(test)]
     pub fn analyze(
         &self,
         sql: &str,
@@ -184,6 +187,7 @@ impl SafeMigrateEngine {
         Ok(findings.into_iter().map(|(_, finding)| finding).collect())
     }
 
+    #[cfg(test)]
     pub fn analyze_with_locations(
         &self,
         filename: String,
@@ -210,6 +214,7 @@ impl SafeMigrateEngine {
 
     /// Analyze one migration and return immutable findings, confidence, and
     /// conservative-analysis evidence together.
+    #[cfg(test)]
     pub fn analyze_outcome_with_locations(
         &self,
         filename: String,
@@ -219,6 +224,7 @@ impl SafeMigrateEngine {
         self.analyze_chain_outcome_with_locations(&[(filename, sql)], state)
     }
 
+    #[cfg(test)]
     fn analyze_single_file(
         &self,
         filename: &str,
@@ -229,6 +235,7 @@ impl SafeMigrateEngine {
         self.analyze_normalized_file(filename, &sql, state)
     }
 
+    #[cfg(test)]
     fn analyze_normalized_file(
         &self,
         filename: &str,

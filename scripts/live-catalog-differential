@@ -6,6 +6,6 @@ if [ -z "${DATABASE_URL:-}" ]; then
     exit 2
 fi
 
-cargo test --locked --test live_catalog_sync \
-    live_routine_and_replication_mutations_match_postgresql \
+cargo test --locked --lib \
+    internal_tests::live_catalog_sync::live_routine_and_replication_mutations_match_postgresql \
     -- --ignored --nocapture

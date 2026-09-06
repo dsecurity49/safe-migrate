@@ -1,5 +1,3 @@
-mod common;
-
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -106,7 +104,8 @@ mod performance_scenarios {
     #[test]
     #[ignore = "manual allocation scenario; run alone with --ignored --nocapture"]
     fn large_state_checkpoint_and_prestate_capture() {
-        let state = safe_migrate::api::AnalysisState::with_baseline(large_baseline(), true);
+        let state =
+            crate::_internal::analysis::state::AnalysisState::with_baseline(large_baseline(), true);
 
         let started = Instant::now();
         let before = allocation_snapshot();
@@ -140,7 +139,8 @@ mod performance_scenarios {
     #[ignore = "manual allocation scenario; run alone with --ignored --nocapture"]
     fn large_baseline_short_chain_allocations() {
         let engine = setup_engine();
-        let mut state = safe_migrate::api::AnalysisState::with_baseline(large_baseline(), true);
+        let mut state =
+            crate::_internal::analysis::state::AnalysisState::with_baseline(large_baseline(), true);
         let files = (0..50)
             .map(|index| {
                 (
@@ -213,7 +213,8 @@ mod performance_scenarios {
     #[ignore = "manual performance scenario; run with --ignored --nocapture"]
     fn large_synchronized_baseline_hydration() {
         let started = Instant::now();
-        let state = safe_migrate::api::AnalysisState::with_baseline(large_baseline(), true);
+        let state =
+            crate::_internal::analysis::state::AnalysisState::with_baseline(large_baseline(), true);
         let elapsed = started.elapsed();
 
         assert!(state.baseline_available);
@@ -382,12 +383,14 @@ mod performance_scenarios {
         let findings = engine
             .analyze_with_locations("performance.sql".to_string(), sql, &mut state)
             .expect("report scenario should analyze");
-        let json = safe_migrate::api::Reporter::json_report_with_locations(
+        let json = crate::_internal::report::reporter::Reporter::json_report_with_locations(
             &findings,
             &state.local.confidence,
         );
-        let markdown =
-            safe_migrate::api::Reporter::markdown_report(&findings, &state.local.confidence);
+        let markdown = crate::_internal::report::reporter::Reporter::markdown_report(
+            &findings,
+            &state.local.confidence,
+        );
         let elapsed = started.elapsed();
 
         assert_eq!(findings.len(), REPORT_FINDINGS);

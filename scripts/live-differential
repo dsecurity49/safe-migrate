@@ -68,5 +68,6 @@ else
     unset SAFE_MIGRATE_DIFF_FIXTURE
 fi
 
-cargo test --locked --test live_differential_harness \
-    live_postgres_differential_harness -- --ignored --nocapture
+cargo test --locked --lib \
+    internal_tests::live_differential_harness::live_postgres_differential_harness \
+    -- --ignored --nocapture

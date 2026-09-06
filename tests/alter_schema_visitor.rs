@@ -1,5 +1,3 @@
-mod common;
-
 mod alter_schema_visitor_test {
     #[test]
     fn test_alter_schema_pipeline() {

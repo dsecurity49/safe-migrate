@@ -558,11 +558,20 @@ pub enum OpaqueMutation {
     UnsupportedStatement,
     DoBlock,
     Execute,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "reserved for dynamic SQL extracted from procedural bodies"
+        )
+    )]
     DynamicSql,
     PrepareTransaction,
     SetTransaction,
     SetConstraints,
+    #[expect(dead_code, reason = "reserved for opaque resolver collisions")]
     StateCollision(String),
+    #[expect(dead_code, reason = "reserved for unresolved typed references")]
     UnresolvedReference {
         object_kind: crate::_internal::report::violations::ObjectKind,
         object_name: String,

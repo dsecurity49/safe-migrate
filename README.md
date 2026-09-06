@@ -29,7 +29,7 @@ Prebuilt binaries are available from
 installer verifies release checksums:
 
 ```bash
-VERSION='v0.8.1'
+VERSION='v0.9.0'
 curl -fsSL "https://raw.githubusercontent.com/dsecurity49/safe-migrate/${VERSION}/install.sh" |
   bash -s -- --version "${VERSION}"
 ```
@@ -178,8 +178,34 @@ Keep a positive `lock_timeout` shorter than a positive `statement_timeout`.
 
 ## Rust library
 
-Rust integrations should use the supported `safe_migrate::api` façade.
-Documentation is published on [docs.rs](https://docs.rs/safe-migrate).
+Rust integrations use `safe_migrate::api`. Load a synchronized baseline when
+one is available; otherwise choose explicit conservative analysis.
+
+```rust,no_run
+use safe_migrate::api::{self, Baseline, Config};
+use std::path::Path;
+
+let config = Config::load_from_file(Path::new("safe-migrate.toml"))?;
+let baseline = Baseline::load_optional(Path::new(".safe-migrate.cache"), &config)?;
+let outcome = api::analyze(
+    &config,
+    "2026-09-05_add_index.sql",
+    "CREATE INDEX ...",
+    &baseline,
+)?;
+
+if outcome.should_halt() {
+    eprintln!("{}", outcome.markdown());
+}
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+`load_optional` treats only a missing cache as unavailable; corrupt,
+incompatible, or incorrectly encrypted caches remain errors. The API exposes
+typed immutable findings, verdicts, evidence, baseline inspection, rule
+metadata, and synchronization. Mutable parser, cache, and state-machine
+internals are not public. Full API documentation is on
+[docs.rs](https://docs.rs/safe-migrate).
 
 ## Contributing
 

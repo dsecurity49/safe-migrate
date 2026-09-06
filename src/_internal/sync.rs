@@ -492,6 +492,7 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
 }
 
 #[doc(hidden)]
+#[cfg(test)]
 pub fn populate_cache_in_current_transaction(
     client: &mut Client,
     schemas: Option<&[String]>,

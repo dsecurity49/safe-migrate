@@ -1,11 +1,8 @@
-mod common;
-
 use crate::common::database_hosts_are_local;
 use postgres::{Client, Config as PostgresConfig, NoTls};
 use safe_migrate::_internal::analysis::graph::DependencyKind;
 use safe_migrate::_internal::analysis::state::AnalysisState;
 use safe_migrate::_internal::db::cache::DbCache;
-use safe_migrate::_internal::engine::config::Config;
 use safe_migrate::_internal::engine::engine::SafeMigrateEngine;
 use safe_migrate::_internal::model::constraint::ConstraintKind;
 use safe_migrate::_internal::model::function::{FunctionOverlay, Volatility};
@@ -15,6 +12,7 @@ use safe_migrate::_internal::model::sequence::{SequenceKind, SequenceOverlay};
 use safe_migrate::_internal::model::trigger::TriggerOverlay;
 use safe_migrate::_internal::model::types::{TypeKind, TypeOverlay};
 use safe_migrate::_internal::sync::{populate_cache, populate_cache_in_current_transaction};
+use safe_migrate::api::Config;
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;

@@ -1,5 +1,3 @@
-mod common;
-
 mod state_mutation_tests {
     use crate::common::*;
     use safe_migrate::_internal::analysis::facts::FunctionSigFact;
@@ -304,7 +302,7 @@ mod state_mutation_tests {
     #[test]
     fn unavailable_baseline_never_claims_schema_coverage() {
         let engine = setup_engine();
-        let mut state = safe_migrate::api::AnalysisState::with_baseline(
+        let mut state = crate::_internal::analysis::state::AnalysisState::with_baseline(
             safe_migrate::_internal::db::cache::DbCache::new(),
             false,
         );
@@ -451,7 +449,7 @@ mod state_mutation_tests {
         cache.dependencies.push(dependency(&view_id));
         cache.dependencies.push(dependency(&table_id));
 
-        let state = safe_migrate::api::AnalysisState::new(cache);
+        let state = crate::_internal::analysis::state::AnalysisState::new(cache);
         assert!(!state.local.graph.edges().iter().any(|edge| {
             matches!(edge.kind, DependencyKind::ViewDependency { .. })
                 && edge.dependent == view_id
@@ -506,7 +504,7 @@ mod state_mutation_tests {
         });
 
         let engine = setup_engine();
-        let mut state = safe_migrate::api::AnalysisState::new(cache.clone());
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache.clone());
         let findings = engine
             .analyze("ALTER TABLE t DROP COLUMN unused;", &mut state)
             .unwrap();
@@ -526,7 +524,8 @@ mod state_mutation_tests {
                     RelationOverlay::Dropped => false,
                 })
         );
-        let mut blocked_state = safe_migrate::api::AnalysisState::new(cache.clone());
+        let mut blocked_state =
+            crate::_internal::analysis::state::AnalysisState::new(cache.clone());
         let findings = engine
             .analyze("ALTER TABLE t DROP COLUMN id;", &mut blocked_state)
             .unwrap();
@@ -536,7 +535,7 @@ mod state_mutation_tests {
                 .any(|finding| finding.rule_id == "chain-conflict")
         );
 
-        let mut cascade_state = safe_migrate::api::AnalysisState::new(cache);
+        let mut cascade_state = crate::_internal::analysis::state::AnalysisState::new(cache);
         let findings = engine
             .analyze("ALTER TABLE t DROP COLUMN id CASCADE;", &mut cascade_state)
             .unwrap();
@@ -595,7 +594,7 @@ mod state_mutation_tests {
             });
 
         let engine = setup_engine();
-        let mut state = safe_migrate::api::AnalysisState::new(cache);
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
         let unrelated = engine
             .analyze("ALTER TABLE t DROP COLUMN unused;", &mut state)
             .unwrap();
@@ -651,7 +650,7 @@ mod state_mutation_tests {
             referenced_column: None,
         });
 
-        let state = safe_migrate::api::AnalysisState::new(cache);
+        let state = crate::_internal::analysis::state::AnalysisState::new(cache);
         assert!(state.local.graph.edges().iter().any(|edge| {
             matches!(edge.kind, DependencyKind::ViewDependency { .. })
                 && edge.dependent == view_id
@@ -683,7 +682,7 @@ mod state_mutation_tests {
             referenced_column: None,
         });
 
-        let state = safe_migrate::api::AnalysisState::new(cache);
+        let state = crate::_internal::analysis::state::AnalysisState::new(cache);
         assert!(state.local.graph.edges().iter().any(|edge| {
             matches!(edge.kind, DependencyKind::ViewDependency { .. })
                 && edge.dependent == omitted_view
@@ -716,7 +715,7 @@ mod state_mutation_tests {
         });
 
         let engine = setup_engine();
-        let mut state = safe_migrate::api::AnalysisState::new(cache);
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
         let violations = engine
             .analyze("DROP TABLE app.base CASCADE;", &mut state)
             .unwrap();
@@ -753,7 +752,7 @@ mod state_mutation_tests {
                 ),
             );
         }
-        let state = safe_migrate::api::AnalysisState::new(cache);
+        let state = crate::_internal::analysis::state::AnalysisState::new(cache);
         assert!(
             !state
                 .local
@@ -1442,7 +1441,7 @@ mod state_mutation_tests {
                 generation: 0,
             },
         );
-        let mut state = safe_migrate::api::AnalysisState::new(cache);
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
 
         engine
             .analyze(
@@ -1542,7 +1541,7 @@ mod state_mutation_tests {
                 },
             },
         );
-        let mut state = safe_migrate::api::AnalysisState::new(cache);
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
 
         engine
             .analyze(
@@ -1882,7 +1881,7 @@ mod state_mutation_tests {
                 security: SecurityMode::Invoker,
             },
         );
-        let mut state = safe_migrate::api::AnalysisState::new(cache);
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
 
         engine
             .analyze(
@@ -2032,7 +2031,7 @@ mod state_mutation_tests {
                 },
             );
         }
-        let mut state = safe_migrate::api::AnalysisState::new(cache);
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
 
         engine
             .analyze(
@@ -2079,7 +2078,7 @@ mod state_mutation_tests {
                 },
             );
         }
-        let mut state = safe_migrate::api::AnalysisState::new(cache);
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
 
         engine
             .analyze(
@@ -2121,7 +2120,7 @@ mod state_mutation_tests {
                 },
             },
         );
-        let mut state = safe_migrate::api::AnalysisState::new(cache);
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
 
         engine
             .analyze(
@@ -2154,7 +2153,7 @@ mod state_mutation_tests {
                 },
             );
         }
-        let mut state = safe_migrate::api::AnalysisState::new(cache);
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
 
         let violations = engine
             .analyze(
@@ -2215,7 +2214,7 @@ mod state_mutation_tests {
                     },
                 },
             );
-            let mut state = safe_migrate::api::AnalysisState::new(cache);
+            let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
             let violations = engine.analyze(sql, &mut state).unwrap();
 
             assert!(violations.iter().any(|violation| {
@@ -2627,7 +2626,7 @@ mod state_mutation_tests {
         let engine = setup_engine();
         let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
         cache.search_path = vec!["tenant_app".to_string(), "shared".to_string()];
-        let mut state = safe_migrate::api::AnalysisState::new(cache);
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
 
         engine
             .analyze("CREATE TABLE first(id int);", &mut state)
@@ -2881,7 +2880,7 @@ mod state_mutation_tests {
                     security: SecurityMode::Invoker,
                 },
             );
-            let mut state = safe_migrate::api::AnalysisState::new(cache);
+            let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
 
             for sql in [
                 "CREATE FUNCTION work(integer) RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$;",
@@ -3015,7 +3014,7 @@ mod state_mutation_tests {
                 },
             );
         }
-        let mut state = safe_migrate::api::AnalysisState::new(cache);
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
 
         engine
             .analyze(
@@ -3083,7 +3082,7 @@ mod state_mutation_tests {
                     security: SecurityMode::Invoker,
                 },
             );
-            let mut state = safe_migrate::api::AnalysisState::new(cache);
+            let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
             let violations = engine.analyze(sql, &mut state).unwrap();
 
             assert!(
@@ -3152,7 +3151,7 @@ mod state_mutation_tests {
             cache
                 .functions
                 .insert(object_id("public", "work(integer)"), routine(kind));
-            let mut state = safe_migrate::api::AnalysisState::new(cache);
+            let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
             assert!(matches!(
                 state.apply(&drop, None),
                 MutationResult::Conflict { .. }
@@ -3165,7 +3164,8 @@ mod state_mutation_tests {
             object_id("public", "work(integer)"),
             routine(RoutineKind::Function),
         );
-        let mut wrong_kind_state = safe_migrate::api::AnalysisState::new(wrong_kind_cache);
+        let mut wrong_kind_state =
+            crate::_internal::analysis::state::AnalysisState::new(wrong_kind_cache);
         assert!(matches!(
             wrong_kind_state.apply(&aggregate_drop("public", true), None),
             MutationResult::Conflict { .. }
@@ -3189,14 +3189,14 @@ mod state_mutation_tests {
         ] {
             let mut cache = DbCache::new();
             cache.metadata.schemas = Some(vec!["public".into()]);
-            let mut state = safe_migrate::api::AnalysisState::new(cache);
+            let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
             assert_eq!(state.apply(&drop, None), MutationResult::Skipped);
             assert_eq!(state.local.confidence, Confidence::Tainted);
         }
 
         let mut cache = DbCache::new();
         cache.metadata.schemas = Some(vec!["public".into()]);
-        let mut state = safe_migrate::api::AnalysisState::new(cache);
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
         assert_eq!(
             state.apply(&function_drop("tenant", true), None),
             MutationResult::Skipped
@@ -3322,7 +3322,7 @@ mod state_mutation_tests {
 
         let mut scoped_cache = DbCache::new();
         scoped_cache.metadata.schemas = Some(vec!["public".into()]);
-        let mut scoped_state = safe_migrate::api::AnalysisState::new(scoped_cache);
+        let mut scoped_state = crate::_internal::analysis::state::AnalysisState::new(scoped_cache);
         let violations = engine
             .analyze(
                 "CREATE PUBLICATION external_pub FOR TABLE tenant.entries;",
@@ -3394,7 +3394,7 @@ mod state_mutation_tests {
                 generation: 0,
             },
         );
-        let mut state = safe_migrate::api::AnalysisState::new(cache);
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
 
         let violations = engine
             .analyze(
@@ -3477,7 +3477,7 @@ mod state_mutation_tests {
                 generation: 0,
             },
         );
-        let mut state = safe_migrate::api::AnalysisState::new(cache);
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
         let initial_generation = state.local.generation_counter;
 
         for (mode, publications) in [
@@ -3543,7 +3543,7 @@ mod state_mutation_tests {
                 generation: 0,
             },
         );
-        let mut state = safe_migrate::api::AnalysisState::new(cache);
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
 
         engine.analyze("DROP TABLE entries;", &mut state).unwrap();
 
@@ -3588,7 +3588,8 @@ mod state_mutation_tests {
             },
         );
 
-        let mut inherited_state = safe_migrate::api::AnalysisState::new(cache.clone());
+        let mut inherited_state =
+            crate::_internal::analysis::state::AnalysisState::new(cache.clone());
         engine
             .analyze(
                 "ALTER PUBLICATION changes DROP TABLE parent *;",
@@ -3597,7 +3598,7 @@ mod state_mutation_tests {
             .unwrap();
         assert_eq!(inherited_state.local.confidence, Confidence::Tainted);
 
-        let mut only_state = safe_migrate::api::AnalysisState::new(cache);
+        let mut only_state = crate::_internal::analysis::state::AnalysisState::new(cache);
         engine
             .analyze(
                 "ALTER PUBLICATION changes DROP TABLE ONLY parent;",
@@ -3855,7 +3856,7 @@ mod state_mutation_tests {
             privileges.grant(reader.clone(), select.clone());
             privileges.grant_options.insert(reader.clone(), select);
         }
-        let mut state = safe_migrate::api::AnalysisState::new(cache);
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
 
         let _findings = engine
             .analyze(
@@ -3904,7 +3905,7 @@ mod state_mutation_tests {
             [Privilege::Select].into_iter().collect(),
         );
         cache.insert_baseline(table_id, relation);
-        let mut state = safe_migrate::api::AnalysisState::new(cache);
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
 
         let findings = engine
             .analyze(
@@ -4005,7 +4006,7 @@ mod state_mutation_tests {
             .privileges
             .grant_with_option(parent, [Privilege::Select].into_iter().collect());
         cache.insert_baseline(table_id, relation);
-        let mut state = safe_migrate::api::AnalysisState::new(cache);
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
 
         let violations = engine
             .analyze(
@@ -4084,7 +4085,7 @@ mod state_mutation_tests {
             .privileges
             .grant_with_option(parent, [Privilege::Select].into_iter().collect());
         cache.insert_baseline(table_id, relation);
-        let mut state = safe_migrate::api::AnalysisState::new(cache);
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
 
         let violations = engine
             .analyze(
@@ -4152,7 +4153,7 @@ mod state_mutation_tests {
             .privileges
             .grant_with_option(parent, [Privilege::Select].into_iter().collect());
         cache.insert_baseline(table_id, relation);
-        let mut state = safe_migrate::api::AnalysisState::new(cache);
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
 
         let findings = engine
             .analyze(
@@ -4214,7 +4215,7 @@ mod state_mutation_tests {
             .privileges
             .grant_with_option(parent, [Privilege::Select].into_iter().collect());
         cache.insert_baseline(table_id, relation);
-        let mut state = safe_migrate::api::AnalysisState::new(cache);
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
 
         let findings = engine
             .analyze(
@@ -4271,7 +4272,7 @@ mod state_mutation_tests {
                 },
             );
         }
-        let mut state = safe_migrate::api::AnalysisState::new(cache);
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
 
         let findings = engine
             .analyze(
@@ -4336,7 +4337,7 @@ mod state_mutation_tests {
                 0,
             ),
         );
-        let mut state = safe_migrate::api::AnalysisState::new(cache);
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
         engine
             .analyze(
                 "GRANT SELECT ON cascade_grant_table TO grant_delegate WITH GRANT OPTION; SET ROLE grant_delegate; GRANT SELECT ON cascade_grant_table TO grant_reader WITH GRANT OPTION; SET ROLE grant_owner;",
@@ -4373,7 +4374,7 @@ mod state_mutation_tests {
         use safe_migrate::_internal::model::role::RoleState;
 
         let engine = setup_engine();
-        let mut cache = safe_migrate::api::DbCache::new();
+        let mut cache = crate::_internal::db::cache::DbCache::new();
         let table_id = object_id("public", "revoke_all_table");
         let owner = object_id("", "owner");
         let intermediate = object_id("", "intermediate");
@@ -4411,7 +4412,7 @@ mod state_mutation_tests {
                 0,
             ),
         );
-        let mut state = safe_migrate::api::AnalysisState::new(cache);
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
         engine
             .analyze(
                 "GRANT SELECT, UPDATE ON revoke_all_table TO intermediate WITH GRANT OPTION; SET ROLE intermediate; GRANT SELECT ON revoke_all_table TO leaf; SET ROLE owner;",
@@ -4474,7 +4475,7 @@ mod state_mutation_tests {
             function_id: object_id("public", "check_row()"),
             enabled_mode: TriggerEnableMode::Origin,
         });
-        let mut state = safe_migrate::api::AnalysisState::new(cache);
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
 
         engine
             .analyze(
@@ -4553,7 +4554,7 @@ mod state_mutation_tests {
                 default_expr_text: None,
                 type_modifier: Some(-1),
             });
-        let mut state = safe_migrate::api::AnalysisState::new(cache);
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
         engine
             .analyze(
                 "ALTER TABLE t_large ADD CONSTRAINT positive_id CHECK (id > 0);",
@@ -4628,7 +4629,8 @@ mod state_mutation_tests {
                 columns: vec!["note".to_string()],
             });
 
-        let mut drop_constraint_state = safe_migrate::api::AnalysisState::new(cache.clone());
+        let mut drop_constraint_state =
+            crate::_internal::analysis::state::AnalysisState::new(cache.clone());
         engine
             .analyze(
                 "ALTER TABLE accounts DROP CONSTRAINT accounts_note_check;",
@@ -4650,7 +4652,7 @@ mod state_mutation_tests {
                 })
         );
 
-        let mut state = safe_migrate::api::AnalysisState::new(cache.clone());
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache.clone());
         let findings = engine
             .analyze("ALTER TABLE accounts DROP COLUMN note;", &mut state)
             .unwrap();
@@ -4664,7 +4666,7 @@ mod state_mutation_tests {
             Some(RelationOverlay::Present(relation)) if relation.has_column("note")
         ));
 
-        let mut cascade_state = safe_migrate::api::AnalysisState::new(cache);
+        let mut cascade_state = crate::_internal::analysis::state::AnalysisState::new(cache);
         let findings = engine
             .analyze(
                 "ALTER TABLE accounts DROP COLUMN note CASCADE;",
@@ -4781,7 +4783,7 @@ mod state_mutation_tests {
                 has_default_opclasses: true,
                 has_default_collations: true,
             });
-        let mut state = safe_migrate::api::AnalysisState::new(cache.clone());
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache.clone());
 
         let findings = engine
             .analyze("ALTER TABLE metrics DROP COLUMN derived;", &mut state)
@@ -4804,7 +4806,8 @@ mod state_mutation_tests {
             Some(RelationOverlay::Present(relation)) if relation.has_column("derived")
         ));
 
-        let mut derived_cascade_state = safe_migrate::api::AnalysisState::new(cache.clone());
+        let mut derived_cascade_state =
+            crate::_internal::analysis::state::AnalysisState::new(cache.clone());
         let findings = engine
             .analyze(
                 "ALTER TABLE metrics DROP COLUMN derived CASCADE;",
@@ -4828,7 +4831,7 @@ mod state_mutation_tests {
                 .contains_key(&(table.clone(), "derived_twice_check".to_string()))
         );
 
-        let mut source_state = safe_migrate::api::AnalysisState::new(cache.clone());
+        let mut source_state = crate::_internal::analysis::state::AnalysisState::new(cache.clone());
         let findings = engine
             .analyze("ALTER TABLE metrics DROP COLUMN source;", &mut source_state)
             .unwrap();
@@ -4837,7 +4840,7 @@ mod state_mutation_tests {
                 .iter()
                 .any(|finding| finding.rule_id == "chain-conflict")
         );
-        let mut cascade_state = safe_migrate::api::AnalysisState::new(cache);
+        let mut cascade_state = crate::_internal::analysis::state::AnalysisState::new(cache);
         let findings = engine
             .analyze(
                 "ALTER TABLE metrics DROP COLUMN source CASCADE;",
@@ -4901,7 +4904,7 @@ mod state_mutation_tests {
             },
         );
 
-        let mut state = safe_migrate::api::AnalysisState::new(cache.clone());
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache.clone());
         let findings = engine
             .analyze("DROP SEQUENCE event_seq;", &mut state)
             .unwrap();
@@ -4911,7 +4914,8 @@ mod state_mutation_tests {
                 .any(|finding| finding.rule_id == "chain-conflict")
         );
 
-        let mut cascade_state = safe_migrate::api::AnalysisState::new(cache.clone());
+        let mut cascade_state =
+            crate::_internal::analysis::state::AnalysisState::new(cache.clone());
         let findings = engine
             .analyze("DROP SEQUENCE event_seq CASCADE;", &mut cascade_state)
             .unwrap();
@@ -4933,7 +4937,8 @@ mod state_mutation_tests {
                     .is_some_and(|column| column.default_expr_text.is_none())
         ));
 
-        let mut table_drop_state = safe_migrate::api::AnalysisState::new(cache.clone());
+        let mut table_drop_state =
+            crate::_internal::analysis::state::AnalysisState::new(cache.clone());
         let findings = engine
             .analyze("DROP TABLE events;", &mut table_drop_state)
             .unwrap();
@@ -4983,7 +4988,8 @@ mod state_mutation_tests {
             .find(|column| column.name == "event_id")
             .expect("baseline column");
         column.default_expr_text = Some("nextval('event_seq'::regclass)".to_string());
-        let mut same_name_state = safe_migrate::api::AnalysisState::new(same_name_cache);
+        let mut same_name_state =
+            crate::_internal::analysis::state::AnalysisState::new(same_name_cache);
         engine
             .analyze(
                 "DROP SEQUENCE public.event_seq CASCADE;",
@@ -4996,7 +5002,7 @@ mod state_mutation_tests {
                 if relation.get_column("event_id").is_some_and(|column| column.default_expr_text.is_some())
         ));
 
-        let mut rollback_state = safe_migrate::api::AnalysisState::new(cache);
+        let mut rollback_state = crate::_internal::analysis::state::AnalysisState::new(cache);
         engine
             .analyze("BEGIN; DROP TABLE events; ROLLBACK;", &mut rollback_state)
             .unwrap();
@@ -5063,8 +5069,9 @@ mod state_mutation_tests {
         use safe_migrate::_internal::model::constraint::ConstraintKind;
 
         let engine = setup_engine();
-        let mut state =
-            safe_migrate::api::AnalysisState::new(cache_with_table("public", "t_large", None));
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache_with_table(
+            "public", "t_large", None,
+        ));
         engine
             .analyze(
                 "ALTER TABLE t_large ADD CONSTRAINT unique_id UNIQUE (id);",
@@ -5178,7 +5185,7 @@ mod state_mutation_tests {
                 security: SecurityMode::Invoker,
             },
         );
-        let mut state = safe_migrate::api::AnalysisState::new(cache);
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
         engine
             .analyze("DROP FUNCTION f_safe(VARIADIC INT[]);", &mut state)
             .unwrap();
@@ -5513,7 +5520,7 @@ mod state_mutation_tests {
             });
         let mut cache = DbCache::new();
         cache.insert_baseline(table_id, relation);
-        let mut state = safe_migrate::api::AnalysisState::new(cache);
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
         let violations = engine
             .analyze(
                 "ALTER TABLE reservations ADD CONSTRAINT no_overlap
@@ -5615,7 +5622,7 @@ mod state_mutation_tests {
                 },
             );
         }
-        let mut state = safe_migrate::api::AnalysisState::new(cache);
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
 
         assert_eq!(state.local.current_role, "app_user");
         assert_eq!(state.local.session_role, "app_user");
@@ -5849,7 +5856,7 @@ mod state_mutation_tests {
                 0,
             ),
         );
-        let mut state = safe_migrate::api::AnalysisState::new(cache);
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
 
         engine
             .analyze(
@@ -5883,7 +5890,7 @@ mod state_mutation_tests {
                 0,
             ),
         );
-        let mut state = safe_migrate::api::AnalysisState::new(cache);
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
 
         engine
             .analyze(
@@ -5926,7 +5933,7 @@ mod state_mutation_tests {
                 generation: 0,
             },
         );
-        let mut state = safe_migrate::api::AnalysisState::new(cache);
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
 
         engine
             .analyze(
@@ -5963,7 +5970,7 @@ mod state_mutation_tests {
                 can_set_role_to: Vec::new(),
             },
         );
-        let mut state = safe_migrate::api::AnalysisState::new(cache);
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
 
         let violations = engine
             .analyze("SET ROLE role_that_does_not_exist;", &mut state)
@@ -6002,7 +6009,7 @@ mod state_mutation_tests {
                 },
             );
         }
-        let mut state = safe_migrate::api::AnalysisState::new(cache);
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
 
         let violations = engine
             .analyze(
@@ -6046,7 +6053,7 @@ mod state_mutation_tests {
                 },
             );
         }
-        let mut state = safe_migrate::api::AnalysisState::new(cache);
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
 
         let violations = engine.analyze("SET ROLE target;", &mut state).unwrap();
 
@@ -6076,7 +6083,7 @@ mod state_mutation_tests {
                 },
             );
         }
-        let mut state = safe_migrate::api::AnalysisState::new(cache);
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
 
         let violations = engine
             .analyze("GRANT parent TO member; SET ROLE parent;", &mut state)
@@ -6136,7 +6143,7 @@ mod state_mutation_tests {
                 },
             );
         }
-        let mut state = safe_migrate::api::AnalysisState::new(cache);
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
 
         let violations = engine
             .analyze(
@@ -6215,7 +6222,7 @@ mod state_mutation_tests {
                 grantor: object_id("", "admin"),
             },
         );
-        let mut state = safe_migrate::api::AnalysisState::new(cache);
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
 
         engine
             .analyze(
@@ -6252,7 +6259,7 @@ mod state_mutation_tests {
                 },
             );
         }
-        let mut state = safe_migrate::api::AnalysisState::new(cache);
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
         let result = engine.analyze("GRANT parent TO member, PUBLIC WITH SET TRUE;", &mut state);
         assert!(result.is_ok());
         let role = state
@@ -6287,7 +6294,7 @@ mod state_mutation_tests {
                 },
             );
         }
-        let mut state = safe_migrate::api::AnalysisState::new(cache);
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
         let _ = engine
             .analyze("GRANT role_a, role_b TO role_b, role_a;", &mut state)
             .unwrap();

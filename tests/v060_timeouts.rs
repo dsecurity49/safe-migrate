@@ -1,10 +1,10 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use safe_migrate::_internal::analysis::state::{AnalysisState, Confidence};
 use safe_migrate::_internal::db::cache::DbCache;
-use safe_migrate::_internal::engine::config::{Config, RuleConfig};
 use safe_migrate::_internal::engine::engine::SafeMigrateEngine;
 use safe_migrate::_internal::report::violations::Violation;
+use safe_migrate::api::{Config, RuleConfig};
 
 fn cache_with_timeouts(lock_timeout_ms: u64, statement_timeout_ms: u64) -> DbCache {
     let mut cache = DbCache::new();
@@ -256,7 +256,7 @@ fn timeout_findings_deduplicate_once_per_file_and_can_be_disabled() {
     assert_eq!(timeout_findings(&violations).len(), 2);
 
     let config = Config {
-        rules: HashMap::from([
+        rules: BTreeMap::from([
             (
                 "require-lock-timeout".to_string(),
                 RuleConfig {

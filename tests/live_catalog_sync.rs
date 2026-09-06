@@ -1,5 +1,3 @@
-mod common;
-
 use crate::common::database_hosts_are_local;
 use std::fs;
 use std::io::Read;
@@ -10,13 +8,13 @@ use safe_migrate::_internal::analysis::facts::{
 use safe_migrate::_internal::analysis::state::AnalysisState;
 use safe_migrate::_internal::ast::identifiers::ObjectId;
 use safe_migrate::_internal::db::cache::{CACHE_V7_MAGIC, DbCacheVersioned};
-use safe_migrate::_internal::engine::config::Config;
 use safe_migrate::_internal::engine::engine::SafeMigrateEngine;
 use safe_migrate::_internal::model::function::{
     FunctionOverlay, RoutineKind, SecurityMode, Volatility,
 };
 use safe_migrate::_internal::model::replication::{PublicationOverlay, SubscriptionOverlay};
 use safe_migrate::_internal::sync::sync_cache;
+use safe_migrate::api::Config;
 
 const SCHEMA: &str = "sm_v6_catalog";
 const SECOND_SCHEMA: &str = "sm_v6_catalog_extra";
@@ -62,7 +60,7 @@ impl Drop for CatalogCleanup {
     }
 }
 
-fn decode_cache(path: &std::path::Path) -> (safe_migrate::api::DbCache, Vec<u8>) {
+fn decode_cache(path: &std::path::Path) -> (crate::_internal::db::cache::DbCache, Vec<u8>) {
     let encoded = fs::read(path).expect("read synchronized cache");
     let mut decoder = zstd::stream::Decoder::new(encoded.as_slice()).expect("decode cache zstd");
     let mut payload = Vec::new();
@@ -223,7 +221,7 @@ fn seed_catalog(client: &mut postgres::Client, version: i32) {
 }
 
 fn inspect_cache(path: &std::path::Path) -> serde_json::Value {
-    let mut command = assert_cmd::Command::cargo_bin("safe-migrate").expect("safe-migrate binary");
+    let mut command = crate::common::safe_migrate_command();
     let output = command
         .arg("cache")
         .arg("inspect")
@@ -249,7 +247,7 @@ fn attributes(
 
 fn assert_routine_matches(
     state: &AnalysisState,
-    cache: &safe_migrate::api::DbCache,
+    cache: &crate::_internal::db::cache::DbCache,
     id: &ObjectId,
 ) {
     let Some(FunctionOverlay::Present(simulated)) = state.local.functions.get(id) else {
@@ -267,7 +265,7 @@ fn assert_routine_matches(
 
 fn assert_publication_matches(
     state: &AnalysisState,
-    cache: &safe_migrate::api::DbCache,
+    cache: &crate::_internal::db::cache::DbCache,
     name: &str,
 ) {
     let Some(PublicationOverlay::Present(simulated)) = state.local.publications.get(name) else {
@@ -294,7 +292,7 @@ fn assert_publication_matches(
 
 fn assert_subscription_matches(
     state: &AnalysisState,
-    cache: &safe_migrate::api::DbCache,
+    cache: &crate::_internal::db::cache::DbCache,
     name: &str,
 ) {
     let Some(SubscriptionOverlay::Present(simulated)) = state.local.subscriptions.get(name) else {

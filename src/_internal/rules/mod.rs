@@ -16,11 +16,10 @@ pub mod transactions;
 pub mod triggers;
 pub mod views;
 
-use crate::_internal::analysis::evidence::EvidenceRecord;
 use crate::_internal::analysis::mutations::Mutation;
-use crate::_internal::analysis::state::{AnalysisState, CascadeResult, Confidence, MutationResult};
-use crate::_internal::engine::config::Config;
+use crate::_internal::analysis::state::{AnalysisState, CascadeResult, MutationResult};
 use crate::_internal::report::violations::{Violation, ViolationTier};
+use crate::api::config::Config;
 
 /// Read-only inputs supplied to a rule for one analyzed mutation.
 ///
@@ -32,8 +31,6 @@ pub(crate) struct TransitionRecord<'a> {
     result: &'a MutationResult,
     pre_state: &'a crate::_internal::analysis::state::PreState,
     cascade_closure: Option<&'a CascadeResult>,
-    evidence: &'a [EvidenceRecord],
-    confidence: &'a Confidence,
 }
 
 impl<'a> TransitionRecord<'a> {
@@ -42,16 +39,12 @@ impl<'a> TransitionRecord<'a> {
         result: &'a MutationResult,
         pre_state: &'a crate::_internal::analysis::state::PreState,
         cascade_closure: Option<&'a CascadeResult>,
-        evidence: &'a [EvidenceRecord],
-        confidence: &'a Confidence,
     ) -> Self {
         Self {
             mutation,
             result,
             pre_state,
             cascade_closure,
-            evidence,
-            confidence,
         }
     }
 }
@@ -206,25 +199,10 @@ impl<'a> RuleContext<'a> {
         cascade_closure: Option<&'a CascadeResult>,
     ) -> Self {
         Self {
-            transition: TransitionRecord::new(
-                mutation,
-                result,
-                pre_state,
-                cascade_closure,
-                state.evidence(),
-                state.confidence(),
-            ),
+            transition: TransitionRecord::new(mutation, result, pre_state, cascade_closure),
             state,
             config,
         }
-    }
-
-    pub fn evidence(&self) -> &[EvidenceRecord] {
-        self.transition.evidence
-    }
-
-    pub fn confidence(&self) -> &Confidence {
-        self.transition.confidence
     }
 
     pub fn mutation(&self) -> &Mutation {

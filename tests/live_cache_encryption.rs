@@ -30,7 +30,7 @@ fn live_encrypted_cache_round_trip_and_rejection_contract() {
     fs::write(&config_path, "cache_encryption = true\n").expect("write encryption config");
     fs::write(&plain_config_path, "").expect("write plain config");
 
-    let mut sync = assert_cmd::Command::cargo_bin("safe-migrate").expect("safe-migrate binary");
+    let mut sync = crate::common::safe_migrate_command();
     let sync_output = sync
         .arg("sync")
         .arg("--out")
@@ -51,8 +51,7 @@ fn live_encrypted_cache_round_trip_and_rejection_contract() {
     assert!(!String::from_utf8_lossy(&sync_output.stdout).contains(TEST_KEY));
     assert!(!String::from_utf8_lossy(&sync_output.stderr).contains(TEST_KEY));
 
-    let mut plain_sync =
-        assert_cmd::Command::cargo_bin("safe-migrate").expect("safe-migrate binary");
+    let mut plain_sync = crate::common::safe_migrate_command();
     let plain_sync_output = plain_sync
         .arg("sync")
         .arg("--out")
@@ -74,7 +73,7 @@ fn live_encrypted_cache_round_trip_and_rejection_contract() {
             .any(|bytes| bytes == TEST_KEY.as_bytes())
     );
 
-    let mut inspect = assert_cmd::Command::cargo_bin("safe-migrate").expect("safe-migrate binary");
+    let mut inspect = crate::common::safe_migrate_command();
     let inspect_output = inspect
         .arg("cache")
         .arg("inspect")
@@ -94,7 +93,7 @@ fn live_encrypted_cache_round_trip_and_rejection_contract() {
 
     let migration_path = temp_dir.path().join("migration.sql");
     fs::write(&migration_path, "SET search_path TO public;\n").expect("write lint migration");
-    let mut lint = assert_cmd::Command::cargo_bin("safe-migrate").expect("safe-migrate binary");
+    let mut lint = crate::common::safe_migrate_command();
     let lint_output = lint
         .arg("lint")
         .arg("--file")
@@ -119,8 +118,7 @@ fn live_encrypted_cache_round_trip_and_rejection_contract() {
         "auto_sync = true\ncache_encryption = true\nschemas = [\"public\"]\n",
     )
     .expect("write encrypted auto-sync config");
-    let mut encrypted_auto_sync =
-        assert_cmd::Command::cargo_bin("safe-migrate").expect("safe-migrate binary");
+    let mut encrypted_auto_sync = crate::common::safe_migrate_command();
     let auto_sync_output = encrypted_auto_sync
         .arg("lint")
         .arg("--file")
@@ -156,8 +154,7 @@ fn live_encrypted_cache_round_trip_and_rejection_contract() {
         "SET search_path TO public;\n",
     )
     .expect("write second chain migration");
-    let mut lint_chain =
-        assert_cmd::Command::cargo_bin("safe-migrate").expect("safe-migrate binary");
+    let mut lint_chain = crate::common::safe_migrate_command();
     let chain_output = lint_chain
         .arg("lint-chain")
         .arg("--dir")
@@ -205,8 +202,7 @@ fn live_encrypted_cache_round_trip_and_rejection_contract() {
             "key is incorrect or the file was modified",
         ),
     ] {
-        let mut rejected =
-            assert_cmd::Command::cargo_bin("safe-migrate").expect("safe-migrate binary");
+        let mut rejected = crate::common::safe_migrate_command();
         rejected
             .arg("cache")
             .arg("inspect")

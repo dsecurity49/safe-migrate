@@ -314,9 +314,7 @@ pub fn find_primary_rule(id: &str) -> Option<&'static RuleDescriptor> {
     PRIMARY_RULES.iter().find(|rule| rule.id == id)
 }
 
-pub fn validate_rule_configuration(
-    config: &crate::_internal::engine::config::Config,
-) -> Result<(), String> {
+pub fn validate_rule_configuration(config: &crate::api::config::Config) -> Result<(), String> {
     if config.tier1_threshold_rows < config.tier2_threshold_rows {
         return Err(format!(
             "tier1_threshold_rows ({}) must be greater than or equal to tier2_threshold_rows ({})",
@@ -453,10 +451,10 @@ mod tests {
 
     #[test]
     fn threshold_validation_requires_tier1_at_or_above_tier2() {
-        let globally_reversed = crate::_internal::engine::config::Config {
+        let globally_reversed = crate::api::config::Config {
             tier1_threshold_rows: 9,
             tier2_threshold_rows: 10,
-            ..crate::_internal::engine::config::Config::default()
+            ..crate::api::config::Config::default()
         };
         assert!(
             validate_rule_configuration(&globally_reversed)
@@ -464,13 +462,13 @@ mod tests {
                 .contains("tier1_threshold_rows (9)")
         );
 
-        let mut per_rule_reversed = crate::_internal::engine::config::Config::default();
+        let mut per_rule_reversed = crate::api::config::Config::default();
         per_rule_reversed.rules.insert(
             "blocking-constraint".into(),
-            crate::_internal::engine::config::RuleConfig {
+            crate::api::config::RuleConfig {
                 tier1_threshold_rows: Some(5),
                 tier2_threshold_rows: Some(6),
-                ..crate::_internal::engine::config::RuleConfig::default()
+                ..crate::api::config::RuleConfig::default()
             },
         );
         assert!(
@@ -482,12 +480,12 @@ mod tests {
 
     #[test]
     fn unsupported_per_rule_thresholds_are_rejected() {
-        let mut config = crate::_internal::engine::config::Config::default();
+        let mut config = crate::api::config::Config::default();
         config.rules.insert(
             "require-lock-timeout".to_string(),
-            crate::_internal::engine::config::RuleConfig {
+            crate::api::config::RuleConfig {
                 tier1_threshold_rows: Some(1),
-                ..crate::_internal::engine::config::RuleConfig::default()
+                ..crate::api::config::RuleConfig::default()
             },
         );
 

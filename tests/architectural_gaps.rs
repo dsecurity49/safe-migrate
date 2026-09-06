@@ -1,5 +1,3 @@
-mod common;
-
 mod architectural_gap_tests {
     use crate::common::*;
     use safe_migrate::_internal::analysis::state::Confidence;

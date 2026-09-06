@@ -1,10 +1,7 @@
-mod common;
-
 mod rule_evaluation_tests {
     use crate::common::*;
     use safe_migrate::_internal::analysis::state::{AnalysisState, Confidence};
     use safe_migrate::_internal::ast::identifiers::ObjectId;
-    use safe_migrate::_internal::engine::config::{Config, RuleConfig};
     use safe_migrate::_internal::engine::engine::SafeMigrateEngine;
     use safe_migrate::_internal::model::column::Column;
     use safe_migrate::_internal::model::function::{
@@ -12,6 +9,7 @@ mod rule_evaluation_tests {
     };
     use safe_migrate::_internal::model::relation::{Persistence, RelationKind, RelationState};
     use safe_migrate::_internal::report::violations::ViolationTier;
+    use safe_migrate::api::{Config, RuleConfig};
 
     #[test]
     fn test_rule_idempotency() {

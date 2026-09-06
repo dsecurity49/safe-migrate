@@ -1,5 +1,3 @@
-mod common;
-
 mod invariant_sequences {
     use crate::common::invariants::{assert_cache_invariants, assert_state_invariants};
     use crate::common::{cache_with_table, object_id, setup_engine, setup_state};
@@ -249,10 +247,12 @@ mod invariant_sequences {
                     .expect("structure-aware statement should analyze");
                 assert_state_invariants(&state);
                 reports.push(
-                    serde_json::to_string(&safe_migrate::api::Reporter::json_report(
-                        &findings,
-                        &state.local.confidence,
-                    ))
+                    serde_json::to_string(
+                        &crate::_internal::report::reporter::Reporter::json_report(
+                            &findings,
+                            &state.local.confidence,
+                        ),
+                    )
                     .expect("report should serialize"),
                 );
             }

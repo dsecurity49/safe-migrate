@@ -1,5 +1,3 @@
-mod common;
-
 mod identifier_casing_tests {
     use crate::common::*;
     use safe_migrate::_internal::model::relation::RelationOverlay;

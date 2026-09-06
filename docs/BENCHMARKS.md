@@ -6,7 +6,7 @@ guarantees.
 Run them with:
 
 ```sh
-cargo test --locked --test performance_scenarios -- --ignored --nocapture
+cargo test --locked --lib internal_tests::performance_scenarios -- --ignored --nocapture
 ```
 
 The scenarios validate final state as well as timing, so an apparent speedup
@@ -68,7 +68,7 @@ the same aarch64 Android Linux host and optimized profile described above.
 Run future comparisons with the same command and profile:
 
 ```sh
-cargo test --release --locked --test performance_scenarios -- --ignored --nocapture --test-threads=1
+cargo test --release --locked --lib internal_tests::performance_scenarios -- --ignored --nocapture --test-threads=1
 ```
 
 The allocation scenarios use a process-global counting allocator. Run them
@@ -143,5 +143,5 @@ The indexed path was about **6.3x faster** while returning the same edge count.
 Run the isolated comparison with:
 
 ```sh
-cargo test --locked --jobs 1 --test performance_scenarios large_dependency_graph_lookup_index -- --ignored --nocapture --test-threads=1
+cargo test --locked --jobs 1 --lib internal_tests::performance_scenarios::large_dependency_graph_lookup_index -- --ignored --nocapture --test-threads=1
 ```

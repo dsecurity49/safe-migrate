@@ -1,7 +1,8 @@
 [package]
 name = "safe-migrate"
-version = "0.8.1"
+version = "0.9.0"
 edition = "2024"
+autotests = false
 rust-version = "1.94"
 description = "Check PostgreSQL migrations against a synchronized database baseline"
 license = "MIT OR Apache-2.0"
@@ -40,3 +41,7 @@ assert_cmd = "2.0"
 postgres = "0.19"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+
+[[test]]
+name = "api_facade"
+path = "tests/api_facade.rs"

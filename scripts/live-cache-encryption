@@ -9,5 +9,6 @@ if [ -z "${DATABASE_URL:-}" ]; then
     exit 2
 fi
 
-cargo test --locked --test live_cache_encryption \
-    live_encrypted_cache_round_trip_and_rejection_contract -- --ignored --nocapture
+cargo test --locked --lib \
+    internal_tests::live_cache_encryption::live_encrypted_cache_round_trip_and_rejection_contract \
+    -- --ignored --nocapture

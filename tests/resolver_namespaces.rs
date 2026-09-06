@@ -1,8 +1,6 @@
-mod common;
-
 #[cfg(test)]
 mod resolver_namespace_tests {
-    use super::common::{object_id, setup_engine, setup_state};
+    use crate::common::{object_id, setup_engine, setup_state};
     use safe_migrate::_internal::model::function::FunctionOverlay;
     use safe_migrate::_internal::model::relation::RelationOverlay;
 

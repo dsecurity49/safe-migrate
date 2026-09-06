@@ -1,5 +1,3 @@
-mod common;
-
 mod phase10_bug_fixes_and_sorting_tests {
     use crate::common::*;
     use safe_migrate::_internal::analysis::state::{AnalysisState, Confidence};
@@ -1241,7 +1239,7 @@ mod phase10_bug_fixes_and_sorting_tests {
     // ─────────────────────────────────────────────
     #[test]
     fn test_bug012_partition_threshold_floor_at_one() {
-        let config = safe_migrate::_internal::engine::config::Config {
+        let config = safe_migrate::api::Config {
             tier1_threshold_rows: 1,
             tier2_threshold_rows: 1,
             ..Default::default()
@@ -1275,7 +1273,7 @@ mod phase10_bug_fixes_and_sorting_tests {
         child.partition_type = Some("RANGE".to_string());
         cache.insert_baseline(child_id, child);
 
-        let mut state = safe_migrate::api::AnalysisState::new(cache);
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
 
         let violations = engine
             .analyze(

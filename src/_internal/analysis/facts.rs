@@ -47,9 +47,14 @@ pub enum ResetSettingTarget {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum TypeCreationKind {
-    Enum { variants: Vec<String> },
+    Enum {
+        variants: Vec<String>,
+    },
+    #[expect(dead_code, reason = "reserved for typed Squawk range support")]
     Range,
+    #[expect(dead_code, reason = "reserved for typed Squawk composite support")]
     Composite,
+    #[expect(dead_code, reason = "reserved for typed Squawk base-type support")]
     Base,
 }
 
@@ -64,10 +69,12 @@ pub enum AlterViewAction {
     SetSchema {
         new_schema: String,
     },
+    #[expect(dead_code, reason = "reserved for typed Squawk view-default support")]
     SetDefault {
         column: String,
         default: Option<ExprIr>,
     },
+    #[expect(dead_code, reason = "reserved for typed Squawk view-default support")]
     DropDefault {
         column: String,
     },
@@ -75,9 +82,11 @@ pub enum AlterViewAction {
         from: Ident,
         to: Ident,
     },
+    #[expect(dead_code, reason = "reserved for typed Squawk view-option support")]
     SetOptions {
         options: Vec<String>,
     },
+    #[expect(dead_code, reason = "reserved for typed Squawk view-option support")]
     ResetOptions {
         options: Vec<String>,
     },

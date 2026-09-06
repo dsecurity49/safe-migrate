@@ -1,5 +1,4 @@
-mod common;
-
+use crate::common;
 use safe_migrate::_internal::analysis::evidence::EvidenceCode;
 
 #[test]
@@ -65,7 +64,7 @@ fn foreign_key_type_compatibility_gap_has_catalog_evidence_not_legacy_taint() {
 #[test]
 fn unknown_sequence_target_has_typed_object_state_evidence() {
     let engine = common::setup_engine();
-    let mut state = safe_migrate::api::AnalysisState::with_baseline(
+    let mut state = crate::_internal::analysis::state::AnalysisState::with_baseline(
         safe_migrate::_internal::db::cache::DbCache::new(),
         false,
     );
@@ -88,7 +87,7 @@ fn unknown_sequence_target_has_typed_object_state_evidence() {
 #[test]
 fn unavailable_rule_capability_is_recorded_before_rule_evaluation() {
     let engine = common::setup_engine();
-    let mut state = safe_migrate::api::AnalysisState::with_baseline(
+    let mut state = crate::_internal::analysis::state::AnalysisState::with_baseline(
         safe_migrate::_internal::db::cache::DbCache::new(),
         false,
     );

@@ -18,7 +18,7 @@ fn run_auto_sync_case(
     fs::write(&config_path, "auto_sync = true\nschemas = [\"public\"]\n")
         .expect("write live auto-sync config");
 
-    let mut command = assert_cmd::Command::cargo_bin("safe-migrate").expect("safe-migrate binary");
+    let mut command = crate::common::safe_migrate_command();
     command
         .arg(mode)
         .arg("--config")

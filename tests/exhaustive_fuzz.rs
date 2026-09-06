@@ -1,5 +1,3 @@
-mod common;
-
 mod exhaustive_fuzz_tests {
     use crate::common::*;
     use safe_migrate::_internal::analysis::state::AnalysisState;

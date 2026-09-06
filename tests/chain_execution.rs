@@ -1,5 +1,3 @@
-mod common;
-
 mod chain_execution_tests {
     use crate::common::*;
     use safe_migrate::_internal::model::relation::RelationOverlay;

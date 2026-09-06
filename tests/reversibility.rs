@@ -1,5 +1,3 @@
-mod common;
-
 mod reversibility_tests {
     use crate::common::*;
     use safe_migrate::_internal::analysis::state::AnalysisState;

@@ -1,22 +1,10 @@
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
-use safe_migrate::_internal::analysis::evidence::{EvidenceCode, EvidenceRecord, EvidenceScope};
-use safe_migrate::_internal::analysis::outcome::AnalysisOutcome;
-use safe_migrate::_internal::db::cache::{
-    CACHE_FORMAT_VERSION, CACHE_V7_MAGIC, CacheMetadata, CatalogCoverage, DbCacheVersioned,
+use safe_migrate::api::{
+    self, AnalysisOutcome, AutoSyncStatus, Baseline, BaselineInspection, Config, Migration, Rule,
 };
-use safe_migrate::_internal::db::cache_file::{
-    MAX_CACHE_DECODE_BYTES, is_encrypted_cache_bytes, read_cache_bytes, unprotect_cache_bytes,
-};
-use safe_migrate::_internal::model::relation::RelationKind;
-use safe_migrate::_internal::report::violations::{ReportFinding, Violation};
-use safe_migrate::_internal::rules::registry::{self, RuleDescriptor};
-use safe_migrate::_internal::sync;
-use safe_migrate::api::{AnalysisState, Config, DbCache, Reporter, SafeMigrateEngine};
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 const EXIT_BLOCKING_FINDINGS: i32 = 2;
 
@@ -163,79 +151,9 @@ enum OutputMode {
     Interactive,
 }
 
-#[derive(Clone, Copy)]
-enum AutoSyncOutcome {
-    NotRequested,
-    Refreshed,
-    Failed,
-    Bypassed,
-}
-
-impl AutoSyncOutcome {
-    fn label(self) -> &'static str {
-        match self {
-            Self::NotRequested => "not_requested",
-            Self::Refreshed => "refreshed",
-            Self::Failed => "failed",
-            Self::Bypassed => "bypassed",
-        }
-    }
-}
-
 struct PreparedCache {
-    cache: DbCache,
-    baseline_unknown: bool,
-    baseline_stale: bool,
-    auto_sync: AutoSyncOutcome,
-    metadata: CacheMetadata,
-}
-
-#[derive(serde::Serialize)]
-struct CacheInspection {
-    path: String,
-    format_version: u32,
-    encrypted: bool,
-    created_at_unix_secs: Option<u64>,
-    age_seconds: Option<u64>,
-    source_database: Option<String>,
-    schemas: Option<Vec<String>>,
-    coverage: CatalogCoverage,
-    search_path: Vec<String>,
-    postgresql_version_num: Option<u32>,
-    observed_settings: ObservedSettings,
-    contents: CacheContentsSummary,
-}
-
-#[derive(Clone, serde::Serialize)]
-struct ObservedSettings {
-    lock_timeout_ms: Option<u64>,
-    statement_timeout_ms: Option<u64>,
-}
-
-#[derive(serde::Serialize)]
-struct CacheContentsSummary {
-    schemas: usize,
-    sequences: usize,
-    relations: usize,
-    tables: usize,
-    views: usize,
-    materialized_views: usize,
-    columns: usize,
-    indexes: usize,
-    foreign_keys: usize,
-    constraints: usize,
-    constraint_keys: usize,
-    triggers: usize,
-    functions: usize,
-    procedures: usize,
-    aggregates: usize,
-    window_functions: usize,
-    publications: usize,
-    subscriptions: usize,
-    types: usize,
-    roles: usize,
-    dependencies: usize,
-    inheritances: usize,
+    baseline: Baseline,
+    auto_sync: AutoSyncStatus,
 }
 
 impl OutputMode {
@@ -314,36 +232,22 @@ fn main() -> Result<()> {
     }
 }
 
-fn rule_descriptor_json(descriptor: &RuleDescriptor, config: &Config) -> serde_json::Value {
-    use safe_migrate::_internal::rules::registry::RuleConfigurationField;
-
-    let mut effective = serde_json::json!({
-        "enabled": !config.is_rule_disabled(descriptor.id),
-    });
-    if descriptor.supports(RuleConfigurationField::Tier1ThresholdRows) {
-        effective["tier1_threshold_rows"] =
-            serde_json::json!(config.rule_tier1_threshold(descriptor.id));
+fn rule_descriptor_json(rule: &Rule) -> serde_json::Value {
+    let mut effective = serde_json::json!({ "enabled": rule.enabled });
+    if let Some(value) = rule.tier1_threshold_rows {
+        effective["tier1_threshold_rows"] = serde_json::json!(value);
     }
-    if descriptor.supports(RuleConfigurationField::Tier2ThresholdRows) {
-        effective["tier2_threshold_rows"] =
-            serde_json::json!(config.rule_tier2_threshold(descriptor.id));
+    if let Some(value) = rule.tier2_threshold_rows {
+        effective["tier2_threshold_rows"] = serde_json::json!(value);
     }
     serde_json::json!({
-        "id": descriptor.id,
-        "title": descriptor.title,
-        "summary": descriptor.summary,
-        "impact": descriptor.impact,
-        "default_tier": match descriptor.default_tier() {
-            safe_migrate::_internal::report::violations::ViolationTier::Tier1 => "Tier1",
-            safe_migrate::_internal::report::violations::ViolationTier::Tier2 => "Tier2",
-            safe_migrate::_internal::report::violations::ViolationTier::Tier3 => "Tier3",
-        },
-        "remediation": descriptor.recipe(),
-        "supported_configuration_fields": descriptor
-            .supported_configuration_fields
-            .iter()
-            .map(|field| field.as_str())
-            .collect::<Vec<_>>(),
+        "id": rule.id,
+        "title": rule.title,
+        "summary": rule.summary,
+        "impact": rule.impact,
+        "default_tier": format!("{:?}", rule.default_tier),
+        "remediation": rule.remediation,
+        "supported_configuration_fields": rule.supported_configuration_fields,
         "effective": effective,
     })
 }
@@ -358,15 +262,26 @@ fn rules_separator() -> String {
 
 fn run_rules(rule_id: Option<&str>, json: bool, config_path: Option<&Path>) -> Result<()> {
     let config = load_config(config_path)?;
-    let descriptors: Vec<_> = match rule_id {
-        Some(id) => vec![registry::find_primary_rule(id).ok_or_else(|| {
-            anyhow!(
-                "Unknown primary rule ID '{}'. Valid primary rule IDs: {}",
-                id,
-                registry::primary_rule_ids().collect::<Vec<_>>().join(", ")
-            )
-        })?],
-        None => registry::PRIMARY_RULES.iter().collect(),
+    let all_rules = api::rules(&config).map_err(anyhow::Error::new)?;
+    let rules: Vec<_> = match rule_id {
+        Some(id) => vec![
+            all_rules
+                .into_iter()
+                .find(|rule| rule.id == id)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Unknown primary rule ID '{}'. Valid primary rule IDs: {}",
+                        id,
+                        api::rules(&config)
+                            .expect("validated configuration must list rules")
+                            .iter()
+                            .map(|rule| rule.id.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                })?,
+        ],
+        None => all_rules,
     };
 
     if json {
@@ -374,48 +289,37 @@ fn run_rules(rule_id: Option<&str>, json: bool, config_path: Option<&Path>) -> R
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "schema_version": 2,
-                "rules": descriptors.iter().map(|descriptor| rule_descriptor_json(descriptor, &config)).collect::<Vec<_>>(),
+                "rules": rules.iter().map(rule_descriptor_json).collect::<Vec<_>>(),
             }))?
         );
         return Ok(());
     }
 
-    for (index, descriptor) in descriptors.iter().enumerate() {
+    for (index, rule) in rules.iter().enumerate() {
         if index > 0 {
             println!();
             println!("{}", rules_separator());
             println!();
         }
-        println!("{} ({})", descriptor.title, descriptor.id);
-        println!("  Summary: {}", descriptor.summary);
-        println!("  Impact: {}", descriptor.impact);
-        println!("  Default tier: {:?}", descriptor.default_tier());
-        println!("  Remediation: {}", descriptor.recipe());
+        println!("{} ({})", rule.title, rule.id);
+        println!("  Summary: {}", rule.summary);
+        println!("  Impact: {}", rule.impact);
+        println!("  Default tier: {:?}", rule.default_tier);
+        println!("  Remediation: {}", rule.remediation);
         println!(
             "  Configuration: {}",
-            descriptor
-                .supported_configuration_fields
+            rule.supported_configuration_fields
                 .iter()
                 .map(|field| field.as_str())
                 .collect::<Vec<_>>()
                 .join(", ")
         );
-        let mut effective = vec![format!(
-            "enabled={}",
-            !config.is_rule_disabled(descriptor.id)
-        )];
-        use safe_migrate::_internal::rules::registry::RuleConfigurationField;
-        if descriptor.supports(RuleConfigurationField::Tier1ThresholdRows) {
-            effective.push(format!(
-                "tier1_threshold_rows={}",
-                config.rule_tier1_threshold(descriptor.id)
-            ));
+        let mut effective = vec![format!("enabled={}", rule.enabled)];
+        if let Some(value) = rule.tier1_threshold_rows {
+            effective.push(format!("tier1_threshold_rows={value}"));
         }
-        if descriptor.supports(RuleConfigurationField::Tier2ThresholdRows) {
-            effective.push(format!(
-                "tier2_threshold_rows={}",
-                config.rule_tier2_threshold(descriptor.id)
-            ));
+        if let Some(value) = rule.tier2_threshold_rows {
+            effective.push(format!("tier2_threshold_rows={value}"));
         }
         println!("  Effective: {}", effective.join(", "));
     }
@@ -434,30 +338,16 @@ fn run_lint(
         .with_context(|| format!("Failed to read migration file: {}", file.display()))?;
     let config = load_config(config_path)?;
     let PreparedCache {
-        cache: db_cache,
-        baseline_unknown,
-        baseline_stale,
+        baseline,
         auto_sync,
-        metadata,
     } = prepare_cache(&config, cache, no_cache, no_auto_sync)?;
 
     eprintln!("Analyzing migration: {}", file.display());
 
-    let engine = SafeMigrateEngine::new(config);
-    let mut state = AnalysisState::with_baseline(db_cache, !baseline_unknown);
-    let outcome = engine
-        .analyze_outcome_with_locations(file.display().to_string(), sql, &mut state)
-        .map_err(analysis_error)?;
-    let outcome = attach_baseline_evidence(outcome, baseline_unknown, baseline_stale);
+    let outcome = api::analyze(&config, file.display().to_string(), sql, &baseline)
+        .map_err(anyhow::Error::new)?;
 
-    finish_analysis(
-        outcome,
-        baseline_unknown,
-        baseline_stale,
-        auto_sync,
-        metadata,
-        output_mode,
-    )
+    finish_analysis(outcome, auto_sync, output_mode)
 }
 
 fn run_lint_chain(
@@ -499,135 +389,58 @@ fn run_lint_chain(
 
     let config = load_config(config_path)?;
     let PreparedCache {
-        cache: db_cache,
-        baseline_unknown,
-        baseline_stale,
+        baseline,
         auto_sync,
-        metadata,
     } = prepare_cache(&config, cache, no_cache, no_auto_sync)?;
 
     eprintln!("Analyzing migration chain in: {}", dir.display());
 
-    let engine = SafeMigrateEngine::new(config);
-    let mut state = AnalysisState::with_baseline(db_cache, !baseline_unknown);
-    let outcome = engine
-        .analyze_chain_outcome_with_locations(&migrations, &mut state)
-        .map_err(analysis_error)?;
-    let outcome = attach_baseline_evidence(outcome, baseline_unknown, baseline_stale);
-
-    finish_analysis(
-        outcome,
-        baseline_unknown,
-        baseline_stale,
-        auto_sync,
-        metadata,
-        output_mode,
+    let outcome = api::analyze_chain(
+        &config,
+        migrations
+            .into_iter()
+            .map(|(filename, sql)| Migration::new(filename, sql)),
+        &baseline,
     )
+    .map_err(anyhow::Error::new)?;
+
+    finish_analysis(outcome, auto_sync, output_mode)
 }
 
 fn run_sync(out: &Path, config_path: Option<&Path>, schemas: Option<&[String]>) -> Result<()> {
     let config = load_config(config_path)?;
-    let schemas = config.sync_schemas(schemas)?;
+    let effective_schemas = schemas.or(config.schema_scope());
 
     println!("Syncing PostgreSQL schema metadata and statistics...");
-    if let Some(schemas) = schemas {
+    if let Some(schemas) = effective_schemas {
         println!("Filtering to schemas: {}", schemas.join(", "));
     }
-    sync::sync_cache(out, schemas, config.cache_encryption)?;
+    api::sync(out, &config, schemas).map_err(anyhow::Error::new)?;
     println!("[ SAFE ] Cache successfully written to {}", out.display());
     Ok(())
 }
 
 fn run_cache_inspect(cache_path: &Path, config_path: Option<&Path>, json: bool) -> Result<()> {
     let config = load_config(config_path)?;
-    let (cache, format_version, encrypted) = decode_cache(cache_path, config.cache_encryption)?;
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let inspection = CacheInspection {
-        path: cache_path.display().to_string(),
-        format_version,
-        encrypted,
-        created_at_unix_secs: cache.metadata.created_at_unix_secs,
-        age_seconds: cache
-            .metadata
-            .created_at_unix_secs
-            .map(|created_at| now.saturating_sub(created_at)),
-        source_database: cache.metadata.source_database.clone(),
-        schemas: cache.metadata.schemas.clone(),
-        coverage: cache.coverage.clone(),
-        search_path: cache.search_path.clone(),
-        postgresql_version_num: cache.pg_version_num,
-        observed_settings: ObservedSettings {
-            lock_timeout_ms: Some(cache.metadata.source_lock_timeout_ms),
-            statement_timeout_ms: Some(cache.metadata.source_statement_timeout_ms),
-        },
-        contents: summarize_cache(&cache),
-    };
+    let inspection = Baseline::load(cache_path, &config)
+        .map_err(anyhow::Error::new)?
+        .inspect();
 
     if json {
         println!("{}", serde_json::to_string_pretty(&inspection)?);
     } else {
-        print_cache_inspection(&inspection);
+        print_cache_inspection(cache_path, &inspection);
     }
     Ok(())
 }
-
-fn summarize_cache(cache: &DbCache) -> CacheContentsSummary {
-    let mut tables = 0;
-    let mut views = 0;
-    let mut materialized_views = 0;
-    let mut columns = 0;
-    for relation in cache.relations.values() {
-        columns += relation.columns.len();
-        match &relation.kind {
-            RelationKind::Table => tables += 1,
-            RelationKind::View => views += 1,
-            RelationKind::MaterializedView => materialized_views += 1,
-        }
-    }
-    let mut functions = 0;
-    let mut procedures = 0;
-    let mut aggregates = 0;
-    let mut window_functions = 0;
-    for routine in cache.functions.values() {
-        match routine.routine_kind {
-            safe_migrate::_internal::model::function::RoutineKind::Function => functions += 1,
-            safe_migrate::_internal::model::function::RoutineKind::Procedure => procedures += 1,
-            safe_migrate::_internal::model::function::RoutineKind::Aggregate => aggregates += 1,
-            safe_migrate::_internal::model::function::RoutineKind::Window => window_functions += 1,
-        }
-    }
-    CacheContentsSummary {
-        schemas: cache.schemas.len(),
-        sequences: cache.sequences.len(),
-        relations: cache.relations.len(),
-        tables,
-        views,
-        materialized_views,
-        columns,
-        indexes: cache.indexes.len(),
-        foreign_keys: cache.foreign_keys.len(),
-        constraints: cache.constraints.len(),
-        constraint_keys: cache.constraint_keys.len(),
-        triggers: cache.triggers.len(),
-        functions,
-        procedures,
-        aggregates,
-        window_functions,
-        publications: cache.publications.len(),
-        subscriptions: cache.subscriptions.len(),
-        types: cache.types.len(),
-        roles: cache.roles.len(),
-        dependencies: cache.dependencies.len(),
-        inheritances: cache.inheritances.len(),
-    }
-}
-
-fn print_cache_inspection(inspection: &CacheInspection) {
-    println!("Cache: {}", inspection.path);
-    println!("Format version: {}", inspection.format_version);
+fn print_cache_inspection(cache_path: &Path, inspection: &BaselineInspection) {
+    println!("Cache: {}", cache_path.display());
+    println!(
+        "Format version: {}",
+        inspection
+            .format_version
+            .map_or_else(|| "unavailable".to_owned(), |version| version.to_string())
+    );
     println!(
         "Encryption: {}",
         if inspection.encrypted {
@@ -665,7 +478,9 @@ fn print_cache_inspection(inspection: &CacheInspection) {
         "Catalog coverage: {}",
         inspection
             .coverage
-            .family_names()
+            .families
+            .iter()
+            .map(String::as_str)
             .collect::<Vec<_>>()
             .join(", ")
     );
@@ -745,29 +560,14 @@ fn load_config(path: Option<&Path>) -> Result<Config> {
     };
     let config = config
         .with_context(|| format!("Failed to load configuration: {}", loaded_path.display()))?;
-    let engine = SafeMigrateEngine::new(config.clone());
-    config
-        .validate_rule_ids(engine.primary_rule_ids())
+    api::validate_config(&config)
+        .map_err(anyhow::Error::new)
         .with_context(|| {
             format!(
                 "Failed to validate configuration: {}",
                 loaded_path.display()
             )
         })?;
-    registry::validate_rule_configuration(&config)
-        .map_err(anyhow::Error::msg)
-        .with_context(|| {
-            format!(
-                "Failed to validate configuration: {}",
-                loaded_path.display()
-            )
-        })?;
-    config.sync_schemas(None).with_context(|| {
-        format!(
-            "Failed to validate configuration: {}",
-            loaded_path.display()
-        )
-    })?;
     Ok(config)
 }
 
@@ -778,16 +578,25 @@ fn prepare_cache(
     no_auto_sync: bool,
 ) -> Result<PreparedCache> {
     let auto_sync = maybe_auto_sync(config, cache, no_cache, no_auto_sync);
-    let (cache, baseline_unknown) = load_cache(cache, no_cache, config.cache_encryption)?;
-    let baseline_stale =
-        warn_if_stale_cache(&cache.metadata, baseline_unknown, config.stale_stats_days);
-    let metadata = cache.metadata.clone();
+    let baseline = if !no_cache && cache.exists() {
+        Baseline::load(cache, config).map_err(anyhow::Error::new)?
+    } else {
+        if no_cache {
+            eprintln!("[ INFO ] --no-cache passed. Running with default worst-case assumptions.");
+        } else {
+            eprintln!("[ INFO ] No cache found. Running with default worst-case assumptions.");
+        }
+        Baseline::unavailable()
+    };
+    let baseline_stale = baseline.is_stale(config.stale_stats_days());
+    if baseline_stale {
+        eprintln!(
+            "[ WARN ] Database cache is stale. Run `safe-migrate sync` before relying on baseline-aware results."
+        );
+    }
     Ok(PreparedCache {
-        cache,
-        baseline_unknown,
-        baseline_stale,
+        baseline,
         auto_sync,
-        metadata,
     })
 }
 
@@ -796,34 +605,27 @@ fn maybe_auto_sync(
     cache: &Path,
     no_cache: bool,
     no_auto_sync: bool,
-) -> AutoSyncOutcome {
-    if !config.auto_sync {
-        return AutoSyncOutcome::NotRequested;
+) -> AutoSyncStatus {
+    if !config.auto_sync() {
+        return AutoSyncStatus::NotRequested;
     }
 
     if no_cache {
         eprintln!("[ INFO ] --no-cache bypasses configured automatic cache sync.");
-        return AutoSyncOutcome::Bypassed;
+        return AutoSyncStatus::Bypassed;
     }
 
     if no_auto_sync {
         eprintln!("[ INFO ] --no-auto-sync bypasses configured automatic cache sync.");
-        return AutoSyncOutcome::Bypassed;
+        return AutoSyncStatus::Bypassed;
     }
 
     eprintln!(
         "[ INFO ] Automatic cache sync enabled. Refreshing {}.",
         cache.display()
     );
-    let schemas = match config.sync_schemas(None) {
-        Ok(schemas) => schemas,
-        Err(error) => {
-            eprintln!("[ WARN ] Automatic cache sync configuration is invalid: {error}");
-            return AutoSyncOutcome::Failed;
-        }
-    };
-    match sync::sync_cache(cache, schemas, config.cache_encryption) {
-        Ok(()) => AutoSyncOutcome::Refreshed,
+    match api::sync(cache, config, None) {
+        Ok(()) => AutoSyncStatus::Refreshed,
         Err(error) => {
             eprintln!("[ WARN ] Automatic cache sync failed: {error}");
             if cache.exists() {
@@ -833,227 +635,30 @@ fn maybe_auto_sync(
                     "         No usable cache is available; continuing with uncertain analysis."
                 );
             }
-            AutoSyncOutcome::Failed
+            AutoSyncStatus::Failed
         }
     }
-}
-
-fn warn_if_stale_cache(metadata: &CacheMetadata, baseline_unknown: bool, stale_days: u64) -> bool {
-    if baseline_unknown {
-        return false;
-    }
-
-    let Some(created_at) = metadata.created_at_unix_secs else {
-        eprintln!(
-            "[ WARN ] Cache has no creation timestamp. Refresh it before relying on baseline-aware results."
-        );
-        return true;
-    };
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let age = now.saturating_sub(created_at);
-    if age > stale_days.saturating_mul(24 * 60 * 60) {
-        eprintln!(
-            "[ WARN ] Database cache is {} days old (configured limit: {} days).",
-            age / (24 * 60 * 60),
-            stale_days
-        );
-        eprintln!("         Run `safe-migrate sync` to refresh lock evaluations.");
-        true
-    } else {
-        false
-    }
-}
-
-fn load_cache(cache: &Path, no_cache: bool, cache_encryption: bool) -> Result<(DbCache, bool)> {
-    if !no_cache && cache.exists() {
-        let (cache, _, _) = decode_cache(cache, cache_encryption)?;
-        Ok((cache, false))
-    } else {
-        if no_cache {
-            eprintln!("[ INFO ] --no-cache passed. Running with default worst-case assumptions.");
-        } else {
-            eprintln!("[ INFO ] No cache found. Running with default worst-case assumptions.");
-        }
-        Ok((DbCache::new(), true))
-    }
-}
-
-fn decode_cache(cache_path: &Path, cache_encryption: bool) -> Result<(DbCache, u32, bool)> {
-    let encoded = read_cache_bytes(cache_path)?;
-    let encrypted = is_encrypted_cache_bytes(&encoded);
-    let decrypted = unprotect_cache_bytes(encoded, cache_encryption)?;
-    let reader = std::io::Cursor::new(decrypted);
-    let decoder = zstd::stream::Decoder::new(reader).map_err(|error| {
-        anyhow!(
-            "Cache file '{}' is corrupted (zstd init): {}",
-            cache_path.display(),
-            error
-        )
-    })?;
-    let mut decoder = decoder.take(MAX_CACHE_DECODE_BYTES as u64 + 1);
-    let mut header = vec![0; CACHE_V7_MAGIC.len()];
-    let mut header_len = 0;
-    while header_len < header.len() {
-        let read = decoder.read(&mut header[header_len..]).map_err(|error| {
-            anyhow!(
-                "Cache file '{}' is corrupted while decompressing: {}",
-                cache_path.display(),
-                error
-            )
-        })?;
-        if read == 0 {
-            break;
-        }
-        header_len += read;
-    }
-    if header_len != CACHE_V7_MAGIC.len() || header != CACHE_V7_MAGIC {
-        anyhow::bail!(
-            "Cache file '{}' uses an unsupported cache format. Run `safe-migrate sync` to rebuild it.",
-            cache_path.display()
-        );
-    }
-
-    let config = bincode::config::standard()
-        .with_variable_int_encoding()
-        .with_limit::<MAX_CACHE_DECODE_BYTES>();
-    let versioned: DbCacheVersioned =
-        bincode::serde::decode_from_std_read(&mut decoder, config).map_err(|error| {
-        if matches!(&error, bincode::error::DecodeError::LimitExceeded) {
-            return anyhow!(
-                "Cache file '{}' exceeds the {} MiB decoded-size limit",
-                cache_path.display(),
-                MAX_CACHE_DECODE_BYTES / (1024 * 1024)
-            );
-        }
-        anyhow!(
-            "Cache file '{}' is corrupted (bincode): {}. Run `safe-migrate sync` to rebuild it.",
-            cache_path.display(),
-            error
-        )
-    })?;
-    let remaining_before_trailing = decoder.limit();
-    std::io::copy(&mut decoder, &mut std::io::sink()).map_err(|error| {
-        anyhow!(
-            "Cache file '{}' is corrupted while decompressing: {}",
-            cache_path.display(),
-            error
-        )
-    })?;
-    let decompressed_bytes = (MAX_CACHE_DECODE_BYTES as u64 + 1) - decoder.limit();
-    if decompressed_bytes > MAX_CACHE_DECODE_BYTES as u64 {
-        anyhow::bail!(
-            "Cache file '{}' exceeds the {} MiB decoded-size limit",
-            cache_path.display(),
-            MAX_CACHE_DECODE_BYTES / (1024 * 1024)
-        );
-    }
-    if decoder.limit() != remaining_before_trailing {
-        anyhow::bail!(
-            "Cache file '{}' is corrupted (trailing payload data). Run `safe-migrate sync` to rebuild it.",
-            cache_path.display()
-        );
-    }
-    let header_version = CACHE_FORMAT_VERSION;
-    let format_version = versioned.format_version();
-    if format_version != header_version {
-        anyhow::bail!(
-            "Cache file '{}' has a mismatched cache format header. Run `safe-migrate sync` to rebuild it.",
-            cache_path.display()
-        );
-    }
-    let cache = versioned.into_cache().map_err(|error| {
-        anyhow!(
-            "Cache file '{}' is incompatible: {}",
-            cache_path.display(),
-            error
-        )
-    })?;
-    Ok((cache, format_version, encrypted))
-}
-
-fn analysis_error(errors: Vec<String>) -> anyhow::Error {
-    anyhow!(
-        "Failed to parse SQL migration:\n  - {}",
-        errors.join("\n  - ")
-    )
 }
 
 fn finish_analysis(
-    outcome: AnalysisOutcome<ReportFinding>,
-    baseline_unknown: bool,
-    baseline_stale: bool,
-    auto_sync: AutoSyncOutcome,
-    metadata: CacheMetadata,
+    outcome: AnalysisOutcome,
+    auto_sync: AutoSyncStatus,
     output_mode: OutputMode,
 ) -> Result<()> {
-    let violations: Vec<Violation> = outcome
-        .findings
-        .iter()
-        .map(|finding| finding.violation.clone())
-        .collect();
-    let should_halt = Reporter::should_halt(&violations);
-    let observed_settings = ObservedSettings {
-        lock_timeout_ms: (!baseline_unknown).then_some(metadata.source_lock_timeout_ms),
-        statement_timeout_ms: (!baseline_unknown).then_some(metadata.source_statement_timeout_ms),
-    };
-    let baseline = serde_json::json!({
-        "status": if baseline_unknown { "unavailable" } else if baseline_stale { "stale" } else { "available" },
-        "created_at_unix_secs": metadata.created_at_unix_secs,
-        "source_database": metadata.source_database,
-        "schemas": metadata.schemas,
-        "auto_sync": auto_sync.label(),
-        "observed_settings": observed_settings,
-    });
+    let outcome = outcome.with_auto_sync_status(auto_sync);
+    let should_halt = outcome.should_halt();
     match output_mode {
         OutputMode::Human => {
-            Reporter::print_outcome(&outcome);
+            outcome.print_human();
         }
         OutputMode::Json => {
-            let mut report = Reporter::json_outcome_with_locations(&outcome);
-            report["baseline"] = baseline.clone();
-            println!("{}", serde_json::to_string_pretty(&report)?);
+            println!("{}", serde_json::to_string_pretty(&outcome.json())?);
         }
         OutputMode::Markdown => {
-            let mut report = Reporter::markdown_outcome(&outcome);
-            report.push_str("\n## Baseline\n\n");
-            report.push_str(&format!(
-                "- **Status:** `{}`\n- **Automatic sync:** `{}`\n",
-                baseline["status"].as_str().unwrap_or("unknown"),
-                baseline["auto_sync"].as_str().unwrap_or("unknown")
-            ));
-            if let Some(source_database) = baseline["source_database"].as_str() {
-                report.push_str(&format!(
-                    "- **Source database:** `{}`\n",
-                    source_database.replace('`', "'")
-                ));
-            }
-            if let Some(schemas) = baseline["schemas"].as_array() {
-                let schemas = schemas
-                    .iter()
-                    .filter_map(serde_json::Value::as_str)
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                report.push_str(&format!("- **Schemas:** `{}`\n", schemas.replace('`', "'")));
-            }
-            report.push_str(&format!(
-                "- **Observed lock timeout:** `{}`\n- **Observed statement timeout:** `{}`\n",
-                baseline["observed_settings"]["lock_timeout_ms"]
-                    .as_u64()
-                    .map_or_else(|| "unknown".to_string(), |value| format!("{value} ms")),
-                baseline["observed_settings"]["statement_timeout_ms"]
-                    .as_u64()
-                    .map_or_else(|| "unknown".to_string(), |value| format!("{value} ms")),
-            ));
-            println!("{report}");
+            println!("{}", outcome.markdown());
         }
         OutputMode::Interactive => {
-            safe_migrate::_internal::report::interactive::run_interactive(
-                &violations,
-                &outcome.confidence,
-            )?;
+            outcome.run_interactive().map_err(anyhow::Error::new)?;
         }
     }
 
@@ -1062,24 +667,4 @@ fn finish_analysis(
     }
 
     Ok(())
-}
-
-fn attach_baseline_evidence(
-    mut outcome: AnalysisOutcome<ReportFinding>,
-    baseline_unknown: bool,
-    baseline_stale: bool,
-) -> AnalysisOutcome<ReportFinding> {
-    if baseline_unknown {
-        outcome = outcome.with_evidence(EvidenceRecord::new(
-            EvidenceCode::BaselineUnavailable,
-            EvidenceScope::Chain,
-        ));
-    }
-    if baseline_stale {
-        outcome = outcome.with_evidence(EvidenceRecord::new(
-            EvidenceCode::BaselineStale,
-            EvidenceScope::Chain,
-        ));
-    }
-    outcome
 }

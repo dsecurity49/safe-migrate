@@ -5,6 +5,19 @@ commits and pull requests. Published binaries, checksums, and generated release
 notes are available on the
 [GitHub Releases page](https://github.com/dsecurity49/safe-migrate/releases).
 
+## v0.9.0 — Unreleased
+
+- Made `safe_migrate::api` the real supported Rust interface: it now owns
+  configuration, opaque validated baselines, immutable findings and evidence,
+  rule metadata, synchronization, and built-in report rendering.
+- Made `_internal` crate-private. Mutable cache and state-machine details are
+  no longer a downstream dependency path.
+- Added typed operation, object, verdict, summary, and rule-configuration
+  values, a public report-schema version, and categorized errors with source
+  chains. Configuration loading now rejects unsafe defaults immediately.
+- Unified API and CLI baseline status, confidence evidence, JSON, and Markdown
+  behavior, and expanded independent downstream API contract coverage.
+
 ## v0.8.1 — Unreleased
 
 - Upgraded Squawk's parser, lexer, syntax tree, and linter to 2.64.0, including

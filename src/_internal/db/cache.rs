@@ -448,6 +448,7 @@ impl DbCache {
         }
     }
 
+    #[cfg(test)]
     pub fn insert_baseline(&mut self, id: ObjectId, state: RelationState) {
         self.relations.insert(id, state);
     }
