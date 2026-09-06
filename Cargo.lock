@@ -1020,7 +1020,7 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "safe-migrate"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -1200,9 +1200,9 @@ dependencies = [
 
 [[package]]
 name = "squawk-lexer"
-version = "2.63.0"
+version = "2.64.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "efaba81a4ba786561a9636eacab44bdd90b3ed35ab547fddab9c912ea52afbb1"
+checksum = "09450f444bc7734433a9167d65c9d05a99135e65eb1093ac0e5e3c797c63415b"
 
 [[package]]
 name = "squawk-line-index"
@@ -1217,9 +1217,9 @@ dependencies = [
 
 [[package]]
 name = "squawk-linter"
-version = "2.63.0"
+version = "2.64.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2f01fc98f8bbe117e591f23a276af0242dec79585a3060ca5df393e922fa6f6"
+checksum = "5805ee8b3750bd815b8ebba49b2e2a65416f29d89cd38503703b350132055f7b"
 dependencies = [
  "annotate-snippets",
  "enum-iterator",
@@ -1233,9 +1233,9 @@ dependencies = [
 
 [[package]]
 name = "squawk-parser"
-version = "2.63.0"
+version = "2.64.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "58327f2c81cd96cfc80c4af6f6d533ca0fe38c38f3c323be0eeb1fcc3677bf28"
+checksum = "14ad5fa5581a0f76a06d7f7702ee8b6a15e26997d1e0b64c02218c7e00b5778b"
 dependencies = [
  "drop_bomb",
  "squawk-lexer",
@@ -1243,9 +1243,9 @@ dependencies = [
 
 [[package]]
 name = "squawk-syntax"
-version = "2.63.0"
+version = "2.64.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "27a59435a2597c355ff6bd6e0e2955043674ea5113d60e590dffecffda21540a"
+checksum = "bdef727e13c2d26b5a431ea77d4727b30625d9eb9232f28ed4b7214a7065a719"
 dependencies = [
  "either",
  "rowan",

@@ -139,10 +139,14 @@ impl AstVisitor {
             Stmt::CreateUser(node) => return Self::extract_create_user(node),
             Stmt::Begin(_) => return Some(StatementFact::BeginTransaction),
             Stmt::Commit(node) => {
-                return Some(if Self::is_and_chain(node.chain_clause()) {
-                    StatementFact::CommitAndChain
-                } else {
-                    StatementFact::CommitTransaction
+                return Some(match node {
+                    ast::Commit::CommitPrepared(_) => StatementFact::OpaqueBlock,
+                    ast::Commit::CommitTransaction(transaction)
+                        if Self::is_and_chain(transaction.chain_clause()) =>
+                    {
+                        StatementFact::CommitAndChain
+                    }
+                    ast::Commit::CommitTransaction(_) => StatementFact::CommitTransaction,
                 });
             }
             Stmt::Rollback(node) => return Self::extract_rollback(node),
@@ -529,7 +533,9 @@ impl AstVisitor {
                 continue;
             }
             if let Some(ac) = AlterConstraint::cast(action.syntax().clone()) {
-                let deferrable = ac.deferrable_constraint_option().is_some();
+                let deferrable = ac.constraint_options().any(|option| {
+                    matches!(option, ast::ConstraintOption::DeferrableConstraintOption(_))
+                });
                 let name = ac
                     .constraint_name_ref()
                     .and_then(|name| name.path_ref())
@@ -959,6 +965,13 @@ impl AstVisitor {
         (columns, foreign_keys, table_constraints)
     }
 
+    fn column_constraints(col: &Column) -> impl Iterator<Item = ColumnConstraint> + '_ {
+        col.clauses().filter_map(|clause| match clause {
+            ast::ColumnClause::ColumnConstraint(constraint) => Some(constraint),
+            _ => None,
+        })
+    }
+
     fn extract_column_fact(col: &Column) -> Option<ColumnFact> {
         let name_token = col.name().and_then(|n| n.ident_token()).or_else(|| {
             col.syntax()
@@ -968,15 +981,14 @@ impl AstVisitor {
         })?;
         let name = Self::resolve_identifier_token(name_token.text());
         let ty = col.ty().map(|t| t.syntax().text().to_string());
-        let is_identity = col.constraints().any(|constraint| {
+        let is_identity = Self::column_constraints(col).any(|constraint| {
             matches!(constraint, ColumnConstraint::GeneratedConstraint(generated)
                 if matches!(generated.generated_as(), Some(ast::GeneratedAs::GeneratedIdentity(_))))
         });
         let not_null = is_identity
-            || col
-                .constraints()
+            || Self::column_constraints(col)
                 .any(|c| matches!(c, ColumnConstraint::NotNullConstraint(_)));
-        let primary_key_constraint_name = col.constraints().find_map(|constraint| {
+        let primary_key_constraint_name = Self::column_constraints(col).find_map(|constraint| {
             let ColumnConstraint::PrimaryKeyConstraint(primary_key) = constraint else {
                 return None;
             };
@@ -990,7 +1002,7 @@ impl AstVisitor {
         });
         let is_primary_key = primary_key_constraint_name.is_some();
         let primary_key_constraint_name = primary_key_constraint_name.flatten();
-        let unique_constraint_name = col.constraints().find_map(|constraint| {
+        let unique_constraint_name = Self::column_constraints(col).find_map(|constraint| {
             let ColumnConstraint::UniqueConstraint(unique) = constraint else {
                 return None;
             };
@@ -1004,7 +1016,7 @@ impl AstVisitor {
         });
         let is_unique = unique_constraint_name.is_some();
         let unique_constraint_name = unique_constraint_name.flatten();
-        let default = col.constraints().find_map(|c| {
+        let default = Self::column_constraints(col).find_map(|c| {
             if let ColumnConstraint::DefaultConstraint(dc) = c {
                 Some(crate::_internal::analysis::expr_visitor::ExprVisitor::convert(dc.expr()?))
             } else {
@@ -1057,7 +1069,7 @@ impl AstVisitor {
                 Some(AlterTableActionFact::DropNotNull { column: col_name })
             }
             AlterColumnOption::SetType(st) => {
-                let has_using = st.using_token().is_some();
+                let has_using = st.using_expr().is_some();
                 Some(AlterTableActionFact::SetType {
                     column: col_name,
                     ty: st.ty()?.syntax().text().to_string(),
@@ -1378,7 +1390,7 @@ impl AstVisitor {
                 })
             })
             .map(|t| Self::resolve_identifier_token(t.text()));
-        col.constraints()
+        Self::column_constraints(col)
             .filter_map(|c| {
                 if let ColumnConstraint::ReferencesConstraint(rc) = c {
                     let ref_path = rc
@@ -2225,7 +2237,7 @@ impl AstVisitor {
                 .and_then(|n| n.ident_token())
                 .map(|t| Self::resolve_identifier_token(t.text())),
             ty: param
-                .ty()
+                .func_type()
                 .map(|t| t.syntax().text().to_string())
                 .unwrap_or_else(|| "unknown".into()),
             default: param.param_default().and_then(|pd| {
@@ -2238,18 +2250,27 @@ impl AstVisitor {
     fn extract_ret_type(
         ret: &squawk_syntax::ast::RetType,
     ) -> crate::_internal::analysis::facts::RetTypeFact {
-        if let Some(tal) = ret.table_arg_list() {
+        if let Some(tal) = ret.return_table_arg_list() {
             let cols = tal
                 .args()
-                .filter_map(|arg| match arg {
-                    TableArg::Column(col) => Self::extract_column_fact(&col),
-                    _ => None,
+                .filter_map(|column| {
+                    Some(ColumnFact {
+                        name: Self::resolve_ast_identifier(&column.name()?),
+                        ty: column.func_type().map(|ty| ty.syntax().text().to_string()),
+                        not_null: false,
+                        is_primary_key: false,
+                        primary_key_constraint_name: None,
+                        is_unique: false,
+                        unique_constraint_name: None,
+                        default: None,
+                        generation: crate::_internal::analysis::facts::ColumnGeneration::Ordinary,
+                    })
                 })
                 .collect();
             crate::_internal::analysis::facts::RetTypeFact::Table(cols)
         } else {
             let ty = ret
-                .ty()
+                .func_type()
                 .map(|t| t.syntax().text().to_string())
                 .unwrap_or_else(|| "unknown".into());
             crate::_internal::analysis::facts::RetTypeFact::Scalar(ty)
@@ -2596,13 +2617,19 @@ impl AstVisitor {
             .map(|params| {
                 params
                     .params()
+                    .chain(
+                        params
+                            .aggregate_order_by()
+                            .into_iter()
+                            .flat_map(|order_by| order_by.params()),
+                    )
                     .filter_map(|param| {
                         if matches!(param.mode(), Some(ast::ParamMode::ParamOut(_))) {
                             return None;
                         }
                         Some(
                             param
-                                .ty()
+                                .func_type()
                                 .map(|ty| ty.syntax().text().to_string())
                                 .unwrap_or_else(|| "unknown".to_string()),
                         )
@@ -3733,6 +3760,7 @@ impl AstVisitor {
                                     ast::ConfigValue::Literal(literal) => {
                                         Self::resolve_string_literal(&literal)
                                     }
+                                    ast::ConfigValue::PrefixExpr(_) => None,
                                 })
                                 .collect();
                             (!schemas.is_empty()).then_some(StatementFact::SetSearchPath {
@@ -3770,6 +3798,9 @@ impl AstVisitor {
                                 ast::ConfigValue::Literal(literal) => {
                                     Self::resolve_string_literal(&literal)
                                         .or_else(|| Some(literal.syntax().text().to_string()))
+                                }
+                                ast::ConfigValue::PrefixExpr(expr) => {
+                                    Some(expr.syntax().text().to_string())
                                 }
                             })
                             .collect();
@@ -3894,20 +3925,20 @@ impl AstVisitor {
     }
 
     fn extract_rollback(node: &Rollback) -> Option<StatementFact> {
-        if node.prepared_token().is_some() {
-            return Some(StatementFact::OpaqueBlock);
-        }
-
-        match node
-            .savepoint_ref()
-            .and_then(|s| s.ident_token())
-            .map(|t| Self::resolve_identifier_token(t.text()))
-        {
-            Some(name) => Some(StatementFact::RollbackToSavepoint { name }),
-            None if Self::is_and_chain(node.chain_clause()) => {
+        match node {
+            Rollback::RollbackPrepared(_) => Some(StatementFact::OpaqueBlock),
+            Rollback::RollbackToSavepoint(rollback) => rollback
+                .savepoint_ref()
+                .and_then(|savepoint| savepoint.ident_token())
+                .map(|token| StatementFact::RollbackToSavepoint {
+                    name: Self::resolve_identifier_token(token.text()),
+                }),
+            Rollback::RollbackTransaction(rollback)
+                if Self::is_and_chain(rollback.chain_clause()) =>
+            {
                 Some(StatementFact::RollbackAndChain)
             }
-            None => Some(StatementFact::RollbackTransaction),
+            Rollback::RollbackTransaction(_) => Some(StatementFact::RollbackTransaction),
         }
     }
 
