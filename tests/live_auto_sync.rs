@@ -2,7 +2,7 @@ use std::fs;
 use std::io::Read;
 use std::path::Path;
 
-use safe_migrate::_internal::db::cache::{CACHE_V7_MAGIC, DbCacheVersioned};
+use safe_migrate::_internal::db::cache::{CACHE_V8_MAGIC, DbCacheVersioned};
 
 fn run_auto_sync_case(
     database_url: &str,
@@ -84,14 +84,14 @@ fn run_auto_sync_case(
         .read_to_end(&mut payload)
         .expect("read decoded cache payload");
     let v7_payload = payload
-        .strip_prefix(CACHE_V7_MAGIC)
-        .expect("auto-sync must write a V7 cache");
+        .strip_prefix(CACHE_V8_MAGIC)
+        .expect("auto-sync must write a V8 cache");
     let config = bincode::config::standard().with_variable_int_encoding();
     let (versioned, bytes_read): (DbCacheVersioned, usize) =
-        bincode::serde::decode_from_slice(v7_payload, config).expect("decode V7 cache");
+        bincode::serde::decode_from_slice(v7_payload, config).expect("decode V8 cache");
     assert_eq!(bytes_read, v7_payload.len());
-    let DbCacheVersioned::V7(cache) = versioned else {
-        panic!("auto-sync must encode the V7 cache variant");
+    let DbCacheVersioned::V8(cache) = versioned else {
+        panic!("auto-sync must encode the V8 cache variant");
     };
     assert_eq!(cache.metadata.source_role.as_deref(), Some(expected_role));
     assert_eq!(

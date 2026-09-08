@@ -2743,7 +2743,7 @@ fn normalize_type_kind(kind: &TypeKind) -> NormalizedType {
             base_type: normalize_data_type(base_type),
         },
         TypeKind::Base => NormalizedType::Base,
-        TypeKind::Composite => NormalizedType::Composite,
+        TypeKind::Composite { .. } => NormalizedType::Composite,
         TypeKind::Range => NormalizedType::Range,
     }
 }

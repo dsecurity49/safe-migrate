@@ -1,9 +1,10 @@
 use super::{AnalysisState, MutationResult};
 use crate::_internal::analysis::evidence::{EvidenceCode, EvidenceScope};
 use crate::_internal::analysis::mutations::{
-    ReleaseSavepointMutation, RollbackToSavepointMutation, SavepointMutation,
+    DropTable, ReleaseSavepointMutation, RollbackToSavepointMutation, SavepointMutation,
 };
 use crate::_internal::analysis::transaction::TransactionFrame;
+use crate::_internal::model::relation::{OnCommitAction, Persistence, RelationOverlay};
 
 impl AnalysisState {
     pub(super) fn apply_begin_transaction(&mut self) -> MutationResult {
@@ -30,12 +31,55 @@ impl AnalysisState {
         } else {
             while self.local.transactions.pop().is_some() {}
             self.restore_persistent_role_context();
+            self.apply_on_commit_actions();
         }
         self.local.transaction_aborted = false;
         if chain {
             self.local.transactions.push(TransactionFrame::root());
         }
         MutationResult::Applied
+    }
+
+    fn apply_on_commit_actions(&mut self) {
+        let actions = self
+            .local
+            .relations
+            .iter()
+            .filter_map(|(id, overlay)| match overlay {
+                RelationOverlay::Present(relation)
+                    if relation.persistence == Persistence::Temporary =>
+                {
+                    relation.on_commit.map(|action| (id.clone(), action))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        for (id, action) in actions {
+            match action {
+                OnCommitAction::PreserveRows => {}
+                OnCommitAction::DeleteRows => {
+                    if let Some(RelationOverlay::Present(relation)) =
+                        self.local.relations.get_mut(&id)
+                    {
+                        relation.estimated_rows = Some(0);
+                        relation.relpages = Some(0);
+                    }
+                }
+                OnCommitAction::Drop => {
+                    // PostgreSQL removes the temporary relation and all of
+                    // its dependent local objects at commit.
+                    let _ = self.apply_drop_table(
+                        &DropTable {
+                            ids: vec![id],
+                            if_exists: false,
+                            cascade: true,
+                        },
+                        None,
+                    );
+                }
+            }
+        }
     }
 
     pub(super) fn apply_rollback_transaction(&mut self, chain: bool) -> MutationResult {

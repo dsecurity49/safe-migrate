@@ -192,6 +192,21 @@ fn configuration_errors_have_a_stable_kind_and_source() {
 }
 
 #[test]
+fn public_io_and_validation_errors_retain_their_source_chain() {
+    let remote = api::DatabaseUrl::new("postgres://db.example.com/app").unwrap_err();
+    assert_eq!(remote.kind(), api::ErrorKind::Configuration);
+    assert!(remote.source().is_some());
+
+    let directory = tempfile::tempdir().unwrap();
+    let cache = directory.path().join("truncated.cache");
+    std::fs::write(&cache, b"not-zstd").unwrap();
+    let error = api::Baseline::load(&cache, &api::Config::default().with_cache_encryption(false))
+        .unwrap_err();
+    assert_eq!(error.kind(), api::ErrorKind::Cache);
+    assert!(error.source().is_some());
+}
+
+#[test]
 fn config_and_baseline_can_be_reused_across_analyses() {
     let config = api::Config::default();
     let baseline = api::Baseline::unavailable();
@@ -209,6 +224,73 @@ fn public_api_values_remain_send_and_sync() {
     assert_send_sync::<api::Baseline>();
     assert_send_sync::<api::AnalysisOutcome>();
     assert_send_sync::<api::Error>();
+    assert_send_sync::<api::DatabaseUrl>();
+    assert_send_sync::<api::CacheKey>();
+}
+
+#[test]
+fn public_secret_inputs_are_validated_and_redacted() {
+    let secret_url = "postgres://private-user:private-password@localhost/app";
+    let database_url = api::DatabaseUrl::new(secret_url).unwrap();
+    let database_debug = format!("{database_url:?}");
+    assert!(!database_debug.contains("private-user"));
+    assert!(!database_debug.contains("private-password"));
+
+    let secret_key = "42".repeat(32);
+    let cache_key = api::CacheKey::from_hex(&secret_key).unwrap();
+    assert!(!format!("{cache_key:?}").contains(&secret_key));
+    assert_eq!(
+        format!("{:?}", api::CacheKey::from_bytes([7; 32])),
+        "CacheKey([REDACTED])"
+    );
+
+    let remote = api::DatabaseUrl::new("postgres://db.example.com/app").unwrap_err();
+    assert_eq!(remote.kind(), api::ErrorKind::Configuration);
+    assert!(api::CacheKey::from_hex("not-a-key").is_err());
+}
+
+#[test]
+fn explicit_sync_secrets_must_match_encryption_configuration() {
+    let database_url = api::DatabaseUrl::new("postgres://localhost/app").unwrap();
+    let cache_key = api::CacheKey::from_hex(&"42".repeat(32)).unwrap();
+    let output = tempfile::tempdir().unwrap().path().join("baseline.cache");
+
+    let missing_key = api::sync_with_secrets(
+        &output,
+        &api::Config::default().with_cache_encryption(true),
+        None,
+        &database_url,
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(missing_key.kind(), api::ErrorKind::Configuration);
+
+    let unexpected_key = api::sync_with_secrets(
+        &output,
+        &api::Config::default().with_cache_encryption(false),
+        None,
+        &database_url,
+        Some(&cache_key),
+    )
+    .unwrap_err();
+    assert_eq!(unexpected_key.kind(), api::ErrorKind::Configuration);
+
+    let missing_cache = tempfile::tempdir().unwrap().path().join("missing.cache");
+    let invalid_optional_load = api::Baseline::load_optional_with_key(
+        &missing_cache,
+        &api::Config::default().with_cache_encryption(false),
+        &cache_key,
+    )
+    .unwrap_err();
+    assert_eq!(invalid_optional_load.kind(), api::ErrorKind::Configuration);
+
+    let optional = api::Baseline::load_optional_with_key(
+        &missing_cache,
+        &api::Config::default().with_cache_encryption(true),
+        &cache_key,
+    )
+    .unwrap();
+    assert!(!optional.is_available());
 }
 
 #[test]
@@ -224,4 +306,28 @@ fn unsafe_conservative_defaults_are_rejected_at_the_api_boundary() {
         invalid_width.validate().unwrap_err().kind(),
         api::ErrorKind::Configuration
     );
+
+    assert!(
+        api::Config::default()
+            .with_assumed_postgres_version(140_000)
+            .validate()
+            .is_ok()
+    );
+    assert!(
+        api::Config::default()
+            .with_assumed_postgres_version(180_999)
+            .validate()
+            .is_ok()
+    );
+    for unsupported in [0, 130_999, 181_000, u32::MAX] {
+        assert_eq!(
+            api::Config::default()
+                .with_assumed_postgres_version(unsupported)
+                .validate()
+                .unwrap_err()
+                .kind(),
+            api::ErrorKind::Configuration,
+            "unsupported assumed PostgreSQL version {unsupported} was accepted"
+        );
+    }
 }

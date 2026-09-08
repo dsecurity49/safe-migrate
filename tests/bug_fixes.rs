@@ -23,6 +23,7 @@ mod phase10_bug_fixes_and_sorting_tests {
             has_expression_keys: false,
             has_predicate: false,
             is_unique: false,
+            is_immediate: true,
             is_valid: true,
             is_ready: true,
             is_live: true,
@@ -934,6 +935,11 @@ mod phase10_bug_fixes_and_sorting_tests {
             avg_width: None,
             default_expr_text: None,
             type_modifier: None,
+            storage: None,
+            compression: None,
+            statistics_target: None,
+            options: Default::default(),
+            generated: None,
         });
         rel.columns.push(Column {
             name: "b".into(),
@@ -944,6 +950,11 @@ mod phase10_bug_fixes_and_sorting_tests {
             avg_width: None,
             default_expr_text: None,
             type_modifier: None,
+            storage: None,
+            compression: None,
+            statistics_target: None,
+            options: Default::default(),
+            generated: None,
         });
 
         // Rename "a" to "b" — "b" already exists, so rename should be a no-op

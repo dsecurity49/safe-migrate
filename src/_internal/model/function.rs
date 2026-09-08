@@ -2,20 +2,20 @@ use crate::_internal::ast::identifiers::ObjectId;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum Volatility {
+pub(crate) enum Volatility {
     Volatile,
     Stable,
     Immutable,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum SecurityMode {
+pub(crate) enum SecurityMode {
     Invoker,
     Definer,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum RoutineKind {
+pub(crate) enum RoutineKind {
     #[default]
     Function,
     Procedure,
@@ -24,7 +24,7 @@ pub enum RoutineKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct FunctionState {
+pub(crate) struct FunctionState {
     pub id: ObjectId,
     pub routine_kind: RoutineKind,
     pub arg_types: Vec<String>,
@@ -44,7 +44,7 @@ pub struct FunctionState {
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(clippy::large_enum_variant)] // Overlay transitions stay allocation-free in the hot state path.
-pub enum FunctionOverlay {
+pub(crate) enum FunctionOverlay {
     Present(FunctionState),
     Dropped,
 }

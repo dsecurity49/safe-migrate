@@ -2,7 +2,7 @@ use crate::_internal::analysis::mutations::{AlterTableActionMutation, Mutation};
 use crate::_internal::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
 use crate::_internal::rules::{Rule, RuleContext};
 
-pub struct IdempotencyRule;
+pub(crate) struct IdempotencyRule;
 
 impl Rule for IdempotencyRule {
     fn id(&self) -> &'static str {

@@ -3,7 +3,7 @@ use crate::_internal::ast::identifiers::ObjectId;
 use crate::_internal::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
 use crate::_internal::rules::{BASELINE_RELATION_CAPABILITIES, Rule, RuleCapability, RuleContext};
 
-pub struct DriftDetectionRule;
+pub(crate) struct DriftDetectionRule;
 
 impl Rule for DriftDetectionRule {
     fn id(&self) -> &'static str {

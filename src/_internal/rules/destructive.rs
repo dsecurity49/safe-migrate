@@ -5,9 +5,9 @@ use crate::_internal::rules::{
     BASELINE_RELATION_CAPABILITIES, BASELINE_STATS_CAPABILITIES, Rule, RuleCapability, RuleContext,
 };
 
-pub const IRREVERSIBLE_MIGRATION_RULE_ID: &str = "irreversible-migration";
+pub(crate) const IRREVERSIBLE_MIGRATION_RULE_ID: &str = "irreversible-migration";
 
-pub struct CascadingDropRule;
+pub(crate) struct CascadingDropRule;
 
 impl Rule for CascadingDropRule {
     fn id(&self) -> &'static str {
@@ -106,7 +106,7 @@ impl Rule for CascadingDropRule {
     }
 }
 
-pub struct SizeAwareAddColumnRule;
+pub(crate) struct SizeAwareAddColumnRule;
 
 impl Rule for SizeAwareAddColumnRule {
     fn id(&self) -> &'static str {
@@ -232,7 +232,7 @@ impl Rule for SizeAwareAddColumnRule {
     }
 }
 
-pub struct DropDatabaseRule;
+pub(crate) struct DropDatabaseRule;
 
 impl Rule for DropDatabaseRule {
     fn id(&self) -> &'static str {
@@ -266,7 +266,7 @@ impl Rule for DropDatabaseRule {
     }
 }
 
-pub struct DropSchemaCascadeRule;
+pub(crate) struct DropSchemaCascadeRule;
 
 impl Rule for DropSchemaCascadeRule {
     fn id(&self) -> &'static str {
@@ -305,7 +305,7 @@ impl Rule for DropSchemaCascadeRule {
     }
 }
 
-pub struct CreateTableAsSelectRule;
+pub(crate) struct CreateTableAsSelectRule;
 
 impl Rule for CreateTableAsSelectRule {
     fn id(&self) -> &'static str {
@@ -345,13 +345,13 @@ impl Rule for CreateTableAsSelectRule {
     }
 }
 
-pub enum Reversibility {
+pub(crate) enum Reversibility {
     Reversible,
     ConditionallyReversible,
     Irreversible,
 }
 
-pub fn classify(mutation: &Mutation) -> Reversibility {
+pub(crate) fn classify(mutation: &Mutation) -> Reversibility {
     match mutation {
         Mutation::Rename(_) => Reversibility::Reversible,
         Mutation::CreateIndex(_) | Mutation::CreateTable(_) => Reversibility::Reversible,
@@ -361,12 +361,14 @@ pub fn classify(mutation: &Mutation) -> Reversibility {
             AlterTableActionMutation::SetType { .. } => Reversibility::ConditionallyReversible,
             _ => Reversibility::Reversible,
         },
-        Mutation::DropTable(_) | Mutation::DropDatabase(_) => Reversibility::Irreversible,
+        Mutation::DropTable(_) | Mutation::DropDatabase(_) | Mutation::Truncate(_) => {
+            Reversibility::Irreversible
+        }
         _ => Reversibility::ConditionallyReversible,
     }
 }
 
-pub struct ReversibilityRule;
+pub(crate) struct ReversibilityRule;
 
 impl Rule for ReversibilityRule {
     fn id(&self) -> &'static str {
@@ -457,6 +459,18 @@ impl Rule for ReversibilityRule {
                     .filter_map(|id| pre_state.relations.get(id).and_then(|r| r.estimated_rows))
                     .max()
                     .unwrap_or(config.default_rows)
+            } else if let Mutation::Truncate(truncate) = mutation {
+                truncate
+                    .targets
+                    .iter()
+                    .filter_map(|target| {
+                        pre_state
+                            .relations
+                            .get(&target.id)
+                            .and_then(|relation| relation.estimated_rows)
+                    })
+                    .max()
+                    .unwrap_or(config.default_rows)
             } else {
                 config.default_rows
             };
@@ -501,6 +515,16 @@ impl Rule for ReversibilityRule {
                     OperationKind::DropDatabase,
                     ObjectKind::Database,
                     d.id.to_string(),
+                ),
+                Mutation::Truncate(truncate) => (
+                    OperationKind::TruncateTable,
+                    ObjectKind::Table,
+                    truncate
+                        .targets
+                        .iter()
+                        .map(|target| target.id.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", "),
                 ),
                 _ => (
                     OperationKind::Irreversible,
@@ -612,7 +636,7 @@ fn integer_type_size_bits(ty: &str) -> Option<i32> {
     }
 }
 
-pub struct GeneralCascadeRule;
+pub(crate) struct GeneralCascadeRule;
 
 impl Rule for GeneralCascadeRule {
     fn id(&self) -> &'static str {
@@ -701,7 +725,7 @@ impl Rule for GeneralCascadeRule {
     }
 }
 
-pub struct TypeChangeRewriteRule;
+pub(crate) struct TypeChangeRewriteRule;
 
 impl TypeChangeRewriteRule {
     fn is_type_change_safe(old_type: &str, new_type: &str, pg_version: u32) -> bool {
@@ -761,7 +785,7 @@ impl TypeChangeRewriteRule {
     ///
     /// A smaller typmod means a smaller character limit, which is lossy.
     /// Returns true if the new modifier represents a smaller limit than the old.
-    pub fn is_lossy_varchar_narrowing(
+    pub(crate) fn is_lossy_varchar_narrowing(
         old_modifier: Option<i32>,
         new_modifier: Option<i32>,
     ) -> bool {
@@ -799,7 +823,7 @@ fn parse_numeric_params(ty: &str) -> Option<(i32, i32)> {
 /// Extracts a synthetic type_modifier-like value from a type string.
 /// Used when the new type comes from the migration SQL (not from the cache).
 /// For varchar(N), derives the atttypmod from the character limit.
-pub fn extract_type_modifier_from_type_string(ty: &str) -> Option<i32> {
+pub(crate) fn extract_type_modifier_from_type_string(ty: &str) -> Option<i32> {
     let lower = ty.to_lowercase().trim().to_string();
     // Check for varchar(N) or character varying(N)
     if lower.starts_with("varchar(") || lower.starts_with("character varying(") {

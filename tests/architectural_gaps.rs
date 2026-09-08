@@ -569,6 +569,11 @@ mod architectural_gap_tests {
                 avg_width: None,
                 default_expr_text: None,
                 type_modifier: Some(-1),
+                storage: None,
+                compression: None,
+                statistics_target: None,
+                options: Default::default(),
+                generated: None,
             });
         table.last_analyze = Some("2026-09-01 00:00:00+00".to_string());
         cache.insert_baseline(table_id.clone(), table);
@@ -748,7 +753,7 @@ mod architectural_gap_tests {
         );
     }
 
-    // 24. ALTER TABLE typed actions produce opaque without crashing
+    // 24. ALTER TABLE typed actions preserve supported catalog state.
     #[test]
     fn test_alter_table_set_access_method_typed() {
         let engine = setup_engine();
@@ -758,8 +763,9 @@ mod architectural_gap_tests {
             .unwrap();
         let result = engine.analyze("ALTER TABLE t SET ACCESS METHOD heap;", &mut state);
         assert!(result.is_ok(), "SetAccessMethod should not crash");
-        assert!(state.evidence().iter().any(|record| {
-            record.code == safe_migrate::_internal::analysis::evidence::EvidenceCode::UnsupportedSemantics
+        assert!(!state.evidence().iter().any(|record| {
+            record.code
+                == safe_migrate::_internal::analysis::evidence::EvidenceCode::UnsupportedSemantics
         }));
 
         let mut state2 = setup_state();
@@ -771,12 +777,9 @@ mod architectural_gap_tests {
             &mut state2,
         );
         assert!(result2.is_ok(), "SetStorage should not crash");
-        assert!(
-            state2.evidence().iter().any(|record| {
-                record.code == safe_migrate::_internal::analysis::evidence::EvidenceCode::UnsupportedSemantics
-            }),
-            "SetStorage must produce UnsupportedSemantics evidence"
-        );
+        assert!(!state2.evidence().iter().any(|record| {
+            record.code == safe_migrate::_internal::analysis::evidence::EvidenceCode::UnsupportedSemantics
+        }));
     }
 
     #[test]

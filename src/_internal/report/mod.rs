@@ -1,5 +1,5 @@
-pub mod interactive;
-pub mod reporter;
+pub(crate) mod interactive;
+pub(crate) mod reporter;
 #[cfg(test)]
 mod reporter_tests;
-pub mod violations;
+pub(crate) mod violations;

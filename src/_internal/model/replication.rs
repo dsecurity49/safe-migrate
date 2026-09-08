@@ -2,7 +2,7 @@ use crate::_internal::analysis::facts::{AttributeFact, ConnectionTarget, Publica
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PublicationState {
+pub(crate) struct PublicationState {
     pub name: String,
     pub owner: Option<String>,
     pub scope: PublicationScope,
@@ -11,13 +11,13 @@ pub struct PublicationState {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum PublicationOverlay {
+pub(crate) enum PublicationOverlay {
     Present(PublicationState),
     Dropped,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SubscriptionState {
+pub(crate) struct SubscriptionState {
     pub name: String,
     pub owner: Option<String>,
     pub connection: ConnectionTarget,
@@ -29,7 +29,7 @@ pub struct SubscriptionState {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum SubscriptionOverlay {
+pub(crate) enum SubscriptionOverlay {
     Present(SubscriptionState),
     Dropped,
 }

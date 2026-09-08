@@ -4,7 +4,7 @@ use crate::_internal::model::relation::Persistence;
 use crate::_internal::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
 use crate::_internal::rules::{BASELINE_STATS_CAPABILITIES, Rule, RuleCapability, RuleContext};
 
-pub struct MaterializedViewRefreshRule;
+pub(crate) struct MaterializedViewRefreshRule;
 
 impl Rule for MaterializedViewRefreshRule {
     fn id(&self) -> &'static str {

@@ -6,8 +6,9 @@ use crate::_internal::model::relation::{Persistence, RelationKind, RelationState
 mod tests {
     use super::*;
     use crate::_internal::sync::{
-        cache_search_path, database_config_is_local, ensure_supported_postgres_version,
-        is_local_host, is_system_schema, parse_search_path_setting, relation_owner_id, sync_cache,
+        cache_search_path, catalog_options, database_config_is_local,
+        ensure_supported_postgres_version, is_local_host, is_system_schema,
+        parse_search_path_setting, relation_owner_id, sync_cache,
     };
     use crate::_internal::test_support::EnvironmentValueGuard;
     use serde::Serialize;
@@ -77,6 +78,19 @@ mod tests {
         assert!(is_local_host("/var/run/postgresql"));
         assert!(!is_local_host("db.internal.example"));
         assert!(!is_local_host("127.0.0.1.attacker.example"));
+    }
+
+    #[test]
+    fn catalog_options_preserve_complete_column_and_relation_metadata() {
+        let options = catalog_options(
+            Some(vec!["fillfactor=80".into(), "n_distinct=-0.25".into()]),
+            "column",
+        )
+        .expect("valid PostgreSQL options");
+        assert_eq!(options.get("fillfactor"), Some(&"80".to_string()));
+        assert_eq!(options.get("n_distinct"), Some(&"-0.25".to_string()));
+        assert!(catalog_options(Some(vec!["broken".into()]), "column").is_err());
+        assert!(catalog_options(Some(vec!["x=1".into(), "x=2".into()]), "column").is_err());
     }
 
     #[test]
@@ -209,6 +223,11 @@ mod tests {
             avg_width: Some(4),
             default_expr_text: None,
             type_modifier: None,
+            storage: None,
+            compression: None,
+            statistics_target: None,
+            options: Default::default(),
+            generated: None,
         });
         cache.insert_baseline(id.clone(), rel);
 
@@ -238,6 +257,7 @@ mod tests {
             has_expression_keys: false,
             has_predicate: false,
             is_unique: false,
+            is_immediate: true,
             is_valid: true,
             is_ready: true,
             is_live: true,
@@ -303,8 +323,8 @@ mod tests {
             },
         );
 
-        // Cache V7 uses bincode.
-        let versioned = crate::_internal::db::cache::DbCacheVersioned::V7(Box::new(cache));
+        // Cache V8 uses bincode.
+        let versioned = crate::_internal::db::cache::DbCacheVersioned::V8(Box::new(cache));
         let config = bincode::config::standard().with_variable_int_encoding();
         let encoded = bincode::serde::encode_to_vec(&versioned, config).unwrap();
 
@@ -312,8 +332,8 @@ mod tests {
             bincode::serde::decode_from_slice(&encoded, config)
                 .unwrap()
                 .0;
-        let crate::_internal::db::cache::DbCacheVersioned::V7(deserialized) = decoded else {
-            panic!("Expected V7");
+        let crate::_internal::db::cache::DbCacheVersioned::V8(deserialized) = decoded else {
+            panic!("Expected V8");
         };
         assert_eq!(deserialized.pg_version_num, Some(160000));
         assert_eq!(
@@ -398,18 +418,23 @@ mod tests {
             avg_width: Some(10),
             default_expr_text: Some("now()".into()),
             type_modifier: Some(255 + 4),
+            storage: None,
+            compression: None,
+            statistics_target: None,
+            options: Default::default(),
+            generated: None,
         });
         cache.insert_baseline(id.clone(), rel);
 
-        let versioned = crate::_internal::db::cache::DbCacheVersioned::V7(Box::new(cache));
+        let versioned = crate::_internal::db::cache::DbCacheVersioned::V8(Box::new(cache));
         let config = bincode::config::standard().with_variable_int_encoding();
         let encoded = bincode::serde::encode_to_vec(&versioned, config).unwrap();
         let decoded: crate::_internal::db::cache::DbCacheVersioned =
             bincode::serde::decode_from_slice(&encoded, config)
                 .unwrap()
                 .0;
-        let crate::_internal::db::cache::DbCacheVersioned::V7(deserialized) = decoded else {
-            panic!("Expected V7");
+        let crate::_internal::db::cache::DbCacheVersioned::V8(deserialized) = decoded else {
+            panic!("Expected V8");
         };
         let rel = deserialized.relations.get(&id).unwrap();
         assert_eq!(rel.columns[0].default_expr_text, Some("now()".into()));
@@ -487,7 +512,7 @@ mod tests {
                 config,
             )
             .is_err(),
-            "the pre-release routine layout must require a fresh V7 sync"
+            "the pre-release routine layout must require a fresh V8 sync"
         );
     }
 
@@ -516,7 +541,7 @@ mod tests {
                 &bytes, config
             )
             .is_err(),
-            "cache payloads without default/type evidence must require a fresh V7 sync"
+            "cache payloads without default/type evidence must require a fresh V8 sync"
         );
     }
 

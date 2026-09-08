@@ -527,7 +527,10 @@ runs:
             core.error(`Could not parse safe-migrate JSON report: ${error.message}`);
             return;
           }
-          const sanitize = (s) => (s || '').toString().replace(/::/g, '::\u200B');
+          const sanitize = (s) => (s || '').toString()
+            .replace(/[\u0000-\u001f\u007f-\u009f]/g, character =>
+              `\\u${character.charCodeAt(0).toString(16).padStart(4, '0')}`)
+            .replace(/::/g, '::\u200B');
           for (const finding of report.violations || []) {
             if (finding.tier !== 'Tier1' && finding.tier !== 'Tier2') continue;
             const location = finding.location || {};

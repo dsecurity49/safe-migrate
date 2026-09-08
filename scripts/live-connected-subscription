@@ -1,0 +1,13 @@
+#!/bin/sh
+set -eu
+
+if [ -z "${DATABASE_URL:-}" ] || [ -z "${PUBLISHER_DATABASE_URL:-}" ] ||
+   [ -z "${SUBSCRIPTION_DATABASE_URL:-}" ]; then
+    printf '%s\n' \
+        "DATABASE_URL, PUBLISHER_DATABASE_URL, and SUBSCRIPTION_DATABASE_URL are required." >&2
+    exit 2
+fi
+
+cargo test --locked --lib \
+    internal_tests::live_catalog_sync::live_connected_subscription_round_trip_is_redacted_and_exact \
+    -- --ignored --nocapture

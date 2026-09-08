@@ -9,7 +9,7 @@ use owo_colors::{OwoColorize, Style};
 
 /// Four-way verdict classification based on violation tiers.
 #[derive(Debug, PartialEq, Eq)]
-pub enum Verdict {
+pub(crate) enum Verdict {
     Halt,         // any Tier 1
     Cautious,     // Tier 2 present, no Tier 1
     SafeWithRisk, // Tier 3 irreversible present, no Tier 1 or 2
@@ -17,7 +17,7 @@ pub enum Verdict {
 }
 
 impl Verdict {
-    pub fn label(&self) -> &'static str {
+    pub(crate) fn label(&self) -> &'static str {
         match self {
             Verdict::Halt => "HALT",
             Verdict::Cautious => "CAUTIOUS",
@@ -26,7 +26,7 @@ impl Verdict {
         }
     }
 
-    pub fn recommendation(&self, confidence: &Confidence) -> &'static str {
+    pub(crate) fn recommendation(&self, confidence: &Confidence) -> &'static str {
         if confidence == &Confidence::Tainted {
             return match self {
                 Verdict::Halt => "do not deploy",
@@ -48,7 +48,7 @@ impl Verdict {
 }
 
 /// Compute the overall verdict from a set of violations.
-pub fn compute_verdict(violations: &[Violation]) -> Verdict {
+pub(crate) fn compute_verdict(violations: &[Violation]) -> Verdict {
     let has_tier1 = violations.iter().any(|v| v.tier == ViolationTier::Tier1);
     let has_tier2 = violations.iter().any(|v| v.tier == ViolationTier::Tier2);
     let has_irreversible_tier3 = violations
@@ -67,19 +67,23 @@ fn no_color() -> bool {
     std::env::var("NO_COLOR").is_ok()
 }
 pub(crate) fn tier_label_colored(tier: &ViolationTier) -> String {
+    tier_label_with_color(tier, !no_color())
+}
+
+pub(super) fn tier_label_with_color(tier: &ViolationTier, color: bool) -> String {
     let label = match tier {
         ViolationTier::Tier1 => "HALT",
         ViolationTier::Tier2 => "WARN",
         ViolationTier::Tier3 => "SAFE",
     };
-    if no_color() {
-        label.to_string()
-    } else {
+    if color {
         match tier {
             ViolationTier::Tier1 => label.style(Style::new().red().bold()).to_string(),
             ViolationTier::Tier2 => label.style(Style::new().yellow().bold()).to_string(),
             ViolationTier::Tier3 => label.style(Style::new().green().bold()).to_string(),
         }
+    } else {
+        label.to_string()
     }
 }
 
@@ -90,12 +94,15 @@ fn terminal_width() -> usize {
         .max(60)
 }
 
-pub struct Reporter;
+pub(crate) struct Reporter;
 
 impl Reporter {
-    pub const JSON_SCHEMA_VERSION: u32 = 2;
+    pub(crate) const JSON_SCHEMA_VERSION: u32 = 2;
 
-    pub fn json_report(violations: &[Violation], confidence: &Confidence) -> serde_json::Value {
+    pub(crate) fn json_report(
+        violations: &[Violation],
+        confidence: &Confidence,
+    ) -> serde_json::Value {
         let verdict = compute_verdict(violations);
         let tier1 = violations
             .iter()
@@ -129,7 +136,7 @@ impl Reporter {
 
     /// Serialize a complete immutable analysis outcome. Schema v2 adds stable
     /// evidence alongside the existing finding contract.
-    pub fn json_outcome_with_locations(
+    pub(crate) fn json_outcome_with_locations(
         outcome: &AnalysisOutcome<ReportFinding>,
     ) -> serde_json::Value {
         let mut report = Self::json_report_with_locations(&outcome.findings, &outcome.confidence);
@@ -140,7 +147,7 @@ impl Reporter {
 
     /// Additive JSON rendering that includes file/line locations when analysis
     /// was invoked with source-aware reporting.
-    pub fn json_report_with_locations(
+    pub(crate) fn json_report_with_locations(
         findings: &[ReportFinding],
         confidence: &Confidence,
     ) -> serde_json::Value {
@@ -176,7 +183,7 @@ impl Reporter {
 
     /// Deterministic Markdown rendering for pull-request artifacts. It uses
     /// the same verdict, confidence, tier, and finding data as JSON output.
-    pub fn markdown_report(findings: &[ReportFinding], confidence: &Confidence) -> String {
+    pub(crate) fn markdown_report(findings: &[ReportFinding], confidence: &Confidence) -> String {
         let violations: Vec<_> = findings
             .iter()
             .map(|finding| finding.violation.clone())
@@ -267,17 +274,17 @@ impl Reporter {
     }
 
     /// Render findings and structured conservative-analysis evidence.
-    pub fn markdown_outcome(outcome: &AnalysisOutcome<ReportFinding>) -> String {
+    pub(crate) fn markdown_outcome(outcome: &AnalysisOutcome<ReportFinding>) -> String {
         let mut output = Self::markdown_report(&outcome.findings, &outcome.confidence);
         append_markdown_evidence(&mut output, &outcome.evidence);
         output
     }
 
-    pub fn should_halt(violations: &[Violation]) -> bool {
+    pub(crate) fn should_halt(violations: &[Violation]) -> bool {
         compute_verdict(violations) == Verdict::Halt
     }
 
-    pub fn print_report(violations: &[Violation], confidence: &Confidence) -> bool {
+    pub(crate) fn print_report(violations: &[Violation], confidence: &Confidence) -> bool {
         let mut tier1 = 0usize;
         let mut tier2 = 0usize;
         let mut tier3 = 0usize;
@@ -360,8 +367,7 @@ impl Reporter {
             let display_name = match &v.object_kind {
                 crate::_internal::report::violations::ObjectKind::Database
                 | crate::_internal::report::violations::ObjectKind::Role
-                | crate::_internal::report::violations::ObjectKind::Publication
-                | crate::_internal::report::violations::ObjectKind::Subscription => {
+                | crate::_internal::report::violations::ObjectKind::Publication => {
                     let step1 = if let Some(idx) = v.object_name.find('.') {
                         &v.object_name[idx + 1..]
                     } else {
@@ -376,12 +382,16 @@ impl Reporter {
             };
 
             if v.object_kind == crate::_internal::report::violations::ObjectKind::Unknown {
-                println!("   object : {}", display_name);
+                println!("   object : {}", terminal_inline(&display_name));
             } else {
-                println!("   object : {} {}", v.object_kind, display_name);
+                println!(
+                    "   object : {} {}",
+                    v.object_kind,
+                    terminal_inline(&display_name)
+                );
             }
 
-            println!("   reason : {}", v.reason);
+            println!("   reason : {}", terminal_inline(&v.reason));
 
             let clean_recipe = v
                 .recipe
@@ -390,12 +400,12 @@ impl Reporter {
                 .filter(|l| !l.is_empty())
                 .collect::<Vec<_>>()
                 .join(" ");
-            println!("   recipe : {}", clean_recipe);
+            println!("   recipe : {}", terminal_inline(&clean_recipe));
 
             if let Some(sql) = &v.sql {
                 let sql_trimmed = sql.trim();
                 if !sql_trimmed.is_empty() {
-                    println!("   sql    : {}", sql_trimmed);
+                    println!("   sql    : {}", terminal_block(sql_trimmed));
                 }
             }
 
@@ -436,7 +446,7 @@ impl Reporter {
     }
 
     /// Print findings and a compact, deterministic evidence summary.
-    pub fn print_outcome(outcome: &AnalysisOutcome<ReportFinding>) -> bool {
+    pub(crate) fn print_outcome(outcome: &AnalysisOutcome<ReportFinding>) -> bool {
         let violations: Vec<_> = outcome
             .findings
             .iter()
@@ -452,10 +462,11 @@ impl Reporter {
                     .map_or_else(String::new, |location| {
                         format!(
                             " ({} statement {})",
-                            location.file, location.statement_index
+                            terminal_inline(&location.file),
+                            location.statement_index
                         )
                     });
-                println!("  - {}{}", evidence.summary, location);
+                println!("  - {}{}", terminal_inline(evidence.summary), location);
             }
             println!();
         }
@@ -494,14 +505,31 @@ fn markdown_tier_label(tier: &ViolationTier) -> &'static str {
 }
 
 fn markdown_escape(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('|', "\\|")
+    markdown_inline_text(value)
+        .replace('\\', "\\\\")
+        .replace('|', "\\|")
+        .replace('<', "\\<")
+        .replace('>', "\\>")
 }
 
 fn markdown_code(value: &str) -> String {
-    value.replace('`', "'")
+    markdown_inline_text(value).replace('`', "'")
+}
+
+fn markdown_inline_text(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '\r' | '\n' => output.push(' '),
+            character if character.is_control() => output.extend(character.escape_default()),
+            character => output.push(character),
+        }
+    }
+    output
 }
 
 fn markdown_sql_block(sql: &str) -> String {
+    let sql = markdown_block_text(sql);
     let longest_backtick_run = sql
         .split(|character| character != '`')
         .map(str::len)
@@ -509,4 +537,40 @@ fn markdown_sql_block(sql: &str) -> String {
         .unwrap_or(0);
     let fence = "`".repeat(longest_backtick_run.max(2) + 1);
     format!("\n{fence}sql\n{sql}\n{fence}\n")
+}
+
+fn markdown_block_text(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    for character in value.chars() {
+        if matches!(character, '\n' | '\t') {
+            output.push(character);
+        } else if character.is_control() {
+            output.extend(character.escape_default());
+        } else {
+            output.push(character);
+        }
+    }
+    output
+}
+
+pub(super) fn terminal_inline(value: &str) -> String {
+    terminal_text(value, false)
+}
+
+pub(super) fn terminal_block(value: &str) -> String {
+    terminal_text(value, true)
+}
+
+fn terminal_text(value: &str, preserve_layout: bool) -> String {
+    let mut output = String::with_capacity(value.len());
+    for character in value.chars() {
+        if preserve_layout && matches!(character, '\n' | '\t') {
+            output.push(character);
+        } else if character.is_control() {
+            output.extend(character.escape_default());
+        } else {
+            output.push(character);
+        }
+    }
+    output
 }

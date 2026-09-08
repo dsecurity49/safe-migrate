@@ -7,7 +7,7 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit},
 };
 use safe_migrate::_internal::ast::identifiers::ObjectId;
-use safe_migrate::_internal::db::cache::{CACHE_V7_MAGIC, DbCache, DbCacheVersioned};
+use safe_migrate::_internal::db::cache::{CACHE_V8_MAGIC, DbCache, DbCacheVersioned};
 use safe_migrate::_internal::model::relation::{Persistence, RelationKind, RelationState};
 use safe_migrate::_internal::model::schema::SchemaState;
 
@@ -44,9 +44,9 @@ fn write_cache_with_timestamp(path: &std::path::Path, created_at_unix_secs: u64)
     let mut compressed = Vec::new();
     let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3).unwrap();
     let config = bincode::config::standard().with_variable_int_encoding();
-    encoder.write_all(CACHE_V7_MAGIC).unwrap();
+    encoder.write_all(CACHE_V8_MAGIC).unwrap();
     bincode::serde::encode_into_std_write(
-        DbCacheVersioned::V7(Box::new(cache)),
+        DbCacheVersioned::V8(Box::new(cache)),
         &mut encoder,
         config,
     )
@@ -237,7 +237,7 @@ fn rules_command_lists_registry_descriptors_in_json() {
     let report = parse_json_stdout(&output);
     assert_eq!(report["schema_version"], 2);
     let rules = report["rules"].as_array().expect("rules array");
-    assert_eq!(rules.len(), 28);
+    assert_eq!(rules.len(), 29);
     assert_eq!(rules[0]["id"], "irreversible-migration");
     assert_eq!(rules[0]["title"], "Irreversible migration");
     assert!(
@@ -275,7 +275,7 @@ fn rules_command_separates_human_descriptors() {
             .lines()
             .filter(|line| line.len() >= 40 && line.bytes().all(|byte| byte == b'-'))
             .count(),
-        27
+        28
     );
 }
 
@@ -408,6 +408,21 @@ fn test_cli_lint_nonexistent_file() {
 }
 
 #[test]
+fn test_cli_errors_render_control_characters_inertly() {
+    let mut cmd = crate::common::safe_migrate_command();
+    let assert = cmd
+        .arg("lint")
+        .arg("--file")
+        .arg("missing\x1b[2J.sql")
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+
+    assert!(!stderr.contains('\x1b'));
+    assert!(stderr.contains("\\u{1b}[2J"), "stderr was: {stderr}");
+}
+
+#[test]
 fn test_cli_lint_invalid_cache() {
     let mut sql_file = tempfile::NamedTempFile::new().unwrap();
     writeln!(sql_file, "CREATE TABLE t (id int);").unwrap();
@@ -437,10 +452,10 @@ fn test_cli_rejects_semantically_contradictory_v7_cache() {
     );
     let config = bincode::config::standard().with_variable_int_encoding();
     let encoded =
-        bincode::serde::encode_to_vec(DbCacheVersioned::V7(Box::new(invalid)), config).unwrap();
+        bincode::serde::encode_to_vec(DbCacheVersioned::V8(Box::new(invalid)), config).unwrap();
     let mut compressed = Vec::new();
     let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3).unwrap();
-    encoder.write_all(CACHE_V7_MAGIC).unwrap();
+    encoder.write_all(CACHE_V8_MAGIC).unwrap();
     encoder.write_all(&encoded).unwrap();
     encoder.finish().unwrap();
     let cache = tempfile::NamedTempFile::new().unwrap();
@@ -474,10 +489,10 @@ fn test_cli_rejects_authenticated_semantically_contradictory_v7_cache() {
     );
     let config = bincode::config::standard().with_variable_int_encoding();
     let encoded =
-        bincode::serde::encode_to_vec(DbCacheVersioned::V7(Box::new(invalid)), config).unwrap();
+        bincode::serde::encode_to_vec(DbCacheVersioned::V8(Box::new(invalid)), config).unwrap();
     let mut compressed = Vec::new();
     let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3).unwrap();
-    encoder.write_all(CACHE_V7_MAGIC).unwrap();
+    encoder.write_all(CACHE_V8_MAGIC).unwrap();
     encoder.write_all(&encoded).unwrap();
     encoder.finish().unwrap();
 
@@ -518,7 +533,7 @@ fn test_cli_rejects_authenticated_semantically_contradictory_v7_cache() {
 fn test_cli_rejects_malformed_cache_payload() {
     let config = bincode::config::standard().with_variable_int_encoding();
     let encoded =
-        bincode::serde::encode_to_vec(DbCacheVersioned::V7(Box::default()), config).unwrap();
+        bincode::serde::encode_to_vec(DbCacheVersioned::V8(Box::default()), config).unwrap();
     // Preserve the current enum discriminant, then corrupt the payload.
     let mut malicious = encoded[..4].to_vec();
     malicious.push(252);
@@ -526,7 +541,7 @@ fn test_cli_rejects_malformed_cache_payload() {
 
     let mut compressed = Vec::new();
     let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3).unwrap();
-    encoder.write_all(CACHE_V7_MAGIC).unwrap();
+    encoder.write_all(CACHE_V8_MAGIC).unwrap();
     encoder.write_all(&malicious).unwrap();
     encoder.finish().unwrap();
 
@@ -551,11 +566,11 @@ fn test_cli_rejects_malformed_cache_payload() {
 fn test_cli_rejects_trailing_data_after_streamed_cache_decode() {
     let config = bincode::config::standard().with_variable_int_encoding();
     let encoded =
-        bincode::serde::encode_to_vec(DbCacheVersioned::V7(Box::default()), config).unwrap();
+        bincode::serde::encode_to_vec(DbCacheVersioned::V8(Box::default()), config).unwrap();
 
     let mut compressed = Vec::new();
     let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3).unwrap();
-    encoder.write_all(CACHE_V7_MAGIC).unwrap();
+    encoder.write_all(CACHE_V8_MAGIC).unwrap();
     encoder.write_all(&encoded).unwrap();
     encoder.write_all(b"trailing-data").unwrap();
     encoder.finish().unwrap();
@@ -684,7 +699,7 @@ fn test_cache_inspect_outputs_a_redacted_json_summary() {
     let report = parse_json_stdout(assert.get_output());
 
     assert_eq!(report["path"], cache_path.display().to_string());
-    assert_eq!(report["format_version"], 7);
+    assert_eq!(report["format_version"], 8);
     assert_eq!(report["encrypted"], false);
     assert_eq!(report["coverage"]["schema_scope"], "all_non_system");
     assert!(report["coverage"]["families"].is_array());

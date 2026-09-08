@@ -10,7 +10,8 @@ mod state_mutation_tests {
     use safe_migrate::_internal::analysis::state::{Confidence, MutationResult};
     use safe_migrate::_internal::ast::identifiers::{Ident, ObjectId, QualifiedName};
     use safe_migrate::_internal::db::cache::{
-        ConstraintDependencyCache, DbCache, GeneratedColumnDependencyCache, ViewDependencyCache,
+        CatalogFamily, ConstraintDependencyCache, DbCache, GeneratedColumnDependencyCache,
+        ViewDependencyCache,
     };
     use safe_migrate::_internal::model::column::Column;
     use safe_migrate::_internal::model::constraint::ConstraintKind;
@@ -29,7 +30,6 @@ mod state_mutation_tests {
     fn test_topology_table_basic() {
         let engine = setup_engine();
         let mut state = setup_state();
-
         engine
             .analyze(
                 "CREATE TABLE t(id int); ALTER TABLE t ADD COLUMN name text; ALTER TABLE t RENAME COLUMN name TO full_name;",
@@ -515,7 +515,12 @@ mod state_mutation_tests {
                 .any(|finding| finding.rule_id == "chain-conflict"),
             "unrelated column drop must not conflict: {findings:?}"
         );
-        assert_eq!(state.local.confidence, Confidence::Exact);
+        assert_eq!(
+            state.local.confidence,
+            Confidence::Exact,
+            "unexpected evidence: {:?}",
+            state.evidence()
+        );
         assert!(
             state
                 .get_relation(&table_id)
@@ -585,6 +590,7 @@ mod state_mutation_tests {
                 has_expression_keys: true,
                 has_predicate: false,
                 is_unique: false,
+                is_immediate: true,
                 is_valid: true,
                 is_ready: true,
                 is_live: true,
@@ -1086,6 +1092,881 @@ mod state_mutation_tests {
     }
 
     #[test]
+    fn concurrent_partition_detach_remains_pending_until_finalize() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE TABLE parent (id integer) PARTITION BY RANGE (id);
+                 CREATE TABLE child (id integer);
+                 ALTER TABLE parent ATTACH PARTITION child FOR VALUES FROM (0) TO (10);
+                 ALTER TABLE parent DETACH PARTITION child CONCURRENTLY;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(state.local.graph.edges().iter().any(|edge| {
+            matches!(edge.kind, DependencyKind::PartitionDetachPending)
+                && edge.dependent == object_id("public", "child")
+                && edge.referenced == object_id("public", "parent")
+        }));
+
+        engine
+            .analyze(
+                "ALTER TABLE parent DETACH PARTITION child FINALIZE;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(!state.local.graph.edges().iter().any(|edge| {
+            matches!(
+                edge.kind,
+                DependencyKind::PartitionOf | DependencyKind::PartitionDetachPending
+            ) && edge.dependent == object_id("public", "child")
+                && edge.referenced == object_id("public", "parent")
+        }));
+    }
+
+    #[test]
+    fn partition_attachment_validates_catalog_and_tracks_generated_objects() {
+        use safe_migrate::_internal::model::constraint::ConstraintKind;
+        use safe_migrate::_internal::model::trigger::TriggerOverlay;
+
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let findings = engine
+            .analyze(
+                "CREATE TABLE parent (
+                     id integer PRIMARY KEY,
+                     value text,
+                     CONSTRAINT positive CHECK (id > 0)
+                 ) PARTITION BY RANGE (id);
+                 CREATE INDEX parent_value_idx ON parent (value);
+                 CREATE FUNCTION audit_row() RETURNS trigger LANGUAGE plpgsql
+                     AS $$ BEGIN RETURN NEW; END; $$;
+                 CREATE TRIGGER audit_row AFTER INSERT ON parent
+                     FOR EACH ROW EXECUTE FUNCTION audit_row();
+                 CREATE TRIGGER audit_statement AFTER INSERT ON parent
+                     FOR EACH STATEMENT EXECUTE FUNCTION audit_row();
+                 CREATE TABLE child (
+                     id integer NOT NULL,
+                     value text,
+                     CONSTRAINT positive CHECK (id > 0)
+                 );
+                 ALTER TABLE parent ATTACH PARTITION child
+                     FOR VALUES FROM (1) TO (100);",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict"),
+            "valid partition attachment conflicted: {findings:?}"
+        );
+
+        let parent = object_id("public", "parent");
+        let child = object_id("public", "child");
+        assert_eq!(
+            state
+                .local
+                .graph
+                .edges()
+                .iter()
+                .filter(|edge| {
+                    edge.referenced == child
+                        && matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
+                })
+                .count(),
+            2,
+            "both parent indexes should have child counterparts"
+        );
+        assert!(state.local.constraints.values().any(|constraint| {
+            constraint.table_id == child && constraint.kind == ConstraintKind::PrimaryKey
+        }));
+        let clone = state
+            .local
+            .triggers
+            .values()
+            .find_map(|overlay| match overlay {
+                TriggerOverlay::Present(trigger)
+                    if trigger.table_id == child && trigger.name == "audit_row" =>
+                {
+                    Some(trigger)
+                }
+                _ => None,
+            });
+        assert!(clone.is_some_and(|trigger| {
+            trigger.row_level
+                && trigger.parent_trigger_id.as_ref()
+                    == Some(&object_id("public", "parent\0audit_row"))
+        }));
+        assert!(!state.local.triggers.values().any(|overlay| {
+            matches!(overlay, TriggerOverlay::Present(trigger)
+                if trigger.table_id == child && trigger.name == "audit_statement")
+        }));
+
+        engine
+            .analyze(
+                "ALTER TABLE parent DETACH PARTITION child CONCURRENTLY;
+                 ALTER TABLE parent DETACH PARTITION child FINALIZE;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(!state.local.triggers.values().any(|overlay| {
+            matches!(overlay, TriggerOverlay::Present(trigger)
+                if trigger.table_id == child && trigger.parent_trigger_id.is_some())
+        }));
+        assert!(state.local.constraints.values().any(|constraint| {
+            constraint.table_id == child && constraint.kind == ConstraintKind::PrimaryKey
+        }));
+        assert!(state.local.graph.edges().iter().any(|edge| {
+            edge.referenced == parent && matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
+        }));
+
+        engine
+            .analyze(
+                "CREATE TABLE rollback_child (
+                     id integer NOT NULL,
+                     value text,
+                     CONSTRAINT positive CHECK (id > 0)
+                 );
+                 BEGIN;
+                 ALTER TABLE parent ATTACH PARTITION rollback_child
+                     FOR VALUES FROM (100) TO (200);
+                 ROLLBACK;",
+                &mut state,
+            )
+            .unwrap();
+        let rollback_child = object_id("public", "rollback_child");
+        assert!(!state.local.graph.edges().iter().any(|edge| {
+            edge.referenced == rollback_child
+                && matches!(
+                    edge.kind,
+                    DependencyKind::IndexOnRelation { .. } | DependencyKind::PartitionOf
+                )
+        }));
+        assert!(!state.local.constraints.values().any(|constraint| {
+            constraint.table_id == rollback_child && constraint.kind == ConstraintKind::PrimaryKey
+        }));
+        assert!(!state.local.triggers.values().any(|overlay| {
+            matches!(overlay, TriggerOverlay::Present(trigger)
+                if trigger.table_id == rollback_child && trigger.parent_trigger_id.is_some())
+        }));
+    }
+
+    #[test]
+    fn partition_attachment_rejects_incompatible_columns_checks_and_triggers() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let findings = engine
+            .analyze(
+                "CREATE TABLE parent (id integer NOT NULL, CONSTRAINT positive CHECK (id > 0))
+                     PARTITION BY RANGE (id);
+                 CREATE FUNCTION audit_row() RETURNS trigger LANGUAGE plpgsql
+                     AS $$ BEGIN RETURN NEW; END; $$;
+                 CREATE TRIGGER audit AFTER INSERT ON parent
+                     FOR EACH ROW EXECUTE FUNCTION audit_row();
+                 CREATE TABLE wrong_type (id bigint NOT NULL, CONSTRAINT positive CHECK (id > 0));
+                 CREATE TABLE wrong_check (id integer NOT NULL, CONSTRAINT positive CHECK (id >= 0));
+                 CREATE TABLE trigger_collision (id integer NOT NULL, CONSTRAINT positive CHECK (id > 0));
+                 CREATE TRIGGER audit AFTER INSERT ON trigger_collision
+                     FOR EACH ROW EXECUTE FUNCTION audit_row();
+                 ALTER TABLE parent ATTACH PARTITION wrong_type FOR VALUES FROM (1) TO (10);
+                 ALTER TABLE parent ATTACH PARTITION wrong_check FOR VALUES FROM (10) TO (20);
+                 ALTER TABLE parent ATTACH PARTITION trigger_collision FOR VALUES FROM (20) TO (30);",
+                &mut state,
+            )
+            .unwrap();
+        assert_eq!(
+            findings
+                .iter()
+                .filter(|finding| finding.rule_id == "chain-conflict")
+                .count(),
+            3,
+            "every incompatible attachment should conflict: {findings:?}"
+        );
+        assert!(!state.local.graph.edges().iter().any(|edge| {
+            edge.referenced == object_id("public", "parent")
+                && matches!(edge.kind, DependencyKind::PartitionOf)
+        }));
+    }
+
+    #[test]
+    fn create_table_inherits_copies_parent_columns_and_records_each_edge() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TABLE parent_a (id integer);
+                 CREATE TABLE parent_b (created_at timestamp);
+                 CREATE TABLE child (local_value text) INHERITS (parent_a, parent_b);",
+                &mut state,
+            )
+            .unwrap();
+
+        let child = object_id("public", "child");
+        assert!(matches!(
+            state.get_relation(&child),
+            Some(RelationOverlay::Present(relation))
+                if relation.has_column("id")
+                    && relation.has_column("created_at")
+                    && relation.has_column("local_value")
+        ));
+        for parent in ["parent_a", "parent_b"] {
+            assert!(state.local.graph.edges().iter().any(|edge| {
+                matches!(edge.kind, DependencyKind::InheritanceOf)
+                    && edge.dependent == child
+                    && edge.referenced == object_id("public", parent)
+            }));
+        }
+    }
+
+    #[test]
+    fn create_table_inherits_merges_compatible_columns_and_rejects_conflicts() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let findings = engine
+            .analyze(
+                "CREATE TABLE parent_a (id integer NOT NULL, value integer DEFAULT 7);
+                 CREATE TABLE parent_b (id integer, value integer DEFAULT 7);
+                 CREATE TABLE child (id integer, value integer DEFAULT 9)
+                   INHERITS (parent_a, parent_b);",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict"),
+            "compatible inherited columns should merge: {findings:?}"
+        );
+        let Some(RelationOverlay::Present(child)) =
+            state.get_relation(&object_id("public", "child"))
+        else {
+            panic!("merged child relation missing")
+        };
+        assert!(!child.get_column("id").expect("id").is_nullable);
+        assert_eq!(
+            child.get_column("value").expect("value").default,
+            Some(safe_migrate::_internal::analysis::expr_ir::ExprIr::Literal(
+                "9".to_string()
+            ))
+        );
+
+        let mut conflicting = setup_state();
+        let findings = engine
+            .analyze(
+                "CREATE TABLE left_parent (id integer);
+                 CREATE TABLE right_parent (id text);
+                 CREATE TABLE broken () INHERITS (left_parent, right_parent);",
+                &mut conflicting,
+            )
+            .unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict")
+        );
+        assert!(!conflicting.relation_is_present(&object_id("public", "broken")));
+    }
+
+    #[test]
+    fn inheritance_requires_and_merges_matching_check_definitions() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let findings = engine
+            .analyze(
+                "CREATE TABLE parent_a (value integer, CONSTRAINT positive CHECK (value > 0));
+                 CREATE TABLE parent_b (value integer, CONSTRAINT positive CHECK (value > 0));
+                 CREATE TABLE child () INHERITS (parent_a, parent_b);
+                 CREATE TABLE attached (value integer, CONSTRAINT positive CHECK (value > 0));
+                 ALTER TABLE attached INHERIT parent_a;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict"),
+            "matching inherited CHECK definitions should merge: {findings:?}"
+        );
+        assert_eq!(
+            state
+                .local
+                .constraints
+                .values()
+                .filter(|constraint| {
+                    constraint.table_id == object_id("public", "child")
+                        && constraint.name == "positive"
+                })
+                .count(),
+            1
+        );
+
+        let mut conflict = setup_state();
+        let findings = engine
+            .analyze(
+                "CREATE TABLE parent_a (value integer, CONSTRAINT positive CHECK (value > 0));
+                 CREATE TABLE parent_b (value integer, CONSTRAINT positive CHECK (value >= 0));
+                 CREATE TABLE broken () INHERITS (parent_a, parent_b);",
+                &mut conflict,
+            )
+            .unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict")
+        );
+        assert!(!conflict.relation_is_present(&object_id("public", "broken")));
+
+        let mut literal_case = setup_state();
+        let findings = engine
+            .analyze(
+                "CREATE TABLE parent_a (value text, CONSTRAINT same_name CHECK (value = 'A'));
+                 CREATE TABLE parent_b (value text, CONSTRAINT same_name CHECK (value = 'a'));
+                 CREATE TABLE broken () INHERITS (parent_a, parent_b);",
+                &mut literal_case,
+            )
+            .unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict")
+        );
+        assert!(!literal_case.relation_is_present(&object_id("public", "broken")));
+    }
+
+    #[test]
+    fn create_table_like_copies_only_default_like_column_properties() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TABLE source (id integer NOT NULL DEFAULT 42, note text);
+                 CREATE TABLE copy (LIKE source);",
+                &mut state,
+            )
+            .unwrap();
+
+        let relation = state
+            .get_relation(&object_id("public", "copy"))
+            .expect("LIKE target relation");
+        let RelationOverlay::Present(relation) = relation else {
+            panic!("LIKE target should be present");
+        };
+        let id = relation.get_column("id").expect("copied id column");
+        assert!(!id.is_nullable);
+        assert_eq!(id.data_type.as_deref(), Some("integer"));
+        assert!(id.default.is_none());
+        assert!(id.default_expr_text.is_none());
+    }
+
+    #[test]
+    fn create_table_like_copies_each_supported_selected_property() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TABLE source (id integer NOT NULL DEFAULT 42, computed integer GENERATED ALWAYS AS (id + 1) STORED);
+                 ALTER TABLE source ALTER COLUMN id SET STORAGE PLAIN;
+                 ALTER TABLE source ALTER COLUMN id SET STATISTICS 100;
+                 ALTER TABLE source ALTER COLUMN id SET (n_distinct = -0.25);
+                 CREATE TABLE copy (LIKE source INCLUDING DEFAULTS INCLUDING GENERATED INCLUDING STORAGE INCLUDING STATISTICS);",
+                &mut state,
+            )
+            .unwrap();
+
+        let RelationOverlay::Present(relation) = state
+            .get_relation(&object_id("public", "copy"))
+            .expect("LIKE target relation")
+        else {
+            panic!("LIKE target should be present");
+        };
+        let id = relation.get_column("id").expect("copied id column");
+        assert!(id.default.is_some());
+        assert_eq!(id.storage.as_deref(), Some("PLAIN"));
+        assert_eq!(id.statistics_target, None);
+        assert!(id.options.is_empty());
+        assert_eq!(
+            relation
+                .get_column("computed")
+                .and_then(|column| column.generated),
+            Some(true),
+            "INCLUDING GENERATED must preserve generated-column state"
+        );
+        assert_eq!(
+            relation
+                .generated_columns
+                .get("computed")
+                .map(|state| state.kind),
+            Some(safe_migrate::_internal::model::relation::GeneratedColumnKind::Stored)
+        );
+        assert!(state.local.graph.edges().iter().any(|edge| {
+            matches!(
+                &edge.kind,
+                DependencyKind::ColumnGeneratedFrom { column, depends_on_column }
+                    if edge.dependent == object_id("public", "copy")
+                        && column == "computed"
+                        && depends_on_column == "id"
+            )
+        }));
+    }
+
+    #[test]
+    fn create_table_like_clones_constraints_indexes_and_identity_objects() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let findings = engine
+            .analyze(
+                "CREATE TABLE source (
+                     id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                     code text UNIQUE,
+                     amount integer CHECK (amount > 0)
+                 );
+                 CREATE INDEX source_amount_idx ON source (amount);
+                 CREATE TABLE copy (
+                     LIKE source INCLUDING CONSTRAINTS INCLUDING INDEXES INCLUDING IDENTITY
+                 );",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict"),
+            "LIKE catalog-object cloning unexpectedly conflicted: {findings:?}"
+        );
+
+        let copy = object_id("public", "copy");
+        let Some(RelationOverlay::Present(relation)) = state.local.relations.get(&copy) else {
+            panic!("LIKE target relation missing")
+        };
+        assert_eq!(
+            relation.identity_columns.get("id"),
+            Some(&safe_migrate::_internal::model::relation::IdentityGeneration::Always)
+        );
+        assert!(state.local.sequences.values().any(|overlay| matches!(
+            overlay,
+            SequenceOverlay::Present(sequence)
+                if sequence.kind == SequenceKind::Identity
+                    && sequence.owned_by.as_ref() == Some(&(copy.clone(), "id".to_string()))
+        )));
+        let cloned_constraints: Vec<_> = state
+            .local
+            .constraints
+            .values()
+            .filter(|constraint| constraint.table_id == copy)
+            .collect();
+        assert!(
+            cloned_constraints
+                .iter()
+                .any(|constraint| constraint.kind == ConstraintKind::Check)
+        );
+        assert!(
+            cloned_constraints
+                .iter()
+                .any(|constraint| constraint.kind == ConstraintKind::PrimaryKey)
+        );
+        assert!(
+            cloned_constraints
+                .iter()
+                .any(|constraint| constraint.kind == ConstraintKind::Unique)
+        );
+        assert_eq!(
+            state
+                .local
+                .graph
+                .edges()
+                .iter()
+                .filter(|edge| {
+                    edge.referenced == copy
+                        && matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
+                })
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn identity_sequence_options_round_trip_into_state_and_like_clone() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let findings = engine
+            .analyze(
+                "CREATE TABLE source (
+                    id integer GENERATED BY DEFAULT AS IDENTITY
+                      (SEQUENCE NAME source_custom_seq INCREMENT BY 5 START WITH 10
+                       MINVALUE 5 MAXVALUE 100 CACHE 4 CYCLE)
+                 );
+                 CREATE TABLE copy (LIKE source INCLUDING IDENTITY);",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict"),
+            "identity sequence options should be valid: {findings:?}"
+        );
+        for table in ["source", "copy"] {
+            let table_id = object_id("public", table);
+            let sequence = state
+                .local
+                .sequences
+                .values()
+                .find_map(|overlay| match overlay {
+                    SequenceOverlay::Present(sequence)
+                        if sequence.kind == SequenceKind::Identity
+                            && sequence.owned_by.as_ref()
+                                == Some(&(table_id.clone(), "id".to_string())) =>
+                    {
+                        Some(sequence)
+                    }
+                    _ => None,
+                })
+                .expect("owned identity sequence");
+            assert_eq!(sequence.parameters.increment, 5);
+            assert_eq!(sequence.parameters.start_value, 10);
+            assert_eq!(sequence.parameters.min_value, 5);
+            assert_eq!(sequence.parameters.max_value, 100);
+            assert_eq!(sequence.parameters.cache_size, 4);
+            assert!(sequence.parameters.cycle);
+        }
+        assert!(
+            state
+                .local
+                .sequences
+                .contains_key(&object_id("public", "source_custom_seq"))
+        );
+    }
+
+    #[test]
+    fn alter_add_identity_validates_negative_ranges_names_and_rollback() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let findings = engine
+            .analyze(
+                "CREATE TABLE events (name text);
+                 ALTER TABLE events ADD COLUMN id integer GENERATED ALWAYS AS IDENTITY
+                   (INCREMENT BY -2 NO MINVALUE NO MAXVALUE START WITH -1 CACHE 3 NO CYCLE);
+                 BEGIN;
+                 ALTER TABLE events ADD COLUMN rolled_back bigint GENERATED BY DEFAULT AS IDENTITY;
+                 ROLLBACK;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict"),
+            "valid ALTER ADD IDENTITY conflicted: {findings:?}"
+        );
+        let events = object_id("public", "events");
+        let Some(RelationOverlay::Present(relation)) = state.get_relation(&events) else {
+            panic!("events relation missing")
+        };
+        assert!(relation.identity_columns.contains_key("id"));
+        assert!(!relation.has_column("rolled_back"));
+        let sequence = state
+            .local
+            .sequences
+            .values()
+            .find_map(|overlay| match overlay {
+                SequenceOverlay::Present(sequence)
+                    if sequence.owned_by.as_ref() == Some(&(events.clone(), "id".to_string())) =>
+                {
+                    Some(sequence)
+                }
+                _ => None,
+            })
+            .expect("identity sequence missing");
+        assert_eq!(sequence.parameters.increment, -2);
+        assert_eq!(sequence.parameters.start_value, -1);
+        assert_eq!(sequence.parameters.min_value, i32::MIN as i64);
+        assert_eq!(sequence.parameters.max_value, -1);
+        assert_eq!(sequence.parameters.cache_size, 3);
+        assert!(!sequence.parameters.cycle);
+        assert!(!state.local.sequences.values().any(|overlay| {
+            matches!(overlay, SequenceOverlay::Present(sequence)
+                if sequence.owned_by.as_ref()
+                    == Some(&(events.clone(), "rolled_back".to_string())))
+        }));
+
+        let invalid = engine
+            .analyze(
+                "CREATE SEQUENCE occupied;
+                 CREATE TABLE collision (
+                   id integer GENERATED ALWAYS AS IDENTITY (SEQUENCE NAME occupied)
+                 );
+                 CREATE TABLE invalid_range (
+                   id integer GENERATED ALWAYS AS IDENTITY (START WITH 20 MAXVALUE 10)
+                 );",
+                &mut state,
+            )
+            .unwrap();
+        assert_eq!(
+            invalid
+                .iter()
+                .filter(|finding| finding.rule_id == "chain-conflict")
+                .count(),
+            2,
+            "invalid identity definitions must conflict: {invalid:?}"
+        );
+        assert!(!state.relation_is_present(&object_id("public", "collision")));
+        assert!(!state.relation_is_present(&object_id("public", "invalid_range")));
+    }
+
+    #[test]
+    fn like_extended_statistics_follow_column_lifecycle_and_rollback() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze("CREATE TABLE source (a integer, b integer);", &mut state)
+            .unwrap();
+        let source = object_id("public", "source");
+        let statistics_id = object_id("public", "source_a_b_stat");
+        let Some(RelationOverlay::Present(source_relation)) =
+            state.local.relations.get_mut(&source)
+        else {
+            panic!("source relation missing")
+        };
+        source_relation.extended_statistics.insert(
+            statistics_id.clone(),
+            safe_migrate::_internal::model::relation::ExtendedStatisticsState {
+                id: statistics_id,
+                kinds: vec!["d".to_string(), "f".to_string()],
+                columns: vec!["a".to_string(), "b".to_string()],
+                expressions: None,
+                target: Some(250),
+            },
+        );
+
+        let findings = engine
+            .analyze(
+                "CREATE TABLE copy (LIKE source INCLUDING STATISTICS);
+                 ALTER TABLE copy RENAME COLUMN a TO renamed;
+                 BEGIN;
+                 ALTER TABLE copy DROP COLUMN renamed CASCADE;
+                 ROLLBACK;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict"),
+            "extended-statistics lifecycle unexpectedly conflicted: {findings:?}"
+        );
+        let copy = object_id("public", "copy");
+        let Some(RelationOverlay::Present(copy_relation)) = state.local.relations.get(&copy) else {
+            panic!("copy relation missing")
+        };
+        let cloned = copy_relation
+            .extended_statistics
+            .values()
+            .next()
+            .expect("cloned extended statistics");
+        assert_eq!(cloned.columns, vec!["renamed", "b"]);
+        assert_eq!(cloned.target, Some(250));
+
+        let findings = engine
+            .analyze("ALTER TABLE copy DROP COLUMN renamed RESTRICT;", &mut state)
+            .unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict")
+        );
+        assert!(state
+            .get_relation(&copy)
+            .is_some_and(|overlay| matches!(overlay, RelationOverlay::Present(relation) if relation.has_column("renamed") && !relation.extended_statistics.is_empty())));
+    }
+
+    #[test]
+    fn temporary_table_on_commit_drop_is_removed_with_dependents() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "BEGIN;
+                 CREATE TEMPORARY TABLE work (id integer) ON COMMIT DROP;
+                 CREATE INDEX work_id_idx ON work (id);
+                 COMMIT;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(!state.relation_is_present(&object_id("public", "work")));
+        assert!(!state.index_is_present(&object_id("public", "work_id_idx")));
+    }
+
+    #[test]
+    fn temporary_table_on_commit_delete_rows_preserves_its_schema() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "BEGIN;
+                 CREATE TEMPORARY TABLE work (id integer) ON COMMIT DELETE ROWS;
+                 COMMIT;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            state.get_relation(&object_id("public", "work")),
+            Some(RelationOverlay::Present(relation))
+                if relation.has_column("id") && relation.estimated_rows == Some(0)
+        ));
+    }
+
+    #[test]
+    fn alter_table_options_update_and_reset_relation_state() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TABLE entries (id integer);
+                 ALTER TABLE entries SET (fillfactor = 70);
+                 ALTER TABLE entries RESET (fillfactor);",
+                &mut state,
+            )
+            .unwrap();
+        let Some(RelationOverlay::Present(relation)) =
+            state.get_relation(&object_id("public", "entries"))
+        else {
+            panic!("relation should be present");
+        };
+        assert!(!relation.table_options.contains_key("fillfactor"));
+    }
+
+    #[test]
+    fn cluster_on_requires_an_index_owned_by_the_relation() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TABLE entries (id integer);
+                 CREATE TABLE other (id integer);
+                 CREATE INDEX entries_id_idx ON entries (id);
+                 CREATE INDEX other_id_idx ON other (id);
+                 ALTER TABLE entries CLUSTER ON entries_id_idx;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(matches!(
+            state.get_relation(&object_id("public", "entries")),
+            Some(RelationOverlay::Present(relation))
+                if relation.cluster_index.as_deref() == Some("entries_id_idx")
+        ));
+        engine
+            .analyze("ALTER TABLE entries CLUSTER ON other_id_idx;", &mut state)
+            .unwrap();
+        assert!(matches!(
+            state.get_relation(&object_id("public", "entries")),
+            Some(RelationOverlay::Present(relation))
+                if relation.cluster_index.as_deref() == Some("entries_id_idx")
+        ));
+    }
+
+    #[test]
+    fn replica_identity_using_index_requires_a_usable_owned_index() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let findings = engine
+            .analyze(
+                "CREATE TABLE entries (id integer NOT NULL);
+                 CREATE TABLE other (id integer NOT NULL);
+                 CREATE UNIQUE INDEX entries_identity_idx ON entries (id);
+                 CREATE UNIQUE INDEX other_identity_idx ON other (id);
+                 ALTER TABLE entries REPLICA IDENTITY USING INDEX entries_identity_idx;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict"),
+            "eligible replica identity index should be accepted: {findings:?}"
+        );
+        assert!(matches!(
+            state.get_relation(&object_id("public", "entries")),
+            Some(RelationOverlay::Present(relation))
+                if relation.replica_identity.as_deref() == Some("USING INDEX entries_identity_idx")
+        ));
+
+        let findings = engine
+            .analyze(
+                "ALTER TABLE entries REPLICA IDENTITY USING INDEX other_identity_idx;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict")
+        );
+        assert!(matches!(
+            state.get_relation(&object_id("public", "entries")),
+            Some(RelationOverlay::Present(relation))
+                if relation.replica_identity.as_deref() == Some("USING INDEX entries_identity_idx")
+        ));
+    }
+
+    #[test]
+    fn typed_table_uses_the_composite_type_column_layout() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let findings = engine
+            .analyze(
+                "CREATE TYPE address AS (street text, zip integer);
+                 CREATE TABLE addresses OF address;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == "opaque-dynamic-sql"),
+            "typed table should not be opaque: {findings:?}"
+        );
+        assert!(matches!(
+            state.get_relation(&object_id("public", "addresses")),
+            Some(RelationOverlay::Present(relation))
+                if relation.of_type == Some(object_id("public", "address"))
+                    && relation.columns.iter().map(|column| column.name.as_str()).collect::<Vec<_>>()
+                        == vec!["street", "zip"]
+        ));
+    }
+
+    #[test]
+    fn alter_table_of_and_not_of_validate_the_composite_layout() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let findings = engine
+            .analyze(
+                "CREATE TYPE address AS (street text, zip integer);
+                 CREATE TABLE addresses (street text, zip integer);
+                 ALTER TABLE addresses OF address;
+                 ALTER TABLE addresses NOT OF;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == "opaque-dynamic-sql"),
+            "typed-table alterations should not be opaque: {findings:?}"
+        );
+        assert!(matches!(
+            state.get_relation(&object_id("public", "addresses")),
+            Some(RelationOverlay::Present(relation)) if relation.of_type.is_none()
+        ));
+    }
+
+    #[test]
     fn test_topology_rename_index() {
         let engine = setup_engine();
         let mut state = setup_state();
@@ -1495,6 +2376,44 @@ mod state_mutation_tests {
                 .any(|violation| violation.rule_id == "chain-conflict")
         );
         assert!(state.relation_is_present(&object_id("public", "copied")));
+    }
+
+    #[test]
+    fn select_into_projects_simple_source_columns_exactly() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let findings = engine
+            .analyze(
+                "CREATE TABLE source (id integer NOT NULL, name varchar(40));
+                 SELECT id AS copied_id, name INTO snapshot FROM source;
+                 ALTER TABLE snapshot DROP COLUMN name;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict"),
+            "simple SELECT INTO should remain exact: {findings:?}"
+        );
+        assert_eq!(
+            state.local.confidence,
+            Confidence::Exact,
+            "unexpected evidence: {:?}",
+            state.evidence()
+        );
+        let Some(RelationOverlay::Present(snapshot)) =
+            state.get_relation(&object_id("public", "snapshot"))
+        else {
+            panic!("SELECT INTO relation missing")
+        };
+        let copied_id = snapshot
+            .get_column("copied_id")
+            .expect("projected alias missing");
+        assert_eq!(copied_id.data_type.as_deref(), Some("integer"));
+        assert!(copied_id.is_nullable, "SELECT INTO does not copy NOT NULL");
+        assert!(!snapshot.has_column("name"));
     }
 
     #[test]
@@ -3276,7 +4195,7 @@ mod state_mutation_tests {
     }
 
     #[test]
-    fn exact_v6_baseline_rejects_an_alter_of_a_missing_publication() {
+    fn complete_v7_baseline_rejects_an_alter_of_a_missing_publication_exactly() {
         let engine = setup_engine();
         let mut state = setup_state();
 
@@ -3296,11 +4215,7 @@ mod state_mutation_tests {
                 && violation.reason.contains("missing_pub")
                 && violation.reason.contains("does not exist")
         }));
-        assert_eq!(
-            state.local.confidence,
-            Confidence::Tainted,
-            "FOR ALL TABLES publication state depends on catalog-wide inheritance knowledge"
-        );
+        assert_eq!(state.local.confidence, Confidence::Exact);
     }
 
     #[test]
@@ -3564,6 +4479,7 @@ mod state_mutation_tests {
     fn cached_publication_parent_edits_are_tainted_without_inheritance_catalogs() {
         let engine = setup_engine();
         let mut cache = cache_with_table("public", "parent", None);
+        cache.coverage.families.remove(&CatalogFamily::Inheritance);
         cache.publications.insert(
             "changes".into(),
             safe_migrate::_internal::model::replication::PublicationState {
@@ -3606,6 +4522,41 @@ mod state_mutation_tests {
             )
             .unwrap();
         assert_eq!(only_state.local.confidence, Confidence::Exact);
+    }
+
+    #[test]
+    fn complete_inheritance_catalog_keeps_publication_parent_edits_exact() {
+        let engine = setup_engine();
+        let mut cache = cache_with_table("public", "parent", None);
+        let child = object_id("public", "child");
+        cache.insert_baseline(
+            child.clone(),
+            RelationState::new(
+                child.clone(),
+                object_id("public", "postgres"),
+                0,
+                None,
+                RelationKind::Table,
+                Persistence::Permanent,
+                0,
+            ),
+        );
+        cache
+            .inheritances
+            .push(safe_migrate::_internal::db::cache::InheritanceCache {
+                child,
+                parent: object_id("public", "parent"),
+                sequence: 1,
+                is_partition: false,
+                detach_pending: false,
+            });
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
+
+        engine
+            .analyze("CREATE PUBLICATION changes FOR TABLE parent *;", &mut state)
+            .unwrap();
+
+        assert_eq!(state.local.confidence, Confidence::Exact);
     }
 
     #[test]
@@ -4473,6 +5424,8 @@ mod state_mutation_tests {
             trigger_id: object_id("public", "check_trigger"),
             table_id: object_id("public", "test_table"),
             function_id: object_id("public", "check_row()"),
+            row_level: true,
+            parent_trigger_id: None,
             enabled_mode: TriggerEnableMode::Origin,
         });
         let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
@@ -4553,6 +5506,11 @@ mod state_mutation_tests {
                 avg_width: None,
                 default_expr_text: None,
                 type_modifier: Some(-1),
+                storage: None,
+                compression: None,
+                statistics_target: None,
+                options: Default::default(),
+                generated: None,
             });
         let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
         engine
@@ -4600,6 +5558,11 @@ mod state_mutation_tests {
                     avg_width: None,
                     default_expr_text: None,
                     type_modifier: Some(-1),
+                    storage: None,
+                    compression: None,
+                    statistics_target: None,
+                    options: Default::default(),
+                    generated: None,
                 },
                 Column {
                     name: "note".to_string(),
@@ -4610,6 +5573,11 @@ mod state_mutation_tests {
                     avg_width: None,
                     default_expr_text: None,
                     type_modifier: Some(-1),
+                    storage: None,
+                    compression: None,
+                    statistics_target: None,
+                    options: Default::default(),
+                    generated: None,
                 },
             ]);
         cache.constraints.push(
@@ -4618,6 +5586,7 @@ mod state_mutation_tests {
                 name: "accounts_note_check".to_string(),
                 kind: ConstraintKind::Check,
                 validated: true,
+                definition: Some("note IS NOT NULL".to_string()),
                 backing_index: None,
             },
         );
@@ -4710,6 +5679,11 @@ mod state_mutation_tests {
                     avg_width: None,
                     default_expr_text: None,
                     type_modifier: Some(-1),
+                    storage: None,
+                    compression: None,
+                    statistics_target: None,
+                    options: Default::default(),
+                    generated: Some(false),
                 },
                 Column {
                     name: "derived".to_string(),
@@ -4720,6 +5694,11 @@ mod state_mutation_tests {
                     avg_width: None,
                     default_expr_text: None,
                     type_modifier: Some(-1),
+                    storage: None,
+                    compression: None,
+                    statistics_target: None,
+                    options: Default::default(),
+                    generated: Some(true),
                 },
                 Column {
                     name: "derived_twice".to_string(),
@@ -4730,6 +5709,11 @@ mod state_mutation_tests {
                     avg_width: None,
                     default_expr_text: None,
                     type_modifier: Some(-1),
+                    storage: None,
+                    compression: None,
+                    statistics_target: None,
+                    options: Default::default(),
+                    generated: Some(true),
                 },
             ]);
         cache
@@ -4752,6 +5736,7 @@ mod state_mutation_tests {
                 name: "derived_twice_check".to_string(),
                 kind: ConstraintKind::Check,
                 validated: true,
+                definition: Some("derived_twice > 0".to_string()),
                 backing_index: None,
             },
         );
@@ -4776,6 +5761,7 @@ mod state_mutation_tests {
                 has_expression_keys: false,
                 has_predicate: false,
                 is_unique: false,
+                is_immediate: true,
                 is_valid: true,
                 is_ready: true,
                 is_live: true,
@@ -4885,6 +5871,11 @@ mod state_mutation_tests {
                 avg_width: None,
                 default_expr_text: Some("nextval('public.event_seq'::regclass)".to_string()),
                 type_modifier: Some(-1),
+                storage: None,
+                compression: None,
+                statistics_target: None,
+                options: Default::default(),
+                generated: None,
             });
         cache.sequences.insert(
             sequence.clone(),
@@ -4893,6 +5884,7 @@ mod state_mutation_tests {
                 owner: object_id("public", "postgres"),
                 owned_by: None,
                 kind: SequenceKind::Standalone,
+                parameters: Default::default(),
                 generation: 0,
             },
         );
@@ -4968,6 +5960,7 @@ mod state_mutation_tests {
                 owner: object_id("public", "postgres"),
                 owned_by: None,
                 kind: SequenceKind::Standalone,
+                parameters: Default::default(),
                 generation: 0,
             },
         );
@@ -5517,6 +6510,11 @@ mod state_mutation_tests {
                 avg_width: None,
                 default_expr_text: None,
                 type_modifier: None,
+                storage: None,
+                compression: None,
+                statistics_target: None,
+                options: Default::default(),
+                generated: None,
             });
         let mut cache = DbCache::new();
         cache.insert_baseline(table_id, relation);
@@ -5930,6 +6928,7 @@ mod state_mutation_tests {
                 owner: object_id("", "old_owner"),
                 owned_by: Some((table.clone(), "id".into())),
                 kind: SequenceKind::Owned,
+                parameters: Default::default(),
                 generation: 0,
             },
         );
@@ -6305,5 +7304,127 @@ mod state_mutation_tests {
             };
             assert!(role.member_of.is_empty());
         }
+    }
+
+    #[test]
+    fn rollback_restores_every_destructively_rewritten_graph_edge() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        state.pg_version_num = Some(180_000);
+
+        let findings = engine
+            .analyze(
+                "CREATE TABLE items (id integer NOT NULL);
+                 CREATE INDEX items_idx ON items (id);
+                 ALTER TABLE items ADD CONSTRAINT items_check CHECK (id > 0) NOT VALID;
+                 CREATE TABLE parent (id integer) PARTITION BY RANGE (id);
+                 CREATE TABLE child PARTITION OF parent FOR VALUES FROM (0) TO (10);
+                 BEGIN;
+                 DROP INDEX items_idx;
+                 ALTER TABLE items DROP CONSTRAINT items_check;
+                 ALTER TABLE items ALTER COLUMN id DROP NOT NULL;
+                 ALTER TABLE parent DETACH PARTITION child;
+                 ROLLBACK;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict"),
+            "rollback setup unexpectedly conflicted: {findings:?}"
+        );
+
+        let items = object_id("public", "items");
+        let index = object_id("public", "items_idx");
+        let parent = object_id("public", "parent");
+        let child = object_id("public", "child");
+        assert!(matches!(
+            state.get_relation(&child),
+            Some(RelationOverlay::Present(relation)) if relation.has_column("id")
+        ));
+        assert!(state.local.graph.edges().iter().any(|edge| {
+            edge.dependent == index
+                && edge.referenced == items
+                && matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
+        }));
+        assert!(state.local.graph.edges().iter().any(|edge| {
+            edge.dependent == items
+                && matches!(
+                    &edge.kind,
+                    DependencyKind::ConstraintDependency {
+                        constraint_name,
+                        ..
+                    } if constraint_name == "items_check"
+                )
+        }));
+        assert!(state.local.graph.edges().iter().any(|edge| {
+            edge.dependent == items
+                && matches!(
+                    &edge.kind,
+                    DependencyKind::ConstraintOnRelation {
+                        columns,
+                        is_primary: false,
+                        ..
+                    } if columns == &["id"]
+                )
+        }));
+        assert!(state.local.graph.edges().iter().any(|edge| {
+            edge.dependent == child
+                && edge.referenced == parent
+                && matches!(edge.kind, DependencyKind::PartitionOf)
+        }));
+    }
+
+    #[test]
+    fn alter_rule_modes_validate_catalog_identity_and_rollback() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let table_id = object_id("public", "events");
+        engine
+            .analyze("CREATE TABLE events (id integer);", &mut state)
+            .unwrap();
+        let Some(RelationOverlay::Present(relation)) = state.local.relations.get_mut(&table_id)
+        else {
+            panic!("created relation missing from state")
+        };
+        relation.rules.insert(
+            "rewrite_rule".to_string(),
+            safe_migrate::_internal::model::relation::RuleEnableMode::Origin,
+        );
+
+        let findings = engine
+            .analyze(
+                "ALTER TABLE events ENABLE REPLICA RULE rewrite_rule;
+                 ALTER TABLE events ENABLE ALWAYS RULE rewrite_rule;
+                 BEGIN;
+                 ALTER TABLE events DISABLE RULE rewrite_rule;
+                 ROLLBACK;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict"),
+            "valid rule mode changes unexpectedly conflicted: {findings:?}"
+        );
+        let Some(RelationOverlay::Present(relation)) = state.local.relations.get(&table_id) else {
+            panic!("relation missing after rule mode rollback")
+        };
+        assert_eq!(
+            relation.rules.get("rewrite_rule"),
+            Some(&safe_migrate::_internal::model::relation::RuleEnableMode::Always)
+        );
+
+        let findings = engine
+            .analyze("ALTER TABLE events ENABLE RULE missing_rule;", &mut state)
+            .unwrap();
+        assert!(findings.iter().any(|finding| {
+            finding.rule_id == "chain-conflict"
+                && finding
+                    .reason
+                    .contains("rule 'missing_rule' does not exist")
+        }));
     }
 }

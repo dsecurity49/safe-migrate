@@ -1,20 +1,20 @@
-pub mod conflict;
-pub mod constraints;
-pub mod destructive;
-pub mod drift;
-pub mod expressions;
-pub mod functions;
-pub mod idempotency;
-pub mod indexes;
-pub mod opaque;
-pub mod partitions;
-pub mod policies;
-pub mod registry;
-pub mod security;
-pub mod timeouts;
-pub mod transactions;
-pub mod triggers;
-pub mod views;
+pub(crate) mod conflict;
+pub(crate) mod constraints;
+pub(crate) mod destructive;
+pub(crate) mod drift;
+pub(crate) mod expressions;
+pub(crate) mod functions;
+pub(crate) mod idempotency;
+pub(crate) mod indexes;
+pub(crate) mod opaque;
+pub(crate) mod partitions;
+pub(crate) mod policies;
+pub(crate) mod registry;
+pub(crate) mod security;
+pub(crate) mod timeouts;
+pub(crate) mod transactions;
+pub(crate) mod triggers;
+pub(crate) mod views;
 
 use crate::_internal::analysis::mutations::Mutation;
 use crate::_internal::analysis::state::{AnalysisState, CascadeResult, MutationResult};
@@ -49,7 +49,7 @@ impl<'a> TransitionRecord<'a> {
     }
 }
 
-pub struct RuleContext<'a> {
+pub(crate) struct RuleContext<'a> {
     pub(crate) transition: TransitionRecord<'a>,
     pub(crate) state: &'a AnalysisState,
     pub(crate) config: &'a Config,
@@ -59,7 +59,7 @@ pub struct RuleContext<'a> {
 /// result. Declarations are checked centrally so new rules cannot silently
 /// depend on an untracked part of the transition state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RuleCapability {
+pub(crate) enum RuleCapability {
     BaselineRelations,
     CatalogDependencies,
     RowStatistics,
@@ -205,34 +205,34 @@ impl<'a> RuleContext<'a> {
         }
     }
 
-    pub fn mutation(&self) -> &Mutation {
+    pub(crate) fn mutation(&self) -> &Mutation {
         self.transition.mutation
     }
 
-    pub fn result(&self) -> &MutationResult {
+    pub(crate) fn result(&self) -> &MutationResult {
         self.transition.result
     }
 
-    pub fn pre_state(&self) -> &crate::_internal::analysis::state::PreState {
+    pub(crate) fn pre_state(&self) -> &crate::_internal::analysis::state::PreState {
         self.transition.pre_state
     }
 
-    pub fn state(&self) -> &AnalysisState {
+    pub(crate) fn state(&self) -> &AnalysisState {
         self.state
     }
 
-    pub fn config(&self) -> &Config {
+    pub(crate) fn config(&self) -> &Config {
         self.config
     }
 
-    pub fn cascade_closure(&self) -> Option<&CascadeResult> {
+    pub(crate) fn cascade_closure(&self) -> Option<&CascadeResult> {
         self.transition.cascade_closure
     }
 }
 
 /// Supported rule interface. Implementations receive one immutable context
 /// object, so future inputs can be added without another argument explosion.
-pub trait Rule {
+pub(crate) trait Rule {
     fn id(&self) -> &'static str;
     fn default_tier(&self) -> ViolationTier;
     fn recipe(&self) -> &'static str;

@@ -138,8 +138,23 @@ jobs:
           --health-retries 5
         ports:
           - 5432:5432
+      publisher:
+        image: ${{ matrix.image }}
+        env:
+          POSTGRES_DB: safe_migrate
+          POSTGRES_USER: safe_migrate
+          POSTGRES_PASSWORD: safe_migrate
+        options: >-
+          --health-cmd "pg_isready -U safe_migrate -d safe_migrate"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5433:5432
     env:
       DATABASE_URL: postgres://safe_migrate:safe_migrate@localhost:5432/safe_migrate
+      PUBLISHER_DATABASE_URL: postgres://safe_migrate:safe_migrate@localhost:5433/safe_migrate
+      SUBSCRIPTION_DATABASE_URL: postgres://safe_migrate:safe_migrate@publisher:5432/safe_migrate
 
     steps:
       - name: Checkout repository
@@ -152,6 +167,23 @@ jobs:
 
       - name: Cache dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Enable logical replication on publisher
+        shell: bash
+        run: |
+          publisher_id='${{ job.services.publisher.id }}'
+          docker exec "$publisher_id" psql -U safe_migrate -d safe_migrate \
+            -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET wal_level = 'logical'"
+          docker restart "$publisher_id"
+          for attempt in {1..30}; do
+            if docker exec "$publisher_id" \
+              pg_isready -U safe_migrate -d safe_migrate; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs "$publisher_id"
+          exit 1
 
       - name: Reject an unreachable live database
         shell: bash
@@ -177,6 +209,9 @@ jobs:
 
       - name: Compare routine and replication state with PostgreSQL
         run: scripts/live-catalog-differential
+
+      - name: Validate a connected logical subscription
+        run: scripts/live-connected-subscription
 
       - name: Compare simulator state with PostgreSQL
         shell: bash

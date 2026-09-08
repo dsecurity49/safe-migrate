@@ -4,7 +4,7 @@ use crate::_internal::model::relation::Persistence;
 use crate::_internal::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
 use crate::_internal::rules::{BASELINE_STATS_CAPABILITIES, Rule, RuleCapability, RuleContext};
 
-pub struct BlockingConstraintRule;
+pub(crate) struct BlockingConstraintRule;
 
 impl Rule for BlockingConstraintRule {
     fn id(&self) -> &'static str {
@@ -68,7 +68,7 @@ impl Rule for BlockingConstraintRule {
                     }
                     | AlterTableActionMutation::AddExcludeConstraint { .. }
                     | AlterTableActionMutation::SetStorage { .. }
-                    | AlterTableActionMutation::SetAccessMethod
+                    | AlterTableActionMutation::SetAccessMethod { .. }
             );
             if !action_is_relevant {
                 return violations;
@@ -280,7 +280,7 @@ impl Rule for BlockingConstraintRule {
                                     fk_dependency_related: false,
                     });
                 }
-                AlterTableActionMutation::SetStorage { column } => {
+                AlterTableActionMutation::SetStorage { column, .. } => {
                     let mut reason = format!(
                         "Changing storage parameter for {}.{} causes a table rewrite",
                         alter.id, column
@@ -302,7 +302,7 @@ impl Rule for BlockingConstraintRule {
                                     fk_dependency_related: false,
                     });
                 }
-                AlterTableActionMutation::SetAccessMethod => {
+                AlterTableActionMutation::SetAccessMethod { .. } => {
                     let mut reason = format!(
                         "Changing access method for {} causes a table rewrite",
                         alter.id

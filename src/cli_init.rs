@@ -8,6 +8,7 @@ use std::fs;
 use std::io::{IsTerminal, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
+use zeroize::Zeroizing;
 
 const ANALYSIS_WORKFLOW: &str = "safe-migrate.yml";
 const BASELINE_WORKFLOW: &str = "safe-migrate-baseline.yml";
@@ -64,8 +65,50 @@ fn yaml_single_quoted(value: &str) -> String {
 }
 
 fn validate_single_line(name: &str, value: &str) -> Result<()> {
-    if value.is_empty() || value.contains(['\r', '\n', '\0']) {
-        return Err(anyhow!("{name} must be a non-empty, single-line value"));
+    if value.is_empty() || value.chars().any(char::is_control) {
+        return Err(anyhow!(
+            "{name} must be a non-empty, single-line value without control characters"
+        ));
+    }
+    Ok(())
+}
+
+fn display_path(path: &Path) -> String {
+    let value = path.display().to_string();
+    let mut output = String::with_capacity(value.len());
+    for character in value.chars() {
+        if character.is_control() {
+            output.extend(character.escape_default());
+        } else {
+            output.push(character);
+        }
+    }
+    output
+}
+
+fn reject_symlink_components(path: &Path) -> Result<()> {
+    for component_path in path.ancestors().collect::<Vec<_>>().into_iter().rev() {
+        if component_path.as_os_str().is_empty() {
+            continue;
+        }
+        match component_path.symlink_metadata() {
+            Ok(metadata) if metadata.is_symlink() => {
+                return Err(anyhow!(
+                    "Refusing to write workflows through a symbolic link: {}",
+                    component_path.display()
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "Could not inspect workflow path {}",
+                        component_path.display()
+                    )
+                });
+            }
+        }
     }
     Ok(())
 }
@@ -258,19 +301,25 @@ fn set_github_secret(name: &str, value: Option<&str>, environment: Option<&str>)
     Ok(())
 }
 
-fn generate_cache_key() -> Result<String> {
+fn generate_cache_key() -> Result<Zeroizing<String>> {
     let key = Key::<XChaCha20Poly1305>::try_generate()
         .context("Operating system could not generate a cache key")?;
-    Ok(key.iter().map(|byte| format!("{byte:02x}")).collect())
+    let mut encoded = String::with_capacity(key.len() * 2);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in key.iter() {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    Ok(Zeroizing::new(encoded))
 }
 
 fn run_cache_key(store_github_secret: bool) -> Result<()> {
     let key = generate_cache_key()?;
     if store_github_secret {
-        set_github_secret("SAFE_MIGRATE_CACHE_KEY", Some(&key), None)?;
+        set_github_secret("SAFE_MIGRATE_CACHE_KEY", Some(key.as_str()), None)?;
         println!("Configured SAFE_MIGRATE_CACHE_KEY for the current GitHub repository.");
     } else {
-        println!("{key}");
+        println!("{}", key.as_str());
     }
     Ok(())
 }
@@ -308,15 +357,7 @@ fn run_github_actions(
     validate_single_line("migration path", migration_path)?;
     validate_single_line("branch", branch)?;
 
-    if output_dir
-        .symlink_metadata()
-        .is_ok_and(|metadata| metadata.is_symlink())
-    {
-        return Err(anyhow!(
-            "Refusing to write workflows through a symbolic link: {}",
-            output_dir.display()
-        ));
-    }
+    reject_symlink_components(output_dir)?;
     if output_dir.exists() && !output_dir.is_dir() {
         return Err(anyhow!(
             "Workflow output is not a directory: {}",
@@ -357,8 +398,8 @@ fn run_github_actions(
     fs::write(&baseline_output, baseline_workflow)
         .with_context(|| format!("Could not write {}", baseline_output.display()))?;
 
-    println!("Created {}", analysis_output.display());
-    println!("Created {}", baseline_output.display());
+    println!("Created {}", display_path(&analysis_output));
+    println!("Created {}", display_path(&baseline_output));
     if configure_secrets {
         warn_if_github_environment_is_unprotected(BASELINE_ENVIRONMENT);
         println!(
@@ -370,7 +411,7 @@ fn run_github_actions(
             Some(BASELINE_ENVIRONMENT),
         )?;
         let key = generate_cache_key()?;
-        set_github_secret("SAFE_MIGRATE_CACHE_KEY", Some(&key), None)?;
+        set_github_secret("SAFE_MIGRATE_CACHE_KEY", Some(key.as_str()), None)?;
         println!(
             "Configured the database URL as an environment secret and the generated cache key as a repository secret."
         );
@@ -436,6 +477,37 @@ mod tests {
                 br#"{"protection_rules":[{"type":"wait_timer"}],"deployment_branch_policy":null}"#
             )
             .unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn github_actions_rejects_a_symlinked_output_ancestor() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let workflow_target = workspace.path().join("workflow-target");
+        let workflow_link = workspace.path().join("workflow-link");
+        fs::create_dir_all(&workflow_target).unwrap();
+        symlink(&workflow_target, &workflow_link).unwrap();
+
+        let error = reject_symlink_components(&workflow_link.join("nested")).unwrap_err();
+
+        assert!(
+            error.to_string().contains("symbolic link"),
+            "unexpected error: {error:#}"
+        );
+        assert!(!workflow_target.join("nested").exists());
+    }
+
+    #[test]
+    fn github_actions_input_values_reject_terminal_controls() {
+        for value in ["branch\u{1b}[2J", "path\u{7f}", "line\nnext"] {
+            assert!(validate_single_line("input", value).is_err());
+        }
+        assert_eq!(
+            display_path(Path::new("workflow\u{1b}[2J_日本")),
+            "workflow\\u{1b}[2J_日本"
         );
     }
 }

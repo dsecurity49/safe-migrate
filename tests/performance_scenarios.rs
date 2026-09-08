@@ -50,6 +50,7 @@ mod performance_scenarios {
         CACHE_KEY_ENV, protect_cache_bytes, unprotect_cache_bytes,
     };
     use safe_migrate::_internal::model::relation::{Persistence, RelationKind, RelationState};
+    use safe_migrate::_internal::test_support::EnvironmentValueGuard;
     use std::io::Cursor;
     use std::sync::atomic::Ordering;
     use std::time::Instant;
@@ -233,22 +234,17 @@ mod performance_scenarios {
         let cache = large_baseline();
         let started = Instant::now();
         let config = bincode::config::standard().with_variable_int_encoding();
-        let payload = bincode::serde::encode_to_vec(DbCacheVersioned::V7(Box::new(cache)), config)
+        let payload = bincode::serde::encode_to_vec(DbCacheVersioned::V8(Box::new(cache)), config)
             .expect("cache should encode");
         let compressed = zstd::stream::encode_all(Cursor::new(payload), 3)
             .expect("cache payload should compress");
-        unsafe {
-            std::env::set_var(
-                CACHE_KEY_ENV,
-                "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
-            );
-        }
+        let _cache_key = EnvironmentValueGuard::set(
+            CACHE_KEY_ENV,
+            "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+        );
         let encrypted = protect_cache_bytes(compressed, true).expect("cache should encrypt");
         let compressed =
             unprotect_cache_bytes(encrypted.clone(), true).expect("cache should decrypt");
-        unsafe {
-            std::env::remove_var(CACHE_KEY_ENV);
-        }
         let payload = zstd::stream::decode_all(Cursor::new(compressed))
             .expect("cache payload should decompress");
         let decoded: DbCacheVersioned = bincode::serde::decode_from_slice(&payload, config)

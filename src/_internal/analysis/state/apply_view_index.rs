@@ -441,6 +441,9 @@ impl AnalysisState {
                 has_predicate: create.has_predicate,
                 is_concurrent: create.concurrently,
                 is_unique: create.unique,
+                // PostgreSQL-created indexes are immediate unless a
+                // constraint later adopts them with deferred semantics.
+                is_immediate: true,
                 is_valid: true,
                 is_ready: true,
                 is_live: true,
@@ -591,7 +594,7 @@ impl AnalysisState {
             // Scoped index rows do not yet carry a complete backing-constraint
             // identity or every external dependency, so PostgreSQL's DROP
             // INDEX conflict semantics cannot be proven from the partial
-            // graph. Leave the baseline unchanged until V7 index ownership
+            // graph. Leave the baseline unchanged until index ownership
             // coverage is object-complete.
             self.taint(
                 EvidenceCode::CatalogCoverageIncomplete,
@@ -682,7 +685,7 @@ impl AnalysisState {
                 return MutationResult::Skipped;
             }
         }
-        self.snapshot_graph();
+        self.snapshot_graph_full();
         self.local.graph.retain_edges(|edge| {
             !(matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
                 && targets.contains(&edge.dependent))

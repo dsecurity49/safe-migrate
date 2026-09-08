@@ -14,6 +14,7 @@ impl EnvironmentValueGuard {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let previous = std::env::var(name).ok();
+        // The process-wide lock serializes every test helper that mutates the environment.
         unsafe {
             std::env::set_var(name, value);
         }
@@ -29,6 +30,7 @@ impl EnvironmentValueGuard {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let previous = std::env::var(name).ok();
+        // The process-wide lock serializes every test helper that mutates the environment.
         unsafe {
             std::env::remove_var(name);
         }
@@ -42,6 +44,7 @@ impl EnvironmentValueGuard {
 
 impl Drop for EnvironmentValueGuard {
     fn drop(&mut self) {
+        // This guard still owns the process-wide environment lock.
         unsafe {
             if let Some(previous) = &self.previous {
                 std::env::set_var(self.name, previous);

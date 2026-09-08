@@ -170,6 +170,7 @@ impl Resolver {
         name: &str,
         table: &QualifiedName,
         function: &Option<QualifiedName>,
+        row_level: bool,
         state: &AnalysisState,
     ) -> Mutation {
         let Some(function) = function else {
@@ -180,6 +181,7 @@ impl Resolver {
             name: name.to_string(),
             table: Self::resolve_relation_lookup_name(table, state),
             function_id,
+            row_level,
         })
     }
 

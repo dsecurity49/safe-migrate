@@ -6,7 +6,7 @@ use serde::Serialize;
 /// value as the compatibility contract rather than matching display text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum EvidenceCode {
+pub(crate) enum EvidenceCode {
     BaselineUnavailable,
     BaselineStale,
     CatalogCoverageIncomplete,
@@ -19,7 +19,7 @@ pub enum EvidenceCode {
 }
 
 impl EvidenceCode {
-    pub const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::BaselineUnavailable => "baseline_unavailable",
             Self::BaselineStale => "baseline_stale",
@@ -33,7 +33,7 @@ impl EvidenceCode {
         }
     }
 
-    pub const fn summary(self) -> &'static str {
+    pub(crate) const fn summary(self) -> &'static str {
         match self {
             Self::BaselineUnavailable => "no synchronized baseline was available",
             Self::BaselineStale => "the synchronized baseline may be stale",
@@ -55,21 +55,21 @@ impl EvidenceCode {
 /// Whether uncertainty affects only one transition or subsequent statements.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum EvidenceScope {
+pub(crate) enum EvidenceScope {
     Statement,
     Chain,
 }
 
 /// Safe source context attached by the engine while it evaluates a statement.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-pub struct EvidenceLocation {
+pub(crate) struct EvidenceLocation {
     pub file: String,
     pub statement_index: usize,
 }
 
 /// One durable reason why the analyzer had to be conservative.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-pub struct EvidenceRecord {
+pub(crate) struct EvidenceRecord {
     pub code: EvidenceCode,
     pub scope: EvidenceScope,
     pub summary: &'static str,
@@ -78,7 +78,7 @@ pub struct EvidenceRecord {
 }
 
 impl EvidenceRecord {
-    pub fn new(code: EvidenceCode, scope: EvidenceScope) -> Self {
+    pub(crate) fn new(code: EvidenceCode, scope: EvidenceScope) -> Self {
         Self {
             code,
             scope,
@@ -87,7 +87,8 @@ impl EvidenceRecord {
         }
     }
 
-    pub fn at(mut self, location: EvidenceLocation) -> Self {
+    #[cfg(test)]
+    pub(crate) fn at(mut self, location: EvidenceLocation) -> Self {
         self.location = Some(location);
         self
     }
@@ -95,21 +96,21 @@ impl EvidenceRecord {
 
 /// Ordered, deduplicated evidence carried by analysis state.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct EvidenceLog {
+pub(crate) struct EvidenceLog {
     records: Vec<EvidenceRecord>,
 }
 
 impl EvidenceLog {
-    pub fn records(&self) -> &[EvidenceRecord] {
+    pub(crate) fn records(&self) -> &[EvidenceRecord] {
         &self.records
     }
 
-    pub fn contains(&self, record: &EvidenceRecord) -> bool {
+    pub(crate) fn contains(&self, record: &EvidenceRecord) -> bool {
         self.records.contains(record)
     }
 
     /// Returns whether the record was newly inserted.
-    pub fn insert(&mut self, record: EvidenceRecord) -> bool {
+    pub(crate) fn insert(&mut self, record: EvidenceRecord) -> bool {
         if self.contains(&record) {
             return false;
         }

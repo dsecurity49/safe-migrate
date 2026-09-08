@@ -5,7 +5,9 @@ mod tests {
     };
     use crate::_internal::analysis::outcome::AnalysisOutcome;
     use crate::_internal::analysis::state::Confidence;
-    use crate::_internal::report::reporter::{Reporter, Verdict, compute_verdict};
+    use crate::_internal::report::reporter::{
+        Reporter, Verdict, compute_verdict, terminal_block, terminal_inline, tier_label_with_color,
+    };
     use crate::_internal::report::violations::{
         ObjectKind, OperationKind, ReportFinding, SourceLocation, Violation, ViolationTier,
     };
@@ -210,6 +212,91 @@ mod tests {
     }
 
     #[test]
+    fn markdown_sql_blocks_render_controls_inertly() {
+        let mut violation = make_violation("test-rule", ViolationTier::Tier2, "review");
+        violation.sql = Some("SELECT '\x1b[2J';\n\tSELECT 1;".to_string());
+        let finding = ReportFinding {
+            violation,
+            location: None,
+            statement_index: None,
+        };
+
+        let markdown = Reporter::markdown_report(&[finding], &Confidence::Exact);
+        assert!(!markdown.contains('\x1b'));
+        assert!(markdown.contains("SELECT '\\u{1b}[2J';\n\tSELECT 1;"));
+    }
+
+    #[test]
+    fn markdown_inline_values_cannot_create_report_structure() {
+        let finding = ReportFinding {
+            location: Some(SourceLocation {
+                file: "migrations/001.sql\n## forged".to_string(),
+                line: 1,
+                column: 1,
+            }),
+            statement_index: Some(1),
+            violation: Violation {
+                source_range: None,
+                rule_id: "test-rule",
+                operation_kind: OperationKind::Other("test".to_string()),
+                object_kind: ObjectKind::Table,
+                object_name: "entry\n## forged <details>".to_string(),
+                tier: ViolationTier::Tier2,
+                reason: "review\r\n## forged".to_string(),
+                recipe: "escape | inline <markup>",
+                dedup_key: None,
+                sql: None,
+                fk_dependency_related: false,
+            },
+        };
+
+        let markdown = Reporter::markdown_report(&[finding], &Confidence::Exact);
+        assert!(!markdown.contains("\n## forged"));
+        assert!(markdown.contains("entry ## forged \\<details\\>"));
+        assert!(markdown.contains("escape \\| inline \\<markup\\>"));
+    }
+
+    #[test]
+    fn markdown_inline_values_render_controls_inertly() {
+        let finding = ReportFinding {
+            location: Some(SourceLocation {
+                file: "migrations/\x1b[2J.sql".to_string(),
+                line: 1,
+                column: 1,
+            }),
+            statement_index: None,
+            violation: Violation {
+                source_range: None,
+                rule_id: "test-rule",
+                operation_kind: OperationKind::Other("test".to_string()),
+                object_kind: ObjectKind::Table,
+                object_name: "entry\x1b[2J".to_string(),
+                tier: ViolationTier::Tier2,
+                reason: "review\x1b[2J".to_string(),
+                recipe: "review",
+                dedup_key: None,
+                sql: None,
+                fk_dependency_related: false,
+            },
+        };
+
+        let markdown = Reporter::markdown_report(&[finding], &Confidence::Exact);
+        assert!(!markdown.contains('\x1b'));
+        assert!(markdown.contains("entry\\\\u{1b}[2J"));
+        assert!(markdown.contains("migrations/\\u{1b}[2J.sql"));
+    }
+
+    #[test]
+    fn terminal_values_render_control_characters_inertly() {
+        assert_eq!(terminal_inline("name\n\u{1b}[31m"), "name\\n\\u{1b}[31m");
+        assert_eq!(terminal_inline("café_日本"), "café_日本");
+        assert_eq!(
+            terminal_block("SELECT\n'\u{1b}[31m';"),
+            "SELECT\n'\\u{1b}[31m';"
+        );
+    }
+
+    #[test]
     fn test_verdict_halt_tier1() {
         let violations = vec![make_violation("test-rule", ViolationTier::Tier1, "halt")];
         assert_eq!(compute_verdict(&violations), Verdict::Halt);
@@ -283,18 +370,10 @@ mod tests {
 
     #[test]
     fn test_no_color_toggling() {
-        unsafe {
-            std::env::set_var("NO_COLOR", "1");
-        }
-        let tier1_colored =
-            crate::_internal::report::reporter::tier_label_colored(&ViolationTier::Tier1);
-        assert_eq!(tier1_colored, "HALT");
+        let tier1_plain = tier_label_with_color(&ViolationTier::Tier1, false);
+        assert_eq!(tier1_plain, "HALT");
 
-        unsafe {
-            std::env::remove_var("NO_COLOR");
-        }
-        let tier1_colored_style =
-            crate::_internal::report::reporter::tier_label_colored(&ViolationTier::Tier1);
+        let tier1_colored_style = tier_label_with_color(&ViolationTier::Tier1, true);
         assert!(tier1_colored_style.contains("HALT"));
         assert!(tier1_colored_style.contains("\x1b["));
     }

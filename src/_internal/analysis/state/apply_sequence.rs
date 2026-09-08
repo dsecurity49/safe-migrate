@@ -291,6 +291,7 @@ impl AnalysisState {
                 } else {
                     SequenceKind::Standalone
                 },
+                parameters: Default::default(),
                 generation,
             }),
         );

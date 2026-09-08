@@ -155,6 +155,10 @@ disabled = true
 Unknown settings and rule IDs are rejected. `safe-migrate rules --json` lists
 the configuration supported by each rule.
 
+Without a synchronized baseline, the built-in version fallback is deliberately
+conservative. Set `assume_pg_version` only when the target is known to be
+PostgreSQL 14–18; for example, `assume_pg_version = 170000`.
+
 Suppress a reviewed finding with its primary rule ID:
 
 ```sql
@@ -206,6 +210,10 @@ typed immutable findings, verdicts, evidence, baseline inspection, rule
 metadata, and synchronization. Mutable parser, cache, and state-machine
 internals are not public. Full API documentation is on
 [docs.rs](https://docs.rs/safe-migrate).
+
+Embedded applications can call `sync_with_secrets` with a validated
+`DatabaseUrl` and optional `CacheKey`. This avoids changing process-wide
+environment variables; the CLI continues to read secrets from its environment.
 
 ## Contributing
 

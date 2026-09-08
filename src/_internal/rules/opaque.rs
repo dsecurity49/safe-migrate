@@ -2,7 +2,7 @@ use crate::_internal::analysis::mutations::Mutation;
 use crate::_internal::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
 use crate::_internal::rules::{Rule, RuleContext};
 
-pub struct OpaqueDynamicSqlRule;
+pub(crate) struct OpaqueDynamicSqlRule;
 
 impl Rule for OpaqueDynamicSqlRule {
     fn id(&self) -> &'static str {

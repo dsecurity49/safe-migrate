@@ -8,6 +8,22 @@ use std::path::{Path, PathBuf};
 
 const EXIT_BLOCKING_FINDINGS: i32 = 2;
 
+fn terminal_inline(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    for character in value.chars() {
+        if character.is_control() {
+            output.extend(character.escape_default());
+        } else {
+            output.push(character);
+        }
+    }
+    output
+}
+
+fn display_path(path: &Path) -> String {
+    terminal_inline(&path.display().to_string())
+}
+
 mod cli_init;
 use cli_init::InitCommands;
 
@@ -170,9 +186,17 @@ impl OutputMode {
     }
 }
 
-fn main() -> Result<()> {
+fn main() {
+    if let Err(error) = run() {
+        eprintln!("error: {}", terminal_inline(&format!("{error:#}")));
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<()> {
     let cli = Cli::parse();
     if cli.no_color {
+        // CLI parsing happens before safe-migrate creates any worker threads.
         unsafe {
             std::env::set_var("NO_COLOR", "1");
         }
@@ -342,7 +366,7 @@ fn run_lint(
         auto_sync,
     } = prepare_cache(&config, cache, no_cache, no_auto_sync)?;
 
-    eprintln!("Analyzing migration: {}", file.display());
+    eprintln!("Analyzing migration: {}", display_path(file));
 
     let outcome = api::analyze(&config, file.display().to_string(), sql, &baseline)
         .map_err(anyhow::Error::new)?;
@@ -375,7 +399,7 @@ fn run_lint_chain(
     files.sort_by_key(|entry| entry.file_name());
 
     if files.is_empty() {
-        anyhow::bail!("No .sql migration files found in {}", dir.display());
+        anyhow::bail!("No .sql migration files found in {}", display_path(dir));
     }
 
     let mut migrations = Vec::new();
@@ -393,7 +417,7 @@ fn run_lint_chain(
         auto_sync,
     } = prepare_cache(&config, cache, no_cache, no_auto_sync)?;
 
-    eprintln!("Analyzing migration chain in: {}", dir.display());
+    eprintln!("Analyzing migration chain in: {}", display_path(dir));
 
     let outcome = api::analyze_chain(
         &config,
@@ -413,10 +437,16 @@ fn run_sync(out: &Path, config_path: Option<&Path>, schemas: Option<&[String]>) 
 
     println!("Syncing PostgreSQL schema metadata and statistics...");
     if let Some(schemas) = effective_schemas {
-        println!("Filtering to schemas: {}", schemas.join(", "));
+        println!(
+            "Filtering to schemas: {}",
+            terminal_inline(&schemas.join(", "))
+        );
     }
     api::sync(out, &config, schemas).map_err(anyhow::Error::new)?;
-    println!("[ SAFE ] Cache successfully written to {}", out.display());
+    println!(
+        "[ SAFE ] Cache successfully written to {}",
+        display_path(out)
+    );
     Ok(())
 }
 
@@ -434,7 +464,7 @@ fn run_cache_inspect(cache_path: &Path, config_path: Option<&Path>, json: bool) 
     Ok(())
 }
 fn print_cache_inspection(cache_path: &Path, inspection: &BaselineInspection) {
-    println!("Cache: {}", cache_path.display());
+    println!("Cache: {}", display_path(cache_path));
     println!(
         "Format version: {}",
         inspection
@@ -464,16 +494,14 @@ fn print_cache_inspection(cache_path: &Path, inspection: &BaselineInspection) {
     );
     println!(
         "Source database: {}",
-        inspection.source_database.as_deref().unwrap_or("unknown")
+        terminal_inline(inspection.source_database.as_deref().unwrap_or("unknown"))
     );
-    println!(
-        "Schema scope: {}",
-        inspection
-            .schemas
-            .as_deref()
-            .map(|schemas| schemas.join(", "))
-            .unwrap_or_else(|| "all non-system schemas".to_string())
-    );
+    let schema_scope = inspection
+        .schemas
+        .as_deref()
+        .map(|schemas| schemas.join(", "))
+        .unwrap_or_else(|| "all non-system schemas".to_string());
+    println!("Schema scope: {}", terminal_inline(&schema_scope));
     println!(
         "Catalog coverage: {}",
         inspection
@@ -484,7 +512,10 @@ fn print_cache_inspection(cache_path: &Path, inspection: &BaselineInspection) {
             .collect::<Vec<_>>()
             .join(", ")
     );
-    println!("Search path: {}", inspection.search_path.join(", "));
+    println!(
+        "Search path: {}",
+        terminal_inline(&inspection.search_path.join(", "))
+    );
     println!(
         "PostgreSQL version: {}",
         inspection
@@ -622,7 +653,7 @@ fn maybe_auto_sync(
 
     eprintln!(
         "[ INFO ] Automatic cache sync enabled. Refreshing {}.",
-        cache.display()
+        display_path(cache)
     );
     match api::sync(cache, config, None) {
         Ok(()) => AutoSyncStatus::Refreshed,
@@ -667,4 +698,17 @@ fn finish_analysis(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{display_path, terminal_inline};
+    use std::path::Path;
+
+    #[test]
+    fn terminal_values_render_controls_inertly() {
+        assert_eq!(terminal_inline("cache\x1b[2J\r\n"), "cache\\u{1b}[2J\\r\\n");
+        assert_eq!(terminal_inline("café_日本"), "café_日本");
+        assert_eq!(display_path(Path::new("cache\x1b[2J")), "cache\\u{1b}[2J");
+    }
 }

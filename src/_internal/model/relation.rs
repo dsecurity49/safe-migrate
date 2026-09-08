@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum Privilege {
+pub(crate) enum Privilege {
     Select,
     Insert,
     Update,
@@ -21,7 +21,7 @@ pub enum Privilege {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct PrivilegeMatrix {
+pub(crate) struct PrivilegeMatrix {
     /// Maps role identity to the set of privileges they possess on this relation
     pub grants: HashMap<ObjectId, HashSet<Privilege>>,
     /// Maps role identity to privileges that role may re-grant. This is kept
@@ -39,11 +39,11 @@ pub struct PrivilegeMatrix {
 }
 
 impl PrivilegeMatrix {
-    pub fn grant(&mut self, role: ObjectId, privileges: HashSet<Privilege>) {
+    pub(crate) fn grant(&mut self, role: ObjectId, privileges: HashSet<Privilege>) {
         self.grants.entry(role).or_default().extend(privileges);
     }
 
-    pub fn grant_with_option(&mut self, role: ObjectId, privileges: HashSet<Privilege>) {
+    pub(crate) fn grant_with_option(&mut self, role: ObjectId, privileges: HashSet<Privilege>) {
         self.grant(role.clone(), privileges.clone());
         self.grant_options
             .entry(role)
@@ -51,7 +51,7 @@ impl PrivilegeMatrix {
             .extend(privileges);
     }
 
-    pub fn grant_from(
+    pub(crate) fn grant_from(
         &mut self,
         role: ObjectId,
         privileges: HashSet<Privilege>,
@@ -79,7 +79,7 @@ impl PrivilegeMatrix {
         }
     }
 
-    pub fn revoke(&mut self, role: &ObjectId, privileges: &HashSet<Privilege>) {
+    pub(crate) fn revoke(&mut self, role: &ObjectId, privileges: &HashSet<Privilege>) {
         if let Some(owned) = self.grants.get_mut(role) {
             if privileges.contains(&Privilege::All) {
                 owned.clear();
@@ -96,14 +96,14 @@ impl PrivilegeMatrix {
         self.remove_grant_provenance(role, privileges, None);
     }
 
-    pub fn has_privilege(&self, role: &ObjectId, privilege: Privilege) -> bool {
+    pub(crate) fn has_privilege(&self, role: &ObjectId, privilege: Privilege) -> bool {
         self.grants.get(role).is_some_and(|set| {
             set.contains(&privilege)
                 || (privilege != Privilege::All && set.contains(&Privilege::All))
         })
     }
 
-    pub fn has_grant_option(&self, role: &ObjectId, privilege: Privilege) -> bool {
+    pub(crate) fn has_grant_option(&self, role: &ObjectId, privilege: Privilege) -> bool {
         self.grant_options.get(role).is_some_and(|set| {
             set.contains(&privilege)
                 || (privilege != Privilege::All && set.contains(&Privilege::All))
@@ -114,12 +114,12 @@ impl PrivilegeMatrix {
     /// authorization input.  Role inheritance is resolved by the analysis
     /// state, because the relation matrix intentionally stores only direct
     /// ACL entries.
-    pub fn has_direct_privilege(&self, role: &ObjectId, privilege: Privilege) -> bool {
+    pub(crate) fn has_direct_privilege(&self, role: &ObjectId, privilege: Privilege) -> bool {
         self.has_privilege(role, privilege)
             || self.has_privilege(&ObjectId::new("", "public"), privilege)
     }
 
-    pub fn has_direct_grant_option(&self, role: &ObjectId, privilege: Privilege) -> bool {
+    pub(crate) fn has_direct_grant_option(&self, role: &ObjectId, privilege: Privilege) -> bool {
         self.has_grant_option(role, privilege)
             || self.has_grant_option(&ObjectId::new("", "public"), privilege)
     }
@@ -128,7 +128,7 @@ impl PrivilegeMatrix {
     /// the requested privilege(s). A missing entry is meaningful only for a
     /// privilege that is actually present; absent privileges need no
     /// provenance to revoke.
-    pub fn targeted_revoke_provenance_is_known(
+    pub(crate) fn targeted_revoke_provenance_is_known(
         &self,
         role: &ObjectId,
         privileges: &HashSet<Privilege>,
@@ -149,7 +149,7 @@ impl PrivilegeMatrix {
     /// Equivalent provenance check for `REVOKE ... GRANT OPTION FOR`, which
     /// changes only the grant-option map and therefore uses its separate
     /// source index.
-    pub fn targeted_grant_option_revoke_provenance_is_known(
+    pub(crate) fn targeted_grant_option_revoke_provenance_is_known(
         &self,
         role: &ObjectId,
         privileges: &HashSet<Privilege>,
@@ -170,7 +170,7 @@ impl PrivilegeMatrix {
         })
     }
 
-    pub fn revoke_grant_option(&mut self, role: &ObjectId, privileges: &HashSet<Privilege>) {
+    pub(crate) fn revoke_grant_option(&mut self, role: &ObjectId, privileges: &HashSet<Privilege>) {
         if let Some(options) = self.grant_options.get_mut(role) {
             if privileges.contains(&Privilege::All) {
                 options.clear();
@@ -199,7 +199,7 @@ impl PrivilegeMatrix {
 
     /// Remove provenance for a revoke.  `grantor = Some(x)` limits the
     /// operation to grants made by x; `None` removes all known sources.
-    pub fn remove_grant_provenance(
+    pub(crate) fn remove_grant_provenance(
         &mut self,
         role: &ObjectId,
         privileges: &HashSet<Privilege>,
@@ -249,7 +249,7 @@ impl PrivilegeMatrix {
         }
     }
 
-    pub fn expand_privileges(
+    pub(crate) fn expand_privileges(
         &self,
         role: &ObjectId,
         privileges: &HashSet<Privilege>,
@@ -267,7 +267,7 @@ impl PrivilegeMatrix {
         }
     }
 
-    pub fn revoke_from(
+    pub(crate) fn revoke_from(
         &mut self,
         role: &ObjectId,
         privileges: &HashSet<Privilege>,
@@ -317,7 +317,7 @@ impl PrivilegeMatrix {
 
     /// Revoke a grant and, when requested, recursively remove grants whose
     /// grantor lost its last known grant option for the same privilege.
-    pub fn revoke_from_cascade(
+    pub(crate) fn revoke_from_cascade(
         &mut self,
         role: &ObjectId,
         privileges: &HashSet<Privilege>,
@@ -357,7 +357,7 @@ impl PrivilegeMatrix {
         }
     }
 
-    pub fn revoke_grant_option_from(
+    pub(crate) fn revoke_grant_option_from(
         &mut self,
         role: &ObjectId,
         privileges: &HashSet<Privilege>,
@@ -402,21 +402,97 @@ impl PrivilegeMatrix {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum RelationKind {
+pub(crate) enum RelationKind {
     Table,
     View,
     MaterializedView,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Persistence {
+pub(crate) enum Persistence {
     Permanent,
     Temporary,
     Unlogged,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum OnCommitAction {
+    PreserveRows,
+    DeleteRows,
+    Drop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum RuleEnableMode {
+    Origin,
+    Disabled,
+    Replica,
+    Always,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum IdentityGeneration {
+    Always,
+    ByDefault,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum GeneratedColumnKind {
+    Stored,
+    Virtual,
+}
+
+impl GeneratedColumnKind {
+    pub(crate) fn from_pg_code(code: char) -> Option<Self> {
+        match code {
+            's' => Some(Self::Stored),
+            'v' => Some(Self::Virtual),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct GeneratedColumnState {
+    pub kind: GeneratedColumnKind,
+    /// Canonical catalog text when synchronized; local AST dependencies remain
+    /// authoritative for mutations in the current analysis chain.
+    pub expression: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ExtendedStatisticsState {
+    pub id: ObjectId,
+    pub kinds: Vec<String>,
+    pub columns: Vec<String>,
+    pub expressions: Option<String>,
+    pub target: Option<i32>,
+}
+
+impl IdentityGeneration {
+    pub(crate) fn from_pg_code(code: char) -> Option<Self> {
+        match code {
+            'a' => Some(Self::Always),
+            'd' => Some(Self::ByDefault),
+            _ => None,
+        }
+    }
+}
+
+impl RuleEnableMode {
+    pub(crate) fn from_pg_code(code: char) -> Option<Self> {
+        match code {
+            'O' => Some(Self::Origin),
+            'D' => Some(Self::Disabled),
+            'R' => Some(Self::Replica),
+            'A' => Some(Self::Always),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RelationState {
+pub(crate) struct RelationState {
     pub id: ObjectId,
     pub owner: ObjectId,
     pub columns: Vec<Column>,
@@ -425,8 +501,19 @@ pub struct RelationState {
     pub relpages: Option<u64>,
     pub kind: RelationKind,
     pub persistence: Persistence,
+    /// Present only for locally-created temporary relations.
+    #[serde(default)]
+    pub on_commit: Option<OnCommitAction>,
     pub triggers: HashSet<String>,
     pub policies: HashSet<String>,
+    #[serde(default)]
+    pub rules: std::collections::HashMap<String, RuleEnableMode>,
+    #[serde(default)]
+    pub identity_columns: std::collections::HashMap<String, IdentityGeneration>,
+    #[serde(default)]
+    pub generated_columns: std::collections::HashMap<String, GeneratedColumnState>,
+    #[serde(default)]
+    pub extended_statistics: std::collections::HashMap<ObjectId, ExtendedStatisticsState>,
     pub last_analyze: Option<String>,
     pub last_autoanalyze: Option<String>,
     /// Transaction depth at creation, used for same-transaction index checks.
@@ -439,6 +526,25 @@ pub struct RelationState {
     /// catalog did not provide this relation-specific fact; it is ignored for
     /// tables and ordinary views and treated conservatively for refreshes.
     pub is_populated: Option<bool>,
+    /// Physical/catalog attributes are optional for caches produced before
+    /// this metadata was synchronized.
+    #[serde(default)]
+    pub tablespace: Option<String>,
+    #[serde(default)]
+    pub access_method: Option<String>,
+    #[serde(default)]
+    pub cluster_index: Option<String>,
+    #[serde(default)]
+    pub row_security: Option<bool>,
+    #[serde(default)]
+    pub force_row_security: Option<bool>,
+    #[serde(default)]
+    pub replica_identity: Option<String>,
+    #[serde(default)]
+    pub table_options: std::collections::BTreeMap<String, String>,
+    /// Composite row type selected by `CREATE TABLE ... OF`.
+    #[serde(default)]
+    pub of_type: Option<ObjectId>,
 }
 
 impl Default for RelationState {
@@ -452,8 +558,13 @@ impl Default for RelationState {
             relpages: None,
             kind: RelationKind::Table,
             persistence: Persistence::Permanent,
+            on_commit: None,
             triggers: HashSet::new(),
             policies: HashSet::new(),
+            rules: Default::default(),
+            identity_columns: Default::default(),
+            generated_columns: Default::default(),
+            extended_statistics: Default::default(),
             last_analyze: None,
             last_autoanalyze: None,
             created_at_tx_depth: 0,
@@ -462,12 +573,20 @@ impl Default for RelationState {
             partition_by: None,
             is_fk_dependency: false,
             is_populated: None,
+            tablespace: None,
+            access_method: None,
+            cluster_index: None,
+            row_security: None,
+            force_row_security: None,
+            replica_identity: None,
+            table_options: Default::default(),
+            of_type: None,
         }
     }
 }
 
 impl RelationState {
-    pub fn new(
+    pub(crate) fn new(
         id: ObjectId,
         owner: ObjectId,
         generation: u64,
@@ -485,8 +604,13 @@ impl RelationState {
             relpages: None,
             kind,
             persistence,
+            on_commit: None,
             triggers: HashSet::new(),
             policies: HashSet::new(),
+            rules: Default::default(),
+            identity_columns: Default::default(),
+            generated_columns: Default::default(),
+            extended_statistics: Default::default(),
             last_analyze: None,
             last_autoanalyze: None,
             created_at_tx_depth,
@@ -495,14 +619,22 @@ impl RelationState {
             partition_by: None,
             is_fk_dependency: false,
             is_populated: None,
+            tablespace: None,
+            access_method: None,
+            cluster_index: None,
+            row_security: None,
+            force_row_security: None,
+            replica_identity: None,
+            table_options: Default::default(),
+            of_type: None,
         }
     }
 
-    pub fn mark_fk_dependency(&mut self) {
+    pub(crate) fn mark_fk_dependency(&mut self) {
         self.is_fk_dependency = true;
     }
 
-    pub fn apply_column_action(&mut self, action: &ColumnAction) {
+    pub(crate) fn apply_column_action(&mut self, action: &ColumnAction) {
         match action {
             ColumnAction::Add {
                 name,
@@ -536,28 +668,44 @@ impl RelationState {
                     } else {
                         default.clone()
                     };
-                    self.columns.push(Column {
-                        name: name.clone(),
-                        data_type: serial_type
+                    self.columns.push(Column::migration_created(
+                        name.clone(),
+                        serial_type
                             .map(str::to_string)
                             .or_else(|| data_type.clone()),
-                        type_id: None,
-                        default: normalized_default,
-                        is_nullable: !(*not_null || is_serial),
-                        avg_width: None,
-                        default_expr_text: None,
-                        type_modifier: None,
-                    });
+                        !(*not_null || is_serial),
+                        normalized_default,
+                    ));
                 }
             }
             ColumnAction::Drop { name } => {
                 self.columns.retain(|c| c.name != *name);
+                self.identity_columns.remove(name);
+                self.generated_columns.remove(name);
             }
             ColumnAction::Rename { from, to } => {
                 if let Some(pos) = self.columns.iter().position(|c| c.name == *from)
                     && !self.columns.iter().any(|c| c.name == *to)
                 {
                     self.columns[pos].name = to.clone();
+                    if let Some(generation) = self.identity_columns.remove(from) {
+                        self.identity_columns.insert(to.clone(), generation);
+                    }
+                    if let Some(generated) = self.generated_columns.remove(from) {
+                        self.generated_columns.insert(to.clone(), generated);
+                    }
+                    for statistics in self.extended_statistics.values_mut() {
+                        let mut renamed = false;
+                        for column in &mut statistics.columns {
+                            if column == from {
+                                *column = to.clone();
+                                renamed = true;
+                            }
+                        }
+                        if renamed {
+                            statistics.expressions = None;
+                        }
+                    }
                 }
             }
             ColumnAction::SetNotNull { name } => {
@@ -596,18 +744,45 @@ impl RelationState {
                     col.default_expr_text = None;
                 }
             }
+            ColumnAction::SetStorage { name, mode } => {
+                if let Some(col) = self.columns.iter_mut().find(|c| c.name == *name) {
+                    col.storage = Some(mode.clone());
+                }
+            }
+            ColumnAction::SetCompression { name, method } => {
+                if let Some(col) = self.columns.iter_mut().find(|c| c.name == *name) {
+                    col.compression = method.clone();
+                }
+            }
+            ColumnAction::SetStatistics { name, target } => {
+                if let Some(col) = self.columns.iter_mut().find(|c| c.name == *name) {
+                    col.statistics_target = Some(*target);
+                }
+            }
+            ColumnAction::SetOptions { name, options } => {
+                if let Some(col) = self.columns.iter_mut().find(|c| c.name == *name) {
+                    col.options.extend(options.clone());
+                }
+            }
+            ColumnAction::ResetOptions { name, names } => {
+                if let Some(col) = self.columns.iter_mut().find(|c| c.name == *name) {
+                    for option in names {
+                        col.options.remove(option);
+                    }
+                }
+            }
         }
     }
 
-    pub fn has_column(&self, name: &str) -> bool {
+    pub(crate) fn has_column(&self, name: &str) -> bool {
         self.columns.iter().any(|c| c.name == name)
     }
 
-    pub fn get_column(&self, name: &str) -> Option<&Column> {
+    pub(crate) fn get_column(&self, name: &str) -> Option<&Column> {
         self.columns.iter().find(|c| c.name == name)
     }
 
-    pub fn is_stale(&self) -> bool {
+    pub(crate) fn is_stale(&self) -> bool {
         self.last_analyze.is_none() && self.last_autoanalyze.is_none()
     }
 }
@@ -637,6 +812,11 @@ mod tests {
             avg_width: Some(32),
             default_expr_text: None,
             type_modifier: Some(259),
+            storage: None,
+            compression: None,
+            statistics_target: None,
+            options: Default::default(),
+            generated: None,
         });
 
         relation.apply_column_action(&ColumnAction::SetType {
@@ -713,7 +893,7 @@ mod tests {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum ColumnAction {
+pub(crate) enum ColumnAction {
     Add {
         name: String,
         data_type: Option<String>,
@@ -741,11 +921,31 @@ pub enum ColumnAction {
         name: String,
         default: Option<crate::_internal::analysis::expr_ir::ExprIr>,
     },
+    SetStorage {
+        name: String,
+        mode: String,
+    },
+    SetCompression {
+        name: String,
+        method: Option<String>,
+    },
+    SetStatistics {
+        name: String,
+        target: i32,
+    },
+    SetOptions {
+        name: String,
+        options: std::collections::BTreeMap<String, String>,
+    },
+    ResetOptions {
+        name: String,
+        names: Vec<String>,
+    },
 }
 
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
-pub enum RelationOverlay {
+pub(crate) enum RelationOverlay {
     Present(RelationState),
     Dropped,
 }

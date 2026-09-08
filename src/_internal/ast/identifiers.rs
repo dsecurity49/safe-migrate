@@ -1,13 +1,13 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct Ident {
+pub(crate) struct Ident {
     pub text: String,
     pub quoted: bool,
 }
 
 impl Ident {
-    pub fn new(text: impl Into<String>, quoted: bool) -> Self {
+    pub(crate) fn new(text: impl Into<String>, quoted: bool) -> Self {
         Self {
             text: text.into(),
             quoted,
@@ -18,7 +18,7 @@ impl Ident {
     /// identifiers preserve case, unquoted identifiers are folded, and both are
     /// clipped to PostgreSQL's default `NAMEDATALEN - 1` byte limit without
     /// splitting a UTF-8 code point.
-    pub fn resolve(&self) -> String {
+    pub(crate) fn resolve(&self) -> String {
         let resolved = if self.quoted {
             self.text.clone()
         } else {
@@ -39,13 +39,13 @@ fn truncate_postgres_identifier(value: &str) -> &str {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct QualifiedName {
+pub(crate) struct QualifiedName {
     pub schema: Option<Ident>,
     pub name: Ident,
 }
 
 impl QualifiedName {
-    pub fn new(schema: Option<Ident>, name: Ident) -> Self {
+    pub(crate) fn new(schema: Option<Ident>, name: Ident) -> Self {
         Self { schema, name }
     }
 }
@@ -75,7 +75,7 @@ mod tests {
 /// ObjectId represents a fully resolved, state-machine tracked database object.
 /// Its schema and name must already use their resolved lookup spelling.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ObjectId {
+pub(crate) struct ObjectId {
     pub schema: String,
     pub name: String,
     pub inferred_schema: bool,
@@ -97,7 +97,7 @@ impl std::hash::Hash for ObjectId {
 }
 
 impl ObjectId {
-    pub fn new(schema: impl Into<String>, name: impl Into<String>) -> Self {
+    pub(crate) fn new(schema: impl Into<String>, name: impl Into<String>) -> Self {
         Self {
             schema: schema.into(),
             name: name.into(),

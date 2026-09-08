@@ -62,6 +62,7 @@ fn cache_v5_hydrates_schema_sequence_and_ownership_edge() {
             owner: object_id("", "owner"),
             owned_by: Some((table_id.clone(), "id".into())),
             kind: SequenceKind::SerialLike,
+            parameters: Default::default(),
             generation: 0,
         },
     );
@@ -157,6 +158,7 @@ fn schema_rename_remaps_namespace_and_rolls_back_atomically() {
             owner,
             owned_by: Some((table.clone(), "id".into())),
             kind: SequenceKind::Owned,
+            parameters: Default::default(),
             generation: 0,
         },
     );
@@ -306,6 +308,7 @@ fn table_set_schema_moves_the_relation_and_preserves_baseline_origin() {
             owner: object_id("", "owner"),
             owned_by: Some((old_id.clone(), "id".into())),
             kind: SequenceKind::SerialLike,
+            parameters: Default::default(),
             generation: 0,
         },
     );
@@ -321,6 +324,7 @@ fn table_set_schema_moves_the_relation_and_preserves_baseline_origin() {
         has_expression_keys: false,
         has_predicate: false,
         is_unique: false,
+        is_immediate: true,
         is_valid: true,
         is_ready: true,
         is_live: true,

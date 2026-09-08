@@ -5,7 +5,7 @@ use crate::_internal::rules::{
     FUNCTION_CAPABILITIES, FUNCTION_DEPENDENCY_CAPABILITIES, Rule, RuleCapability, RuleContext,
 };
 
-pub struct FunctionVolatilityRule;
+pub(crate) struct FunctionVolatilityRule;
 
 impl Rule for FunctionVolatilityRule {
     fn id(&self) -> &'static str {
@@ -72,7 +72,7 @@ impl Rule for FunctionVolatilityRule {
     }
 }
 
-pub struct BrokenComputeRule;
+pub(crate) struct BrokenComputeRule;
 
 impl Rule for BrokenComputeRule {
     fn id(&self) -> &'static str {

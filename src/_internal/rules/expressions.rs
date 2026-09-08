@@ -3,7 +3,7 @@ use crate::_internal::analysis::state::MutationResult;
 use crate::_internal::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
 use crate::_internal::rules::{Rule, RuleContext};
 
-pub struct VolatileDefaultRule;
+pub(crate) struct VolatileDefaultRule;
 
 impl Rule for VolatileDefaultRule {
     fn id(&self) -> &'static str {

@@ -17,8 +17,33 @@ notes are available on the
   chains. Configuration loading now rejects unsafe defaults immediately.
 - Unified API and CLI baseline status, confidence evidence, JSON, and Markdown
   behavior, and expanded independent downstream API contract coverage.
+- Added redacted, validated database and cache-key inputs so embedded callers
+  can synchronize and load encrypted baselines without mutating process-wide
+  environment variables.
+- Narrowed implementation-only visibility and made accidental unreachable
+  public items a compile-time error.
+- Wired V7 inheritance coverage into publication confidence, and expanded the
+  PostgreSQL 14–18 differential gate for altered CHECK/EXCLUDE constraints and
+  a real connected logical subscription.
+- Hardened statement rollback, future-dated and unsupported-version baselines,
+  secret-buffer cleanup, error source chains, and untrusted report rendering.
+- Reject unsupported configured PostgreSQL-version assumptions instead of
+  applying unvalidated future-server semantics.
+- Added typed state transitions for locking, truncation, table storage and
+  access settings, partition detachment, table inheritance, `SELECT INTO`,
+  temporary-table `ON COMMIT` behavior, and the supported `ALTER COLUMN`
+  metadata forms.
+- Completed table-definition lifecycles for generated and identity columns,
+  inherited CHECK constraints, `LIKE` indexes and extended statistics, and
+  partition indexes, key constraints, foreign keys, and row-trigger clones.
+- Cache V8 now validates and synchronizes CHECK definitions, extended
+  statistics, column metadata, and partition-trigger parentage. Simple
+  single-source `SELECT INTO` projections retain exact column state.
+- Preserve qualified index identity for `CLUSTER ON` and `REPLICA IDENTITY
+  USING INDEX`. Replica identity now verifies ownership and PostgreSQL index
+  eligibility from synchronized catalog evidence.
 
-## v0.8.1 — Unreleased
+## v0.8.1 — 2026-09-06
 
 - Upgraded Squawk's parser, lexer, syntax tree, and linter to 2.64.0, including
   its stricter routine validation and more precise type and transaction nodes.

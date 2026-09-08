@@ -4,7 +4,7 @@ use crate::_internal::model::relation::Persistence;
 use crate::_internal::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
 use crate::_internal::rules::{BASELINE_STATS_CAPABILITIES, Rule, RuleCapability, RuleContext};
 
-pub struct PartitionLockRule;
+pub(crate) struct PartitionLockRule;
 
 impl Rule for PartitionLockRule {
     fn id(&self) -> &'static str {
@@ -139,7 +139,7 @@ impl Rule for PartitionLockRule {
     }
 }
 
-pub struct PartitionStrategyMismatchRule;
+pub(crate) struct PartitionStrategyMismatchRule;
 
 impl Rule for PartitionStrategyMismatchRule {
     fn id(&self) -> &'static str {

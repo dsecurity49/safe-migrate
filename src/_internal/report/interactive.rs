@@ -1,4 +1,5 @@
 use crate::_internal::analysis::state::Confidence;
+use crate::_internal::report::reporter::{terminal_block, terminal_inline};
 use crate::_internal::report::violations::Violation;
 use anyhow::Result;
 use crossterm::{
@@ -39,7 +40,7 @@ fn require_interactive_terminal(stdin_is_terminal: bool, stdout_is_terminal: boo
     Ok(())
 }
 
-pub fn run_interactive(violations: &[Violation], confidence: &Confidence) -> Result<()> {
+pub(crate) fn run_interactive(violations: &[Violation], confidence: &Confidence) -> Result<()> {
     if violations.is_empty() {
         println!("No violations found!");
         return Ok(());
@@ -99,7 +100,11 @@ pub fn run_interactive(violations: &[Violation], confidence: &Confidence) -> Res
                 SetForegroundColor(color),
                 Print(format!("[{:?}] ", v.tier)),
                 ResetColor,
-                Print(format!("{} (rule: {})\r\n", v.operation_kind, v.rule_id))
+                Print(format!(
+                    "{} (rule: {})\r\n",
+                    terminal_inline(&v.operation_kind.to_string()),
+                    terminal_inline(v.rule_id)
+                ))
             )?;
         }
 
@@ -118,11 +123,11 @@ pub fn run_interactive(violations: &[Violation], confidence: &Confidence) -> Res
             SetForegroundColor(Color::White),
             Print("Reason: "),
             ResetColor,
-            Print(format!("{}\r\n", active.reason)),
+            Print(format!("{}\r\n", terminal_inline(&active.reason))),
             SetForegroundColor(Color::White),
             Print("Recipe: "),
             ResetColor,
-            Print(format!("{}\r\n", active.recipe)),
+            Print(format!("{}\r\n", terminal_inline(active.recipe))),
         )?;
 
         if let Some(sql) = &active.sql {
@@ -140,7 +145,10 @@ pub fn run_interactive(violations: &[Violation], confidence: &Confidence) -> Res
                 Print("\r\nSQL Context:\r\n"),
                 SetForegroundColor(Color::DarkGrey),
                 // Raw terminal output uses CRLF line endings.
-                Print(format!("{}\r\n", sql_lines.join("\r\n"))),
+                Print(format!(
+                    "{}\r\n",
+                    terminal_block(&sql_lines.join("\n")).replace('\n', "\r\n")
+                )),
             )?;
 
             if truncated {

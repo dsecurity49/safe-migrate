@@ -17,7 +17,17 @@ impl Resolver {
                 variants: variants.clone(),
             },
             TypeCreationKind::Range => TypeKind::Range,
-            TypeCreationKind::Composite => TypeKind::Composite,
+            TypeCreationKind::Composite { fields } => TypeKind::Composite {
+                fields: fields
+                    .iter()
+                    .map(
+                        |field| crate::_internal::model::types::CompositeFieldState {
+                            name: field.name.clone(),
+                            data_type: field.data_type.clone(),
+                        },
+                    )
+                    .collect(),
+            },
             TypeCreationKind::Base => TypeKind::Base,
         };
         Mutation::CreateType(CreateTypeMutation {

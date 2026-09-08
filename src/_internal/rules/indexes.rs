@@ -6,7 +6,7 @@ use crate::_internal::rules::{
     BASELINE_STATS_DEPENDENCY_CAPABILITIES, Rule, RuleCapability, RuleContext,
 };
 
-pub struct ConcurrentIndexRule;
+pub(crate) struct ConcurrentIndexRule;
 
 impl Rule for ConcurrentIndexRule {
     fn id(&self) -> &'static str {
@@ -26,7 +26,7 @@ impl Rule for ConcurrentIndexRule {
     fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
         if *context.result() == MutationResult::Skipped {
             // An index that is present in the pre-state still incurs the
-            // synchronous DROP INDEX risk even when V6 metadata is too
+            // synchronous DROP INDEX risk even when catalog metadata is too
             // incomplete to mutate it exactly (for example, eligibility for
             // a backing constraint is not serialized).  A truly absent,
             // guarded drop remains a no-op and is correctly suppressed.

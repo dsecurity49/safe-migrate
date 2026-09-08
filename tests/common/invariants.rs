@@ -12,7 +12,7 @@ use safe_migrate::_internal::model::trigger::TriggerOverlay;
 use safe_migrate::_internal::model::types::TypeOverlay;
 use std::collections::HashSet;
 
-pub fn assert_cache_invariants(cache: &DbCache) {
+pub(crate) fn assert_cache_invariants(cache: &DbCache) {
     for (id, relation) in &cache.relations {
         assert_eq!(
             id, &relation.id,
@@ -94,7 +94,7 @@ pub fn assert_cache_invariants(cache: &DbCache) {
     }
 }
 
-pub fn assert_state_invariants(state: &AnalysisState) {
+pub(crate) fn assert_state_invariants(state: &AnalysisState) {
     let local = &state.local;
     assert!(
         local.graph.indexes_are_valid(),
@@ -238,11 +238,19 @@ pub fn assert_state_invariants(state: &AnalysisState) {
                     .contains_key(&(edge.dependent.clone(), constraint_name.clone())),
                 "constraint key edge must have a matching constraint"
             ),
+            DependencyKind::ConstraintDependency {
+                constraint_name, ..
+            } => assert!(
+                local
+                    .constraints
+                    .contains_key(&(edge.dependent.clone(), constraint_name.clone())),
+                "constraint dependency edge must have a matching constraint"
+            ),
             DependencyKind::IndexOnRelation { .. }
             | DependencyKind::RenameTo
             | DependencyKind::InheritanceOf
             | DependencyKind::PartitionOf
-            | DependencyKind::ConstraintDependency { .. }
+            | DependencyKind::PartitionDetachPending
             | DependencyKind::ColumnGeneratedFrom { .. }
             | DependencyKind::ColumnDefaultOnSequence { .. }
             | DependencyKind::ForeignKey {

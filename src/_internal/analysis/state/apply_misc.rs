@@ -1,11 +1,47 @@
 use super::{AnalysisState, MutationResult};
 use crate::_internal::analysis::evidence::{EvidenceCode, EvidenceScope};
 use crate::_internal::analysis::mutations::{
-    AlterDatabaseMutation, CreateDatabaseMutation, DropDatabaseMutation,
+    AlterDatabaseMutation, CreateDatabaseMutation, DropDatabaseMutation, LockTableMutation,
+    TruncateMutation,
 };
 use crate::_internal::ast::identifiers::ObjectId;
+use crate::_internal::model::relation::RelationKind;
 
 impl AnalysisState {
+    pub(super) fn apply_lock_table(&mut self, lock: &LockTableMutation) -> MutationResult {
+        for target in &lock.targets {
+            if let Err(result) = self.ensure_relation_target(
+                &target.id,
+                |kind| *kind == RelationKind::Table,
+                format!("locked relation '{}' does not exist", target.id),
+                format!("locked relation '{}' is not a table", target.id),
+            ) {
+                return result;
+            }
+        }
+        // Locks are transaction-scoped runtime state.  Validating each target
+        // is exact; retaining them in the schema snapshot would incorrectly
+        // make a lock survive COMMIT or ROLLBACK.
+        MutationResult::Applied
+    }
+
+    pub(super) fn apply_truncate(&mut self, truncate: &TruncateMutation) -> MutationResult {
+        for target in &truncate.targets {
+            if let Err(result) = self.ensure_relation_target(
+                &target.id,
+                |kind| *kind == RelationKind::Table,
+                format!("truncated relation '{}' does not exist", target.id),
+                format!("truncated relation '{}' is not a table", target.id),
+            ) {
+                return result;
+            }
+        }
+        // Row contents and sequence counters are runtime data rather than
+        // schema catalog state.  The operation remains fully typed for rules;
+        // no invented relation or sequence metadata is written here.
+        MutationResult::Applied
+    }
+
     pub(super) fn apply_check_timeouts(&mut self) -> MutationResult {
         MutationResult::Applied
     }

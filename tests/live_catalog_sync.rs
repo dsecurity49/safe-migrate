@@ -5,10 +5,12 @@ use std::io::Read;
 use safe_migrate::_internal::analysis::facts::{
     ConnectionTarget, PublicationObjectFact, PublicationRowFilter, PublicationScope,
 };
+use safe_migrate::_internal::analysis::graph::DependencyKind;
 use safe_migrate::_internal::analysis::state::AnalysisState;
 use safe_migrate::_internal::ast::identifiers::ObjectId;
-use safe_migrate::_internal::db::cache::{CACHE_V7_MAGIC, DbCacheVersioned};
+use safe_migrate::_internal::db::cache::{CACHE_V8_MAGIC, DbCacheVersioned};
 use safe_migrate::_internal::engine::engine::SafeMigrateEngine;
+use safe_migrate::_internal::model::constraint::ConstraintKind;
 use safe_migrate::_internal::model::function::{
     FunctionOverlay, RoutineKind, SecurityMode, Volatility,
 };
@@ -16,29 +18,40 @@ use safe_migrate::_internal::model::replication::{PublicationOverlay, Subscripti
 use safe_migrate::_internal::sync::sync_cache;
 use safe_migrate::api::Config;
 
-const SCHEMA: &str = "sm_v6_catalog";
-const SECOND_SCHEMA: &str = "sm_v6_catalog_extra";
-const PUBLICATION: &str = "sm_v6_catalog_publication";
-const SCHEMA_PUBLICATION: &str = "sm_v6_schema_publication";
-const SUBSCRIPTION: &str = "sm_v6_catalog_subscription";
-const CONNECTION_SENTINEL: &str = "sm_v6_connection_secret_must_not_enter_cache";
+const SCHEMA: &str = "sm_v7_catalog";
+const SECOND_SCHEMA: &str = "sm_v7_catalog_extra";
+const PUBLICATION: &str = "sm_v7_catalog_publication";
+const SCHEMA_PUBLICATION: &str = "sm_v7_schema_publication";
+const SUBSCRIPTION: &str = "sm_v7_catalog_subscription";
+const CONNECTED_SUBSCRIPTION: &str = "sm_v7_connected_subscription";
+const CONNECTION_SENTINEL: &str = "sm_v7_connection_secret_must_not_enter_cache";
 
 fn cleanup(client: &mut postgres::Client) {
-    let subscription_exists: bool = client
-        .query_one(
-            "SELECT EXISTS (SELECT 1 FROM pg_subscription WHERE subname = $1)",
-            &[&SUBSCRIPTION],
-        )
-        .expect("check live catalog subscription")
-        .get(0);
-    if subscription_exists {
-        client
-            .batch_execute(&format!(
-                "ALTER SUBSCRIPTION {SUBSCRIPTION} DISABLE;
-                 ALTER SUBSCRIPTION {SUBSCRIPTION} SET (slot_name = NONE);
-                 DROP SUBSCRIPTION {SUBSCRIPTION};"
-            ))
-            .expect("remove live catalog subscription");
+    for subscription in [CONNECTED_SUBSCRIPTION, SUBSCRIPTION] {
+        let exists: bool = client
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM pg_subscription WHERE subname = $1)",
+                &[&subscription],
+            )
+            .expect("check live catalog subscription")
+            .get(0);
+        if exists {
+            let drop_sql = if subscription == CONNECTED_SUBSCRIPTION {
+                format!(
+                    "ALTER SUBSCRIPTION {subscription} DISABLE;
+                     DROP SUBSCRIPTION {subscription};"
+                )
+            } else {
+                format!(
+                    "ALTER SUBSCRIPTION {subscription} DISABLE;
+                     ALTER SUBSCRIPTION {subscription} SET (slot_name = NONE);
+                     DROP SUBSCRIPTION {subscription};"
+                )
+            };
+            client
+                .batch_execute(&drop_sql)
+                .expect("remove live catalog subscription");
+        }
     }
     client
         .batch_execute(&format!(
@@ -68,14 +81,14 @@ fn decode_cache(path: &std::path::Path) -> (crate::_internal::db::cache::DbCache
         .read_to_end(&mut payload)
         .expect("read decoded cache payload");
     let v7_payload = payload
-        .strip_prefix(CACHE_V7_MAGIC)
-        .expect("catalog sync must write a V7 cache");
+        .strip_prefix(CACHE_V8_MAGIC)
+        .expect("catalog sync must write a V8 cache");
     let config = bincode::config::standard().with_variable_int_encoding();
     let (versioned, bytes_read): (DbCacheVersioned, usize) =
-        bincode::serde::decode_from_slice(v7_payload, config).expect("decode V7 cache");
+        bincode::serde::decode_from_slice(v7_payload, config).expect("decode V8 cache");
     assert_eq!(bytes_read, v7_payload.len());
-    let DbCacheVersioned::V7(cache) = versioned else {
-        panic!("catalog sync must encode the V7 cache variant");
+    let DbCacheVersioned::V8(cache) = versioned else {
+        panic!("catalog sync must encode the V8 cache variant");
     };
     (*cache, payload)
 }
@@ -118,6 +131,8 @@ fn seed_catalog(client: &mut postgres::Client, version: i32) {
              CREATE TABLE {SCHEMA}.entries (
                id integer PRIMARY KEY,
                note text,
+               score integer,
+               period int4range,
                CONSTRAINT entries_note_check CHECK (note IS NOT NULL)
              );
              CREATE TABLE {SCHEMA}.entry_refs (
@@ -128,6 +143,9 @@ fn seed_catalog(client: &mut postgres::Client, version: i32) {
                WHERE note IS NOT NULL;
              CREATE INDEX entries_note_expression_idx ON {SCHEMA}.entries((lower(note)));
              CREATE INDEX entries_id_include_idx ON {SCHEMA}.entries(id) INCLUDE (note);
+             CREATE STATISTICS {SCHEMA}.entries_note_score_stats (dependencies, ndistinct)
+               ON note, score FROM {SCHEMA}.entries;
+             ALTER STATISTICS {SCHEMA}.entries_note_score_stats SET STATISTICS 250;
              CREATE TABLE {SCHEMA}.view_source (id integer, note text, unused text);
              CREATE TABLE {SCHEMA}.generated_source (
                source integer,
@@ -148,6 +166,10 @@ fn seed_catalog(client: &mut postgres::Client, version: i32) {
              CREATE TABLE {SECOND_SCHEMA}.audit_entries (id integer PRIMARY KEY);
              CREATE FUNCTION {SCHEMA}.with_out(value integer, OUT doubled integer)
                LANGUAGE sql IMMUTABLE AS 'SELECT value * 2';
+             CREATE FUNCTION {SCHEMA}.partition_audit() RETURNS trigger
+               LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';
+             CREATE TRIGGER partition_audit AFTER INSERT ON {SCHEMA}.partition_root
+               FOR EACH ROW EXECUTE FUNCTION {SCHEMA}.partition_audit();
              CREATE PROCEDURE {SCHEMA}.record_value(value integer)
                LANGUAGE sql AS 'SELECT value';
              CREATE FUNCTION {SCHEMA}.add_values(state integer, value integer)
@@ -317,6 +339,15 @@ fn assert_subscription_matches(
     );
 }
 
+fn cleanup_publisher(client: &mut postgres::Client) {
+    client
+        .batch_execute(&format!(
+            "DROP PUBLICATION IF EXISTS {PUBLICATION};
+             DROP SCHEMA IF EXISTS {SCHEMA} CASCADE;"
+        ))
+        .expect("remove publisher fixtures");
+}
+
 #[test]
 fn live_catalog_database_guard_accepts_only_local_hosts() {
     for value in [
@@ -434,6 +465,31 @@ fn live_sync_preserves_routine_and_replication_catalogs_without_connection_secre
     assert!(cache.indexes.iter().any(|index| {
         index.index_id == ObjectId::new(SCHEMA, "entries_id_include_idx")
             && index.included_columns == ["note"]
+    }));
+    let extended_statistics = cache
+        .relations
+        .get(&entry_id)
+        .and_then(|relation| {
+            relation
+                .extended_statistics
+                .get(&ObjectId::new(SCHEMA, "entries_note_score_stats"))
+        })
+        .expect("synchronized extended statistics");
+    assert_eq!(extended_statistics.kinds, ["d", "f"]);
+    assert_eq!(extended_statistics.columns, ["note", "score"]);
+    assert_eq!(extended_statistics.target, Some(250));
+    let parent_trigger_id = ObjectId::new(SCHEMA, "partition_root\0partition_audit");
+    assert!(cache.triggers.iter().any(|trigger| {
+        trigger.table_id == ObjectId::new(SCHEMA, "partition_root")
+            && trigger.trigger_id.name == "partition_audit"
+            && trigger.row_level
+            && trigger.parent_trigger_id.is_none()
+    }));
+    assert!(cache.triggers.iter().any(|trigger| {
+        trigger.table_id == ObjectId::new(SCHEMA, "partition_leaf")
+            && trigger.trigger_id.name == "partition_audit"
+            && trigger.row_level
+            && trigger.parent_trigger_id.as_ref() == Some(&parent_trigger_id)
     }));
     for column in ["id", "note"] {
         assert!(cache.dependencies.iter().any(|dependency| {
@@ -765,6 +821,9 @@ fn live_routine_and_replication_mutations_match_postgresql() {
          ALTER PROCEDURE {SCHEMA}.record_value(integer) RENAME TO record_value_renamed;
          ALTER AGGREGATE {SCHEMA}.total(integer) RENAME TO total_renamed;
          ALTER FUNCTION {SCHEMA}.win_rank() STABLE;
+         ALTER TABLE {SCHEMA}.entries
+           ADD CONSTRAINT entries_score_check CHECK (score >= 0),
+           ADD CONSTRAINT entries_period_excl EXCLUDE USING gist (period WITH &&);
          ALTER PUBLICATION {PUBLICATION} ADD TABLE ONLY {SECOND_SCHEMA}.audit_entries;
          ALTER PUBLICATION {PUBLICATION} SET (publish = 'insert');
          ALTER SUBSCRIPTION {SUBSCRIPTION}
@@ -797,6 +856,82 @@ fn live_routine_and_replication_mutations_match_postgresql() {
     }
     assert_publication_matches(&state, &altered, PUBLICATION);
     assert_subscription_matches(&state, &altered, SUBSCRIPTION);
+
+    let entries = ObjectId::new(SCHEMA, "entries");
+    for (name, kind, columns) in [
+        ("entries_score_check", ConstraintKind::Check, &["score"][..]),
+        (
+            "entries_period_excl",
+            ConstraintKind::Exclusion,
+            &["period"][..],
+        ),
+    ] {
+        let simulated = state
+            .local
+            .constraints
+            .get(&(entries.clone(), name.to_string()))
+            .unwrap_or_else(|| panic!("simulator omitted altered constraint {name}"));
+        let synchronized = altered
+            .constraints
+            .iter()
+            .find(|constraint| constraint.table_id == entries && constraint.name == name)
+            .unwrap_or_else(|| panic!("PostgreSQL omitted altered constraint {name}"));
+        assert_eq!(simulated.kind, kind, "simulator constraint kind for {name}");
+        assert_eq!(
+            synchronized.kind, kind,
+            "catalog constraint kind for {name}"
+        );
+        assert_eq!(simulated.validated, synchronized.validated);
+        assert!(state.local.graph.edges().iter().any(|edge| {
+            edge.dependent == entries
+                && matches!(
+                    &edge.kind,
+                    DependencyKind::ConstraintDependency {
+                        constraint_name,
+                        columns: dependency_columns,
+                    } if constraint_name == name && dependency_columns == columns
+                )
+        }));
+        assert!(altered.constraint_dependencies.iter().any(|dependency| {
+            dependency.table_id == entries
+                && dependency.constraint_name == name
+                && dependency.columns == columns
+        }));
+    }
+
+    let constraint_drop_sql = format!(
+        "ALTER TABLE {SCHEMA}.entries
+           DROP COLUMN score CASCADE,
+           DROP COLUMN period CASCADE;"
+    );
+    let violations = engine
+        .analyze(&constraint_drop_sql, &mut state)
+        .expect("analyze altered constraint cascades");
+    assert!(
+        !violations
+            .iter()
+            .any(|violation| violation.rule_id == "chain-conflict"),
+        "simulator rejected PostgreSQL-valid constraint cascades: {violations:#?}"
+    );
+    client
+        .batch_execute(&constraint_drop_sql)
+        .expect("apply altered constraint cascades to PostgreSQL");
+    sync_cache(&cache_path, None, false).expect("resync cascaded constraints");
+    let (after_constraint_drop, _) = decode_cache(&cache_path);
+    for name in ["entries_score_check", "entries_period_excl"] {
+        assert!(
+            !state
+                .local
+                .constraints
+                .contains_key(&(entries.clone(), name.to_string()))
+        );
+        assert!(
+            !after_constraint_drop
+                .constraints
+                .iter()
+                .any(|constraint| constraint.table_id == entries && constraint.name == name)
+        );
+    }
 
     let drop_sql = format!(
         "DROP SUBSCRIPTION {SUBSCRIPTION};
@@ -854,4 +989,86 @@ fn live_routine_and_replication_mutations_match_postgresql() {
     assert!(!dropped.subscriptions.contains_key(SUBSCRIPTION));
 
     cleanup(&mut client);
+}
+
+#[test]
+#[ignore = "requires local subscriber and publisher databases"]
+fn live_connected_subscription_round_trip_is_redacted_and_exact() {
+    let publisher_url = std::env::var("PUBLISHER_DATABASE_URL")
+        .expect("PUBLISHER_DATABASE_URL is required for connected subscription validation");
+    let subscription_url = std::env::var("SUBSCRIPTION_DATABASE_URL")
+        .expect("SUBSCRIPTION_DATABASE_URL is required for connected subscription validation");
+    assert!(
+        !publisher_url.trim().is_empty() && !subscription_url.trim().is_empty(),
+        "connected subscription database URLs must not be empty"
+    );
+    let publisher_config: postgres::Config = publisher_url
+        .parse()
+        .expect("PUBLISHER_DATABASE_URL is invalid");
+    assert!(
+        database_hosts_are_local(&publisher_config),
+        "connected subscription validation accepts only a local publisher"
+    );
+    let mut publisher = publisher_config
+        .connect(postgres::NoTls)
+        .expect("connect to logical replication publisher");
+    cleanup_publisher(&mut publisher);
+    publisher
+        .batch_execute(&format!(
+            "CREATE SCHEMA {SCHEMA};
+             CREATE TABLE {SCHEMA}.entries (id integer PRIMARY KEY, note text);
+             CREATE PUBLICATION {PUBLICATION} FOR TABLE {SCHEMA}.entries;"
+        ))
+        .expect("seed logical replication publisher");
+
+    let (subscriber_config, _, subscriber_version) = live_database();
+    let _cleanup = CatalogCleanup(subscriber_config.clone());
+    let mut subscriber = subscriber_config
+        .connect(postgres::NoTls)
+        .expect("connect to logical replication subscriber");
+    seed_catalog(&mut subscriber, subscriber_version);
+    let escaped_url = subscription_url.replace('\'', "''");
+    subscriber
+        .batch_execute(&format!(
+            "CREATE SUBSCRIPTION {CONNECTED_SUBSCRIPTION}
+               CONNECTION '{escaped_url}'
+               PUBLICATION {PUBLICATION}
+               WITH (copy_data = false, enabled = false);"
+        ))
+        .expect("create connected subscription and remote replication slot");
+
+    let temp_dir = tempfile::tempdir().expect("create connected subscription directory");
+    let cache_path = temp_dir.path().join("connected.cache");
+    sync_cache(&cache_path, None, false).expect("sync connected subscription");
+    let (cache, decoded_payload) = decode_cache(&cache_path);
+    let connected = cache
+        .subscriptions
+        .get(CONNECTED_SUBSCRIPTION)
+        .expect("synchronized connected subscription");
+    assert_eq!(connected.connection, ConnectionTarget::Redacted);
+    assert_eq!(connected.publications, [PUBLICATION]);
+    assert!(!connected.enabled);
+    assert_eq!(connected.slot_name.as_deref(), Some(CONNECTED_SUBSCRIPTION));
+    assert!(
+        !decoded_payload
+            .windows(subscription_url.len())
+            .any(|bytes| bytes == subscription_url.as_bytes()),
+        "publisher credentials entered the decoded cache"
+    );
+
+    let mut state = AnalysisState::new(cache);
+    let engine = SafeMigrateEngine::new(Config::default());
+    let alter_sql = format!("ALTER SUBSCRIPTION {CONNECTED_SUBSCRIPTION} ENABLE;");
+    engine
+        .analyze(&alter_sql, &mut state)
+        .expect("analyze connected subscription enablement");
+    subscriber
+        .batch_execute(&alter_sql)
+        .expect("enable connected subscription");
+    sync_cache(&cache_path, None, false).expect("resync enabled subscription");
+    let (enabled, _) = decode_cache(&cache_path);
+    assert_subscription_matches(&state, &enabled, CONNECTED_SUBSCRIPTION);
+
+    cleanup(&mut subscriber);
+    cleanup_publisher(&mut publisher);
 }

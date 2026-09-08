@@ -3,7 +3,7 @@ use crate::_internal::analysis::state::MutationResult;
 use crate::_internal::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
 use crate::_internal::rules::{Rule, RuleContext};
 
-pub struct RequireLockTimeoutRule;
+pub(crate) struct RequireLockTimeoutRule;
 
 impl Rule for RequireLockTimeoutRule {
     fn id(&self) -> &'static str {
@@ -56,7 +56,7 @@ impl Rule for RequireLockTimeoutRule {
     }
 }
 
-pub struct RequireStatementTimeoutRule;
+pub(crate) struct RequireStatementTimeoutRule;
 
 impl Rule for RequireStatementTimeoutRule {
     fn id(&self) -> &'static str {

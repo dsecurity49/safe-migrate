@@ -2,14 +2,49 @@ use crate::_internal::analysis::expr_ir::ExprIr;
 use crate::_internal::ast::identifiers::{Ident, QualifiedName};
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum PersistenceFact {
+pub(crate) enum PersistenceFact {
     Permanent,
     Temporary,
     Unlogged,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OnCommitFact {
+    PreserveRows,
+    DeleteRows,
+    Drop,
+}
+
+/// Properties selected by `CREATE TABLE ... LIKE` after applying its ordered
+/// INCLUDING/EXCLUDING clauses.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LikePropertiesFact {
+    pub defaults: bool,
+    pub generated: bool,
+    pub storage: bool,
+    pub compression: bool,
+    pub statistics: bool,
+    pub constraints: bool,
+    pub indexes: bool,
+    pub identity: bool,
+}
+
 #[derive(Clone, Debug, PartialEq)]
-pub enum PolicyCommand {
+pub(crate) struct LikeSourceFact {
+    pub relation: QualifiedName,
+    pub properties: LikePropertiesFact,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ReplicaIdentityFact {
+    Default,
+    Full,
+    Nothing,
+    UsingIndex(QualifiedName),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum PolicyCommand {
     All,
     Select,
     Insert,
@@ -18,19 +53,19 @@ pub enum PolicyCommand {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum SearchPathTarget {
+pub(crate) enum SearchPathTarget {
     Default,
     Schemas(Vec<String>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TimeoutSetting {
+pub(crate) enum TimeoutSetting {
     Lock,
     Statement,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum TimeoutSettingValue {
+pub(crate) enum TimeoutSettingValue {
     Default,
     Milliseconds(u64),
     Current,
@@ -38,7 +73,7 @@ pub enum TimeoutSettingValue {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ResetSettingTarget {
+pub(crate) enum ResetSettingTarget {
     All,
     SearchPath,
     LockTimeout,
@@ -46,20 +81,27 @@ pub enum ResetSettingTarget {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum TypeCreationKind {
+pub(crate) enum TypeCreationKind {
     Enum {
         variants: Vec<String>,
     },
     #[expect(dead_code, reason = "reserved for typed Squawk range support")]
     Range,
-    #[expect(dead_code, reason = "reserved for typed Squawk composite support")]
-    Composite,
+    Composite {
+        fields: Vec<CompositeFieldFact>,
+    },
     #[expect(dead_code, reason = "reserved for typed Squawk base-type support")]
     Base,
 }
 
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct CompositeFieldFact {
+    pub name: String,
+    pub data_type: String,
+}
+
 #[derive(Clone, Debug, PartialEq)]
-pub enum AlterViewAction {
+pub(crate) enum AlterViewAction {
     RenameTo {
         new_name: Ident,
     },
@@ -93,13 +135,13 @@ pub enum AlterViewAction {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum AlterSchemaActionFact {
+pub(crate) enum AlterSchemaActionFact {
     RenameTo { new_name: Ident },
     OwnerTo { new_owner: RoleFact },
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum StatementFact {
+pub(crate) enum StatementFact {
     CreateSchema {
         name: QualifiedName,
         if_not_exists: bool,
@@ -119,12 +161,19 @@ pub enum StatementFact {
         if_not_exists: bool,
         as_select: bool,
         persistence: PersistenceFact,
+        on_commit: Option<OnCommitFact>,
         columns: Vec<ColumnFact>,
         foreign_keys: Vec<FkFact>,
         table_constraints: Vec<TableConstraintFact>,
         partition_by: Option<String>,
         partition_of: Option<QualifiedName>,
         partition_type: Option<String>,
+        inherits: Vec<QualifiedName>,
+        like_sources: Vec<LikeSourceFact>,
+        of_type: Option<QualifiedName>,
+        select_source: Option<QualifiedName>,
+        select_outputs: Vec<SelectOutputFact>,
+        select_projection_complete: bool,
     },
     CreateView {
         name: QualifiedName,
@@ -179,6 +228,7 @@ pub enum StatementFact {
         name: String,
         table: QualifiedName,
         function: Option<QualifiedName>,
+        row_level: bool,
     },
     DropTrigger {
         name: String,
@@ -253,6 +303,16 @@ pub enum StatementFact {
         if_exists: bool,
         concurrently: bool,
         cascade: bool,
+    },
+    Lock {
+        targets: Vec<RelationTargetFact>,
+        mode: LockModeFact,
+        nowait: bool,
+    },
+    Truncate {
+        targets: Vec<RelationTargetFact>,
+        cascade: bool,
+        restart_identity: bool,
     },
     SetSearchPath {
         target: SearchPathTarget,
@@ -330,8 +390,44 @@ pub enum StatementFact {
     },
 }
 
+/// A relation target whose `ONLY` modifier materially changes inheritance and
+/// partition behavior.
 #[derive(Clone, Debug, PartialEq)]
-pub enum AlterSequenceActionFact {
+pub(crate) struct RelationTargetFact {
+    pub name: QualifiedName,
+    pub only: bool,
+}
+
+/// Lifecycle form used by `ALTER TABLE ... DETACH PARTITION`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DetachPartitionMode {
+    Immediate,
+    Concurrently,
+    Finalize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LockModeFact {
+    AccessShare,
+    RowShare,
+    RowExclusive,
+    ShareUpdateExclusive,
+    Share,
+    ShareRowExclusive,
+    Exclusive,
+    AccessExclusive,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RuleEnableModeFact {
+    Origin,
+    Disabled,
+    Replica,
+    Always,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum AlterSequenceActionFact {
     OwnedBy(Option<(QualifiedName, String)>),
     OwnerTo(RoleFact),
     RenameTo(Ident),
@@ -340,24 +436,24 @@ pub enum AlterSequenceActionFact {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum AlterIndexActionFact {
+pub(crate) enum AlterIndexActionFact {
     RenameTo { new_name: Ident },
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct CreateTypeFact {
+pub(crate) struct CreateTypeFact {
     pub name: QualifiedName,
     pub kind: TypeCreationKind,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct AlterTypeFact {
+pub(crate) struct AlterTypeFact {
     pub name: QualifiedName,
     pub actions: Vec<AlterTypeActionFact>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum AlterTypeActionFact {
+pub(crate) enum AlterTypeActionFact {
     RenameTo {
         new_name: Ident,
     },
@@ -376,7 +472,7 @@ pub enum AlterTypeActionFact {
 }
 
 #[derive(Clone, Debug, PartialEq, Default)]
-pub enum RoleFact {
+pub(crate) enum RoleFact {
     #[default]
     Unknown,
     Named {
@@ -389,26 +485,26 @@ pub enum RoleFact {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct CreateRoleFact {
+pub(crate) struct CreateRoleFact {
     pub name: String,
     pub inherits: bool,
     pub can_login: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct AlterRoleFact {
+pub(crate) struct AlterRoleFact {
     pub name: RoleFact,
     pub inherits: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct DropRoleFact {
+pub(crate) struct DropRoleFact {
     pub names: Vec<String>,
     pub if_exists: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct CreateFunctionFact {
+pub(crate) struct CreateFunctionFact {
     pub name: QualifiedName,
     pub or_replace: bool,
     pub params: Vec<ParamFact>,
@@ -417,7 +513,7 @@ pub struct CreateFunctionFact {
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct ParamFact {
+pub(crate) struct ParamFact {
     pub mode: ParamModeFact,
     pub name: Option<String>,
     pub ty: String,
@@ -425,7 +521,7 @@ pub struct ParamFact {
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-pub enum ParamModeFact {
+pub(crate) enum ParamModeFact {
     In,
     Out,
     InOut,
@@ -433,13 +529,13 @@ pub enum ParamModeFact {
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-pub enum RetTypeFact {
+pub(crate) enum RetTypeFact {
     Table(Vec<ColumnFact>),
     Scalar(String),
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-pub enum FuncOptionFact {
+pub(crate) enum FuncOptionFact {
     Language(String),
     Volatility(VolatilityKind),
     Security(SecurityKind),
@@ -461,32 +557,32 @@ pub enum FuncOptionFact {
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-pub enum VolatilityKind {
+pub(crate) enum VolatilityKind {
     Immutable,
     Stable,
     Volatile,
 }
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-pub enum SecurityKind {
+pub(crate) enum SecurityKind {
     Invoker,
     Definer,
 }
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-pub enum StrictKind {
+pub(crate) enum StrictKind {
     Strict,
     CalledOnNull,
     ReturnsNullOnNull,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct AlterFunctionFact {
+pub(crate) struct AlterFunctionFact {
     pub name: QualifiedName,
     pub params: Vec<String>,
     pub action: AlterFunctionAction,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum AlterFunctionAction {
+pub(crate) enum AlterFunctionAction {
     Rename { from: String, to: String },
     OwnerChange(RoleFact),
     SchemaChange { new_schema: String },
@@ -496,20 +592,20 @@ pub enum AlterFunctionAction {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct DropFunctionFact {
+pub(crate) struct DropFunctionFact {
     pub signatures: Vec<FunctionSigFact>,
     pub if_exists: bool,
     pub cascade: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct FunctionSigFact {
+pub(crate) struct FunctionSigFact {
     pub name: QualifiedName,
     pub params: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct CreateProcedureFact {
+pub(crate) struct CreateProcedureFact {
     pub name: QualifiedName,
     pub or_replace: bool,
     pub params: Vec<ParamFact>,
@@ -517,55 +613,55 @@ pub struct CreateProcedureFact {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct AlterProcedureFact {
+pub(crate) struct AlterProcedureFact {
     pub name: QualifiedName,
     pub params: Vec<String>,
     pub action: AlterFunctionAction,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct DropProcedureFact {
+pub(crate) struct DropProcedureFact {
     pub signatures: Vec<FunctionSigFact>,
     pub if_exists: bool,
     pub cascade: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct CreateAggregateFact {
+pub(crate) struct CreateAggregateFact {
     pub name: QualifiedName,
     pub or_replace: bool,
     pub params: Vec<ParamFact>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct AlterAggregateFact {
+pub(crate) struct AlterAggregateFact {
     pub name: QualifiedName,
     pub params: Vec<String>,
     pub action: AlterFunctionAction,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct DropAggregateFact {
+pub(crate) struct DropAggregateFact {
     pub signatures: Vec<FunctionSigFact>,
     pub if_exists: bool,
     pub cascade: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct CreatePublicationFact {
+pub(crate) struct CreatePublicationFact {
     pub name: String,
     pub scope: PublicationScope,
     pub params: Vec<AttributeFact>,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-pub enum PublicationScope {
+pub(crate) enum PublicationScope {
     AllTables { except: Vec<String> },
     Explicit(Vec<PublicationObjectFact>),
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-pub enum PublicationObjectFact {
+pub(crate) enum PublicationObjectFact {
     Table {
         name: QualifiedName,
         only: bool,
@@ -582,19 +678,19 @@ pub enum PublicationObjectFact {
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-pub enum PublicationRowFilter {
+pub(crate) enum PublicationRowFilter {
     Parsed(ExprIr),
     CatalogSql(String),
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct AlterPublicationFact {
+pub(crate) struct AlterPublicationFact {
     pub name: String,
     pub action: AlterPublicationActionFact,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum AlterPublicationActionFact {
+pub(crate) enum AlterPublicationActionFact {
     AddObjects(Vec<PublicationObjectFact>),
     SetObjects(PublicationScope),
     DropObjects(Vec<PublicationObjectFact>),
@@ -604,14 +700,14 @@ pub enum AlterPublicationActionFact {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct DropPublicationFact {
+pub(crate) struct DropPublicationFact {
     pub names: Vec<String>,
     pub if_exists: bool,
     pub cascade: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct CreateSubscriptionFact {
+pub(crate) struct CreateSubscriptionFact {
     pub name: Option<String>,
     pub connection: ConnectionTarget,
     pub publications: Vec<String>,
@@ -619,7 +715,7 @@ pub struct CreateSubscriptionFact {
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-pub enum ConnectionTarget {
+pub(crate) enum ConnectionTarget {
     Literal(Option<String>),
     Server(Option<String>),
     /// A synchronized subscription exists, but its connection string is never
@@ -628,20 +724,20 @@ pub enum ConnectionTarget {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct AlterSubscriptionFact {
+pub(crate) struct AlterSubscriptionFact {
     pub name: String,
     pub action: AlterSubscriptionActionFact,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum SubscriptionPublicationMode {
+pub(crate) enum SubscriptionPublicationMode {
     Set,
     Add,
     Drop,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum AlterSubscriptionActionFact {
+pub(crate) enum AlterSubscriptionActionFact {
     SetConnection(ConnectionTarget),
     Publications {
         mode: SubscriptionPublicationMode,
@@ -660,13 +756,13 @@ pub enum AlterSubscriptionActionFact {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct DropSubscriptionFact {
+pub(crate) struct DropSubscriptionFact {
     pub name: String,
     pub if_exists: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct GrantFact {
+pub(crate) struct GrantFact {
     pub privileges: PrivilegeSpec,
     pub target: GrantTarget,
     pub grantees: Vec<RoleFact>,
@@ -676,7 +772,7 @@ pub struct GrantFact {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct RevokeFact {
+pub(crate) struct RevokeFact {
     pub grant_option_only: bool,
     pub role_option: Option<RoleMembershipOptionFact>,
     pub privileges: PrivilegeSpec,
@@ -690,20 +786,20 @@ pub struct RevokeFact {
 /// name and value are kept typed at extraction time so state transitions never
 /// need to infer semantics from raw SQL text.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum RoleMembershipOptionFact {
+pub(crate) enum RoleMembershipOptionFact {
     Admin(bool),
     Inherit(bool),
     Set(bool),
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum PrivilegeSpec {
+pub(crate) enum PrivilegeSpec {
     All,
     List(Vec<PrivilegeFact>),
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum PrivilegeFact {
+pub(crate) enum PrivilegeFact {
     Select,
     Insert,
     Update,
@@ -723,20 +819,20 @@ pub enum PrivilegeFact {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum GrantTarget {
+pub(crate) enum GrantTarget {
     Tables(Vec<QualifiedName>),
     AllTablesInSchema(Vec<String>),
     Roles(Vec<String>),
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct CreateDatabaseFact {
+pub(crate) struct CreateDatabaseFact {
     pub name: String,
     pub options: Vec<DatabaseOptionFact>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum DatabaseOptionFact {
+pub(crate) enum DatabaseOptionFact {
     Owner(DatabaseOptionValue),
     Template(DatabaseOptionValue),
     Encoding(DatabaseOptionValue),
@@ -747,19 +843,19 @@ pub enum DatabaseOptionFact {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum DatabaseOptionValue {
+pub(crate) enum DatabaseOptionValue {
     Default,
     Literal(Option<String>),
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct AlterDatabaseFact {
+pub(crate) struct AlterDatabaseFact {
     pub name: QualifiedName,
     pub action: AlterDatabaseAction,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum AlterDatabaseAction {
+pub(crate) enum AlterDatabaseAction {
     Rename { to: String },
     OwnerChange(RoleFact),
     TablespaceChange { new_tablespace: String },
@@ -770,26 +866,42 @@ pub enum AlterDatabaseAction {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct DropDatabaseFact {
+pub(crate) struct DropDatabaseFact {
     pub name: QualifiedName,
     pub if_exists: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct AttributeFact {
+pub(crate) struct AttributeFact {
     pub name: String,
     pub value: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum ColumnGeneration {
+pub(crate) enum ColumnGeneration {
     Ordinary,
     Serial,
-    Identity,
+    IdentityAlways,
+    IdentityByDefault,
+    GeneratedStored,
+    GeneratedVirtual,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct IdentitySequenceOptionsFact {
+    pub data_type: Option<String>,
+    pub start_value: Option<i64>,
+    pub increment: Option<i64>,
+    pub min_value: Option<Option<i64>>,
+    pub max_value: Option<Option<i64>>,
+    pub cache_size: Option<i64>,
+    pub cycle: Option<bool>,
+    pub persistence: Option<bool>,
+    pub sequence_name: Option<QualifiedName>,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct ColumnFact {
+pub(crate) struct ColumnFact {
     pub name: String,
     pub ty: Option<String>,
     pub not_null: bool,
@@ -799,10 +911,21 @@ pub struct ColumnFact {
     pub unique_constraint_name: Option<String>,
     pub default: Option<ExprIr>,
     pub generation: ColumnGeneration,
+    pub identity_sequence: Option<IdentitySequenceOptionsFact>,
+    pub generated_expr: Option<ExprIr>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct FkFact {
+pub(crate) enum SelectOutputFact {
+    AllColumns,
+    Column {
+        source_name: String,
+        output_name: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct FkFact {
     pub constraint_name: Option<String>,
     pub references: QualifiedName,
     pub from_columns: Vec<String>,
@@ -810,7 +933,7 @@ pub struct FkFact {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum TableConstraintFact {
+pub(crate) enum TableConstraintFact {
     PrimaryKey {
         constraint_name: Option<String>,
         columns: Vec<String>,
@@ -821,6 +944,8 @@ pub enum TableConstraintFact {
     },
     Check {
         constraint_name: Option<String>,
+        name_hint: Option<String>,
+        definition: String,
         columns: Vec<String>,
         columns_complete: bool,
     },
@@ -832,7 +957,7 @@ pub enum TableConstraintFact {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum AlterDomainActionFact {
+pub(crate) enum AlterDomainActionFact {
     AddConstraint,
     DropConstraint,
     DropDefault,
@@ -847,7 +972,7 @@ pub enum AlterDomainActionFact {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum AlterTableActionFact {
+pub(crate) enum AlterTableActionFact {
     AddColumn {
         name: String,
         ty: Option<String>,
@@ -855,6 +980,8 @@ pub enum AlterTableActionFact {
         not_null: bool,
         default: Option<ExprIr>,
         generation: ColumnGeneration,
+        identity_sequence: Option<IdentitySequenceOptionsFact>,
+        generated_expr: Option<ExprIr>,
     },
     DropColumn {
         name: String,
@@ -890,6 +1017,7 @@ pub enum AlterTableActionFact {
     },
     AddCheckConstraint {
         constraint_name: Option<String>,
+        definition: String,
         columns: Vec<String>,
         columns_complete: bool,
         not_valid: bool,
@@ -932,6 +1060,16 @@ pub enum AlterTableActionFact {
         column: String,
         attributes: Vec<AttributeFact>,
     },
+    ResetOptions {
+        column: String,
+        names: Vec<String>,
+    },
+    SetTableOptions {
+        attributes: Vec<AttributeFact>,
+    },
+    ResetTableOptions {
+        names: Vec<String>,
+    },
     Inherit {
         column: String,
         parent: QualifiedName,
@@ -955,20 +1093,41 @@ pub enum AlterTableActionFact {
     },
     DetachPartition {
         child: QualifiedName,
+        mode: DetachPartitionMode,
     },
     SetStorage {
         column: String,
+        mode: String,
     },
-    SetAccessMethod,
+    SetCompression {
+        column: String,
+        method: Option<String>,
+    },
+    SetStatistics {
+        column: String,
+        target: i32,
+    },
+    DropExpression {
+        column: String,
+        if_exists: bool,
+    },
+    SetAccessMethod {
+        access_method: Option<String>,
+    },
     ClusterOn {
-        index: String,
+        index: QualifiedName,
     },
+    SetWithoutCluster,
     InheritTable {
         parent: QualifiedName,
     },
     NoInheritTable {
         parent: QualifiedName,
     },
+    OfType {
+        type_name: QualifiedName,
+    },
+    NotOf,
     MergePartitions {
         parent: QualifiedName,
     },
@@ -985,9 +1144,10 @@ pub enum AlterTableActionFact {
         new_owner: RoleFact,
     },
     ReplicaIdentity {
-        option: String,
+        option: ReplicaIdentityFact,
     },
     ForceRls,
+    NoForceRls,
     EnableRls,
     DisableRls,
     EnableAlwaysTrigger {
@@ -995,5 +1155,9 @@ pub enum AlterTableActionFact {
     },
     EnableReplicaTrigger {
         trigger_name: Option<String>,
+    },
+    SetRuleMode {
+        rule_name: Option<String>,
+        mode: RuleEnableModeFact,
     },
 }

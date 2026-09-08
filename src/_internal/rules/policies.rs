@@ -3,7 +3,7 @@ use crate::_internal::analysis::state::MutationResult;
 use crate::_internal::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
 use crate::_internal::rules::{Rule, RuleContext};
 
-pub struct RestrictivePolicyRule;
+pub(crate) struct RestrictivePolicyRule;
 
 impl Rule for RestrictivePolicyRule {
     fn id(&self) -> &'static str {

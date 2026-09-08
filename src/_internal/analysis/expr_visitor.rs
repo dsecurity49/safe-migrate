@@ -1,10 +1,10 @@
 use crate::_internal::analysis::expr_ir::ExprIr;
 use squawk_syntax::ast::{AstNode, Expr};
 
-pub struct ExprVisitor;
+pub(crate) struct ExprVisitor;
 
 impl ExprVisitor {
-    pub fn convert(expr: Expr) -> ExprIr {
+    pub(crate) fn convert(expr: Expr) -> ExprIr {
         match expr {
             Expr::Literal(lit) => Self::convert_literal(lit),
             Expr::NameRef(nr) => Self::convert_name_ref(nr),

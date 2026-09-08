@@ -2,7 +2,7 @@ use crate::_internal::ast::identifiers::ObjectId;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RoleState {
+pub(crate) struct RoleState {
     pub id: ObjectId, // role name, no schema
     pub can_login: bool,
     pub is_superuser: bool,
@@ -28,14 +28,14 @@ pub struct RoleState {
 /// provenance separate from the option vectors lets revoke-CASCADE remove only
 /// memberships delegated by a grantor whose authority was withdrawn.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RoleMembershipGrantor {
+pub(crate) struct RoleMembershipGrantor {
     pub member: ObjectId,
     pub role: ObjectId,
     pub grantor: ObjectId,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum RoleOverlay {
+pub(crate) enum RoleOverlay {
     Present(RoleState),
     Dropped,
 }

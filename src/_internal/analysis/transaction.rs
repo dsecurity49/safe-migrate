@@ -7,7 +7,7 @@ use crate::_internal::model::types::TypeOverlay;
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone)]
-pub struct NamespaceSnapshot {
+pub(crate) struct NamespaceSnapshot {
     pub schemas: HashMap<String, SchemaOverlay>,
     pub relations: HashMap<ObjectId, RelationOverlay>,
     pub types: HashMap<ObjectId, TypeOverlay>,
@@ -34,7 +34,7 @@ pub struct NamespaceSnapshot {
 }
 
 #[derive(Debug, Clone)]
-pub enum StateChange {
+pub(crate) enum StateChange {
     SchemaSnapshot {
         name: String,
         previous: Option<SchemaOverlay>,
@@ -124,33 +124,33 @@ pub enum StateChange {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TransactionFrameKind {
+pub(crate) enum TransactionFrameKind {
     Root,
     Savepoint(String),
 }
 
 #[derive(Debug, Clone)]
-pub struct TransactionFrame {
+pub(crate) struct TransactionFrame {
     pub kind: TransactionFrameKind,
     pub undo_log: Vec<StateChange>,
 }
 
 impl TransactionFrame {
-    pub fn root() -> Self {
+    pub(crate) fn root() -> Self {
         Self {
             kind: TransactionFrameKind::Root,
             undo_log: Vec::new(),
         }
     }
 
-    pub fn savepoint(name: impl Into<String>) -> Self {
+    pub(crate) fn savepoint(name: impl Into<String>) -> Self {
         Self {
             kind: TransactionFrameKind::Savepoint(name.into()),
             undo_log: Vec::new(),
         }
     }
 
-    pub fn is_named_savepoint(&self, name: &str) -> bool {
+    pub(crate) fn is_named_savepoint(&self, name: &str) -> bool {
         matches!(&self.kind, TransactionFrameKind::Savepoint(candidate) if candidate == name)
     }
 }

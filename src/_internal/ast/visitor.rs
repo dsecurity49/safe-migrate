@@ -1,7 +1,8 @@
 use crate::_internal::analysis::expr_ir::ExprIr;
 use crate::_internal::analysis::facts::{
     AlterIndexActionFact, AlterTableActionFact, AlterTypeActionFact, AlterTypeFact, ColumnFact,
-    CreateTypeFact, FkFact, PersistenceFact, ResetSettingTarget, SearchPathTarget, StatementFact,
+    CreateTypeFact, FkFact, LikePropertiesFact, LikeSourceFact, LockModeFact, PersistenceFact,
+    RelationTargetFact, ReplicaIdentityFact, ResetSettingTarget, SearchPathTarget, StatementFact,
     TableConstraintFact, TimeoutSetting, TimeoutSettingValue, TypeCreationKind,
 };
 use crate::_internal::ast::identifiers::{Ident, QualifiedName};
@@ -11,13 +12,13 @@ use squawk_syntax::ast::{
     Constraint, CreateDatabase, CreateDomain, CreateIndex, CreateMaterializedView, CreatePolicy,
     CreateSequence, CreateTable, CreateTableAs, CreateTrigger, CreateType, CreateView, CteName,
     DetachPartition, DropDomain, DropIndex, DropMaterializedView, DropPolicy, DropSequence,
-    DropTable, DropTrigger, DropType, DropView, Grant, NameRef, PartitionType, Path, PathSegment,
-    PathSegmentRef, RelationNameRef, ReleaseSavepoint, Revoke, RevokeCommand, Rollback, Set, Stmt,
-    TableArg, TableConstraint,
+    DropTable, DropTrigger, DropType, DropView, Grant, Lock, NameRef, PartitionType, Path,
+    PathSegment, PathSegmentRef, RelationNameRef, ReleaseSavepoint, Revoke, RevokeCommand,
+    Rollback, SelectInto, Set, Stmt, TableArg, TableConstraint, Truncate,
 };
 use squawk_syntax::{SyntaxKind, ast};
 
-pub struct AstVisitor;
+pub(crate) struct AstVisitor;
 
 impl AstVisitor {
     fn expr_columns(expr: crate::_internal::analysis::expr_ir::ExprIr) -> Vec<String> {
@@ -116,11 +117,12 @@ impl AstVisitor {
         matches!(scope, Some(ast::SetScope::LocalScope(_)))
     }
 
-    pub fn extract(stmt: &Stmt) -> Option<StatementFact> {
+    pub(crate) fn extract(stmt: &Stmt) -> Option<StatementFact> {
         let syntax = stmt.syntax();
         match stmt {
             Stmt::CreateTable(node) => return Self::extract_create_table(node),
             Stmt::CreateTableAs(node) => return Self::extract_create_table_as(node),
+            Stmt::SelectInto(node) => return Self::extract_select_into(node),
             Stmt::CreateView(node) => return Self::extract_create_view(node),
             Stmt::CreateMaterializedView(node) => {
                 return Self::extract_create_materialized_view(node);
@@ -132,6 +134,8 @@ impl AstVisitor {
             Stmt::DropView(node) => return Self::extract_drop_view(node),
             Stmt::DropMaterializedView(node) => return Self::extract_drop_materialized_view(node),
             Stmt::DropIndex(node) => return Self::extract_drop_index(node),
+            Stmt::Lock(node) => return Self::extract_lock(node),
+            Stmt::Truncate(node) => return Self::extract_truncate(node),
             Stmt::Set(node) => return Self::extract_set(node),
             Stmt::Reset(node) => return Self::extract_reset(node),
             Stmt::Grant(node) => return Self::extract_grant(node),
@@ -393,21 +397,6 @@ impl AstVisitor {
         let path = node.table_name()?.path()?;
         let name = Self::path_to_qualified_name(&path)?;
 
-        // These forms copy inherited/type/LIKE metadata or add transaction
-        // lifecycle semantics that the current table facts cannot represent.
-        // Keep them on the engine's opaque path instead of creating an
-        // incomplete table while claiming an exact state transition.
-        if node.inherits().is_some()
-            || node.of_type().is_some()
-            || node.on_commit().is_some()
-            || node.table_arg_list().is_some_and(|args| {
-                args.args()
-                    .any(|arg| matches!(arg, TableArg::LikeClause(_)))
-            })
-        {
-            return None;
-        }
-
         let persistence = match node
             .persistence()
             .map(|p| p.syntax().text().to_string().to_lowercase())
@@ -417,6 +406,24 @@ impl AstVisitor {
             Some("unlogged") => PersistenceFact::Unlogged,
             _ => PersistenceFact::Permanent,
         };
+        let on_commit = match node
+            .on_commit()
+            .and_then(|clause| clause.on_commit_action())
+        {
+            Some(ast::OnCommitAction::PreserveRows(_)) => {
+                Some(crate::_internal::analysis::facts::OnCommitFact::PreserveRows)
+            }
+            Some(ast::OnCommitAction::DeleteRows(_)) => {
+                Some(crate::_internal::analysis::facts::OnCommitFact::DeleteRows)
+            }
+            Some(ast::OnCommitAction::Drop(_)) => {
+                Some(crate::_internal::analysis::facts::OnCommitFact::Drop)
+            }
+            None => None,
+        };
+        if on_commit.is_some() && !matches!(persistence, PersistenceFact::Temporary) {
+            return None;
+        }
 
         let partition_by = node.partition_by().map(|p| p.syntax().text().to_string());
         let partition_of = node
@@ -427,38 +434,61 @@ impl AstVisitor {
         let partition_type = node
             .partition_type()
             .map(|pt| pt.syntax().text().to_string());
+        let inherits = match node.inherits() {
+            Some(inherits) => inherits
+                .table_name_refs()
+                .map(|table| {
+                    table
+                        .path_ref()
+                        .and_then(|path| Self::path_ref_to_qualified_name(&path))
+                })
+                .collect::<Option<Vec<_>>>()?,
+            None => Vec::new(),
+        };
+        let of_type = node
+            .of_type()
+            .and_then(|of_type| of_type.ty())
+            .and_then(|ty| match ty {
+                ast::Type::PathType(path_type)
+                    if path_type.arg_list().is_none() && path_type.setof_token().is_none() =>
+                {
+                    path_type
+                        .path_ref()
+                        .and_then(|path| Self::path_ref_to_qualified_name(&path))
+                }
+                _ => None,
+            });
+        if node.of_type().is_some() && of_type.is_none() {
+            return None;
+        }
 
-        let (columns, foreign_keys, table_constraints) = node
-            .table_arg_list()
-            .map(|tal| {
-                let (columns, foreign_keys, table_constraints) =
-                    Self::extract_table_body(tal.args());
-                (columns, foreign_keys, table_constraints)
-            })
-            .unwrap_or_else(|| (Vec::new(), Vec::new(), Vec::new()));
+        let (columns, foreign_keys, table_constraints, like_sources) = match node.table_arg_list() {
+            Some(args) => Self::extract_table_body(args.args())?,
+            None => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+        };
 
         Some(StatementFact::CreateTable {
             name,
             if_not_exists: node.if_not_exists().is_some(),
             as_select: false,
             persistence,
+            on_commit,
             columns,
             foreign_keys,
             table_constraints,
             partition_by,
             partition_of,
             partition_type,
+            inherits,
+            like_sources,
+            of_type,
+            select_source: None,
+            select_outputs: Vec::new(),
+            select_projection_complete: false,
         })
     }
 
     fn extract_create_table_as(node: &CreateTableAs) -> Option<StatementFact> {
-        // CTAS relations with ON COMMIT actions do not have the same
-        // transaction lifecycle as an ordinary relation.  We do not model
-        // that lifecycle yet, so preserve the engine's opaque-statement path
-        // instead of claiming the relation survives (or disappears) exactly.
-        if node.on_commit().is_some() {
-            return None;
-        }
         let path = node.table_name()?.path()?;
         let persistence = match node
             .persistence()
@@ -469,17 +499,127 @@ impl AstVisitor {
             Some("unlogged") => PersistenceFact::Unlogged,
             _ => PersistenceFact::Permanent,
         };
+        let on_commit = match node
+            .on_commit()
+            .and_then(|clause| clause.on_commit_action())
+        {
+            Some(ast::OnCommitAction::PreserveRows(_)) => {
+                Some(crate::_internal::analysis::facts::OnCommitFact::PreserveRows)
+            }
+            Some(ast::OnCommitAction::DeleteRows(_)) => {
+                Some(crate::_internal::analysis::facts::OnCommitFact::DeleteRows)
+            }
+            Some(ast::OnCommitAction::Drop(_)) => {
+                Some(crate::_internal::analysis::facts::OnCommitFact::Drop)
+            }
+            None => None,
+        };
+        if on_commit.is_some() && !matches!(persistence, PersistenceFact::Temporary) {
+            return None;
+        }
         Some(StatementFact::CreateTable {
             name: Self::path_to_qualified_name(&path)?,
             if_not_exists: node.if_not_exists().is_some(),
             as_select: true,
             persistence,
+            on_commit,
             columns: Vec::new(),
             foreign_keys: Vec::new(),
             table_constraints: Vec::new(),
             partition_by: None,
             partition_of: None,
             partition_type: None,
+            inherits: Vec::new(),
+            like_sources: Vec::new(),
+            of_type: None,
+            select_source: None,
+            select_outputs: Vec::new(),
+            select_projection_complete: false,
+        })
+    }
+
+    fn extract_select_into(node: &SelectInto) -> Option<StatementFact> {
+        let into = node.into_clause()?;
+        let name = into.table_name()?.path()?;
+        let persistence = match into
+            .persistence()
+            .map(|persistence| persistence.syntax().text().to_string().to_lowercase())
+            .as_deref()
+        {
+            Some("temporary") | Some("temp") => PersistenceFact::Temporary,
+            Some("unlogged") => PersistenceFact::Unlogged,
+            _ => PersistenceFact::Permanent,
+        };
+        let select_source = node.from_clause().and_then(|from| {
+            let mut items = from.items();
+            let item = items.next()?;
+            if items.next().is_some() {
+                return None;
+            }
+            let ast::FromListItem::FromItem(ast::FromItem::RelationFromItem(relation)) = item
+            else {
+                return None;
+            };
+            if relation.tablesample_clause().is_some() {
+                return None;
+            }
+            relation
+                .relation_name_ref()?
+                .path_ref()
+                .and_then(|path| Self::path_ref_to_qualified_name(&path))
+        });
+        let select_outputs = node
+            .select_clause()
+            .and_then(|select| select.target_list())
+            .map(|targets| {
+                targets
+                    .targets()
+                    .map(|target| {
+                        if target.star_token().is_some() {
+                            return Some(
+                                crate::_internal::analysis::facts::SelectOutputFact::AllColumns,
+                            );
+                        }
+                        let ast::Expr::NameRef(name) = target.expr()? else {
+                            return None;
+                        };
+                        let source_name =
+                            Self::resolve_identifier_token(name.syntax().first_token()?.text());
+                        let output_name = target
+                            .as_name()
+                            .and_then(|alias| alias.name())
+                            .and_then(|name| name.syntax().first_token())
+                            .map(|token| Self::resolve_identifier_token(token.text()))
+                            .unwrap_or_else(|| source_name.clone());
+                        Some(
+                            crate::_internal::analysis::facts::SelectOutputFact::Column {
+                                source_name,
+                                output_name,
+                            },
+                        )
+                    })
+                    .collect::<Option<Vec<_>>>()
+            })
+            .flatten();
+        let select_projection_complete = select_source.is_some() && select_outputs.is_some();
+        Some(StatementFact::CreateTable {
+            name: Self::path_to_qualified_name(&name)?,
+            if_not_exists: false,
+            as_select: true,
+            persistence,
+            on_commit: None,
+            columns: Vec::new(),
+            foreign_keys: Vec::new(),
+            table_constraints: Vec::new(),
+            partition_by: None,
+            partition_of: None,
+            partition_type: None,
+            inherits: Vec::new(),
+            like_sources: Vec::new(),
+            of_type: None,
+            select_source,
+            select_outputs: select_outputs.unwrap_or_default(),
+            select_projection_complete,
         })
     }
 
@@ -496,6 +636,59 @@ impl AstVisitor {
             names,
             if_exists: node.if_exists().is_some(),
             cascade: Self::is_cascade(node.drop_behavior()),
+        })
+    }
+
+    fn extract_lock(node: &Lock) -> Option<StatementFact> {
+        let targets = node
+            .relation_list()?
+            .relation_names()
+            .map(|relation| {
+                Some(RelationTargetFact {
+                    name: Self::path_ref_to_qualified_name(
+                        &relation.relation_name_ref()?.path_ref()?,
+                    )?,
+                    only: relation.only_token().is_some(),
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let mode = match node.lock_mode_clause()?.lock_mode()? {
+            ast::LockMode::AccessShare(_) => LockModeFact::AccessShare,
+            ast::LockMode::RowShare(_) => LockModeFact::RowShare,
+            ast::LockMode::RowExclusive(_) => LockModeFact::RowExclusive,
+            ast::LockMode::ShareUpdateExclusive(_) => LockModeFact::ShareUpdateExclusive,
+            ast::LockMode::Share(_) => LockModeFact::Share,
+            ast::LockMode::ShareRowExclusive(_) => LockModeFact::ShareRowExclusive,
+            ast::LockMode::Exclusive(_) => LockModeFact::Exclusive,
+            ast::LockMode::AccessExclusive(_) => LockModeFact::AccessExclusive,
+        };
+        (!targets.is_empty()).then_some(StatementFact::Lock {
+            targets,
+            mode,
+            nowait: node.nowait().is_some(),
+        })
+    }
+
+    fn extract_truncate(node: &Truncate) -> Option<StatementFact> {
+        let targets = node
+            .table_list()?
+            .table_relation_names()
+            .map(|relation| {
+                Some(RelationTargetFact {
+                    name: Self::path_ref_to_qualified_name(
+                        &relation.table_name_ref()?.path_ref()?,
+                    )?,
+                    only: relation.only_token().is_some(),
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        (!targets.is_empty()).then_some(StatementFact::Truncate {
+            targets,
+            cascade: Self::is_cascade(node.drop_behavior()),
+            restart_identity: matches!(
+                node.identity_action(),
+                Some(ast::IdentityAction::RestartIdentity(_))
+            ),
         })
     }
 
@@ -528,7 +721,16 @@ impl AstVisitor {
                     .and_then(|tn| tn.path_ref())
                     .and_then(|p| Self::path_ref_to_qualified_name(&p))
                 {
-                    actions.push(AlterTableActionFact::DetachPartition { child });
+                    let mode = match dp.detach_partition_option() {
+                        Some(ast::DetachPartitionOption::DetachConcurrently(_)) => {
+                            crate::_internal::analysis::facts::DetachPartitionMode::Concurrently
+                        }
+                        Some(ast::DetachPartitionOption::DetachFinalize(_)) => {
+                            crate::_internal::analysis::facts::DetachPartitionMode::Finalize
+                        }
+                        None => crate::_internal::analysis::facts::DetachPartitionMode::Immediate,
+                    };
+                    actions.push(AlterTableActionFact::DetachPartition { child, mode });
                 }
                 continue;
             }
@@ -579,6 +781,8 @@ impl AstVisitor {
                         let mut default = None;
                         let mut generation =
                             crate::_internal::analysis::facts::ColumnGeneration::Ordinary;
+                        let mut identity_sequence = None;
+                        let mut generated_expr = None;
                         for c in add.constraints() {
                             match c {
                                 Constraint::NotNullConstraint(_) => not_null = true,
@@ -592,8 +796,38 @@ impl AstVisitor {
                                         Some(ast::GeneratedAs::GeneratedIdentity(_))
                                     ) =>
                                 {
-                                    generation = crate::_internal::analysis::facts::ColumnGeneration::Identity;
+                                    let Some(ast::GeneratedAs::GeneratedIdentity(identity)) =
+                                        generated.generated_as()
+                                    else {
+                                        unreachable!("guard requires an identity clause")
+                                    };
+                                    generation = match identity.generated_when() {
+                                        Some(ast::GeneratedWhen::GeneratedAlways(_)) => crate::_internal::analysis::facts::ColumnGeneration::IdentityAlways,
+                                        Some(ast::GeneratedWhen::GeneratedByDefault(_)) => crate::_internal::analysis::facts::ColumnGeneration::IdentityByDefault,
+                                        None => return None,
+                                    };
+                                    identity_sequence =
+                                        Some(Self::identity_sequence_options(&identity)?);
                                     not_null = true;
+                                }
+                                Constraint::GeneratedConstraint(generated)
+                                    if matches!(
+                                        generated.generated_as(),
+                                        Some(ast::GeneratedAs::GeneratedStored(_))
+                                    ) =>
+                                {
+                                    generation = match generated.generated_as() {
+                                        Some(ast::GeneratedAs::GeneratedStored(stored)) => match stored.generated_kind() {
+                                            Some(ast::GeneratedKind::Stored(_)) => crate::_internal::analysis::facts::ColumnGeneration::GeneratedStored,
+                                            Some(ast::GeneratedKind::Virtual(_)) => crate::_internal::analysis::facts::ColumnGeneration::GeneratedVirtual,
+                                            None => return None,
+                                        },
+                                        _ => unreachable!("guard requires a generated expression"),
+                                    };
+                                    generated_expr = match generated.generated_as() {
+                                        Some(ast::GeneratedAs::GeneratedStored(stored)) => stored.expr().map(crate::_internal::analysis::expr_visitor::ExprVisitor::convert),
+                                        _ => None,
+                                    };
                                 }
                                 _ => {}
                             }
@@ -611,6 +845,8 @@ impl AstVisitor {
                             } else {
                                 generation
                             },
+                            identity_sequence,
+                            generated_expr,
                         });
                     }
                 }
@@ -732,11 +968,16 @@ impl AstVisitor {
                             })
                         });
 
-                    if let Some(col_name) = col_ident
-                        && let Some(opt) = alter_col.option()
-                        && let Some(fact) = Self::extract_alter_column_option(col_name, opt)
-                    {
-                        actions.push(fact);
+                    if let (Some(col_name), Some(opt)) = (col_ident, alter_col.option()) {
+                        if let Some(fact) = Self::extract_alter_column_option(col_name, opt) {
+                            actions.push(fact);
+                        } else {
+                            // A typed but unmodeled column option must not be
+                            // mistaken for an exact no-op.
+                            unsupported_action = true;
+                        }
+                    } else {
+                        unsupported_action = true;
                     }
                 }
                 AlterTableAction::ValidateConstraint(vc) => {
@@ -750,9 +991,11 @@ impl AstVisitor {
                     }
                 }
                 AlterTableAction::SetAccessMethod(sam) => {
-                    if sam.access_method_ref().is_some() {
-                        actions.push(AlterTableActionFact::SetAccessMethod);
-                    }
+                    let access_method = sam
+                        .access_method_ref()
+                        .and_then(|method| method.ident_token())
+                        .map(|token| Self::resolve_identifier_token(token.text()));
+                    actions.push(AlterTableActionFact::SetAccessMethod { access_method });
                 }
                 AlterTableAction::DisableTrigger(dt) => {
                     let trigger_name = match dt.trigger_target() {
@@ -760,7 +1003,14 @@ impl AstVisitor {
                             .ident_token()
                             .map(|name| Self::resolve_identifier_token(name.text())),
                         Some(ast::TriggerTarget::All(_)) => Some("ALL".to_string()),
-                        Some(ast::TriggerTarget::User(_)) | None => None,
+                        // Constraint triggers are modeled as constraints, not
+                        // entries in the user-trigger catalog. Preserve USER
+                        // so state can target every tracked user trigger.
+                        Some(ast::TriggerTarget::User(_)) => Some("USER".to_string()),
+                        None => {
+                            unsupported_action = true;
+                            continue;
+                        }
                     };
                     actions.push(AlterTableActionFact::DisableTrigger { trigger_name });
                 }
@@ -770,7 +1020,11 @@ impl AstVisitor {
                             .ident_token()
                             .map(|name| Self::resolve_identifier_token(name.text())),
                         Some(ast::TriggerTarget::All(_)) => Some("ALL".to_string()),
-                        Some(ast::TriggerTarget::User(_)) | None => None,
+                        Some(ast::TriggerTarget::User(_)) => Some("USER".to_string()),
+                        None => {
+                            unsupported_action = true;
+                            continue;
+                        }
                     };
                     actions.push(AlterTableActionFact::EnableTrigger { trigger_name });
                 }
@@ -801,23 +1055,29 @@ impl AstVisitor {
                 AlterTableAction::ReplicaIdentity(ri) => {
                     let option = match ri.replica_identity_option() {
                         Some(ast::ReplicaIdentityOption::ReplicaIdentityDefault(_)) => {
-                            "DEFAULT".to_string()
+                            ReplicaIdentityFact::Default
                         }
                         Some(ast::ReplicaIdentityOption::ReplicaIdentityFull(_)) => {
-                            "FULL".to_string()
+                            ReplicaIdentityFact::Full
                         }
                         Some(ast::ReplicaIdentityOption::ReplicaIdentityNothing(_)) => {
-                            "NOTHING".to_string()
+                            ReplicaIdentityFact::Nothing
                         }
                         Some(ast::ReplicaIdentityOption::UsingIndexName(using_index)) => {
                             using_index
                                 .index_ref()
                                 .and_then(|index| index.path_ref())
                                 .and_then(|path| Self::path_ref_to_qualified_name(&path))
-                                .map(|name| name.name.resolve())
-                                .unwrap_or_default()
+                                .map(ReplicaIdentityFact::UsingIndex)
+                                .unwrap_or_else(|| {
+                                    unsupported_action = true;
+                                    ReplicaIdentityFact::Default
+                                })
                         }
-                        None => String::new(),
+                        None => {
+                            unsupported_action = true;
+                            ReplicaIdentityFact::Default
+                        }
                     };
                     actions.push(AlterTableActionFact::ReplicaIdentity { option });
                 }
@@ -825,16 +1085,38 @@ impl AstVisitor {
                     let index = co
                         .index_ref()
                         .and_then(|ir| ir.path_ref())
-                        .and_then(|pr| Self::path_ref_to_qualified_name(&pr))
-                        .map(|qn| qn.name.resolve())
-                        .or_else(|| {
-                            co.syntax()
-                                .descendants()
-                                .find_map(NameRef::cast)
-                                .map(|nr| Self::resolve_name_ref(&nr))
-                        })
-                        .unwrap_or_default();
-                    actions.push(AlterTableActionFact::ClusterOn { index });
+                        .and_then(|pr| Self::path_ref_to_qualified_name(&pr));
+                    if let Some(index) = index {
+                        actions.push(AlterTableActionFact::ClusterOn { index });
+                    } else {
+                        unsupported_action = true;
+                    }
+                }
+                AlterTableAction::SetWithoutCluster(_) => {
+                    actions.push(AlterTableActionFact::SetWithoutCluster);
+                }
+                AlterTableAction::SetOptions(options) => {
+                    if let Some(attributes) =
+                        Self::extract_attribute_options(options.attribute_list())
+                    {
+                        actions.push(AlterTableActionFact::SetTableOptions { attributes });
+                    } else {
+                        unsupported_action = true;
+                    }
+                }
+                AlterTableAction::ResetOptions(options) => {
+                    let names = options.attribute_list().map(|list| {
+                        list.attribute_options()
+                            .filter_map(|option| {
+                                option.name().map(|name| name.syntax().text().to_string())
+                            })
+                            .collect::<Vec<_>>()
+                    });
+                    if let Some(names) = names.filter(|names| !names.is_empty()) {
+                        actions.push(AlterTableActionFact::ResetTableOptions { names });
+                    } else {
+                        unsupported_action = true;
+                    }
                 }
                 AlterTableAction::InheritTable(it) => {
                     if let Some(path) = it.table_name_ref().and_then(|t| t.path_ref())
@@ -850,6 +1132,25 @@ impl AstVisitor {
                         actions.push(AlterTableActionFact::NoInheritTable { parent });
                     }
                 }
+                AlterTableAction::OfType(of_type) => {
+                    let type_name = of_type.ty().and_then(|ty| match ty {
+                        ast::Type::PathType(path_type)
+                            if path_type.arg_list().is_none()
+                                && path_type.setof_token().is_none() =>
+                        {
+                            path_type
+                                .path_ref()
+                                .and_then(|path| Self::path_ref_to_qualified_name(&path))
+                        }
+                        _ => None,
+                    });
+                    if let Some(type_name) = type_name {
+                        actions.push(AlterTableActionFact::OfType { type_name });
+                    } else {
+                        unsupported_action = true;
+                    }
+                }
+                AlterTableAction::NotOf(_) => actions.push(AlterTableActionFact::NotOf),
                 AlterTableAction::MergePartitions(mp) => {
                     if let Some(path) = mp.table_name().and_then(|t| t.path())
                         && let Some(parent) = Self::path_to_qualified_name(&path)
@@ -863,11 +1164,50 @@ impl AstVisitor {
                 AlterTableAction::ForceRls(_) => {
                     actions.push(AlterTableActionFact::ForceRls);
                 }
+                AlterTableAction::NoForceRls(_) => {
+                    actions.push(AlterTableActionFact::NoForceRls);
+                }
                 AlterTableAction::EnableRls(_) => {
                     actions.push(AlterTableActionFact::EnableRls);
                 }
                 AlterTableAction::DisableRls(_) => {
                     actions.push(AlterTableActionFact::DisableRls);
+                }
+                AlterTableAction::EnableRule(rule) => {
+                    actions.push(AlterTableActionFact::SetRuleMode {
+                        rule_name: rule
+                            .rule_ref()
+                            .and_then(|rule| rule.ident_token())
+                            .map(|token| Self::resolve_identifier_token(token.text())),
+                        mode: crate::_internal::analysis::facts::RuleEnableModeFact::Origin,
+                    });
+                }
+                AlterTableAction::DisableRule(rule) => {
+                    actions.push(AlterTableActionFact::SetRuleMode {
+                        rule_name: rule
+                            .rule_ref()
+                            .and_then(|rule| rule.ident_token())
+                            .map(|token| Self::resolve_identifier_token(token.text())),
+                        mode: crate::_internal::analysis::facts::RuleEnableModeFact::Disabled,
+                    });
+                }
+                AlterTableAction::EnableReplicaRule(rule) => {
+                    actions.push(AlterTableActionFact::SetRuleMode {
+                        rule_name: rule
+                            .rule_ref()
+                            .and_then(|rule| rule.ident_token())
+                            .map(|token| Self::resolve_identifier_token(token.text())),
+                        mode: crate::_internal::analysis::facts::RuleEnableModeFact::Replica,
+                    });
+                }
+                AlterTableAction::EnableAlwaysRule(rule) => {
+                    actions.push(AlterTableActionFact::SetRuleMode {
+                        rule_name: rule
+                            .rule_ref()
+                            .and_then(|rule| rule.ident_token())
+                            .map(|token| Self::resolve_identifier_token(token.text())),
+                        mode: crate::_internal::analysis::facts::RuleEnableModeFact::Always,
+                    });
                 }
                 AlterTableAction::EnableAlwaysTrigger(eat) => {
                     let trigger_name = eat
@@ -899,13 +1239,11 @@ impl AstVisitor {
                     let txt = action.syntax().text().to_string().to_lowercase();
 
                     if txt.contains("set storage") {
-                        let parts: Vec<&str> = txt.split_whitespace().collect();
-                        if let Some(idx) = parts.iter().position(|&p| p == "column")
-                            && idx + 1 < parts.len()
-                        {
-                            let c_name = Self::resolve_identifier_token(parts[idx + 1]);
-                            actions.push(AlterTableActionFact::SetStorage { column: c_name });
-                        }
+                        // A storage clause belongs to the typed ALTER COLUMN
+                        // option path. If Squawk does not expose that child,
+                        // preserve conservative handling instead of guessing
+                        // its target or mode from source text.
+                        unsupported_action = true;
                     } else {
                         // Parser-accepted actions that are not represented in
                         // our fact model must take the engine's explicit
@@ -926,31 +1264,104 @@ impl AstVisitor {
         })
     }
 
+    fn extract_like_properties(like: &ast::LikeClause) -> Option<LikePropertiesFact> {
+        let mut properties = LikePropertiesFact::default();
+        for option in like.like_options() {
+            let (including, property) = match option {
+                ast::LikeOption::IncludingProperty(option) => (true, option.table_property()?),
+                ast::LikeOption::ExcludingProperty(option) => (false, option.table_property()?),
+            };
+            match property {
+                ast::TableProperty::PropertyAll(_) => {
+                    properties = LikePropertiesFact {
+                        defaults: including,
+                        generated: including,
+                        storage: including,
+                        compression: including,
+                        statistics: including,
+                        constraints: including,
+                        indexes: including,
+                        identity: including,
+                    };
+                }
+                // Comments are not catalog semantics consumed by the analyzer.
+                ast::TableProperty::PropertyComments(_) => {}
+                ast::TableProperty::PropertyDefaults(_) => properties.defaults = including,
+                ast::TableProperty::PropertyGenerated(_) => properties.generated = including,
+                ast::TableProperty::PropertyStorage(_) => properties.storage = including,
+                ast::TableProperty::PropertyCompression(_) => properties.compression = including,
+                ast::TableProperty::PropertyStatistics(_) => properties.statistics = including,
+                ast::TableProperty::PropertyConstraints(_) => properties.constraints = including,
+                ast::TableProperty::PropertyIndexes(_) => properties.indexes = including,
+                ast::TableProperty::PropertyIdentity(_) => properties.identity = including,
+            }
+        }
+        Some(properties)
+    }
+
     fn extract_table_body(
         args: impl Iterator<Item = TableArg>,
-    ) -> (Vec<ColumnFact>, Vec<FkFact>, Vec<TableConstraintFact>) {
+    ) -> Option<(
+        Vec<ColumnFact>,
+        Vec<FkFact>,
+        Vec<TableConstraintFact>,
+        Vec<LikeSourceFact>,
+    )> {
         let mut columns = Vec::new();
         let mut foreign_keys = Vec::new();
         let mut table_constraints = Vec::new();
+        let mut like_sources = Vec::new();
         for arg in args {
             match arg {
                 TableArg::Column(col) => {
                     for fk in Self::extract_column_fk_facts(&col) {
                         foreign_keys.push(fk);
                     }
+                    let column_name = col
+                        .name()
+                        .and_then(|name| name.ident_token())
+                        .or_else(|| {
+                            col.syntax()
+                                .descendants_with_tokens()
+                                .filter_map(|element| element.into_token())
+                                .find(|token| token.kind() != SyntaxKind::WHITESPACE)
+                        })
+                        .map(|token| Self::resolve_identifier_token(token.text()))?;
+                    for constraint in Self::column_constraints(&col) {
+                        let ColumnConstraint::CheckConstraint(check) = constraint else {
+                            continue;
+                        };
+                        let (columns, columns_complete) = check
+                            .expr()
+                            .map(crate::_internal::analysis::expr_visitor::ExprVisitor::convert)
+                            .map(Self::expr_columns_with_completeness)
+                            .unwrap_or((Vec::new(), false));
+                        table_constraints.push(TableConstraintFact::Check {
+                            constraint_name: check
+                                .constraint_name_clause()
+                                .and_then(|clause| clause.constraint_name())
+                                .and_then(|name| name.ident_token())
+                                .map(|token| Self::resolve_identifier_token(token.text())),
+                            name_hint: Some(column_name.clone()),
+                            definition: check.expr()?.syntax().text().to_string(),
+                            columns,
+                            columns_complete,
+                        });
+                    }
                     if let Some(fact) = Self::extract_column_fact(&col) {
                         columns.push(fact);
                     }
                 }
                 TableArg::LikeClause(like) => {
-                    if let Some(path) = like.syntax().descendants().find_map(Path::cast)
-                        && let Some(_parent) = Self::path_to_qualified_name(&path)
-                    {
-                        // In the future, we may need to track 'Like' clauses as a specific
-                        // mutation fact to properly model schema dependency and inheritance.
-                        // For now, we omit them from the core table creation facts as
-                        // they do not create column definitions in the current AST.
-                    }
+                    let properties = Self::extract_like_properties(&like)?;
+                    let source = like
+                        .relation_name_ref()
+                        .and_then(|name| name.path_ref())
+                        .and_then(|path| Self::path_ref_to_qualified_name(&path))?;
+                    like_sources.push(LikeSourceFact {
+                        relation: source,
+                        properties,
+                    });
                 }
                 TableArg::TableConstraint(tc) => {
                     if let Some(fk) = Self::extract_table_fk_fact(&tc) {
@@ -962,7 +1373,7 @@ impl AstVisitor {
                 }
             }
         }
-        (columns, foreign_keys, table_constraints)
+        Some((columns, foreign_keys, table_constraints, like_sources))
     }
 
     fn column_constraints(col: &Column) -> impl Iterator<Item = ColumnConstraint> + '_ {
@@ -970,6 +1381,55 @@ impl AstVisitor {
             ast::ColumnClause::ColumnConstraint(constraint) => Some(constraint),
             _ => None,
         })
+    }
+
+    fn identity_sequence_options(
+        identity: &ast::GeneratedIdentity,
+    ) -> Option<crate::_internal::analysis::facts::IdentitySequenceOptionsFact> {
+        let mut result = crate::_internal::analysis::facts::IdentitySequenceOptionsFact::default();
+        let Some(options) = identity.sequence_option_list() else {
+            return Some(result);
+        };
+        let integer = |expr: ast::Expr| expr.syntax().text().to_string().trim().parse::<i64>().ok();
+        for option in options.sequence_options() {
+            match option {
+                ast::SequenceOption::OptionAsType(option) => {
+                    result.data_type = Some(option.ty()?.syntax().text().to_string());
+                }
+                ast::SequenceOption::OptionCache(option) => {
+                    result.cache_size = Some(integer(option.expr()?)?);
+                }
+                ast::SequenceOption::OptionCycle(_) => result.cycle = Some(true),
+                ast::SequenceOption::OptionNoCycle(_) => result.cycle = Some(false),
+                ast::SequenceOption::OptionIncrement(option) => {
+                    result.increment = Some(integer(option.expr()?)?);
+                }
+                ast::SequenceOption::OptionMaxValue(option) => {
+                    result.max_value = Some(Some(integer(option.expr()?)?));
+                }
+                ast::SequenceOption::OptionNoMaxValue(_) => result.max_value = Some(None),
+                ast::SequenceOption::OptionMinValue(option) => {
+                    result.min_value = Some(Some(integer(option.expr()?)?));
+                }
+                ast::SequenceOption::OptionNoMinValue(_) => result.min_value = Some(None),
+                ast::SequenceOption::OptionStart(option) => {
+                    result.start_value = Some(integer(option.expr()?)?);
+                }
+                ast::SequenceOption::OptionLogged(_) => result.persistence = Some(true),
+                ast::SequenceOption::OptionUnlogged(_) => result.persistence = Some(false),
+                ast::SequenceOption::OptionSequenceName(option) => {
+                    result.sequence_name = option
+                        .sequence()
+                        .and_then(|sequence| sequence.path())
+                        .and_then(|path| Self::path_to_qualified_name(&path));
+                    result.sequence_name.as_ref()?;
+                }
+                ast::SequenceOption::OptionRestart(_) | ast::SequenceOption::OptionOwnedBy(_) => {
+                    return None;
+                }
+            }
+        }
+        Some(result)
     }
 
     fn extract_column_fact(col: &Column) -> Option<ColumnFact> {
@@ -981,10 +1441,15 @@ impl AstVisitor {
         })?;
         let name = Self::resolve_identifier_token(name_token.text());
         let ty = col.ty().map(|t| t.syntax().text().to_string());
-        let is_identity = Self::column_constraints(col).any(|constraint| {
-            matches!(constraint, ColumnConstraint::GeneratedConstraint(generated)
-                if matches!(generated.generated_as(), Some(ast::GeneratedAs::GeneratedIdentity(_))))
+        let generated_as = Self::column_constraints(col).find_map(|constraint| {
+            let ColumnConstraint::GeneratedConstraint(generated) = constraint else {
+                return None;
+            };
+            generated.generated_as()
         });
+        let is_identity = matches!(generated_as, Some(ast::GeneratedAs::GeneratedIdentity(_)));
+        let is_stored_generated =
+            matches!(generated_as, Some(ast::GeneratedAs::GeneratedStored(_)));
         let not_null = is_identity
             || Self::column_constraints(col)
                 .any(|c| matches!(c, ColumnConstraint::NotNullConstraint(_)));
@@ -1025,10 +1490,37 @@ impl AstVisitor {
         });
         let generation = if Self::is_serial_type(ty.as_deref()) {
             crate::_internal::analysis::facts::ColumnGeneration::Serial
-        } else if is_identity {
-            crate::_internal::analysis::facts::ColumnGeneration::Identity
+        } else if let Some(ast::GeneratedAs::GeneratedIdentity(identity)) = &generated_as {
+            match identity.generated_when() {
+                Some(ast::GeneratedWhen::GeneratedAlways(_)) => {
+                    crate::_internal::analysis::facts::ColumnGeneration::IdentityAlways
+                }
+                Some(ast::GeneratedWhen::GeneratedByDefault(_)) => {
+                    crate::_internal::analysis::facts::ColumnGeneration::IdentityByDefault
+                }
+                None => return None,
+            }
+        } else if is_stored_generated {
+            let Some(ast::GeneratedAs::GeneratedStored(generated)) = &generated_as else {
+                unreachable!("generated-expression guard checked above")
+            };
+            match generated.generated_kind() {
+                Some(ast::GeneratedKind::Stored(_)) => {
+                    crate::_internal::analysis::facts::ColumnGeneration::GeneratedStored
+                }
+                Some(ast::GeneratedKind::Virtual(_)) => {
+                    crate::_internal::analysis::facts::ColumnGeneration::GeneratedVirtual
+                }
+                None => return None,
+            }
         } else {
             crate::_internal::analysis::facts::ColumnGeneration::Ordinary
+        };
+        let identity_sequence = match &generated_as {
+            Some(ast::GeneratedAs::GeneratedIdentity(identity)) => {
+                Some(Self::identity_sequence_options(identity)?)
+            }
+            _ => None,
         };
         Some(ColumnFact {
             name,
@@ -1040,6 +1532,13 @@ impl AstVisitor {
             unique_constraint_name,
             default,
             generation,
+            identity_sequence,
+            generated_expr: match generated_as {
+                Some(ast::GeneratedAs::GeneratedStored(stored)) => stored
+                    .expr()
+                    .map(crate::_internal::analysis::expr_visitor::ExprVisitor::convert),
+                _ => None,
+            },
         })
     }
 
@@ -1059,8 +1558,42 @@ impl AstVisitor {
         opt: AlterColumnOption,
     ) -> Option<AlterTableActionFact> {
         match opt {
-            AlterColumnOption::SetStorage(_) => {
-                Some(AlterTableActionFact::SetStorage { column: col_name })
+            AlterColumnOption::SetStorage(storage) => Some(AlterTableActionFact::SetStorage {
+                column: col_name,
+                mode: storage
+                    .storage_mode()?
+                    .syntax()
+                    .text()
+                    .to_string()
+                    .to_ascii_uppercase(),
+            }),
+            AlterColumnOption::SetCompression(compression) => {
+                let method = compression.compression_method_name()?;
+                Some(AlterTableActionFact::SetCompression {
+                    column: col_name,
+                    method: method
+                        .ident_token()
+                        .map(|token| Self::resolve_identifier_token(token.text())),
+                })
+            }
+            AlterColumnOption::SetStatistics(statistics) => {
+                let target = statistics
+                    .expr()?
+                    .syntax()
+                    .text()
+                    .to_string()
+                    .parse::<i32>()
+                    .ok()?;
+                Some(AlterTableActionFact::SetStatistics {
+                    column: col_name,
+                    target,
+                })
+            }
+            AlterColumnOption::DropExpression(drop_expression) => {
+                Some(AlterTableActionFact::DropExpression {
+                    column: col_name,
+                    if_exists: drop_expression.if_exists().is_some(),
+                })
             }
             AlterColumnOption::SetNotNull(_) => {
                 Some(AlterTableActionFact::SetNotNull { column: col_name })
@@ -1093,29 +1626,21 @@ impl AstVisitor {
                     .map(crate::_internal::analysis::expr_visitor::ExprVisitor::convert)
                     .unwrap_or(ExprIr::Omitted),
             }),
-            AlterColumnOption::SetOptions(so) => Some(AlterTableActionFact::SetOptions {
+            AlterColumnOption::SetOptions(options) => Some(AlterTableActionFact::SetOptions {
                 column: col_name,
-                attributes: so
-                    .attribute_list()
-                    .map(|al| {
-                        al.attribute_options()
-                            .map(|ao| crate::_internal::analysis::facts::AttributeFact {
-                                name: ao
-                                    .name()
-                                    .and_then(|n| n.ident_token())
-                                    .map(|t| t.text().to_string())
-                                    .unwrap_or_default(),
-                                value: ao
-                                    .syntax()
-                                    .descendants()
-                                    .find_map(ast::Literal::cast)
-                                    .map(|l| l.syntax().text().to_string())
-                                    .unwrap_or_default(),
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default(),
+                attributes: Self::extract_attribute_options(options.attribute_list())?,
             }),
+            AlterColumnOption::ResetOptions(options) => {
+                let names = options
+                    .attribute_list()?
+                    .attribute_options()
+                    .map(|option| option.name().map(|name| name.syntax().text().to_string()))
+                    .collect::<Option<Vec<_>>>()?;
+                (!names.is_empty()).then_some(AlterTableActionFact::ResetOptions {
+                    column: col_name,
+                    names,
+                })
+            }
             AlterColumnOption::Inherit(i) => Some(AlterTableActionFact::Inherit {
                 column: col_name,
                 parent: i
@@ -1140,6 +1665,21 @@ impl AstVisitor {
             }),
             _ => None,
         }
+    }
+
+    fn extract_attribute_options(
+        list: Option<ast::AttributeList>,
+    ) -> Option<Vec<crate::_internal::analysis::facts::AttributeFact>> {
+        let attributes = list?
+            .attribute_options()
+            .map(|option| {
+                Some(crate::_internal::analysis::facts::AttributeFact {
+                    name: option.name()?.syntax().text().to_string(),
+                    value: option.attribute_value()?.syntax().text().to_string(),
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        (!attributes.is_empty()).then_some(attributes)
     }
 
     fn extract_add_constraint_fact(
@@ -1204,6 +1744,7 @@ impl AstVisitor {
                 .unwrap_or((Vec::new(), false));
             return Some(AlterTableActionFact::AddCheckConstraint {
                 constraint_name,
+                definition: cc.expr()?.syntax().text().to_string(),
                 columns,
                 columns_complete,
                 not_valid,
@@ -1342,6 +1883,8 @@ impl AstVisitor {
                         .and_then(|clause| clause.constraint_name())
                         .and_then(|name| name.ident_token())
                         .map(|token| Self::resolve_identifier_token(token.text())),
+                    name_hint: None,
+                    definition: check.expr()?.syntax().text().to_string(),
                     columns,
                     columns_complete,
                 })
@@ -2044,13 +2587,23 @@ impl AstVisitor {
                     })
                     .collect::<Option<Vec<_>>>()?,
             },
-            // Range/composite/base types carry subtype, attribute, function,
-            // and/or catalog dependency metadata that TypeState does not
-            // retain. Keep enum creation exact, but route these forms through
-            // the explicit opaque path.
-            ast::CreateTypeKind::RangeType(_)
-            | ast::CreateTypeKind::CompositeType(_)
-            | ast::CreateTypeKind::BaseType(_) => return None,
+            ast::CreateTypeKind::CompositeType(composite) => TypeCreationKind::Composite {
+                fields: composite
+                    .composite_field_list()?
+                    .composite_field_defs()
+                    .map(|field| {
+                        Some(crate::_internal::analysis::facts::CompositeFieldFact {
+                            name: Self::resolve_identifier_token(
+                                field.name()?.ident_token()?.text(),
+                            ),
+                            data_type: field.ty()?.syntax().text().to_string(),
+                        })
+                    })
+                    .collect::<Option<Vec<_>>>()?,
+            },
+            // Range/base types carry subtype or function metadata that the
+            // state model does not retain.
+            ast::CreateTypeKind::RangeType(_) | ast::CreateTypeKind::BaseType(_) => return None,
         };
 
         Some(StatementFact::CreateType(CreateTypeFact { name, kind }))
@@ -2186,6 +2739,7 @@ impl AstVisitor {
             name,
             table,
             function,
+            row_level: matches!(node.trigger_level(), Some(ast::TriggerLevel::ForEachRow(_))),
         })
     }
 
@@ -2264,6 +2818,8 @@ impl AstVisitor {
                         unique_constraint_name: None,
                         default: None,
                         generation: crate::_internal::analysis::facts::ColumnGeneration::Ordinary,
+                        identity_sequence: None,
+                        generated_expr: None,
                     })
                 })
                 .collect();

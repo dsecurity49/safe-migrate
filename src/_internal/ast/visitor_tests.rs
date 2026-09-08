@@ -155,7 +155,7 @@ mod tests {
         assert_eq!(columns.len(), 1);
         assert_eq!(
             columns[0].generation,
-            crate::_internal::analysis::facts::ColumnGeneration::Identity
+            crate::_internal::analysis::facts::ColumnGeneration::IdentityAlways
         );
         assert!(columns[0].not_null);
     }
@@ -220,6 +220,8 @@ mod tests {
             [
                 TableConstraintFact::Check {
                     constraint_name: Some(check),
+                    name_hint: _,
+                    definition: _,
                     columns: check_columns,
                     columns_complete: check_complete,
                 },
@@ -299,6 +301,7 @@ mod tests {
 
         let StatementFact::CreateTrigger {
             function: Some(function),
+            row_level,
             ..
         } = fact
         else {
@@ -309,6 +312,19 @@ mod tests {
             Some("s".into())
         );
         assert_eq!(function.name.resolve(), "notify_func");
+        assert!(row_level);
+
+        let statement_fact = parse_and_extract_statement(
+            "CREATE TRIGGER trg AFTER INSERT ON s.t1 EXECUTE FUNCTION s.notify_func();",
+        )
+        .expect("statement trigger fact");
+        assert!(matches!(
+            statement_fact,
+            StatementFact::CreateTrigger {
+                row_level: false,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -384,6 +400,22 @@ mod tests {
                 variants: vec!["sad".into(), "it's fine".into(), "line\nbreak".into()]
             }
         );
+    }
+
+    #[test]
+    fn create_composite_type_preserves_ordered_fields() {
+        let fact =
+            parse_and_extract_statement(r#"CREATE TYPE address AS (street text, zip integer);"#)
+                .expect("composite type fact");
+        let StatementFact::CreateType(create_type) = fact else {
+            panic!("expected create type fact");
+        };
+        assert!(matches!(
+            create_type.kind,
+            crate::_internal::analysis::facts::TypeCreationKind::Composite { fields }
+                if fields.iter().map(|field| (field.name.as_str(), field.data_type.as_str())).collect::<Vec<_>>()
+                    == vec![("street", "text"), ("zip", "integer")]
+        ));
     }
 
     #[test]
@@ -872,6 +904,231 @@ mod tests {
             }
             _ => panic!("Expected Vacuum fact"),
         }
+    }
+
+    #[test]
+    fn lock_and_truncate_preserve_targets_and_options() {
+        let lock = parse_and_extract_statement(
+            "LOCK TABLE ONLY public.events IN ACCESS EXCLUSIVE MODE NOWAIT;",
+        )
+        .expect("LOCK TABLE fact");
+        match lock {
+            StatementFact::Lock {
+                targets,
+                mode,
+                nowait,
+            } => {
+                assert_eq!(targets.len(), 1);
+                assert!(targets[0].only);
+                assert_eq!(targets[0].name.schema.as_ref().unwrap().resolve(), "public");
+                assert_eq!(targets[0].name.name.resolve(), "events");
+                assert_eq!(
+                    mode,
+                    crate::_internal::analysis::facts::LockModeFact::AccessExclusive
+                );
+                assert!(nowait);
+            }
+            other => panic!("expected LOCK TABLE fact, got {other:?}"),
+        }
+
+        let truncate = parse_and_extract_statement(
+            "TRUNCATE TABLE ONLY public.events, audit RESTART IDENTITY CASCADE;",
+        )
+        .expect("TRUNCATE fact");
+        match truncate {
+            StatementFact::Truncate {
+                targets,
+                cascade,
+                restart_identity,
+            } => {
+                assert_eq!(targets.len(), 2);
+                assert!(targets[0].only);
+                assert_eq!(targets[0].name.name.resolve(), "events");
+                assert!(!targets[1].only);
+                assert_eq!(targets[1].name.name.resolve(), "audit");
+                assert!(cascade);
+                assert!(restart_identity);
+            }
+            other => panic!("expected TRUNCATE fact, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn detach_partition_preserves_its_lifecycle_mode() {
+        let facts = parse_and_extract(
+            "ALTER TABLE measurements DETACH PARTITION measurements_2025;
+             ALTER TABLE measurements DETACH PARTITION measurements_2026 CONCURRENTLY;
+             ALTER TABLE measurements DETACH PARTITION measurements_2027 FINALIZE;",
+        );
+        for (fact, expected_child, expected_mode) in [
+            (
+                &facts[0],
+                "measurements_2025",
+                crate::_internal::analysis::facts::DetachPartitionMode::Immediate,
+            ),
+            (
+                &facts[1],
+                "measurements_2026",
+                crate::_internal::analysis::facts::DetachPartitionMode::Concurrently,
+            ),
+            (
+                &facts[2],
+                "measurements_2027",
+                crate::_internal::analysis::facts::DetachPartitionMode::Finalize,
+            ),
+        ] {
+            assert!(matches!(
+                fact,
+                StatementFact::AlterTable { actions, .. }
+                    if matches!(actions.as_slice(), [AlterTableActionFact::DetachPartition { child, mode }]
+                        if child.name.resolve() == expected_child && *mode == expected_mode)
+            ));
+        }
+    }
+
+    #[test]
+    fn select_into_preserves_relation_name_and_persistence() {
+        let facts = parse_and_extract(
+            "SELECT id INTO TEMPORARY TABLE recent_events FROM events;
+             SELECT id INTO UNLOGGED TABLE snapshot FROM events;
+             SELECT id AS copied_id, name INTO projected FROM events;",
+        );
+        assert!(matches!(
+            &facts[0],
+            StatementFact::CreateTable {
+                name,
+                as_select: true,
+                persistence,
+                select_source: Some(source),
+                select_outputs,
+                select_projection_complete: true,
+                ..
+            }
+                if name.name.resolve() == "recent_events"
+                    && source.name.resolve() == "events"
+                    && matches!(select_outputs.as_slice(), [
+                        crate::_internal::analysis::facts::SelectOutputFact::Column {
+                            source_name,
+                            output_name,
+                        }
+                    ] if source_name == "id" && output_name == "id")
+                    && *persistence
+                        == crate::_internal::analysis::facts::PersistenceFact::Temporary
+        ));
+        assert!(matches!(
+            &facts[1],
+            StatementFact::CreateTable { name, as_select: true, persistence, .. }
+                if name.name.resolve() == "snapshot"
+                    && *persistence
+                        == crate::_internal::analysis::facts::PersistenceFact::Unlogged
+        ));
+        assert!(
+            matches!(
+                &facts[2],
+                StatementFact::CreateTable {
+                    select_outputs,
+                    select_projection_complete: true,
+                    ..
+                } if matches!(select_outputs.as_slice(), [
+                    crate::_internal::analysis::facts::SelectOutputFact::Column {
+                        source_name,
+                        output_name,
+                    },
+                    crate::_internal::analysis::facts::SelectOutputFact::Column {
+                        source_name: second_source,
+                        output_name: second_output,
+                    }
+                ] if source_name == "id" && output_name == "copied_id"
+                    && second_source == "name" && second_output == "name")
+            ),
+            "unexpected projected SELECT INTO fact: {:?}",
+            facts[2]
+        );
+    }
+
+    #[test]
+    fn create_table_inherits_preserves_all_parent_references() {
+        let fact = parse_and_extract_statement(
+            "CREATE TABLE child (local_value integer) INHERITS (public.parent_a, parent_b);",
+        )
+        .expect("CREATE TABLE INHERITS fact");
+        assert!(matches!(
+            fact,
+            StatementFact::CreateTable { inherits, .. }
+                if inherits.len() == 2
+                    && inherits[0].schema.as_ref().is_some_and(|schema| schema.resolve() == "public")
+                    && inherits[0].name.resolve() == "parent_a"
+                    && inherits[1].name.resolve() == "parent_b"
+        ));
+    }
+
+    #[test]
+    fn create_table_like_preserves_supported_property_selection() {
+        let fact = parse_and_extract_statement("CREATE TABLE copy (LIKE public.source);")
+            .expect("unadorned LIKE fact");
+        assert!(matches!(
+            fact,
+            StatementFact::CreateTable { like_sources, .. }
+                if like_sources.len() == 1
+                    && like_sources[0].relation.schema.as_ref().is_some_and(|schema| schema.resolve() == "public")
+                    && like_sources[0].relation.name.resolve() == "source"
+        ));
+        let with_properties = parse_and_extract_statement(
+            "CREATE TABLE copy_options (LIKE source INCLUDING DEFAULTS INCLUDING GENERATED INCLUDING STORAGE INCLUDING COMPRESSION INCLUDING STATISTICS);",
+        )
+        .expect("supported LIKE properties");
+        assert!(matches!(
+            with_properties,
+            StatementFact::CreateTable { like_sources, .. }
+                if matches!(like_sources.as_slice(), [source]
+                    if source.properties.defaults
+                        && source.properties.generated
+                        && source.properties.storage
+                        && source.properties.compression
+                        && source.properties.statistics)
+        ));
+        assert!(matches!(
+            parse_and_extract_statement(
+                "CREATE TABLE indexed_like (LIKE source INCLUDING INDEXES);"
+            ),
+            Some(StatementFact::CreateTable { like_sources, .. })
+                if like_sources[0].properties.indexes
+        ));
+        assert!(parse_and_extract_statement(
+            "CREATE TABLE all_but_objects (LIKE source INCLUDING ALL EXCLUDING INDEXES EXCLUDING CONSTRAINTS EXCLUDING IDENTITY);"
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn temporary_table_on_commit_uses_the_typed_action() {
+        let fact = parse_and_extract_statement(
+            "CREATE TEMPORARY TABLE work (id integer) ON COMMIT DELETE ROWS;",
+        )
+        .expect("temporary ON COMMIT fact");
+        assert!(matches!(
+            fact,
+            StatementFact::CreateTable {
+                persistence: crate::_internal::analysis::facts::PersistenceFact::Temporary,
+                on_commit: Some(crate::_internal::analysis::facts::OnCommitFact::DeleteRows),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn alter_table_options_preserve_typed_keys_and_values() {
+        let fact = parse_and_extract_statement(
+            "ALTER TABLE entries SET (fillfactor = 70, autovacuum_enabled = false);",
+        )
+        .expect("table options fact");
+        assert!(matches!(
+            fact,
+            StatementFact::AlterTable { actions, .. }
+                if matches!(actions.as_slice(), [crate::_internal::analysis::facts::AlterTableActionFact::SetTableOptions { attributes }]
+                    if attributes.iter().any(|attribute| attribute.name == "fillfactor" && attribute.value == "70")
+                        && attributes.iter().any(|attribute| attribute.name == "autovacuum_enabled" && attribute.value == "false"))
+        ));
     }
 
     #[test]
@@ -2216,7 +2473,7 @@ mod tests {
                     actions.as_slice(),
                     [AlterTableActionFact::AddColumn {
                         name,
-                        generation: crate::_internal::analysis::facts::ColumnGeneration::Identity,
+                        generation: crate::_internal::analysis::facts::ColumnGeneration::IdentityAlways,
                         not_null: true,
                         ..
                     }] if name == "generated_id"
@@ -2244,6 +2501,7 @@ mod tests {
                         columns,
                         not_valid: true,
                         columns_complete: true,
+                        definition: _,
                     }] if name == "events_id_positive"
                         && columns == &["generated_id".to_string()]
                 )
@@ -2271,37 +2529,172 @@ mod tests {
             StatementFact::AlterTable { actions, .. }
                 if matches!(
                     actions.as_slice(),
-                    [AlterTableActionFact::ReplicaIdentity { option }]
-                        if option == "events_identity_idx"
+                    [AlterTableActionFact::ReplicaIdentity {
+                        option: crate::_internal::analysis::facts::ReplicaIdentityFact::UsingIndex(index)
+                    }]
+                        if index.name.resolve() == "events_identity_idx"
                 )
         ));
     }
 
     #[test]
-    fn unsupported_alter_table_actions_are_not_silent_noops() {
-        let parsed = SourceFile::parse("ALTER TABLE events SET WITHOUT CLUSTER;");
-        let statement = parsed.tree().stmts().next().expect("statement");
-
-        assert!(
-            AstVisitor::extract(&statement).is_none(),
-            "parser-accepted but unmodeled ALTER TABLE actions must use the opaque engine path"
+    fn alter_table_rule_modes_use_typed_names_and_modes() {
+        let facts = parse_and_extract(
+            "ALTER TABLE events ENABLE RULE rewrite_rule;
+             ALTER TABLE events DISABLE RULE rewrite_rule;
+             ALTER TABLE events ENABLE REPLICA RULE rewrite_rule;
+             ALTER TABLE events ENABLE ALWAYS RULE rewrite_rule;",
         );
+        let expected = [
+            crate::_internal::analysis::facts::RuleEnableModeFact::Origin,
+            crate::_internal::analysis::facts::RuleEnableModeFact::Disabled,
+            crate::_internal::analysis::facts::RuleEnableModeFact::Replica,
+            crate::_internal::analysis::facts::RuleEnableModeFact::Always,
+        ];
+        assert_eq!(facts.len(), expected.len());
+        for (fact, expected_mode) in facts.iter().zip(expected) {
+            assert!(matches!(
+                fact,
+                StatementFact::AlterTable { actions, .. }
+                    if matches!(actions.as_slice(), [AlterTableActionFact::SetRuleMode { rule_name: Some(name), mode }]
+                        if name == "rewrite_rule" && *mode == expected_mode)
+            ));
+        }
     }
 
     #[test]
-    fn unsupported_create_table_copy_forms_are_not_silent_noops() {
-        for sql in [
-            "CREATE TABLE copied (LIKE source);",
-            "CREATE TABLE child () INHERITS (parent);",
-            "CREATE TABLE typed OF composite_type;",
-        ] {
-            let parsed = SourceFile::parse(sql);
-            let statement = parsed.tree().stmts().next().expect("statement");
-            assert!(
-                AstVisitor::extract(&statement).is_none(),
-                "unsupported CREATE TABLE form must use the opaque engine path: {sql}"
-            );
+    fn trigger_user_target_is_preserved_without_including_constraint_triggers() {
+        let facts = parse_and_extract(
+            "ALTER TABLE events DISABLE TRIGGER USER;
+             ALTER TABLE events ENABLE TRIGGER USER;",
+        );
+        for fact in facts {
+            assert!(matches!(
+                fact,
+                StatementFact::AlterTable { actions, .. }
+                    if matches!(actions.as_slice(),
+                        [AlterTableActionFact::DisableTrigger { trigger_name: Some(name) }]
+                            | [AlterTableActionFact::EnableTrigger { trigger_name: Some(name) }]
+                        if name == "USER")
+            ));
         }
+    }
+
+    #[test]
+    fn typed_column_storage_and_generated_expression_options_preserve_values() {
+        let facts = parse_and_extract(
+            "ALTER TABLE events ALTER COLUMN payload SET STORAGE EXTERNAL;
+             ALTER TABLE events ALTER COLUMN payload SET COMPRESSION lz4;
+             ALTER TABLE events ALTER COLUMN payload SET COMPRESSION DEFAULT;
+             ALTER TABLE events ALTER COLUMN payload SET STATISTICS 100;
+             ALTER TABLE events ALTER COLUMN payload SET (n_distinct = -0.5);
+             ALTER TABLE events ALTER COLUMN payload RESET (n_distinct);
+             ALTER TABLE events ALTER COLUMN payload SET EXPRESSION AS (source_id + 1);
+             ALTER TABLE events ALTER COLUMN payload DROP EXPRESSION IF EXISTS;",
+        );
+        assert!(matches!(
+            &facts[0],
+            StatementFact::AlterTable { actions, .. }
+                if matches!(actions.as_slice(), [AlterTableActionFact::SetStorage { column, mode }]
+                    if column == "payload" && mode == "EXTERNAL")
+        ));
+        assert!(matches!(
+            &facts[1],
+            StatementFact::AlterTable { actions, .. }
+                if matches!(actions.as_slice(), [AlterTableActionFact::SetCompression { column, method }]
+                    if column == "payload" && method.as_deref() == Some("lz4"))
+        ));
+        assert!(matches!(
+            &facts[2],
+            StatementFact::AlterTable { actions, .. }
+                if matches!(actions.as_slice(), [AlterTableActionFact::SetCompression { method: None, .. }])
+        ));
+        assert!(matches!(
+            &facts[3],
+            StatementFact::AlterTable { actions, .. }
+                if matches!(actions.as_slice(), [AlterTableActionFact::SetStatistics { column, target }]
+                    if column == "payload" && target == &100)
+        ));
+        assert!(matches!(
+            &facts[4],
+            StatementFact::AlterTable { actions, .. }
+                if matches!(actions.as_slice(), [AlterTableActionFact::SetOptions { column, attributes }]
+                    if column == "payload"
+                        && attributes.len() == 1
+                        && attributes[0].name == "n_distinct"
+                        && attributes[0].value == "-0.5")
+        ));
+        assert!(matches!(
+            &facts[5],
+            StatementFact::AlterTable { actions, .. }
+                if matches!(actions.as_slice(), [AlterTableActionFact::ResetOptions { column, names }]
+                    if column == "payload" && names == &vec!["n_distinct".to_string()])
+        ));
+        assert!(matches!(
+            &facts[6],
+            StatementFact::AlterTable { actions, .. }
+                if matches!(actions.as_slice(), [AlterTableActionFact::SetExpression { column, .. }]
+                    if column == "payload")
+        ));
+        assert!(matches!(
+            &facts[7],
+            StatementFact::AlterTable { actions, .. }
+                if matches!(actions.as_slice(), [AlterTableActionFact::DropExpression { column, if_exists }]
+                    if column == "payload" && *if_exists)
+        ));
+    }
+
+    #[test]
+    fn create_table_preserves_stored_generated_column_expression() {
+        let fact = parse_and_extract_statement(
+            "CREATE TABLE metrics (value integer, doubled integer GENERATED ALWAYS AS (value * 2) STORED);",
+        )
+        .expect("generated-column CREATE TABLE fact");
+        assert!(matches!(
+            fact,
+            StatementFact::CreateTable { columns, .. }
+                if matches!(columns.as_slice(), [_, column]
+                    if column.generation == crate::_internal::analysis::facts::ColumnGeneration::GeneratedStored
+                        && column.generated_expr.as_ref().and_then(ExprIr::referenced_columns)
+                            .is_some_and(|references| references.len() == 1 && references.contains("value")))
+        ));
+    }
+
+    #[test]
+    fn create_table_preserves_virtual_generated_column_kind() {
+        let fact = parse_and_extract_statement(
+            "CREATE TABLE metrics (value integer, doubled integer GENERATED ALWAYS AS (value * 2) VIRTUAL);",
+        )
+        .expect("virtual generated-column CREATE TABLE fact");
+        assert!(matches!(
+            fact,
+            StatementFact::CreateTable { columns, .. }
+                if matches!(columns.as_slice(), [_, column]
+                    if column.generation == crate::_internal::analysis::facts::ColumnGeneration::GeneratedVirtual
+                        && column.generated_expr.as_ref().and_then(ExprIr::referenced_columns)
+                            .is_some_and(|references| references.contains("value")))
+        ));
+    }
+
+    #[test]
+    fn create_table_like_preserves_catalog_object_selections() {
+        let fact = parse_and_extract_statement(
+            "CREATE TABLE copied (LIKE source INCLUDING ALL EXCLUDING DEFAULTS);",
+        )
+        .expect("typed LIKE fact");
+        assert!(matches!(
+            fact,
+            StatementFact::CreateTable { like_sources, .. }
+                if matches!(like_sources.as_slice(), [source]
+                    if source.properties.constraints
+                        && source.properties.indexes
+                        && source.properties.identity
+                        && source.properties.generated
+                        && source.properties.storage
+                        && source.properties.compression
+                        && source.properties.statistics
+                        && !source.properties.defaults)
+        ));
     }
 
     #[test]
@@ -2310,10 +2703,13 @@ mod tests {
             "CREATE TEMP TABLE snapshot ON COMMIT DROP AS SELECT id FROM source;",
         );
         let statement = parsed.tree().stmts().next().expect("statement");
-        assert!(
-            AstVisitor::extract(&statement).is_none(),
-            "CTAS transaction lifecycle must use the opaque engine path"
-        );
+        assert!(matches!(
+            AstVisitor::extract(&statement),
+            Some(StatementFact::CreateTable {
+                as_select: true,
+                ..
+            })
+        ));
 
         let parsed =
             SourceFile::parse("CREATE TABLE snapshot AS SELECT id FROM source WITH NO DATA;");
@@ -2371,10 +2767,7 @@ mod tests {
 
     #[test]
     fn unsupported_create_non_enum_types_are_not_silent() {
-        for sql in [
-            "CREATE TYPE address AS (street text, city text);",
-            "CREATE TYPE floatrange AS RANGE (subtype = float8);",
-        ] {
+        for sql in ["CREATE TYPE floatrange AS RANGE (subtype = float8);"] {
             let parsed = SourceFile::parse(sql);
             let statement = parsed.tree().stmts().next().expect("statement");
             assert!(

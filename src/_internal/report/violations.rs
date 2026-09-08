@@ -1,5 +1,5 @@
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub enum OperationKind {
+pub(crate) enum OperationKind {
     DropColumn,
     DropTable,
     DropIndex,
@@ -21,30 +21,24 @@ pub enum OperationKind {
     CreateIndex,
     CreateTable,
     CreateView,
-    CreateFunction,
-    CreateProcedure,
     AlterFunction,
     AlterProcedure,
     RefreshMaterializedView,
     AttachPartition,
     DetachPartition,
     VacuumFull,
+    LockTable,
+    TruncateTable,
     Grant,
-    RevokeGrant,
     AlterType,
-    CreateTrigger,
     CreatePolicy,
     DisableTrigger,
     EnableTrigger,
-    RenameTable,
-    RenameColumn,
     Rename,
     OpaqueSql,
     CreateSchema,
     SetDefault,
     CreateSequence,
-    CreateDomain,
-    AlterSchema,
     Conflict,
     Irreversible,
     UnresolvedReference,
@@ -75,30 +69,24 @@ impl std::fmt::Display for OperationKind {
             OperationKind::CreateIndex => write!(f, "create_index"),
             OperationKind::CreateTable => write!(f, "create_table"),
             OperationKind::CreateView => write!(f, "create_view"),
-            OperationKind::CreateFunction => write!(f, "create_function"),
-            OperationKind::CreateProcedure => write!(f, "create_procedure"),
             OperationKind::AlterFunction => write!(f, "alter_function"),
             OperationKind::AlterProcedure => write!(f, "alter_procedure"),
             OperationKind::RefreshMaterializedView => write!(f, "refresh_materialized_view"),
             OperationKind::AttachPartition => write!(f, "attach_partition"),
             OperationKind::DetachPartition => write!(f, "detach_partition"),
             OperationKind::VacuumFull => write!(f, "vacuum_full"),
+            OperationKind::LockTable => write!(f, "lock_table"),
+            OperationKind::TruncateTable => write!(f, "truncate_table"),
             OperationKind::Grant => write!(f, "grant"),
-            OperationKind::RevokeGrant => write!(f, "revoke_grant"),
             OperationKind::AlterType => write!(f, "alter_type"),
-            OperationKind::CreateTrigger => write!(f, "create_trigger"),
             OperationKind::CreatePolicy => write!(f, "create_policy"),
             OperationKind::DisableTrigger => write!(f, "disable_trigger"),
             OperationKind::EnableTrigger => write!(f, "enable_trigger"),
-            OperationKind::RenameTable => write!(f, "rename_table"),
-            OperationKind::RenameColumn => write!(f, "rename_column"),
             OperationKind::Rename => write!(f, "rename"),
             OperationKind::OpaqueSql => write!(f, "opaque_sql"),
             OperationKind::CreateSchema => write!(f, "create_schema"),
             OperationKind::SetDefault => write!(f, "set_default"),
             OperationKind::CreateSequence => write!(f, "create_sequence"),
-            OperationKind::CreateDomain => write!(f, "create_domain"),
-            OperationKind::AlterSchema => write!(f, "alter_schema"),
             OperationKind::Conflict => write!(f, "conflict"),
             OperationKind::Irreversible => write!(f, "irreversible"),
             OperationKind::UnresolvedReference => write!(f, "unresolved_reference"),
@@ -108,7 +96,7 @@ impl std::fmt::Display for OperationKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub enum ObjectKind {
+pub(crate) enum ObjectKind {
     Table,
     Index,
     View,
@@ -120,7 +108,6 @@ pub enum ObjectKind {
     Schema,
     Role,
     Publication,
-    Subscription,
     Database,
     Domain,
     Policy,
@@ -143,7 +130,6 @@ impl std::fmt::Display for ObjectKind {
             ObjectKind::Schema => write!(f, "schema"),
             ObjectKind::Role => write!(f, "role"),
             ObjectKind::Publication => write!(f, "publication"),
-            ObjectKind::Subscription => write!(f, "subscription"),
             ObjectKind::Database => write!(f, "database"),
             ObjectKind::Domain => write!(f, "domain"),
             ObjectKind::Policy => write!(f, "policy"),
@@ -157,14 +143,14 @@ impl std::fmt::Display for ObjectKind {
 /// ViolationTier represents the severity of a finding.
 /// Tier1 is declared first so `derive(Ord)` sorts it before Tier2 and Tier3.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
-pub enum ViolationTier {
+pub(crate) enum ViolationTier {
     Tier1, // HALT — Access Exclusive / data-destructive, sorts first
     Tier2, // WARN — Share Row Exclusive / cautious
     Tier3, // SAFE — informational / low risk, sorts last
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
-pub struct Violation {
+pub(crate) struct Violation {
     #[serde(skip)]
     pub source_range: Option<rowan::TextRange>,
     pub rule_id: &'static str,
@@ -183,7 +169,7 @@ pub struct Violation {
 /// Stable source location attached at reporting time. Rules remain independent
 /// of file layout; the engine derives this from the parsed statement range.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct SourceLocation {
+pub(crate) struct SourceLocation {
     pub file: String,
     pub line: usize,
     pub column: usize,
@@ -192,7 +178,7 @@ pub struct SourceLocation {
 /// A violation paired with the file and line that produced it. The flattened
 /// serialization keeps the JSON violation schema additive.
 #[derive(Debug, Clone, serde::Serialize)]
-pub struct ReportFinding {
+pub(crate) struct ReportFinding {
     #[serde(flatten)]
     pub violation: Violation,
     #[serde(skip_serializing_if = "Option::is_none")]

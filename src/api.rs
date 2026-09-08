@@ -50,10 +50,11 @@ use crate::_internal::analysis::state::{
     AnalysisState as InternalAnalysisState, Confidence as InternalConfidence,
 };
 use crate::_internal::db::cache::{
-    CACHE_FORMAT_VERSION, CACHE_V7_MAGIC, DbCache as InternalDbCache, DbCacheVersioned,
+    CACHE_FORMAT_VERSION, CACHE_V8_MAGIC, DbCache as InternalDbCache, DbCacheVersioned,
 };
 use crate::_internal::db::cache_file::{
-    MAX_CACHE_DECODE_BYTES, is_encrypted_cache_bytes, read_cache_bytes, unprotect_cache_bytes,
+    MAX_CACHE_DECODE_BYTES, decode_hex_key, is_encrypted_cache_bytes, read_cache_bytes,
+    unprotect_cache_bytes, unprotect_cache_bytes_with_key,
 };
 use crate::_internal::engine::engine::SafeMigrateEngine;
 use crate::_internal::model::function::RoutineKind;
@@ -74,6 +75,7 @@ use std::fmt;
 use std::io::Read;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
+use zeroize::{Zeroize, Zeroizing};
 
 /// Broad category of a supported API failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -122,6 +124,18 @@ impl Error {
             kind,
             message: message.into(),
             source: Some(Box::new(source)),
+        }
+    }
+
+    fn with_anyhow_source(
+        kind: ErrorKind,
+        message: impl Into<String>,
+        source: anyhow::Error,
+    ) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+            source: Some(source.into_boxed_dyn_error()),
         }
     }
 
@@ -193,6 +207,96 @@ impl std::error::Error for Error {
     }
 }
 
+/// Validated PostgreSQL connection input for embedded synchronization.
+///
+/// Its debug representation is always redacted. Connections must target
+/// localhost or a Unix socket, matching the CLI security boundary.
+pub struct DatabaseUrl(String);
+
+impl DatabaseUrl {
+    /// Validate and retain a PostgreSQL connection string without connecting.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::Configuration`] for empty, malformed, or remote
+    /// connection strings.
+    pub fn new(value: impl Into<String>) -> Result<Self, Error> {
+        let mut value = value.into();
+        if let Err(error) = crate::_internal::sync::validate_database_url(&value) {
+            value.zeroize();
+            let message = error.to_string();
+            return Err(Error::with_anyhow_source(
+                ErrorKind::Configuration,
+                message,
+                error,
+            ));
+        }
+        Ok(Self(value))
+    }
+
+    fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for DatabaseUrl {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("DatabaseUrl([REDACTED])")
+    }
+}
+
+impl Drop for DatabaseUrl {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+/// Validated 256-bit key for encrypted baseline caches.
+///
+/// Key material is never exposed through formatting or serialization.
+pub struct CacheKey([u8; 32]);
+
+impl CacheKey {
+    /// Retain an already decoded 256-bit cache key.
+    pub fn from_bytes(value: [u8; 32]) -> Self {
+        Self(value)
+    }
+
+    /// Decode a 64-character hexadecimal cache key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::Configuration`] when the value is not exactly 32
+    /// bytes of hexadecimal key material.
+    pub fn from_hex(value: &str) -> Result<Self, Error> {
+        decode_hex_key(value.trim())
+            .map(Self)
+            .map_err(|error| Error::configuration(error.to_string()))
+    }
+
+    fn expose(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for CacheKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CacheKey([REDACTED])")
+    }
+}
+
+impl Drop for CacheKey {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+impl From<[u8; 32]> for CacheKey {
+    fn from(value: [u8; 32]) -> Self {
+        Self::from_bytes(value)
+    }
+}
+
 /// Confidence in the final migration result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[non_exhaustive]
@@ -218,56 +322,106 @@ pub enum Tier {
 /// Stable category of the SQL operation that produced a finding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[non_exhaustive]
-#[allow(missing_docs)]
 pub enum OperationKind {
+    /// Drops a table column.
     DropColumn,
+    /// Drops a table.
     DropTable,
+    /// Drops an index.
     DropIndex,
+    /// Drops a view.
     DropView,
+    /// Drops a materialized view.
     DropMaterializedView,
+    /// Drops a function.
     DropFunction,
+    /// Drops a procedure.
     DropProcedure,
+    /// Drops a schema.
     DropSchema,
+    /// Drops a database.
     DropDatabase,
+    /// Drops a sequence.
     DropSequence,
+    /// Drops a domain.
     DropDomain,
+    /// Drops a type.
     DropType,
+    /// Drops a publication.
     DropPublication,
+    /// Drops a trigger.
     DropTrigger,
+    /// Drops a row-level security policy.
     DropPolicy,
+    /// Adds a table column.
     AddColumn,
+    /// Changes a column's data type.
     AlterColumnType,
+    /// Adds a table constraint.
     AddConstraint,
+    /// Creates an index.
     CreateIndex,
+    /// Creates a table.
     CreateTable,
+    /// Creates a view.
     CreateView,
+    /// Creates a function.
     CreateFunction,
+    /// Creates a procedure.
     CreateProcedure,
+    /// Changes a function.
     AlterFunction,
+    /// Changes a procedure.
     AlterProcedure,
+    /// Refreshes a materialized view.
     RefreshMaterializedView,
+    /// Attaches a partition.
     AttachPartition,
+    /// Detaches a partition.
     DetachPartition,
+    /// Runs `VACUUM FULL`.
     VacuumFull,
+    /// Acquires an explicit table lock.
+    LockTable,
+    /// Removes all rows from one or more tables.
+    TruncateTable,
+    /// Grants privileges.
     Grant,
+    /// Revokes privileges.
     RevokeGrant,
+    /// Changes a type definition.
     AlterType,
+    /// Creates a trigger.
     CreateTrigger,
+    /// Creates a row-level security policy.
     CreatePolicy,
+    /// Disables a trigger.
     DisableTrigger,
+    /// Enables a trigger.
     EnableTrigger,
+    /// Renames a table.
     RenameTable,
+    /// Renames a table column.
     RenameColumn,
+    /// Renames an object with no more specific category.
     Rename,
     /// SQL whose effects cannot be modeled precisely.
     OpaqueSql,
+    /// Creates a schema.
     CreateSchema,
+    /// Sets or drops a column default.
     SetDefault,
+    /// Creates a sequence.
     CreateSequence,
+    /// Creates a domain.
     CreateDomain,
+    /// Changes a schema.
     AlterSchema,
+    /// Represents a conflict detected before execution.
     Conflict,
+    /// Represents an irreversible operation.
     Irreversible,
+    /// Represents a reference that could not be resolved safely.
     UnresolvedReference,
     /// A named operation outside the stable categories above.
     Other(String),
@@ -276,23 +430,38 @@ pub enum OperationKind {
 /// Stable category of the database object associated with a finding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[non_exhaustive]
-#[allow(missing_docs)]
 pub enum ObjectKind {
+    /// A table.
     Table,
+    /// An index.
     Index,
+    /// A view.
     View,
+    /// A materialized view.
     MaterializedView,
+    /// A function.
     Function,
+    /// A procedure.
     Procedure,
+    /// A trigger.
     Trigger,
+    /// A sequence.
     Sequence,
+    /// A schema.
     Schema,
+    /// A database role.
     Role,
+    /// A logical replication publication.
     Publication,
+    /// A logical replication subscription.
     Subscription,
+    /// A database.
     Database,
+    /// A domain.
     Domain,
+    /// A row-level security policy.
     Policy,
+    /// A PostgreSQL type.
     Type,
     /// Object whose identity is opaque to the analyzer.
     Opaque,
@@ -582,13 +751,13 @@ impl AnalysisOutcome {
         if let Some(source_database) = &self.baseline.source_database {
             report.push_str(&format!(
                 "- **Source database:** `{}`\n",
-                source_database.replace('`', "'")
+                markdown_inline_code(source_database)
             ));
         }
         if let Some(schemas) = &self.baseline.schemas {
             report.push_str(&format!(
                 "- **Schemas:** `{}`\n",
-                schemas.join(", ").replace('`', "'")
+                markdown_inline_code(&schemas.join(", "))
             ));
         }
         report.push_str(&format!(
@@ -610,7 +779,10 @@ impl AnalysisOutcome {
             &self.violations(),
             &self.inner.confidence,
         )
-        .map_err(|error| Error::new(ErrorKind::Report, error.to_string()))
+        .map_err(|error| {
+            let message = error.to_string();
+            Error::with_anyhow_source(ErrorKind::Report, message, error)
+        })
     }
 
     /// Add explicit conservative evidence before rendering an outcome.
@@ -699,6 +871,27 @@ impl Baseline {
         })
     }
 
+    /// Load an encrypted baseline with key material supplied by the caller.
+    ///
+    /// This entry point avoids process-global environment mutation in embedded
+    /// and concurrent applications.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::Configuration`] when cache encryption is disabled,
+    /// or [`ErrorKind::Cache`] when the cache cannot be authenticated or decoded.
+    pub fn load_with_key(path: &Path, config: &Config, key: &CacheKey) -> Result<Self, Error> {
+        require_cache_encryption(config)?;
+        let (inner, format_version, encrypted) = decode_cache_with_key(path, key)?;
+        Ok(Self {
+            inner,
+            available: true,
+            encrypted,
+            format_version: Some(format_version),
+            path: Some(path.to_path_buf()),
+        })
+    }
+
     /// Load a baseline when it exists, while preserving every other loading
     /// or validation failure.
     ///
@@ -711,6 +904,32 @@ impl Baseline {
     pub fn load_optional(path: &Path, config: &Config) -> Result<Self, Error> {
         match std::fs::metadata(path) {
             Ok(_) => Self::load(path, config),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::unavailable()),
+            Err(error) => Err(Error::with_source(
+                ErrorKind::Cache,
+                format!("failed to inspect {}", path.display()),
+                error,
+            )),
+        }
+    }
+
+    /// Load an explicitly keyed baseline when it exists.
+    ///
+    /// A missing path produces [`Baseline::unavailable`]. Every other error is
+    /// returned, including authentication and decoding failures.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::Configuration`] when cache encryption is disabled,
+    /// or [`ErrorKind::Cache`] for any failure other than a missing file.
+    pub fn load_optional_with_key(
+        path: &Path,
+        config: &Config,
+        key: &CacheKey,
+    ) -> Result<Self, Error> {
+        require_cache_encryption(config)?;
+        match std::fs::metadata(path) {
+            Ok(_) => Self::load_with_key(path, config, key),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::unavailable()),
             Err(error) => Err(Error::with_source(
                 ErrorKind::Cache,
@@ -733,8 +952,9 @@ impl Baseline {
                 .metadata
                 .created_at_unix_secs
                 .is_none_or(|created_at| {
-                    now_unix_seconds().saturating_sub(created_at)
-                        > stale_days.saturating_mul(24 * 60 * 60)
+                    now_unix_seconds()
+                        .checked_sub(created_at)
+                        .is_none_or(|age| age > stale_days.saturating_mul(24 * 60 * 60))
                 })
     }
 
@@ -765,6 +985,16 @@ impl Baseline {
                     .then_some(self.inner.metadata.source_statement_timeout_ms),
             },
         }
+    }
+}
+
+fn require_cache_encryption(config: &Config) -> Result<(), Error> {
+    if config.cache_encryption() {
+        Ok(())
+    } else {
+        Err(Error::configuration(
+            "cache_encryption must be enabled when an explicit cache key is supplied",
+        ))
     }
 }
 
@@ -909,7 +1139,8 @@ pub struct BaselineInspection {
     pub encrypted: bool,
     /// Baseline creation time as Unix seconds.
     pub created_at_unix_secs: Option<u64>,
-    /// Saturating age of the baseline in seconds.
+    /// Age of the baseline in seconds, or `None` when its timestamp is absent
+    /// or lies in the future.
     pub age_seconds: Option<u64>,
     /// Redacted source database name.
     pub source_database: Option<String>,
@@ -987,7 +1218,7 @@ impl BaselineInspection {
             age_seconds: cache
                 .metadata
                 .created_at_unix_secs
-                .map(|created_at| now_unix_seconds().saturating_sub(created_at)),
+                .and_then(|created_at| now_unix_seconds().checked_sub(created_at)),
             source_database: cache.metadata.source_database.clone(),
             schemas: cache.metadata.schemas.clone(),
             coverage: BaselineCoverage {
@@ -1106,6 +1337,12 @@ pub fn validate_config(config: &Config) -> Result<(), Error> {
             "toast_width_threshold_bytes must be greater than zero",
         ));
     }
+    let assumed_version = config.assumed_postgres_version();
+    if assumed_version != 100_000 && !(140_000..=180_999).contains(&assumed_version) {
+        return Err(Error::configuration(
+            "assume_pg_version must be 100000 (the conservative no-baseline default) or a PostgreSQL 14–18 version number",
+        ));
+    }
     config
         .validate_rule_ids(registry::primary_rule_ids())
         .and_then(|_| config.sync_schemas(None).map(|_| ()))?;
@@ -1173,8 +1410,55 @@ pub fn rule(config: &Config, rule_id: &str) -> Result<Rule, Error> {
 pub fn sync(out: &Path, config: &Config, schemas: Option<&[String]>) -> Result<(), Error> {
     validate_config(config)?;
     let schemas = config.sync_schemas(schemas)?;
-    crate::_internal::sync::sync_cache(out, schemas, config.cache_encryption())
-        .map_err(|error| Error::new(ErrorKind::Sync, error.to_string()))
+    crate::_internal::sync::sync_cache(out, schemas, config.cache_encryption()).map_err(|error| {
+        let message = error.to_string();
+        Error::with_anyhow_source(ErrorKind::Sync, message, error)
+    })
+}
+
+/// Synchronize PostgreSQL metadata using caller-owned secret material.
+///
+/// This is the embedded equivalent of [`sync`]. It never reads `DATABASE_URL`
+/// or `SAFE_MIGRATE_CACHE_KEY` from the process environment. Pass a cache key
+/// exactly when `cache_encryption` is enabled in `config`.
+///
+/// # Errors
+///
+/// Returns [`ErrorKind::Configuration`] for invalid settings or an inconsistent
+/// cache-key choice, and [`ErrorKind::Sync`] for connection, catalog, or cache
+/// replacement failures.
+pub fn sync_with_secrets(
+    out: &Path,
+    config: &Config,
+    schemas: Option<&[String]>,
+    database_url: &DatabaseUrl,
+    cache_key: Option<&CacheKey>,
+) -> Result<(), Error> {
+    validate_config(config)?;
+    match (config.cache_encryption(), cache_key) {
+        (true, None) => {
+            return Err(Error::configuration(
+                "an explicit cache key is required when cache_encryption is enabled",
+            ));
+        }
+        (false, Some(_)) => {
+            return Err(Error::configuration(
+                "an explicit cache key requires cache_encryption to be enabled",
+            ));
+        }
+        _ => {}
+    }
+    let schemas = config.sync_schemas(schemas)?;
+    crate::_internal::sync::sync_cache_with_secrets(
+        out,
+        schemas,
+        database_url.expose(),
+        cache_key.map(CacheKey::expose),
+    )
+    .map_err(|error| {
+        let message = error.to_string();
+        Error::with_anyhow_source(ErrorKind::Sync, message, error)
+    })
 }
 
 /// Analyze a single migration against an opaque baseline.
@@ -1233,19 +1517,59 @@ fn decode_cache(
     path: &Path,
     cache_encryption: bool,
 ) -> Result<(InternalDbCache, u32, bool), Error> {
-    let encoded = read_cache_bytes(path).map_err(|error| Error::cache(error.to_string()))?;
+    let encoded = read_cache_bytes(path).map_err(|error| {
+        let detail = error.to_string();
+        Error::with_anyhow_source(
+            ErrorKind::Cache,
+            format!("failed to read {}: {detail}", path.display()),
+            error,
+        )
+    })?;
     let encrypted = is_encrypted_cache_bytes(&encoded);
-    let decrypted = unprotect_cache_bytes(encoded, cache_encryption)
-        .map_err(|error| Error::cache(error.to_string()))?;
+    let decrypted = unprotect_cache_bytes(encoded, cache_encryption).map_err(|error| {
+        let detail = error.to_string();
+        Error::with_anyhow_source(
+            ErrorKind::Cache,
+            format!("failed to unlock {}: {detail}", path.display()),
+            error,
+        )
+    })?;
+    decode_cache_payload(path, decrypted, encrypted)
+}
+
+fn decode_cache_payload(
+    path: &Path,
+    decrypted: Vec<u8>,
+    encrypted: bool,
+) -> Result<(InternalDbCache, u32, bool), Error> {
+    let decrypted = Zeroizing::new(decrypted);
     let decoder = zstd::stream::Decoder::new(std::io::Cursor::new(decrypted)).map_err(|error| {
-        Error::cache(format!(
-            "{}: zstd initialization failed: {error}",
-            path.display()
-        ))
+        Error::with_source(
+            ErrorKind::Cache,
+            format!("{}: zstd initialization failed", path.display()),
+            error,
+        )
     })?;
     let mut decoder = decoder.take(MAX_CACHE_DECODE_BYTES as u64 + 1);
-    let mut header = vec![0; CACHE_V7_MAGIC.len()];
-    if decoder.read_exact(&mut header).is_err() || header != CACHE_V7_MAGIC {
+    let mut header = Vec::with_capacity(CACHE_V8_MAGIC.len());
+    decoder
+        .by_ref()
+        .take(CACHE_V8_MAGIC.len() as u64)
+        .read_to_end(&mut header)
+        .map_err(|error| {
+            Error::with_source(
+                ErrorKind::Cache,
+                format!("{} is truncated or corrupted", path.display()),
+                error,
+            )
+        })?;
+    if header.len() < CACHE_V8_MAGIC.len() && CACHE_V8_MAGIC.starts_with(&header) {
+        return Err(Error::cache(format!(
+            "{} is truncated or corrupted",
+            path.display()
+        )));
+    }
+    if header != CACHE_V8_MAGIC {
         return Err(Error::cache(format!(
             "{} uses an unsupported cache format; run `safe-migrate sync`",
             path.display()
@@ -1264,17 +1588,19 @@ fn decode_cache(
             } else {
                 error.to_string()
             };
-            Error::cache(format!(
-                "{} is corrupted (bincode): {detail}",
-                path.display()
-            ))
+            Error::with_source(
+                ErrorKind::Cache,
+                format!("{} is corrupted (bincode): {detail}", path.display()),
+                error,
+            )
         })?;
     let remaining_before_trailing = decoder.limit();
     std::io::copy(&mut decoder, &mut std::io::sink()).map_err(|error| {
-        Error::cache(format!(
-            "{} is corrupted while decompressing: {error}",
-            path.display()
-        ))
+        Error::with_source(
+            ErrorKind::Cache,
+            format!("{} is corrupted while decompressing", path.display()),
+            error,
+        )
     })?;
     let decompressed = (MAX_CACHE_DECODE_BYTES as u64 + 1) - decoder.limit();
     if decompressed > MAX_CACHE_DECODE_BYTES as u64 {
@@ -1301,6 +1627,29 @@ fn decode_cache(
     Ok((cache, format_version, encrypted))
 }
 
+fn decode_cache_with_key(
+    path: &Path,
+    key: &CacheKey,
+) -> Result<(InternalDbCache, u32, bool), Error> {
+    let encoded = read_cache_bytes(path).map_err(|error| {
+        let detail = error.to_string();
+        Error::with_anyhow_source(
+            ErrorKind::Cache,
+            format!("failed to read {}: {detail}", path.display()),
+            error,
+        )
+    })?;
+    let decrypted = unprotect_cache_bytes_with_key(encoded, key.expose()).map_err(|error| {
+        let detail = error.to_string();
+        Error::with_anyhow_source(
+            ErrorKind::Cache,
+            format!("failed to unlock {}: {detail}", path.display()),
+            error,
+        )
+    })?;
+    decode_cache_payload(path, decrypted, true)
+}
+
 fn now_unix_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1322,6 +1671,19 @@ impl AnalysisOutcome {
 
 fn format_timeout(timeout_ms: Option<u64>) -> String {
     timeout_ms.map_or_else(|| "unknown".to_owned(), |value| format!("{value} ms"))
+}
+
+fn markdown_inline_code(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '`' => output.push('\''),
+            '\r' | '\n' => output.push(' '),
+            character if character.is_control() => output.extend(character.escape_default()),
+            character => output.push(character),
+        }
+    }
+    output
 }
 
 impl From<&InternalFinding> for Finding {
@@ -1416,30 +1778,24 @@ impl From<&InternalOperationKind> for OperationKind {
             InternalOperationKind::CreateIndex => Self::CreateIndex,
             InternalOperationKind::CreateTable => Self::CreateTable,
             InternalOperationKind::CreateView => Self::CreateView,
-            InternalOperationKind::CreateFunction => Self::CreateFunction,
-            InternalOperationKind::CreateProcedure => Self::CreateProcedure,
             InternalOperationKind::AlterFunction => Self::AlterFunction,
             InternalOperationKind::AlterProcedure => Self::AlterProcedure,
             InternalOperationKind::RefreshMaterializedView => Self::RefreshMaterializedView,
             InternalOperationKind::AttachPartition => Self::AttachPartition,
             InternalOperationKind::DetachPartition => Self::DetachPartition,
             InternalOperationKind::VacuumFull => Self::VacuumFull,
+            InternalOperationKind::LockTable => Self::LockTable,
+            InternalOperationKind::TruncateTable => Self::TruncateTable,
             InternalOperationKind::Grant => Self::Grant,
-            InternalOperationKind::RevokeGrant => Self::RevokeGrant,
             InternalOperationKind::AlterType => Self::AlterType,
-            InternalOperationKind::CreateTrigger => Self::CreateTrigger,
             InternalOperationKind::CreatePolicy => Self::CreatePolicy,
             InternalOperationKind::DisableTrigger => Self::DisableTrigger,
             InternalOperationKind::EnableTrigger => Self::EnableTrigger,
-            InternalOperationKind::RenameTable => Self::RenameTable,
-            InternalOperationKind::RenameColumn => Self::RenameColumn,
             InternalOperationKind::Rename => Self::Rename,
             InternalOperationKind::OpaqueSql => Self::OpaqueSql,
             InternalOperationKind::CreateSchema => Self::CreateSchema,
             InternalOperationKind::SetDefault => Self::SetDefault,
             InternalOperationKind::CreateSequence => Self::CreateSequence,
-            InternalOperationKind::CreateDomain => Self::CreateDomain,
-            InternalOperationKind::AlterSchema => Self::AlterSchema,
             InternalOperationKind::Conflict => Self::Conflict,
             InternalOperationKind::Irreversible => Self::Irreversible,
             InternalOperationKind::UnresolvedReference => Self::UnresolvedReference,
@@ -1462,7 +1818,6 @@ impl From<&InternalObjectKind> for ObjectKind {
             InternalObjectKind::Schema => Self::Schema,
             InternalObjectKind::Role => Self::Role,
             InternalObjectKind::Publication => Self::Publication,
-            InternalObjectKind::Subscription => Self::Subscription,
             InternalObjectKind::Database => Self::Database,
             InternalObjectKind::Domain => Self::Domain,
             InternalObjectKind::Policy => Self::Policy,
@@ -1538,5 +1893,28 @@ impl From<EvidenceScope> for internal_evidence::EvidenceScope {
             EvidenceScope::Statement => Self::Statement,
             EvidenceScope::Chain => Self::Chain,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn future_dated_baseline_is_not_treated_as_fresh() {
+        let mut baseline = Baseline::unavailable();
+        baseline.available = true;
+        baseline.inner.metadata.created_at_unix_secs = Some(u64::MAX);
+
+        assert!(baseline.is_stale(u64::MAX));
+        assert_eq!(baseline.inspect().age_seconds, None);
+    }
+
+    #[test]
+    fn markdown_inline_values_render_controls_inertly() {
+        assert_eq!(
+            markdown_inline_code("cache\x1b[2J\r\n`"),
+            "cache\\u{1b}[2J  '"
+        );
     }
 }

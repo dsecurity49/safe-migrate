@@ -135,6 +135,10 @@ impl Config {
     }
 
     /// Return the PostgreSQL version assumed when no connected baseline provides one.
+    ///
+    /// The default `100000` is a conservative compatibility fallback, not a
+    /// claim that PostgreSQL 10 is supported. A configured value must name a
+    /// supported PostgreSQL 14–18 version.
     pub fn assumed_postgres_version(&self) -> u32 {
         self.assume_pg_version
     }
@@ -182,6 +186,9 @@ impl Config {
     }
 
     /// Set the PostgreSQL version assumed when no connected baseline provides one.
+    ///
+    /// Use a PostgreSQL 14–18 server version number only when the deployment
+    /// target is known. [`Config::validate`] rejects unsupported values.
     pub fn with_assumed_postgres_version(mut self, version_num: u32) -> Self {
         self.assume_pg_version = version_num;
         self

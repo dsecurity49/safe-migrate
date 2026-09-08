@@ -472,7 +472,8 @@
         "007_ctas_join.sql",
         "008_ctas_group_by.sql",
         "009_ctas_where.sql",
-        "010_ctas_subquery.sql"
+        "010_ctas_subquery.sql",
+        "005_select_into.sql"
       ],
       "excluded_fixtures": [
         {
@@ -493,10 +494,6 @@
         },
         {
           "fixture": "safe_004_create_unlogged.sql",
-          "reason": "The cumulative canonical baseline contains sm_core.t for rule_18."
-        },
-        {
-          "fixture": "safe_005_select_into.sql",
           "reason": "The cumulative canonical baseline contains sm_core.t for rule_18."
         },
         {
@@ -533,6 +530,12 @@
       "scope": [
         "relations"
       ],
+      "fixture_scopes": {
+        "005_select_into.sql": [
+          "relations",
+          "columns"
+        ]
+      },
       "required_relations": [
         "public.test_table",
         "sm_core.a",

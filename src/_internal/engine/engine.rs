@@ -68,13 +68,13 @@ impl StatementCheckpoint {
     }
 }
 
-pub struct SafeMigrateEngine {
+pub(crate) struct SafeMigrateEngine {
     config: Config,
     rules: Vec<Box<dyn Rule>>,
 }
 
 impl SafeMigrateEngine {
-    pub fn new(config: Config) -> Self {
+    pub(crate) fn new(config: Config) -> Self {
         Self {
             config,
             rules: registry::build_primary_rules(),
@@ -83,12 +83,12 @@ impl SafeMigrateEngine {
 
     /// Returns primary rule IDs in evaluation order.
     #[cfg(test)]
-    pub fn primary_rule_ids(&self) -> Vec<&'static str> {
+    pub(crate) fn primary_rule_ids(&self) -> Vec<&'static str> {
         registry::primary_rule_ids().collect()
     }
 
     #[cfg(test)]
-    pub fn analyze_chain(
+    pub(crate) fn analyze_chain(
         &self,
         files: &[(String, String)],
         state: &mut AnalysisState,
@@ -118,7 +118,7 @@ impl SafeMigrateEngine {
     }
 
     #[cfg(test)]
-    pub fn analyze(
+    pub(crate) fn analyze(
         &self,
         sql: &str,
         state: &mut AnalysisState,
@@ -129,7 +129,7 @@ impl SafeMigrateEngine {
     /// Analyze ordered files and retain reportable source locations for every
     /// finding. The original `analyze_chain` API remains available to callers
     /// that only need violations.
-    pub fn analyze_chain_with_locations(
+    pub(crate) fn analyze_chain_with_locations(
         &self,
         files: &[(String, String)],
         state: &mut AnalysisState,
@@ -188,7 +188,7 @@ impl SafeMigrateEngine {
     }
 
     #[cfg(test)]
-    pub fn analyze_with_locations(
+    pub(crate) fn analyze_with_locations(
         &self,
         filename: String,
         sql: String,
@@ -199,7 +199,7 @@ impl SafeMigrateEngine {
 
     /// Analyze a migration chain and return immutable findings, confidence, and
     /// conservative-analysis evidence together.
-    pub fn analyze_chain_outcome_with_locations(
+    pub(crate) fn analyze_chain_outcome_with_locations(
         &self,
         files: &[(String, String)],
         state: &mut AnalysisState,
@@ -215,7 +215,7 @@ impl SafeMigrateEngine {
     /// Analyze one migration and return immutable findings, confidence, and
     /// conservative-analysis evidence together.
     #[cfg(test)]
-    pub fn analyze_outcome_with_locations(
+    pub(crate) fn analyze_outcome_with_locations(
         &self,
         filename: String,
         sql: String,

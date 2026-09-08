@@ -76,6 +76,11 @@ mod rule_evaluation_tests {
             avg_width: Some(3000),
             default_expr_text: None,
             type_modifier: None,
+            storage: None,
+            compression: None,
+            statistics_target: None,
+            options: Default::default(),
+            generated: None,
         });
 
         cache.insert_baseline(tid, rel);
@@ -400,6 +405,11 @@ mod rule_evaluation_tests {
             avg_width: Some(4),
             default_expr_text: None,
             type_modifier: None,
+            storage: None,
+            compression: None,
+            statistics_target: None,
+            options: Default::default(),
+            generated: None,
         });
         cache.insert_baseline(table_id, relation);
         let mut state = AnalysisState::new(cache);

@@ -1,8 +1,9 @@
+use crate::_internal::analysis::facts::LockModeFact;
 use crate::_internal::analysis::mutations::{AlterTypeActionMutation, Mutation};
 use crate::_internal::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
 use crate::_internal::rules::{Rule, RuleCapability, RuleContext, TRANSACTION_CAPABILITIES};
 
-pub struct ConcurrentInsideTransactionRule;
+pub(crate) struct ConcurrentInsideTransactionRule;
 
 impl Rule for ConcurrentInsideTransactionRule {
     fn id(&self) -> &'static str {
@@ -84,7 +85,7 @@ impl Rule for ConcurrentInsideTransactionRule {
     }
 }
 
-pub struct AlterTypeAddValueRule;
+pub(crate) struct AlterTypeAddValueRule;
 
 impl Rule for AlterTypeAddValueRule {
     fn id(&self) -> &'static str {
@@ -127,7 +128,61 @@ impl Rule for AlterTypeAddValueRule {
     }
 }
 
-pub struct VacuumFullRule;
+pub(crate) struct VacuumFullRule;
+
+pub(crate) struct LockTableRule;
+
+impl Rule for LockTableRule {
+    fn id(&self) -> &'static str {
+        "table-lock"
+    }
+
+    fn default_tier(&self) -> ViolationTier {
+        ViolationTier::Tier2
+    }
+
+    fn recipe(&self) -> &'static str {
+        "Use the weakest lock mode that preserves correctness, set lock_timeout, and prefer NOWAIT when the migration can retry safely."
+    }
+
+    fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
+        let Mutation::LockTable(lock) = context.mutation() else {
+            return Vec::new();
+        };
+        let tier = match lock.mode {
+            LockModeFact::AccessExclusive => ViolationTier::Tier1,
+            LockModeFact::Exclusive | LockModeFact::ShareRowExclusive => self.default_tier(),
+            _ => return Vec::new(),
+        };
+        let mode = match lock.mode {
+            LockModeFact::ShareRowExclusive => "SHARE ROW EXCLUSIVE",
+            LockModeFact::Exclusive => "EXCLUSIVE",
+            LockModeFact::AccessExclusive => "ACCESS EXCLUSIVE",
+            _ => unreachable!("only strong lock modes reach this rule"),
+        };
+        lock.targets
+            .iter()
+            .map(|target| Violation {
+                source_range: None,
+                rule_id: self.id(),
+                operation_kind: OperationKind::LockTable,
+                object_kind: ObjectKind::Table,
+                object_name: target.id.to_string(),
+                tier: tier.clone(),
+                reason: format!(
+                    "LOCK TABLE {} uses {}{}",
+                    target.id,
+                    mode,
+                    if lock.nowait { " with NOWAIT" } else { "" }
+                ),
+                recipe: self.recipe(),
+                dedup_key: None,
+                sql: None,
+                fk_dependency_related: false,
+            })
+            .collect()
+    }
+}
 
 impl Rule for VacuumFullRule {
     fn id(&self) -> &'static str {

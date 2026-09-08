@@ -1,16 +1,16 @@
 /// PostgreSQL stores `lock_timeout` and `statement_timeout` as signed 32-bit
 /// millisecond GUCs. Values above this limit are rejected by PostgreSQL.
-pub const MAX_TIMEOUT_MS: u64 = i32::MAX as u64;
+pub(crate) const MAX_TIMEOUT_MS: u64 = i32::MAX as u64;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ScopedSetting<T> {
+pub(crate) struct ScopedSetting<T> {
     pub default: T,
     pub session: T,
     pub effective: T,
 }
 
 impl<T: Clone> ScopedSetting<T> {
-    pub fn new(default: T) -> Self {
+    pub(crate) fn new(default: T) -> Self {
         Self {
             session: default.clone(),
             effective: default.clone(),
@@ -18,14 +18,14 @@ impl<T: Clone> ScopedSetting<T> {
         }
     }
 
-    pub fn reset_effective_to_session(&mut self) {
+    pub(crate) fn reset_effective_to_session(&mut self) {
         self.effective = self.session.clone();
     }
 }
 
 /// Parse PostgreSQL's documented timeout syntax and normalize it to the
 /// integer millisecond representation used by its timeout GUCs.
-pub fn parse_timeout_ms(raw: &str) -> Result<u64, String> {
+pub(crate) fn parse_timeout_ms(raw: &str) -> Result<u64, String> {
     let value = raw.trim();
     if value.is_empty() {
         return Err("timeout value is empty".to_string());
