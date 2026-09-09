@@ -44,7 +44,9 @@ notes are available on the
   eligibility from synchronized catalog evidence.
 - Deepened live PostgreSQL differential checks for physical table and column
   metadata, index definitions, sequence parameters, trigger parentage, CHECK
-  definitions, and extended statistics; added Batch 1 lifecycle fixtures.
+  definitions, and extended statistics. New fixtures cover storage and security
+  settings, generated-column changes, `LIKE` copies, sequence options,
+  inheritance, typed tables, partition detach, `LOCK`, `TRUNCATE`, and `SELECT INTO`.
 - Apply typed options on standalone `CREATE SEQUENCE`, and match PostgreSQL's
   `LIKE INCLUDING STATISTICS` target and partition-child catalog behavior.
 - Fixed key-constraint index ownership, type-change metadata resets, row-type
