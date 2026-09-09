@@ -164,7 +164,9 @@ impl Rule for PartitionStrategyMismatchRule {
         let mut violations = Vec::new();
 
         if let Mutation::AlterTable(alter) = context.mutation()
-            && let AlterTableActionMutation::AttachPartition { child, strategy } = &alter.action
+            && let AlterTableActionMutation::AttachPartition {
+                child, strategy, ..
+            } = &alter.action
         {
             let parent_partition_type = context
                 .pre_state()

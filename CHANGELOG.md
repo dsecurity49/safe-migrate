@@ -42,6 +42,15 @@ notes are available on the
 - Preserve qualified index identity for `CLUSTER ON` and `REPLICA IDENTITY
   USING INDEX`. Replica identity now verifies ownership and PostgreSQL index
   eligibility from synchronized catalog evidence.
+- Deepened live PostgreSQL differential checks for physical table and column
+  metadata, index definitions, sequence parameters, trigger parentage, CHECK
+  definitions, and extended statistics; added Batch 1 lifecycle fixtures.
+- Apply typed options on standalone `CREATE SEQUENCE`, and match PostgreSQL's
+  `LIKE INCLUDING STATISTICS` target and partition-child catalog behavior.
+- Fixed key-constraint index ownership, type-change metadata resets, row-type
+  resolution, and keyword-shaped constraint columns; preserve generated
+  expression text and unary operators through creation, column renames,
+  changes, and rollback without rewriting function names.
 
 ## v0.8.1 — 2026-09-06
 

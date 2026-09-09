@@ -39,7 +39,7 @@ impl AstVisitor {
                     walk(*left, columns);
                     walk(*right, columns);
                 }
-                ExprIr::Cast { expr, .. } => walk(*expr, columns),
+                ExprIr::Cast { expr, .. } | ExprIr::UnaryOp { expr, .. } => walk(*expr, columns),
                 ExprIr::Literal(_) | ExprIr::Sentinel(_) | ExprIr::Omitted => {}
             }
         }
@@ -426,12 +426,17 @@ impl AstVisitor {
         }
 
         let partition_by = node.partition_by().map(|p| p.syntax().text().to_string());
+        let partition_strategy = node
+            .partition_by()
+            .and_then(|partition| partition.partition_strategy())
+            .and_then(|strategy| strategy.range_token().or_else(|| strategy.ident_token()))
+            .map(|token| Self::resolve_identifier_token(token.text()));
         let partition_of = node
             .partition_of()
             .and_then(|po| po.table_name_ref())
             .and_then(|t| t.path_ref())
             .and_then(|p| Self::path_ref_to_qualified_name(&p));
-        let partition_type = node
+        let partition_bound = node
             .partition_type()
             .map(|pt| pt.syntax().text().to_string());
         let inherits = match node.inherits() {
@@ -477,8 +482,9 @@ impl AstVisitor {
             foreign_keys,
             table_constraints,
             partition_by,
+            partition_strategy,
             partition_of,
-            partition_type,
+            partition_bound,
             inherits,
             like_sources,
             of_type,
@@ -527,8 +533,9 @@ impl AstVisitor {
             foreign_keys: Vec::new(),
             table_constraints: Vec::new(),
             partition_by: None,
+            partition_strategy: None,
             partition_of: None,
-            partition_type: None,
+            partition_bound: None,
             inherits: Vec::new(),
             like_sources: Vec::new(),
             of_type: None,
@@ -571,7 +578,7 @@ impl AstVisitor {
         let select_outputs = node
             .select_clause()
             .and_then(|select| select.target_list())
-            .map(|targets| {
+            .and_then(|targets| {
                 targets
                     .targets()
                     .map(|target| {
@@ -599,8 +606,7 @@ impl AstVisitor {
                         )
                     })
                     .collect::<Option<Vec<_>>>()
-            })
-            .flatten();
+            });
         let select_projection_complete = select_source.is_some() && select_outputs.is_some();
         Some(StatementFact::CreateTable {
             name: Self::path_to_qualified_name(&name)?,
@@ -612,8 +618,9 @@ impl AstVisitor {
             foreign_keys: Vec::new(),
             table_constraints: Vec::new(),
             partition_by: None,
+            partition_strategy: None,
             partition_of: None,
-            partition_type: None,
+            partition_bound: None,
             inherits: Vec::new(),
             like_sources: Vec::new(),
             of_type: None,
@@ -711,7 +718,14 @@ impl AstVisitor {
                         Some(PartitionType::PartitionForValuesWith(_)) => Some("HASH".to_string()),
                         Some(PartitionType::PartitionDefault(_)) | None => None,
                     };
-                    actions.push(AlterTableActionFact::AttachPartition { child, strategy });
+                    let bound = ap
+                        .partition_type()
+                        .map(|bound| bound.syntax().text().to_string());
+                    actions.push(AlterTableActionFact::AttachPartition {
+                        child,
+                        strategy,
+                        bound,
+                    });
                 }
                 continue;
             }
@@ -783,6 +797,7 @@ impl AstVisitor {
                             crate::_internal::analysis::facts::ColumnGeneration::Ordinary;
                         let mut identity_sequence = None;
                         let mut generated_expr = None;
+                        let mut generated_expr_sql = None;
                         for c in add.constraints() {
                             match c {
                                 Constraint::NotNullConstraint(_) => not_null = true,
@@ -807,7 +822,7 @@ impl AstVisitor {
                                         None => return None,
                                     };
                                     identity_sequence =
-                                        Some(Self::identity_sequence_options(&identity)?);
+                                        Some(Box::new(Self::identity_sequence_options(&identity)?));
                                     not_null = true;
                                 }
                                 Constraint::GeneratedConstraint(generated)
@@ -823,6 +838,12 @@ impl AstVisitor {
                                             None => return None,
                                         },
                                         _ => unreachable!("guard requires a generated expression"),
+                                    };
+                                    generated_expr_sql = match generated.generated_as() {
+                                        Some(ast::GeneratedAs::GeneratedStored(stored)) => stored
+                                            .expr()
+                                            .map(|expr| expr.syntax().text().to_string()),
+                                        _ => None,
                                     };
                                     generated_expr = match generated.generated_as() {
                                         Some(ast::GeneratedAs::GeneratedStored(stored)) => stored.expr().map(crate::_internal::analysis::expr_visitor::ExprVisitor::convert),
@@ -847,6 +868,7 @@ impl AstVisitor {
                             },
                             identity_sequence,
                             generated_expr,
+                            generated_expr_sql,
                         });
                     }
                 }
@@ -1299,6 +1321,7 @@ impl AstVisitor {
         Some(properties)
     }
 
+    #[allow(clippy::type_complexity)]
     fn extract_table_body(
         args: impl Iterator<Item = TableArg>,
     ) -> Option<(
@@ -1386,12 +1409,18 @@ impl AstVisitor {
     fn identity_sequence_options(
         identity: &ast::GeneratedIdentity,
     ) -> Option<crate::_internal::analysis::facts::IdentitySequenceOptionsFact> {
-        let mut result = crate::_internal::analysis::facts::IdentitySequenceOptionsFact::default();
         let Some(options) = identity.sequence_option_list() else {
-            return Some(result);
+            return Some(Default::default());
         };
+        Self::extract_sequence_options(options.sequence_options())
+    }
+
+    fn extract_sequence_options(
+        options: impl Iterator<Item = ast::SequenceOption>,
+    ) -> Option<crate::_internal::analysis::facts::IdentitySequenceOptionsFact> {
+        let mut result = crate::_internal::analysis::facts::IdentitySequenceOptionsFact::default();
         let integer = |expr: ast::Expr| expr.syntax().text().to_string().trim().parse::<i64>().ok();
-        for option in options.sequence_options() {
+        for option in options {
             match option {
                 ast::SequenceOption::OptionAsType(option) => {
                     result.data_type = Some(option.ty()?.syntax().text().to_string());
@@ -1424,9 +1453,8 @@ impl AstVisitor {
                         .and_then(|path| Self::path_to_qualified_name(&path));
                     result.sequence_name.as_ref()?;
                 }
-                ast::SequenceOption::OptionRestart(_) | ast::SequenceOption::OptionOwnedBy(_) => {
-                    return None;
-                }
+                ast::SequenceOption::OptionOwnedBy(_) => {}
+                ast::SequenceOption::OptionRestart(_) => return None,
             }
         }
         Some(result)
@@ -1533,6 +1561,12 @@ impl AstVisitor {
             default,
             generation,
             identity_sequence,
+            generated_expr_sql: match &generated_as {
+                Some(ast::GeneratedAs::GeneratedStored(stored)) => {
+                    stored.expr().map(|expr| expr.syntax().text().to_string())
+                }
+                _ => None,
+            },
             generated_expr: match generated_as {
                 Some(ast::GeneratedAs::GeneratedStored(stored)) => stored
                     .expr()
@@ -1577,13 +1611,19 @@ impl AstVisitor {
                 })
             }
             AlterColumnOption::SetStatistics(statistics) => {
-                let target = statistics
-                    .expr()?
-                    .syntax()
-                    .text()
-                    .to_string()
-                    .parse::<i32>()
-                    .ok()?;
+                let target = if statistics.default_token().is_some() {
+                    None
+                } else {
+                    Some(
+                        statistics
+                            .expr()?
+                            .syntax()
+                            .text()
+                            .to_string()
+                            .parse::<i32>()
+                            .ok()?,
+                    )
+                };
                 Some(AlterTableActionFact::SetStatistics {
                     column: col_name,
                     target,
@@ -1621,6 +1661,7 @@ impl AstVisitor {
             }),
             AlterColumnOption::SetExpression(se) => Some(AlterTableActionFact::SetExpression {
                 column: col_name,
+                expression_sql: se.expr()?.syntax().text().to_string(),
                 expr: se
                     .expr()
                     .map(crate::_internal::analysis::expr_visitor::ExprVisitor::convert)
@@ -1991,7 +2032,8 @@ impl AstVisitor {
 
     fn extract_constraint_column_list_names(cl: ast::ConstraintColumnRefList) -> Vec<String> {
         cl.column_name_refs()
-            .filter_map(|column| column.ident_token())
+            // Squawk's pg_name keeps legal keyword names as keyword tokens.
+            .filter_map(|column| column.syntax().first_token())
             .map(|token| Self::resolve_identifier_token(token.text()))
             .collect()
     }
@@ -2381,6 +2423,16 @@ impl AstVisitor {
                 ast::SequenceOption::OptionOwnedBy(owned_by) => Self::extract_owned_by(&owned_by),
                 _ => None,
             }),
+            persistence: match node
+                .persistence()
+                .map(|value| value.syntax().text().to_string().to_lowercase())
+                .as_deref()
+            {
+                Some("temporary") | Some("temp") => PersistenceFact::Temporary,
+                Some("unlogged") => PersistenceFact::Unlogged,
+                _ => PersistenceFact::Permanent,
+            },
+            options: Self::extract_sequence_options(node.sequence_options())?,
         })
     }
 
@@ -2820,6 +2872,7 @@ impl AstVisitor {
                         generation: crate::_internal::analysis::facts::ColumnGeneration::Ordinary,
                         identity_sequence: None,
                         generated_expr: None,
+                        generated_expr_sql: None,
                     })
                 })
                 .collect();

@@ -69,7 +69,9 @@ impl AnalysisState {
                 Self::expression_references_sequence(left, sequence)
                     || Self::expression_references_sequence(right, sequence)
             }
-            ExprIr::Cast { expr, .. } => Self::expression_references_sequence(expr, sequence),
+            ExprIr::Cast { expr, .. } | ExprIr::UnaryOp { expr, .. } => {
+                Self::expression_references_sequence(expr, sequence)
+            }
             ExprIr::ColumnRef(_) | ExprIr::Sentinel(_) | ExprIr::Omitted => false,
         }
     }
@@ -85,7 +87,9 @@ impl AnalysisState {
             ExprIr::BinaryOp { left, right, .. } => {
                 Self::expression_contains_nextval(left) || Self::expression_contains_nextval(right)
             }
-            ExprIr::Cast { expr, .. } => Self::expression_contains_nextval(expr),
+            ExprIr::Cast { expr, .. } | ExprIr::UnaryOp { expr, .. } => {
+                Self::expression_contains_nextval(expr)
+            }
             ExprIr::Literal(_) | ExprIr::ColumnRef(_) | ExprIr::Sentinel(_) | ExprIr::Omitted => {
                 false
             }
@@ -280,6 +284,17 @@ impl AnalysisState {
         self.snapshot_generation_counter();
         self.local.generation_counter += 1;
         let generation = self.local.generation_counter;
+        let Some(parameters) = Self::apply_identity_sequence_options(
+            crate::_internal::model::sequence::SequenceParameters {
+                persistence: create.persistence,
+                ..Default::default()
+            },
+            &create.options,
+        ) else {
+            return MutationResult::Conflict {
+                reason: "invalid sequence parameters".to_string(),
+            };
+        };
         self.local.sequences.insert(
             create.id.clone(),
             SequenceOverlay::Present(SequenceState {
@@ -291,7 +306,7 @@ impl AnalysisState {
                 } else {
                     SequenceKind::Standalone
                 },
-                parameters: Default::default(),
+                parameters,
                 generation,
             }),
         );

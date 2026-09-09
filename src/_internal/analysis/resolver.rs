@@ -217,8 +217,9 @@ impl Resolver {
                 foreign_keys,
                 table_constraints,
                 partition_by,
+                partition_strategy,
                 partition_of,
-                partition_type,
+                partition_bound,
                 inherits,
                 like_sources,
                 of_type,
@@ -236,8 +237,9 @@ impl Resolver {
                     foreign_keys,
                     table_constraints,
                     partition_by,
+                    partition_strategy,
                     partition_of,
-                    partition_type,
+                    partition_bound,
                     inherits,
                     like_sources,
                     of_type,
@@ -395,11 +397,15 @@ impl Resolver {
                 name,
                 if_not_exists,
                 owned_by,
+                persistence,
+                options,
             } => {
                 mutations.push(Self::resolve_create_sequence(
                     name,
                     *if_not_exists,
                     owned_by,
+                    persistence,
+                    options,
                     state,
                 ));
             }

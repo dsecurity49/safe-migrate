@@ -769,11 +769,17 @@ impl AnalysisState {
             .map(|(id, type_state)| (id.clone(), TypeOverlay::Present(type_state.clone())))
             .collect::<HashMap<_, _>>();
         let type_catalog = types.clone();
+        let row_types: HashSet<_> = relations.keys().cloned().collect();
         for overlay in relations.values_mut() {
             if let RelationOverlay::Present(relation) = overlay {
                 for column in &mut relation.columns {
                     column.type_id = column.data_type.as_deref().and_then(|raw| {
-                        Self::resolve_type_reference_from_catalog(raw, &type_catalog, search_path)
+                        Self::resolve_type_reference_from_catalog(
+                            raw,
+                            &type_catalog,
+                            search_path,
+                            |id| row_types.contains(id),
+                        )
                     });
                 }
             }
@@ -792,6 +798,7 @@ impl AnalysisState {
                     base_type,
                     &type_catalog,
                     search_path,
+                    |id| row_types.contains(id),
                 );
             }
         }
@@ -1119,6 +1126,7 @@ impl AnalysisState {
                             raw,
                             &type_catalog,
                             &default_search_path,
+                            |id| matches!(relations.get(id), Some(RelationOverlay::Present(_))),
                         )
                     })
                     .collect();
@@ -1126,6 +1134,7 @@ impl AnalysisState {
                     &function.return_type,
                     &type_catalog,
                     &default_search_path,
+                    |id| matches!(relations.get(id), Some(RelationOverlay::Present(_))),
                 );
             }
         }
@@ -1693,16 +1702,20 @@ impl AnalysisState {
         raw: &str,
         types: &HashMap<ObjectId, TypeOverlay>,
         search_path: &[String],
+        row_type_exists: impl Fn(&ObjectId) -> bool,
     ) -> Option<ObjectId> {
         let (schema, name) = Self::parse_type_reference(raw)?;
         if let Some(schema) = schema {
             let candidate = ObjectId::new(schema, name);
-            return matches!(types.get(&candidate), Some(TypeOverlay::Present(_)))
-                .then_some(candidate);
+            return (matches!(types.get(&candidate), Some(TypeOverlay::Present(_)))
+                || row_type_exists(&candidate))
+            .then_some(candidate);
         }
         search_path.iter().find_map(|schema| {
             let candidate = ObjectId::new(schema, &name);
-            matches!(types.get(&candidate), Some(TypeOverlay::Present(_))).then_some(candidate)
+            (matches!(types.get(&candidate), Some(TypeOverlay::Present(_)))
+                || row_type_exists(&candidate))
+            .then_some(candidate)
         })
     }
 
@@ -1761,7 +1774,17 @@ impl AnalysisState {
     }
 
     fn resolve_type_reference(&self, raw: &str) -> Option<ObjectId> {
-        Self::resolve_type_reference_from_catalog(raw, &self.local.types, &self.local.search_path)
+        Self::resolve_type_reference_from_catalog(
+            raw,
+            &self.local.types,
+            &self.local.search_path,
+            |id| {
+                matches!(
+                    self.local.relations.get(id),
+                    Some(RelationOverlay::Present(_))
+                )
+            },
+        )
     }
 
     fn type_reference_name(id: &ObjectId, qualified: bool) -> String {

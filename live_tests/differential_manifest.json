@@ -1726,6 +1726,9 @@
         "016_missing_set_role.sql",
         "017_unauthorized_set_role.sql",
         "018_identifier_truncation_collision.sql",
+        "019_concurrent_detach_in_transaction.sql",
+        "020_invalid_partition_strategy.sql",
+        "021_concurrent_detach_default_partition.sql",
         "004_conflict.sql",
         "safe_001_chain.sql",
         "safe_001_create_table.sql",
@@ -1749,10 +1752,30 @@
         "safe_021_routine_type_aliases.sql",
         "safe_022_role_membership_cascade.sql",
         "safe_023_role_options.sql",
-        "safe_024_logical_replication.sql"
+        "safe_024_logical_replication.sql",
+        "safe_025_table_catalog_lifecycle.sql",
+        "safe_026_column_catalog_lifecycle.sql",
+        "safe_027_like_including_all.sql",
+        "safe_028_sequence_parameters.sql",
+        "safe_029_select_into_projection.sql",
+        "safe_030_lock_and_truncate.sql",
+        "safe_031_partition_clone_catalog.sql",
+        "safe_032_inheritance_lifecycle.sql",
+        "safe_033_typed_table_lifecycle.sql",
+        "safe_034_generated_expression_change.sql",
+        "safe_035_metadata_reset.sql",
+        "safe_036_table_security_reset.sql",
+        "safe_037_key_index_lifecycle.sql",
+        "safe_038_type_change_metadata.sql",
+        "safe_039_rule_enablement.sql",
+        "safe_040_generated_column_rename.sql",
+        "safe_041_partition_bounds.sql",
+        "safe_042_concurrent_hash_detach.sql"
       ],
       "fixture_transactional": {
         "safe_010_role_transaction_semantics.sql": false,
+        "safe_042_concurrent_hash_detach.sql": false,
+        "021_concurrent_detach_default_partition.sql": false,
         "safe_011_session_authorization.sql": false,
         "safe_012_role_search_path_and_owner.sql": false,
         "safe_013_quoted_session_authorization.sql": false,
@@ -1760,7 +1783,12 @@
         "safe_015_session_authorization_default.sql": false,
         "safe_016_transitive_set_role_membership.sql": false
       },
+      "fixture_autocommit": [
+        "safe_042_concurrent_hash_detach.sql",
+        "021_concurrent_detach_default_partition.sql"
+      ],
       "fixture_min_pg_version": {
+        "safe_034_generated_expression_change.sql": 170000,
         "safe_022_role_membership_cascade.sql": 160000,
         "safe_024_logical_replication.sql": 150000,
         "safe_023_role_options.sql": 160000
@@ -1796,6 +1824,18 @@
         },
         "018_identifier_truncation_collision.sql": {
           "sqlstate": "42P07",
+          "simulator_rule": "chain-conflict"
+        },
+        "019_concurrent_detach_in_transaction.sql": {
+          "sqlstate": "25001",
+          "simulator_rule": "chain-conflict"
+        },
+        "020_invalid_partition_strategy.sql": {
+          "sqlstate": "22023",
+          "simulator_rule": "chain-conflict"
+        },
+        "021_concurrent_detach_default_partition.sql": {
+          "sqlstate": "55000",
           "simulator_rule": "chain-conflict"
         }
       },
@@ -1932,6 +1972,95 @@
         "safe_024_logical_replication.sql": [
           "publications",
           "subscriptions"
+        ],
+        "safe_025_table_catalog_lifecycle.sql": [
+          "relations",
+          "columns",
+          "indexes"
+        ],
+        "safe_026_column_catalog_lifecycle.sql": [
+          "relations",
+          "columns"
+        ],
+        "safe_027_like_including_all.sql": [
+          "relations",
+          "columns",
+          "indexes",
+          "constraints",
+          "sequences",
+          "extended_statistics"
+        ],
+        "safe_028_sequence_parameters.sql": [
+          "sequences"
+        ],
+        "safe_029_select_into_projection.sql": [
+          "relations",
+          "columns"
+        ],
+        "safe_030_lock_and_truncate.sql": [
+          "relations",
+          "columns"
+        ],
+        "safe_031_partition_clone_catalog.sql": [
+          "relations",
+          "columns",
+          "indexes",
+          "constraints",
+          "triggers",
+          "partitions"
+        ],
+        "safe_032_inheritance_lifecycle.sql": [
+          "relations",
+          "columns",
+          "constraints",
+          "partitions"
+        ],
+        "safe_033_typed_table_lifecycle.sql": [
+          "relations",
+          "columns",
+          "types"
+        ],
+        "safe_034_generated_expression_change.sql": [
+          "relations",
+          "columns"
+        ],
+        "safe_035_metadata_reset.sql": [
+          "relations",
+          "columns"
+        ],
+        "safe_036_table_security_reset.sql": [
+          "relations",
+          "columns"
+        ],
+        "safe_037_key_index_lifecycle.sql": [
+          "relations",
+          "columns",
+          "constraints",
+          "indexes"
+        ],
+        "safe_038_type_change_metadata.sql": [
+          "relations",
+          "columns"
+        ],
+        "safe_039_rule_enablement.sql": [
+          "relations"
+        ],
+        "safe_040_generated_column_rename.sql": [
+          "relations",
+          "columns"
+        ],
+        "safe_041_partition_bounds.sql": [
+          "relations",
+          "columns",
+          "partitions"
+        ],
+        "safe_042_concurrent_hash_detach.sql": [
+          "relations",
+          "columns",
+          "partitions",
+          "indexes",
+          "constraints",
+          "triggers"
         ],
         "safe_017_relation_namespace_resolution.sql": [
           "schemas",

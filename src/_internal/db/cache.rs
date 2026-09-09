@@ -699,13 +699,12 @@ impl DbCache {
                     return Err(format!("relation '{}' has an empty {label}", id));
                 }
             }
-            for (label, options) in [("table", &relation.table_options)] {
-                if options
-                    .iter()
-                    .any(|(key, value)| key.is_empty() || value.is_empty())
-                {
-                    return Err(format!("relation '{}' has a malformed {label} option", id));
-                }
+            if relation
+                .table_options
+                .iter()
+                .any(|(key, value)| key.is_empty() || value.is_empty())
+            {
+                return Err(format!("relation '{}' has a malformed table option", id));
             }
             let mut column_names = HashSet::new();
             for column in &relation.columns {

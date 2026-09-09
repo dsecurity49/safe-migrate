@@ -40,6 +40,7 @@ pub(crate) struct TriggerState {
     pub generation: u64,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum TriggerOverlay {
     Present(TriggerState),

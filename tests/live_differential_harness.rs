@@ -14,6 +14,7 @@ use safe_migrate::_internal::model::types::{TypeKind, TypeOverlay};
 use safe_migrate::_internal::sync::{populate_cache, populate_cache_in_current_transaction};
 use safe_migrate::api::Config;
 use serde::Deserialize;
+use squawk_syntax::ast::{self, AstNode};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -41,6 +42,8 @@ struct RuleManifest {
     transactional: bool,
     #[serde(default)]
     fixture_transactional: BTreeMap<String, bool>,
+    #[serde(default)]
+    fixture_autocommit: BTreeSet<String>,
     #[serde(default)]
     fixture_min_pg_version: BTreeMap<String, u32>,
     #[serde(default)]
@@ -96,6 +99,28 @@ fn default_transactional() -> bool {
     true
 }
 
+fn split_fixture_statements(sql: &str) -> Result<Vec<String>, String> {
+    let parsed = ast::SourceFile::parse(sql);
+    if !parsed.errors().is_empty() {
+        return Err(format!("SQL parse errors: {:?}", parsed.errors()));
+    }
+    // Typed statement boundaries preserve semicolons inside bodies and literals.
+    Ok(parsed
+        .tree()
+        .stmts()
+        .map(|stmt| stmt.syntax().text().to_string())
+        .collect())
+}
+
+#[test]
+fn autocommit_fixture_split_preserves_bodies_and_literals() {
+    let statements = split_fixture_statements("-- leading ;\n CREATE FUNCTION f() RETURNS text LANGUAGE sql AS $$ SELECT ';'; $$; SELECT ';'; -- trailing ;").unwrap();
+    assert_eq!(statements.len(), 2);
+    assert!(statements[0].contains("$$ SELECT ';'; $$"));
+    assert_eq!(statements[1], "SELECT ';';");
+    assert!(split_fixture_statements("CREATE TABLE broken (").is_err());
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum ComparisonScope {
@@ -116,6 +141,7 @@ enum ComparisonScope {
     Partitions,
     Publications,
     Subscriptions,
+    ExtendedStatistics,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -132,10 +158,11 @@ struct NormalizedState {
     privileges: BTreeSet<NormalizedPrivilege>,
     policies: BTreeSet<NormalizedPolicy>,
     triggers: BTreeMap<(String, String), NormalizedTrigger>,
-    partition_edges: BTreeSet<(String, String)>,
+    partition_edges: BTreeSet<(String, String, bool, bool)>,
     view_dependencies: BTreeSet<(String, String)>,
     publications: BTreeMap<String, NormalizedPublication>,
     subscriptions: BTreeMap<String, NormalizedSubscription>,
+    extended_statistics: BTreeMap<String, NormalizedExtendedStatistics>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -153,6 +180,14 @@ struct NormalizedSequence {
     owner: String,
     owned_by: Option<String>,
     kind: SequenceKind,
+    data_type: String,
+    start_value: i64,
+    increment: i64,
+    min_value: i64,
+    max_value: i64,
+    cache_size: i64,
+    cycle: bool,
+    persistence: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -160,6 +195,17 @@ struct NormalizedRelation {
     kind: NormalizedRelationKind,
     owner: String,
     partition_strategy: Option<String>,
+    partition_is_default: Option<bool>,
+    persistence: String,
+    tablespace: Option<String>,
+    access_method: Option<String>,
+    cluster_index: Option<String>,
+    row_security: Option<bool>,
+    force_row_security: Option<bool>,
+    replica_identity: Option<String>,
+    table_options: BTreeMap<String, String>,
+    of_type: Option<String>,
+    rules: BTreeMap<String, String>,
     columns: BTreeMap<String, NormalizedColumn>,
 }
 
@@ -175,12 +221,32 @@ struct NormalizedColumn {
     data_type: String,
     is_nullable: bool,
     has_default: bool,
+    generated: Option<bool>,
+    generation: Option<String>,
+    identity_generation: Option<String>,
+    storage: Option<String>,
+    compression: Option<String>,
+    statistics_target: Option<i32>,
+    options: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct NormalizedIndex {
     index: String,
     table: String,
+    using_method: Option<String>,
+    key_columns: Vec<String>,
+    included_columns: Vec<String>,
+    has_expression_keys: bool,
+    has_predicate: bool,
+    is_unique: bool,
+    is_immediate: bool,
+    is_valid: bool,
+    is_ready: bool,
+    is_live: bool,
+    has_default_sort_order: bool,
+    has_default_opclasses: bool,
+    has_default_collations: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -196,6 +262,8 @@ struct NormalizedConstraint {
     name: String,
     kind: String,
     validated: bool,
+    definition: Option<String>,
+    backing_index: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -208,6 +276,17 @@ struct NormalizedPolicy {
 struct NormalizedTrigger {
     function: String,
     enabled_mode: String,
+    row_level: bool,
+    parent_trigger: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NormalizedExtendedStatistics {
+    table: String,
+    kinds: Vec<String>,
+    columns: Vec<String>,
+    expressions: Option<String>,
+    target: Option<i32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -256,6 +335,7 @@ enum MismatchCategory {
     RelationKindMismatch,
     RelationOwnerMismatch,
     PartitionStrategyMismatch,
+    RelationDefinitionMismatch,
     ColumnMismatch,
     MissingIndexInSimulator,
     ExtraIndexInSimulator,
@@ -277,6 +357,10 @@ enum MismatchCategory {
     ExtraTriggerInSimulator,
     TriggerFunctionMismatch,
     TriggerEnableModeMismatch,
+    TriggerDefinitionMismatch,
+    MissingExtendedStatisticsInSimulator,
+    ExtraExtendedStatisticsInSimulator,
+    ExtendedStatisticsDefinitionMismatch,
     MissingPartitionEdgeInSimulator,
     ExtraPartitionEdgeInSimulator,
     MissingViewDependencyInSimulator,
@@ -502,6 +586,16 @@ fn live_postgres_differential_harness() {
             let sql = fs::read_to_string(&fixture_path).unwrap_or_else(|error| {
                 panic!("failed to read {}: {error}", fixture_path.display())
             });
+            let live_statements = if rule.fixture_autocommit.contains(fixture) {
+                split_fixture_statements(&sql).unwrap_or_else(|error| {
+                    panic!(
+                        "invalid autocommit fixture {}: {error}",
+                        fixture_path.display()
+                    )
+                })
+            } else {
+                vec![sql.clone()]
+            };
             verbose(
                 verbosity,
                 1,
@@ -628,7 +722,10 @@ fn live_postgres_differential_harness() {
                 );
             }
 
-            if let Err(error) = client.batch_execute(&sql) {
+            if let Err(error) = live_statements
+                .iter()
+                .try_for_each(|statement| client.batch_execute(statement))
+            {
                 // Recover the shared harness connection even when a fixture
                 // owns its transaction boundaries and leaves one aborted.
                 let _ = client.batch_execute("ROLLBACK");
@@ -756,7 +853,7 @@ fn live_postgres_differential_harness() {
                         fixture: fixture.clone(),
                         category: MismatchCategory::LiveExecutionFailed,
                         root_cause: RootCauseClassification::EnvironmentIssue,
-                        note: format!("failed to snapshot live PostgreSQL state: {error}"),
+                        note: format!("failed to snapshot live PostgreSQL state: {error:#}"),
                     });
                     continue;
                 }
@@ -860,7 +957,7 @@ fn verbose(verbosity: u8, level: u8, message: impl std::fmt::Display) {
 
 fn state_counts(state: &NormalizedState) -> String {
     format!(
-        "schemas:{} sequences:{} relations:{} indexes:{} constraints:{} foreign_keys:{} functions:{} types:{} privileges:{} policies:{} triggers:{} partitions:{} view_dependencies:{} publications:{} subscriptions:{}",
+        "schemas:{} sequences:{} relations:{} indexes:{} constraints:{} foreign_keys:{} functions:{} types:{} privileges:{} policies:{} triggers:{} partitions:{} view_dependencies:{} publications:{} subscriptions:{} extended_statistics:{}",
         state.schemas.len(),
         state.sequences.len(),
         state.relations.len(),
@@ -875,7 +972,8 @@ fn state_counts(state: &NormalizedState) -> String {
         state.partition_edges.len(),
         state.view_dependencies.len(),
         state.publications.len(),
-        state.subscriptions.len()
+        state.subscriptions.len(),
+        state.extended_statistics.len()
     )
 }
 
@@ -1018,7 +1116,7 @@ fn state_counts_include_every_replication_family() {
         },
     );
     let counts = state_counts(&state);
-    assert!(counts.ends_with("publications:0 subscriptions:1"));
+    assert!(counts.ends_with("publications:0 subscriptions:1 extended_statistics:0"));
 }
 
 fn load_manifest(path: &Path) -> DifferentialManifest {
@@ -1091,6 +1189,24 @@ fn validate_manifest(manifest: &DifferentialManifest, path: &Path) {
             assert!(
                 included.contains(fixture),
                 "fixture transaction override references a non-included fixture: {}/{}",
+                rule.rule_dir,
+                fixture
+            );
+        }
+        for fixture in &rule.fixture_autocommit {
+            assert!(
+                included.contains(fixture),
+                "autocommit references a non-included fixture: {}/{}",
+                rule.rule_dir,
+                fixture
+            );
+            assert!(
+                !rule
+                    .fixture_transactional
+                    .get(fixture)
+                    .copied()
+                    .unwrap_or(rule.transactional),
+                "autocommit fixture cannot use the rollback wrapper: {}/{}",
                 rule.rule_dir,
                 fixture
             );
@@ -1180,6 +1296,7 @@ fn expected_live_error_must_reference_an_included_fixture() {
         fixtures: Vec::new(),
         transactional: true,
         fixture_transactional: BTreeMap::new(),
+        fixture_autocommit: BTreeSet::new(),
         fixture_min_pg_version: BTreeMap::new(),
         excluded_fixtures: Vec::new(),
         schemas: Vec::new(),
@@ -1208,6 +1325,7 @@ fn expected_live_error_must_reference_a_known_simulator_rule() {
         fixtures: vec!["case.sql".to_string()],
         transactional: true,
         fixture_transactional: BTreeMap::new(),
+        fixture_autocommit: BTreeSet::new(),
         fixture_min_pg_version: BTreeMap::new(),
         excluded_fixtures: Vec::new(),
         schemas: Vec::new(),
@@ -1572,6 +1690,14 @@ fn snapshot_live_state(
                         format!("{}.{}", qualified_name(&table.schema, &table.name), column)
                     }),
                     kind: sequence.kind.clone(),
+                    data_type: normalize_data_type(&sequence.parameters.data_type),
+                    start_value: sequence.parameters.start_value,
+                    increment: sequence.parameters.increment,
+                    min_value: sequence.parameters.min_value,
+                    max_value: sequence.parameters.max_value,
+                    cache_size: sequence.parameters.cache_size,
+                    cycle: sequence.parameters.cycle,
+                    persistence: normalize_sequence_persistence(sequence.parameters.persistence),
                 },
             );
         }
@@ -1623,11 +1749,19 @@ fn snapshot_live_state(
 
     if scope.contains(&ComparisonScope::Constraints) {
         for constraint in &cache.constraints {
+            if constraint.kind == ConstraintKind::NotNull {
+                continue;
+            }
             state.constraints.insert(NormalizedConstraint {
                 table: qualified_name(&constraint.table_id.schema, &constraint.table_id.name),
                 name: constraint.name.clone(),
                 kind: normalize_constraint_kind(constraint.kind),
                 validated: constraint.validated,
+                definition: normalize_constraint_definition(constraint.definition.as_deref()),
+                backing_index: constraint
+                    .backing_index
+                    .as_ref()
+                    .map(|id| qualified_name(&id.schema, &id.name)),
             });
         }
     }
@@ -1645,6 +1779,11 @@ fn snapshot_live_state(
                         &trigger.function_id.name,
                     ),
                     enabled_mode: normalize_trigger_mode(trigger.enabled_mode),
+                    row_level: trigger.row_level,
+                    parent_trigger: trigger
+                        .parent_trigger_id
+                        .as_ref()
+                        .map(|id| qualified_name(&id.schema, &id.name)),
                 },
             );
         }
@@ -1656,6 +1795,36 @@ fn snapshot_live_state(
                 kind: normalize_relation_kind(relation.kind.clone()),
                 owner: relation.owner.name.clone(),
                 partition_strategy: relation.partition_type.clone(),
+                partition_is_default: relation
+                    .partition_bound
+                    .as_deref()
+                    .map(|bound| bound.trim().eq_ignore_ascii_case("DEFAULT")),
+                persistence: normalize_relation_persistence(relation.persistence.clone()),
+                tablespace: relation.tablespace.clone(),
+                access_method: normalize_access_method(
+                    &relation.kind,
+                    relation.access_method.as_deref(),
+                ),
+                cluster_index: relation.cluster_index.clone(),
+                row_security: normalize_table_flag(&relation.kind, relation.row_security),
+                force_row_security: normalize_table_flag(
+                    &relation.kind,
+                    relation.force_row_security,
+                ),
+                replica_identity: normalize_replica_identity(
+                    &relation.kind,
+                    relation.replica_identity.as_deref(),
+                ),
+                table_options: relation.table_options.clone(),
+                of_type: relation
+                    .of_type
+                    .as_ref()
+                    .map(|id| qualified_name(&id.schema, &id.name)),
+                rules: relation
+                    .rules
+                    .iter()
+                    .map(|(name, mode)| (name.clone(), format!("{mode:?}")))
+                    .collect(),
                 columns: BTreeMap::new(),
             };
             if scope.contains(&ComparisonScope::Columns) {
@@ -1669,19 +1838,32 @@ fn snapshot_live_state(
                             .and_then(|resolved_column| resolved_column.type_id.as_ref()),
                         RelationOverlay::Dropped => None,
                     });
+                    let data_type = normalize_data_type_with_identity(
+                        &column
+                            .data_type
+                            .clone()
+                            .unwrap_or_else(|| "<unknown>".to_string()),
+                        type_id,
+                    );
                     normalized.columns.insert(
                         column.name.clone(),
                         NormalizedColumn {
-                            data_type: normalize_data_type_with_identity(
-                                &column
-                                    .data_type
-                                    .clone()
-                                    .unwrap_or_else(|| "<unknown>".to_string()),
-                                type_id,
-                            ),
+                            data_type: data_type.clone(),
                             is_nullable: column.is_nullable,
-                            has_default: column.default.is_some()
-                                || column.default_expr_text.is_some(),
+                            has_default: !relation.identity_columns.contains_key(&column.name)
+                                && (column.default.is_some() || column.default_expr_text.is_some()),
+                            generated: column.generated,
+                            generation: normalize_generated_column(
+                                relation.generated_columns.get(&column.name),
+                            ),
+                            identity_generation: relation
+                                .identity_columns
+                                .get(&column.name)
+                                .map(|generation| format!("{generation:?}")),
+                            storage: column.storage.clone(),
+                            compression: column.compression.clone(),
+                            statistics_target: column.statistics_target,
+                            options: column.options.clone(),
                         },
                     );
                 }
@@ -1697,7 +1879,37 @@ fn snapshot_live_state(
             state.indexes.insert(NormalizedIndex {
                 index: qualified_name(&index.index_id.schema, &index.index_id.name),
                 table: qualified_name(&index.table_id.schema, &index.table_id.name),
+                using_method: Some(index.using_method.to_ascii_lowercase()),
+                key_columns: index.key_columns,
+                included_columns: index.included_columns,
+                has_expression_keys: index.has_expression_keys,
+                has_predicate: index.has_predicate,
+                is_unique: index.is_unique,
+                is_immediate: index.is_immediate,
+                is_valid: index.is_valid,
+                is_ready: index.is_ready,
+                is_live: index.is_live,
+                has_default_sort_order: index.has_default_sort_order,
+                has_default_opclasses: index.has_default_opclasses,
+                has_default_collations: index.has_default_collations,
             });
+        }
+    }
+
+    if scope.contains(&ComparisonScope::ExtendedStatistics) {
+        for (table_id, relation) in &cache.relations {
+            for (stats_id, statistics) in &relation.extended_statistics {
+                state.extended_statistics.insert(
+                    qualified_name(&stats_id.schema, &stats_id.name),
+                    NormalizedExtendedStatistics {
+                        table: qualified_name(&table_id.schema, &table_id.name),
+                        kinds: statistics.kinds.clone(),
+                        columns: statistics.columns.clone(),
+                        expressions: statistics.expressions.clone(),
+                        target: statistics.target,
+                    },
+                );
+            }
         }
     }
 
@@ -1719,13 +1931,17 @@ fn snapshot_live_state(
                 pn.nspname AS parent_schema,
                 pc.relname AS parent_name,
                 cn.nspname AS child_schema,
-                cc.relname AS child_name
+                cc.relname AS child_name,
+                cc.relispartition AS is_partition,
+                i.inhdetachpending AS detach_pending
             FROM pg_inherits i
             JOIN pg_class pc ON pc.oid = i.inhparent
             JOIN pg_namespace pn ON pn.oid = pc.relnamespace
             JOIN pg_class cc ON cc.oid = i.inhrelid
             JOIN pg_namespace cn ON cn.oid = cc.relnamespace
             WHERE pn.nspname = ANY($1) AND cn.nspname = ANY($1)
+              AND pc.relkind IN ('r', 'p')
+              AND cc.relkind IN ('r', 'p')
             ",
             &[&schema_names],
         )? {
@@ -1736,6 +1952,8 @@ fn snapshot_live_state(
             state.partition_edges.insert((
                 qualified_name(&parent_schema, &parent_name),
                 qualified_name(&child_schema, &child_name),
+                row.get("is_partition"),
+                row.get("detach_pending"),
             ));
         }
     }
@@ -1875,6 +2093,14 @@ fn snapshot_simulator_state(
                         format!("{}.{}", qualified_name(&table.schema, &table.name), column)
                     }),
                     kind: sequence.kind.clone(),
+                    data_type: normalize_data_type(&sequence.parameters.data_type),
+                    start_value: sequence.parameters.start_value,
+                    increment: sequence.parameters.increment,
+                    min_value: sequence.parameters.min_value,
+                    max_value: sequence.parameters.max_value,
+                    cache_size: sequence.parameters.cache_size,
+                    cycle: sequence.parameters.cycle,
+                    persistence: normalize_sequence_persistence(sequence.parameters.persistence),
                 },
             );
         }
@@ -1938,11 +2164,19 @@ fn snapshot_simulator_state(
 
     if scope.contains(&ComparisonScope::Constraints) {
         for constraint in state.local.constraints.values() {
+            if constraint.kind == ConstraintKind::NotNull {
+                continue;
+            }
             projection.constraints.insert(NormalizedConstraint {
                 table: qualified_name(&constraint.table_id.schema, &constraint.table_id.name),
                 name: constraint.name.clone(),
                 kind: normalize_constraint_kind(constraint.kind),
                 validated: constraint.validated,
+                definition: normalize_constraint_definition(constraint.definition.as_deref()),
+                backing_index: constraint
+                    .backing_index
+                    .as_ref()
+                    .map(|id| qualified_name(&id.schema, &id.name)),
             });
         }
     }
@@ -1969,6 +2203,11 @@ fn snapshot_simulator_state(
                 NormalizedTrigger {
                     function: qualified_name(&function_id.schema, &function_id.name),
                     enabled_mode: normalize_trigger_mode(trigger.enabled_mode),
+                    row_level: trigger.row_level,
+                    parent_trigger: trigger
+                        .parent_trigger_id
+                        .as_ref()
+                        .map(|id| qualified_name(&id.schema, &id.name)),
                 },
             );
         }
@@ -1983,23 +2222,70 @@ fn snapshot_simulator_state(
                 kind: normalize_relation_kind(relation.kind.clone()),
                 owner: relation.owner.name.clone(),
                 partition_strategy: relation.partition_type.clone(),
+                partition_is_default: relation
+                    .partition_bound
+                    .as_deref()
+                    .map(|bound| bound.trim().eq_ignore_ascii_case("DEFAULT")),
+                persistence: normalize_relation_persistence(relation.persistence.clone()),
+                tablespace: relation.tablespace.clone(),
+                access_method: normalize_access_method(
+                    &relation.kind,
+                    relation.access_method.as_deref(),
+                ),
+                cluster_index: relation.cluster_index.clone(),
+                row_security: normalize_table_flag(&relation.kind, relation.row_security),
+                force_row_security: normalize_table_flag(
+                    &relation.kind,
+                    relation.force_row_security,
+                ),
+                replica_identity: normalize_replica_identity(
+                    &relation.kind,
+                    relation.replica_identity.as_deref(),
+                ),
+                table_options: relation.table_options.clone(),
+                of_type: relation
+                    .of_type
+                    .as_ref()
+                    .map(|id| qualified_name(&id.schema, &id.name)),
+                rules: relation
+                    .rules
+                    .iter()
+                    .map(|(name, mode)| (name.clone(), format!("{mode:?}")))
+                    .collect(),
                 columns: BTreeMap::new(),
             };
             if scope.contains(&ComparisonScope::Columns) {
                 for column in &relation.columns {
+                    let data_type = normalize_data_type_with_identity(
+                        &column
+                            .data_type
+                            .clone()
+                            .unwrap_or_else(|| "<unknown>".to_string()),
+                        column.type_id.as_ref(),
+                    );
                     normalized.columns.insert(
                         column.name.clone(),
                         NormalizedColumn {
-                            data_type: normalize_data_type_with_identity(
-                                &column
-                                    .data_type
-                                    .clone()
-                                    .unwrap_or_else(|| "<unknown>".to_string()),
-                                column.type_id.as_ref(),
-                            ),
+                            data_type: data_type.clone(),
                             is_nullable: column.is_nullable,
-                            has_default: column.default.is_some()
-                                || column.default_expr_text.is_some(),
+                            has_default: !relation.identity_columns.contains_key(&column.name)
+                                && (column.default.is_some() || column.default_expr_text.is_some()),
+                            generated: column.generated,
+                            generation: normalize_generated_column(
+                                relation.generated_columns.get(&column.name),
+                            ),
+                            identity_generation: relation
+                                .identity_columns
+                                .get(&column.name)
+                                .map(|generation| format!("{generation:?}")),
+                            storage: normalize_column_storage(
+                                state,
+                                &data_type,
+                                column.storage.as_deref(),
+                            ),
+                            compression: column.compression.clone(),
+                            statistics_target: column.statistics_target,
+                            options: column.options.clone(),
                         },
                     );
                 }
@@ -2012,10 +2298,40 @@ fn snapshot_simulator_state(
 
     for edge in state.local.graph.edges() {
         match &edge.kind {
-            DependencyKind::IndexOnRelation { .. } if scope.contains(&ComparisonScope::Indexes) => {
+            DependencyKind::IndexOnRelation {
+                using_method,
+                key_columns,
+                included_columns,
+                has_expression_keys,
+                has_predicate,
+                is_unique,
+                is_immediate,
+                is_valid,
+                is_ready,
+                is_live,
+                has_default_sort_order,
+                has_default_opclasses,
+                has_default_collations,
+                ..
+            } if scope.contains(&ComparisonScope::Indexes) => {
                 projection.indexes.insert(NormalizedIndex {
                     index: qualified_name(&edge.dependent.schema, &edge.dependent.name),
                     table: qualified_name(&edge.referenced.schema, &edge.referenced.name),
+                    using_method: using_method
+                        .as_ref()
+                        .map(|method| method.to_ascii_lowercase()),
+                    key_columns: key_columns.clone(),
+                    included_columns: included_columns.clone(),
+                    has_expression_keys: *has_expression_keys,
+                    has_predicate: *has_predicate,
+                    is_unique: *is_unique,
+                    is_immediate: *is_immediate,
+                    is_valid: *is_valid,
+                    is_ready: *is_ready,
+                    is_live: *is_live,
+                    has_default_sort_order: *has_default_sort_order,
+                    has_default_opclasses: *has_default_opclasses,
+                    has_default_collations: *has_default_collations,
                 });
             }
             DependencyKind::ForeignKey {
@@ -2029,10 +2345,16 @@ fn snapshot_simulator_state(
                         .unwrap_or_else(|| "<unnamed>".to_string()),
                 });
             }
-            DependencyKind::PartitionOf if scope.contains(&ComparisonScope::Partitions) => {
+            DependencyKind::PartitionOf
+            | DependencyKind::PartitionDetachPending
+            | DependencyKind::InheritanceOf
+                if scope.contains(&ComparisonScope::Partitions) =>
+            {
                 projection.partition_edges.insert((
                     qualified_name(&edge.referenced.schema, &edge.referenced.name),
                     qualified_name(&edge.dependent.schema, &edge.dependent.name),
+                    !matches!(edge.kind, DependencyKind::InheritanceOf),
+                    matches!(edge.kind, DependencyKind::PartitionDetachPending),
                 ));
             }
             DependencyKind::ViewDependency { .. }
@@ -2044,6 +2366,26 @@ fn snapshot_simulator_state(
                 ));
             }
             _ => {}
+        }
+    }
+
+    if scope.contains(&ComparisonScope::ExtendedStatistics) {
+        for (table_id, overlay) in &state.local.relations {
+            let RelationOverlay::Present(relation) = overlay else {
+                continue;
+            };
+            for (stats_id, statistics) in &relation.extended_statistics {
+                projection.extended_statistics.insert(
+                    qualified_name(&stats_id.schema, &stats_id.name),
+                    NormalizedExtendedStatistics {
+                        table: qualified_name(&table_id.schema, &table_id.name),
+                        kinds: statistics.kinds.clone(),
+                        columns: statistics.columns.clone(),
+                        expressions: statistics.expressions.clone(),
+                        target: statistics.target,
+                    },
+                );
+            }
         }
     }
 
@@ -2293,6 +2635,28 @@ fn compare_states(
                     });
                 }
                 Some(sim_relation)
+                    if sim_relation.persistence != live_relation.persistence
+                        || sim_relation.tablespace != live_relation.tablespace
+                        || sim_relation.access_method != live_relation.access_method
+                        || sim_relation.cluster_index != live_relation.cluster_index
+                        || sim_relation.row_security != live_relation.row_security
+                        || sim_relation.force_row_security != live_relation.force_row_security
+                        || sim_relation.replica_identity != live_relation.replica_identity
+                        || sim_relation.table_options != live_relation.table_options
+                        || sim_relation.of_type != live_relation.of_type
+                        || sim_relation.rules != live_relation.rules =>
+                {
+                    mismatches.push(Mismatch {
+                        rule_dir: rule_dir.to_string(),
+                        fixture: fixture.to_string(),
+                        category: MismatchCategory::RelationDefinitionMismatch,
+                        root_cause: RootCauseClassification::SimulatorBug,
+                        note: format!(
+                            "relation metadata mismatch for {name}: live={live_relation:?}, simulator={sim_relation:?}"
+                        ),
+                    });
+                }
+                Some(sim_relation)
                     if scope.contains(&ComparisonScope::Columns)
                         && sim_relation.columns != live_relation.columns =>
                 {
@@ -2331,10 +2695,7 @@ fn compare_states(
                 fixture: fixture.to_string(),
                 category: MismatchCategory::MissingIndexInSimulator,
                 root_cause: RootCauseClassification::SimulatorBug,
-                note: format!(
-                    "live PostgreSQL kept index {} on {}",
-                    index.index, index.table
-                ),
+                note: format!("live PostgreSQL kept index {index:?}"),
             });
         }
         for index in simulator.indexes.difference(&live.indexes) {
@@ -2343,7 +2704,7 @@ fn compare_states(
                 fixture: fixture.to_string(),
                 category: MismatchCategory::ExtraIndexInSimulator,
                 root_cause: RootCauseClassification::SimulatorBug,
-                note: format!("simulator kept index {} on {}", index.index, index.table),
+                note: format!("simulator kept index {index:?}"),
             });
         }
     }
@@ -2382,10 +2743,7 @@ fn compare_states(
                 fixture: fixture.to_string(),
                 category: MismatchCategory::MissingConstraintInSimulator,
                 root_cause: RootCauseClassification::SimulatorBug,
-                note: format!(
-                    "live PostgreSQL kept {:?} constraint {} on {} (validated={})",
-                    constraint.kind, constraint.name, constraint.table, constraint.validated
-                ),
+                note: format!("live PostgreSQL kept constraint {constraint:?}"),
             });
         }
         for constraint in simulator.constraints.difference(&live.constraints) {
@@ -2394,10 +2752,7 @@ fn compare_states(
                 fixture: fixture.to_string(),
                 category: MismatchCategory::ExtraConstraintInSimulator,
                 root_cause: RootCauseClassification::SimulatorBug,
-                note: format!(
-                    "simulator kept {:?} constraint {} on {} (validated={})",
-                    constraint.kind, constraint.name, constraint.table, constraint.validated
-                ),
+                note: format!("simulator kept constraint {constraint:?}"),
             });
         }
     }
@@ -2569,6 +2924,21 @@ fn compare_states(
                         ),
                     });
                 }
+                Some(simulator_trigger)
+                    if simulator_trigger.row_level != live_trigger.row_level
+                        || simulator_trigger.parent_trigger != live_trigger.parent_trigger =>
+                {
+                    mismatches.push(Mismatch {
+                        rule_dir: rule_dir.to_string(),
+                        fixture: fixture.to_string(),
+                        category: MismatchCategory::TriggerDefinitionMismatch,
+                        root_cause: RootCauseClassification::SimulatorBug,
+                        note: format!(
+                            "trigger {} on {} definition mismatch: live={live_trigger:?}, simulator={simulator_trigger:?}",
+                            key.1, key.0
+                        ),
+                    });
+                }
                 Some(_) => {}
             }
         }
@@ -2582,6 +2952,48 @@ fn compare_states(
                     note: format!(
                         "simulator kept trigger {} on {}, but live PostgreSQL removed it",
                         key.1, key.0
+                    ),
+                });
+            }
+        }
+    }
+
+    if scope.contains(&ComparisonScope::ExtendedStatistics) {
+        for (name, live_statistics) in &live.extended_statistics {
+            match simulator.extended_statistics.get(name) {
+                None => mismatches.push(Mismatch {
+                    rule_dir: rule_dir.to_string(),
+                    fixture: fixture.to_string(),
+                    category: MismatchCategory::MissingExtendedStatisticsInSimulator,
+                    root_cause: RootCauseClassification::SimulatorBug,
+                    note: format!(
+                        "live PostgreSQL kept extended statistics {name} on {}",
+                        live_statistics.table
+                    ),
+                }),
+                Some(simulator_statistics) if simulator_statistics != live_statistics => {
+                    mismatches.push(Mismatch {
+                        rule_dir: rule_dir.to_string(),
+                        fixture: fixture.to_string(),
+                        category: MismatchCategory::ExtendedStatisticsDefinitionMismatch,
+                        root_cause: RootCauseClassification::SimulatorBug,
+                        note: format!(
+                            "extended statistics {name} mismatch: live={live_statistics:?}, simulator={simulator_statistics:?}"
+                        ),
+                    });
+                }
+                Some(_) => {}
+            }
+        }
+        for name in simulator.extended_statistics.keys() {
+            if !live.extended_statistics.contains_key(name) {
+                mismatches.push(Mismatch {
+                    rule_dir: rule_dir.to_string(),
+                    fixture: fixture.to_string(),
+                    category: MismatchCategory::ExtraExtendedStatisticsInSimulator,
+                    root_cause: RootCauseClassification::SimulatorBug,
+                    note: format!(
+                        "simulator kept extended statistics {name}, but live PostgreSQL removed it"
                     ),
                 });
             }
@@ -2651,6 +3063,120 @@ fn normalize_relation_kind(kind: RelationKind) -> NormalizedRelationKind {
         RelationKind::View => NormalizedRelationKind::View,
         RelationKind::MaterializedView => NormalizedRelationKind::MaterializedView,
     }
+}
+
+fn normalize_access_method(kind: &RelationKind, method: Option<&str>) -> Option<String> {
+    match kind {
+        RelationKind::Table | RelationKind::MaterializedView => {
+            Some(method.unwrap_or("heap").to_ascii_lowercase())
+        }
+        RelationKind::View => None,
+    }
+}
+
+fn normalize_table_flag(kind: &RelationKind, value: Option<bool>) -> Option<bool> {
+    matches!(kind, RelationKind::Table).then_some(value.unwrap_or(false))
+}
+
+fn normalize_replica_identity(kind: &RelationKind, value: Option<&str>) -> Option<String> {
+    matches!(kind, RelationKind::Table).then(|| value.unwrap_or("DEFAULT").to_ascii_uppercase())
+}
+
+#[test]
+fn generated_expression_comparison_preserves_operators_and_literals() {
+    use safe_migrate::_internal::model::relation::{GeneratedColumnKind, GeneratedColumnState};
+    let normalize = |expression: &str| {
+        normalize_generated_column(Some(&GeneratedColumnState {
+            kind: GeneratedColumnKind::Stored,
+            expression: Some(expression.into()),
+        }))
+    };
+    assert_eq!(normalize("((value * 2))"), normalize("value*2"));
+    assert_ne!(normalize("-value"), normalize("value"));
+    assert_ne!(normalize("value * 2"), normalize("value * 3"));
+    assert_ne!(normalize("'a b'"), normalize("'ab'"));
+}
+
+fn normalize_generated_column(
+    generated: Option<&safe_migrate::_internal::model::relation::GeneratedColumnState>,
+) -> Option<String> {
+    let generated = generated?;
+    let Some(expression) = &generated.expression else {
+        return Some(format!("{:?}:<missing expression>", generated.kind));
+    };
+    let expression = normalize_constraint_definition(Some(expression)).unwrap();
+    let parsed = ast::SourceFile::parse(&format!("SELECT {expression}"));
+    let normalized = parsed
+        .tree()
+        .syntax()
+        .descendants_with_tokens()
+        .filter_map(|element| element.into_token())
+        .filter(|token| !token.kind().is_trivia())
+        .map(|token| {
+            token
+                .parent()
+                .and_then(ast::NameRef::cast)
+                .map(|name| format!("name:{}", name.text()))
+                .unwrap_or_else(|| token.text().to_string())
+        })
+        .collect::<Vec<_>>();
+    Some(format!("{:?}:{normalized:?}", generated.kind))
+}
+
+fn normalize_column_storage(
+    state: &AnalysisState,
+    data_type: &str,
+    storage: Option<&str>,
+) -> Option<String> {
+    if let Some(storage) = storage {
+        return Some(storage.to_ascii_uppercase());
+    }
+    let mut data_type = data_type.to_string();
+    let mut visited = BTreeSet::new();
+    loop {
+        if data_type.ends_with("[]") {
+            return Some("EXTENDED".into());
+        }
+        if !visited.insert(data_type.clone()) {
+            return None;
+        }
+        let Some((schema, name)) = data_type.split_once('.') else {
+            break;
+        };
+        let id = safe_migrate::_internal::ast::identifiers::ObjectId::new(schema, name);
+        match state.local.types.get(&id) {
+            Some(TypeOverlay::Present(ty)) => match &ty.kind {
+                TypeKind::Domain {
+                    base_type,
+                    base_type_id,
+                } => {
+                    data_type = normalize_data_type_with_identity(base_type, base_type_id.as_ref());
+                    continue;
+                }
+                TypeKind::Composite { .. } | TypeKind::Range => return Some("EXTENDED".into()),
+                TypeKind::Enum { .. } => return Some("PLAIN".into()),
+                TypeKind::Base => return None,
+            },
+            _ if matches!(
+                state.local.relations.get(&id),
+                Some(RelationOverlay::Present(_))
+            ) =>
+            {
+                return Some("EXTENDED".into());
+            }
+            _ => break,
+        }
+    }
+    let base = data_type.split('(').next()?.trim().to_ascii_lowercase();
+    let inferred = match base.as_str() {
+        "text" | "bytea" | "json" | "jsonb" | "xml" | "character varying" | "varchar"
+        | "character" | "char" | "bpchar" | "bit" | "bit varying" | "varbit" | "jsonpath"
+        | "path" | "polygon" | "tsvector" | "refcursor" => "EXTENDED",
+        "numeric" | "decimal" | "inet" | "cidr" => "MAIN",
+        "<unknown>" => return None,
+        _ => "PLAIN",
+    };
+    Some(inferred.into())
 }
 
 fn normalize_attributes(
@@ -2725,6 +3251,30 @@ fn normalize_trigger_mode(
     .to_string()
 }
 
+fn normalize_sequence_persistence(
+    persistence: safe_migrate::_internal::model::sequence::SequencePersistence,
+) -> String {
+    use safe_migrate::_internal::model::sequence::SequencePersistence;
+    match persistence {
+        SequencePersistence::Permanent => "permanent",
+        SequencePersistence::Temporary => "temporary",
+        SequencePersistence::Unlogged => "unlogged",
+    }
+    .to_string()
+}
+
+fn normalize_relation_persistence(
+    persistence: safe_migrate::_internal::model::relation::Persistence,
+) -> String {
+    use safe_migrate::_internal::model::relation::Persistence;
+    match persistence {
+        Persistence::Permanent => "permanent",
+        Persistence::Temporary => "temporary",
+        Persistence::Unlogged => "unlogged",
+    }
+    .to_string()
+}
+
 fn normalize_volatility(volatility: &Volatility) -> String {
     match volatility {
         Volatility::Volatile => "volatile",
@@ -2773,6 +3323,55 @@ fn normalize_constraint_kind(kind: ConstraintKind) -> String {
         ConstraintKind::NotNull => "not_null",
     }
     .to_string()
+}
+
+fn normalize_constraint_definition(definition: Option<&str>) -> Option<String> {
+    definition.map(|definition| {
+        let mut expression = definition.trim();
+        while expression.starts_with('(')
+            && expression.ends_with(')')
+            && outer_parentheses_wrap_expression(expression)
+        {
+            expression = expression[1..expression.len() - 1].trim();
+        }
+        expression.to_string()
+    })
+}
+
+fn outer_parentheses_wrap_expression(expression: &str) -> bool {
+    let mut depth = 0usize;
+    let mut single_quoted = false;
+    let mut double_quoted = false;
+    let bytes = expression.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\'' if !double_quoted => {
+                if single_quoted && bytes.get(index + 1) == Some(&b'\'') {
+                    index += 1;
+                } else {
+                    single_quoted = !single_quoted;
+                }
+            }
+            b'"' if !single_quoted => {
+                if double_quoted && bytes.get(index + 1) == Some(&b'"') {
+                    index += 1;
+                } else {
+                    double_quoted = !double_quoted;
+                }
+            }
+            b'(' if !single_quoted && !double_quoted => depth += 1,
+            b')' if !single_quoted && !double_quoted => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 && index + 1 != bytes.len() {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    depth == 0 && !single_quoted && !double_quoted
 }
 
 fn normalize_data_type(data_type: &str) -> String {

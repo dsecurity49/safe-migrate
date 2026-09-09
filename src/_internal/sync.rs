@@ -1406,6 +1406,9 @@ fn load_relations_and_columns(
             to_char(s.last_analyze, 'YYYY-MM-DD HH24:MI:SS') AS last_analyze,
             to_char(s.last_autoanalyze, 'YYYY-MM-DD HH24:MI:SS') AS last_autoanalyze,
             p.partstrat::text AS partition_strategy,
+            pg_catalog.pg_get_partkeydef(c.oid) AS partition_key,
+            pg_catalog.pg_get_expr(c.relpartbound, c.oid) AS partition_bound,
+            pg_catalog.pg_get_partition_constraintdef(c.oid) AS partition_constraint,
             CASE WHEN c.relkind = 'm' THEN c.relispopulated ELSE NULL END AS is_populated
         FROM pg_class c
         JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -1506,6 +1509,11 @@ fn load_relations_and_columns(
         state.partition_type = partition_strategy_from_pg(partition_strategy.as_deref())
             .with_context(|| format!("relation '{}' partition strategy", object_id))?;
         state.is_populated = is_populated;
+        state.partition_by = row
+            .try_get::<_, Option<String>>("partition_key")?
+            .map(|key| format!("PARTITION BY {key}"));
+        state.partition_bound = row.try_get("partition_bound")?;
+        state.partition_constraint = row.try_get("partition_constraint")?;
         state.row_security = Some(row_security);
         state.force_row_security = Some(force_row_security);
         state.replica_identity = replica_identity;
@@ -1533,7 +1541,11 @@ fn load_relations_and_columns(
             n.nspname AS schema_name,
             c.relname AS relation_name,
             a.attname AS column_name,
-            pg_catalog.format_type(a.atttypid, a.atttypmod) AS type_name,
+            CASE WHEN type_ns.nspname <> 'pg_catalog'
+                       AND pg_catalog.pg_type_is_visible(a.atttypid)
+                 THEN quote_ident(type_ns.nspname) || '.' || pg_catalog.format_type(a.atttypid, a.atttypmod)
+                 ELSE pg_catalog.format_type(a.atttypid, a.atttypmod)
+            END AS type_name,
             a.attnotnull AS not_null,
             s.avg_width AS avg_width,
             pg_get_expr(ad.adbin, ad.adrelid) AS default_expr_text,
@@ -1545,6 +1557,8 @@ fn load_relations_and_columns(
             NULLIF(a.attgenerated::text, '') AS generated_kind,
             NULLIF(a.attidentity::text, '') AS identity_generation
         FROM pg_attribute a
+        JOIN pg_type column_type ON column_type.oid = a.atttypid
+        JOIN pg_namespace type_ns ON type_ns.oid = column_type.typnamespace
         JOIN pg_class c ON a.attrelid = c.oid
         JOIN pg_namespace n ON n.oid = c.relnamespace
         LEFT JOIN pg_stats s ON s.schemaname = n.nspname AND s.tablename = c.relname AND s.attname = a.attname

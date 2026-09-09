@@ -20,6 +20,10 @@ pub(crate) enum ExprIr {
     },
     Sentinel(String),
     Omitted,
+    UnaryOp {
+        op: String,
+        expr: Box<ExprIr>,
+    },
 }
 
 impl ExprIr {
@@ -40,7 +44,7 @@ impl ExprIr {
                     collect(left, columns)?;
                     collect(right, columns)
                 }
-                ExprIr::Cast { expr, .. } => collect(expr, columns),
+                ExprIr::Cast { expr, .. } | ExprIr::UnaryOp { expr, .. } => collect(expr, columns),
                 ExprIr::Sentinel(_) | ExprIr::Omitted => None,
             }
         }
@@ -85,6 +89,9 @@ impl ExprIr {
                 is_sentinel(op) || left.contains_opaque() || right.contains_opaque()
             }
             Self::Cast { expr, target_type } => is_sentinel(target_type) || expr.contains_opaque(),
+            Self::UnaryOp { op, expr } => {
+                !matches!(op.as_str(), "+" | "-" | "NOT") || expr.contains_opaque()
+            }
             Self::Omitted => true,
         }
     }
@@ -122,7 +129,7 @@ impl ExprIr {
                 known_volatile || args.iter().any(ExprIr::is_volatile)
             }
             ExprIr::BinaryOp { left, right, .. } => left.is_volatile() || right.is_volatile(),
-            ExprIr::Cast { expr, .. } => expr.is_volatile(),
+            ExprIr::Cast { expr, .. } | ExprIr::UnaryOp { expr, .. } => expr.is_volatile(),
             ExprIr::Sentinel(_) | ExprIr::Literal(_) | ExprIr::ColumnRef(_) | ExprIr::Omitted => {
                 false
             }

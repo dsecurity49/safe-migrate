@@ -460,7 +460,7 @@ impl AnalysisState {
                 ConstraintState {
                     table_id: child.clone(),
                     name: parent_constraint.name.clone(),
-                    kind: parent_constraint.kind.clone(),
+                    kind: parent_constraint.kind,
                     validated: true,
                     definition: None,
                     backing_index: Some(child_index),
@@ -544,7 +544,7 @@ impl AnalysisState {
         }
     }
 
-    fn apply_identity_sequence_options(
+    pub(super) fn apply_identity_sequence_options(
         mut parameters: SequenceParameters,
         options: &crate::_internal::analysis::mutations::IdentitySequenceOptionsMutation,
     ) -> Option<SequenceParameters> {
@@ -1170,6 +1170,15 @@ impl AnalysisState {
     }
 
     pub(super) fn apply_create_table(&mut self, create: &CreateTable) -> MutationResult {
+        if let Some(strategy) = &create.partition_strategy
+            && !["range", "list", "hash"]
+                .iter()
+                .any(|valid| strategy.eq_ignore_ascii_case(valid))
+        {
+            return MutationResult::Conflict {
+                reason: format!("unrecognized partitioning strategy '{strategy}'"),
+            };
+        }
         if let Err(result) = self.ensure_schema_target(&create.id.schema) {
             return result;
         }
@@ -1419,6 +1428,9 @@ impl AnalysisState {
                     reserved_statistics_ids.insert(id.clone());
                     let mut cloned = statistics.clone();
                     cloned.id = id;
+                    // LIKE copies the statistics definition, while PostgreSQL
+                    // initializes the new object's target independently.
+                    cloned.target = None;
                     like_extended_statistics.push(cloned);
                 }
             }
@@ -1559,7 +1571,7 @@ impl AnalysisState {
                                 }
                             })?;
                             copied_constraints.insert(constraint.name.clone());
-                            Some((constraint.kind.clone(), columns))
+                            Some((constraint.kind, columns))
                         });
                     like_indexes.push((edge.kind.clone(), constraint));
                 }
@@ -1762,7 +1774,7 @@ impl AnalysisState {
                                     }
                                     _ => None,
                                 })?;
-                        Some((constraint.kind.clone(), columns))
+                        Some((constraint.kind, columns))
                     });
                 like_indexes.push((edge.kind.clone(), constraint));
             }
@@ -2546,25 +2558,9 @@ impl AnalysisState {
             self.taint(EvidenceCode::UnsupportedSemantics, EvidenceScope::Chain);
         }
 
-        // Store partition strategy information
-        rel_state.partition_type = create
-            .partition_by
-            .as_ref()
-            .and_then(|partition_by| partition_by.split_whitespace().nth(2))
-            .and_then(|strategy| strategy.split('(').next())
-            .map(str::to_uppercase)
-            .or_else(|| {
-                create.partition_of.as_ref().and_then(|parent_id| {
-                    self.local.relations.get(parent_id).and_then(|r| {
-                        if let RelationOverlay::Present(rel) = r {
-                            rel.partition_type.clone()
-                        } else {
-                            None
-                        }
-                    })
-                })
-            });
+        rel_state.partition_type = create.partition_strategy.as_deref().map(str::to_uppercase);
         rel_state.partition_by = create.partition_by.clone();
+        rel_state.partition_bound = create.partition_bound.clone();
 
         let pk_columns: HashSet<&str> = create
             .table_constraints
@@ -2598,7 +2594,7 @@ impl AnalysisState {
             {
                 column.is_nullable &= !(col.not_null || is_pk);
                 if col.default.is_some() {
-                    column.default = col.default.clone();
+                    column.default = RelationState::normalize_column_default(&col.default);
                     column.default_expr_text = None;
                 }
             }
@@ -2637,7 +2633,7 @@ impl AnalysisState {
                             }
                             _ => unreachable!("generated kind checked above"),
                         },
-                        expression: None,
+                        expression: col.generated_expr_sql.clone(),
                     },
                 );
             }
@@ -2751,7 +2747,7 @@ impl AnalysisState {
                     ConstraintState {
                         table_id: create.id.clone(),
                         name: constraint_name.clone(),
-                        kind: kind.clone(),
+                        kind,
                         validated: true,
                         definition: None,
                         backing_index: Some(index_id),
@@ -3134,6 +3130,25 @@ impl AnalysisState {
     }
 
     pub(super) fn apply_alter_table(&mut self, alter: &AlterTable) -> MutationResult {
+        let concurrent_hash_detach = matches!(
+            alter.action,
+            AlterTableActionMutation::DetachPartition {
+                mode: crate::_internal::analysis::facts::DetachPartitionMode::Concurrently,
+                ..
+            }
+        ) && matches!(self.local.relations.get(&alter.id), Some(RelationOverlay::Present(parent)) if parent.partition_type.as_deref() == Some("HASH"));
+        if matches!(
+            alter.action,
+            AlterTableActionMutation::DetachPartition {
+                mode: crate::_internal::analysis::facts::DetachPartitionMode::Concurrently,
+                ..
+            }
+        ) && self.in_transaction()
+        {
+            return MutationResult::Conflict {
+                reason: "DETACH PARTITION CONCURRENTLY cannot run inside a transaction".into(),
+            };
+        }
         match self.relation_lookup(&alter.id, |kind| *kind == RelationKind::Table) {
             ObjectLookup::Present => {}
             ObjectLookup::WrongKind => {
@@ -3309,6 +3324,23 @@ impl AnalysisState {
                         ),
                     };
                 }
+                if relation.generated_columns.values().any(|generated| {
+                    generated.expression.as_deref().is_none_or(|source| {
+                        crate::_internal::analysis::expr_visitor::ExprVisitor::rename_column_source(
+                            source,
+                            &alter.id.name,
+                            from,
+                            to,
+                        )
+                        .is_none()
+                    })
+                }) {
+                    self.taint(
+                        EvidenceCode::CatalogCoverageIncomplete,
+                        EvidenceScope::Chain,
+                    );
+                    return MutationResult::Skipped;
+                }
             }
             AlterTableActionMutation::SetNotNull { column }
             | AlterTableActionMutation::DropNotNull { column }
@@ -3330,7 +3362,7 @@ impl AnalysisState {
                     ),
                 };
             }
-            AlterTableActionMutation::SetGeneratedExpression { column, expr } => {
+            AlterTableActionMutation::SetGeneratedExpression { column, expr, .. } => {
                 if !relation.generated_columns.contains_key(column) {
                     return MutationResult::Conflict {
                         reason: format!(
@@ -3355,19 +3387,19 @@ impl AnalysisState {
                     };
                 }
             }
-            AlterTableActionMutation::DropGeneratedExpression { column, if_exists } => {
-                if !relation.generated_columns.contains_key(column) {
-                    return if *if_exists {
-                        MutationResult::Skipped
-                    } else {
-                        MutationResult::Conflict {
-                            reason: format!(
-                                "column '{}.{}' has no generated expression",
-                                alter.id, column
-                            ),
-                        }
-                    };
-                }
+            AlterTableActionMutation::DropGeneratedExpression { column, if_exists }
+                if !relation.generated_columns.contains_key(column) =>
+            {
+                return if *if_exists {
+                    MutationResult::Skipped
+                } else {
+                    MutationResult::Conflict {
+                        reason: format!(
+                            "column '{}.{}' has no generated expression",
+                            alter.id, column
+                        ),
+                    }
+                };
             }
             _ => {}
         }
@@ -3607,6 +3639,19 @@ impl AnalysisState {
                         ),
                     };
                 }
+                if using_index.is_none()
+                    && self.relation_namespace_object_is_present(&ObjectId::new(
+                        &alter.id.schema,
+                        &name,
+                    ))
+                {
+                    return MutationResult::Conflict {
+                        reason: format!(
+                            "constraint index '{}.{}' already exists",
+                            alter.id.schema, name
+                        ),
+                    };
+                }
             }
             AlterTableActionMutation::AlterConstraint { name, .. } => {
                 let Some(name) = name else {
@@ -3695,6 +3740,42 @@ impl AnalysisState {
                 }
             }
             AlterTableActionMutation::DetachPartition { child, mode } => {
+                if matches!(
+                    mode,
+                    crate::_internal::analysis::facts::DetachPartitionMode::Concurrently
+                ) {
+                    for edge in self
+                        .local
+                        .graph
+                        .edges()
+                        .iter()
+                        .filter(|edge| edge.referenced == alter.id)
+                    {
+                        if matches!(edge.kind, DependencyKind::PartitionDetachPending) {
+                            return MutationResult::Conflict {
+                                reason: format!(
+                                    "parent '{}' already has a partition pending detach",
+                                    alter.id
+                                ),
+                            };
+                        }
+                        if matches!(edge.kind, DependencyKind::PartitionOf)
+                            && let Some(RelationOverlay::Present(partition)) =
+                                self.local.relations.get(&edge.dependent)
+                            && partition
+                                .partition_bound
+                                .as_deref()
+                                .is_some_and(|bound| bound.trim().eq_ignore_ascii_case("DEFAULT"))
+                        {
+                            return MutationResult::Conflict {
+                                reason: format!(
+                                    "cannot detach concurrently from '{}' while it has a default partition",
+                                    alter.id
+                                ),
+                            };
+                        }
+                    }
+                }
                 if let Err(result) = self.ensure_relation_target(
                     child,
                     |kind| *kind == RelationKind::Table,
@@ -4788,6 +4869,7 @@ impl AnalysisState {
                     generation,
                     identity_sequence: _,
                     generated_expr,
+                    generated_expr_sql,
                 } => {
                     if let Some(existing_col) = rel.columns.iter().find(|c| c.name == *name) {
                         if *if_not_exists {
@@ -4833,7 +4915,7 @@ impl AnalysisState {
                                         crate::_internal::analysis::facts::ColumnGeneration::GeneratedVirtual => crate::_internal::model::relation::GeneratedColumnKind::Virtual,
                                         _ => unreachable!("generated kind checked above"),
                                     },
-                                    expression: None,
+                                    expression: generated_expr_sql.clone(),
                                 },
                             );
                         }
@@ -5049,6 +5131,16 @@ impl AnalysisState {
                         .local
                         .constraints
                         .remove(&(alter.id.clone(), name.clone()));
+                    if let Some(index) = removed_constraint
+                        .as_ref()
+                        .and_then(|constraint| constraint.backing_index.as_ref())
+                    {
+                        self.snapshot_graph_full();
+                        self.local.graph.retain_edges(|edge| {
+                            !(edge.dependent == *index
+                                && matches!(edge.kind, DependencyKind::IndexOnRelation { .. }))
+                        });
+                    }
                     if let Some(ref c) = removed_constraint
                         && c.kind == crate::_internal::model::constraint::ConstraintKind::NotNull
                     {
@@ -5234,11 +5326,16 @@ impl AnalysisState {
                                 &HashSet::new(),
                             )
                         });
-                    let backing_index = using_index
-                        .as_ref()
-                        .map(|index| ObjectId::new(index.schema.clone(), constraint_name.clone()));
+                    let backing_index = Some(ObjectId::new(&alter.id.schema, &constraint_name));
                     if let Some(index) = using_index {
                         self.adopt_index_for_constraint(index, &alter.id, &constraint_name);
+                    } else {
+                        self.snapshot_graph();
+                        self.local.graph.add_edge(DependencyEdge::new(
+                            ObjectId::new(&alter.id.schema, &constraint_name),
+                            alter.id.clone(),
+                            Self::constraint_index_dependency(columns.clone(), true),
+                        ));
                     }
                     self.snapshot_constraint(&alter.id, &constraint_name);
                     self.local.constraints.insert(
@@ -5287,11 +5384,16 @@ impl AnalysisState {
                                 &HashSet::new(),
                             )
                         });
-                    let backing_index = using_index
-                        .as_ref()
-                        .map(|index| ObjectId::new(index.schema.clone(), constraint_name.clone()));
+                    let backing_index = Some(ObjectId::new(&alter.id.schema, &constraint_name));
                     if let Some(index) = using_index {
                         self.adopt_index_for_constraint(index, &alter.id, &constraint_name);
+                    } else {
+                        self.snapshot_graph();
+                        self.local.graph.add_edge(DependencyEdge::new(
+                            ObjectId::new(&alter.id.schema, &constraint_name),
+                            alter.id.clone(),
+                            Self::constraint_index_dependency(columns.clone(), true),
+                        ));
                     }
                     self.snapshot_constraint(&alter.id, &constraint_name);
                     self.local.constraints.insert(
@@ -5322,6 +5424,13 @@ impl AnalysisState {
                             },
                         ));
                         for column in columns.iter() {
+                            if let Some(RelationOverlay::Present(relation)) =
+                                self.local.relations.get_mut(&alter.id)
+                            {
+                                relation.apply_column_action(&ColumnAction::SetNotNull {
+                                    name: column.clone(),
+                                });
+                            }
                             self.register_not_null_constraint(&alter.id, column);
                         }
                     }
@@ -5435,11 +5544,15 @@ impl AnalysisState {
                                     && edge.dependent == *child
                                     && edge.referenced == alter.id)
                             });
-                            self.local.graph.add_edge(DependencyEdge::new(
-                                child.clone(),
-                                alter.id.clone(),
-                                DependencyKind::PartitionDetachPending,
-                            ));
+                            // PostgreSQL deliberately adds no CHECK for hash detach:
+                            // its partition predicate contains the parent table OID.
+                            if !concurrent_hash_detach {
+                                self.local.graph.add_edge(DependencyEdge::new(
+                                    child.clone(),
+                                    alter.id.clone(),
+                                    DependencyKind::PartitionDetachPending,
+                                ));
+                            }
                         }
                     }
                 }
@@ -5503,9 +5616,15 @@ impl AnalysisState {
                         rel.table_options.remove(name);
                     }
                 }
-                // The dependency edges for a generated expression are updated
-                // above; the column flag itself already came from the cache.
-                AlterTableActionMutation::SetGeneratedExpression { .. } => {}
+                AlterTableActionMutation::SetGeneratedExpression {
+                    column,
+                    expression_sql,
+                    ..
+                } => {
+                    if let Some(generated) = rel.generated_columns.get_mut(column) {
+                        generated.expression = Some(expression_sql.clone());
+                    }
+                }
                 AlterTableActionMutation::AlterColumnInheritance
                 | AlterTableActionMutation::PartitionReshape => {
                     // These forms have a typed parse but change physical or
@@ -5524,7 +5643,14 @@ impl AnalysisState {
             }
         }
         match &alter.action {
-            AlterTableActionMutation::AttachPartition { child, .. } => {
+            AlterTableActionMutation::AttachPartition { child, bound, .. } => {
+                self.snapshot_relation(child);
+                if let Some(RelationOverlay::Present(relation)) =
+                    self.local.relations.get_mut(child)
+                {
+                    relation.partition_bound = bound.clone();
+                    relation.partition_constraint = None;
+                }
                 self.ensure_partition_indexes_and_constraints(&alter.id, child);
                 let result = self.clone_row_triggers_to_partition(&alter.id, child);
                 debug_assert!(matches!(result, MutationResult::Applied));
@@ -5533,12 +5659,18 @@ impl AnalysisState {
                 }
             }
             AlterTableActionMutation::DetachPartition { child, mode }
-                if matches!(
+                if !matches!(
                     mode,
-                    crate::_internal::analysis::facts::DetachPartitionMode::Immediate
-                        | crate::_internal::analysis::facts::DetachPartitionMode::Finalize
-                ) =>
+                    crate::_internal::analysis::facts::DetachPartitionMode::Concurrently
+                ) || concurrent_hash_detach =>
             {
+                self.snapshot_relation(child);
+                if let Some(RelationOverlay::Present(relation)) =
+                    self.local.relations.get_mut(child)
+                {
+                    relation.partition_bound = None;
+                    relation.partition_constraint = None;
+                }
                 self.remove_partition_trigger_clones(&alter.id, child);
             }
             _ => {}
@@ -5582,7 +5714,7 @@ impl AnalysisState {
             }
         }
         match &alter.action {
-            AlterTableActionMutation::SetGeneratedExpression { column, expr } => {
+            AlterTableActionMutation::SetGeneratedExpression { column, expr, .. } => {
                 let references = expr
                     .referenced_columns()
                     .expect("generated expression was validated before state mutation");

@@ -23,8 +23,9 @@ impl Resolver {
         foreign_keys: &[FkFact],
         table_constraints: &[TableConstraintFact],
         partition_by: &Option<String>,
+        partition_strategy: &Option<String>,
         partition_of: &Option<QualifiedName>,
-        partition_type: &Option<String>,
+        partition_bound: &Option<String>,
         inherits: &[QualifiedName],
         like_sources: &[crate::_internal::analysis::facts::LikeSourceFact],
         of_type: &Option<QualifiedName>,
@@ -79,6 +80,7 @@ impl Resolver {
                     }
                 }),
                 generated_expr: column.generated_expr.clone(),
+                generated_expr_sql: column.generated_expr_sql.clone(),
             })
             .collect();
         let of_type = of_type
@@ -105,6 +107,7 @@ impl Resolver {
                 generation: crate::_internal::analysis::facts::ColumnGeneration::Ordinary,
                 identity_sequence: None,
                 generated_expr: None,
+                generated_expr_sql: None,
             }));
         }
         let mut as_select_columns_known = !as_select;
@@ -135,6 +138,7 @@ impl Resolver {
                                     crate::_internal::analysis::facts::ColumnGeneration::Ordinary,
                                 identity_sequence: None,
                                 generated_expr: None,
+                                generated_expr_sql: None,
                             }));
                         }
                         SelectOutputFact::Column {
@@ -159,6 +163,7 @@ impl Resolver {
                                     crate::_internal::analysis::facts::ColumnGeneration::Ordinary,
                                 identity_sequence: None,
                                 generated_expr: None,
+                                generated_expr_sql: None,
                             });
                         }
                     }
@@ -189,10 +194,11 @@ impl Resolver {
             foreign_keys,
             table_constraints: table_constraints.to_vec(),
             partition_by: partition_by.clone(),
+            partition_strategy: partition_strategy.clone(),
             partition_of: partition_of
                 .as_ref()
                 .map(|parent| Self::resolve_relation_lookup_name(parent, state)),
-            partition_type: partition_type.clone(),
+            partition_bound: partition_bound.clone(),
             inherits: inherits
                 .iter()
                 .map(|parent| Self::resolve_relation_lookup_name(parent, state))
@@ -226,6 +232,7 @@ impl Resolver {
                     generation,
                     identity_sequence,
                     generated_expr,
+                    generated_expr_sql,
                 } => AlterTableActionMutation::AddColumn {
                     name: name.clone(),
                     ty: ty.clone(),
@@ -250,6 +257,7 @@ impl Resolver {
                         }
                     }),
                     generated_expr: generated_expr.clone(),
+                    generated_expr_sql: generated_expr_sql.clone(),
                 },
                 AlterTableActionFact::DropColumn {
                     name,
@@ -393,10 +401,11 @@ impl Resolver {
                         constraint_name: constraint_name.clone(),
                     }
                 }
-                AlterTableActionFact::AttachPartition { child, strategy } => {
+                AlterTableActionFact::AttachPartition { child, strategy, bound } => {
                     AlterTableActionMutation::AttachPartition {
                         child: Self::resolve_relation_lookup_name(child, state),
                         strategy: strategy.clone(),
+                        bound: bound.clone(),
                     }
                 }
                 AlterTableActionFact::DetachPartition { child, mode } => {
@@ -520,10 +529,11 @@ impl Resolver {
                 AlterTableActionFact::DisableRls => {
                     AlterTableActionMutation::SetRowSecurity { enabled: false }
                 }
-                AlterTableActionFact::SetExpression { column, expr } => {
+                AlterTableActionFact::SetExpression { column, expr, expression_sql } => {
                     AlterTableActionMutation::SetGeneratedExpression {
                         column: column.clone(),
                         expr: expr.clone(),
+                        expression_sql: expression_sql.clone(),
                     }
                 }
                 AlterTableActionFact::InheritTable { parent } => {

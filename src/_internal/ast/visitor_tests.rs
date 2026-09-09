@@ -35,6 +35,84 @@ mod tests {
     }
 
     #[test]
+    fn key_constraint_columns_preserve_keyword_and_quoted_names() {
+        let facts = parse_and_extract(
+            "ALTER TABLE items ADD CONSTRAINT items_key UNIQUE (value, \"Mixed\");",
+        );
+        assert!(
+            matches!(&facts[0], StatementFact::AlterTable { actions, .. }
+            if matches!(actions.as_slice(), [AlterTableActionFact::AddUniqueConstraint { columns, .. }]
+                if columns == &["value", "Mixed"]))
+        );
+    }
+
+    #[test]
+    fn generated_prefix_operators_preserve_semantics_and_dependencies() {
+        for (source, expected) in [("-base", "-"), ("+base", "+"), ("NOT base", "NOT")] {
+            let facts = parse_and_extract(&format!(
+                "CREATE TABLE expressions (base integer, computed integer GENERATED ALWAYS AS ({source}) STORED);"
+            ));
+            let StatementFact::CreateTable { columns, .. } = &facts[0] else {
+                panic!("expected table")
+            };
+            let expression = columns[1].generated_expr.as_ref().unwrap();
+            assert!(
+                matches!(expression, ExprIr::UnaryOp { op, expr } if op == expected && matches!(expr.as_ref(), ExprIr::ColumnRef(name) if name == "base"))
+            );
+            assert_eq!(
+                expression.referenced_columns().unwrap(),
+                ["base".into()].into_iter().collect()
+            );
+            assert!(!expression.contains_opaque());
+        }
+        let expression = ExprIr::UnaryOp {
+            op: "-".into(),
+            expr: Box::new(ExprIr::FunctionCall {
+                name: "random".into(),
+                args: vec![],
+            }),
+        };
+        assert!(expression.is_volatile());
+    }
+
+    #[test]
+    fn expression_column_rename_preserves_functions_literals_and_unicode() {
+        use crate::_internal::analysis::expr_visitor::ExprVisitor;
+        assert_eq!(
+            ExprVisitor::rename_column_source(
+                "abs(abs) + length('abs')",
+                "items",
+                "abs",
+                "Renamed"
+            ),
+            Some("abs(\"Renamed\") + length('abs')".into())
+        );
+        assert_eq!(
+            ExprVisitor::rename_column_source("\"café\" + 1", "items", "café", "new\"name"),
+            Some("\"new\"\"name\" + 1".into())
+        );
+        assert_eq!(
+            ExprVisitor::rename_column_source(
+                "items.value + payload.value",
+                "items",
+                "value",
+                "new_value"
+            ),
+            Some("items.\"new_value\" + payload.value".into())
+        );
+        assert!(ExprVisitor::rename_column_source("base +", "items", "base", "renamed").is_none());
+        assert_eq!(
+            ExprVisitor::rename_column_source(
+                "pg_catalog.abs(pg_catalog) + pg_catalog.abs(items.pg_catalog)",
+                "items",
+                "pg_catalog",
+                "renamed"
+            ),
+            Some("pg_catalog.abs(\"renamed\") + pg_catalog.abs(items.\"renamed\")".into())
+        );
+    }
+
+    #[test]
     fn test_grant_extracts_individual_table_privileges() {
         let fact = parse_and_extract_statement(
             "GRANT SELECT, INSERT, UPDATE, DELETE ON test_table TO app_user;",
@@ -1916,9 +1994,30 @@ mod tests {
             actions.as_slice(),
             [AlterTableActionFact::AttachPartition {
                 strategy: Some(strategy),
+                bound: Some(bound),
                 ..
-            }] if strategy == "RANGE"
+            }] if strategy == "RANGE" && bound == "FOR VALUES FROM (1) TO (100)"
         ));
+    }
+
+    #[test]
+    fn partition_strategy_ignores_comments_and_preserves_bound_identity() {
+        for (sql_strategy, expected) in [("RANGE", "range"), ("list", "list"), ("\"HASH\"", "HASH")]
+        {
+            let sql = format!(
+                "CREATE TABLE child PARTITION OF parent DEFAULT PARTITION /* key */ BY {sql_strategy} /* bound is separate */ (id);"
+            );
+            let StatementFact::CreateTable {
+                partition_strategy,
+                partition_bound,
+                ..
+            } = parse_and_extract_statement(&sql).expect("partition fact")
+            else {
+                panic!("expected create table")
+            };
+            assert_eq!(partition_strategy.as_deref(), Some(expected));
+            assert_eq!(partition_bound.as_deref(), Some("DEFAULT"));
+        }
     }
 
     #[test]
@@ -2613,7 +2712,7 @@ mod tests {
             &facts[3],
             StatementFact::AlterTable { actions, .. }
                 if matches!(actions.as_slice(), [AlterTableActionFact::SetStatistics { column, target }]
-                    if column == "payload" && target == &100)
+                    if column == "payload" && target == &Some(100))
         ));
         assert!(matches!(
             &facts[4],
@@ -2641,6 +2740,25 @@ mod tests {
             StatementFact::AlterTable { actions, .. }
                 if matches!(actions.as_slice(), [AlterTableActionFact::DropExpression { column, if_exists }]
                     if column == "payload" && *if_exists)
+        ));
+    }
+
+    #[test]
+    fn typed_column_default_metadata_options_preserve_reset_semantics() {
+        let facts = parse_and_extract(
+            "ALTER TABLE events ALTER COLUMN payload SET STORAGE DEFAULT;
+             ALTER TABLE events ALTER COLUMN payload SET STATISTICS DEFAULT;",
+        );
+        assert!(matches!(
+            &facts[0],
+            StatementFact::AlterTable { actions, .. }
+                if matches!(actions.as_slice(), [AlterTableActionFact::SetStorage { mode, .. }]
+                    if mode == "DEFAULT")
+        ));
+        assert!(matches!(
+            &facts[1],
+            StatementFact::AlterTable { actions, .. }
+                if matches!(actions.as_slice(), [AlterTableActionFact::SetStatistics { target: None, .. }])
         ));
     }
 
@@ -2767,14 +2885,13 @@ mod tests {
 
     #[test]
     fn unsupported_create_non_enum_types_are_not_silent() {
-        for sql in ["CREATE TYPE floatrange AS RANGE (subtype = float8);"] {
-            let parsed = SourceFile::parse(sql);
-            let statement = parsed.tree().stmts().next().expect("statement");
-            assert!(
-                AstVisitor::extract(&statement).is_none(),
-                "unmodeled CREATE TYPE semantics must use the opaque engine path: {sql}"
-            );
-        }
+        let sql = "CREATE TYPE floatrange AS RANGE (subtype = float8);";
+        let parsed = SourceFile::parse(sql);
+        let statement = parsed.tree().stmts().next().expect("statement");
+        assert!(
+            AstVisitor::extract(&statement).is_none(),
+            "unmodeled CREATE TYPE semantics must use the opaque engine path: {sql}"
+        );
     }
 
     #[test]
@@ -2930,6 +3047,33 @@ mod tests {
                 crate::_internal::analysis::facts::SecurityKind::Definer
             )
         )));
+    }
+
+    #[test]
+    fn create_sequence_preserves_typed_parameters_and_persistence() {
+        let facts = parse_and_extract(
+            "CREATE UNLOGGED SEQUENCE public.event_ids AS integer INCREMENT BY -3 \
+             MINVALUE -99 MAXVALUE -3 START WITH -3 CACHE 7 CYCLE;",
+        );
+        let StatementFact::CreateSequence {
+            persistence,
+            options,
+            ..
+        } = &facts[0]
+        else {
+            panic!("expected create sequence fact");
+        };
+        assert_eq!(
+            *persistence,
+            crate::_internal::analysis::facts::PersistenceFact::Unlogged
+        );
+        assert_eq!(options.data_type.as_deref(), Some("integer"));
+        assert_eq!(options.increment, Some(-3));
+        assert_eq!(options.min_value, Some(Some(-99)));
+        assert_eq!(options.max_value, Some(Some(-3)));
+        assert_eq!(options.start_value, Some(-3));
+        assert_eq!(options.cache_size, Some(7));
+        assert_eq!(options.cycle, Some(true));
     }
 
     #[test]

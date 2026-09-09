@@ -232,6 +232,8 @@ pub(crate) struct CreateSequenceMutation {
     pub id: ObjectId,
     pub if_not_exists: bool,
     pub owned_by: Option<(ObjectId, String)>,
+    pub persistence: crate::_internal::model::sequence::SequencePersistence,
+    pub options: IdentitySequenceOptionsMutation,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -320,8 +322,9 @@ pub(crate) struct CreateTable {
     pub foreign_keys: Vec<FkMutation>,
     pub table_constraints: Vec<TableConstraintFact>,
     pub partition_by: Option<String>,
+    pub partition_strategy: Option<String>,
     pub partition_of: Option<ObjectId>,
-    pub partition_type: Option<String>,
+    pub partition_bound: Option<String>,
     pub inherits: Vec<ObjectId>,
     /// Source tables and the supported column-property selection for `LIKE`.
     /// Object-producing options (constraints, indexes, and identity) remain
@@ -350,6 +353,7 @@ pub(crate) struct ColumnMutation {
     pub generation: crate::_internal::analysis::facts::ColumnGeneration,
     pub identity_sequence: Option<IdentitySequenceOptionsMutation>,
     pub generated_expr: Option<ExprIr>,
+    pub generated_expr_sql: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -647,6 +651,7 @@ pub(crate) enum OpaqueMutation {
     },
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum AlterTableActionMutation {
     AddColumn {
@@ -659,6 +664,7 @@ pub(crate) enum AlterTableActionMutation {
         generation: crate::_internal::analysis::facts::ColumnGeneration,
         identity_sequence: Option<IdentitySequenceOptionsMutation>,
         generated_expr: Option<ExprIr>,
+        generated_expr_sql: Option<String>,
     },
     DropColumn {
         name: String,
@@ -729,6 +735,7 @@ pub(crate) enum AlterTableActionMutation {
     SetGeneratedExpression {
         column: String,
         expr: ExprIr,
+        expression_sql: String,
     },
     SetColumnOptions {
         column: String,
@@ -762,6 +769,7 @@ pub(crate) enum AlterTableActionMutation {
     AttachPartition {
         child: ObjectId,
         strategy: Option<String>,
+        bound: Option<String>,
     },
     DetachPartition {
         child: ObjectId,
@@ -786,7 +794,7 @@ pub(crate) enum AlterTableActionMutation {
     },
     SetStatistics {
         column: String,
-        target: i32,
+        target: Option<i32>,
     },
     DropGeneratedExpression {
         column: String,

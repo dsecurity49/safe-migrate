@@ -24,12 +24,36 @@ impl Resolver {
         name: &QualifiedName,
         if_not_exists: bool,
         owned_by: &Option<(QualifiedName, String)>,
+        persistence: &crate::_internal::analysis::facts::PersistenceFact,
+        options: &crate::_internal::analysis::facts::IdentitySequenceOptionsFact,
         state: &AnalysisState,
     ) -> Mutation {
         Mutation::CreateSequence(CreateSequenceMutation {
             id: Self::resolve_creation_name(name, state),
             if_not_exists,
             owned_by: Self::resolve_owned_by(owned_by, state),
+            persistence: match persistence {
+                crate::_internal::analysis::facts::PersistenceFact::Permanent => {
+                    crate::_internal::model::sequence::SequencePersistence::Permanent
+                }
+                crate::_internal::analysis::facts::PersistenceFact::Temporary => {
+                    crate::_internal::model::sequence::SequencePersistence::Temporary
+                }
+                crate::_internal::analysis::facts::PersistenceFact::Unlogged => {
+                    crate::_internal::model::sequence::SequencePersistence::Unlogged
+                }
+            },
+            options: crate::_internal::analysis::mutations::IdentitySequenceOptionsMutation {
+                data_type: options.data_type.clone(),
+                start_value: options.start_value,
+                increment: options.increment,
+                min_value: options.min_value,
+                max_value: options.max_value,
+                cache_size: options.cache_size,
+                cycle: options.cycle,
+                persistence: options.persistence,
+                sequence_name: None,
+            },
         })
     }
 

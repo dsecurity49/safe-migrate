@@ -1,3 +1,4 @@
+use crate::_internal::analysis::expr_ir::ExprIr;
 use crate::_internal::ast::identifiers::ObjectId;
 use crate::_internal::model::column::Column;
 use serde::{Deserialize, Serialize};
@@ -521,6 +522,11 @@ pub(crate) struct RelationState {
     pub privileges: PrivilegeMatrix,
     pub partition_type: Option<String>, // e.g., "RANGE", "LIST", "HASH"
     pub partition_by: Option<String>,   // The partition key expression
+    #[serde(default)]
+    pub partition_bound: Option<String>,
+    /// PostgreSQL's effective partition predicate, including ancestor bounds.
+    #[serde(default)]
+    pub partition_constraint: Option<String>,
     pub is_fk_dependency: bool,
     /// Whether a materialized view has been populated. `None` means the
     /// catalog did not provide this relation-specific fact; it is ignored for
@@ -571,6 +577,8 @@ impl Default for RelationState {
             privileges: PrivilegeMatrix::default(),
             partition_type: None,
             partition_by: None,
+            partition_bound: None,
+            partition_constraint: None,
             is_fk_dependency: false,
             is_populated: None,
             tablespace: None,
@@ -586,6 +594,17 @@ impl Default for RelationState {
 }
 
 impl RelationState {
+    pub(crate) fn normalize_column_default(default: &Option<ExprIr>) -> Option<ExprIr> {
+        if matches!(
+            default,
+            Some(ExprIr::Literal(value)) if value.trim().eq_ignore_ascii_case("null")
+        ) {
+            None
+        } else {
+            default.clone()
+        }
+    }
+
     pub(crate) fn new(
         id: ObjectId,
         owner: ObjectId,
@@ -617,6 +636,8 @@ impl RelationState {
             privileges: PrivilegeMatrix::default(),
             partition_type: None,
             partition_by: None,
+            partition_bound: None,
+            partition_constraint: None,
             is_fk_dependency: false,
             is_populated: None,
             tablespace: None,
@@ -659,14 +680,8 @@ impl RelationState {
                             name: "nextval".to_string(),
                             args: Vec::new(),
                         })
-                    } else if matches!(
-                        default,
-                        Some(crate::_internal::analysis::expr_ir::ExprIr::Literal(value))
-                            if value.trim().eq_ignore_ascii_case("null")
-                    ) {
-                        None
                     } else {
-                        default.clone()
+                        Self::normalize_column_default(default)
                     };
                     self.columns.push(Column::migration_created(
                         name.clone(),
@@ -693,6 +708,11 @@ impl RelationState {
                     }
                     if let Some(generated) = self.generated_columns.remove(from) {
                         self.generated_columns.insert(to.clone(), generated);
+                    }
+                    for generated in self.generated_columns.values_mut() {
+                        generated.expression = generated.expression.as_deref().and_then(|source| {
+                            crate::_internal::analysis::expr_visitor::ExprVisitor::rename_column_source(source, &self.id.name, from, to)
+                        });
                     }
                     for statistics in self.extended_statistics.values_mut() {
                         let mut renamed = false;
@@ -727,26 +747,21 @@ impl RelationState {
                     col.type_id = None;
                     col.type_modifier = None;
                     col.avg_width = None;
+                    // ALTER TYPE resets these to the destination type's defaults.
+                    col.storage = None;
+                    col.compression = None;
                 }
             }
             ColumnAction::SetDefault { name, default } => {
                 if let Some(col) = self.columns.iter_mut().find(|c| c.name == *name) {
-                    col.default = if matches!(
-                        default,
-                        Some(crate::_internal::analysis::expr_ir::ExprIr::Literal(value))
-                            if value.trim().eq_ignore_ascii_case("null")
-                    ) {
-                        None
-                    } else {
-                        default.clone()
-                    };
+                    col.default = Self::normalize_column_default(default);
                     // A migration mutation supersedes raw baseline catalog text.
                     col.default_expr_text = None;
                 }
             }
             ColumnAction::SetStorage { name, mode } => {
                 if let Some(col) = self.columns.iter_mut().find(|c| c.name == *name) {
-                    col.storage = Some(mode.clone());
+                    col.storage = (!mode.eq_ignore_ascii_case("default")).then(|| mode.clone());
                 }
             }
             ColumnAction::SetCompression { name, method } => {
@@ -756,7 +771,7 @@ impl RelationState {
             }
             ColumnAction::SetStatistics { name, target } => {
                 if let Some(col) = self.columns.iter_mut().find(|c| c.name == *name) {
-                    col.statistics_target = Some(*target);
+                    col.statistics_target = *target;
                 }
             }
             ColumnAction::SetOptions { name, options } => {
@@ -931,7 +946,7 @@ pub(crate) enum ColumnAction {
     },
     SetStatistics {
         name: String,
-        target: i32,
+        target: Option<i32>,
     },
     SetOptions {
         name: String,

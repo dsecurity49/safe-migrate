@@ -4,6 +4,73 @@ use squawk_syntax::ast::{AstNode, Expr};
 pub(crate) struct ExprVisitor;
 
 impl ExprVisitor {
+    pub(crate) fn rename_column_source(
+        source: &str,
+        table: &str,
+        from: &str,
+        to: &str,
+    ) -> Option<String> {
+        use squawk_syntax::ast::{CallExpr, FieldExpr, NameRef, SourceFile, Target};
+        let prefix = "SELECT ";
+        let parsed = SourceFile::parse(&format!("{prefix}{source}"));
+        if !parsed.errors().is_empty() || parsed.tree().stmts().count() != 1 {
+            return None;
+        }
+        let expr = parsed
+            .tree()
+            .syntax()
+            .descendants()
+            .find_map(Target::cast)?
+            .expr()?;
+        let mut ranges = Vec::new();
+        for name in expr.syntax().descendants().filter_map(NameRef::cast) {
+            if name.text() != from {
+                continue;
+            }
+            // A qualified callee contains NameRefs too, but none refer to columns.
+            if name
+                .syntax()
+                .ancestors()
+                .filter_map(CallExpr::cast)
+                .any(|call| {
+                    call.expr().is_some_and(|callee| {
+                        callee
+                            .syntax()
+                            .text_range()
+                            .contains_range(name.syntax().text_range())
+                    })
+                })
+            {
+                continue;
+            }
+            if let Some(parent) = name.syntax().parent()
+                && let Some(field) = FieldExpr::cast(parent)
+            {
+                let qualified_table = field.base().is_some_and(
+                    |base| matches!(base, Expr::NameRef(base) if base.text() == table),
+                );
+                let is_field = field
+                    .field()
+                    .is_some_and(|field| field.syntax() == name.syntax());
+                if (is_field && !qualified_table) || (!is_field && qualified_table) {
+                    continue;
+                }
+            }
+            let range = name.syntax().text_range();
+            ranges.push((
+                usize::from(range.start()).checked_sub(prefix.len())?,
+                usize::from(range.end()).checked_sub(prefix.len())?,
+            ));
+        }
+        let replacement = format!("\"{}\"", to.replace('"', "\"\""));
+        let mut result = source.to_string();
+        ranges.sort_unstable();
+        for (start, end) in ranges.into_iter().rev() {
+            result.replace_range(start..end, &replacement);
+        }
+        Some(result)
+    }
+
     pub(crate) fn convert(expr: Expr) -> ExprIr {
         match expr {
             Expr::Literal(lit) => Self::convert_literal(lit),
@@ -11,10 +78,21 @@ impl ExprVisitor {
             Expr::CallExpr(ce) => Self::convert_call_expr(ce),
             Expr::BinExpr(be) => Self::convert_bin_expr(be),
             Expr::CastExpr(ce) => Self::convert_cast_expr(ce),
-            Expr::PrefixExpr(pe) => pe
-                .expr()
-                .map(Self::convert)
-                .unwrap_or(ExprIr::Sentinel("<prefix>".into())),
+            Expr::PrefixExpr(pe) => {
+                use squawk_syntax::ast::PrefixOp;
+                let op = match pe.op() {
+                    Some(PrefixOp::Minus(_)) => "-".into(),
+                    Some(PrefixOp::Plus(_)) => "+".into(),
+                    Some(PrefixOp::Not(_)) => "NOT".into(),
+                    Some(PrefixOp::CustomOp(op)) => op.syntax().text().to_string(),
+                    Some(PrefixOp::OperatorCall(op)) => op.syntax().text().to_string(),
+                    None => return ExprIr::Sentinel("<prefix>".into()),
+                };
+                ExprIr::UnaryOp {
+                    op,
+                    expr: Box::new(pe.expr().map(Self::convert).unwrap_or(ExprIr::Omitted)),
+                }
+            }
             Expr::ParenExpr(pe) => pe
                 .expr()
                 .map(Self::convert)

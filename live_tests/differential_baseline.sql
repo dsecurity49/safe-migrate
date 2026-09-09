@@ -210,6 +210,28 @@ CREATE TABLE sm_core.t_large (
     col2 integer,
     created_at timestamptz
 );
+
+-- Canonical source for Batch 1 LIKE/catalog differential coverage. Keeping it
+-- in the baseline lets the simulator and PostgreSQL start from identical
+-- extended-statistics and identity-sequence evidence.
+CREATE TABLE sm_core.batch1_like_source (
+    id bigint GENERATED ALWAYS AS IDENTITY
+        (START WITH 10 INCREMENT BY 2 CACHE 5),
+    a integer NOT NULL CONSTRAINT batch1_like_source_a_check CHECK (a > 0),
+    b text,
+    doubled integer GENERATED ALWAYS AS (a * 2) STORED
+);
+ALTER TABLE sm_core.batch1_like_source ALTER COLUMN b SET STORAGE MAIN;
+ALTER TABLE sm_core.batch1_like_source ALTER COLUMN b SET STATISTICS 250;
+CREATE INDEX batch1_like_source_a_idx ON sm_core.batch1_like_source (a);
+CREATE STATISTICS sm_core.batch1_like_source_stats (dependencies, ndistinct)
+    ON a, b FROM sm_core.batch1_like_source;
+ALTER STATISTICS sm_core.batch1_like_source_stats SET STATISTICS 250;
+CREATE TABLE sm_core.batch1_rules (id integer);
+CREATE RULE rule_origin AS ON INSERT TO sm_core.batch1_rules DO ALSO NOTHING;
+CREATE RULE rule_disabled AS ON INSERT TO sm_core.batch1_rules DO ALSO NOTHING;
+CREATE RULE rule_replica AS ON INSERT TO sm_core.batch1_rules DO ALSO NOTHING;
+CREATE RULE rule_always AS ON INSERT TO sm_core.batch1_rules DO ALSO NOTHING;
 CREATE UNIQUE INDEX t_large_col1_prebuilt_key ON sm_core.t_large (col1);
 
 CREATE TABLE sm_core.items (

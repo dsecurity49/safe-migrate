@@ -166,8 +166,9 @@ pub(crate) enum StatementFact {
         foreign_keys: Vec<FkFact>,
         table_constraints: Vec<TableConstraintFact>,
         partition_by: Option<String>,
+        partition_strategy: Option<String>,
         partition_of: Option<QualifiedName>,
-        partition_type: Option<String>,
+        partition_bound: Option<String>,
         inherits: Vec<QualifiedName>,
         like_sources: Vec<LikeSourceFact>,
         of_type: Option<QualifiedName>,
@@ -272,6 +273,8 @@ pub(crate) enum StatementFact {
         name: QualifiedName,
         if_not_exists: bool,
         owned_by: Option<(QualifiedName, String)>,
+        persistence: PersistenceFact,
+        options: IdentitySequenceOptionsFact,
     },
     AlterSequence {
         name: QualifiedName,
@@ -913,6 +916,8 @@ pub(crate) struct ColumnFact {
     pub generation: ColumnGeneration,
     pub identity_sequence: Option<IdentitySequenceOptionsFact>,
     pub generated_expr: Option<ExprIr>,
+    #[serde(default)]
+    pub generated_expr_sql: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -980,8 +985,9 @@ pub(crate) enum AlterTableActionFact {
         not_null: bool,
         default: Option<ExprIr>,
         generation: ColumnGeneration,
-        identity_sequence: Option<IdentitySequenceOptionsFact>,
+        identity_sequence: Option<Box<IdentitySequenceOptionsFact>>,
         generated_expr: Option<ExprIr>,
+        generated_expr_sql: Option<String>,
     },
     DropColumn {
         name: String,
@@ -1055,6 +1061,7 @@ pub(crate) enum AlterTableActionFact {
     SetExpression {
         column: String,
         expr: ExprIr,
+        expression_sql: String,
     },
     SetOptions {
         column: String,
@@ -1090,6 +1097,7 @@ pub(crate) enum AlterTableActionFact {
     AttachPartition {
         child: QualifiedName,
         strategy: Option<String>,
+        bound: Option<String>,
     },
     DetachPartition {
         child: QualifiedName,
@@ -1105,7 +1113,7 @@ pub(crate) enum AlterTableActionFact {
     },
     SetStatistics {
         column: String,
-        target: i32,
+        target: Option<i32>,
     },
     DropExpression {
         column: String,
