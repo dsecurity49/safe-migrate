@@ -1389,7 +1389,7 @@ fn load_relations_and_columns(
                 WHEN 'n' THEN 'NOTHING'
                 WHEN 'f' THEN 'FULL'
                 WHEN 'i' THEN CASE
-                    WHEN replica_index.relname IS NULL THEN NULL
+                    WHEN replica_index.relname IS NULL THEN 'USING INDEX'
                     ELSE 'USING INDEX ' || replica_index.relname
                 END
                 ELSE NULL

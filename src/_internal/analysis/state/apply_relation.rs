@@ -3479,6 +3479,17 @@ impl AnalysisState {
                         ),
                     };
                 }
+                let constraint = &self.local.constraints[&(alter.id.clone(), old_name.clone())];
+                if matches!(
+                    constraint.kind,
+                    ConstraintKind::PrimaryKey | ConstraintKind::Unique | ConstraintKind::Exclusion
+                ) && let Some(index) = &constraint.backing_index
+                {
+                    return self.apply_rename_relation(&Rename {
+                        old_id: index.clone(),
+                        new_id: ObjectId::new(index.schema.clone(), new_name.clone()),
+                    });
+                }
             }
             AlterTableActionMutation::AddForeignKey {
                 constraint_name,
@@ -5133,8 +5144,22 @@ impl AnalysisState {
                         .remove(&(alter.id.clone(), name.clone()));
                     if let Some(index) = removed_constraint
                         .as_ref()
+                        .filter(|constraint| {
+                            matches!(
+                                constraint.kind,
+                                ConstraintKind::PrimaryKey
+                                    | ConstraintKind::Unique
+                                    | ConstraintKind::Exclusion
+                            )
+                        })
                         .and_then(|constraint| constraint.backing_index.as_ref())
                     {
+                        self.snapshot_relation(&alter.id);
+                        if let Some(RelationOverlay::Present(relation)) =
+                            self.local.relations.get_mut(&alter.id)
+                        {
+                            relation.clear_index_settings(&index.name);
+                        }
                         self.snapshot_graph_full();
                         self.local.graph.retain_edges(|edge| {
                             !(edge.dependent == *index
@@ -5256,7 +5281,7 @@ impl AnalysisState {
                     self.snapshot_graph_full();
                     self.local
                         .graph
-                        .rename_foreign_key_constraint(&alter.id, old_name, new_name);
+                        .rename_constraint(&alter.id, old_name, new_name);
                 }
                 AlterTableActionMutation::AddCheckConstraint {
                     constraint_name,
@@ -5449,6 +5474,12 @@ impl AnalysisState {
                             &HashSet::new(),
                         )
                     });
+                    let backing_index = ObjectId::new(&alter.id.schema, &constraint_name);
+                    if self.relation_namespace_is_taken(&backing_index) {
+                        return MutationResult::Conflict {
+                            reason: format!("relation '{}' already exists", backing_index),
+                        };
+                    }
                     self.snapshot_constraint(&alter.id, &constraint_name);
                     self.local.constraints.insert(
                         (alter.id.clone(), constraint_name.clone()),
@@ -5458,7 +5489,7 @@ impl AnalysisState {
                             kind: ConstraintKind::Exclusion,
                             validated: true,
                             definition: None,
-                            backing_index: None,
+                            backing_index: Some(backing_index.clone()),
                         },
                     );
                     if !relation_columns_known || !columns_complete {
@@ -5467,7 +5498,30 @@ impl AnalysisState {
                             EvidenceScope::Chain,
                         );
                     } else {
-                        self.snapshot_graph();
+                        self.snapshot_graph_full();
+                        self.local.graph.add_edge(DependencyEdge::new(
+                            backing_index,
+                            alter.id.clone(),
+                            DependencyKind::IndexOnRelation {
+                                using_method: None,
+                                key_columns: columns.clone(),
+                                included_columns: Vec::new(),
+                                dependency_columns: columns.clone(),
+                                dependency_columns_known: true,
+                                has_expression_keys: true,
+                                has_predicate: false,
+                                is_concurrent: false,
+                                is_unique: false,
+                                is_immediate: true,
+                                is_valid: true,
+                                is_ready: true,
+                                is_live: true,
+                                has_default_sort_order: false,
+                                has_default_opclasses: false,
+                                has_default_collations: false,
+                                eligibility_known: false,
+                            },
+                        ));
                         self.local.graph.add_edge(DependencyEdge::new(
                             alter.id.clone(),
                             alter.id.clone(),
@@ -6060,6 +6114,31 @@ impl AnalysisState {
     pub(super) fn apply_rename_relation(&mut self, rename: &Rename) -> MutationResult {
         let renames_relation = self.relation_is_present(&rename.old_id);
         let renames_index = self.index_is_present(&rename.old_id);
+        if renames_index && rename.old_id.name != rename.new_id.name {
+            for constraint in self.local.constraints.values().filter(|constraint| {
+                constraint.backing_index.as_ref() == Some(&rename.old_id)
+                    && matches!(
+                        constraint.kind,
+                        ConstraintKind::PrimaryKey
+                            | ConstraintKind::Unique
+                            | ConstraintKind::Exclusion
+                    )
+            }) {
+                if constraint.name != rename.new_id.name
+                    && self
+                        .local
+                        .constraints
+                        .contains_key(&(constraint.table_id.clone(), rename.new_id.name.clone()))
+                {
+                    return MutationResult::Conflict {
+                        reason: format!(
+                            "constraint '{}' already exists on relation '{}'",
+                            rename.new_id.name, constraint.table_id
+                        ),
+                    };
+                }
+            }
+        }
         match self.relation_or_index_lookup(&rename.old_id) {
             RelationLookup::Present => {}
             _ if self.baseline_covers_family_object(
@@ -6253,6 +6332,7 @@ impl AnalysisState {
             self.local
                 .graph
                 .propagate_index_rename(old_index_id, new_index_id);
+            self.rename_index_catalog_references(old_index_id, new_index_id);
             self.local.graph.add_edge(DependencyEdge::new(
                 old_index_id.clone(),
                 new_index_id.clone(),
@@ -6361,6 +6441,7 @@ impl AnalysisState {
             self.local
                 .graph
                 .propagate_index_rename(&rename.old_id, &rename.new_id);
+            self.rename_index_catalog_references(&rename.old_id, &rename.new_id);
         }
 
         if renames_relation {
@@ -6396,6 +6477,60 @@ impl AnalysisState {
         }
 
         MutationResult::Applied
+    }
+
+    // The caller takes a namespace snapshot before changing these coupled identities.
+    fn rename_index_catalog_references(&mut self, old: &ObjectId, new: &ObjectId) {
+        let constraints = self
+            .local
+            .constraints
+            .values()
+            .filter(|constraint| constraint.backing_index.as_ref() == Some(old))
+            .cloned()
+            .collect::<Vec<_>>();
+        for mut constraint in constraints {
+            let old_name = constraint.name.clone();
+            let owns_index = matches!(
+                constraint.kind,
+                ConstraintKind::PrimaryKey | ConstraintKind::Unique | ConstraintKind::Exclusion
+            );
+            if owns_index && old.name != new.name {
+                constraint.name = new.name.clone();
+            }
+            self.local
+                .constraints
+                .remove(&(constraint.table_id.clone(), old_name.clone()));
+            constraint.backing_index = Some(new.clone());
+            if old_name != constraint.name {
+                self.local.graph.rename_constraint(
+                    &constraint.table_id,
+                    &old_name,
+                    &constraint.name,
+                );
+            }
+            self.local.constraints.insert(
+                (constraint.table_id.clone(), constraint.name.clone()),
+                constraint,
+            );
+        }
+        if old.name == new.name {
+            return;
+        }
+        let old_replica = format!("USING INDEX {}", old.name);
+        for (id, overlay) in &mut self.local.relations {
+            let RelationOverlay::Present(relation) = overlay else {
+                continue;
+            };
+            if id.schema != old.schema {
+                continue;
+            }
+            if relation.cluster_index.as_deref() == Some(old.name.as_str()) {
+                relation.cluster_index = Some(new.name.clone());
+            }
+            if relation.replica_identity.as_deref() == Some(old_replica.as_str()) {
+                relation.replica_identity = Some(format!("USING INDEX {}", new.name));
+            }
+        }
     }
 
     pub(super) fn apply_change_relation_owner(

@@ -655,6 +655,16 @@ impl RelationState {
         self.is_fk_dependency = true;
     }
 
+    pub(crate) fn clear_index_settings(&mut self, index_name: &str) {
+        if self.cluster_index.as_deref() == Some(index_name) {
+            self.cluster_index = None;
+        }
+        if self.replica_identity.as_deref() == Some(format!("USING INDEX {index_name}").as_str()) {
+            // PostgreSQL retains relreplident='i' after its identity index is dropped.
+            self.replica_identity = Some("USING INDEX".into());
+        }
+    }
+
     pub(crate) fn apply_column_action(&mut self, action: &ColumnAction) {
         match action {
             ColumnAction::Add {

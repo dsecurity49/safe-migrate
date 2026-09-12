@@ -940,6 +940,23 @@ mod tests {
     }
 
     #[test]
+    fn drop_index_preserves_qualified_quoted_identity() {
+        let StatementFact::DropIndex { names, .. } =
+            parse_and_extract_statement("DROP INDEX sm_core.\"IdentityIndex\";")
+                .expect("drop index fact")
+        else {
+            panic!("expected drop index fact")
+        };
+        assert_eq!(names.len(), 1);
+        assert_eq!(
+            names[0].schema.as_ref().map(Ident::resolve).as_deref(),
+            Some("sm_core")
+        );
+        assert_eq!(names[0].name.resolve(), "IdentityIndex");
+        assert!(names[0].name.quoted);
+    }
+
+    #[test]
     fn test_vacuum_full() {
         let sql = "VACUUM FULL;";
         let facts = parse_and_extract_statement(sql);

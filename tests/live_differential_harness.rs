@@ -3079,7 +3079,7 @@ fn normalize_table_flag(kind: &RelationKind, value: Option<bool>) -> Option<bool
 }
 
 fn normalize_replica_identity(kind: &RelationKind, value: Option<&str>) -> Option<String> {
-    matches!(kind, RelationKind::Table).then(|| value.unwrap_or("DEFAULT").to_ascii_uppercase())
+    matches!(kind, RelationKind::Table).then(|| value.unwrap_or("DEFAULT").to_string())
 }
 
 #[test]

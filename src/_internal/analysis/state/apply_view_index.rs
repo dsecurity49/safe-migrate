@@ -685,10 +685,34 @@ impl AnalysisState {
                 return MutationResult::Skipped;
             }
         }
+        let table_indexes = self
+            .local
+            .graph
+            .edges()
+            .iter()
+            .filter_map(|edge| {
+                (matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
+                    && targets.iter().any(|target| {
+                        self.local.graph.resolve_rename(target)
+                            == self.local.graph.resolve_rename(&edge.dependent)
+                    }))
+                .then(|| (edge.referenced.clone(), edge.dependent.name.clone()))
+            })
+            .collect::<Vec<_>>();
+        for (table, index_name) in table_indexes {
+            self.snapshot_relation(&table);
+            if let Some(RelationOverlay::Present(relation)) = self.local.relations.get_mut(&table) {
+                relation.clear_index_settings(&index_name);
+            }
+        }
         self.snapshot_graph_full();
+        let resolution_graph = self.local.graph.clone();
         self.local.graph.retain_edges(|edge| {
             !(matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
-                && targets.contains(&edge.dependent))
+                && targets.iter().any(|target| {
+                    resolution_graph.resolve_rename(target)
+                        == resolution_graph.resolve_rename(&edge.dependent)
+                }))
         });
         MutationResult::Applied
     }

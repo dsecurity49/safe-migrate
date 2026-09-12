@@ -1588,7 +1588,10 @@ impl DbCache {
                 continue;
             };
             let Some(index_name) = replica_identity.strip_prefix("USING INDEX ") else {
-                if matches!(replica_identity.as_str(), "DEFAULT" | "NOTHING" | "FULL") {
+                if matches!(
+                    replica_identity.as_str(),
+                    "DEFAULT" | "NOTHING" | "FULL" | "USING INDEX"
+                ) {
                     continue;
                 }
                 return Err(format!(

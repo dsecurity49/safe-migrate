@@ -1770,7 +1770,10 @@
         "safe_039_rule_enablement.sql",
         "safe_040_generated_column_rename.sql",
         "safe_041_partition_bounds.sql",
-        "safe_042_concurrent_hash_detach.sql"
+        "safe_042_concurrent_hash_detach.sql",
+        "safe_043_check_constraint_rename.sql",
+        "safe_044_key_index_rename.sql",
+        "safe_045_drop_index_settings.sql"
       ],
       "fixture_transactional": {
         "safe_010_role_transaction_semantics.sql": false,
@@ -2061,6 +2064,22 @@
           "indexes",
           "constraints",
           "triggers"
+        ],
+        "safe_043_check_constraint_rename.sql": [
+          "relations",
+          "columns",
+          "constraints"
+        ],
+        "safe_044_key_index_rename.sql": [
+          "relations",
+          "columns",
+          "indexes",
+          "constraints"
+        ],
+        "safe_045_drop_index_settings.sql": [
+          "relations",
+          "indexes",
+          "constraints"
         ],
         "safe_017_relation_namespace_resolution.sql": [
           "schemas",

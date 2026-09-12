@@ -630,7 +630,7 @@ impl DependencyGraph {
     }
 
     /// Rename a foreign-key constraint payload owned by a relation.
-    pub(crate) fn rename_foreign_key_constraint(
+    pub(crate) fn rename_constraint(
         &mut self,
         table_id: &ObjectId,
         old_name: &str,
@@ -638,13 +638,25 @@ impl DependencyGraph {
     ) {
         self.mutate_edges(|edges| {
             for edge in edges {
-                if edge.dependent == *table_id
-                    && let DependencyKind::ForeignKey {
+                if edge.dependent != *table_id {
+                    continue;
+                }
+                let name = match &mut edge.kind {
+                    DependencyKind::ForeignKey {
                         constraint_name: Some(name),
                         ..
-                    } = &mut edge.kind
-                    && name == old_name
-                {
+                    }
+                    | DependencyKind::ConstraintOnRelation {
+                        constraint_name: name,
+                        ..
+                    }
+                    | DependencyKind::ConstraintDependency {
+                        constraint_name: name,
+                        ..
+                    } => name,
+                    _ => continue,
+                };
+                if name == old_name {
                     *name = new_name.to_string();
                 }
             }

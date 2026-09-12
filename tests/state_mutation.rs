@@ -27,6 +27,226 @@ mod state_mutation_tests {
     use safe_migrate::_internal::model::types::{TypeKind, TypeOverlay, TypeState};
 
     #[test]
+    fn key_index_renames_preserve_constraint_and_table_metadata() {
+        let engine = setup_engine();
+        for rename in [
+            "ALTER TABLE rename_keys RENAME CONSTRAINT original_key TO renamed_key;",
+            "ALTER INDEX original_key RENAME TO renamed_key;",
+        ] {
+            let mut state = setup_state();
+            engine.analyze("CREATE TABLE rename_keys(id integer NOT NULL); ALTER TABLE rename_keys ADD CONSTRAINT original_key UNIQUE(id); ALTER TABLE rename_keys CLUSTER ON original_key; ALTER TABLE rename_keys REPLICA IDENTITY USING INDEX original_key;", &mut state).unwrap();
+            let before_constraints = state.local.constraints.clone();
+            let before_relations = state.local.relations.clone();
+            let before_edges = state.local.graph.edges().to_vec();
+            let findings = engine
+                .analyze(&format!("BEGIN; {rename}"), &mut state)
+                .unwrap();
+            assert!(
+                !findings
+                    .iter()
+                    .any(|finding| finding.rule_id == "chain-conflict"),
+                "{findings:?}"
+            );
+            let table = object_id("public", "rename_keys");
+            assert!(
+                !state
+                    .local
+                    .constraints
+                    .contains_key(&(table.clone(), "original_key".into()))
+            );
+            assert_eq!(
+                state.local.constraints[&(table.clone(), "renamed_key".into())].backing_index,
+                Some(object_id("public", "renamed_key"))
+            );
+            let RelationOverlay::Present(relation) = &state.local.relations[&table] else {
+                panic!("missing table")
+            };
+            assert_eq!(relation.cluster_index.as_deref(), Some("renamed_key"));
+            assert_eq!(
+                relation.replica_identity.as_deref(),
+                Some("USING INDEX renamed_key")
+            );
+            engine.analyze("ROLLBACK;", &mut state).unwrap();
+            assert_eq!(state.local.constraints, before_constraints);
+            assert_eq!(state.local.relations, before_relations);
+            assert_eq!(state.local.graph.edges(), before_edges.as_slice());
+            engine.analyze(rename, &mut state).unwrap();
+            let findings = engine
+                .analyze(
+                    "ALTER TABLE rename_keys DROP CONSTRAINT renamed_key;",
+                    &mut state,
+                )
+                .unwrap();
+            assert!(
+                !findings
+                    .iter()
+                    .any(|finding| finding.rule_id == "chain-conflict"),
+                "{findings:?}"
+            );
+            assert!(
+                !state
+                    .local
+                    .graph
+                    .edges()
+                    .iter()
+                    .any(|edge| edge.referenced == table
+                        && matches!(edge.kind, DependencyKind::IndexOnRelation { .. }))
+            );
+            let RelationOverlay::Present(relation) = &state.local.relations[&table] else {
+                panic!("missing table")
+            };
+            assert_eq!(relation.cluster_index, None);
+            assert_eq!(relation.replica_identity.as_deref(), Some("USING INDEX"));
+        }
+    }
+
+    #[test]
+    fn key_index_rename_rejects_constraint_name_collision_without_changes() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine.analyze("CREATE TABLE rename_keys(id integer NOT NULL, CONSTRAINT occupied CHECK(id > 0)); ALTER TABLE rename_keys ADD CONSTRAINT original_key UNIQUE(id);", &mut state).unwrap();
+        let before_constraints = state.local.constraints.clone();
+        let before_edges = state.local.graph.edges().to_vec();
+        let findings = engine
+            .analyze("ALTER INDEX original_key RENAME TO occupied;", &mut state)
+            .unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict"),
+            "{findings:?}"
+        );
+        assert_eq!(state.local.constraints, before_constraints);
+        assert_eq!(state.local.graph.edges(), before_edges.as_slice());
+    }
+
+    #[test]
+    fn dropping_foreign_key_keeps_its_referenced_index() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine.analyze("CREATE TABLE referenced_key(id integer); ALTER TABLE referenced_key ADD CONSTRAINT referenced_unique UNIQUE(id); CREATE TABLE referencing_key(id integer); ALTER TABLE referencing_key ADD CONSTRAINT referencing_fk FOREIGN KEY(id) REFERENCES referenced_key(id);", &mut state).unwrap();
+        let parent = object_id("public", "referenced_key");
+        let index = state
+            .local
+            .constraints
+            .values()
+            .find(|constraint| {
+                constraint.table_id == parent && constraint.kind == ConstraintKind::Unique
+            })
+            .unwrap()
+            .backing_index
+            .clone()
+            .unwrap();
+        state
+            .local
+            .constraints
+            .get_mut(&(
+                object_id("public", "referencing_key"),
+                "referencing_fk".into(),
+            ))
+            .unwrap()
+            .backing_index = Some(index.clone());
+        engine
+            .analyze(
+                "ALTER TABLE referencing_key DROP CONSTRAINT referencing_fk;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            state
+                .local
+                .graph
+                .edges()
+                .iter()
+                .any(|edge| edge.dependent == index
+                    && matches!(edge.kind, DependencyKind::IndexOnRelation { .. }))
+        );
+    }
+
+    #[test]
+    fn dropping_identity_index_settings_is_transactional() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine.analyze("CREATE TABLE index_settings(id integer NOT NULL); CREATE UNIQUE INDEX identity_idx ON index_settings(id); ALTER TABLE index_settings CLUSTER ON identity_idx; ALTER TABLE index_settings REPLICA IDENTITY USING INDEX identity_idx;", &mut state).unwrap();
+        let before = state.local.relations.clone();
+        engine
+            .analyze("BEGIN; DROP INDEX identity_idx;", &mut state)
+            .unwrap();
+        let RelationOverlay::Present(table) =
+            &state.local.relations[&object_id("public", "index_settings")]
+        else {
+            panic!("missing table")
+        };
+        assert_eq!(table.cluster_index, None);
+        assert_eq!(table.replica_identity.as_deref(), Some("USING INDEX"));
+        engine.analyze("ROLLBACK;", &mut state).unwrap();
+        assert_eq!(state.local.relations, before);
+    }
+
+    #[test]
+    fn dropping_qualified_quoted_index_clears_index_settings() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine.analyze("CREATE TABLE quoted_index_settings(id integer NOT NULL); CREATE UNIQUE INDEX \"IdentityIndex\" ON quoted_index_settings(id); ALTER TABLE quoted_index_settings CLUSTER ON \"IdentityIndex\"; ALTER TABLE quoted_index_settings REPLICA IDENTITY USING INDEX \"IdentityIndex\"; DROP INDEX public.\"IdentityIndex\";", &mut state).unwrap();
+        let table = object_id("public", "quoted_index_settings");
+        assert!(!state.index_is_present(&object_id("public", "IdentityIndex")));
+        let RelationOverlay::Present(relation) = &state.local.relations[&table] else {
+            panic!("missing table")
+        };
+        assert_eq!(relation.cluster_index, None);
+        assert_eq!(relation.replica_identity.as_deref(), Some("USING INDEX"));
+    }
+
+    #[test]
+    fn renamed_check_dependencies_follow_rollback_and_drop() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TABLE check_rename(id integer, CONSTRAINT old_check CHECK (id > 0));",
+                &mut state,
+            )
+            .unwrap();
+        let table = object_id("public", "check_rename");
+        let edges_before = state.local.graph.edges().to_vec();
+        engine.analyze("BEGIN; ALTER TABLE check_rename RENAME CONSTRAINT old_check TO new_check; ROLLBACK;", &mut state).unwrap();
+        assert_eq!(state.local.graph.edges(), edges_before.as_slice());
+        assert!(
+            state
+                .local
+                .constraints
+                .contains_key(&(table.clone(), "old_check".into()))
+        );
+        engine
+            .analyze(
+                "ALTER TABLE check_rename RENAME CONSTRAINT old_check TO new_check;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(state.local.graph.edges().iter().any(|edge| edge.dependent == table && matches!(&edge.kind, DependencyKind::ConstraintDependency { constraint_name, .. } if constraint_name == "new_check")));
+        let findings = engine.analyze("ALTER TABLE check_rename DROP CONSTRAINT new_check; ALTER TABLE check_rename DROP COLUMN id;", &mut state).unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict"),
+            "{findings:?}"
+        );
+        assert!(
+            !state
+                .local
+                .graph
+                .edges()
+                .iter()
+                .any(|edge| edge.dependent == table
+                    && matches!(
+                        edge.kind,
+                        DependencyKind::ConstraintDependency { .. }
+                            | DependencyKind::ConstraintOnRelation { .. }
+                    ))
+        );
+    }
+
+    #[test]
     fn altered_key_constraints_own_indexes_and_rollback_restores_them() {
         let engine = setup_engine();
         for kind in ["UNIQUE", "PRIMARY KEY"] {

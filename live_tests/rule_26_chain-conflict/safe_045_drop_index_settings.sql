@@ -1,0 +1,10 @@
+CREATE TABLE sm_core.drop_index_settings (id integer NOT NULL);
+CREATE UNIQUE INDEX "IdentityIndex" ON sm_core.drop_index_settings (id);
+ALTER TABLE sm_core.drop_index_settings CLUSTER ON "IdentityIndex";
+ALTER TABLE sm_core.drop_index_settings REPLICA IDENTITY USING INDEX "IdentityIndex";
+DROP INDEX sm_core."IdentityIndex";
+CREATE TABLE sm_core.drop_key_settings (id integer NOT NULL);
+ALTER TABLE sm_core.drop_key_settings ADD CONSTRAINT identity_key UNIQUE (id);
+ALTER TABLE sm_core.drop_key_settings CLUSTER ON identity_key;
+ALTER TABLE sm_core.drop_key_settings REPLICA IDENTITY USING INDEX identity_key;
+ALTER TABLE sm_core.drop_key_settings DROP CONSTRAINT identity_key;

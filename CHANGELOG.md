@@ -53,6 +53,8 @@ notes are available on the
   resolution, and keyword-shaped constraint columns; preserve generated
   expression text and unary operators through creation, column renames,
   changes, and rollback without rewriting function names.
+- Keep constraint dependencies, backing indexes, `CLUSTER`, and replica-identity
+  references consistent through renames and drops.
 
 ## v0.8.1 — 2026-09-06
 
