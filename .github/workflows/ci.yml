@@ -185,6 +185,19 @@ jobs:
           docker logs "$publisher_id"
           exit 1
 
+      - name: Wait for PostgreSQL services
+        shell: bash
+        run: |
+          for port in 5432 5433; do
+            for attempt in {1..30}; do
+              if pg_isready -h 127.0.0.1 -p "$port" -U safe_migrate -d safe_migrate; then
+                break
+              fi
+              sleep 1
+            done
+            pg_isready -h 127.0.0.1 -p "$port" -U safe_migrate -d safe_migrate
+          done
+
       - name: Reject an unreachable live database
         shell: bash
         env:

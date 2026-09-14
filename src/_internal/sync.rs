@@ -2085,9 +2085,9 @@ fn load_triggers(
             t.tgname AS trigger_name,
             t.tgenabled::text AS enabled_mode,
             (t.tgtype & 1) <> 0 AS row_level,
-            pn.nspname AS parent_table_schema,
-            pc.relname AS parent_table_name,
-            pt.tgname AS parent_trigger_name,
+            COALESCE(pn.nspname, inferred_pn.nspname) AS parent_table_schema,
+            COALESCE(pc.relname, inferred_pc.relname) AS parent_table_name,
+            COALESCE(pt.tgname, inferred_pt.tgname) AS parent_trigger_name,
             fn.nspname AS function_schema,
             f.proname || '()' AS function_name
         FROM pg_trigger t
@@ -2098,6 +2098,26 @@ fn load_triggers(
         LEFT JOIN pg_trigger pt ON pt.oid = t.tgparentid
         LEFT JOIN pg_class pc ON pc.oid = pt.tgrelid
         LEFT JOIN pg_namespace pn ON pn.oid = pc.relnamespace
+        LEFT JOIN LATERAL (
+            SELECT parent_t.oid AS trigger_oid,
+                   parent_c.oid AS table_oid,
+                   parent_c.relname,
+                   parent_n.nspname,
+                   parent_t.tgname
+            FROM pg_inherits inheritance
+            JOIN pg_trigger parent_t
+              ON parent_t.tgrelid = inheritance.inhparent
+             AND parent_t.tgname = t.tgname
+             AND parent_t.tgfoid = t.tgfoid
+             AND parent_t.tgisinternal = false
+            JOIN pg_class parent_c ON parent_c.oid = parent_t.tgrelid
+            JOIN pg_namespace parent_n ON parent_n.oid = parent_c.relnamespace
+            WHERE inheritance.inhrelid = t.tgrelid
+            ORDER BY parent_t.oid
+            LIMIT 1
+        ) inferred_pt ON true
+        LEFT JOIN pg_class inferred_pc ON inferred_pc.oid = inferred_pt.table_oid
+        LEFT JOIN pg_namespace inferred_pn ON inferred_pn.oid = inferred_pc.relnamespace
         WHERE t.tgisinternal = false
           AND c.relkind IN ('r', 'p', 'v', 'm')
           AND n.nspname NOT IN ('pg_catalog', 'information_schema')
@@ -2309,19 +2329,29 @@ fn load_constraint_dependencies(
             c.relname AS table_name,
             con.conname AS constraint_name,
             ARRAY(
-                SELECT DISTINCT a.attname
-                FROM pg_depend d
-                JOIN pg_attribute a
-                  ON a.attrelid = d.refobjid
-                 AND a.attnum = d.refobjsubid
-                 AND NOT a.attisdropped
-                WHERE d.classid = 'pg_constraint'::regclass
-                  AND d.objid = con.oid
-                  AND d.refclassid = 'pg_class'::regclass
-                  AND d.refobjid = con.conrelid
-                  AND d.refobjsubid > 0
-                  AND d.deptype = 'n'
-                ORDER BY a.attname
+                SELECT DISTINCT names.attname
+                FROM (
+                    SELECT a.attname
+                    FROM pg_depend d
+                    JOIN pg_attribute a
+                      ON a.attrelid = d.refobjid
+                     AND a.attnum = d.refobjsubid
+                     AND NOT a.attisdropped
+                    WHERE d.classid = 'pg_constraint'::regclass
+                      AND d.objid = con.oid
+                      AND d.refclassid = 'pg_class'::regclass
+                      AND d.refobjid = con.conrelid
+                      AND d.refobjsubid > 0
+                      AND d.deptype = 'n'
+                    UNION ALL
+                    SELECT a.attname
+                    FROM unnest(con.conkey) AS key(attnum)
+                    JOIN pg_attribute a
+                      ON a.attrelid = con.conrelid
+                     AND a.attnum = key.attnum
+                     AND NOT a.attisdropped
+                ) AS names
+                ORDER BY names.attname
             ) AS dependency_columns
         FROM pg_constraint con
         JOIN pg_class c ON c.oid = con.conrelid
