@@ -5949,12 +5949,38 @@ impl AnalysisState {
             }
             AlterTableActionMutation::AttachPartition { child, bound, .. } => {
                 self.invalidate_descendant_partition_predicates(child);
+                let canonical_bound = bound.as_deref().map(canonical_partition_bound);
+                let generated_partition_constraint = self
+                    .local
+                    .relations
+                    .get(child)
+                    .and_then(|overlay| match overlay {
+                        RelationOverlay::Present(relation) => Some(relation),
+                        RelationOverlay::Dropped => None,
+                    })
+                    .and_then(|relation| {
+                        let parent_strategy = self.local.relations.get(&alter.id).and_then(
+                            |overlay| match overlay {
+                                RelationOverlay::Present(parent) => {
+                                    parent.partition_type.as_deref()
+                                }
+                                RelationOverlay::Dropped => None,
+                            },
+                        )?;
+                        let keys = self.partition_key_columns(&alter.id)?;
+                        self.synthesize_partition_check(
+                            parent_strategy,
+                            canonical_bound.as_deref()?,
+                            &keys,
+                            relation,
+                        )
+                    });
                 self.snapshot_relation(child);
                 if let Some(RelationOverlay::Present(relation)) =
                     self.local.relations.get_mut(child)
                 {
-                    relation.partition_bound = bound.clone();
-                    relation.partition_constraint = None;
+                    relation.partition_bound = canonical_bound;
+                    relation.partition_constraint = generated_partition_constraint;
                     for column in &relation.columns {
                         relation.column_inheritance.insert(
                             column.name.clone(),
@@ -7196,6 +7222,60 @@ impl AnalysisState {
             None
         }
     }
+}
+
+/// Match PostgreSQL's stable `pg_get_expr(relpartbound, ...)` spelling for
+/// the bound forms represented by the typed Squawk node.
+fn canonical_partition_bound(bound: &str) -> String {
+    let trimmed = bound.trim();
+    if trimmed.eq_ignore_ascii_case("DEFAULT") {
+        return "DEFAULT".into();
+    }
+    let upper = trimmed.to_ascii_uppercase();
+    if upper.starts_with("FOR VALUES IN (") {
+        let inner = &trimmed["FOR VALUES IN (".len()..trimmed.len().saturating_sub(1)];
+        let values = split_top_level(inner, ',')
+            .into_iter()
+            .map(str::trim)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return format!("FOR VALUES IN ({values})");
+    }
+    if upper.starts_with("FOR VALUES FROM (")
+        && let (Some(from), Some(to)) = (
+            extract_paren_group(trimmed, "FROM ("),
+            extract_paren_group(trimmed, "TO ("),
+        )
+    {
+        let from = split_top_level(&from, ',')
+            .into_iter()
+            .map(str::trim)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let to = split_top_level(&to, ',')
+            .into_iter()
+            .map(str::trim)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return format!("FOR VALUES FROM ({from}) TO ({to})");
+    }
+    if upper.starts_with("FOR VALUES WITH (")
+        && let Some(inner) = extract_paren_group(trimmed, "WITH (")
+    {
+        let values = split_top_level(&inner, ',')
+            .into_iter()
+            .map(str::trim)
+            .map(|value| {
+                let mut words = value.splitn(2, char::is_whitespace);
+                let key = words.next().unwrap_or_default().to_ascii_lowercase();
+                let rest = words.next().unwrap_or_default().trim();
+                format!("{key} {rest}")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        return format!("FOR VALUES WITH ({values})");
+    }
+    trimmed.to_string()
 }
 
 /// Whether PostgreSQL retains a CHECK constraint on `DETACH PARTITION

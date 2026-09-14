@@ -233,6 +233,10 @@ struct NormalizedColumn {
     options: BTreeMap<String, String>,
 }
 
+fn normalize_statistics_target(target: Option<i32>) -> Option<i32> {
+    target.filter(|value| *value != -1)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct NormalizedIndex {
     index: String,
@@ -2039,7 +2043,7 @@ fn snapshot_live_state(
                                 .map(|generation| format!("{generation:?}")),
                             storage: column.storage.clone(),
                             compression: column.compression.clone(),
-                            statistics_target: column.statistics_target,
+                            statistics_target: normalize_statistics_target(column.statistics_target),
                             options: column.options.clone(),
                         },
                     );
@@ -2473,7 +2477,7 @@ fn snapshot_simulator_state(
                                 column.storage.as_deref(),
                             ),
                             compression: column.compression.clone(),
-                            statistics_target: column.statistics_target,
+                            statistics_target: normalize_statistics_target(column.statistics_target),
                             options: column.options.clone(),
                         },
                     );
