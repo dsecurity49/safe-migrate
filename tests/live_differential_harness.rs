@@ -2043,7 +2043,9 @@ fn snapshot_live_state(
                                 .map(|generation| format!("{generation:?}")),
                             storage: column.storage.clone(),
                             compression: column.compression.clone(),
-                            statistics_target: normalize_statistics_target(column.statistics_target),
+                            statistics_target: normalize_statistics_target(
+                                column.statistics_target,
+                            ),
                             options: column.options.clone(),
                         },
                     );
@@ -2477,7 +2479,9 @@ fn snapshot_simulator_state(
                                 column.storage.as_deref(),
                             ),
                             compression: column.compression.clone(),
-                            statistics_target: normalize_statistics_target(column.statistics_target),
+                            statistics_target: normalize_statistics_target(
+                                column.statistics_target,
+                            ),
                             options: column.options.clone(),
                         },
                     );

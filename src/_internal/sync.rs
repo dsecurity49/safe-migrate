@@ -2121,7 +2121,7 @@ fn load_triggers(
         ) inferred_pt ON true
         LEFT JOIN pg_class inferred_pc ON inferred_pc.oid = inferred_pt.table_oid
         LEFT JOIN pg_namespace inferred_pn ON inferred_pn.oid = inferred_pc.relnamespace
-        WHERE t.tgisinternal = false
+        WHERE (t.tgisinternal = false OR (t.tgparentid <> 0 AND pt.tgisinternal = false))
           AND c.relkind IN ('r', 'p', 'v', 'm')
           AND n.nspname NOT IN ('pg_catalog', 'information_schema')
           {schema_filter_with_fk};
