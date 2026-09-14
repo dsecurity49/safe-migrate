@@ -7298,6 +7298,18 @@ impl AnalysisState {
                     return None;
                 }
                 let predicate = self.synthesize_partition_check(strategy, bound, &keys, child)?;
+                let predicate = if predicate.starts_with("((") && predicate.ends_with("))") {
+                    let inner = &predicate[1..predicate.len() - 1];
+                    if let Some(separator) = inner.find(") AND (") {
+                        let first = &inner[..separator + 1];
+                        let rest = &inner[separator + 6..];
+                        format!("({first} AND ({rest}))")
+                    } else {
+                        predicate
+                    }
+                } else {
+                    predicate
+                };
                 Some(predicate)
             })
             .collect::<Vec<_>>();
