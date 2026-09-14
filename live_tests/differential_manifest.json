@@ -551,6 +551,11 @@
     "003_attach_default.sql",
     "007_attach_schema_qualified.sql"
    ],
+   "fixture_min_pg_version": {
+    "001_attach_partition.sql": 150000,
+    "003_attach_default.sql": 150000,
+    "007_attach_schema_qualified.sql": 150000
+   },
    "excluded_fixtures": [
     {
      "fixture": "002_detach_partition.sql",
