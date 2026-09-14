@@ -2108,12 +2108,15 @@ fn load_triggers(
             JOIN pg_trigger parent_t
               ON parent_t.tgrelid = inheritance.inhparent
              AND parent_t.tgname = t.tgname
-             AND parent_t.tgfoid = t.tgfoid
              AND parent_t.tgisinternal = false
             JOIN pg_class parent_c ON parent_c.oid = parent_t.tgrelid
             JOIN pg_namespace parent_n ON parent_n.oid = parent_c.relnamespace
             WHERE inheritance.inhrelid = t.tgrelid
-            ORDER BY parent_t.oid
+            -- A cloned trigger normally keeps the same function OID.  Older
+            -- PostgreSQL releases have catalog cases where that linkage is
+            -- not stable, so prefer an exact function match but retain the
+            -- unique parent/name relationship as a compatibility fallback.
+            ORDER BY (parent_t.tgfoid = t.tgfoid) DESC, parent_t.oid
             LIMIT 1
         ) inferred_pt ON true
         LEFT JOIN pg_class inferred_pc ON inferred_pc.oid = inferred_pt.table_oid

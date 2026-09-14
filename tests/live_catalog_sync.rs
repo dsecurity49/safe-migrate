@@ -36,20 +36,22 @@ fn cleanup(client: &mut postgres::Client) {
             .expect("check live catalog subscription")
             .get(0);
         if exists {
-            let drop_sql = if subscription == CONNECTED_SUBSCRIPTION {
-                format!(
-                    "ALTER SUBSCRIPTION {subscription} DISABLE;
-                     DROP SUBSCRIPTION {subscription};"
-                )
-            } else {
-                format!(
-                    "ALTER SUBSCRIPTION {subscription} DISABLE;
-                     ALTER SUBSCRIPTION {subscription} SET (slot_name = NONE);
-                     DROP SUBSCRIPTION {subscription};"
-                )
-            };
+            // DROP SUBSCRIPTION is one of PostgreSQL's commands that must be
+            // executed outside a transaction.  Send each statement as its
+            // own simple query; combining it with ALTER in batch_execute can
+            // make the server treat the command string as a transaction block.
             client
-                .batch_execute(&drop_sql)
+                .batch_execute(&format!("ALTER SUBSCRIPTION {subscription} DISABLE;"))
+                .expect("disable live catalog subscription");
+            if subscription != CONNECTED_SUBSCRIPTION {
+                client
+                    .batch_execute(&format!(
+                        "ALTER SUBSCRIPTION {subscription} SET (slot_name = NONE);"
+                    ))
+                    .expect("detach live catalog replication slot");
+            }
+            client
+                .batch_execute(&format!("DROP SUBSCRIPTION {subscription};"))
                 .expect("remove live catalog subscription");
         }
     }

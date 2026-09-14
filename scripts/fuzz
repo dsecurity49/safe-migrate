@@ -94,7 +94,9 @@ for migration in "$corpus_dir"/*.sql; do
             esac
             ;;
         1)
-            if grep -q 'Failed to parse SQL migration' "$stderr_file"; then
+            # The CLI exposes parser failures through the stable analysis
+            # error boundary; retain the legacy wording for older binaries.
+            if grep -Eq 'Failed to parse SQL migration|analysis failed:.*(expected command|Missing semicolon|Unterminated dollar quoted string)' "$stderr_file"; then
                 migration_name=$(basename "$migration")
                 case "$migration_name" in
                     *_do_block_nested.sql)
