@@ -105,7 +105,7 @@ jobs:
         run: cargo build --locked
 
       - name: Exercise CLI runtime
-        run: cargo test --locked --test cli_tests test_cli_help
+        run: cargo test --locked --lib internal_tests::cli_tests::test_cli_help -- --exact
 
   live-differential:
     name: PostgreSQL ${{ matrix.postgres }} differential harness

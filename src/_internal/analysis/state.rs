@@ -103,6 +103,9 @@ pub(crate) struct LocalState {
     pub roles: HashMap<ObjectId, crate::_internal::model::role::RoleOverlay>,
     pub role_membership_grantors: Vec<crate::_internal::model::role::RoleMembershipGrantor>,
     pub role_membership_grantors_complete: bool,
+    /// The cluster's bootstrap superuser, attributed with modern PostgreSQL's
+    /// implicit superuser grantor. Absent when unknown or unset.
+    pub bootstrap_superuser: Option<String>,
     pub triggers: HashMap<ObjectId, TriggerOverlay>,
     pub constraints: HashMap<(ObjectId, String), ConstraintState>,
     pub graph: DependencyGraph,
@@ -264,6 +267,7 @@ pub(crate) struct AnalysisState {
     pub scoped_external_relation_dependencies: HashSet<ObjectId>,
     pub scoped_external_type_dependencies: HashSet<ObjectId>,
     pub scoped_external_routine_dependencies: HashSet<ObjectId>,
+    pub scoped_external_index_dependencies: HashSet<ObjectId>,
     pub local: LocalState,
 }
 
@@ -899,6 +903,11 @@ impl AnalysisState {
             .iter()
             .cloned()
             .collect();
+        let scoped_external_index_dependencies = cache
+            .scoped_external_index_dependencies
+            .iter()
+            .cloned()
+            .collect();
         for sequence in cache.sequences.values() {
             if let Some((table, column)) = &sequence.owned_by {
                 graph.add_edge(DependencyEdge::new(
@@ -1015,14 +1024,16 @@ impl AnalysisState {
         }
 
         for inheritance in cache.inheritances {
-            // Cache validation rejects a detach-in-progress row, so every
-            // hydrated edge represents a stable direct relationship. Keep
-            // cross-scope endpoints too: they are evidence that an in-scope
-            // destructive change may have an omitted dependent.
+            // A committed first phase of DETACH CONCURRENTLY remains visible
+            // as an inheritance row with inhdetachpending until FINALIZE.
+            // Keep cross-scope endpoints too: they are evidence that an
+            // in-scope destructive change may have an omitted dependent.
             graph.add_edge(DependencyEdge::new(
                 inheritance.child,
                 inheritance.parent,
-                if inheritance.is_partition {
+                if inheritance.detach_pending {
+                    DependencyKind::PartitionDetachPending
+                } else if inheritance.is_partition {
                     DependencyKind::PartitionOf
                 } else {
                     DependencyKind::InheritanceOf
@@ -1203,6 +1214,7 @@ impl AnalysisState {
             scoped_external_relation_dependencies,
             scoped_external_type_dependencies,
             scoped_external_routine_dependencies,
+            scoped_external_index_dependencies,
             local: LocalState {
                 schemas,
                 relations,
@@ -1223,6 +1235,7 @@ impl AnalysisState {
                     .collect(),
                 role_membership_grantors: cache.role_membership_grantors,
                 role_membership_grantors_complete: cache.role_membership_grantors_complete,
+                bootstrap_superuser: cache.bootstrap_superuser,
                 triggers,
                 constraints,
                 graph,
@@ -1425,6 +1438,9 @@ impl AnalysisState {
         }
         if matches!(family, crate::_internal::db::cache::CatalogFamily::Routines) {
             return self.scoped_external_routine_dependencies.contains(id);
+        }
+        if matches!(family, crate::_internal::db::cache::CatalogFamily::Indexes) {
+            return self.scoped_external_index_dependencies.contains(id);
         }
         true
     }
@@ -1857,10 +1873,11 @@ impl AnalysisState {
             })
             .find(|candidate| {
                 !reserved.contains(candidate)
-                    && !self
-                        .local
-                        .constraints
-                        .contains_key(&(table.clone(), candidate.clone()))
+                    // PostgreSQL's ChooseConstraintName checks the namespace,
+                    // even though explicit constraint names are table-local.
+                    && !self.local.constraints.keys().any(|(owner, name)| {
+                        owner.schema == table.schema && name == candidate
+                    })
             })
             .expect("constraint suffix space is unbounded")
     }
@@ -2452,6 +2469,121 @@ impl AnalysisState {
                     .current_role_known
                     .then(|| ObjectId::new("", self.local.current_role.clone()))
             })
+    }
+
+    /// Identity attributed to a role-membership grantor.  Role grants differ
+    /// from object grants: PostgreSQL 18 routes an implicit grantor through
+    /// `BOOTSTRAP_SUPERUSERID` when the session user is a superuser, so a
+    /// superuser session records the *bootstrap* role instead of the session
+    /// role.  An explicit `GRANTED BY` always wins; otherwise a known
+    /// superuser maps to the cached bootstrap name (falling back to the
+    /// session identity when that is unknown), and any other role uses
+    /// itself.  `None` means the attribution cannot be resolved statically.
+    fn role_membership_grantor(
+        &self,
+        granted_by: Option<&crate::_internal::analysis::facts::RoleFact>,
+    ) -> Option<ObjectId> {
+        granted_by
+            .and_then(|fact| {
+                self.role_fact_identity(fact)
+                    .map(|(name, _)| ObjectId::new("", name))
+            })
+            .or_else(|| {
+                if !self.local.current_role_known {
+                    return None;
+                }
+                let current = ObjectId::new("", self.local.current_role.clone());
+                let is_superuser = matches!(
+                    self.local.roles.get(&current),
+                    Some(crate::_internal::model::role::RoleOverlay::Present(role))
+                        if role.is_superuser
+                );
+                if is_superuser {
+                    self.local
+                        .bootstrap_superuser
+                        .as_ref()
+                        .map(|name| ObjectId::new("", name.clone()))
+                } else {
+                    Some(current)
+                }
+            })
+    }
+
+    /// Index of the role-membership record for this exact
+    /// (member, role, grantor) triple, if present.
+    fn membership_record_index(
+        &self,
+        member: &ObjectId,
+        role: &ObjectId,
+        grantor: &ObjectId,
+    ) -> Option<usize> {
+        self.local
+            .role_membership_grantors
+            .iter()
+            .position(|record| {
+                &record.member == member && &record.role == role && &record.grantor == grantor
+            })
+    }
+
+    /// Whether the member still holds the ADMIN option on `role` through a
+    /// record other than `exclude`, mirroring PostgreSQL's
+    /// `would_still_have_admin_option`.
+    fn membership_admin_from_other_record(
+        &self,
+        member: &ObjectId,
+        role: &ObjectId,
+        exclude: Option<usize>,
+    ) -> bool {
+        self.local
+            .role_membership_grantors
+            .iter()
+            .enumerate()
+            .any(|(index, record)| {
+                Some(index) != exclude
+                    && &record.member == member
+                    && &record.role == role
+                    && record.admin
+            })
+    }
+
+    /// Rebuild a member's option-vector projection from its membership
+    /// records.  The effective projection is the union of the per-grantor
+    /// records, matching both `load_roles` aggregation and the live option
+    /// vectors the differential harness compares against.  No-op when the
+    /// provenance set is incomplete.
+    fn reconcile_membership_projection(&mut self, member: &ObjectId) {
+        if !self.local.role_membership_grantors_complete {
+            return;
+        }
+        let Some(crate::_internal::model::role::RoleOverlay::Present(role)) =
+            self.local.roles.get_mut(member)
+        else {
+            return;
+        };
+        role.member_of.clear();
+        role.can_administer_membership.clear();
+        role.can_inherit_from.clear();
+        role.can_set_role_to.clear();
+        for record in &self.local.role_membership_grantors {
+            if &record.member != member {
+                continue;
+            }
+            if !role.member_of.contains(&record.role) {
+                role.member_of.push(record.role.clone());
+            }
+            if record.admin && !role.can_administer_membership.contains(&record.role) {
+                role.can_administer_membership.push(record.role.clone());
+            }
+            if record.inherit && !role.can_inherit_from.contains(&record.role) {
+                role.can_inherit_from.push(record.role.clone());
+            }
+            if record.set && !role.can_set_role_to.contains(&record.role) {
+                role.can_set_role_to.push(record.role.clone());
+            }
+        }
+        // Reuse the role vector ordering the synchronizer produces: empty
+        // edge lists carry no ordering constraint, and the harness compares
+        // both live options and sim projections as unordered sets.
     }
 
     fn authorize_relation_grant(
@@ -3855,6 +3987,7 @@ mod evidence_tests {
         let result = state.apply(
             &Mutation::AlterTable(crate::_internal::analysis::mutations::AlterTable {
                 id: table_id.clone(),
+                only: false,
                 action:
                     crate::_internal::analysis::mutations::AlterTableActionMutation::DropColumn {
                         name: "id".to_string(),

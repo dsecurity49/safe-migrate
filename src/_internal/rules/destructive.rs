@@ -393,6 +393,7 @@ impl Rule for ReversibilityRule {
                 Mutation::AlterTable(crate::_internal::analysis::mutations::AlterTable {
                     id: _,
                     action: AlterTableActionMutation::DropColumn { .. },
+                    ..
                 })
             )
             && matches!(

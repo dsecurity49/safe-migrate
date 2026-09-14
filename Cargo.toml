@@ -10,7 +10,13 @@ repository = "https://github.com/dsecurity49/safe-migrate"
 homepage = "https://github.com/dsecurity49/safe-migrate"
 documentation = "https://docs.rs/safe-migrate"
 readme = "README.md"
-exclude = ["live_tests/.safe-migrate.cache"]
+exclude = [
+    "live_tests/.safe-migrate.cache",
+    "/ROADMAP.md",
+    "/log.txt",
+    "/heap.c.*",
+    "/pg_*.h.*",
+]
 keywords = ["postgres", "migration", "linter", "ast", "database"]
 categories = ["command-line-utilities", "database"]
 

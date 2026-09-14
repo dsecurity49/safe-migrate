@@ -343,11 +343,18 @@ pub(crate) struct DbCache {
     pub types: HashMap<ObjectId, TypeState>,
     pub roles: HashMap<ObjectId, RoleState>,
     /// Grantor provenance for role memberships, used by membership CASCADE.
+    /// PostgreSQL bookkeeping allows several records per (member, role) pair,
+    /// one per grantor, each carrying its own option flags.
     #[serde(default)]
     pub role_membership_grantors: Vec<RoleMembershipGrantor>,
     /// True only when the synchronizer queried every membership grantor row.
     #[serde(default)]
     pub role_membership_grantors_complete: bool,
+    /// The cluster's bootstrap superuser (the role PG attacks implicit
+    /// superuser-issued role grants to, via `BOOTSTRAP_SUPERUSERID`). Absent
+    /// when a programmatic cache did not record it.
+    #[serde(default)]
+    pub bootstrap_superuser: Option<String>,
     pub schemas: HashMap<String, SchemaState>,
     pub sequences: HashMap<ObjectId, SequenceState>,
     pub dependencies: Vec<ViewDependencyCache>,
@@ -358,6 +365,7 @@ pub(crate) struct DbCache {
     pub scoped_external_relation_dependencies: Vec<ObjectId>,
     pub scoped_external_type_dependencies: Vec<ObjectId>,
     pub scoped_external_routine_dependencies: Vec<ObjectId>,
+    pub scoped_external_index_dependencies: Vec<ObjectId>,
     pub inheritances: Vec<InheritanceCache>,
     pub publications: HashMap<String, PublicationState>,
     pub subscriptions: HashMap<String, SubscriptionState>,
@@ -444,12 +452,14 @@ impl DbCache {
             roles: HashMap::new(),
             role_membership_grantors: Vec::new(),
             role_membership_grantors_complete: false,
+            bootstrap_superuser: None,
             schemas: HashMap::new(),
             sequences: HashMap::new(),
             dependencies: Vec::new(),
             scoped_external_relation_dependencies: Vec::new(),
             scoped_external_type_dependencies: Vec::new(),
             scoped_external_routine_dependencies: Vec::new(),
+            scoped_external_index_dependencies: Vec::new(),
             inheritances: Vec::new(),
             publications: HashMap::new(),
             subscriptions: HashMap::new(),
@@ -635,6 +645,10 @@ impl DbCache {
                 "scoped external routine dependency",
                 &self.scoped_external_routine_dependencies,
             ),
+            (
+                "scoped external index dependency",
+                &self.scoped_external_index_dependencies,
+            ),
         ] {
             let mut seen = HashSet::new();
             for id in ids {
@@ -762,6 +776,17 @@ impl DbCache {
             }
             if relation.rules.keys().any(String::is_empty) {
                 return Err(format!("relation '{}' contains an empty rule identity", id));
+            }
+            for (column, provenance) in &relation.column_inheritance {
+                if !column_names.contains(column.as_str())
+                    || provenance.parent_count > i32::MAX as u32
+                    || (provenance.parent_count == 0 && !provenance.is_local)
+                {
+                    return Err(format!(
+                        "relation '{}' contains invalid inheritance provenance for column '{}'",
+                        id, column
+                    ));
+                }
             }
             for column in relation.identity_columns.keys() {
                 let Some(column_state) = relation.get_column(column) else {
@@ -1335,17 +1360,27 @@ impl DbCache {
                     provenance.member, provenance.role
                 ));
             }
-            if !membership_grantors.insert((provenance.member.clone(), provenance.role.clone())) {
+            // PostgreSQL 16+ may record several memberships for the same
+            // edge, one per grantor.  Uniqueness applies to the full tuple,
+            // not the (member, role) pair.
+            if !membership_grantors.insert((
+                provenance.member.clone(),
+                provenance.role.clone(),
+                provenance.grantor.clone(),
+            )) {
                 return Err(format!(
-                    "duplicate role membership provenance for '{}' -> '{}'",
-                    provenance.member, provenance.role
+                    "duplicate role membership provenance for '{}' -> '{}' by '{}'",
+                    provenance.member, provenance.role, provenance.grantor
                 ));
             }
         }
         if self.role_membership_grantors_complete {
             for (member_id, role) in &self.roles {
                 for role_id in &role.member_of {
-                    if !membership_grantors.contains(&(member_id.clone(), role_id.clone())) {
+                    if !membership_grantors
+                        .iter()
+                        .any(|(m, r, _)| m == member_id && r == role_id)
+                    {
                         return Err(format!(
                             "complete role membership provenance is missing for '{}' -> '{}'",
                             member_id, role_id
@@ -1823,6 +1858,7 @@ impl DbCache {
         }
 
         let mut inheritance_pairs = HashSet::new();
+        let mut pending_parents = HashSet::new();
         for inheritance in &self.inheritances {
             validate_id("inheritance child identity", &inheritance.child, true)?;
             validate_id("inheritance parent identity", &inheritance.parent, true)?;
@@ -1833,10 +1869,23 @@ impl DbCache {
                 ));
             }
             if inheritance.detach_pending {
-                return Err(format!(
-                    "inheritance '{} -> {}' is being detached; synchronize after the detach completes",
-                    inheritance.child, inheritance.parent
-                ));
+                if !inheritance.is_partition
+                    || self
+                        .relations
+                        .get(&inheritance.parent)
+                        .is_some_and(|parent| parent.partition_type.is_none())
+                    || self
+                        .relations
+                        .get(&inheritance.child)
+                        .is_some_and(|child| child.partition_bound.is_none())
+                {
+                    return Err(
+                        "pending detach requires a bounded partition and partitioned parent".into(),
+                    );
+                }
+                if !pending_parents.insert(inheritance.parent.clone()) {
+                    return Err("a partitioned parent cannot have multiple pending detaches".into());
+                }
             }
             let omitted_schema = |schema: &str| {
                 self.metadata
@@ -2620,6 +2669,33 @@ mod tests {
     }
 
     #[test]
+    fn current_cache_rejects_invalid_column_inheritance_provenance() {
+        for (column, parent_count, is_local) in [
+            ("missing", 1, false),
+            ("id", 0, false),
+            ("id", u32::MAX, true),
+        ] {
+            let id = ObjectId::new("public", "entries");
+            let mut relation = table(id.clone(), &["id"]);
+            relation.column_inheritance.insert(
+                column.into(),
+                crate::_internal::model::relation::ColumnInheritance {
+                    parent_count,
+                    is_local,
+                },
+            );
+            let mut cache = DbCache::new();
+            cache.insert_baseline(id, relation);
+            assert!(
+                cache
+                    .validate_semantics()
+                    .unwrap_err()
+                    .contains("inheritance provenance")
+            );
+        }
+    }
+
+    #[test]
     fn current_cache_rejects_ambiguous_relation_columns() {
         let table_id = ObjectId::new("public", "entries");
         let mut cache = DbCache::new();
@@ -3252,7 +3328,29 @@ mod tests {
         let error = DbCacheVersioned::V8(Box::new(cache))
             .into_cache()
             .unwrap_err();
-        assert!(error.contains("being detached"));
+        assert!(error.contains("pending detach requires"));
+    }
+
+    #[test]
+    fn current_cache_accepts_pending_partition_detach() {
+        let parent = ObjectId::new("public", "parent");
+        let child = ObjectId::new("public", "child");
+        let mut cache = DbCache::new();
+        cache.search_path.clear();
+        let mut parent_relation = table(parent.clone(), &["id"]);
+        parent_relation.partition_type = Some("RANGE".into());
+        let mut child_relation = table(child.clone(), &["id"]);
+        child_relation.partition_bound = Some("FOR VALUES FROM (0) TO (10)".into());
+        cache.insert_baseline(parent.clone(), parent_relation);
+        cache.insert_baseline(child.clone(), child_relation);
+        cache.inheritances.push(InheritanceCache {
+            child,
+            parent,
+            sequence: 1,
+            is_partition: true,
+            detach_pending: true,
+        });
+        assert!(DbCacheVersioned::V8(Box::new(cache)).into_cache().is_ok());
     }
 
     #[test]

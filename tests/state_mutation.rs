@@ -1,5 +1,6 @@
 mod state_mutation_tests {
     use crate::common::*;
+    use safe_migrate::_internal::analysis::evidence::EvidenceCode;
     use safe_migrate::_internal::analysis::facts::FunctionSigFact;
     use safe_migrate::_internal::analysis::graph::{
         DependencyEdge, DependencyGraph, DependencyKind,
@@ -326,6 +327,37 @@ mod state_mutation_tests {
         let column = relation.get_column("value").unwrap();
         assert_eq!(column.storage.as_deref(), Some("MAIN"));
         assert_eq!(column.compression.as_deref(), Some("pglz"));
+    }
+
+    #[test]
+    fn unavailable_compression_method_stays_conservative_without_mutating_state() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze("CREATE TABLE compression_probe(value text);", &mut state)
+            .unwrap();
+        let findings = engine
+            .analyze(
+                "ALTER TABLE compression_probe ALTER COLUMN value SET COMPRESSION lz4;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(findings.is_empty());
+        let RelationOverlay::Present(relation) = state
+            .get_relation(&object_id("public", "compression_probe"))
+            .unwrap()
+        else {
+            panic!("missing relation")
+        };
+        assert_eq!(relation.get_column("value").unwrap().compression, None);
+        assert_eq!(state.confidence(), &Confidence::Tainted);
+        assert!(
+            state
+                .evidence()
+                .iter()
+                .any(|evidence| evidence.code == EvidenceCode::UnsupportedSemantics)
+        );
     }
 
     #[test]
@@ -1643,7 +1675,415 @@ mod state_mutation_tests {
     }
 
     #[test]
-    fn concurrent_partition_detach_remains_pending_until_finalize() {
+    fn inherit_provenance_preserves_other_parents_and_local_status() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine.analyze("CREATE TABLE p1(id integer); CREATE TABLE p2(id integer); CREATE TABLE child() INHERITS(p1,p2);", &mut state).unwrap();
+        for (sql, count, local) in [
+            ("ALTER TABLE child NO INHERIT p1;", 1, false),
+            ("ALTER TABLE child NO INHERIT p2;", 0, true),
+            ("ALTER TABLE child INHERIT p1;", 1, true),
+        ] {
+            let findings = engine.analyze(sql, &mut state).unwrap();
+            assert!(
+                !findings
+                    .iter()
+                    .any(|finding| finding.rule_id == "chain-conflict"),
+                "{findings:?}"
+            );
+            let RelationOverlay::Present(relation) =
+                &state.local.relations[&object_id("public", "child")]
+            else {
+                panic!("missing child")
+            };
+            let provenance = &relation.column_inheritance["id"];
+            assert_eq!(
+                (provenance.parent_count, provenance.is_local),
+                (count, local),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn partition_attachment_provenance_follows_detach_and_rollback() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine.analyze("CREATE TABLE parent(id integer) PARTITION BY RANGE(id); CREATE TABLE child(id integer);", &mut state).unwrap();
+        let child = object_id("public", "child");
+        let provenance = |state: &safe_migrate::_internal::analysis::state::AnalysisState| {
+            let RelationOverlay::Present(relation) = &state.local.relations[&child] else {
+                panic!("missing child")
+            };
+            let value = &relation.column_inheritance["id"];
+            (value.parent_count, value.is_local)
+        };
+        assert_eq!(provenance(&state), (0, true));
+        engine
+            .analyze(
+                "ALTER TABLE parent ATTACH PARTITION child FOR VALUES FROM (0) TO (10);",
+                &mut state,
+            )
+            .unwrap();
+        assert_eq!(provenance(&state), (1, false));
+        engine
+            .analyze(
+                "BEGIN; ALTER TABLE parent DETACH PARTITION child;",
+                &mut state,
+            )
+            .unwrap();
+        assert_eq!(provenance(&state), (0, true));
+        engine.analyze("ROLLBACK;", &mut state).unwrap();
+        assert_eq!(provenance(&state), (1, false));
+    }
+
+    #[test]
+    fn create_table_records_column_inheritance_provenance() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TABLE p1 (id integer); CREATE TABLE p2 (id integer);
+             CREATE TABLE inherited () INHERITS (p1, p2);
+             CREATE TABLE local_child (id integer) INHERITS (p1);
+             CREATE TABLE partitioned (id integer) PARTITION BY RANGE (id);
+             CREATE TABLE part PARTITION OF partitioned FOR VALUES FROM (0) TO (10);",
+                &mut state,
+            )
+            .unwrap();
+        for (name, parent_count, is_local) in [
+            ("p1", 0, true),
+            ("inherited", 2, false),
+            ("local_child", 1, true),
+            ("part", 1, false),
+        ] {
+            let RelationOverlay::Present(relation) =
+                &state.local.relations[&object_id("public", name)]
+            else {
+                panic!("missing relation")
+            };
+            let provenance = &relation.column_inheritance["id"];
+            assert_eq!(
+                (provenance.parent_count, provenance.is_local),
+                (parent_count, is_local),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn ancestor_detach_invalidates_descendant_predicate_and_rollback_restores_it() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine.analyze(
+            "CREATE TABLE root (id integer) PARTITION BY RANGE (id);
+             CREATE TABLE middle PARTITION OF root FOR VALUES FROM (0) TO (100) PARTITION BY RANGE (id);
+             CREATE TABLE leaf PARTITION OF middle FOR VALUES FROM (0) TO (10);",
+            &mut state,
+        ).unwrap();
+        let leaf = object_id("public", "leaf");
+        let predicate = "(id IS NOT NULL) AND (id >= 0) AND (id < 10)";
+        let Some(RelationOverlay::Present(relation)) = state.local.relations.get_mut(&leaf) else {
+            panic!("missing leaf");
+        };
+        relation.partition_constraint = Some(predicate.into());
+        let findings = engine
+            .analyze(
+                "BEGIN; ALTER TABLE root DETACH PARTITION middle;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict"),
+            "{findings:?}"
+        );
+        let RelationOverlay::Present(relation) = &state.local.relations[&leaf] else {
+            panic!("missing leaf");
+        };
+        assert_eq!(relation.partition_constraint, None);
+        engine.analyze("ROLLBACK;", &mut state).unwrap();
+        let RelationOverlay::Present(relation) = &state.local.relations[&leaf] else {
+            panic!("missing leaf");
+        };
+        assert_eq!(relation.partition_constraint.as_deref(), Some(predicate));
+    }
+
+    #[test]
+    fn recursive_column_rename_collision_preserves_every_relation_and_dependency() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TABLE parent (id integer CHECK (id > 0));
+             CREATE TABLE child (renamed integer) INHERITS (parent);
+             CREATE INDEX child_id_idx ON child (id);",
+                &mut state,
+            )
+            .unwrap();
+        let relations = state.local.relations.clone();
+        let constraints = state.local.constraints.clone();
+        let edges = state.local.graph.edges().to_vec();
+        let findings = engine
+            .analyze(
+                "ALTER TABLE parent RENAME COLUMN id TO renamed;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict"),
+            "{findings:?}"
+        );
+        assert_eq!(state.local.relations, relations);
+        assert_eq!(state.local.constraints, constraints);
+        assert_eq!(state.local.graph.edges(), edges);
+    }
+
+    #[test]
+    fn recursive_column_rename_updates_descendant_metadata_and_rolls_back() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TABLE parent (id integer CHECK (id > 0));
+             CREATE TABLE child () INHERITS (parent);
+             CREATE INDEX child_id_idx ON child (id);
+             BEGIN; ALTER TABLE parent RENAME COLUMN id TO renamed;",
+                &mut state,
+            )
+            .unwrap();
+        for name in ["parent", "child"] {
+            let RelationOverlay::Present(relation) =
+                &state.local.relations[&object_id("public", name)]
+            else {
+                panic!("missing {name}")
+            };
+            assert!(relation.has_column("renamed"));
+            assert!(!relation.has_column("id"));
+        }
+        assert!(
+            state
+                .local
+                .constraints
+                .values()
+                .filter(
+                    |constraint| constraint.table_id == object_id("public", "parent")
+                        && constraint.kind == ConstraintKind::Check
+                )
+                .all(|constraint| constraint
+                    .definition
+                    .as_deref()
+                    .is_some_and(|definition| definition.contains("renamed")))
+        );
+        assert!(state.local.graph.edges().iter().any(|edge| edge.dependent == object_id("public", "child_id_idx")
+            && matches!(&edge.kind, DependencyKind::IndexOnRelation { key_columns, .. } if key_columns == &["renamed".to_string()])));
+        engine.analyze("ROLLBACK;", &mut state).unwrap();
+        for name in ["parent", "child"] {
+            let RelationOverlay::Present(relation) =
+                &state.local.relations[&object_id("public", name)]
+            else {
+                panic!("missing {name}")
+            };
+            assert!(relation.has_column("id"));
+            assert!(!relation.has_column("renamed"));
+        }
+    }
+
+    #[test]
+    fn only_column_rename_rejects_descendants_without_mutation() {
+        let engine = setup_engine();
+        for child_sql in [
+            "CREATE TABLE child () INHERITS (parent);",
+            "CREATE TABLE child PARTITION OF parent FOR VALUES FROM (0) TO (10);",
+        ] {
+            let mut state = setup_state();
+            let parent_sql = if child_sql.contains("PARTITION") {
+                "CREATE TABLE parent (id integer) PARTITION BY RANGE (id);"
+            } else {
+                "CREATE TABLE parent (id integer);"
+            };
+            engine
+                .analyze(&format!("{parent_sql} {child_sql}"), &mut state)
+                .unwrap();
+            let findings = engine
+                .analyze(
+                    "ALTER TABLE ONLY parent RENAME COLUMN id TO renamed;",
+                    &mut state,
+                )
+                .unwrap();
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| finding.rule_id == "chain-conflict"),
+                "{findings:?}"
+            );
+            for name in ["parent", "child"] {
+                let RelationOverlay::Present(relation) =
+                    &state.local.relations[&object_id("public", name)]
+                else {
+                    panic!("missing relation")
+                };
+                assert!(relation.has_column("id"));
+                assert!(!relation.has_column("renamed"));
+            }
+        }
+    }
+
+    #[test]
+    fn partition_key_column_rename_preserves_expressions_and_rollback() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine.analyze(
+            "CREATE TABLE key_parent (id integer, other integer) PARTITION BY RANGE (id, (id + other));",
+            &mut state,
+        ).unwrap();
+        let id = object_id("public", "key_parent");
+        let RelationOverlay::Present(before) = &state.local.relations[&id] else {
+            panic!("missing parent")
+        };
+        let original = before.partition_by.clone();
+        let findings = engine
+            .analyze(
+                "BEGIN; ALTER TABLE key_parent RENAME COLUMN id TO \"NewKey\";",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict"),
+            "{findings:?}"
+        );
+        let RelationOverlay::Present(relation) = &state.local.relations[&id] else {
+            panic!("missing parent")
+        };
+        assert_eq!(
+            relation.partition_by.as_deref(),
+            Some("PARTITION BY RANGE (\"NewKey\", (\"NewKey\" + other))")
+        );
+        engine.analyze("ROLLBACK;", &mut state).unwrap();
+        let RelationOverlay::Present(relation) = &state.local.relations[&id] else {
+            panic!("missing parent")
+        };
+        assert_eq!(relation.partition_by, original);
+    }
+
+    #[test]
+    fn partition_predicate_column_rename_restores_on_rollback() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze("CREATE TABLE predicate_child (id integer);", &mut state)
+            .unwrap();
+        let id = object_id("public", "predicate_child");
+        let predicate = "id IS NOT NULL AND id >= 0 AND id < 10";
+        let RelationOverlay::Present(relation) = state.local.relations.get_mut(&id).unwrap() else {
+            panic!("missing relation")
+        };
+        relation.partition_constraint = Some(predicate.into());
+        engine
+            .analyze(
+                "BEGIN; ALTER TABLE predicate_child RENAME COLUMN id TO renamed;",
+                &mut state,
+            )
+            .unwrap();
+        let RelationOverlay::Present(relation) = &state.local.relations[&id] else {
+            panic!("missing relation")
+        };
+        assert_eq!(
+            relation.partition_constraint.as_deref(),
+            Some("renamed IS NOT NULL AND renamed >= 0 AND renamed < 10")
+        );
+        engine.analyze("ROLLBACK;", &mut state).unwrap();
+        let RelationOverlay::Present(relation) = &state.local.relations[&id] else {
+            panic!("missing relation")
+        };
+        assert_eq!(relation.partition_constraint.as_deref(), Some(predicate));
+    }
+
+    #[test]
+    fn finalize_interrupted_detach_retains_existing_check_and_undo_state() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine.analyze(
+            "CREATE TABLE parent (id integer) PARTITION BY RANGE (id);
+             CREATE TABLE child PARTITION OF parent FOR VALUES FROM (0) TO (10);
+             ALTER TABLE child ADD CONSTRAINT retained_bound CHECK (id IS NOT NULL AND id >= 0 AND id < 10);",
+            &mut state,
+        ).unwrap();
+        let child = object_id("public", "child");
+        let parent = object_id("public", "parent");
+        // Model the catalog after the first internal transaction was committed.
+        state.local.graph.retain_edges(|edge| {
+            !(edge.dependent == child
+                && edge.referenced == parent
+                && matches!(edge.kind, DependencyKind::PartitionOf))
+        });
+        state.local.graph.add_edge(DependencyEdge::new(
+            child.clone(),
+            parent.clone(),
+            DependencyKind::PartitionDetachPending,
+        ));
+        let check = state.local.constraints[&(child.clone(), "retained_bound".into())].clone();
+        let findings = engine
+            .analyze(
+                "BEGIN; ALTER TABLE parent DETACH PARTITION child FINALIZE; ROLLBACK;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict"),
+            "{findings:?}"
+        );
+        assert!(state.local.graph.edges().iter().any(|edge| {
+            edge.dependent == child
+                && edge.referenced == parent
+                && matches!(edge.kind, DependencyKind::PartitionDetachPending)
+        }));
+        let findings = engine
+            .analyze(
+                "ALTER TABLE parent DETACH PARTITION child FINALIZE;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict"),
+            "{findings:?}"
+        );
+        assert!(!state.local.graph.edges().iter().any(|edge| {
+            edge.dependent == child
+                && edge.referenced == parent
+                && matches!(
+                    edge.kind,
+                    DependencyKind::PartitionDetachPending | DependencyKind::PartitionOf
+                )
+        }));
+        assert_eq!(
+            state.local.constraints[&(child.clone(), "retained_bound".into())],
+            check
+        );
+        assert_eq!(
+            state
+                .local
+                .constraints
+                .values()
+                .filter(|constraint| {
+                    constraint.table_id == child && constraint.kind == ConstraintKind::Check
+                })
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn successful_concurrent_partition_detach_completes_without_finalize() {
         let engine = setup_engine();
         let mut state = setup_state();
 
@@ -1657,19 +2097,6 @@ mod state_mutation_tests {
             )
             .unwrap();
 
-        assert!(state.local.graph.edges().iter().any(|edge| {
-            matches!(edge.kind, DependencyKind::PartitionDetachPending)
-                && edge.dependent == object_id("public", "child")
-                && edge.referenced == object_id("public", "parent")
-        }));
-
-        engine
-            .analyze(
-                "ALTER TABLE parent DETACH PARTITION child FINALIZE;",
-                &mut state,
-            )
-            .unwrap();
-
         assert!(!state.local.graph.edges().iter().any(|edge| {
             matches!(
                 edge.kind,
@@ -1677,6 +2104,370 @@ mod state_mutation_tests {
             ) && edge.dependent == object_id("public", "child")
                 && edge.referenced == object_id("public", "parent")
         }));
+
+        let RelationOverlay::Present(child) = &state.local.relations[&object_id("public", "child")]
+        else {
+            panic!("detached child must remain present")
+        };
+        assert_eq!(child.partition_bound, None);
+        assert_eq!(child.partition_constraint, None);
+        // Concurrent detach retained a CHECK reproducing the partition
+        // predicate; the chain is now provable.
+        assert_eq!(state.local.confidence, Confidence::Exact);
+        let retained =
+            &state.local.constraints[&(object_id("public", "child"), "child_id_check".into())];
+        assert_eq!(retained.kind, ConstraintKind::Check);
+        assert!(retained.validated);
+        assert_eq!(
+            retained.definition.as_deref(),
+            Some("((id IS NOT NULL) AND (id >= 0) AND (id < 10))")
+        );
+
+        let findings = engine
+            .analyze(
+                "ALTER TABLE parent DETACH PARTITION child FINALIZE;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(findings.iter().any(|finding| {
+            finding.rule_id == "chain-conflict" && finding.reason.contains("no pending")
+        }));
+    }
+
+    #[test]
+    fn retained_partition_check_preserves_quoted_key_identity() {
+        let engine = setup_engine();
+        for name in ["MyKey", "key with space", "key\"quote"] {
+            let mut state = setup_state();
+            let quoted = format!("\"{}\"", name.replace('"', "\"\""));
+            let sql = format!(
+                "CREATE TABLE parent({quoted} integer) PARTITION BY RANGE ({quoted});
+                CREATE TABLE child PARTITION OF parent FOR VALUES FROM (0) TO (10);
+                ALTER TABLE parent DETACH PARTITION child CONCURRENTLY;"
+            );
+            engine.analyze(&sql, &mut state).unwrap();
+            let child = object_id("public", "child");
+            let check = state
+                .local
+                .constraints
+                .values()
+                .find(|check| check.table_id == child && check.kind == ConstraintKind::Check)
+                .expect("retained check");
+            assert_eq!(
+                check.definition.as_deref(),
+                Some(
+                    format!("(({quoted} IS NOT NULL) AND ({quoted} >= 0) AND ({quoted} < 10))")
+                        .as_str()
+                )
+            );
+            assert!(state.local.graph.edges().iter().any(|edge|
+                edge.dependent == child && matches!(&edge.kind, DependencyKind::ConstraintDependency { columns, .. } if columns == &[name.to_string()])));
+        }
+    }
+
+    #[test]
+    fn retained_partition_check_tracks_all_cached_predicate_columns() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine.analyze("CREATE TABLE parent(id integer, ancestor_key integer) PARTITION BY RANGE(id); CREATE TABLE child PARTITION OF parent FOR VALUES FROM (0) TO (10);", &mut state).unwrap();
+        let child = object_id("public", "child");
+        let RelationOverlay::Present(relation) = state.local.relations.get_mut(&child).unwrap()
+        else {
+            panic!("child")
+        };
+        relation.partition_constraint =
+            Some("id IS NOT NULL AND id >= 0 AND id < 10 AND ancestor_key > 5".into());
+        engine
+            .analyze(
+                "ALTER TABLE parent DETACH PARTITION child CONCURRENTLY;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            state
+                .local
+                .constraints
+                .contains_key(&(child.clone(), "child_check".into()))
+        );
+        assert!(
+            state
+                .local
+                .graph
+                .edges()
+                .iter()
+                .any(|edge| edge.dependent == child
+                    && matches!(&edge.kind, DependencyKind::ConstraintDependency { columns, .. }
+                if columns == &["ancestor_key".to_string(), "id".to_string()]))
+        );
+    }
+
+    #[test]
+    fn concurrent_detach_uses_parent_strategy_for_subpartitioned_child() {
+        let engine = setup_engine();
+        for (parent_strategy, child_strategy, bound, check_expected) in [
+            ("RANGE", "HASH", "FROM (0) TO (10)", true),
+            ("HASH", "RANGE", "WITH (MODULUS 2, REMAINDER 0)", false),
+        ] {
+            let mut state = setup_state();
+            let sql = format!("CREATE TABLE parent(id integer) PARTITION BY {parent_strategy}(id);
+                CREATE TABLE child PARTITION OF parent FOR VALUES {bound} PARTITION BY {child_strategy}(id);
+                ALTER TABLE parent DETACH PARTITION child CONCURRENTLY;");
+            let findings = engine.analyze(&sql, &mut state).unwrap();
+            assert!(
+                !findings
+                    .iter()
+                    .any(|finding| finding.rule_id == "chain-conflict"),
+                "{findings:?}"
+            );
+            assert_eq!(
+                state
+                    .local
+                    .constraints
+                    .values()
+                    .any(
+                        |constraint| constraint.table_id == object_id("public", "child")
+                            && constraint.kind == ConstraintKind::Check
+                    ),
+                check_expected
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_detach_retains_check_from_created_partition_bound() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TABLE parent (id integer) PARTITION BY RANGE (id);
+                 CREATE TABLE child PARTITION OF parent FOR VALUES FROM (0) TO (10);
+                 ALTER TABLE parent DETACH PARTITION child CONCURRENTLY;",
+                &mut state,
+            )
+            .unwrap();
+        assert_eq!(state.local.confidence, Confidence::Exact);
+        let retained =
+            &state.local.constraints[&(object_id("public", "child"), "child_id_check".into())];
+        assert_eq!(
+            retained.definition.as_deref(),
+            Some("((id IS NOT NULL) AND (id >= 0) AND (id < 10))")
+        );
+        assert!(state.local.graph.edges().iter().any(|edge| {
+            edge.dependent == object_id("public", "child")
+                && edge.referenced == object_id("public", "child")
+                && matches!(
+                    edge.kind,
+                    DependencyKind::ConstraintDependency { ref columns, .. }
+                        if columns == &vec!["id".to_string()]
+                )
+        }));
+    }
+
+    #[test]
+    fn concurrent_detach_keeps_list_bound_tainted_for_composite_key() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TABLE parent (a integer, b integer) PARTITION BY RANGE (a, b);
+                 CREATE TABLE child PARTITION OF parent FOR VALUES FROM (0, 0) TO (10, 10);
+                 ALTER TABLE parent DETACH PARTITION child CONCURRENTLY;",
+                &mut state,
+            )
+            .unwrap();
+        assert_ne!(state.local.confidence, Confidence::Exact);
+        assert!(!state.local.constraints.values().any(|constraint| {
+            constraint.table_id == object_id("public", "child")
+                && constraint.kind == ConstraintKind::Check
+        }));
+    }
+
+    #[test]
+    fn concurrent_detach_of_hash_partition_adds_no_check() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TABLE parent (id integer) PARTITION BY HASH (id);
+                 CREATE TABLE child PARTITION OF parent FOR VALUES WITH (MODULUS 2, REMAINDER 0);
+                 ALTER TABLE parent DETACH PARTITION child CONCURRENTLY;",
+                &mut state,
+            )
+            .unwrap();
+        assert_eq!(state.local.confidence, Confidence::Exact);
+        assert!(!state.local.constraints.values().any(|constraint| {
+            constraint.table_id == object_id("public", "child")
+                && constraint.kind == ConstraintKind::Check
+        }));
+    }
+
+    #[test]
+    fn concurrent_detach_folds_baseline_cached_list_predicate() {
+        use safe_migrate::_internal::db::cache::InheritanceCache;
+
+        let engine = setup_engine();
+        let mut cache = DbCache::new();
+        let parent_id = object_id("public", "parent");
+        let child_id = object_id("public", "child");
+        let owner = object_id("public", "postgres");
+        let mut parent = RelationState::new(
+            parent_id.clone(),
+            owner.clone(),
+            0,
+            Some(1000),
+            RelationKind::Table,
+            Persistence::Permanent,
+            0,
+        );
+        parent.partition_type = Some("LIST".into());
+        parent.partition_by = Some("PARTITION BY LIST (b)".into());
+        parent.last_analyze = Some("2024-01-01 00:00:00+00".into());
+        let mut child = RelationState::new(
+            child_id.clone(),
+            owner.clone(),
+            0,
+            Some(1000),
+            RelationKind::Table,
+            Persistence::Permanent,
+            0,
+        );
+        child.partition_type = Some("LIST".into());
+        child.partition_bound = Some("FOR VALUES IN (true, false)".into());
+        child.partition_constraint =
+            Some("((b IS NOT NULL) AND (b = ANY (ARRAY[true, false])))".into());
+        child.columns.push(Column {
+            name: "b".into(),
+            data_type: Some("boolean".into()),
+            type_id: None,
+            is_nullable: false,
+            default: None,
+            avg_width: None,
+            default_expr_text: None,
+            type_modifier: None,
+            storage: None,
+            compression: None,
+            statistics_target: None,
+            options: Default::default(),
+            generated: None,
+        });
+        cache.insert_baseline(parent_id.clone(), parent);
+        cache.insert_baseline(child_id.clone(), child);
+        cache.inheritances.push(InheritanceCache {
+            child: child_id.clone(),
+            parent: parent_id.clone(),
+            sequence: 0,
+            is_partition: true,
+            detach_pending: false,
+        });
+        let mut state = safe_migrate::_internal::analysis::state::AnalysisState::new(cache);
+        engine
+            .analyze(
+                "ALTER TABLE parent DETACH PARTITION child CONCURRENTLY;",
+                &mut state,
+            )
+            .unwrap();
+        assert_eq!(state.local.confidence, Confidence::Exact);
+        let retained = &state.local.constraints[&(child_id, "child_b_check".into())];
+        assert_eq!(retained.kind, ConstraintKind::Check);
+        assert!(retained.validated);
+        assert_eq!(
+            retained.definition.as_deref(),
+            Some("((b IS NOT NULL) AND (b = ANY ('{t,f}'::boolean[])))")
+        );
+    }
+
+    #[test]
+    fn concurrent_detach_folds_baseline_cached_boolean_single_predicate() {
+        use safe_migrate::_internal::db::cache::InheritanceCache;
+
+        let engine = setup_engine();
+        let mut cache = DbCache::new();
+        let parent_id = object_id("public", "parent");
+        let child_id = object_id("public", "child");
+        let owner = object_id("public", "postgres");
+        let mut parent = RelationState::new(
+            parent_id.clone(),
+            owner.clone(),
+            0,
+            Some(1000),
+            RelationKind::Table,
+            Persistence::Permanent,
+            0,
+        );
+        parent.partition_type = Some("LIST".into());
+        parent.partition_by = Some("PARTITION BY LIST (b)".into());
+        parent.last_analyze = Some("2024-01-01 00:00:00+00".into());
+        let mut child = RelationState::new(
+            child_id.clone(),
+            owner.clone(),
+            0,
+            Some(1000),
+            RelationKind::Table,
+            Persistence::Permanent,
+            0,
+        );
+        child.partition_type = Some("LIST".into());
+        child.partition_bound = Some("FOR VALUES IN (true)".into());
+        child.last_analyze = Some("2024-01-01 00:00:00+00".into());
+        child.partition_constraint = Some("((b IS NOT NULL) AND (b = true))".into());
+        child.columns.push(Column {
+            name: "b".into(),
+            data_type: Some("boolean".into()),
+            type_id: None,
+            is_nullable: false,
+            default: None,
+            avg_width: None,
+            default_expr_text: None,
+            type_modifier: None,
+            storage: None,
+            compression: None,
+            statistics_target: None,
+            options: Default::default(),
+            generated: None,
+        });
+        cache.insert_baseline(parent_id.clone(), parent);
+        cache.insert_baseline(child_id.clone(), child);
+        cache.inheritances.push(InheritanceCache {
+            child: child_id.clone(),
+            parent: parent_id.clone(),
+            sequence: 0,
+            is_partition: true,
+            detach_pending: false,
+        });
+        let mut state = safe_migrate::_internal::analysis::state::AnalysisState::new(cache);
+        engine
+            .analyze(
+                "ALTER TABLE parent DETACH PARTITION child CONCURRENTLY;",
+                &mut state,
+            )
+            .unwrap();
+        assert_eq!(state.local.confidence, Confidence::Exact);
+        let retained = &state.local.constraints[&(child_id, "child_b_check".into())];
+        assert_eq!(
+            retained.definition.as_deref(),
+            Some("((b IS NOT NULL) AND b)")
+        );
+    }
+
+    #[test]
+    fn concurrent_detach_synthesizes_list_integer_array_from_bound() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TABLE parent (a integer) PARTITION BY LIST (a);
+                 CREATE TABLE child PARTITION OF parent FOR VALUES IN (1, 2, 3);
+                 ALTER TABLE parent DETACH PARTITION child CONCURRENTLY;",
+                &mut state,
+            )
+            .unwrap();
+        assert_eq!(state.local.confidence, Confidence::Exact);
+        let retained =
+            &state.local.constraints[&(object_id("public", "child"), "child_a_check".into())];
+        assert_eq!(
+            retained.definition.as_deref(),
+            Some("((a IS NOT NULL) AND (a = ANY ('{1,2,3}'::integer[])))")
+        );
     }
 
     #[test]
@@ -1760,8 +2551,7 @@ mod state_mutation_tests {
 
         engine
             .analyze(
-                "ALTER TABLE parent DETACH PARTITION child CONCURRENTLY;
-                 ALTER TABLE parent DETACH PARTITION child FINALIZE;",
+                "ALTER TABLE parent DETACH PARTITION child CONCURRENTLY;",
                 &mut state,
             )
             .unwrap();
@@ -2289,7 +3079,7 @@ mod state_mutation_tests {
                 id: statistics_id,
                 kinds: vec!["d".to_string(), "f".to_string()],
                 columns: vec!["a".to_string(), "b".to_string()],
-                expressions: None,
+                expressions: Some("(a + b), (a * b)".to_string()),
                 target: Some(250),
             },
         );
@@ -2320,6 +3110,10 @@ mod state_mutation_tests {
             .next()
             .expect("cloned extended statistics");
         assert_eq!(cloned.columns, vec!["renamed", "b"]);
+        assert_eq!(
+            cloned.expressions.as_deref(),
+            Some("(renamed + b), (renamed * b)")
+        );
         assert_eq!(cloned.target, None);
 
         let findings = engine
@@ -2345,6 +3139,22 @@ mod state_mutation_tests {
                  CREATE TEMPORARY TABLE work (id integer) ON COMMIT DROP;
                  CREATE INDEX work_id_idx ON work (id);
                  COMMIT;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(!state.relation_is_present(&object_id("public", "work")));
+        assert!(!state.index_is_present(&object_id("public", "work_id_idx")));
+    }
+
+    #[test]
+    fn autocommit_runs_on_commit_drop_before_the_next_statement() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TEMPORARY TABLE work (id integer) ON COMMIT DROP;
+                 CREATE INDEX work_id_idx ON work (id);",
                 &mut state,
             )
             .unwrap();
@@ -6975,6 +7785,76 @@ mod state_mutation_tests {
     }
 
     #[test]
+    fn generated_check_names_avoid_other_tables_in_same_schema() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE SCHEMA other;
+             CREATE TABLE other.holder (id integer
+                 CONSTRAINT target_id_check CHECK (id > 0)
+                 CONSTRAINT target_id_check1 CHECK (id < 100));
+             CREATE TABLE public.holder (id integer CONSTRAINT target_id_check CHECK (id > 0));
+             CREATE TABLE public.target (id integer CHECK (id > 0));
+             CREATE TABLE other.target (id integer CHECK (id > 0));",
+                &mut state,
+            )
+            .unwrap();
+        for (schema, name) in [
+            ("public", "target_id_check1"),
+            ("other", "target_id_check2"),
+        ] {
+            assert!(
+                state
+                    .local
+                    .constraints
+                    .contains_key(&(object_id(schema, "target"), name.into()))
+            );
+        }
+    }
+
+    #[test]
+    fn check_names_use_one_distinct_column_for_create_and_alter() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TABLE check_names (id integer, other integer,
+                CHECK (id > 0 AND id < 100), CHECK (id < other));
+             ALTER TABLE check_names ADD CHECK (id > 1 AND id < 99);",
+                &mut state,
+            )
+            .unwrap();
+        let table = object_id("public", "check_names");
+        for name in [
+            "check_names_id_check",
+            "check_names_check",
+            "check_names_id_check1",
+        ] {
+            assert!(
+                state
+                    .local
+                    .constraints
+                    .contains_key(&(table.clone(), name.into())),
+                "missing {name}"
+            );
+        }
+        let findings = engine
+            .analyze(
+                "ALTER TABLE check_names DROP CONSTRAINT check_names_id_check1;
+             ALTER TABLE check_names RENAME CONSTRAINT check_names_id_check TO bounded_id;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict"),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
     fn generated_constraint_names_follow_postgres_identifier_length_limit() {
         let engine = setup_engine();
         let mut state = setup_state();
@@ -7823,6 +8703,9 @@ mod state_mutation_tests {
                 member: member.clone(),
                 role: parent.clone(),
                 grantor: object_id("", "admin"),
+                admin: false,
+                inherit: true,
+                set: true,
             },
         );
         let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);

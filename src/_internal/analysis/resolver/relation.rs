@@ -216,6 +216,7 @@ impl Resolver {
 
     pub(super) fn resolve_alter_table(
         name: &QualifiedName,
+        only: bool,
         actions: &[AlterTableActionFact],
         state: &AnalysisState,
     ) -> Vec<Mutation> {
@@ -496,7 +497,7 @@ impl Resolver {
                     persistence: crate::_internal::model::relation::Persistence::Unlogged,
                 },
                 AlterTableActionFact::ClusterOn { index } => AlterTableActionMutation::SetCluster {
-                    index: Some(Self::resolve_relation_lookup_name(index, state)),
+                    index: Some(Self::resolve_constraint_index_name(index, &id)),
                 },
                 AlterTableActionFact::SetWithoutCluster => {
                     AlterTableActionMutation::SetCluster { index: None }
@@ -512,7 +513,7 @@ impl Resolver {
                                 crate::_internal::analysis::mutations::ReplicaIdentityMutation::Nothing,
                             crate::_internal::analysis::facts::ReplicaIdentityFact::UsingIndex(index) =>
                                 crate::_internal::analysis::mutations::ReplicaIdentityMutation::UsingIndex(
-                                    Self::resolve_relation_lookup_name(index, state),
+                                    Self::resolve_constraint_index_name(index, &id),
                                 ),
                         },
                     }
@@ -587,6 +588,7 @@ impl Resolver {
             };
             mutations.push(Mutation::AlterTable(AlterTable {
                 id: id.clone(),
+                only,
                 action,
             }));
         }

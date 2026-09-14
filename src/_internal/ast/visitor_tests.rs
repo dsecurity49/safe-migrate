@@ -98,7 +98,7 @@ mod tests {
                 "value",
                 "new_value"
             ),
-            Some("items.\"new_value\" + payload.value".into())
+            Some("items.new_value + payload.value".into())
         );
         assert!(ExprVisitor::rename_column_source("base +", "items", "base", "renamed").is_none());
         assert_eq!(
@@ -108,7 +108,11 @@ mod tests {
                 "pg_catalog",
                 "renamed"
             ),
-            Some("pg_catalog.abs(\"renamed\") + pg_catalog.abs(items.\"renamed\")".into())
+            Some("pg_catalog.abs(renamed) + pg_catalog.abs(items.renamed)".into())
+        );
+        assert_eq!(
+            ExprVisitor::rename_column_source("(a + b), (a * b)", "items", "a", "renamed"),
+            Some("(renamed + b), (renamed * b)".into())
         );
     }
 
@@ -276,6 +280,17 @@ mod tests {
     }
 
     #[test]
+    fn alter_table_preserves_only_scope() {
+        for (sql, expected) in [
+            ("ALTER TABLE ONLY t RENAME COLUMN a TO b;", true),
+            ("ALTER TABLE t RENAME COLUMN a TO b;", false),
+        ] {
+            assert!(matches!(parse_and_extract_statement(sql),
+                Some(StatementFact::AlterTable { only, .. }) if only == expected));
+        }
+    }
+
+    #[test]
     fn create_table_preserves_table_check_and_exclusion_constraint_names() {
         let fact = parse_and_extract_statement(
             "CREATE TABLE reservations (
@@ -298,7 +313,7 @@ mod tests {
             [
                 TableConstraintFact::Check {
                     constraint_name: Some(check),
-                    name_hint: _,
+                    name_hint: Some(hint),
                     definition: _,
                     columns: check_columns,
                     columns_complete: check_complete,
@@ -309,6 +324,7 @@ mod tests {
                     columns_complete: exclude_complete,
                 },
             ] if check == "reservations_id_check"
+                && hint == "id"
                 && check_columns == &["id".to_string()]
                 && exclude == "reservations_period_excl"
                 && exclude_columns == &["period".to_string()]
@@ -630,7 +646,7 @@ mod tests {
         let facts = parse_and_extract_statement(sql);
         assert!(facts.is_some());
         match facts.unwrap() {
-            StatementFact::AlterTable { name, actions } => {
+            StatementFact::AlterTable { name, actions, .. } => {
                 assert_eq!(name.name.resolve(), "users");
                 assert!(!actions.is_empty());
             }
@@ -644,7 +660,7 @@ mod tests {
         let facts = parse_and_extract_statement(sql);
         assert!(facts.is_some());
         match facts.unwrap() {
-            StatementFact::AlterTable { name, actions } => {
+            StatementFact::AlterTable { name, actions, .. } => {
                 assert_eq!(name.name.resolve(), "users");
                 assert!(!actions.is_empty());
             }
@@ -658,7 +674,7 @@ mod tests {
         let facts = parse_and_extract_statement(sql);
         assert!(facts.is_some());
         match facts.unwrap() {
-            StatementFact::AlterTable { name, actions } => {
+            StatementFact::AlterTable { name, actions, .. } => {
                 assert_eq!(name.name.resolve(), "users");
                 assert!(!actions.is_empty());
             }
@@ -672,7 +688,7 @@ mod tests {
         let facts = parse_and_extract_statement(sql);
         assert!(facts.is_some());
         match facts.unwrap() {
-            StatementFact::AlterTable { name, actions } => {
+            StatementFact::AlterTable { name, actions, .. } => {
                 assert_eq!(name.name.resolve(), "users");
                 assert!(!actions.is_empty());
             }
@@ -686,7 +702,7 @@ mod tests {
         let facts = parse_and_extract_statement(sql);
         assert!(facts.is_some());
         match facts.unwrap() {
-            StatementFact::AlterTable { name, actions } => {
+            StatementFact::AlterTable { name, actions, .. } => {
                 assert_eq!(name.name.resolve(), "users");
                 assert!(!actions.is_empty());
             }
@@ -715,7 +731,7 @@ mod tests {
         let facts = parse_and_extract_statement(sql);
         assert!(facts.is_some());
         match facts.unwrap() {
-            StatementFact::AlterTable { name, actions } => {
+            StatementFact::AlterTable { name, actions, .. } => {
                 assert_eq!(name.name.resolve(), "users");
                 assert!(!actions.is_empty());
             }

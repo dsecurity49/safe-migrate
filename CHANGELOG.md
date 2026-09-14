@@ -33,7 +33,16 @@ notes are available on the
   access settings, partition detachment, table inheritance, `SELECT INTO`,
   temporary-table `ON COMMIT` behavior, and the supported `ALTER COLUMN`
   metadata forms.
-- Completed table-definition lifecycles for generated and identity columns,
+- Correct successful concurrent partition detach so it does not leave a
+  pending attachment. Retained CHECKs use the parent strategy, preserve quoted
+  keys, and track columns from the full predicate; unsupported forms remain
+  conservative.
+- Match PostgreSQL's generated CHECK names and avoid schema-wide constraint
+  name collisions.
+- Track role-membership grantors and per-grant ADMIN/INHERIT/SET options, so
+  role `REVOKE`/`CASCADE` linting matches PostgreSQL 16+ per-grant-record
+  semantics instead of collapsing options across grantors.
+- Expanded table-definition lifecycles for generated and identity columns,
   inherited CHECK constraints, `LIKE` indexes and extended statistics, and
   partition indexes, key constraints, foreign keys, and row-trigger clones.
 - Cache V8 now validates and synchronizes CHECK definitions, extended
@@ -55,6 +64,10 @@ notes are available on the
   changes, and rollback without rewriting function names.
 - Keep constraint dependencies, backing indexes, `CLUSTER`, and replica-identity
   references consistent through renames and drops.
+- Reject recursive column-rename collisions before changing descendant metadata,
+  and invalidate descendant partition predicates when their ancestry changes.
+- Check full partition bounds and predicates in the live differential gate;
+  live-test scripts now resolve the repository independently of the working directory.
 
 ## v0.8.1 — 2026-09-06
 

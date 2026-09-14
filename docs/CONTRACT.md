@@ -169,7 +169,8 @@ The principal precision boundaries are:
 
 | Area | Contract |
 | --- | --- |
-| Unsupported DDL | Parser-valid but unmodeled semantics are opaque and `Tainted`, never exact no-ops. This includes copied/inherited tables, CTAS lifecycle actions, unsupported role attributes, and unmodeled database, type, view, materialized-view, domain, or aggregate details. |
+| Unsupported DDL | Parser-valid but unmodeled semantics are opaque and `Tainted`, never exact no-ops. This includes unsupported copying/inheritance forms, CTAS lifecycle actions, unsupported role attributes, and unmodeled database, type, view, materialized-view, domain, or aggregate details. |
+| Partitions | Synchronized predicates retain catalog evidence. Local retained-CHECK synthesis supports simple single-column RANGE/LIST bounds; expression keys, multi-column bounds, and missing ancestor predicates remain conservative. Full local predicate generation is not yet complete. |
 | Indexes | Synchronized complex-index dependencies support exact cleanup. Locally parsed complex indexes do not claim that precision. CTAS `WITH NO DATA` and expression indexes remain available to safety rules. |
 | Grants and policies | `ALL TABLES IN SCHEMA` and policy role/expression changes are `Tainted`; their useful modeled effects remain available to security rules. PostgreSQL 17+ `MAINTAIN` is recognized only with a versioned baseline. |
 | Routines and settings | All synchronized routine kinds are modeled; routine DDL without a typed Squawk extractor is opaque. Unknown `RESET` parameters are opaque, while modeled timeouts/search path and schema-neutral settings remain exact. |

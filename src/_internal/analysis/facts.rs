@@ -243,6 +243,7 @@ pub(crate) enum StatementFact {
     },
     AlterTable {
         name: QualifiedName,
+        only: bool,
         actions: Vec<AlterTableActionFact>,
     },
     AlterIndex {

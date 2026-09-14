@@ -656,6 +656,133 @@ fn load_view_dependencies(
 /// explicit schema boundary. The query covers the catalog classes that can
 /// expose a dependent relation (relations/indexes, constraints, rewrites,
 /// defaults, and triggers); unscoped synchronization needs no boundary list.
+fn load_scoped_external_index_dependencies(
+    client: &mut impl GenericClient,
+    schema_values: &Option<Vec<String>>,
+) -> Result<Vec<ObjectId>> {
+    let Some(schemas) = schema_values else {
+        return Ok(Vec::new());
+    };
+    if schemas.is_empty() {
+        return Ok(Vec::new());
+    }
+    let query = r#"
+        SELECT DISTINCT ref_n.nspname AS ref_schema, ref_c.relname AS ref_name
+        FROM pg_depend d
+        JOIN pg_class ref_c ON d.refclassid = 'pg_class'::regclass
+                           AND d.refobjid = ref_c.oid
+        JOIN pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace
+        JOIN pg_class dep_c ON d.classid = 'pg_class'::regclass
+                           AND d.objid = dep_c.oid
+        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
+        WHERE ref_c.relkind IN ('i', 'I')
+          AND ref_n.nspname = ANY($1)
+          AND NOT (dep_n.nspname = ANY($1))
+          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
+          AND dep_n.nspname <> 'information_schema'
+        UNION
+        SELECT DISTINCT ref_n.nspname, ref_c.relname
+        FROM pg_depend d
+        JOIN pg_class ref_c ON d.refclassid = 'pg_class'::regclass
+                           AND d.refobjid = ref_c.oid
+        JOIN pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace
+        JOIN pg_constraint dep_con ON d.classid = 'pg_constraint'::regclass
+                                  AND d.objid = dep_con.oid
+        JOIN pg_class dep_c ON dep_c.oid = dep_con.conrelid
+        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
+        WHERE ref_c.relkind IN ('i', 'I')
+          AND ref_n.nspname = ANY($1)
+          AND NOT (dep_n.nspname = ANY($1))
+          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
+          AND dep_n.nspname <> 'information_schema'
+        UNION
+        SELECT DISTINCT ref_n.nspname, ref_c.relname
+        FROM pg_depend d
+        JOIN pg_class ref_c ON d.refclassid = 'pg_class'::regclass
+                           AND d.refobjid = ref_c.oid
+        JOIN pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace
+        JOIN pg_rewrite dep_rw ON d.classid = 'pg_rewrite'::regclass
+                              AND d.objid = dep_rw.oid
+        JOIN pg_class dep_c ON dep_c.oid = dep_rw.ev_class
+        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
+        WHERE ref_c.relkind IN ('i', 'I')
+          AND ref_n.nspname = ANY($1)
+          AND NOT (dep_n.nspname = ANY($1))
+          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
+          AND dep_n.nspname <> 'information_schema'
+        UNION
+        SELECT DISTINCT ref_n.nspname, ref_c.relname
+        FROM pg_depend d
+        JOIN pg_class ref_c ON d.refclassid = 'pg_class'::regclass
+                           AND d.refobjid = ref_c.oid
+        JOIN pg_attrdef dep_ad ON d.classid = 'pg_attrdef'::regclass
+                              AND d.objid = dep_ad.oid
+        JOIN pg_class dep_c ON dep_c.oid = dep_ad.adrelid
+        JOIN pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace
+        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
+        WHERE ref_c.relkind IN ('i', 'I')
+          AND ref_n.nspname = ANY($1)
+          AND NOT (dep_n.nspname = ANY($1))
+          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
+          AND dep_n.nspname <> 'information_schema'
+        UNION
+        SELECT DISTINCT ref_n.nspname, ref_c.relname
+        FROM pg_depend d
+        JOIN pg_class ref_c ON d.refclassid = 'pg_class'::regclass
+                           AND d.refobjid = ref_c.oid
+        JOIN pg_trigger dep_tg ON d.classid = 'pg_trigger'::regclass
+                              AND d.objid = dep_tg.oid
+        JOIN pg_class dep_c ON dep_c.oid = dep_tg.tgrelid
+        JOIN pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace
+        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
+        WHERE ref_c.relkind IN ('i', 'I')
+          AND ref_n.nspname = ANY($1)
+          AND NOT (dep_n.nspname = ANY($1))
+          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
+          AND dep_n.nspname <> 'information_schema'
+        UNION
+        SELECT DISTINCT ref_n.nspname, ref_c.relname
+        FROM pg_depend d
+        JOIN pg_class ref_c ON d.refclassid = 'pg_class'::regclass
+                           AND d.refobjid = ref_c.oid
+        JOIN pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace
+        JOIN pg_proc dep_p ON d.classid = 'pg_proc'::regclass
+                          AND d.objid = dep_p.oid
+        JOIN pg_namespace dep_n ON dep_n.oid = dep_p.pronamespace
+        WHERE ref_c.relkind IN ('i', 'I')
+          AND ref_n.nspname = ANY($1)
+          AND NOT (dep_n.nspname = ANY($1))
+          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
+          AND dep_n.nspname <> 'information_schema'
+        UNION
+        SELECT DISTINCT ref_n.nspname, ref_c.relname
+        FROM pg_depend d
+        JOIN pg_class ref_c ON d.refclassid = 'pg_class'::regclass
+                           AND d.refobjid = ref_c.oid
+        JOIN pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace
+        JOIN pg_policy dep_pol ON d.classid = 'pg_policy'::regclass
+                              AND d.objid = dep_pol.oid
+        JOIN pg_class dep_c ON dep_c.oid = dep_pol.polrelid
+        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
+        WHERE ref_c.relkind IN ('i', 'I')
+          AND ref_n.nspname = ANY($1)
+          AND NOT (dep_n.nspname = ANY($1))
+          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
+          AND dep_n.nspname <> 'information_schema'
+    "#;
+    client
+        .query(query, &[schemas])
+        .context("Failed to load scoped index dependency boundaries")?
+        .into_iter()
+        .map(|row| {
+            Ok(ObjectId::new(
+                row.try_get::<_, String>("ref_schema")?,
+                row.try_get::<_, String>("ref_name")?,
+            ))
+        })
+        .collect()
+}
+
 fn load_scoped_external_relation_dependencies(
     client: &mut impl GenericClient,
     schema_values: &Option<Vec<String>>,
@@ -1095,6 +1222,10 @@ fn load_roles(
     let memberships = client
         .query(membership_query, &[])
         .context("Failed to load role memberships from pg_auth_members")?;
+    // PostgreSQL 16+ may store several rows for the same (member, role) pair,
+    // one per grantor.  The effective projection is the union of their
+    // options, so aggregate rows instead of duplicating the edge.
+    let mut seen_edges = std::collections::HashSet::new();
     for row in memberships {
         let member = ObjectId::new("", row.try_get::<_, String>(0).context("member role")?);
         let parent = ObjectId::new("", row.try_get::<_, String>(1).context("parent role")?);
@@ -1102,15 +1233,27 @@ fn load_roles(
         let inherit_option: bool = row.try_get(3).context("role membership INHERIT option")?;
         let set_option: bool = row.try_get(4).context("role membership SET option")?;
         if let Some(role) = roles.get_mut(&member) {
-            role.member_of.push(parent.clone());
-            if admin_option {
-                role.can_administer_membership.push(parent.clone());
-            }
-            if inherit_option {
-                role.can_inherit_from.push(parent.clone());
-            }
-            if set_option {
-                role.can_set_role_to.push(parent);
+            if seen_edges.insert((member, parent.clone())) {
+                role.member_of.push(parent.clone());
+                if admin_option {
+                    role.can_administer_membership.push(parent.clone());
+                }
+                if inherit_option {
+                    role.can_inherit_from.push(parent.clone());
+                }
+                if set_option {
+                    role.can_set_role_to.push(parent.clone());
+                }
+            } else {
+                if admin_option && !role.can_administer_membership.contains(&parent) {
+                    role.can_administer_membership.push(parent.clone());
+                }
+                if inherit_option && !role.can_inherit_from.contains(&parent) {
+                    role.can_inherit_from.push(parent.clone());
+                }
+                if set_option && !role.can_set_role_to.contains(&parent) {
+                    role.can_set_role_to.push(parent);
+                }
             }
         }
     }
@@ -1119,17 +1262,29 @@ fn load_roles(
 
 fn load_role_membership_grantors(
     client: &mut impl GenericClient,
+    pg_version_num: u32,
 ) -> Result<Vec<crate::_internal::model::role::RoleMembershipGrantor>> {
+    let query = if pg_version_num >= 160_000 {
+        "SELECT member.rolname, parent.rolname, grantor.rolname,
+                membership.admin_option, membership.inherit_option,
+                membership.set_option
+         FROM pg_auth_members membership
+         JOIN pg_roles member ON member.oid = membership.member
+         JOIN pg_roles parent ON parent.oid = membership.roleid
+         JOIN pg_roles grantor ON grantor.oid = membership.grantor
+         ORDER BY member.rolname, parent.rolname, grantor.rolname;"
+    } else {
+        "SELECT member.rolname, parent.rolname, grantor.rolname,
+                membership.admin_option, true AS inherit_option,
+                true AS set_option
+         FROM pg_auth_members membership
+         JOIN pg_roles member ON member.oid = membership.member
+         JOIN pg_roles parent ON parent.oid = membership.roleid
+         JOIN pg_roles grantor ON grantor.oid = membership.grantor
+         ORDER BY member.rolname, parent.rolname, grantor.rolname;"
+    };
     let rows = client
-        .query(
-            "SELECT member.rolname, parent.rolname, grantor.rolname
-             FROM pg_auth_members membership
-             JOIN pg_roles member ON member.oid = membership.member
-             JOIN pg_roles parent ON parent.oid = membership.roleid
-             JOIN pg_roles grantor ON grantor.oid = membership.grantor
-             ORDER BY member.rolname, parent.rolname, grantor.rolname;",
-            &[],
-        )
+        .query(query, &[])
         .context("Failed to load role membership grantors")?;
     rows.into_iter()
         .map(|row| {
@@ -1137,6 +1292,9 @@ fn load_role_membership_grantors(
                 member: ObjectId::new("", row.try_get::<_, String>(0)?),
                 role: ObjectId::new("", row.try_get::<_, String>(1)?),
                 grantor: ObjectId::new("", row.try_get::<_, String>(2)?),
+                admin: row.try_get(3)?,
+                inherit: row.try_get(4)?,
+                set: row.try_get(5)?,
             })
         })
         .collect()
@@ -1554,6 +1712,8 @@ fn load_relations_and_columns(
             NULLIF(a.attcompression::text, '') AS compression,
             a.attstattarget::integer AS statistics_target,
             a.attoptions AS column_options,
+            a.attinhcount::integer AS inheritance_count,
+            a.attislocal AS is_local,
             NULLIF(a.attgenerated::text, '') AS generated_kind,
             NULLIF(a.attidentity::text, '') AS identity_generation
         FROM pg_attribute a
@@ -1629,6 +1789,14 @@ fn load_relations_and_columns(
                 },
             );
         }
+        relation.column_inheritance.insert(
+            column_name.clone(),
+            crate::_internal::model::relation::ColumnInheritance {
+                parent_count: u32::try_from(row.try_get::<_, i32>("inheritance_count")?)
+                    .context("negative column inheritance count")?,
+                is_local: row.try_get("is_local")?,
+            },
+        );
         relation
             .columns
             .push(crate::_internal::model::column::Column {
@@ -3380,6 +3548,8 @@ fn populate_cache_from_client(
         load_scoped_external_type_dependencies(client, &schema_values)?;
     cache.scoped_external_routine_dependencies =
         load_scoped_external_routine_dependencies(client, &schema_values)?;
+    cache.scoped_external_index_dependencies =
+        load_scoped_external_index_dependencies(client, &schema_values)?;
     // All scope-boundary queries above completed inside the same repeatable
     // read transaction. Mark this only after every query succeeds; a cache
     // that was assembled programmatically or by a partial loader remains
@@ -3390,8 +3560,21 @@ fn populate_cache_from_client(
     // `SET ROLE` from a migration that PostgreSQL would reject. pg_roles does
     // not expose password hashes or other credentials.
     cache.roles = load_roles(client, cache.pg_version_num.unwrap_or_default())?;
-    cache.role_membership_grantors = load_role_membership_grantors(client)?;
+    cache.role_membership_grantors =
+        load_role_membership_grantors(client, cache.pg_version_num.unwrap_or_default())?;
     cache.role_membership_grantors_complete = true;
+
+    // The bootstrap superuser (pg_authid OID 10, `BOOTSTRAP_SUPERUSERID`)
+    // receives implicit superuser-issued role grantor attribution on modern
+    // PostgreSQL.  Recording its name lets state resolution distinguish it
+    // from a session role when replaying unchecked GRANT statements.
+    cache.bootstrap_superuser = client
+        .query("SELECT rolname FROM pg_roles WHERE oid = 10;", &[])
+        .context("Failed to load the bootstrap superuser role")?
+        .first()
+        .map(|row| row.try_get::<_, String>(0))
+        .transpose()
+        .context("bootstrap superuser name")?;
 
     cache
         .validate_semantics()

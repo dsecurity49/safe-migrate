@@ -29,7 +29,7 @@ src/_internal/engine/     configuration, orchestration, and rule dispatch
 src/_internal/model/      modeled PostgreSQL objects
 src/_internal/report/     human, JSON, and interactive reporting
 src/_internal/rules/      safety rule implementations
-src/api.rs                supported Rust integration façade
+src/api.rs, src/api/      supported Rust integration API
 tests/          integration, state-machine, rule, CLI, and regression tests
 live_tests/     end-to-end SQL fixtures and frozen database cache
 docs/           Action guide and CLI/report contract
@@ -55,6 +55,10 @@ cargo test rule_evaluation
 cargo test architectural_gap
 cargo test expression_parsing
 ```
+
+Implementation tests are registered under the library target (`--lib`), not
+individual `--test` targets. The independent public API suite uses
+`cargo test --locked --test api_facade`.
 
 End-to-end fixtures:
 

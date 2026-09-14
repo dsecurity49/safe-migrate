@@ -404,6 +404,7 @@ pub(crate) struct CreateIndex {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct AlterTable {
     pub id: ObjectId,
+    pub only: bool,
     pub action: AlterTableActionMutation,
 }
 

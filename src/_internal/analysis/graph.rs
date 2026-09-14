@@ -61,7 +61,8 @@ pub(crate) enum DependencyKind {
     /// ordinary table inheritance.
     InheritanceOf,
     PartitionOf,
-    /// A concurrently detached partition remains attached until FINALIZE.
+    /// A `DETACH PARTITION CONCURRENTLY` interrupted after its first internal
+    /// transaction remains attached until `FINALIZE` completes it.
     PartitionDetachPending,
     SequenceOwnedBy {
         column: String,

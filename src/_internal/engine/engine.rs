@@ -326,7 +326,22 @@ impl SafeMigrateEngine {
             if squawk_linter::analyze::possibly_slow_stmt(&stmt) {
                 mutations.push(Mutation::CheckTimeouts);
             }
+            let started_in_transaction = state.in_transaction();
+            let transaction_control = mutations.iter().any(|mutation| {
+                matches!(
+                    mutation,
+                    Mutation::BeginTransaction
+                        | Mutation::CommitTransaction
+                        | Mutation::CommitAndChain
+                        | Mutation::RollbackTransaction
+                        | Mutation::RollbackAndChain
+                        | Mutation::RollbackToSavepoint(_)
+                        | Mutation::Savepoint(_)
+                        | Mutation::ReleaseSavepoint(_)
+                )
+            });
             let mut statement_checkpoint = StatementCheckpoint::capture(state, &mutations);
+            let mut statement_failed = false;
 
             for mutation in mutations {
                 let pre_cascade = match &mutation {
@@ -339,7 +354,7 @@ impl SafeMigrateEngine {
                 state.capture_pre_state_into(&mut pre_state);
                 let result = state.apply(&mutation, pre_cascade.as_ref());
 
-                let statement_failed = matches!(
+                statement_failed = matches!(
                     result,
                     crate::_internal::analysis::state::MutationResult::Conflict { .. }
                 );
@@ -452,6 +467,14 @@ impl SafeMigrateEngine {
                 if statement_failed {
                     break;
                 }
+            }
+
+            if !statement_failed
+                && !started_in_transaction
+                && !transaction_control
+                && !state.in_transaction()
+            {
+                state.apply_implicit_commit_actions();
             }
 
             warned_keys.extend(statement_warned_keys);

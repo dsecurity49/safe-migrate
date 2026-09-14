@@ -1282,6 +1282,7 @@ impl AstVisitor {
 
         Some(StatementFact::AlterTable {
             name: table_name,
+            only: node.table_relation_name()?.only_token().is_some(),
             actions,
         })
     }
@@ -1924,7 +1925,7 @@ impl AstVisitor {
                         .and_then(|clause| clause.constraint_name())
                         .and_then(|name| name.ident_token())
                         .map(|token| Self::resolve_identifier_token(token.text())),
-                    name_hint: None,
+                    name_hint: (columns_complete && columns.len() == 1).then(|| columns[0].clone()),
                     definition: check.expr()?.syntax().text().to_string(),
                     columns,
                     columns_complete,

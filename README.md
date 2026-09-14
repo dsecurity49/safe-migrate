@@ -68,7 +68,7 @@ safe-migrate rules --rule require-concurrent-index
 
 ## GitHub Actions
 
-Create the `safe-migrate-baseline` GitHub environment, then run:
+Create and protect the `safe-migrate-baseline` GitHub environment, then run:
 
 ```bash
 safe-migrate init github-actions --path migrations --configure-secrets

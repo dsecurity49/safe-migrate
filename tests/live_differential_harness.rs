@@ -2,6 +2,7 @@ use crate::common::database_hosts_are_local;
 use postgres::{Client, Config as PostgresConfig, NoTls};
 use safe_migrate::_internal::analysis::graph::DependencyKind;
 use safe_migrate::_internal::analysis::state::AnalysisState;
+use safe_migrate::_internal::ast::identifiers::ObjectId;
 use safe_migrate::_internal::db::cache::DbCache;
 use safe_migrate::_internal::engine::engine::SafeMigrateEngine;
 use safe_migrate::_internal::model::constraint::ConstraintKind;
@@ -196,6 +197,8 @@ struct NormalizedRelation {
     owner: String,
     partition_strategy: Option<String>,
     partition_is_default: Option<bool>,
+    partition_bound: Option<String>,
+    partition_constraint: Option<String>,
     persistence: String,
     tablespace: Option<String>,
     access_method: Option<String>,
@@ -986,6 +989,146 @@ fn repo_path(relative: &str) -> PathBuf {
 }
 
 #[test]
+#[ignore = "requires a disposable local PostgreSQL database via DATABASE_URL"]
+fn live_interrupted_partition_detach_finalize() {
+    let config: PostgresConfig = std::env::var("DATABASE_URL")
+        .expect("DATABASE_URL")
+        .parse()
+        .expect("database configuration");
+    assert!(database_hosts_are_local(&config));
+    let mut client = config.connect(NoTls).expect("local PostgreSQL");
+    let database: String = client
+        .query_one("SELECT current_database()", &[])
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        database,
+        std::env::var(DATABASE_NAME_ENV).unwrap_or_else(|_| "safe_migrate".into())
+    );
+    let schema = format!("sm_detach_interrupt_{}", std::process::id());
+    client
+        .batch_execute(&format!("CREATE SCHEMA {schema}"))
+        .unwrap();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        for (strategy, bound) in [("RANGE", "FROM (0) TO (10)"), ("LIST", "IN (1, 2, 3)")] {
+            client
+                .batch_execute(&format!(
+                    "CREATE TABLE {schema}.parent(id integer) PARTITION BY {strategy}(id);
+                CREATE TABLE {schema}.child PARTITION OF {schema}.parent FOR VALUES {bound};"
+                ))
+                .unwrap();
+            let mut blocker = config.connect(NoTls).unwrap();
+            blocker
+                .batch_execute(&format!(
+                    "BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT * FROM {schema}.parent;"
+                ))
+                .unwrap();
+            let mut detacher = config.connect(NoTls).unwrap();
+            detacher
+                .batch_execute("SET statement_timeout = '15s'")
+                .unwrap();
+            let cancel = detacher.cancel_token();
+            let sql =
+                format!("ALTER TABLE {schema}.parent DETACH PARTITION {schema}.child CONCURRENTLY");
+            let worker = std::thread::spawn(move || detacher.batch_execute(&sql));
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut pending = false;
+            while Instant::now() < deadline {
+                pending = client.query_one("SELECT EXISTS (SELECT 1 FROM pg_inherits WHERE inhrelid = to_regclass($1) AND inhdetachpending)", &[&format!("{schema}.child")]).unwrap().get(0);
+                if pending {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let cancellation = cancel.cancel_query(NoTls);
+            let detached = worker.join().expect("detach worker");
+            blocker.batch_execute("ROLLBACK").unwrap();
+            assert!(pending, "detach never committed its pending state");
+            cancellation.expect("cancel blocked detach");
+            assert_eq!(
+                detached.unwrap_err().code(),
+                Some(&postgres::error::SqlState::QUERY_CANCELED)
+            );
+
+            let scopes = vec![schema.clone()];
+            let cache = populate_cache(&mut client, Some(&scopes)).expect("sync interrupted state");
+            cache.validate_semantics().expect("valid interrupted cache");
+            let child = safe_migrate::_internal::ast::identifiers::ObjectId::new(&schema, "child");
+            let mut state = AnalysisState::with_baseline(cache, true);
+            assert!(
+                state
+                    .local
+                    .graph
+                    .edges()
+                    .iter()
+                    .any(|edge| edge.dependent == child
+                        && matches!(edge.kind, DependencyKind::PartitionDetachPending))
+            );
+            let checks_before: Vec<_> = state
+                .local
+                .constraints
+                .values()
+                .filter(|check| check.table_id == child && check.kind == ConstraintKind::Check)
+                .cloned()
+                .collect();
+            assert_eq!(checks_before.len(), 1);
+            let finalize =
+                format!("ALTER TABLE {schema}.parent DETACH PARTITION {schema}.child FINALIZE;");
+            let findings = SafeMigrateEngine::new(Config::default())
+                .analyze(&finalize, &mut state)
+                .unwrap();
+            assert!(
+                !findings
+                    .iter()
+                    .any(|finding| finding.rule_id == "chain-conflict"),
+                "{findings:?}"
+            );
+            client.batch_execute(&finalize).expect("live FINALIZE");
+            let live = AnalysisState::with_baseline(
+                populate_cache(&mut client, Some(&scopes)).unwrap(),
+                true,
+            );
+            for snapshot in [&state, &live] {
+                assert!(
+                    !snapshot
+                        .local
+                        .graph
+                        .edges()
+                        .iter()
+                        .any(|edge| edge.dependent == child
+                            && matches!(
+                                edge.kind,
+                                DependencyKind::PartitionOf
+                                    | DependencyKind::PartitionDetachPending
+                            ))
+                );
+                let checks: Vec<_> = snapshot
+                    .local
+                    .constraints
+                    .values()
+                    .filter(|check| check.table_id == child && check.kind == ConstraintKind::Check)
+                    .cloned()
+                    .collect();
+                assert_eq!(checks, checks_before);
+            }
+            client
+                .batch_execute(&format!(
+                    "DROP TABLE {schema}.child; DROP TABLE {schema}.parent;"
+                ))
+                .unwrap();
+        }
+    }));
+    client
+        .batch_execute(&format!(
+            "SET lock_timeout = '3s'; DROP SCHEMA {schema} CASCADE;"
+        ))
+        .expect("cleanup interruption schema");
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[test]
 fn differential_database_guard_accepts_only_local_hosts() {
     for url in [
         "postgresql://localhost/safe_migrate",
@@ -1004,6 +1147,35 @@ fn differential_database_guard_accepts_only_local_hosts() {
 #[test]
 fn differential_manifest_accounts_for_every_sql_fixture() {
     load_manifest(&repo_path("live_tests/differential_manifest.json"));
+}
+
+#[test]
+fn constraint_definition_boolean_operands_are_paren_insensitive() {
+    assert_eq!(
+        canonical_constraint_expression("(id > 0) AND (id < 100)"),
+        "id > 0 AND id < 100"
+    );
+    assert_eq!(
+        canonical_constraint_expression("id > 0 AND id < 100"),
+        "id > 0 AND id < 100"
+    );
+    assert_eq!(
+        canonical_constraint_expression("((id > 0)) AND (id < 100)"),
+        "id > 0 AND id < 100"
+    );
+    assert_eq!(
+        canonical_constraint_expression("(a = 1 OR b = 2) AND c = 3"),
+        "(a = 1 OR b = 2) AND c = 3"
+    );
+    assert_eq!(
+        canonical_constraint_expression("land = 1 AND id > 0"),
+        "land = 1 AND id > 0"
+    );
+    assert_eq!(canonical_constraint_expression("(id > 0)"), "id > 0");
+    assert_eq!(
+        canonical_constraint_expression("status IN ('on', 'off') AND (id > 0)"),
+        "status IN ('on', 'off') AND id > 0"
+    );
 }
 
 #[test]
@@ -1630,6 +1802,7 @@ fn snapshot_live_state(
     // fixture that changes search_path cannot turn the same type into two
     // different textual representations.
     let resolved_cache_state = AnalysisState::with_baseline(cache.clone(), true);
+    let known_function_ids = cache.functions.keys().cloned().collect::<Vec<_>>();
 
     if scope.contains(&ComparisonScope::Schemas) {
         for (name, schema) in &cache.schemas {
@@ -1799,6 +1972,8 @@ fn snapshot_live_state(
                     .partition_bound
                     .as_deref()
                     .map(|bound| bound.trim().eq_ignore_ascii_case("DEFAULT")),
+                partition_bound: relation.partition_bound.clone(),
+                partition_constraint: relation.partition_constraint.clone(),
                 persistence: normalize_relation_persistence(relation.persistence.clone()),
                 tablespace: relation.tablespace.clone(),
                 access_method: normalize_access_method(
@@ -1855,6 +2030,8 @@ fn snapshot_live_state(
                             generated: column.generated,
                             generation: normalize_generated_column(
                                 relation.generated_columns.get(&column.name),
+                                &known_function_ids,
+                                &cache.search_path,
                             ),
                             identity_generation: relation
                                 .identity_columns
@@ -2004,6 +2181,14 @@ fn snapshot_simulator_state(
     scope: &[ComparisonScope],
 ) -> NormalizedState {
     let mut projection = NormalizedState::default();
+    let known_function_ids = state
+        .local
+        .functions
+        .iter()
+        .filter_map(|(id, overlay)| {
+            matches!(overlay, FunctionOverlay::Present(_)).then_some(id.clone())
+        })
+        .collect::<Vec<_>>();
 
     if scope.contains(&ComparisonScope::Schemas) {
         for (name, overlay) in &state.local.schemas {
@@ -2226,6 +2411,8 @@ fn snapshot_simulator_state(
                     .partition_bound
                     .as_deref()
                     .map(|bound| bound.trim().eq_ignore_ascii_case("DEFAULT")),
+                partition_bound: relation.partition_bound.clone(),
+                partition_constraint: relation.partition_constraint.clone(),
                 persistence: normalize_relation_persistence(relation.persistence.clone()),
                 tablespace: relation.tablespace.clone(),
                 access_method: normalize_access_method(
@@ -2273,6 +2460,8 @@ fn snapshot_simulator_state(
                             generated: column.generated,
                             generation: normalize_generated_column(
                                 relation.generated_columns.get(&column.name),
+                                &known_function_ids,
+                                state.search_path(),
                             ),
                             identity_generation: relation
                                 .identity_columns
@@ -2390,6 +2579,51 @@ fn snapshot_simulator_state(
     }
 
     projection
+}
+
+#[test]
+fn relation_comparison_detects_partition_metadata_differences() {
+    let relation = NormalizedRelation {
+        kind: NormalizedRelationKind::Table,
+        owner: "owner".into(),
+        partition_strategy: None,
+        partition_is_default: Some(false),
+        partition_bound: Some("FOR VALUES FROM (0) TO (10)".into()),
+        partition_constraint: Some("(id IS NOT NULL) AND (id >= 0) AND (id < 10)".into()),
+        persistence: "permanent".into(),
+        tablespace: None,
+        access_method: None,
+        cluster_index: None,
+        row_security: None,
+        force_row_security: None,
+        replica_identity: None,
+        table_options: BTreeMap::new(),
+        of_type: None,
+        rules: BTreeMap::new(),
+        columns: BTreeMap::new(),
+    };
+    let mut live = NormalizedState::default();
+    live.relations
+        .insert("public.child".into(), relation.clone());
+    for field in 0..3 {
+        let mut changed = relation.clone();
+        match field {
+            0 => changed.partition_bound = Some("FOR VALUES FROM (0) TO (20)".into()),
+            1 => changed.partition_constraint = None,
+            _ => changed.partition_is_default = Some(true),
+        }
+        let mut simulator = NormalizedState::default();
+        simulator.relations.insert("public.child".into(), changed);
+        for scope in [ComparisonScope::Relations, ComparisonScope::Partitions] {
+            let mismatches = compare_states("regression", "partition", &[scope], &live, &simulator);
+            assert!(
+                mismatches
+                    .iter()
+                    .any(|mismatch| mismatch.category
+                        == MismatchCategory::RelationDefinitionMismatch)
+            );
+        }
+    }
 }
 
 fn compare_states(
@@ -2581,6 +2815,29 @@ fn compare_states(
                     category: MismatchCategory::ExtraSequenceInSimulator,
                     root_cause: RootCauseClassification::SimulatorBug,
                     note: format!("simulator kept sequence {name}, but live PostgreSQL removed it"),
+                });
+            }
+        }
+    }
+
+    if scope.contains(&ComparisonScope::Relations) || scope.contains(&ComparisonScope::Partitions) {
+        for (name, live_relation) in &live.relations {
+            let Some(sim_relation) = simulator.relations.get(name) else {
+                continue;
+            };
+            if sim_relation.partition_is_default != live_relation.partition_is_default
+                || sim_relation.partition_bound != live_relation.partition_bound
+                || normalize_constraint_definition(sim_relation.partition_constraint.as_deref())
+                    != normalize_constraint_definition(
+                        live_relation.partition_constraint.as_deref(),
+                    )
+            {
+                mismatches.push(Mismatch {
+                    rule_dir: rule_dir.to_string(),
+                    fixture: fixture.to_string(),
+                    category: MismatchCategory::RelationDefinitionMismatch,
+                    root_cause: RootCauseClassification::SimulatorBug,
+                    note: format!("partition metadata mismatch for {name}: live={live_relation:?}, simulator={sim_relation:?}"),
                 });
             }
         }
@@ -3086,10 +3343,14 @@ fn normalize_replica_identity(kind: &RelationKind, value: Option<&str>) -> Optio
 fn generated_expression_comparison_preserves_operators_and_literals() {
     use safe_migrate::_internal::model::relation::{GeneratedColumnKind, GeneratedColumnState};
     let normalize = |expression: &str| {
-        normalize_generated_column(Some(&GeneratedColumnState {
-            kind: GeneratedColumnKind::Stored,
-            expression: Some(expression.into()),
-        }))
+        normalize_generated_column(
+            Some(&GeneratedColumnState {
+                kind: GeneratedColumnKind::Stored,
+                expression: Some(expression.into()),
+            }),
+            &[],
+            &[],
+        )
     };
     assert_eq!(normalize("((value * 2))"), normalize("value*2"));
     assert_ne!(normalize("-value"), normalize("value"));
@@ -3097,8 +3358,49 @@ fn generated_expression_comparison_preserves_operators_and_literals() {
     assert_ne!(normalize("'a b'"), normalize("'ab'"));
 }
 
+#[test]
+fn generated_expression_comparison_resolves_only_unambiguous_known_functions() {
+    use safe_migrate::_internal::model::relation::{GeneratedColumnKind, GeneratedColumnState};
+    let generated = |expression: &str| GeneratedColumnState {
+        kind: GeneratedColumnKind::Stored,
+        expression: Some(expression.into()),
+    };
+    let one_overload = vec![ObjectId::new("app", "visible(integer)")];
+    assert_eq!(
+        normalize_generated_column(
+            Some(&generated("app.visible(value)")),
+            &one_overload,
+            &["app".into()]
+        ),
+        normalize_generated_column(
+            Some(&generated("visible(value)")),
+            &one_overload,
+            &["app".into()]
+        ),
+    );
+
+    let overloaded = vec![
+        ObjectId::new("app", "visible(integer)"),
+        ObjectId::new("app", "visible(text)"),
+    ];
+    assert_ne!(
+        normalize_generated_column(
+            Some(&generated("app.visible(value)")),
+            &overloaded,
+            &["app".into()]
+        ),
+        normalize_generated_column(
+            Some(&generated("visible(value)")),
+            &overloaded,
+            &["app".into()]
+        ),
+    );
+}
+
 fn normalize_generated_column(
     generated: Option<&safe_migrate::_internal::model::relation::GeneratedColumnState>,
+    known_function_ids: &[ObjectId],
+    search_path: &[String],
 ) -> Option<String> {
     let generated = generated?;
     let Some(expression) = &generated.expression else {
@@ -3106,21 +3408,78 @@ fn normalize_generated_column(
     };
     let expression = normalize_constraint_definition(Some(expression)).unwrap();
     let parsed = ast::SourceFile::parse(&format!("SELECT {expression}"));
+    let callee_identities = parsed
+        .tree()
+        .syntax()
+        .descendants()
+        .filter_map(ast::CallExpr::cast)
+        .filter_map(|call| {
+            let callee = call.expr()?;
+            canonical_generated_function_identity(&callee, known_function_ids, search_path)
+                .map(|identity| (callee.syntax().text_range(), identity))
+        })
+        .collect::<Vec<_>>();
     let normalized = parsed
         .tree()
         .syntax()
         .descendants_with_tokens()
         .filter_map(|element| element.into_token())
         .filter(|token| !token.kind().is_trivia())
-        .map(|token| {
+        .filter_map(|token| {
+            if let Some((callee_range, identity)) = callee_identities
+                .iter()
+                .find(|(callee_range, _)| callee_range.contains_range(token.text_range()))
+            {
+                return (token.text_range().start() == callee_range.start())
+                    .then(|| format!("function:{identity}"));
+            }
             token
                 .parent()
                 .and_then(ast::NameRef::cast)
                 .map(|name| format!("name:{}", name.text()))
-                .unwrap_or_else(|| token.text().to_string())
+                .or_else(|| Some(token.text().to_string()))
         })
         .collect::<Vec<_>>();
     Some(format!("{:?}:{normalized:?}", generated.kind))
+}
+
+fn canonical_generated_function_identity(
+    callee: &ast::Expr,
+    known_function_ids: &[ObjectId],
+    search_path: &[String],
+) -> Option<String> {
+    let id = match callee {
+        ast::Expr::NameRef(name) => {
+            let name = name.text();
+            search_path
+                .iter()
+                .find_map(|schema| known_generated_function(schema, &name, known_function_ids))?
+        }
+        ast::Expr::FieldExpr(field) => {
+            let ast::Expr::NameRef(schema) = field.base()? else {
+                return None;
+            };
+            let name = field.field()?;
+            let schema = schema.text();
+            let name = name.text();
+            known_generated_function(&schema, &name, known_function_ids)?
+        }
+        _ => return None,
+    };
+    Some(qualified_name(&id.schema, &id.name))
+}
+
+fn known_generated_function(
+    schema: &str,
+    name: &str,
+    known_function_ids: &[ObjectId],
+) -> Option<ObjectId> {
+    let prefix = format!("{name}(");
+    let mut candidates = known_function_ids
+        .iter()
+        .filter(|id| id.schema == schema && id.name.starts_with(&prefix));
+    let candidate = candidates.next()?.clone();
+    candidates.next().is_none().then_some(candidate)
 }
 
 fn normalize_column_storage(
@@ -3326,16 +3685,138 @@ fn normalize_constraint_kind(kind: ConstraintKind) -> String {
 }
 
 fn normalize_constraint_definition(definition: Option<&str>) -> Option<String> {
-    definition.map(|definition| {
-        let mut expression = definition.trim();
-        while expression.starts_with('(')
-            && expression.ends_with(')')
-            && outer_parentheses_wrap_expression(expression)
-        {
-            expression = expression[1..expression.len() - 1].trim();
+    definition.map(canonical_constraint_expression)
+}
+
+/// PostgreSQL's `pg_get_expr(conbin)` deparse wraps every operand of a
+/// top-level `AND`/`OR` in parentheses regardless of how the author spelled
+/// the constraint. Canonicalize both sides to a parenthesis-insensitive
+/// boolean form: a parenthesized operand that is not itself a boolean
+/// combination loses its parens; a parenthesized `AND`/`OR` group keeps them.
+fn canonical_constraint_expression(expression: &str) -> String {
+    let trimmed = expression.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let mut current = trimmed;
+    while current.starts_with('(')
+        && current.ends_with(')')
+        && outer_parentheses_wrap_expression(current)
+    {
+        current = current[1..current.len() - 1].trim();
+    }
+    let separators = top_level_boolean_separators(current);
+    if separators.is_empty() {
+        return current.to_string();
+    }
+    let mut parts = Vec::new();
+    let mut cursor = 0usize;
+    for separator in &separators {
+        parts.push(&current[cursor..separator.start]);
+        cursor = separator.end;
+    }
+    parts.push(&current[cursor..]);
+    let mut canonical = String::new();
+    for (index, part) in parts.iter().enumerate() {
+        if index > 0 {
+            canonical.push(' ');
+            canonical.push_str(separators[index - 1].word);
+            canonical.push(' ');
         }
-        expression.to_string()
-    })
+        canonical.push_str(&canonical_boolean_part(part));
+    }
+    canonical
+}
+
+fn canonical_boolean_part(part: &str) -> String {
+    let trimmed = part.trim();
+    if trimmed.starts_with('(')
+        && trimmed.ends_with(')')
+        && outer_parentheses_wrap_expression(trimmed)
+    {
+        let inner = &trimmed[1..trimmed.len() - 1];
+        if top_level_boolean_separators(inner.trim()).is_empty() {
+            canonical_constraint_expression(inner)
+        } else {
+            format!("({})", canonical_constraint_expression(inner))
+        }
+    } else {
+        canonical_constraint_expression(trimmed)
+    }
+}
+
+struct BooleanSeparator {
+    start: usize,
+    end: usize,
+    word: &'static str,
+}
+
+/// Byte offsets of top-level `AND`/`OR` keywords (whitespace-delimited) in a
+/// SQL expression, ignoring quoted strings. `'a'`/`'o'` inside identifiers
+/// such as `land` are rejected by requiring surrounding whitespace.
+fn top_level_boolean_separators(expression: &str) -> Vec<BooleanSeparator> {
+    let mut separators = Vec::new();
+    let bytes = expression.as_bytes();
+    let mut depth = 0usize;
+    let mut single_quoted = false;
+    let mut double_quoted = false;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let ch = bytes[index];
+        if single_quoted {
+            if ch == b'\'' {
+                single_quoted = false;
+            }
+            index += 1;
+            continue;
+        }
+        if double_quoted {
+            if ch == b'"' {
+                double_quoted = false;
+            }
+            index += 1;
+            continue;
+        }
+        match ch {
+            b'\'' => single_quoted = true,
+            b'"' => double_quoted = true,
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        let len =
+            if depth == 0 && (ch.eq_ignore_ascii_case(&b'a') || ch.eq_ignore_ascii_case(&b'o')) {
+                bytes
+                    .get(index..index + 3)
+                    .is_some_and(|word| word.eq_ignore_ascii_case(b"and"))
+                    .then_some(3)
+                    .or_else(|| {
+                        bytes
+                            .get(index..index + 2)
+                            .is_some_and(|word| word.eq_ignore_ascii_case(b"or"))
+                            .then_some(2)
+                    })
+            } else {
+                None
+            };
+        if let Some(len) = len {
+            let before = index == 0 || bytes[index - 1].is_ascii_whitespace();
+            let after = index + len;
+            let after_whitespace = after >= bytes.len() || bytes[after].is_ascii_whitespace();
+            if before && after_whitespace {
+                let word = if len == 3 { "AND" } else { "OR" };
+                separators.push(BooleanSeparator {
+                    start: index,
+                    end: after,
+                    word,
+                });
+                index = after;
+                continue;
+            }
+        }
+        index += 1;
+    }
+    separators
 }
 
 fn outer_parentheses_wrap_expression(expression: &str) -> bool {

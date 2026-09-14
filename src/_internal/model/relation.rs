@@ -492,11 +492,20 @@ impl RuleEnableMode {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ColumnInheritance {
+    pub parent_count: u32,
+    pub is_local: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct RelationState {
     pub id: ObjectId,
     pub owner: ObjectId,
     pub columns: Vec<Column>,
+    /// Missing entries mean inheritance provenance has not been captured.
+    #[serde(default)]
+    pub column_inheritance: std::collections::HashMap<String, ColumnInheritance>,
     pub generation: u64,
     pub estimated_rows: Option<u64>,
     pub relpages: Option<u64>,
@@ -568,6 +577,7 @@ impl Default for RelationState {
             triggers: HashSet::new(),
             policies: HashSet::new(),
             rules: Default::default(),
+            column_inheritance: Default::default(),
             identity_columns: Default::default(),
             generated_columns: Default::default(),
             extended_statistics: Default::default(),
@@ -627,6 +637,7 @@ impl RelationState {
             triggers: HashSet::new(),
             policies: HashSet::new(),
             rules: Default::default(),
+            column_inheritance: Default::default(),
             identity_columns: Default::default(),
             generated_columns: Default::default(),
             extended_statistics: Default::default(),
@@ -701,10 +712,18 @@ impl RelationState {
                         !(*not_null || is_serial),
                         normalized_default,
                     ));
+                    self.column_inheritance.insert(
+                        name.clone(),
+                        ColumnInheritance {
+                            parent_count: 0,
+                            is_local: true,
+                        },
+                    );
                 }
             }
             ColumnAction::Drop { name } => {
                 self.columns.retain(|c| c.name != *name);
+                self.column_inheritance.remove(name);
                 self.identity_columns.remove(name);
                 self.generated_columns.remove(name);
             }
@@ -713,6 +732,15 @@ impl RelationState {
                     && !self.columns.iter().any(|c| c.name == *to)
                 {
                     self.columns[pos].name = to.clone();
+                    if let Some(provenance) = self.column_inheritance.remove(from) {
+                        self.column_inheritance.insert(to.clone(), provenance);
+                    }
+                    self.partition_by = self.partition_by.as_deref().and_then(|source| {
+                        crate::_internal::analysis::expr_visitor::ExprVisitor::rename_partition_key_source(source, &self.id.name, from, to)
+                    });
+                    self.partition_constraint = self.partition_constraint.as_deref().and_then(|source| {
+                        crate::_internal::analysis::expr_visitor::ExprVisitor::rename_column_source(source, &self.id.name, from, to)
+                    });
                     if let Some(generation) = self.identity_columns.remove(from) {
                         self.identity_columns.insert(to.clone(), generation);
                     }
@@ -725,16 +753,22 @@ impl RelationState {
                         });
                     }
                     for statistics in self.extended_statistics.values_mut() {
-                        let mut renamed = false;
                         for column in &mut statistics.columns {
                             if column == from {
                                 *column = to.clone();
-                                renamed = true;
                             }
                         }
-                        if renamed {
-                            statistics.expressions = None;
-                        }
+                        statistics.expressions = statistics
+                            .expressions
+                            .as_deref()
+                            .and_then(|source| {
+                                crate::_internal::analysis::expr_visitor::ExprVisitor::rename_column_source(
+                                    source,
+                                    &self.id.name,
+                                    from,
+                                    to,
+                                )
+                            });
                     }
                 }
             }

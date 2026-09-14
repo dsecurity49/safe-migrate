@@ -690,14 +690,14 @@ impl AnalysisState {
             .graph
             .edges()
             .iter()
-            .filter_map(|edge| {
-                (matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
+            .filter(|edge| {
+                matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
                     && targets.iter().any(|target| {
                         self.local.graph.resolve_rename(target)
                             == self.local.graph.resolve_rename(&edge.dependent)
-                    }))
-                .then(|| (edge.referenced.clone(), edge.dependent.name.clone()))
+                    })
             })
+            .map(|edge| (edge.referenced.clone(), edge.dependent.name.clone()))
             .collect::<Vec<_>>();
         for (table, index_name) in table_indexes {
             self.snapshot_relation(&table);

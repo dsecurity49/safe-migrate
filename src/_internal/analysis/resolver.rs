@@ -427,8 +427,12 @@ impl Resolver {
                     names, *if_exists, *cascade, state,
                 ));
             }
-            StatementFact::AlterTable { name, actions } => {
-                mutations.extend(Self::resolve_alter_table(name, actions, state));
+            StatementFact::AlterTable {
+                name,
+                only,
+                actions,
+            } => {
+                mutations.extend(Self::resolve_alter_table(name, *only, actions, state));
             }
             StatementFact::DropTable {
                 names,

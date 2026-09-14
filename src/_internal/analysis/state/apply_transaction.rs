@@ -82,6 +82,14 @@ impl AnalysisState {
         }
     }
 
+    /// PostgreSQL wraps each statement outside an explicit transaction in its
+    /// own transaction, so ON COMMIT actions run after that statement.
+    pub(crate) fn apply_implicit_commit_actions(&mut self) {
+        if self.local.transactions.is_empty() && !self.local.transaction_aborted {
+            self.apply_on_commit_actions();
+        }
+    }
+
     pub(super) fn apply_rollback_transaction(&mut self, chain: bool) -> MutationResult {
         if chain && self.local.transactions.is_empty() {
             self.taint(EvidenceCode::TransactionStateUnknown, EvidenceScope::Chain);

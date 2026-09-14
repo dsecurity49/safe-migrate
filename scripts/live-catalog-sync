@@ -1,6 +1,18 @@
 #!/bin/sh
 set -eu
 
+repository_root=$(CDPATH='' cd -- "$(dirname "$0")/.." && pwd)
+cd "$repository_root"
+
+if [ "$#" -gt 0 ]; then
+    if [ "$#" -eq 1 ] && { [ "$1" = --help ] || [ "$1" = -h ]; }; then
+        printf '%s\n' "Usage: scripts/live-catalog-sync" "Requires disposable local PostgreSQL databases; see CONTRIBUTING.md."
+        exit 0
+    fi
+    printf '%s\n' "Unexpected arguments; use --help for usage." >&2
+    exit 2
+fi
+
 if [ -z "${DATABASE_URL:-}" ]; then
     printf '%s\n' "DATABASE_URL is required for the live catalog sync test." >&2
     exit 2
@@ -8,4 +20,4 @@ fi
 
 cargo test --locked --lib \
     internal_tests::live_catalog_sync::live_sync_preserves_routine_and_replication_catalogs_without_connection_secrets \
-    -- --ignored --nocapture
+    -- --exact --ignored --nocapture

@@ -209,6 +209,61 @@ impl AnalysisState {
         }
     }
 
+    /// Remove memberships granted by roles whose ADMIN authority was
+    /// withdrawn, mirroring PostgreSQL's `plan_recursive_revoke`: a revoked
+    /// record only triggers cascade when it carried the ADMIN option and the
+    /// affected member would no longer hold ADMIN through any other record
+    /// for the same parent role.  Each removal can free the next grantor, so
+    /// the queue makes the propagation transitive.  Operates exclusively on
+    /// per-grantor records (the PostgreSQL 16+ model).
+    fn cascade_memberships_granted_by(&mut self, initial_grantors: &[ObjectId]) {
+        let mut pending = initial_grantors.to_vec();
+        let mut visited = HashSet::new();
+        let mut removals: Vec<(ObjectId, ObjectId, ObjectId)> = Vec::new();
+        while let Some(grantor) = pending.pop() {
+            if !visited.insert(grantor.clone()) {
+                continue;
+            }
+            let indices: Vec<usize> = self
+                .local
+                .role_membership_grantors
+                .iter()
+                .enumerate()
+                .filter_map(|(index, record)| (record.grantor == grantor).then_some(index))
+                .collect();
+            for index in indices {
+                let record = self.local.role_membership_grantors[index].clone();
+                // The member loses ADMIN for this parent role unless another
+                // record, untouched so far, still provides it.
+                if !self.membership_admin_from_other_record(
+                    &record.member,
+                    &record.role,
+                    Some(index),
+                ) {
+                    removals.push((
+                        record.member.clone(),
+                        record.role.clone(),
+                        record.grantor.clone(),
+                    ));
+                    if record.admin {
+                        pending.push(record.member.clone());
+                    }
+                }
+            }
+        }
+        if removals.is_empty() {
+            return;
+        }
+        self.snapshot_role_membership_grantors();
+        for (member, role_id, grantor) in removals {
+            self.snapshot_role(&member);
+            self.local.role_membership_grantors.retain(|record| {
+                record.member != member || record.role != role_id || record.grantor != grantor
+            });
+            self.reconcile_membership_projection(&member);
+        }
+    }
+
     pub(super) fn apply_grant(&mut self, grant: &GrantMutation) -> MutationResult {
         if let Err(result) = self.validate_grant_targets(&grant.target) {
             return result;
@@ -335,7 +390,9 @@ impl AnalysisState {
                             .to_string(),
                     };
                 }
-                let grantor = self.grantor_identity(grant.granted_by.as_ref());
+                // Role memberships attribute implicit superuser grants to
+                // the bootstrap superuser, unlike object privileges.
+                let grantor = self.role_membership_grantor(grant.granted_by.as_ref());
                 if let Some(grantor) = grantor.as_ref() {
                     if self.local.roles_known {
                         let can_administer = if grant.granted_by.is_some() {
@@ -448,45 +505,130 @@ impl AnalysisState {
                             .push(parent.clone());
                     }
                 }
+                let record_mode = grantor.is_some() && self.local.role_membership_grantors_complete;
+                let mut touched = HashSet::new();
                 if let Some(grantor) = grantor.as_ref() {
                     self.snapshot_role_membership_grantors();
                     for member in &grantees {
+                        touched.insert(member.clone());
                         for parent in parents {
-                            let already_member =
-                                self.local.roles.get(member).is_some_and(|overlay| {
-                                    matches!(overlay, RoleOverlay::Present(role) if role
-                                        .member_of
-                                        .contains(parent))
+                            if record_mode {
+                                // Record-based application: one row per
+                                // (member, role, grantor) triple, mirroring
+                                // AddRoleMems. Role vectors are rebuilt by
+                                // `reconcile_membership_projection` after the
+                                // record set is finalized, so the undo
+                                // snapshot taken in the touched loop is
+                                // unaffected by intermediate mutations.
+                                match self.membership_record_index(member, parent, grantor) {
+                                    Some(index) => {
+                                        let record =
+                                            &mut self.local.role_membership_grantors[index];
+                                        if let Some(admin) = explicit_admin {
+                                            record.admin = admin;
+                                        }
+                                        if let Some(inherit) = explicit_inherit
+                                            && self
+                                                .pg_version_num
+                                                .is_some_and(|version| version >= 160_000)
+                                        {
+                                            record.inherit = inherit;
+                                        }
+                                        if let Some(set) = explicit_set {
+                                            record.set = set;
+                                        }
+                                    }
+                                    None => {
+                                        let member_inherits = self
+                                            .local
+                                            .roles
+                                            .get(member)
+                                            .and_then(|overlay| match overlay {
+                                                RoleOverlay::Present(role) => Some(role.inherits),
+                                                RoleOverlay::Dropped => None,
+                                            })
+                                            .unwrap_or(true);
+                                        // A new tuple inherits the member
+                                        // role's INHERIT attribute by default;
+                                        // an existing tuple is only updated
+                                        // when an option was specified.
+                                        let default_inherit = if self
+                                            .pg_version_num
+                                            .is_some_and(|version| version >= 160_000)
+                                        {
+                                            member_inherits
+                                        } else {
+                                            // Pre-16: every edge is implicitly
+                                            // inheritable.
+                                            true
+                                        };
+                                        self.local.role_membership_grantors.push(
+                                            crate::_internal::model::role::RoleMembershipGrantor {
+                                                member: member.clone(),
+                                                role: parent.clone(),
+                                                grantor: grantor.clone(),
+                                                admin: explicit_admin.unwrap_or(false),
+                                                inherit: explicit_inherit
+                                                    .unwrap_or(default_inherit),
+                                                set: explicit_set.unwrap_or(true),
+                                            },
+                                        );
+                                    }
+                                }
+                            } else {
+                                // Legacy edge records without per-record
+                                // options.
+                                let already_member =
+                                    self.local.roles.get(member).is_some_and(|overlay| {
+                                        matches!(overlay, RoleOverlay::Present(role) if role
+                                            .member_of
+                                            .contains(parent))
+                                    });
+                                if already_member
+                                    && self.local.role_membership_grantors.iter().any(
+                                        |provenance| {
+                                            provenance.member == *member
+                                                && provenance.role == *parent
+                                        },
+                                    )
+                                {
+                                    continue;
+                                }
+                                self.local.role_membership_grantors.retain(|provenance| {
+                                    provenance.member != *member || provenance.role != *parent
                                 });
-                            if already_member
-                                && self
-                                    .local
-                                    .role_membership_grantors
-                                    .iter()
-                                    .any(|provenance| {
-                                        provenance.member == *member && provenance.role == *parent
-                                    })
-                            {
-                                continue;
+                                self.local.role_membership_grantors.push(
+                                    crate::_internal::model::role::RoleMembershipGrantor {
+                                        member: member.clone(),
+                                        role: parent.clone(),
+                                        grantor: grantor.clone(),
+                                        admin: explicit_admin.unwrap_or(false),
+                                        inherit: self
+                                            .pg_version_num
+                                            .is_some_and(|version| version < 160_000)
+                                            || explicit_inherit.unwrap_or(true),
+                                        set: explicit_set.unwrap_or(true),
+                                    },
+                                );
                             }
-                            self.local.role_membership_grantors.retain(|provenance| {
-                                provenance.member != *member || provenance.role != *parent
-                            });
-                            self.local.role_membership_grantors.push(
-                                crate::_internal::model::role::RoleMembershipGrantor {
-                                    member: member.clone(),
-                                    role: parent.clone(),
-                                    grantor: grantor.clone(),
-                                },
-                            );
                         }
                     }
                 } else {
                     self.snapshot_role_membership_grantors();
                     self.local.role_membership_grantors_complete = false;
+                    for member in &grantees {
+                        touched.insert(member.clone());
+                    }
                 }
-                for member in grantees {
+                for member in touched {
                     self.snapshot_role(&member);
+                    if record_mode {
+                        self.reconcile_membership_projection(&member);
+                        continue;
+                    }
+                    // Legacy edge mutation; kept distinct from the record-based
+                    // projection for catalog completeness that predates
+                    // per-grantor rows.
                     let Some(RoleOverlay::Present(role)) = self.local.roles.get_mut(&member) else {
                         continue;
                     };
@@ -709,7 +851,8 @@ impl AnalysisState {
                         EvidenceScope::Chain,
                     );
                 }
-                if let Some(grantor) = self.grantor_identity(revoke.granted_by.as_ref()) {
+                let resolved_grantor = self.role_membership_grantor(revoke.granted_by.as_ref());
+                if let Some(grantor) = resolved_grantor.as_ref() {
                     if self.local.roles_known {
                         let can_administer = if revoke.granted_by.is_some() {
                             self.present_role(&grantor.name)
@@ -722,7 +865,7 @@ impl AnalysisState {
                                 .then_some(true)
                         } else {
                             parents.iter().try_fold(true, |allowed, parent| {
-                                self.has_admin_privileges_on_role(&grantor, parent)
+                                self.has_admin_privileges_on_role(grantor, parent)
                                     .map(|has_admin| allowed && has_admin)
                             })
                         };
@@ -783,69 +926,161 @@ impl AnalysisState {
                     return MutationResult::Skipped;
                 }
                 let mut cascade_grantors = Vec::new();
-                if revoke.cascade
-                    && (revoke_option.is_none()
-                        || matches!(revoke_option, Some(RoleMembershipOptionFact::Admin(false))))
-                {
-                    cascade_grantors.extend(revokees.iter().cloned());
-                }
-                if !revokees.is_empty()
-                    && (revoke.cascade || revoke_option.is_none())
-                    && self
-                        .local
-                        .role_membership_grantors
-                        .iter()
-                        .any(|provenance| {
-                            revokees.contains(&provenance.member)
-                                && parents.contains(&provenance.role)
+                let record_mode =
+                    resolved_grantor.is_some() && self.local.role_membership_grantors_complete;
+                if record_mode {
+                    let grantor = resolved_grantor
+                        .as_ref()
+                        .expect("record mode requires a grantor");
+                    // Harvest the provenance set once, before the first record
+                    // is mutated, when any record will actually be touched.
+                    let any_match = revokees.iter().any(|member| {
+                        parents.iter().any(|parent| {
+                            self.membership_record_index(member, parent, grantor)
+                                .is_some()
                         })
-                {
-                    self.snapshot_role_membership_grantors();
-                }
-                for member in revokees {
-                    self.snapshot_role(&member);
-                    let Some(RoleOverlay::Present(role)) = self.local.roles.get_mut(&member) else {
-                        continue;
-                    };
-                    for parent in parents {
-                        match revoke_option {
-                            Some(RoleMembershipOptionFact::Admin(false)) => {
-                                role.can_administer_membership
-                                    .retain(|target| target != parent);
-                            }
-                            Some(RoleMembershipOptionFact::Inherit(false)) => {
-                                role.can_inherit_from.retain(|target| target != parent);
-                            }
-                            Some(RoleMembershipOptionFact::Set(false)) => {
-                                role.can_set_role_to.retain(|target| target != parent);
-                            }
-                            None => {
-                                role.can_administer_membership
-                                    .retain(|target| target != parent);
-                                role.can_inherit_from.retain(|target| target != parent);
-                                role.can_set_role_to.retain(|target| target != parent);
-                                role.member_of.retain(|target| target != parent);
-                                if revoke.cascade {
-                                    cascade_grantors.push(member.clone());
+                    });
+                    if any_match {
+                        self.snapshot_role_membership_grantors();
+                    }
+                    let mut cascade_members = Vec::new();
+                    for member in revokees {
+                        for parent in parents {
+                            let Some(index) =
+                                self.membership_record_index(&member, parent, grantor)
+                            else {
+                                // PostgreSQL warns that the grant does not
+                                // exist and leaves state untouched.
+                                continue;
+                            };
+                            match revoke_option {
+                                Some(RoleMembershipOptionFact::Admin(false)) => {
+                                    let had_admin =
+                                        self.local.role_membership_grantors[index].admin;
+                                    // PostgreSQL ignores an admin-option
+                                    // revoke on a record without admin.
+                                    if !had_admin {
+                                        continue;
+                                    }
+                                    let still_admin = self.membership_admin_from_other_record(
+                                        &member,
+                                        parent,
+                                        Some(index),
+                                    );
+                                    let record = &mut self.local.role_membership_grantors[index];
+                                    record.admin = false;
+                                    self.snapshot_role(&member);
+                                    self.reconcile_membership_projection(&member);
+                                    if revoke.cascade && !still_admin {
+                                        cascade_members.push(member.clone());
+                                    }
                                 }
+                                Some(RoleMembershipOptionFact::Inherit(false)) => {
+                                    let record = &mut self.local.role_membership_grantors[index];
+                                    record.inherit = false;
+                                    self.snapshot_role(&member);
+                                    self.reconcile_membership_projection(&member);
+                                }
+                                Some(RoleMembershipOptionFact::Set(false)) => {
+                                    let record = &mut self.local.role_membership_grantors[index];
+                                    record.set = false;
+                                    self.snapshot_role(&member);
+                                    self.reconcile_membership_projection(&member);
+                                }
+                                None => {
+                                    let record = self.local.role_membership_grantors[index].clone();
+                                    let had_admin = record.admin;
+                                    let still_admin = self.membership_admin_from_other_record(
+                                        &member,
+                                        parent,
+                                        Some(index),
+                                    );
+                                    self.local.role_membership_grantors.remove(index);
+                                    self.snapshot_role(&member);
+                                    self.reconcile_membership_projection(&member);
+                                    if had_admin && !still_admin {
+                                        cascade_members.push(member.clone());
+                                    }
+                                }
+                                Some(_) => unreachable!(),
                             }
-                            Some(_) => unreachable!(),
-                        }
-                        if revoke_option.is_some()
-                            && matches!(revoke_option, Some(RoleMembershipOptionFact::Admin(false)))
-                            && revoke.cascade
-                        {
-                            cascade_grantors.push(member.clone());
-                        }
-                        if revoke_option.is_none() {
-                            self.local.role_membership_grantors.retain(|provenance| {
-                                provenance.member != member || provenance.role != *parent
-                            });
                         }
                     }
-                }
-                if revoke.cascade && !cascade_grantors.is_empty() {
-                    self.cascade_role_memberships(&cascade_grantors);
+                    if revoke.cascade && !cascade_members.is_empty() {
+                        self.cascade_memberships_granted_by(&cascade_members);
+                    }
+                } else {
+                    if revoke.cascade
+                        && (revoke_option.is_none()
+                            || matches!(
+                                revoke_option,
+                                Some(RoleMembershipOptionFact::Admin(false))
+                            ))
+                    {
+                        cascade_grantors.extend(revokees.iter().cloned());
+                    }
+                    if !revokees.is_empty()
+                        && (revoke.cascade || revoke_option.is_none())
+                        && self
+                            .local
+                            .role_membership_grantors
+                            .iter()
+                            .any(|provenance| {
+                                revokees.contains(&provenance.member)
+                                    && parents.contains(&provenance.role)
+                            })
+                    {
+                        self.snapshot_role_membership_grantors();
+                    }
+                    for member in revokees {
+                        self.snapshot_role(&member);
+                        let Some(RoleOverlay::Present(role)) = self.local.roles.get_mut(&member)
+                        else {
+                            continue;
+                        };
+                        for parent in parents {
+                            match revoke_option {
+                                Some(RoleMembershipOptionFact::Admin(false)) => {
+                                    role.can_administer_membership
+                                        .retain(|target| target != parent);
+                                }
+                                Some(RoleMembershipOptionFact::Inherit(false)) => {
+                                    role.can_inherit_from.retain(|target| target != parent);
+                                }
+                                Some(RoleMembershipOptionFact::Set(false)) => {
+                                    role.can_set_role_to.retain(|target| target != parent);
+                                }
+                                None => {
+                                    role.can_administer_membership
+                                        .retain(|target| target != parent);
+                                    role.can_inherit_from.retain(|target| target != parent);
+                                    role.can_set_role_to.retain(|target| target != parent);
+                                    role.member_of.retain(|target| target != parent);
+                                    if revoke.cascade {
+                                        cascade_grantors.push(member.clone());
+                                    }
+                                }
+                                Some(_) => unreachable!(),
+                            }
+                            if revoke_option.is_some()
+                                && matches!(
+                                    revoke_option,
+                                    Some(RoleMembershipOptionFact::Admin(false))
+                                )
+                                && revoke.cascade
+                            {
+                                cascade_grantors.push(member.clone());
+                            }
+                            if revoke_option.is_none() {
+                                self.local.role_membership_grantors.retain(|provenance| {
+                                    provenance.member != member || provenance.role != *parent
+                                });
+                            }
+                        }
+                    }
+                    if revoke.cascade && !cascade_grantors.is_empty() {
+                        self.cascade_role_memberships(&cascade_grantors);
+                    }
                 }
             }
         }

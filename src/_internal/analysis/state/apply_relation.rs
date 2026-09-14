@@ -17,6 +17,88 @@ use std::collections::HashSet;
 type RelationLookup = ObjectLookup;
 
 impl AnalysisState {
+    fn inherited_descendants(&self, root: &ObjectId) -> Vec<ObjectId> {
+        let mut pending = vec![root.clone()];
+        let mut visited = HashSet::from([root.clone()]);
+        let mut descendants = Vec::new();
+        while let Some(parent) = pending.pop() {
+            for edge in self.local.graph.edges() {
+                if edge.referenced != parent
+                    || !matches!(
+                        edge.kind,
+                        DependencyKind::InheritanceOf | DependencyKind::PartitionOf
+                    )
+                    || !visited.insert(edge.dependent.clone())
+                {
+                    continue;
+                }
+                pending.push(edge.dependent.clone());
+                descendants.push(edge.dependent.clone());
+            }
+        }
+        descendants
+    }
+
+    fn rename_relation_column_metadata(&mut self, table: &ObjectId, from: &str, to: &str) {
+        self.snapshot_relation(table);
+        if let Some(RelationOverlay::Present(relation)) = self.local.relations.get_mut(table) {
+            relation.apply_column_action(&ColumnAction::Rename {
+                from: from.to_string(),
+                to: to.to_string(),
+            });
+        }
+        let constraints = self
+            .local
+            .constraints
+            .iter()
+            .filter(|((owner, _), constraint)| {
+                owner == table && constraint.kind == ConstraintKind::Check
+            })
+            .filter_map(|((_, name), constraint)| {
+                constraint
+                    .definition
+                    .as_deref()
+                    .map(|source| (name.clone(), source.to_string()))
+            })
+            .collect::<Vec<_>>();
+        for (name, source) in constraints {
+            self.snapshot_constraint(table, &name);
+            if let Some(constraint) = self.local.constraints.get_mut(&(table.clone(), name)) {
+                constraint.definition =
+                    crate::_internal::analysis::expr_visitor::ExprVisitor::rename_column_source(
+                        &source,
+                        &table.name,
+                        from,
+                        to,
+                    );
+            }
+        }
+        self.snapshot_graph_full();
+        self.local.graph.rename_column_dependencies(table, from, to);
+        self.local.graph.rename_index_column(table, from, to);
+        let sequences = self
+            .local
+            .graph
+            .edges()
+            .iter()
+            .filter(|edge| {
+                matches!(&edge.kind, DependencyKind::SequenceOwnedBy { column } if column == from)
+            })
+            .map(|edge| (edge.dependent.clone(), edge.referenced == *table))
+            .filter_map(|(sequence, owned)| owned.then_some(sequence))
+            .collect::<Vec<_>>();
+        for sequence in sequences {
+            self.snapshot_sequence(&sequence);
+            if let Some(SequenceOverlay::Present(state)) = self.local.sequences.get_mut(&sequence)
+                && let Some((_, column)) = &mut state.owned_by
+            {
+                *column = to.to_string();
+            }
+            self.local
+                .graph
+                .rename_owned_sequence_column(&sequence, from, to);
+        }
+    }
     fn partition_attachment_is_compatible(
         &self,
         parent_id: &ObjectId,
@@ -2657,6 +2739,31 @@ impl AnalysisState {
             }
         }
 
+        for column in &rel_state.columns {
+            let parent_count = create
+                .inherits
+                .iter()
+                .chain(create.partition_of.iter())
+                .filter(|parent| {
+                    matches!(self.local.relations.get(*parent),
+                    Some(RelationOverlay::Present(relation)) if relation.has_column(&column.name))
+                })
+                .count() as u32;
+            let is_local = create.partition_of.is_none()
+                && (parent_count == 0
+                    || create
+                        .columns
+                        .iter()
+                        .any(|declared| declared.name == column.name));
+            rel_state.column_inheritance.insert(
+                column.name.clone(),
+                crate::_internal::model::relation::ColumnInheritance {
+                    parent_count,
+                    is_local,
+                },
+            );
+        }
+
         for (sequence_id, column_name, _, _) in &implicit_sequences {
             if let Some(column) = rel_state
                 .columns
@@ -3130,21 +3237,101 @@ impl AnalysisState {
     }
 
     pub(super) fn apply_alter_table(&mut self, alter: &AlterTable) -> MutationResult {
-        let concurrent_hash_detach = matches!(
-            alter.action,
-            AlterTableActionMutation::DetachPartition {
-                mode: crate::_internal::analysis::facts::DetachPartitionMode::Concurrently,
-                ..
-            }
-        ) && matches!(self.local.relations.get(&alter.id), Some(RelationOverlay::Present(parent)) if parent.partition_type.as_deref() == Some("HASH"));
-        if matches!(
-            alter.action,
-            AlterTableActionMutation::DetachPartition {
-                mode: crate::_internal::analysis::facts::DetachPartitionMode::Concurrently,
-                ..
-            }
-        ) && self.in_transaction()
+        let recursive_rename_descendants = if !alter.only
+            && matches!(alter.action, AlterTableActionMutation::RenameColumn { .. })
         {
+            self.inherited_descendants(&alter.id)
+        } else {
+            Vec::new()
+        };
+        if let AlterTableActionMutation::RenameColumn { from, to } = &alter.action {
+            for descendant in &recursive_rename_descendants {
+                let Some(RelationOverlay::Present(relation)) = self.local.relations.get(descendant)
+                else {
+                    self.taint(
+                        EvidenceCode::CatalogCoverageIncomplete,
+                        EvidenceScope::Chain,
+                    );
+                    return MutationResult::Skipped;
+                };
+                if relation.has_column(to) {
+                    return MutationResult::Conflict {
+                        reason: format!(
+                            "column '{}' already exists on relation '{}'",
+                            to, descendant
+                        ),
+                    };
+                }
+                if relation.generated_columns.values().any(|generated| {
+                    generated.expression.as_deref().is_none_or(|source| {
+                        crate::_internal::analysis::expr_visitor::ExprVisitor::rename_column_source(
+                            source,
+                            &descendant.name,
+                            from,
+                            to,
+                        )
+                        .is_none()
+                    })
+                }) {
+                    self.taint(
+                        EvidenceCode::CatalogCoverageIncomplete,
+                        EvidenceScope::Chain,
+                    );
+                    return MutationResult::Skipped;
+                }
+                let Some(provenance) = relation.column_inheritance.get(from) else {
+                    self.taint(
+                        EvidenceCode::CatalogCoverageIncomplete,
+                        EvidenceScope::Chain,
+                    );
+                    return MutationResult::Skipped;
+                };
+                let expected_parents = self
+                    .local
+                    .graph
+                    .edges()
+                    .iter()
+                    .filter(|edge| {
+                        edge.dependent == *descendant
+                            && matches!(
+                                edge.kind,
+                                DependencyKind::InheritanceOf | DependencyKind::PartitionOf
+                            )
+                            && (edge.referenced == alter.id
+                                || recursive_rename_descendants.contains(&edge.referenced))
+                    })
+                    .count() as u32;
+                if provenance.parent_count > expected_parents {
+                    return MutationResult::Conflict {
+                        reason: format!("cannot rename inherited column '{}'", from),
+                    };
+                }
+            }
+        }
+        if alter.only
+            && matches!(alter.action, AlterTableActionMutation::RenameColumn { .. })
+            && self.local.graph.edges().iter().any(|edge| {
+                matches!(
+                    edge.kind,
+                    DependencyKind::InheritanceOf
+                        | DependencyKind::PartitionOf
+                        | DependencyKind::PartitionDetachPending
+                ) && self.local.graph.resolve_rename(&edge.referenced)
+                    == self.local.graph.resolve_rename(&alter.id)
+            })
+        {
+            return MutationResult::Conflict {
+                reason: "inherited columns must be renamed in child tables too".into(),
+            };
+        }
+        let concurrent_detach = matches!(
+            alter.action,
+            AlterTableActionMutation::DetachPartition {
+                mode: crate::_internal::analysis::facts::DetachPartitionMode::Concurrently,
+                ..
+            }
+        );
+        if concurrent_detach && self.in_transaction() {
             return MutationResult::Conflict {
                 reason: "DETACH PARTITION CONCURRENTLY cannot run inside a transaction".into(),
             };
@@ -3362,6 +3549,15 @@ impl AnalysisState {
                     ),
                 };
             }
+            AlterTableActionMutation::SetCompression {
+                method: Some(method),
+                ..
+            } if !method.eq_ignore_ascii_case("pglz") => {
+                // lz4 availability is a PostgreSQL build capability, not a
+                // catalog fact carried by V8. Do not claim an exact result.
+                self.taint(EvidenceCode::UnsupportedSemantics, EvidenceScope::Statement);
+                return MutationResult::Skipped;
+            }
             AlterTableActionMutation::SetGeneratedExpression { column, expr, .. } => {
                 if !relation.generated_columns.contains_key(column) {
                     return MutationResult::Conflict {
@@ -3519,13 +3715,16 @@ impl AnalysisState {
                 }
             }
             AlterTableActionMutation::AddCheckConstraint {
-                constraint_name, ..
+                constraint_name,
+                columns,
+                columns_complete,
+                ..
             } => {
                 let name = constraint_name.clone().unwrap_or_else(|| {
                     self.next_generated_constraint_name_avoiding(
                         &alter.id,
                         &alter.id.name,
-                        None,
+                        (*columns_complete && columns.len() == 1).then(|| columns[0].as_str()),
                         "check",
                         &HashSet::new(),
                     )
@@ -5294,7 +5493,7 @@ impl AnalysisState {
                         self.next_generated_constraint_name_avoiding(
                             &alter.id,
                             &alter.id.name,
-                            None,
+                            (*columns_complete && columns.len() == 1).then(|| columns[0].as_str()),
                             "check",
                             &HashSet::new(),
                         )
@@ -5598,14 +5797,21 @@ impl AnalysisState {
                                     && edge.dependent == *child
                                     && edge.referenced == alter.id)
                             });
-                            // PostgreSQL deliberately adds no CHECK for hash detach:
-                            // its partition predicate contains the parent table OID.
-                            if !concurrent_hash_detach {
-                                self.local.graph.add_edge(DependencyEdge::new(
-                                    child.clone(),
-                                    alter.id.clone(),
-                                    DependencyKind::PartitionDetachPending,
-                                ));
+                            // PostgreSQL retains a CHECK duplicating the
+                            // partition predicate on concurrent detach
+                            // (DetachAddConstraintIfNeeded). Reproduce its
+                            // exact deparse; otherwise stay conservative.
+                            match self.retained_check_for_detached_partition(&alter.id, child) {
+                                RetainedCheckSynthesis::NoCheck => {}
+                                RetainedCheckSynthesis::CantResolve => {
+                                    self.taint(
+                                        EvidenceCode::UnsupportedSemantics,
+                                        EvidenceScope::Chain,
+                                    );
+                                }
+                                RetainedCheckSynthesis::Definition(definition) => {
+                                    self.register_retained_partition_check(child, definition);
+                                }
                             }
                         }
                     }
@@ -5697,13 +5903,67 @@ impl AnalysisState {
             }
         }
         match &alter.action {
+            AlterTableActionMutation::InheritTable { parent }
+            | AlterTableActionMutation::NoInheritTable { parent } => {
+                let columns = match self.local.relations.get(parent) {
+                    Some(RelationOverlay::Present(parent)) => parent
+                        .columns
+                        .iter()
+                        .map(|column| column.name.clone())
+                        .collect::<Vec<_>>(),
+                    _ => Vec::new(),
+                };
+                let adding = matches!(alter.action, AlterTableActionMutation::InheritTable { .. });
+                let mut incomplete = false;
+                self.snapshot_relation(&alter.id);
+                if let Some(RelationOverlay::Present(relation)) =
+                    self.local.relations.get_mut(&alter.id)
+                {
+                    for column in columns {
+                        let Some(provenance) = relation.column_inheritance.get_mut(&column) else {
+                            incomplete = true;
+                            continue;
+                        };
+                        let count = if adding {
+                            provenance.parent_count.checked_add(1)
+                        } else {
+                            provenance.parent_count.checked_sub(1)
+                        };
+                        if let Some(count) = count {
+                            provenance.parent_count = count;
+                            if count == 0 {
+                                provenance.is_local = true;
+                            }
+                        } else {
+                            relation.column_inheritance.remove(&column);
+                            incomplete = true;
+                        }
+                    }
+                }
+                if incomplete {
+                    self.taint(
+                        EvidenceCode::CatalogCoverageIncomplete,
+                        EvidenceScope::Chain,
+                    );
+                }
+            }
             AlterTableActionMutation::AttachPartition { child, bound, .. } => {
+                self.invalidate_descendant_partition_predicates(child);
                 self.snapshot_relation(child);
                 if let Some(RelationOverlay::Present(relation)) =
                     self.local.relations.get_mut(child)
                 {
                     relation.partition_bound = bound.clone();
                     relation.partition_constraint = None;
+                    for column in &relation.columns {
+                        relation.column_inheritance.insert(
+                            column.name.clone(),
+                            crate::_internal::model::relation::ColumnInheritance {
+                                parent_count: 1,
+                                is_local: false,
+                            },
+                        );
+                    }
                 }
                 self.ensure_partition_indexes_and_constraints(&alter.id, child);
                 let result = self.clone_row_triggers_to_partition(&alter.id, child);
@@ -5712,18 +5972,25 @@ impl AnalysisState {
                     return result;
                 }
             }
-            AlterTableActionMutation::DetachPartition { child, mode }
-                if !matches!(
-                    mode,
-                    crate::_internal::analysis::facts::DetachPartitionMode::Concurrently
-                ) || concurrent_hash_detach =>
-            {
+            AlterTableActionMutation::DetachPartition { child, .. } => {
+                // The retained CHECK for a concurrent detach is synthesized in
+                // the apply arm; this block only resets partition metadata.
+                self.invalidate_descendant_partition_predicates(child);
                 self.snapshot_relation(child);
                 if let Some(RelationOverlay::Present(relation)) =
                     self.local.relations.get_mut(child)
                 {
                     relation.partition_bound = None;
                     relation.partition_constraint = None;
+                    for column in &relation.columns {
+                        relation.column_inheritance.insert(
+                            column.name.clone(),
+                            crate::_internal::model::relation::ColumnInheritance {
+                                parent_count: 0,
+                                is_local: true,
+                            },
+                        );
+                    }
                 }
                 self.remove_partition_trigger_clones(&alter.id, child);
             }
@@ -5808,10 +6075,10 @@ impl AnalysisState {
             _ => {}
         }
         if let AlterTableActionMutation::RenameColumn { from, to } = &alter.action {
-            self.snapshot_graph_full();
-            self.local
-                .graph
-                .rename_column_dependencies(&alter.id, from, to);
+            self.rename_relation_column_metadata(&alter.id, from, to);
+            for descendant in recursive_rename_descendants {
+                self.rename_relation_column_metadata(&descendant, from, to);
+            }
 
             // Publication column lists are catalog identities, not merely
             // display text. PostgreSQL follows a renamed column in an
@@ -6616,4 +6883,672 @@ impl AnalysisState {
             }
         }
     }
+
+    fn invalidate_descendant_partition_predicates(&mut self, root: &ObjectId) {
+        // Cached effective predicates include ancestors, not just the local bound.
+        for descendant in self.inherited_descendants(root) {
+            self.snapshot_relation(&descendant);
+            if let Some(RelationOverlay::Present(relation)) =
+                self.local.relations.get_mut(&descendant)
+            {
+                relation.partition_constraint = None;
+            }
+        }
+    }
+
+    // Effective predicates may reference ancestor columns as well as the immediate key.
+    fn register_retained_partition_check(&mut self, child: &ObjectId, definition: String) {
+        use squawk_syntax::ast::{AstNode, SourceFile, Target};
+        let parsed = SourceFile::parse(&format!("SELECT {definition}"));
+        let columns = if parsed.errors().is_empty() && parsed.tree().stmts().count() == 1 {
+            parsed
+                .tree()
+                .syntax()
+                .descendants()
+                .find_map(Target::cast)
+                .and_then(|target| target.expr())
+                .and_then(|expr| {
+                    crate::_internal::analysis::expr_visitor::ExprVisitor::convert(expr)
+                        .referenced_columns()
+                })
+        } else {
+            None
+        };
+        let Some(columns) = columns.filter(|columns| {
+            matches!(self.local.relations.get(child), Some(RelationOverlay::Present(relation))
+                if columns.iter().all(|column| relation.has_column(column)))
+        }) else {
+            self.taint(EvidenceCode::UnsupportedSemantics, EvidenceScope::Chain);
+            return;
+        };
+        let columns: Vec<String> = columns.into_iter().collect();
+        let name = self.next_generated_constraint_name_avoiding(
+            child,
+            &child.name,
+            (columns.len() == 1).then(|| columns[0].as_str()),
+            "check",
+            &HashSet::new(),
+        );
+        self.snapshot_constraint(child, &name);
+        self.local.constraints.insert(
+            (child.clone(), name.clone()),
+            ConstraintState {
+                table_id: child.clone(),
+                name: name.clone(),
+                kind: ConstraintKind::Check,
+                validated: true,
+                definition: Some(definition),
+                backing_index: None,
+            },
+        );
+        self.snapshot_graph();
+        self.local.graph.add_edge(DependencyEdge::new(
+            child.clone(),
+            child.clone(),
+            DependencyKind::ConstraintDependency {
+                constraint_name: name,
+                columns,
+            },
+        ));
+    }
+
+    fn retained_check_for_detached_partition(
+        &mut self,
+        parent: &ObjectId,
+        child: &ObjectId,
+    ) -> RetainedCheckSynthesis {
+        let Some(RelationOverlay::Present(relation)) = self.local.relations.get(child) else {
+            return RetainedCheckSynthesis::CantResolve;
+        };
+        let parent_strategy = match self.local.relations.get(parent) {
+            Some(RelationOverlay::Present(parent)) => parent.partition_type.as_deref(),
+            _ => None,
+        };
+        let Some(strategy) = parent_strategy else {
+            return RetainedCheckSynthesis::CantResolve;
+        };
+        if strategy.eq_ignore_ascii_case("HASH") {
+            return RetainedCheckSynthesis::NoCheck;
+        }
+        if let Some(predicate) = relation
+            .partition_constraint
+            .as_deref()
+            .filter(|predicate| !predicate.trim().is_empty())
+        {
+            if strategy.eq_ignore_ascii_case("RANGE") {
+                return RetainedCheckSynthesis::Definition(predicate.to_string());
+            }
+            return self
+                .fold_list_partition_predicate(predicate, child)
+                .map(RetainedCheckSynthesis::Definition)
+                .unwrap_or(RetainedCheckSynthesis::CantResolve);
+        }
+        let Some(bound) = relation.partition_bound.as_deref() else {
+            return RetainedCheckSynthesis::CantResolve;
+        };
+        if self.local.graph.edges().iter().any(|edge| {
+            edge.dependent == *parent
+                && matches!(
+                    edge.kind,
+                    DependencyKind::PartitionOf | DependencyKind::PartitionDetachPending
+                )
+        }) {
+            // A local bound alone cannot reconstruct the ancestor's effective predicate.
+            return RetainedCheckSynthesis::CantResolve;
+        }
+        let Some(keys) = self.partition_key_columns(parent) else {
+            return RetainedCheckSynthesis::CantResolve;
+        };
+        self.synthesize_partition_check(strategy, bound, &keys, relation)
+            .map(RetainedCheckSynthesis::Definition)
+            .unwrap_or(RetainedCheckSynthesis::CantResolve)
+    }
+
+    /// Split a `PARTITION BY <strategy> (c1, c2, ...)` key into column names.
+    /// Plain identifiers and quoted identifiers are accepted; expressions and
+    /// opclass/collation annotations return `None`, because PostgreSQL then
+    /// deparses the retained predicate in terms of the expression, not a
+    /// column.
+    fn partition_key_columns(&self, parent: &ObjectId) -> Option<Vec<(String, String)>> {
+        use squawk_syntax::ast::{AstNode, Expr, PartitionBy, SourceFile};
+        let Some(RelationOverlay::Present(parent)) = self.local.relations.get(parent) else {
+            return None;
+        };
+        let partition_by = parent.partition_by.as_deref()?;
+        let parsed = SourceFile::parse(&format!("CREATE TABLE __key () {partition_by}"));
+        if !parsed.errors().is_empty() || parsed.tree().stmts().count() != 1 {
+            return None;
+        }
+        let partition = parsed
+            .tree()
+            .syntax()
+            .descendants()
+            .find_map(PartitionBy::cast)?;
+        let mut columns = Vec::new();
+        for item in partition.partition_item_list()?.partition_items() {
+            if item.collate().is_some()
+                || item.op_class_ref().is_some()
+                || item.attribute_list().is_some()
+                || item.nulls_order().is_some()
+            {
+                return None;
+            }
+            let Expr::NameRef(name) = item.expr()? else {
+                return None;
+            };
+            columns.push((name.text().to_string(), name.syntax().text().to_string()));
+        }
+        if columns.is_empty() {
+            None
+        } else {
+            Some(columns)
+        }
+    }
+
+    /// Fold PostgreSQL's `eval_const_expressions` normalizations of a LIST
+    /// partition predicate into their retained-CHECK forms:
+    /// `= ANY (ARRAY[...])` becomes an array constant and a single
+    /// `= true`/`= false` becomes the bare column / `NOT <column>`.
+    /// Single-datum non-boolean predicates are already in final form and are
+    /// passed through unchanged.
+    fn fold_list_partition_predicate(&self, predicate: &str, child: &ObjectId) -> Option<String> {
+        const ANY_MARKER: &str = "ANY (ARRAY[";
+        if let Some(marker) = predicate.find(ANY_MARKER) {
+            let elements_start = marker + ANY_MARKER.len();
+            let rest = &predicate[elements_start..];
+            let mut chars = rest.char_indices().peekable();
+            let mut close = None;
+            while let Some((index, ch)) = chars.next() {
+                match ch {
+                    '\'' => {
+                        while let Some((_, quoted)) = chars.next() {
+                            if quoted == '\'' {
+                                match chars.peek() {
+                                    Some((_, '\'')) => {
+                                        chars.next();
+                                    }
+                                    _ => break,
+                                }
+                            }
+                        }
+                    }
+                    ']' => {
+                        close = Some(index);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            let close = close?;
+            let elements_txt = &rest[..close];
+            let elements = split_top_level(elements_txt, ',');
+            let column_type = self
+                .local
+                .relations
+                .get(child)
+                .and_then(|overlay| match overlay {
+                    RelationOverlay::Present(relation) => Some(relation),
+                    _ => None,
+                })
+                .and_then(|relation| {
+                    predicate_column_name(predicate).and_then(|column| {
+                        relation
+                            .columns
+                            .iter()
+                            .find(|candidate| candidate.name == column)
+                            .and_then(|candidate| candidate.data_type.as_deref())
+                    })
+                })?;
+            let array_type = array_element_type(&elements, column_type)?;
+            let mut values = Vec::new();
+            for element in elements {
+                values.push(decode_sql_literal(element)?);
+            }
+            let mapped = elements_for_array(&values, &array_type)?;
+            let array_text = serialize_array_literal(&mapped);
+            let suffix = &rest[close + 1..];
+            return Some(format!(
+                "{}ANY ('{array_text}'::{}[]{suffix}",
+                &predicate[..marker],
+                array_type
+            ));
+        }
+        fold_boolean_equality(predicate)
+    }
+
+    /// Synthesize the retained CHECK from a `FOR VALUES ...` bound for a
+    /// single-column RANGE/LIST partition.
+    fn synthesize_partition_check(
+        &self,
+        strategy: &str,
+        bound: &str,
+        keys: &[(String, String)],
+        relation: &RelationState,
+    ) -> Option<String> {
+        if keys.len() != 1 {
+            return None;
+        }
+        let (key_name, key) = &keys[0];
+        let column_type = relation
+            .columns
+            .iter()
+            .find(|column| &column.name == key_name)
+            .and_then(|column| column.data_type.as_deref())?;
+        let comparison_left = if column_type.starts_with("character varying") {
+            format!("({key})::text")
+        } else {
+            key.clone()
+        };
+        if strategy.eq_ignore_ascii_case("RANGE") {
+            let lower = extract_paren_group(bound, "FROM (")?;
+            let upper = extract_paren_group(bound, "TO (")?;
+            let lower_datums = split_top_level(&lower, ',');
+            let upper_datums = split_top_level(&upper, ',');
+            if lower_datums.len() != upper_datums.len() || lower_datums.len() != keys.len() {
+                return None;
+            }
+            let lower = lower_datums[0].trim();
+            let upper = upper_datums[0].trim();
+            let mut clauses = vec![format!("({key} IS NOT NULL)")];
+            if !lower.eq_ignore_ascii_case("MINVALUE") {
+                let literal = deparse_partition_literal(column_type, lower)?;
+                clauses.push(format!("({comparison_left} >= {literal})"));
+            }
+            if !upper.eq_ignore_ascii_case("MAXVALUE") {
+                let literal = deparse_partition_literal(column_type, upper)?;
+                clauses.push(format!("({comparison_left} < {literal})"));
+            }
+            Some(format!("({})", clauses.join(" AND ")))
+        } else if strategy.eq_ignore_ascii_case("LIST") {
+            let inner = extract_paren_group(bound, "IN (")?;
+            let datums = split_top_level(&inner, ',');
+            match datums.as_slice() {
+                [single] => {
+                    let literal = deparse_partition_literal(column_type, single.trim())?;
+                    if column_type == "boolean" {
+                        let narrow = if literal == "true" {
+                            key.clone()
+                        } else if literal == "false" {
+                            format!("(NOT {key})")
+                        } else {
+                            return None;
+                        };
+                        return Some(format!("(({key} IS NOT NULL) AND {narrow})"));
+                    }
+                    Some(format!(
+                        "(({key} IS NOT NULL) AND ({comparison_left} = {literal}))"
+                    ))
+                }
+                [] => None,
+                _ => {
+                    let mut values = Vec::new();
+                    for datum in datums {
+                        values.push(decode_sql_literal(datum.trim())?);
+                    }
+                    let mapped = elements_for_array(&values, column_type)?;
+                    let array_text = serialize_array_literal(&mapped);
+                    Some(format!(
+                        "(({key} IS NOT NULL) AND ({comparison_left} = ANY ('{array_text}'::{column_type}[])))"
+                    ))
+                }
+            }
+        } else {
+            None
+        }
+    }
+}
+
+/// Whether PostgreSQL retains a CHECK constraint on `DETACH PARTITION
+/// CONCURRENTLY` and whether the local model can reproduce its exact text.
+#[derive(Debug)]
+enum RetainedCheckSynthesis {
+    /// HASH partitions never gain a retained constraint.
+    NoCheck,
+    /// Exact `pg_get_expr(conbin)` text of the retained CHECK.
+    Definition(String),
+    /// The predicate is not representable exactly; callers keep the
+    /// conservative `UnsupportedSemantics` taint.
+    CantResolve,
+}
+
+/// Split `input` on `separator` at the top nesting level of `()`, `[]`, `{}`
+/// and single-quoted SQL string literals (with doubled-quote handling).
+fn split_top_level(input: &str, separator: char) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut depth: i32 = 0;
+    let mut chars = input.char_indices().peekable();
+    while let Some((index, ch)) = chars.next() {
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            '\'' => {
+                while let Some((_, quoted)) = chars.next() {
+                    if quoted == '\'' {
+                        match chars.peek() {
+                            Some((_, '\'')) => {
+                                chars.next();
+                            }
+                            _ => break,
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        if ch == separator && depth <= 0 {
+            parts.push(&input[start..index]);
+            start = index + ch.len_utf8();
+        }
+    }
+    parts.push(&input[start..]);
+    parts
+}
+
+/// Return the SQL string value of a bound/constraint literal token, unwrapping
+/// a leading `'...'` (doubled quotes) and any `::type` suffix. Bare tokens
+/// (numbers, booleans, identifiers) pass through unchanged.
+fn decode_sql_literal(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let raw = raw.split("::").next().unwrap_or(raw).trim();
+    if let Some(inner) = raw.strip_prefix('\'') {
+        let mut value = String::new();
+        let mut chars = inner.char_indices().peekable();
+        while let Some((_, ch)) = chars.next() {
+            if ch == '\'' {
+                match chars.peek() {
+                    Some((_, '\'')) => {
+                        chars.next();
+                        value.push('\'');
+                    }
+                    _ => return Some(value),
+                }
+            } else {
+                value.push(ch);
+            }
+        }
+        None
+    } else if !raw.chars().any(|ch| matches!(ch, '(' | ')' | '\'')) {
+        Some(raw.to_string())
+    } else {
+        None
+    }
+}
+
+/// Extract the balanced parenthesized content following `needle` (which must
+/// end with `(`), returning the group's inner text.
+fn extract_paren_group(input: &str, needle: &str) -> Option<String> {
+    let lowercase = input.to_ascii_lowercase();
+    let needle_lower = needle.to_ascii_lowercase();
+    let start = lowercase.find(&needle_lower)?;
+    // `needle` ends with `(`, so the group content begins right after it.
+    let content = &input[start + needle.len()..];
+    let mut depth = 0i32;
+    let mut chars = content.char_indices().peekable();
+    while let Some((index, ch)) = chars.next() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                if depth == 0 {
+                    return Some(content[..index].to_string());
+                }
+                depth -= 1;
+            }
+            '\'' => {
+                while let Some((_, quoted)) = chars.next() {
+                    if quoted == '\'' {
+                        match chars.peek() {
+                            Some((_, '\'')) => {
+                                chars.next();
+                            }
+                            _ => break,
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Choose the array element type for a folded `ARRAY[...]` constant. When
+/// elements carry homogeneous `::type` casts that cast is used; otherwise the
+/// key column type applies. Mixed casts conservatively fail (`None`).
+fn array_element_type(elements: &[&str], fallback: &str) -> Option<String> {
+    let first_cast = elements
+        .first()?
+        .split("::")
+        .nth(1)
+        .map(str::trim)
+        .map(str::to_owned);
+    for element in elements.iter().skip(1) {
+        let cast = element.split("::").nth(1).map(str::trim).map(str::to_owned);
+        if cast != first_cast {
+            return None;
+        }
+    }
+    Some(first_cast.unwrap_or_else(|| fallback.to_string()))
+}
+
+/// Render partition-list values in the array-constant element syntax for the
+/// key column type (`t`/`f` for booleans, otherwise the element text as-is).
+fn elements_for_array(values: &[String], column_type: &str) -> Option<Vec<String>> {
+    match column_type {
+        "boolean" => values
+            .iter()
+            .map(|value| {
+                if value.eq_ignore_ascii_case("true") {
+                    Some("t".to_string())
+                } else if value.eq_ignore_ascii_case("false") {
+                    Some("f".to_string())
+                } else {
+                    None
+                }
+            })
+            .collect(),
+        "integer" | "smallint" | "bigint" | "numeric" | "text" | "name" | "citext" => {
+            Some(values.to_vec())
+        }
+        type_name
+            if type_name.starts_with("character varying")
+                || type_name.starts_with("character(")
+                || type_name.starts_with("bpchar") =>
+        {
+            Some(values.to_vec())
+        }
+        _ => None,
+    }
+}
+
+/// Serialize array element values into the `{...}` array-literal text with
+/// PostgreSQL's element quoting (double quotes around elements containing
+/// specials, `"` and `\` backslash-escaped) and single-quote doubling for the
+/// enclosing string literal.
+fn serialize_array_literal(values: &[String]) -> String {
+    let inner = values
+        .iter()
+        .map(|value| {
+            let special = value.is_empty()
+                || value.contains([',', '"', '\\', '{', '}'])
+                || value.starts_with(' ')
+                || value.ends_with(' ')
+                || value.starts_with('\n')
+                || value.ends_with('\n');
+            let token = if special {
+                let mut quoted = String::from("\"");
+                for ch in value.chars() {
+                    if ch == '"' || ch == '\\' {
+                        quoted.push('\\');
+                    }
+                    quoted.push(ch);
+                }
+                quoted.push('"');
+                quoted
+            } else {
+                value.to_string()
+            };
+            token.replace('\'', "''")
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{{inner}}}")
+}
+
+/// Fold a single-datum boolean LIST predicate (`X = true` -> `X`,
+/// `X = false` -> `NOT X`). Non-boolean single-datum predicates are already in
+/// final form and are returned unchanged.
+fn fold_boolean_equality(predicate: &str) -> Option<String> {
+    let equality = predicate
+        .find("= true")
+        .map(|position| (position, "= true", true))
+        .or_else(|| {
+            predicate
+                .find("= false")
+                .map(|position| (position, "= false", false))
+        });
+    let Some((position, needle, is_true)) = equality else {
+        return Some(predicate.to_string());
+    };
+    let open = predicate[..position].rfind('(')?;
+    let variable = predicate[open + 1..position].trim();
+    if variable.is_empty() || !variable.chars().all(|ch| ch.is_alphanumeric() || ch == '_') {
+        return None;
+    }
+    let after = &predicate[position + needle.len()..];
+    let close = after.find(')')?;
+    let replacement = if is_true {
+        variable.to_string()
+    } else {
+        format!("(NOT {variable})")
+    };
+    Some(format!(
+        "{}{}{}",
+        &predicate[..open],
+        replacement,
+        &after[close + 1..]
+    ))
+}
+
+/// Extract the column variable referenced by an `= ANY (...)`/`= true` clause
+/// from a fully-deparsed predicate (`((col IS NOT NULL) AND (col = ...))`).
+fn predicate_column_name(predicate: &str) -> Option<String> {
+    let start = predicate.find(" IS NOT NULL)")?;
+    let open = predicate[..start].rfind('(')?;
+    let name = predicate[open + 1..start].trim();
+    if name.is_empty() || !name.chars().all(|ch| ch.is_alphanumeric() || ch == '_') {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+/// Deparse a single bound literal exactly as `get_const_expr`/`ruleutils`
+/// would for the column's data type: booleans bare, INT4 bare when
+/// non-negative and quoted otherwise, smallint/bigint/real/double always
+/// quoted, numeric quoted unless it looks like a float literal, and
+/// text-like/uuid/ISO-date values quoted with a `::type` cast.
+fn deparse_partition_literal(data_type: &str, raw: &str) -> Option<String> {
+    let decoded = decode_sql_literal(raw)?;
+    match data_type {
+        "boolean" => {
+            if decoded.eq_ignore_ascii_case("true") {
+                Some("true".to_string())
+            } else if decoded.eq_ignore_ascii_case("false") {
+                Some("false".to_string())
+            } else {
+                None
+            }
+        }
+        "integer" => {
+            let value: i64 = decoded.parse().ok()?;
+            if (i32::MIN as i64..=i32::MAX as i64).contains(&value) {
+                if value >= 0 {
+                    Some(value.to_string())
+                } else {
+                    Some(format!("'{}'::integer", value))
+                }
+            } else {
+                None
+            }
+        }
+        "smallint" => {
+            let value: i16 = decoded.parse().ok()?;
+            Some(format!("'{}'::smallint", value))
+        }
+        "bigint" => {
+            let value: i64 = decoded.parse().ok()?;
+            Some(format!("'{}'::bigint", value))
+        }
+        "numeric" => {
+            if numeric_float_like(&decoded) {
+                Some(decoded)
+            } else {
+                Some(format!("'{}'::numeric", decoded))
+            }
+        }
+        "real" | "double precision" => {
+            if numeric_float_like(&decoded) {
+                Some(format!("'{}'::{}", decoded, data_type))
+            } else {
+                None
+            }
+        }
+        "date" => {
+            if decoded.len() == 10
+                && decoded.as_bytes()[4] == b'-'
+                && decoded.as_bytes()[7] == b'-'
+                && decoded
+                    .chars()
+                    .enumerate()
+                    .all(|(index, ch)| (index == 4 || index == 7) || ch.is_ascii_digit())
+            {
+                Some(format!("'{}'::date", decoded))
+            } else {
+                None
+            }
+        }
+        "uuid" => {
+            if decoded.len() == 36
+                && decoded.as_bytes()[8] == b'-'
+                && decoded.as_bytes()[13] == b'-'
+                && decoded.as_bytes()[18] == b'-'
+                && decoded.as_bytes()[23] == b'-'
+                && decoded
+                    .chars()
+                    .all(|ch| ch.is_ascii_hexdigit() || ch == '-')
+            {
+                Some(format!("'{}'::uuid", decoded))
+            } else {
+                None
+            }
+        }
+        type_name
+            if type_name == "text"
+                || type_name == "name"
+                || type_name == "citext"
+                || type_name.starts_with("character varying")
+                || type_name.starts_with("character(")
+                || type_name.starts_with("bpchar") =>
+        {
+            Some(format!("'{}'::{}", decoded.replace('\'', "''"), data_type))
+        }
+        _ => None,
+    }
+}
+
+/// `get_const_expr` prints a NUMERIC constant bare when it looks like a float
+/// literal (starts with a digit and contains `.`, `e`, or `E`).
+fn numeric_float_like(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    first.is_ascii_digit()
+        && value[first.len_utf8()..]
+            .chars()
+            .any(|ch| matches!(ch, '.' | 'e' | 'E'))
 }

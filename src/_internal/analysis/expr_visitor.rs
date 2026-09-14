@@ -4,26 +4,63 @@ use squawk_syntax::ast::{AstNode, Expr};
 pub(crate) struct ExprVisitor;
 
 impl ExprVisitor {
+    pub(crate) fn rename_partition_key_source(
+        source: &str,
+        table: &str,
+        from: &str,
+        to: &str,
+    ) -> Option<String> {
+        use squawk_syntax::ast::{PartitionBy, SourceFile};
+        let prefix = "CREATE TABLE __partition_key () ";
+        let parsed = SourceFile::parse(&format!("{prefix}{source}"));
+        if !parsed.errors().is_empty() || parsed.tree().stmts().count() != 1 {
+            return None;
+        }
+        let partition = parsed
+            .tree()
+            .syntax()
+            .descendants()
+            .find_map(PartitionBy::cast)?;
+        let mut replacements = Vec::new();
+        for item in partition.partition_item_list()?.partition_items() {
+            let expr = item.expr()?;
+            let range = expr.syntax().text_range();
+            let replacement =
+                Self::rename_column_source(&expr.syntax().text().to_string(), table, from, to)?;
+            replacements.push((
+                usize::from(range.start()).checked_sub(prefix.len())?,
+                usize::from(range.end()).checked_sub(prefix.len())?,
+                replacement,
+            ));
+        }
+        let mut result = source.to_string();
+        for (start, end, replacement) in replacements.into_iter().rev() {
+            result.replace_range(start..end, &replacement);
+        }
+        Some(result)
+    }
+
     pub(crate) fn rename_column_source(
         source: &str,
         table: &str,
         from: &str,
         to: &str,
     ) -> Option<String> {
-        use squawk_syntax::ast::{CallExpr, FieldExpr, NameRef, SourceFile, Target};
+        use squawk_syntax::ast::{CallExpr, FieldExpr, NameRef, SourceFile};
         let prefix = "SELECT ";
         let parsed = SourceFile::parse(&format!("{prefix}{source}"));
         if !parsed.errors().is_empty() || parsed.tree().stmts().count() != 1 {
             return None;
         }
-        let expr = parsed
+        let mut ranges = Vec::new();
+        // A statistics expression list is valid SELECT target syntax too, so
+        // scan every target rather than assuming a single expression.
+        for name in parsed
             .tree()
             .syntax()
             .descendants()
-            .find_map(Target::cast)?
-            .expr()?;
-        let mut ranges = Vec::new();
-        for name in expr.syntax().descendants().filter_map(NameRef::cast) {
+            .filter_map(NameRef::cast)
+        {
             if name.text() != from {
                 continue;
             }
@@ -62,13 +99,41 @@ impl ExprVisitor {
                 usize::from(range.end()).checked_sub(prefix.len())?,
             ));
         }
-        let replacement = format!("\"{}\"", to.replace('"', "\"\""));
+        // Preserve the normal PostgreSQL deparse for ordinary identifiers, but
+        // quote names whose spelling cannot safely be parsed unquoted.
+        let replacement = if Self::can_render_unquoted_identifier(to) {
+            to.to_string()
+        } else {
+            format!("\"{}\"", to.replace('"', "\"\""))
+        };
         let mut result = source.to_string();
         ranges.sort_unstable();
         for (start, end) in ranges.into_iter().rev() {
             result.replace_range(start..end, &replacement);
         }
         Some(result)
+    }
+
+    fn can_render_unquoted_identifier(identifier: &str) -> bool {
+        use squawk_syntax::ast::{NameRef, SourceFile, Target};
+
+        let mut chars = identifier.chars();
+        if !matches!(chars.next(), Some('a'..='z' | '_'))
+            || !chars.all(|character| matches!(character, 'a'..='z' | '0'..='9' | '_' | '$'))
+        {
+            return false;
+        }
+        let parsed = SourceFile::parse(&format!("SELECT {identifier}"));
+        parsed.errors().is_empty()
+            && parsed.tree().stmts().count() == 1
+            && parsed
+                .tree()
+                .syntax()
+                .descendants()
+                .find_map(Target::cast)
+                .and_then(|target| target.expr())
+                .and_then(|expr| NameRef::cast(expr.syntax().clone()))
+                .is_some_and(|name| name.text() == identifier && !name.is_quoted())
     }
 
     pub(crate) fn convert(expr: Expr) -> ExprIr {
