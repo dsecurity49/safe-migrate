@@ -7304,7 +7304,11 @@ impl AnalysisState {
         if predicates.is_empty() {
             return None;
         }
-        Some(format!("(NOT ({}))", predicates.join(" OR ")))
+        if predicates.len() == 1 {
+            Some(format!("(NOT {})", predicates[0]))
+        } else {
+            Some(format!("(NOT ({}))", predicates.join(" OR ")))
+        }
     }
 
     fn refresh_default_partition_constraints(&mut self, parent: &ObjectId) {
