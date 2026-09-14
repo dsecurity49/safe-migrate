@@ -3983,6 +3983,19 @@ impl AnalysisState {
                             EvidenceScope::Chain,
                         );
                     }
+                    Err(reason)
+                        if self.effective_pg_version_num(0) < 150_000
+                            && reason.contains("partition column") =>
+                    {
+                        // PostgreSQL 14 can omit inherited column catalog
+                        // detail needed for a definitive compatibility check.
+                        // Keep the attach transition, but make all downstream
+                        // analysis conservative rather than dropping topology.
+                        self.taint(
+                            EvidenceCode::CatalogCoverageIncomplete,
+                            EvidenceScope::Chain,
+                        );
+                    }
                     Err(reason) => return MutationResult::Conflict { reason },
                 }
             }
