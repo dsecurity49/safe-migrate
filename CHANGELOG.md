@@ -7,67 +7,27 @@ notes are available on the
 
 ## v0.9.0 — Unreleased
 
-- Made `safe_migrate::api` the real supported Rust interface: it now owns
-  configuration, opaque validated baselines, immutable findings and evidence,
-  rule metadata, synchronization, and built-in report rendering.
-- Made `_internal` crate-private. Mutable cache and state-machine details are
-  no longer a downstream dependency path.
-- Added typed operation, object, verdict, summary, and rule-configuration
-  values, a public report-schema version, and categorized errors with source
-  chains. Configuration loading now rejects unsafe defaults immediately.
-- Unified API and CLI baseline status, confidence evidence, JSON, and Markdown
-  behavior, and expanded independent downstream API contract coverage.
-- Added redacted, validated database and cache-key inputs so embedded callers
-  can synchronize and load encrypted baselines without mutating process-wide
-  environment variables.
-- Narrowed implementation-only visibility and made accidental unreachable
-  public items a compile-time error.
-- Wired V7 inheritance coverage into publication confidence, and expanded the
-  PostgreSQL 14–18 differential gate for altered CHECK/EXCLUDE constraints and
-  a real connected logical subscription.
-- Hardened statement rollback, future-dated and unsupported-version baselines,
-  secret-buffer cleanup, error source chains, and untrusted report rendering.
-- Reject unsupported configured PostgreSQL-version assumptions instead of
-  applying unvalidated future-server semantics.
-- Added typed state transitions for locking, truncation, table storage and
-  access settings, partition detachment, table inheritance, `SELECT INTO`,
-  temporary-table `ON COMMIT` behavior, and the supported `ALTER COLUMN`
-  metadata forms.
-- Correct successful concurrent partition detach so it does not leave a
-  pending attachment. Retained CHECKs use the parent strategy, preserve quoted
-  keys, and track columns from the full predicate; unsupported forms remain
-  conservative.
-- Match PostgreSQL's generated CHECK names and avoid schema-wide constraint
-  name collisions.
-- Track role-membership grantors and per-grant ADMIN/INHERIT/SET options, so
-  role `REVOKE`/`CASCADE` linting matches PostgreSQL 16+ per-grant-record
-  semantics instead of collapsing options across grantors.
-- Expanded table-definition lifecycles for generated and identity columns,
-  inherited CHECK constraints, `LIKE` indexes and extended statistics, and
-  partition indexes, key constraints, foreign keys, and row-trigger clones.
-- Cache V8 now validates and synchronizes CHECK definitions, extended
-  statistics, column metadata, and partition-trigger parentage. Simple
-  single-source `SELECT INTO` projections retain exact column state.
-- Preserve qualified index identity for `CLUSTER ON` and `REPLICA IDENTITY
-  USING INDEX`. Replica identity now verifies ownership and PostgreSQL index
-  eligibility from synchronized catalog evidence.
-- Deepened live PostgreSQL differential checks for physical table and column
-  metadata, index definitions, sequence parameters, trigger parentage, CHECK
-  definitions, and extended statistics. New fixtures cover storage and security
-  settings, generated-column changes, `LIKE` copies, sequence options,
-  inheritance, typed tables, partition detach, `LOCK`, `TRUNCATE`, and `SELECT INTO`.
-- Apply typed options on standalone `CREATE SEQUENCE`, and match PostgreSQL's
-  `LIKE INCLUDING STATISTICS` target and partition-child catalog behavior.
-- Fixed key-constraint index ownership, type-change metadata resets, row-type
-  resolution, and keyword-shaped constraint columns; preserve generated
-  expression text and unary operators through creation, column renames,
-  changes, and rollback without rewriting function names.
-- Keep constraint dependencies, backing indexes, `CLUSTER`, and replica-identity
-  references consistent through renames and drops.
-- Reject recursive column-rename collisions before changing descendant metadata,
-  and invalidate descendant partition predicates when their ancestry changes.
-- Check full partition bounds and predicates in the live differential gate;
-  live-test scripts now resolve the repository independently of the working directory.
+- Established `safe_migrate::api` as the supported Rust interface for analysis,
+  configuration, synchronization, and reporting; `_internal` is now private.
+- Unified API and CLI reports and evidence, with typed results, categorized
+  errors, and redacted database/cache-key inputs for embedded callers.
+- Added `table-lock` to flag explicit blocking locks, bringing the rule count
+  to 29.
+- Expanded SQL modeling for `TRUNCATE`, storage and column settings, inheritance,
+  partition detach, `SELECT INTO`, sequence options, and temporary-table commits.
+- Added Cache V8 metadata for CHECK definitions, extended statistics, column
+  inheritance, generated/identity columns, and partition-trigger parentage.
+- Improved constraint/index rename and drop propagation, generated CHECK names,
+  expression preservation, `LIKE` copies, and replica-identity eligibility checks.
+- Fixed concurrent-detach state and recursive rename collisions; invalidate
+  descendant predicates after ancestry changes. Unsupported predicate forms
+  remain conservative.
+- Track PostgreSQL 16+ role-membership grantors and per-grant options for more
+  accurate `REVOKE`/`CASCADE` analysis.
+- Hardened rollback, baseline/version validation, secret cleanup, and report
+  rendering; reject unsupported PostgreSQL-version assumptions.
+- Expanded live catalog comparisons and interrupted-detach coverage, repaired
+  the CI smoke-test target, and improved live scripts and crate packaging.
 
 ## v0.8.1 — 2026-09-06
 

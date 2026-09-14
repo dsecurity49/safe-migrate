@@ -50,7 +50,7 @@ Run `safe-migrate cache inspect` to view its provenance and redacted contents.
 
 ## What it checks
 
-The 28 built-in rules cover:
+The 29 built-in rules cover:
 
 - blocking locks, table rewrites, constraints, indexes, partitions, and
   materialized-view refreshes;

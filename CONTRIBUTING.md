@@ -1,5 +1,24 @@
 # Contributing to safe-migrate
 
+## Start with an issue
+
+Before submitting a new issue, [search existing issues](https://github.com/dsecurity49/safe-migrate/issues),
+including closed ones, for similar reports or proposals. If one already covers
+your topic, add any new information there rather than opening a duplicate.
+
+Otherwise, [open an issue](https://github.com/dsecurity49/safe-migrate/issues/new/choose).
+For substantial changes, discuss the approach before starting implementation.
+For bug reports, include:
+
+- minimal SQL;
+- expected and actual output;
+- safe-migrate version;
+- PostgreSQL version or assumed version;
+- whether a cache was used;
+- relevant configuration, with credentials and other secrets removed.
+
+## How analysis works
+
 Thanks for contributing. safe-migrate is a Rust PostgreSQL migration analyzer
 with typed AST extraction, stateful schema simulation, and safety rules.
 
@@ -200,15 +219,3 @@ versions.
 - Use idiomatic Rust naming and four-space indentation.
 - Keep one rule concept per file or focused module.
 - Document non-obvious undo-log and dependency-graph behavior inline.
-
-## Reporting bugs
-
-[Open an issue](https://github.com/dsecurity49/safe-migrate/issues/new/choose)
-with:
-
-- minimal SQL;
-- expected and actual output;
-- safe-migrate version;
-- PostgreSQL version or assumed version;
-- whether a cache was used;
-- relevant configuration.
