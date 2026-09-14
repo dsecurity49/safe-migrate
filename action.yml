@@ -12,7 +12,7 @@ inputs:
     required: false
     default: ""
   cache:
-    description: Explicit trusted Cache V7 path; disables managed GitHub cache restore and save.
+    description: Explicit trusted Cache V8 path; disables managed GitHub cache restore and save.
     required: false
     default: ""
   config:
@@ -135,13 +135,13 @@ runs:
           cache_dir="${baseline_root}/${INPUT_BASELINE}"
           rm -rf -- "$cache_dir"
           mkdir -p -- "$cache_dir"
-          cache_path="${cache_dir}/baseline-v7.cache"
-          cache_transport_path="~/.cache/safe-migrate-action/baselines/${INPUT_BASELINE}/baseline-v7.cache"
+          cache_path="${cache_dir}/baseline-v8.cache"
+          cache_transport_path="~/.cache/safe-migrate-action/baselines/${INPUT_BASELINE}/baseline-v8.cache"
         else
           cache_root="${RUNNER_TEMP}/safe-migrate-action"
           mkdir -p "$cache_root"
           cache_dir="$(mktemp -d "${cache_root}/invocation.XXXXXX")"
-          cache_path="${cache_dir}/baseline-v7.cache"
+          cache_path="${cache_dir}/baseline-v8.cache"
         fi
 
         printf '%s\n' "cache-path=${cache_path}" >> "$GITHUB_OUTPUT"
@@ -158,7 +158,7 @@ runs:
           else
             cache_mode=plaintext
           fi
-          cache_prefix="safe-migrate-v7-${RUNNER_OS}-${cache_mode}-${INPUT_BASELINE}-"
+          cache_prefix="safe-migrate-v8-${RUNNER_OS}-${cache_mode}-${INPUT_BASELINE}-"
           printf '%s\n' "cache-prefix=${cache_prefix}" >> "$GITHUB_OUTPUT"
           printf '%s\n' \
             "cache-primary-key=${cache_prefix}${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \

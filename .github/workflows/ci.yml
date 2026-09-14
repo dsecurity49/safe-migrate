@@ -295,7 +295,7 @@ jobs:
         run: |
           test "$SYNC_STATUS" = "refreshed"
           test "$BASELINE_SOURCE" = "synced"
-          test "$CACHE_PATH" = "$HOME/.cache/safe-migrate-action/baselines/action-smoke/baseline-v7.cache"
+          test "$CACHE_PATH" = "$HOME/.cache/safe-migrate-action/baselines/action-smoke/baseline-v8.cache"
           test -z "$JSON_REPORT"
           rm -f -- "$CACHE_PATH"
 
