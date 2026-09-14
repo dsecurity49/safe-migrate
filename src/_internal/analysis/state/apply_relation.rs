@@ -2642,7 +2642,10 @@ impl AnalysisState {
 
         rel_state.partition_type = create.partition_strategy.as_deref().map(str::to_uppercase);
         rel_state.partition_by = create.partition_by.clone();
-        rel_state.partition_bound = create.partition_bound.clone();
+        rel_state.partition_bound = create
+            .partition_bound
+            .as_deref()
+            .map(canonical_partition_bound);
 
         let pk_columns: HashSet<&str> = create
             .table_constraints
@@ -3147,6 +3150,37 @@ impl AnalysisState {
             ));
         }
         if let Some(parent) = &create.partition_of {
+            let generated_partition_constraint =
+                self.local
+                    .relations
+                    .get(&create.id)
+                    .and_then(|overlay| match overlay {
+                        RelationOverlay::Present(relation) => Some(relation),
+                        RelationOverlay::Dropped => None,
+                    })
+                    .and_then(|relation| {
+                        let bound = relation.partition_bound.as_deref()?;
+                        if bound.eq_ignore_ascii_case("DEFAULT") {
+                            self.synthesize_default_partition_constraint(parent)
+                        } else {
+                            let strategy = self.local.relations.get(parent).and_then(
+                                |overlay| match overlay {
+                                    RelationOverlay::Present(parent) => {
+                                        parent.partition_type.as_deref()
+                                    }
+                                    RelationOverlay::Dropped => None,
+                                },
+                            )?;
+                            let keys = self.partition_key_columns(parent)?;
+                            self.synthesize_partition_check(strategy, bound, &keys, relation)
+                        }
+                    });
+            if generated_partition_constraint.is_some()
+                && let Some(RelationOverlay::Present(relation)) =
+                    self.local.relations.get_mut(&create.id)
+            {
+                relation.partition_constraint = generated_partition_constraint;
+            }
             let result = self.clone_row_triggers_to_partition(parent, &create.id);
             debug_assert!(matches!(result, MutationResult::Applied));
             if !matches!(result, MutationResult::Applied) {

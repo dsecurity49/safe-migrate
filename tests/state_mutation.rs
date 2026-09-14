@@ -2466,7 +2466,7 @@ mod state_mutation_tests {
             &state.local.constraints[&(object_id("public", "child"), "child_a_check".into())];
         assert_eq!(
             retained.definition.as_deref(),
-            Some("((a IS NOT NULL) AND (a = ANY (ARRAY[1, 2, 3])))")
+            Some("((a IS NOT NULL) AND (a = ANY ('{1,2,3}'::integer[])))")
         );
     }
 
