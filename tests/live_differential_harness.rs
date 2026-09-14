@@ -237,6 +237,12 @@ fn normalize_statistics_target(target: Option<i32>) -> Option<i32> {
     target.filter(|value| *value != -1)
 }
 
+fn normalize_partition_constraint(constraint: Option<&str>) -> Option<String> {
+    constraint
+        .filter(|value| !value.trim_start().starts_with("satisfies_hash_partition("))
+        .map(str::to_owned)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct NormalizedIndex {
     index: String,
@@ -1977,7 +1983,9 @@ fn snapshot_live_state(
                     .as_deref()
                     .map(|bound| bound.trim().eq_ignore_ascii_case("DEFAULT")),
                 partition_bound: relation.partition_bound.clone(),
-                partition_constraint: relation.partition_constraint.clone(),
+                partition_constraint: normalize_partition_constraint(
+                    relation.partition_constraint.as_deref(),
+                ),
                 persistence: normalize_relation_persistence(relation.persistence.clone()),
                 tablespace: relation.tablespace.clone(),
                 access_method: normalize_access_method(
@@ -2089,7 +2097,7 @@ fn snapshot_live_state(
                         kinds: statistics.kinds.clone(),
                         columns: statistics.columns.clone(),
                         expressions: statistics.expressions.clone(),
-                        target: statistics.target,
+                        target: normalize_statistics_target(statistics.target),
                     },
                 );
             }
@@ -2418,7 +2426,9 @@ fn snapshot_simulator_state(
                     .as_deref()
                     .map(|bound| bound.trim().eq_ignore_ascii_case("DEFAULT")),
                 partition_bound: relation.partition_bound.clone(),
-                partition_constraint: relation.partition_constraint.clone(),
+                partition_constraint: normalize_partition_constraint(
+                    relation.partition_constraint.as_deref(),
+                ),
                 persistence: normalize_relation_persistence(relation.persistence.clone()),
                 tablespace: relation.tablespace.clone(),
                 access_method: normalize_access_method(
@@ -2579,7 +2589,7 @@ fn snapshot_simulator_state(
                         kinds: statistics.kinds.clone(),
                         columns: statistics.columns.clone(),
                         expressions: statistics.expressions.clone(),
-                        target: statistics.target,
+                        target: normalize_statistics_target(statistics.target),
                     },
                 );
             }

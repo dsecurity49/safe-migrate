@@ -5968,6 +5968,12 @@ impl AnalysisState {
                             },
                         )?;
                         let keys = self.partition_key_columns(&alter.id)?;
+                        if canonical_bound
+                            .as_deref()
+                            .is_some_and(|value| value.eq_ignore_ascii_case("DEFAULT"))
+                        {
+                            return self.synthesize_default_partition_constraint(&alter.id);
+                        }
                         self.synthesize_partition_check(
                             parent_strategy,
                             canonical_bound.as_deref()?,
@@ -7212,6 +7218,12 @@ impl AnalysisState {
                         values.push(decode_sql_literal(datum.trim())?);
                     }
                     let mapped = elements_for_array(&values, column_type)?;
+                    if matches!(column_type, "integer" | "smallint" | "bigint") {
+                        return Some(format!(
+                            "(({key} IS NOT NULL) AND ({comparison_left} = ANY (ARRAY[{}])))",
+                            mapped.join(", ")
+                        ));
+                    }
                     let array_text = serialize_array_literal(&mapped);
                     Some(format!(
                         "(({key} IS NOT NULL) AND ({comparison_left} = ANY ('{array_text}'::{column_type}[])))"
@@ -7221,6 +7233,43 @@ impl AnalysisState {
         } else {
             None
         }
+    }
+
+    fn synthesize_default_partition_constraint(&self, parent: &ObjectId) -> Option<String> {
+        let strategy = self
+            .local
+            .relations
+            .get(parent)
+            .and_then(|overlay| match overlay {
+                RelationOverlay::Present(parent) => parent.partition_type.as_deref(),
+                RelationOverlay::Dropped => None,
+            })?;
+        let keys = self.partition_key_columns(parent)?;
+        let predicates = self
+            .local
+            .graph
+            .edges()
+            .iter()
+            .filter(|edge| {
+                edge.referenced == *parent && matches!(edge.kind, DependencyKind::PartitionOf)
+            })
+            .filter_map(|edge| {
+                let child = match self.local.relations.get(&edge.dependent) {
+                    Some(RelationOverlay::Present(child)) => child,
+                    _ => return None,
+                };
+                let bound = child.partition_bound.as_deref()?;
+                if bound.eq_ignore_ascii_case("DEFAULT") {
+                    return None;
+                }
+                let predicate = self.synthesize_partition_check(strategy, bound, &keys, child)?;
+                Some(predicate)
+            })
+            .collect::<Vec<_>>();
+        if predicates.is_empty() {
+            return None;
+        }
+        Some(format!("(NOT ({}))", predicates.join(" OR ")))
     }
 }
 
