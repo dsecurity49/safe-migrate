@@ -1805,6 +1805,9 @@
     "safe_034_generated_expression_change.sql": 170000,
     "safe_022_role_membership_cascade.sql": 160000,
     "safe_024_logical_replication.sql": 150000,
+    "safe_025_table_catalog_lifecycle.sql": 150000,
+    "safe_028_sequence_parameters.sql": 150000,
+    "safe_035_metadata_reset.sql": 160000,
     "safe_023_role_options.sql": 160000
    },
    "expected_live_errors": {

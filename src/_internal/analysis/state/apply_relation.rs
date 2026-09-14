@@ -3974,11 +3974,14 @@ impl AnalysisState {
                 match self.partition_attachment_is_compatible(&alter.id, child) {
                     Ok(true) => {}
                     Ok(false) => {
+                        // Missing catalog detail should lower confidence, not
+                        // erase the attachment from the transition state. The
+                        // taint keeps downstream findings conservative while
+                        // the mutation retains the edge and bound.
                         self.taint(
                             EvidenceCode::CatalogCoverageIncomplete,
                             EvidenceScope::Chain,
                         );
-                        return MutationResult::Skipped;
                     }
                     Err(reason) => return MutationResult::Conflict { reason },
                 }
