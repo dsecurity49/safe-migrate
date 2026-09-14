@@ -6031,6 +6031,7 @@ impl AnalysisState {
                         );
                     }
                 }
+                self.refresh_default_partition_constraints(&alter.id);
                 self.ensure_partition_indexes_and_constraints(&alter.id, child);
                 let result = self.clone_row_triggers_to_partition(&alter.id, child);
                 debug_assert!(matches!(result, MutationResult::Applied));
@@ -7304,6 +7305,36 @@ impl AnalysisState {
             return None;
         }
         Some(format!("(NOT ({}))", predicates.join(" OR ")))
+    }
+
+    fn refresh_default_partition_constraints(&mut self, parent: &ObjectId) {
+        let defaults = self
+            .local
+            .graph
+            .edges()
+            .iter()
+            .filter(|edge| {
+                edge.referenced == *parent && matches!(edge.kind, DependencyKind::PartitionOf)
+            })
+            .filter_map(|edge| {
+                let RelationOverlay::Present(relation) =
+                    self.local.relations.get(&edge.dependent)?
+                else {
+                    return None;
+                };
+                relation
+                    .partition_bound
+                    .as_deref()
+                    .is_some_and(|bound| bound.eq_ignore_ascii_case("DEFAULT"))
+                    .then_some(edge.dependent.clone())
+            })
+            .collect::<Vec<_>>();
+        for child in defaults {
+            let constraint = self.synthesize_default_partition_constraint(parent);
+            if let Some(RelationOverlay::Present(relation)) = self.local.relations.get_mut(&child) {
+                relation.partition_constraint = constraint;
+            }
+        }
     }
 }
 
