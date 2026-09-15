@@ -1812,7 +1812,6 @@
     "safe_024_logical_replication.sql": 150000,
     "safe_025_table_catalog_lifecycle.sql": 150000,
     "safe_028_sequence_parameters.sql": 150000,
-    "safe_033_typed_table_lifecycle.sql": 160000,
     "safe_035_metadata_reset.sql": 160000,
     "safe_023_role_options.sql": 160000
    },
