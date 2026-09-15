@@ -5,7 +5,7 @@ commits and pull requests. Published binaries, checksums, and generated release
 notes are available on the
 [GitHub Releases page](https://github.com/dsecurity49/safe-migrate/releases).
 
-## v0.9.0 — Unreleased
+## v0.9.0 — 2026-09-15
 
 - Established `safe_migrate::api` as the supported Rust interface for analysis,
   configuration, synchronization, and reporting; `_internal` is now private.
