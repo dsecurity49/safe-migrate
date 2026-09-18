@@ -7249,7 +7249,11 @@ impl AnalysisState {
         let typed_bound = parse_typed_bound(bound)?;
 
         if strategy.eq_ignore_ascii_case("RANGE") {
-            let TypedBound::FromTo { from: lower_datums, to: upper_datums } = typed_bound else {
+            let TypedBound::FromTo {
+                from: lower_datums,
+                to: upper_datums,
+            } = typed_bound
+            else {
                 return None;
             };
 
@@ -7351,7 +7355,7 @@ impl AnalysisState {
             let TypedBound::In(datums) = typed_bound else {
                 return None;
             };
-            
+
             match datums.as_slice() {
                 [single] => {
                     let literal = deparse_partition_literal(column_type, &single.text)?;
@@ -7367,7 +7371,7 @@ impl AnalysisState {
                     }
                     Some(vec![
                         format!("({key} IS NOT NULL)"),
-                        format!("({comparison_left} = {literal})")
+                        format!("({comparison_left} = {literal})"),
                     ])
                 }
                 [] => None,
@@ -7380,13 +7384,13 @@ impl AnalysisState {
                     if matches!(column_type, "integer" | "smallint" | "bigint") {
                         return Some(vec![
                             format!("({key} IS NOT NULL)"),
-                            format!("({comparison_left} = ANY (ARRAY[{}]))", mapped.join(", "))
+                            format!("({comparison_left} = ANY (ARRAY[{}]))", mapped.join(", ")),
                         ]);
                     }
                     let array_text = serialize_array_literal(&mapped);
                     Some(vec![
                         format!("({key} IS NOT NULL)"),
-                        format!("({comparison_left} = ANY ('{array_text}'::{column_type}[]))")
+                        format!("({comparison_left} = ANY ('{array_text}'::{column_type}[]))"),
                     ])
                 }
             }
@@ -7422,7 +7426,8 @@ impl AnalysisState {
                 if bound.eq_ignore_ascii_case("DEFAULT") {
                     return None;
                 }
-                let clauses = self.synthesize_partition_check_clauses(strategy, bound, &keys, child)?;
+                let clauses =
+                    self.synthesize_partition_check_clauses(strategy, bound, &keys, child)?;
                 if clauses.len() >= 2 {
                     let first = &clauses[0];
                     let rest = clauses[1..].join(" AND ");
@@ -7483,12 +7488,24 @@ fn canonical_partition_bound(bound: &str) -> String {
     match typed {
         TypedBound::Default => "DEFAULT".to_string(),
         TypedBound::In(datums) => {
-            let values = datums.into_iter().map(|d| d.text).collect::<Vec<_>>().join(", ");
+            let values = datums
+                .into_iter()
+                .map(|d| d.text)
+                .collect::<Vec<_>>()
+                .join(", ");
             format!("FOR VALUES IN ({values})")
         }
         TypedBound::FromTo { from, to } => {
-            let from_str = from.into_iter().map(|d| d.text).collect::<Vec<_>>().join(", ");
-            let to_str = to.into_iter().map(|d| d.text).collect::<Vec<_>>().join(", ");
+            let from_str = from
+                .into_iter()
+                .map(|d| d.text)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let to_str = to
+                .into_iter()
+                .map(|d| d.text)
+                .collect::<Vec<_>>()
+                .join(", ");
             format!("FOR VALUES FROM ({from_str}) TO ({to_str})")
         }
         TypedBound::With { modulus, remainder } => {
@@ -7794,7 +7811,8 @@ fn deparse_partition_literal(data_type: &str, raw: &str) -> Option<String> {
                 || type_name == "citext"
                 || type_name.starts_with("character varying")
                 || type_name.starts_with("character(")
-                || type_name.starts_with("bpchar") =>
+                || type_name.starts_with("bpchar")
+                || type_name.starts_with("timestamp") =>
         {
             Some(format!("'{}'::{}", decoded.replace('\'', "''"), data_type))
         }
@@ -7815,7 +7833,6 @@ fn numeric_float_like(value: &str) -> bool {
             .any(|ch| matches!(ch, '.' | 'e' | 'E'))
 }
 
-
 enum DatumKind {
     UnboundedMin,
     UnboundedMax,
@@ -7830,19 +7847,25 @@ struct BoundDatum {
 enum TypedBound {
     Default,
     In(Vec<BoundDatum>),
-    FromTo { from: Vec<BoundDatum>, to: Vec<BoundDatum> },
-    With { modulus: String, remainder: String },
+    FromTo {
+        from: Vec<BoundDatum>,
+        to: Vec<BoundDatum>,
+    },
+    With {
+        modulus: String,
+        remainder: String,
+    },
 }
 
 fn parse_typed_bound(bound: &str) -> Option<TypedBound> {
-    use squawk_syntax::ast::{AstNode, PartitionType, SourceFile, Stmt, Expr};
     use squawk_syntax::SyntaxKind;
+    use squawk_syntax::ast::{AstNode, Expr, PartitionType, SourceFile, Stmt};
 
     // Fast-path DEFAULT matching current canonical_partition_bound case-insensitivity
     if bound.trim().eq_ignore_ascii_case("DEFAULT") {
         return Some(TypedBound::Default);
     }
-    
+
     // Some callers (e.g. tests) may pass a bound without the prefix.
     let wrap = if bound.trim().to_ascii_uppercase().starts_with("FOR VALUES ") {
         format!("CREATE TABLE __key PARTITION OF __parent () {bound}")
@@ -7860,18 +7883,35 @@ fn parse_typed_bound(bound: &str) -> Option<TypedBound> {
         // Detect MINVALUE/MAXVALUE keyword token presence.
         if let Some(tok) = expr.syntax().first_token() {
             if tok.kind() == SyntaxKind::MINVALUE_KW {
-                return Some(BoundDatum { kind: DatumKind::UnboundedMin, text: expr.syntax().text().to_string() });
+                return Some(BoundDatum {
+                    kind: DatumKind::UnboundedMin,
+                    text: expr.syntax().text().to_string(),
+                });
             }
             if tok.kind() == SyntaxKind::MAXVALUE_KW {
-                return Some(BoundDatum { kind: DatumKind::UnboundedMax, text: expr.syntax().text().to_string() });
+                return Some(BoundDatum {
+                    kind: DatumKind::UnboundedMax,
+                    text: expr.syntax().text().to_string(),
+                });
             }
         }
         match expr {
-            Expr::Literal(_) => Some(BoundDatum { kind: DatumKind::Const, text: expr.syntax().text().to_string() }),
+            Expr::Literal(_) => Some(BoundDatum {
+                kind: DatumKind::Const,
+                text: expr.syntax().text().to_string(),
+            }),
             Expr::PrefixExpr(pre) => {
                 let inner = pre.expr()?;
-                if matches!(inner, Expr::Literal(_)) && pre.syntax().first_token().is_some_and(|t| t.kind() == SyntaxKind::MINUS) {
-                    Some(BoundDatum { kind: DatumKind::Const, text: pre.syntax().text().to_string() })
+                if matches!(inner, Expr::Literal(_))
+                    && pre
+                        .syntax()
+                        .first_token()
+                        .is_some_and(|t| t.kind() == SyntaxKind::MINUS)
+                {
+                    Some(BoundDatum {
+                        kind: DatumKind::Const,
+                        text: pre.syntax().text().to_string(),
+                    })
                 } else {
                     None
                 }
@@ -7879,7 +7919,10 @@ fn parse_typed_bound(bound: &str) -> Option<TypedBound> {
             Expr::CastExpr(cast) => {
                 let inner = cast.expr()?;
                 if matches!(inner, Expr::Literal(_) | Expr::PrefixExpr(_)) {
-                    Some(BoundDatum { kind: DatumKind::Const, text: cast.syntax().text().to_string() })
+                    Some(BoundDatum {
+                        kind: DatumKind::Const,
+                        text: cast.syntax().text().to_string(),
+                    })
                 } else {
                     None
                 }
@@ -7890,8 +7933,14 @@ fn parse_typed_bound(bound: &str) -> Option<TypedBound> {
 
     match pt {
         PartitionType::PartitionForValuesFrom(f) => {
-            let from_node = f.syntax().descendants().find_map(squawk_syntax::ast::PartitionFromValues::cast)?;
-            let to_node = f.syntax().descendants().find_map(squawk_syntax::ast::PartitionToValues::cast)?;
+            let from_node = f
+                .syntax()
+                .descendants()
+                .find_map(squawk_syntax::ast::PartitionFromValues::cast)?;
+            let to_node = f
+                .syntax()
+                .descendants()
+                .find_map(squawk_syntax::ast::PartitionToValues::cast)?;
             let mut from_datums = Vec::new();
             for expr in from_node.exprs() {
                 from_datums.push(parse_datum(expr)?);
@@ -7900,7 +7949,10 @@ fn parse_typed_bound(bound: &str) -> Option<TypedBound> {
             for expr in to_node.exprs() {
                 to_datums.push(parse_datum(expr)?);
             }
-            Some(TypedBound::FromTo { from: from_datums, to: to_datums })
+            Some(TypedBound::FromTo {
+                from: from_datums,
+                to: to_datums,
+            })
         }
         PartitionType::PartitionForValuesIn(l) => {
             let mut datums = Vec::new();
@@ -7912,9 +7964,20 @@ fn parse_typed_bound(bound: &str) -> Option<TypedBound> {
         PartitionType::PartitionForValuesWith(w) => {
             let modulus = w.modulus()?;
             let remainder = w.remainder()?;
-            let mod_text = format!("{} {}", modulus.ident_token()?.text().to_ascii_lowercase(), modulus.int_number_token()?.text());
-            let rem_text = format!("{} {}", remainder.ident_token()?.text().to_ascii_lowercase(), remainder.int_number_token()?.text());
-            Some(TypedBound::With { modulus: mod_text, remainder: rem_text })
+            let mod_text = format!(
+                "{} {}",
+                modulus.ident_token()?.text().to_ascii_lowercase(),
+                modulus.int_number_token()?.text()
+            );
+            let rem_text = format!(
+                "{} {}",
+                remainder.ident_token()?.text().to_ascii_lowercase(),
+                remainder.int_number_token()?.text()
+            );
+            Some(TypedBound::With {
+                modulus: mod_text,
+                remainder: rem_text,
+            })
         }
         PartitionType::PartitionDefault(_) => Some(TypedBound::Default),
     }
