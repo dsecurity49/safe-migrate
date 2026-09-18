@@ -7356,43 +7356,54 @@ impl AnalysisState {
                 return None;
             };
 
-            match datums.as_slice() {
+            let has_null = datums.iter().any(|d| matches!(d.kind, DatumKind::Null));
+            let non_null_datums: Vec<_> = datums
+                .iter()
+                .filter(|d| !matches!(d.kind, DatumKind::Null))
+                .collect();
+
+            if non_null_datums.is_empty() {
+                if has_null {
+                    return Some(vec![format!("({key} IS NULL)")]);
+                }
+                return None;
+            }
+
+            let value_check = match non_null_datums.as_slice() {
                 [single] => {
                     let literal = deparse_partition_literal(column_type, &single.text)?;
                     if column_type == "boolean" {
-                        let narrow = if literal == "true" {
+                        if literal == "true" {
                             key.clone()
                         } else if literal == "false" {
                             format!("(NOT {key})")
                         } else {
                             return None;
-                        };
-                        return Some(vec![format!("({key} IS NOT NULL)"), narrow]);
+                        }
+                    } else {
+                        format!("({comparison_left} = {literal})")
                     }
-                    Some(vec![
-                        format!("({key} IS NOT NULL)"),
-                        format!("({comparison_left} = {literal})"),
-                    ])
                 }
-                [] => None,
+                [] => return None, // handled above, but for exhaustiveness
                 _ => {
                     let mut values = Vec::new();
-                    for datum in datums {
+                    for datum in non_null_datums {
                         values.push(decode_sql_literal(&datum.text)?);
                     }
                     let mapped = elements_for_array(&values, column_type)?;
                     if matches!(column_type, "integer" | "smallint" | "bigint") {
-                        return Some(vec![
-                            format!("({key} IS NOT NULL)"),
-                            format!("({comparison_left} = ANY (ARRAY[{}]))", mapped.join(", ")),
-                        ]);
+                        format!("({comparison_left} = ANY (ARRAY[{}]))", mapped.join(", "))
+                    } else {
+                        let array_text = serialize_array_literal(&mapped);
+                        format!("({comparison_left} = ANY ('{array_text}'::{column_type}[]))")
                     }
-                    let array_text = serialize_array_literal(&mapped);
-                    Some(vec![
-                        format!("({key} IS NOT NULL)"),
-                        format!("({comparison_left} = ANY ('{array_text}'::{column_type}[]))"),
-                    ])
                 }
+            };
+
+            if has_null {
+                Some(vec![format!("(({key} IS NULL) OR {value_check})")])
+            } else {
+                Some(vec![format!("({key} IS NOT NULL)"), value_check])
             }
         } else {
             None
@@ -7713,9 +7724,12 @@ fn fold_boolean_equality(predicate: &str) -> Option<String> {
 }
 
 /// Extract the column variable referenced by an `= ANY (...)`/`= true` clause
-/// from a fully-deparsed predicate (`((col IS NOT NULL) AND (col = ...))`).
+/// from a fully-deparsed predicate (`((col IS NOT NULL) AND (col = ...))` or
+/// `((col IS NULL) OR (col = ANY (...)))`).
 fn predicate_column_name(predicate: &str) -> Option<String> {
-    let start = predicate.find(" IS NOT NULL)")?;
+    let start = predicate
+        .find(" IS NOT NULL)")
+        .or_else(|| predicate.find(" IS NULL)"))?;
     let open = predicate[..start].rfind('(')?;
     let name = predicate[open + 1..start].trim();
     if name.is_empty() || !name.chars().all(|ch| ch.is_alphanumeric() || ch == '_') {
@@ -7836,6 +7850,7 @@ fn numeric_float_like(value: &str) -> bool {
 enum DatumKind {
     UnboundedMin,
     UnboundedMax,
+    Null,
     Const,
 }
 
@@ -7891,6 +7906,12 @@ fn parse_typed_bound(bound: &str) -> Option<TypedBound> {
             if tok.kind() == SyntaxKind::MAXVALUE_KW {
                 return Some(BoundDatum {
                     kind: DatumKind::UnboundedMax,
+                    text: expr.syntax().text().to_string(),
+                });
+            }
+            if tok.kind() == SyntaxKind::NULL_KW {
+                return Some(BoundDatum {
+                    kind: DatumKind::Null,
                     text: expr.syntax().text().to_string(),
                 });
             }

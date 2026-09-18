@@ -2166,6 +2166,35 @@ mod state_mutation_tests {
     }
 
     #[test]
+    fn concurrent_detach_of_list_null_partition_retains_or_predicate() {
+        let engine = setup_engine();
+        for (bound, expected) in [
+            (
+                "IN (1, 2, NULL)",
+                "(((a IS NULL) OR (a = ANY ('{1,2}'::integer[]))))",
+            ),
+            ("IN (NULL)", "((a IS NULL))"),
+            ("IN (5, NULL)", "(((a IS NULL) OR (a = 5)))"),
+        ] {
+            let mut state = setup_state();
+            let sql = format!(
+                "CREATE TABLE parent(a integer) PARTITION BY LIST (a);
+                CREATE TABLE child PARTITION OF parent FOR VALUES {bound};
+                ALTER TABLE parent DETACH PARTITION child CONCURRENTLY;"
+            );
+            engine.analyze(&sql, &mut state).unwrap();
+            let child = object_id("public", "child");
+            let check = state
+                .local
+                .constraints
+                .values()
+                .find(|check| check.table_id == child && check.kind == ConstraintKind::Check)
+                .expect("retained check");
+            assert_eq!(check.definition.as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
     fn retained_partition_check_tracks_all_cached_predicate_columns() {
         let engine = setup_engine();
         let mut state = setup_state();

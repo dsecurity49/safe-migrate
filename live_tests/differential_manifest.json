@@ -2579,7 +2579,9 @@
     "safe_016_timestamp.sql",
     "safe_017_text.sql",
     "safe_018_double.sql",
-    "safe_019_leading_minmax.sql"
+    "safe_019_leading_minmax.sql",
+    "safe_020_list_null.sql",
+    "safe_021_list_only_null.sql"
    ],
    "fixtures": [
     "safe_001_composite_int.sql",
@@ -2599,7 +2601,9 @@
     "safe_016_timestamp.sql",
     "safe_017_text.sql",
     "safe_018_double.sql",
-    "safe_019_leading_minmax.sql"
+    "safe_019_leading_minmax.sql",
+    "safe_020_list_null.sql",
+    "safe_021_list_only_null.sql"
    ],
    "schemas": [
     "public",
