@@ -2556,6 +2556,70 @@
     "sm_core.t"
    ],
    "notes": "Twenty-fifth incremental slice. Represents the connection-level rule with safe live controls only; fixed-name database creation, alteration, and deletion are explicitly classified as unsupported nondifferentiable behavior in the schema-state harness."
+  },
+  {
+   "rule_dir": "rule_30_partition_bounds",
+   "enabled": true,
+   "transactional": false,
+   "fixture_autocommit": [
+    "safe_001_composite_int.sql",
+    "safe_002_trailing_minmax.sql",
+    "safe_003_full_collapse.sql",
+    "safe_004_all_unbounded.sql",
+    "safe_005_varchar_two_key.sql",
+    "safe_006_list_int.sql",
+    "safe_007_range_varchar.sql",
+    "safe_009_negative_int.sql",
+    "safe_010_smallint.sql",
+    "safe_011_bigint.sql",
+    "safe_012_numeric.sql",
+    "safe_013_date.sql",
+    "safe_014_uuid.sql",
+    "safe_015_boolean.sql",
+    "safe_016_timestamp.sql",
+    "safe_017_text.sql",
+    "safe_018_double.sql",
+    "safe_019_leading_minmax.sql"
+   ],
+   "fixtures": [
+    "safe_001_composite_int.sql",
+    "safe_002_trailing_minmax.sql",
+    "safe_003_full_collapse.sql",
+    "safe_004_all_unbounded.sql",
+    "safe_005_varchar_two_key.sql",
+    "safe_006_list_int.sql",
+    "safe_007_range_varchar.sql",
+    "safe_009_negative_int.sql",
+    "safe_010_smallint.sql",
+    "safe_011_bigint.sql",
+    "safe_012_numeric.sql",
+    "safe_013_date.sql",
+    "safe_014_uuid.sql",
+    "safe_015_boolean.sql",
+    "safe_016_timestamp.sql",
+    "safe_017_text.sql",
+    "safe_018_double.sql",
+    "safe_019_leading_minmax.sql"
+   ],
+   "schemas": [
+    "public",
+    "sm_identity",
+    "sm_core",
+    "sm_catalog",
+    "sm_billing",
+    "sm_fulfillment",
+    "sm_audit",
+    "sm_analytics"
+   ],
+   "scope": [
+    "relations",
+    "constraints"
+   ],
+   "required_relations": [
+    "public.parent",
+    "public.child"
+   ],
+   "notes": "Parity oracle: validates exact byte-for-byte synthesized CHECK constraints across matrix of pg_type and bound shapes via DETACH PARTITION CONCURRENTLY."
   }
  ]
 }

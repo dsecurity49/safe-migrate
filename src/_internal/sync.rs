@@ -1423,7 +1423,25 @@ fn load_sequences(
     // scope. A sequence can live in a different schema from its owning
     // table, and dropping it without that edge would make a later migration
     // look exact while missing PostgreSQL's ownership dependency.
-    let schema_filter = "AND ($1::text[] IS NULL OR n.nspname = ANY($1) OR tn.nspname = ANY($1))";
+    let schema_filter = r#"
+        AND (
+            $1::text[] IS NULL
+            OR n.nspname = ANY($1)
+            OR tn.nspname = ANY($1)
+            OR t.oid IN (
+                SELECT conrelid FROM pg_constraint cst
+                JOIN pg_class c2 ON c2.oid = cst.confrelid
+                JOIN pg_namespace n2 ON n2.oid = c2.relnamespace
+                WHERE n2.nspname = ANY($1)
+            )
+            OR t.oid IN (
+                SELECT confrelid FROM pg_constraint cst
+                JOIN pg_class c2 ON c2.oid = cst.conrelid
+                JOIN pg_namespace n2 ON n2.oid = c2.relnamespace
+                WHERE n2.nspname = ANY($1)
+            )
+        )
+    "#;
     let query = format!(
         "SELECT
              n.nspname AS sequence_schema,

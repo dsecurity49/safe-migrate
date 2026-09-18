@@ -1,0 +1,3 @@
+CREATE TABLE parent (a integer, b integer, c integer) PARTITION BY RANGE (a, b, c);
+CREATE TABLE child PARTITION OF parent FOR VALUES FROM (1, 2, MINVALUE) TO (10, 20, MAXVALUE);
+ALTER TABLE parent DETACH PARTITION child CONCURRENTLY;

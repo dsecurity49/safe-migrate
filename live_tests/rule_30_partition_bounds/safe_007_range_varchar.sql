@@ -1,0 +1,3 @@
+CREATE TABLE parent (a character varying(16)) PARTITION BY RANGE (a);
+CREATE TABLE child PARTITION OF parent FOR VALUES FROM ('x') TO ('z');
+ALTER TABLE parent DETACH PARTITION child CONCURRENTLY;
