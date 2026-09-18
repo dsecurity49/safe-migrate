@@ -858,9 +858,14 @@ impl DbCache {
                             })
                     });
                 if !matches_layout {
+                    let table_layout = relation
+                        .columns
+                        .iter()
+                        .map(|column| (&column.name, column.data_type.as_deref()))
+                        .collect::<Vec<_>>();
                     return Err(format!(
-                        "typed table '{}' does not match composite type '{}' column layout",
-                        id, type_id
+                        "typed table '{}' does not match composite type '{}' column layout: table={table_layout:?}, composite={fields:?}",
+                        id, type_id,
                     ));
                 }
             }

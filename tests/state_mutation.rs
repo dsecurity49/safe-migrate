@@ -3306,7 +3306,8 @@ mod state_mutation_tests {
         let mut state = setup_state();
         let findings = engine
             .analyze(
-                "CREATE TYPE address AS (street text, zip integer);
+                "CREATE TYPE component AS (code text);
+                 CREATE TYPE address AS (street text, zip integer, component component);
                  CREATE TABLE addresses OF address;",
                 &mut state,
             )
@@ -3322,7 +3323,7 @@ mod state_mutation_tests {
             Some(RelationOverlay::Present(relation))
                 if relation.of_type == Some(object_id("public", "address"))
                     && relation.columns.iter().map(|column| column.name.as_str()).collect::<Vec<_>>()
-                        == vec!["street", "zip"]
+                        == vec!["street", "zip", "component"]
         ));
     }
 
