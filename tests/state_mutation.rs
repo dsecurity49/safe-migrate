@@ -2264,7 +2264,7 @@ mod state_mutation_tests {
     }
 
     #[test]
-    fn concurrent_detach_keeps_list_bound_tainted_for_composite_key() {
+    fn concurrent_detach_synthesizes_check_for_composite_range_key() {
         let engine = setup_engine();
         let mut state = setup_state();
         engine
@@ -2275,11 +2275,197 @@ mod state_mutation_tests {
                 &mut state,
             )
             .unwrap();
-        assert_ne!(state.local.confidence, Confidence::Exact);
-        assert!(!state.local.constraints.values().any(|constraint| {
+        assert_eq!(state.local.confidence, Confidence::Exact);
+        assert!(state.local.constraints.values().any(|constraint| {
             constraint.table_id == object_id("public", "child")
                 && constraint.kind == ConstraintKind::Check
+                && constraint.definition.as_deref() == Some("((a IS NOT NULL) AND (b IS NOT NULL) AND ((a > 0) OR ((a = 0) AND (b >= 0))) AND ((a < 10) OR ((a = 10) AND (b < 10))))")
         }));
+    }
+
+    #[test]
+    fn composite_range_detach_synthesis_matches_postgres_wildcard_bounds() {
+        let engine = setup_engine();
+        for (columns, keys, bound, expected) in [
+            (
+                "a integer, b integer, c integer",
+                "(a, b, c)",
+                "FROM (1, 2, 3) TO (10, 20, 30)",
+                "((a IS NOT NULL) AND (b IS NOT NULL) AND (c IS NOT NULL) AND ((a > 1) OR ((a = 1) AND (b > 2)) OR ((a = 1) AND (b = 2) AND (c >= 3))) AND ((a < 10) OR ((a = 10) AND (b < 20)) OR ((a = 10) AND (b = 20) AND (c < 30))))",
+            ),
+            (
+                "a integer, b integer, c integer",
+                "(a, b, c)",
+                "FROM (1, 2, MINVALUE) TO (10, 20, MAXVALUE)",
+                "((a IS NOT NULL) AND (b IS NOT NULL) AND (c IS NOT NULL) AND ((a > 1) OR ((a = 1) AND (b >= 2))) AND ((a < 10) OR ((a = 10) AND (b <= 20))))",
+            ),
+            (
+                "a integer, b integer, c integer",
+                "(a, b, c)",
+                "FROM (1, MINVALUE, MINVALUE) TO (10, MAXVALUE, MAXVALUE)",
+                "((a IS NOT NULL) AND (b IS NOT NULL) AND (c IS NOT NULL) AND (a >= 1) AND (a <= 10))",
+            ),
+            (
+                "a integer, b integer",
+                "(a, b)",
+                "FROM (MINVALUE, MINVALUE) TO (MAXVALUE, MAXVALUE)",
+                "((a IS NOT NULL) AND (b IS NOT NULL))",
+            ),
+            (
+                "a integer, b integer",
+                "(a, b)",
+                "FROM (MINVALUE, MINVALUE) TO (10, 20)",
+                "((a IS NOT NULL) AND (b IS NOT NULL) AND ((a < 10) OR ((a = 10) AND (b < 20))))",
+            ),
+        ] {
+            let mut state = setup_state();
+            let sql = format!(
+                "CREATE TABLE parent ({columns}) PARTITION BY RANGE {keys};
+                CREATE TABLE child PARTITION OF parent FOR VALUES {bound};
+                ALTER TABLE parent DETACH PARTITION child CONCURRENTLY;"
+            );
+            engine.analyze(&sql, &mut state).unwrap();
+            assert_eq!(state.local.confidence, Confidence::Exact, "{bound}");
+            assert!(
+                state.local.constraints.values().any(|constraint| {
+                    constraint.table_id == object_id("public", "child")
+                        && constraint.kind == ConstraintKind::Check
+                        && constraint.definition.as_deref() == Some(expected)
+                }),
+                "{bound}"
+            );
+        }
+    }
+
+    #[test]
+    fn composite_range_detach_synthesis_matches_postgres_for_varchar_keys() {
+        let engine = setup_engine();
+        for (columns, keys, bound, expected) in [
+            (
+                "a character varying(32), b character varying(32)",
+                "(a, b)",
+                "FROM ('a', 'b') TO ('m', 'n')",
+                "((a IS NOT NULL) AND (b IS NOT NULL) AND (((a)::text > 'a'::character varying(32)) OR (((a)::text = 'a'::character varying(32)) AND ((b)::text >= 'b'::character varying(32)))) AND (((a)::text < 'm'::character varying(32)) OR (((a)::text = 'm'::character varying(32)) AND ((b)::text < 'n'::character varying(32)))))",
+            ),
+            (
+                "a character varying(32), b integer",
+                "(a, b)",
+                "FROM ('a', 0) TO ('m', 10)",
+                "((a IS NOT NULL) AND (b IS NOT NULL) AND (((a)::text > 'a'::character varying(32)) OR (((a)::text = 'a'::character varying(32)) AND (b >= 0))) AND (((a)::text < 'm'::character varying(32)) OR (((a)::text = 'm'::character varying(32)) AND (b < 10))))",
+            ),
+            (
+                "a character varying(16), b character varying(16), c character varying(16)",
+                "(a, b, c)",
+                "FROM ('a', 'b', 'c') TO ('x', 'y', 'z')",
+                "((a IS NOT NULL) AND (b IS NOT NULL) AND (c IS NOT NULL) AND (((a)::text > 'a'::character varying(16)) OR (((a)::text = 'a'::character varying(16)) AND ((b)::text > 'b'::character varying(16))) OR (((a)::text = 'a'::character varying(16)) AND ((b)::text = 'b'::character varying(16)) AND ((c)::text >= 'c'::character varying(16)))) AND (((a)::text < 'x'::character varying(16)) OR (((a)::text = 'x'::character varying(16)) AND ((b)::text < 'y'::character varying(16))) OR (((a)::text = 'x'::character varying(16)) AND ((b)::text = 'y'::character varying(16)) AND ((c)::text < 'z'::character varying(16)))))",
+            ),
+        ] {
+            let mut state = setup_state();
+            let sql = format!(
+                "CREATE TABLE parent ({columns}) PARTITION BY RANGE {keys};
+                CREATE TABLE child PARTITION OF parent FOR VALUES {bound};
+                ALTER TABLE parent DETACH PARTITION child CONCURRENTLY;"
+            );
+            engine.analyze(&sql, &mut state).unwrap();
+            assert_eq!(state.local.confidence, Confidence::Exact, "{bound}");
+            assert!(
+                state.local.constraints.values().any(|constraint| {
+                    constraint.table_id == object_id("public", "child")
+                        && constraint.kind == ConstraintKind::Check
+                        && constraint.definition.as_deref() == Some(expected)
+                }),
+                "{bound}"
+            );
+        }
+    }
+
+    #[test]
+    fn parenthesized_plain_column_keys_deparse_as_bare_columns() {
+        let engine = setup_engine();
+        for (columns, keys, bound, expected) in [
+            (
+                "a integer",
+                "((a))",
+                "FROM (10) TO (20)",
+                "((a IS NOT NULL) AND (a >= 10) AND (a < 20))",
+            ),
+            (
+                "a integer, b integer",
+                "((a), (b))",
+                "FROM (0, 0) TO (10, 10)",
+                "((a IS NOT NULL) AND (b IS NOT NULL) AND ((a > 0) OR ((a = 0) AND (b >= 0))) AND ((a < 10) OR ((a = 10) AND (b < 10))))",
+            ),
+            (
+                "a integer, b integer",
+                "(((a)), b)",
+                "FROM (0, 0) TO (10, 10)",
+                "((a IS NOT NULL) AND (b IS NOT NULL) AND ((a > 0) OR ((a = 0) AND (b >= 0))) AND ((a < 10) OR ((a = 10) AND (b < 10))))",
+            ),
+            (
+                "a character varying(32), b integer",
+                "((a), (b))",
+                "FROM ('a', 0) TO ('m', 10)",
+                "((a IS NOT NULL) AND (b IS NOT NULL) AND (((a)::text > 'a'::character varying(32)) OR (((a)::text = 'a'::character varying(32)) AND (b >= 0))) AND (((a)::text < 'm'::character varying(32)) OR (((a)::text = 'm'::character varying(32)) AND (b < 10))))",
+            ),
+        ] {
+            let mut state = setup_state();
+            let sql = format!(
+                "CREATE TABLE parent ({columns}) PARTITION BY RANGE {keys};
+                CREATE TABLE child PARTITION OF parent FOR VALUES {bound};
+                ALTER TABLE parent DETACH PARTITION child CONCURRENTLY;"
+            );
+            engine.analyze(&sql, &mut state).unwrap();
+            assert_eq!(state.local.confidence, Confidence::Exact, "{keys}");
+            assert!(
+                state.local.constraints.values().any(|constraint| {
+                    constraint.table_id == object_id("public", "child")
+                        && constraint.kind == ConstraintKind::Check
+                        && constraint.definition.as_deref() == Some(expected)
+                }),
+                "{keys}"
+            );
+        }
+    }
+
+    #[test]
+    fn expression_partition_keys_retain_conservative_taint() {
+        let engine = setup_engine();
+        for keys in ["((a * 2))", "((upper(a)))", "(((a)::date))", "((a + b))"] {
+            let mut state = setup_state();
+            let columns = if keys.contains("a + b") {
+                "a integer, b integer"
+            } else if keys.contains("upper(a)") {
+                "a text"
+            } else if keys.contains("::date") {
+                "a date"
+            } else {
+                "a integer"
+            };
+            let sql = format!(
+                "CREATE TABLE parent ({columns}) PARTITION BY RANGE {keys};
+                CREATE TABLE child PARTITION OF parent FOR VALUES FROM ({lower}) TO ({upper});
+                ALTER TABLE parent DETACH PARTITION child CONCURRENTLY;",
+                lower = if keys.contains("upper(a)") {
+                    "'A'"
+                } else {
+                    "0"
+                },
+                upper = if keys.contains("upper(a)") {
+                    "'Z'"
+                } else {
+                    "10"
+                }
+            );
+            engine.analyze(&sql, &mut state).unwrap();
+            assert_ne!(state.local.confidence, Confidence::Exact, "{keys}");
+            assert!(
+                !state.local.constraints.values().any(|constraint| {
+                    constraint.table_id == object_id("public", "child")
+                        && constraint.kind == ConstraintKind::Check
+                }),
+                "{keys}"
+            );
+        }
     }
 
     #[test]

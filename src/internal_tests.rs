@@ -1,5 +1,16 @@
 // Implementation tests are compiled inside the crate so they can exercise
 // invariants without promoting the mutable engine model to public API.
+use std::sync::{Mutex, MutexGuard, OnceLock};
+
+/// Live tests share disposable PostgreSQL fixtures, so Rust's default parallel
+/// test scheduler must not let their setup and teardown overlap.
+pub(crate) fn live_database_test_lock() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[path = "../tests/alter_schema_visitor.rs"]
 mod alter_schema_visitor;
 #[path = "../tests/architectural_gaps.rs"]

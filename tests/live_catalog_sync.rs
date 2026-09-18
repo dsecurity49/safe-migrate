@@ -374,6 +374,7 @@ fn live_catalog_database_guard_accepts_only_local_hosts() {
 #[test]
 #[ignore = "requires a live local PostgreSQL database via DATABASE_URL"]
 fn live_sync_preserves_routine_and_replication_catalogs_without_connection_secrets() {
+    let _live_database_guard = crate::internal_tests::live_database_test_lock();
     let (database_config, expected_owner, version) = live_database();
     let _cleanup = CatalogCleanup(database_config.clone());
     let mut client = database_config
@@ -804,6 +805,7 @@ fn live_sync_preserves_routine_and_replication_catalogs_without_connection_secre
 #[test]
 #[ignore = "requires a live local PostgreSQL database via DATABASE_URL"]
 fn live_routine_and_replication_mutations_match_postgresql() {
+    let _live_database_guard = crate::internal_tests::live_database_test_lock();
     let (database_config, _expected_owner, version) = live_database();
     let _cleanup = CatalogCleanup(database_config.clone());
     let mut client = database_config
@@ -996,6 +998,7 @@ fn live_routine_and_replication_mutations_match_postgresql() {
 #[test]
 #[ignore = "requires local subscriber and publisher databases"]
 fn live_connected_subscription_round_trip_is_redacted_and_exact() {
+    let _live_database_guard = crate::internal_tests::live_database_test_lock();
     let publisher_url = std::env::var("PUBLISHER_DATABASE_URL")
         .expect("PUBLISHER_DATABASE_URL is required for connected subscription validation");
     let subscription_url = std::env::var("SUBSCRIPTION_DATABASE_URL")

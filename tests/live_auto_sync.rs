@@ -117,6 +117,7 @@ fn run_auto_sync_case(
 #[test]
 #[ignore = "requires a live local PostgreSQL database via DATABASE_URL"]
 fn live_auto_sync_refreshes_lint_and_lint_chain() {
+    let _live_database_guard = crate::internal_tests::live_database_test_lock();
     let database_url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL is required for live auto-sync proof");
     let mut client = postgres::Client::connect(&database_url, postgres::NoTls)

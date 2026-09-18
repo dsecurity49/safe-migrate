@@ -5,6 +5,19 @@ commits and pull requests. Published binaries, checksums, and generated release
 notes are available on the
 [GitHub Releases page](https://github.com/dsecurity49/safe-migrate/releases).
 
+## v0.9.1 — 2026-09-18
+
+- Stabilized typed-table catalog synchronization: composite-field types resolve
+  through their owning namespace and relation rows order by `attnum`, preventing
+  layout-validation and type-resolution failures on PostgreSQL 15+ typed tables.
+- Expanded `DETACH PARTITION ... CONCURRENTLY` retained-CHECK synthesis to
+  byte-exact PostgreSQL output for composite, mixed-varchar, and boundary
+  sentinel partition ranges; plain columns wrapped in parentheses are accepted
+  identically to bare names. True expression keys (operators, function calls,
+  casts) remain conservatively tainted because PostgreSQL normalizes them through
+  `eval_const_expressions` and `get_rule_expr`, which cannot be replicated
+  offline.
+
 ## v0.9.0 — 2026-09-15
 
 - Established `safe_migrate::api` as the supported Rust interface for analysis,

@@ -7075,12 +7075,14 @@ impl AnalysisState {
     }
 
     /// Split a `PARTITION BY <strategy> (c1, c2, ...)` key into column names.
-    /// Plain identifiers and quoted identifiers are accepted; expressions and
-    /// opclass/collation annotations return `None`, because PostgreSQL then
-    /// deparses the retained predicate in terms of the expression, not a
-    /// column.
+    /// Plain, quoted, and parenthesized plain identifiers (e.g. `(a)`,
+    /// `((b))`) resolve to the bare column, matching PostgreSQL's retained
+    /// predicate. True expressions (operators, calls, casts) and
+    /// collation/opclass/sort annotations return `None`, because PostgreSQL
+    /// deparses them in normalized form we cannot replicate byte-for-byte;
+    /// those keys keep the conservative `CantResolve` taint.
     fn partition_key_columns(&self, parent: &ObjectId) -> Option<Vec<(String, String)>> {
-        use squawk_syntax::ast::{AstNode, Expr, PartitionBy, SourceFile};
+        use squawk_syntax::ast::{AstNode, PartitionBy, SourceFile};
         let Some(RelationOverlay::Present(parent)) = self.local.relations.get(parent) else {
             return None;
         };
@@ -7103,15 +7105,29 @@ impl AnalysisState {
             {
                 return None;
             }
-            let Expr::NameRef(name) = item.expr()? else {
-                return None;
-            };
-            columns.push((name.text().to_string(), name.syntax().text().to_string()));
+            let name = Self::resolve_partition_column_name(item.expr()?)?;
+            columns.push(name);
         }
         if columns.is_empty() {
             None
         } else {
             Some(columns)
+        }
+    }
+
+    /// Unwrap parentheses to a plain column name; return `None` for any
+    /// non-column expression.
+    fn resolve_partition_column_name(expr: squawk_syntax::ast::Expr) -> Option<(String, String)> {
+        use squawk_syntax::ast::{AstNode, Expr};
+        let mut current = expr;
+        loop {
+            match current {
+                Expr::ParenExpr(paren) => current = paren.expr()?,
+                Expr::NameRef(name) => {
+                    return Some((name.text().to_string(), name.syntax().text().to_string()));
+                }
+                _ => return None,
+            }
         }
     }
 
@@ -7195,41 +7211,134 @@ impl AnalysisState {
         keys: &[(String, String)],
         relation: &RelationState,
     ) -> Option<String> {
-        if keys.len() != 1 {
+        if keys.is_empty() {
             return None;
         }
-        let (key_name, key) = &keys[0];
-        let column_type = relation
-            .columns
-            .iter()
-            .find(|column| &column.name == key_name)
-            .and_then(|column| column.data_type.as_deref())?;
-        let comparison_left = if column_type.starts_with("character varying") {
-            format!("({key})::text")
-        } else {
-            key.clone()
-        };
+
+        let mut column_types = Vec::new();
+        let mut comparison_lefts = Vec::new();
+
+        for (key_name, key) in keys {
+            let col_type = relation
+                .columns
+                .iter()
+                .find(|c| &c.name == key_name)
+                .and_then(|c| c.data_type.as_deref())?;
+
+            let comp_left = if col_type.starts_with("character varying") {
+                format!("({key})::text")
+            } else {
+                key.clone()
+            };
+
+            column_types.push(col_type);
+            comparison_lefts.push(comp_left);
+        }
+
         if strategy.eq_ignore_ascii_case("RANGE") {
             let lower = extract_paren_group(bound, "FROM (")?;
             let upper = extract_paren_group(bound, "TO (")?;
             let lower_datums = split_top_level(&lower, ',');
             let upper_datums = split_top_level(&upper, ',');
+
             if lower_datums.len() != upper_datums.len() || lower_datums.len() != keys.len() {
                 return None;
             }
-            let lower = lower_datums[0].trim();
-            let upper = upper_datums[0].trim();
-            let mut clauses = vec![format!("({key} IS NOT NULL)")];
-            if !lower.eq_ignore_ascii_case("MINVALUE") {
-                let literal = deparse_partition_literal(column_type, lower)?;
-                clauses.push(format!("({comparison_left} >= {literal})"));
+
+            let mut clauses = Vec::new();
+            for (_, key) in keys {
+                clauses.push(format!("({key} IS NOT NULL)"));
             }
-            if !upper.eq_ignore_ascii_case("MAXVALUE") {
-                let literal = deparse_partition_literal(column_type, upper)?;
-                clauses.push(format!("({comparison_left} < {literal})"));
+
+            let lower = lower_datums.iter().map(|d| d.trim()).collect::<Vec<_>>();
+            let upper = upper_datums.iter().map(|d| d.trim()).collect::<Vec<_>>();
+
+            let mut k_lower = keys.len();
+            for (i, datum) in lower.iter().enumerate() {
+                if datum.eq_ignore_ascii_case("MINVALUE") {
+                    k_lower = i;
+                    break;
+                }
             }
+
+            if k_lower > 0 {
+                let mut or_clauses = Vec::new();
+                for (i, datum) in lower.iter().take(k_lower).enumerate() {
+                    let mut and_clauses = Vec::new();
+                    for (j, prev) in lower.iter().take(i).enumerate() {
+                        let literal = deparse_partition_literal(column_types[j], prev)?;
+                        and_clauses.push(format!("({} = {})", comparison_lefts[j], literal));
+                    }
+                    let literal = deparse_partition_literal(column_types[i], datum)?;
+                    if i == k_lower - 1 {
+                        and_clauses.push(format!("({} >= {})", comparison_lefts[i], literal));
+                    } else {
+                        and_clauses.push(format!("({} > {})", comparison_lefts[i], literal));
+                    }
+
+                    if and_clauses.len() == 1 {
+                        or_clauses.push(and_clauses[0].clone());
+                    } else {
+                        or_clauses.push(format!("({})", and_clauses.join(" AND ")));
+                    }
+                }
+                if or_clauses.len() == 1 {
+                    clauses.push(or_clauses[0].clone());
+                } else {
+                    clauses.push(format!("({})", or_clauses.join(" OR ")));
+                }
+            }
+
+            let mut k_upper = keys.len();
+            let mut is_maxvalue = false;
+            for (i, datum) in upper.iter().enumerate() {
+                if datum.eq_ignore_ascii_case("MAXVALUE") {
+                    k_upper = i;
+                    is_maxvalue = true;
+                    break;
+                } else if datum.eq_ignore_ascii_case("MINVALUE") {
+                    k_upper = i;
+                    break;
+                }
+            }
+
+            if k_upper > 0 {
+                let mut or_clauses = Vec::new();
+                for (i, datum) in upper.iter().take(k_upper).enumerate() {
+                    let mut and_clauses = Vec::new();
+                    for (j, prev) in upper.iter().take(i).enumerate() {
+                        let literal = deparse_partition_literal(column_types[j], prev)?;
+                        and_clauses.push(format!("({} = {})", comparison_lefts[j], literal));
+                    }
+                    let literal = deparse_partition_literal(column_types[i], datum)?;
+                    if i == k_upper - 1 && is_maxvalue {
+                        and_clauses.push(format!("({} <= {})", comparison_lefts[i], literal));
+                    } else {
+                        and_clauses.push(format!("({} < {})", comparison_lefts[i], literal));
+                    }
+
+                    if and_clauses.len() == 1 {
+                        or_clauses.push(and_clauses[0].clone());
+                    } else {
+                        or_clauses.push(format!("({})", and_clauses.join(" AND ")));
+                    }
+                }
+                if or_clauses.len() == 1 {
+                    clauses.push(or_clauses[0].clone());
+                } else {
+                    clauses.push(format!("({})", or_clauses.join(" OR ")));
+                }
+            }
+
             Some(format!("({})", clauses.join(" AND ")))
         } else if strategy.eq_ignore_ascii_case("LIST") {
+            if keys.len() != 1 {
+                return None;
+            }
+            let (_, key) = &keys[0];
+            let column_type = column_types[0];
+            let comparison_left = &comparison_lefts[0];
+
             let inner = extract_paren_group(bound, "IN (")?;
             let datums = split_top_level(&inner, ',');
             match datums.as_slice() {

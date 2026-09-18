@@ -20,6 +20,7 @@ fn assert_success(output: &Output, operation: &str) {
 #[test]
 #[ignore = "requires a live local PostgreSQL database via DATABASE_URL"]
 fn live_encrypted_cache_round_trip_and_rejection_contract() {
+    let _live_database_guard = crate::internal_tests::live_database_test_lock();
     let database_url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL is required for encryption proof");
     let temp_dir = tempfile::tempdir().expect("create live encryption temp directory");
