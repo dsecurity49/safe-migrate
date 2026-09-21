@@ -1,0 +1,1 @@
+ALTER TABLE sm_core.pending_finalize_list_parent DETACH PARTITION sm_core.pending_finalize_list_child FINALIZE;

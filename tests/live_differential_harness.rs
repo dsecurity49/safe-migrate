@@ -60,7 +60,32 @@ struct RuleManifest {
     #[serde(default)]
     required_role_edges: Vec<RequiredRoleEdge>,
     #[serde(default)]
+    pending_detach_setup: BTreeMap<String, PendingDetachSetup>,
+    #[serde(default)]
     notes: Option<String>,
+}
+
+/// Certificate that a fixture begins from a genuinely-pending concurrent detach
+/// (PostgreSQL `inhdetachpending = true`) instead of a steady-state baseline.
+/// The harness plants this real catalog state by starting a blocked
+/// `DETACH PARTITION ... CONCURRENTLY` and terminating the backend after its
+/// first internal transaction commits, matching how an interrupted or crashed
+/// detach leaves `pg_inherits` behind.  `FINALIZE` fixtures then validate
+/// against the true crash-recovery catalog.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PendingDetachSetup {
+    schema: String,
+    parent: String,
+    child: String,
+    strategy: String,
+    column: String,
+    bound: String,
+    // Interrupt via `pg_terminate_backend` (backend crash) instead of a
+    // protocol-level query cancel.  The committed pending row is identical;
+    // the distinction exercises the crash-recovery catalog path.
+    #[serde(default)]
+    crash: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -652,6 +677,32 @@ fn live_postgres_differential_harness() {
                 format!("case={}/{} phase=baseline-rebuilt", rule.rule_dir, fixture),
             );
 
+            if let Some(setup) = rule.pending_detach_setup.get(fixture) {
+                let planted = plant_pending_detach(&mut client, database_config.clone(), setup);
+                match planted {
+                    Ok(child) => {
+                        verbose(
+                            verbosity,
+                            2,
+                            format!(
+                                "case={}/{} phase=pending-detach-planted child={child}",
+                                rule.rule_dir, fixture
+                            ),
+                        );
+                    }
+                    Err(error) => {
+                        mismatches.push(Mismatch {
+                            rule_dir: rule.rule_dir.clone(),
+                            fixture: fixture.clone(),
+                            category: MismatchCategory::LiveExecutionFailed,
+                            root_cause: RootCauseClassification::HarnessBug,
+                            note: format!("failed to plant pending concurrent detach: {error:#}"),
+                        });
+                        continue;
+                    }
+                }
+            }
+
             let baseline_cache = match populate_cache(&mut client, Some(&rule.schemas)) {
                 Ok(cache) => cache,
                 Err(error) => {
@@ -998,6 +1049,97 @@ fn repo_path(relative: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(relative)
 }
 
+/// Plant a real interrupted-concurrent-detach catalog state: create a parent
+/// and child partition, block a `DETACH PARTITION ... CONCURRENTLY` behind a
+/// second session's REPEATABLE READ snapshot, wait for PostgreSQL to commit
+/// the first internal transaction (`inhdetachpending = true`), then interrupt
+/// the detach.  `crash` controls the interruption: `true` terminates the
+/// backend (`pg_terminate_backend`), matching how a backend crash leaves the
+/// pending row behind; `false` issues a protocol-level query cancel
+/// (`cancel_query`).  Either way the committed pending row survives exactly as
+/// `FINALIZE` expects it, and the harness synchronizes it via `sync`.
+///
+/// Returns the identifier of the child relation so callers can assert the
+/// hydrated pending edge.
+fn plant_pending_detach(
+    main: &mut Client,
+    config: PostgresConfig,
+    setup: &PendingDetachSetup,
+) -> anyhow::Result<String> {
+    let qualified_parent = format!("{}.{}", setup.schema, setup.parent);
+    let qualified_child = format!("{}.{}", setup.schema, setup.child);
+    main.batch_execute(&format!(
+        "CREATE TABLE {qualified_parent} ({column} integer NOT NULL) PARTITION BY {strategy} ({column});
+         CREATE TABLE {qualified_child} PARTITION OF {qualified_parent} FOR VALUES {bound};",
+        column = setup.column,
+        strategy = setup.strategy,
+        bound = setup.bound,
+    ))?;
+
+    // A second session holds a REPEATABLE READ snapshot, blocking phase 2 of
+    // DETACH CONCURRENTLY (the phase-1 catalog row is already committed).
+    let mut blocker = config.connect(NoTls)?;
+    blocker.batch_execute(&format!(
+        "BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT * FROM {qualified_parent};"
+    ))?;
+
+    let mut detacher = config.connect(NoTls)?;
+    let detach_backend: i32 = detacher
+        .query_one("SELECT pg_backend_pid()", &[])
+        .expect("cannot identify the detacher backend")
+        .get(0);
+    let cancel = detacher.cancel_token();
+    let detach_sql =
+        format!("ALTER TABLE {qualified_parent} DETACH PARTITION {qualified_child} CONCURRENTLY");
+    let worker = std::thread::spawn(move || detacher.batch_execute(&detach_sql));
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut pending = false;
+    while Instant::now() < deadline {
+        pending = main
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM pg_inherits WHERE inhrelid = to_regclass($1) AND inhdetachpending)",
+                &[&qualified_child],
+            )?
+            .get(0);
+        if pending {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    if setup.crash {
+        main.execute("SELECT pg_terminate_backend($1)", &[&detach_backend])?;
+    } else {
+        cancel.cancel_query(NoTls)?;
+    }
+    let detached = worker.join().expect("detach worker panicked");
+    blocker.batch_execute("ROLLBACK")?;
+
+    if !pending {
+        anyhow::bail!("DETACH CONCURRENTLY never reached pending state for {qualified_child}");
+    }
+    if detached.is_ok() {
+        anyhow::bail!("interrupted detach of {qualified_child} completed despite the interruption");
+    }
+    let sqlstate = detached
+        .as_ref()
+        .err()
+        .and_then(|error| error.as_db_error())
+        .map(|db_error| db_error.code().code())
+        .unwrap_or_else(|| if setup.crash { "<io>" } else { "<none>" });
+    if !matches!(
+        sqlstate,
+        "57014" | "57P01" | "57P02" | "08P01" | "08006" | "<io>"
+    ) {
+        anyhow::bail!(
+            "interrupted detach of {qualified_child} failed unexpectedly (SQLSTATE {sqlstate}): {error:?}",
+            error = detached
+        );
+    }
+    Ok(qualified_child)
+}
+
 #[test]
 #[ignore = "requires a disposable local PostgreSQL database via DATABASE_URL"]
 fn live_interrupted_partition_detach_finalize() {
@@ -1020,45 +1162,31 @@ fn live_interrupted_partition_detach_finalize() {
         .batch_execute(&format!("CREATE SCHEMA {schema}"))
         .unwrap();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        for (strategy, bound) in [("RANGE", "FROM (0) TO (10)"), ("LIST", "IN (1, 2, 3)")] {
-            client
-                .batch_execute(&format!(
-                    "CREATE TABLE {schema}.parent(id integer) PARTITION BY {strategy}(id);
-                CREATE TABLE {schema}.child PARTITION OF {schema}.parent FOR VALUES {bound};"
-                ))
-                .unwrap();
-            let mut blocker = config.connect(NoTls).unwrap();
-            blocker
-                .batch_execute(&format!(
-                    "BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT * FROM {schema}.parent;"
-                ))
-                .unwrap();
-            let mut detacher = config.connect(NoTls).unwrap();
-            detacher
-                .batch_execute("SET statement_timeout = '15s'")
-                .unwrap();
-            let cancel = detacher.cancel_token();
-            let sql =
-                format!("ALTER TABLE {schema}.parent DETACH PARTITION {schema}.child CONCURRENTLY");
-            let worker = std::thread::spawn(move || detacher.batch_execute(&sql));
-            let deadline = Instant::now() + Duration::from_secs(10);
-            let mut pending = false;
-            while Instant::now() < deadline {
-                pending = client.query_one("SELECT EXISTS (SELECT 1 FROM pg_inherits WHERE inhrelid = to_regclass($1) AND inhdetachpending)", &[&format!("{schema}.child")]).unwrap().get(0);
-                if pending {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            let cancellation = cancel.cancel_query(NoTls);
-            let detached = worker.join().expect("detach worker");
-            blocker.batch_execute("ROLLBACK").unwrap();
-            assert!(pending, "detach never committed its pending state");
-            cancellation.expect("cancel blocked detach");
-            assert_eq!(
-                detached.unwrap_err().code(),
-                Some(&postgres::error::SqlState::QUERY_CANCELED)
-            );
+        let setups = [
+            PendingDetachSetup {
+                schema: schema.clone(),
+                parent: "parent".to_string(),
+                child: "child".to_string(),
+                strategy: "RANGE".to_string(),
+                column: "id".to_string(),
+                bound: "FROM (0) TO (10)".to_string(),
+                crash: false,
+            },
+            PendingDetachSetup {
+                schema: schema.clone(),
+                parent: "parent".to_string(),
+                child: "child".to_string(),
+                strategy: "LIST".to_string(),
+                column: "id".to_string(),
+                bound: "IN (1, 2, 3)".to_string(),
+                crash: true,
+            },
+        ];
+        for setup in setups {
+            plant_pending_detach(&mut client, config.clone(), &setup)
+                .expect("plant pending detach");
+            let qualified_parent = format!("{}.{}", setup.schema, setup.parent);
+            let qualified_child = format!("{}.{}", setup.schema, setup.child);
 
             let scopes = vec![schema.clone()];
             let cache = populate_cache(&mut client, Some(&scopes)).expect("sync interrupted state");
@@ -1082,8 +1210,9 @@ fn live_interrupted_partition_detach_finalize() {
                 .cloned()
                 .collect();
             assert_eq!(checks_before.len(), 1);
-            let finalize =
-                format!("ALTER TABLE {schema}.parent DETACH PARTITION {schema}.child FINALIZE;");
+            let finalize = format!(
+                "ALTER TABLE {qualified_parent} DETACH PARTITION {qualified_child} FINALIZE;"
+            );
             let findings = SafeMigrateEngine::new(Config::default())
                 .analyze(&finalize, &mut state)
                 .unwrap();
@@ -1123,7 +1252,7 @@ fn live_interrupted_partition_detach_finalize() {
             }
             client
                 .batch_execute(&format!(
-                    "DROP TABLE {schema}.child; DROP TABLE {schema}.parent;"
+                    "DROP TABLE {qualified_child}; DROP TABLE {qualified_parent};"
                 ))
                 .unwrap();
         }
@@ -1393,6 +1522,14 @@ fn validate_manifest(manifest: &DifferentialManifest, path: &Path) {
                 fixture
             );
         }
+        for fixture in rule.pending_detach_setup.keys() {
+            assert!(
+                rule.fixture_autocommit.contains(fixture),
+                "pending-detach fixture must be autocommit (DETACH CONCURRENTLY cannot run in a transaction): {}/{}",
+                rule.rule_dir,
+                fixture
+            );
+        }
         for fixture in rule.fixture_min_pg_version.keys() {
             assert!(
                 included.contains(fixture),
@@ -1400,6 +1537,39 @@ fn validate_manifest(manifest: &DifferentialManifest, path: &Path) {
                 rule.rule_dir,
                 fixture
             );
+        }
+
+        for (fixture, setup) in &rule.pending_detach_setup {
+            assert!(
+                included.contains(fixture),
+                "pending-detach setup references a non-included fixture: {}/{}",
+                rule.rule_dir,
+                fixture
+            );
+            assert!(
+                !rule
+                    .excluded_fixtures
+                    .iter()
+                    .any(|exclusion| exclusion.fixture == *fixture),
+                "pending-detach fixture cannot also be excluded: {}/{}",
+                rule.rule_dir,
+                fixture
+            );
+            for identity in [
+                &setup.schema,
+                &setup.parent,
+                &setup.child,
+                &setup.strategy,
+                &setup.column,
+                &setup.bound,
+            ] {
+                assert!(
+                    !identity.trim().is_empty(),
+                    "pending-detach setup has an empty field for {}/{}",
+                    rule.rule_dir,
+                    fixture
+                );
+            }
         }
 
         validate_expected_live_errors(rule, &included, &valid_rule_ids);
@@ -1493,6 +1663,7 @@ fn expected_live_error_must_reference_an_included_fixture() {
         )]),
         required_relations: Vec::new(),
         required_role_edges: Vec::new(),
+        pending_detach_setup: BTreeMap::new(),
         notes: None,
     };
     validate_expected_live_errors(&rule, &BTreeSet::new(), &BTreeSet::from(["chain-conflict"]));
@@ -1522,6 +1693,7 @@ fn expected_live_error_must_reference_a_known_simulator_rule() {
         )]),
         required_relations: Vec::new(),
         required_role_edges: Vec::new(),
+        pending_detach_setup: BTreeMap::new(),
         notes: None,
     };
     validate_expected_live_errors(
