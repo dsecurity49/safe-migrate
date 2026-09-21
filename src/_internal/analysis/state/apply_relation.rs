@@ -7397,13 +7397,11 @@ impl AnalysisState {
                     for datum in non_null_datums {
                         values.push(decode_sql_literal(&datum.text)?);
                     }
+                    let type_family = DataTypeFamily::from_type_name(column_type)?;
+                    let canonical_type = type_family.to_canonical_type_string(column_type);
                     let mapped = elements_for_array(&values, column_type)?;
-                    if matches!(column_type, "integer" | "smallint" | "bigint") {
-                        format!("({comparison_left} = ANY (ARRAY[{}]))", mapped.join(", "))
-                    } else {
-                        let array_text = serialize_array_literal(&mapped);
-                        format!("({comparison_left} = ANY ('{array_text}'::{column_type}[]))")
-                    }
+                    let array_text = serialize_array_literal(&mapped);
+                    format!("({comparison_left} = ANY ('{array_text}'::{canonical_type}[]))")
                 }
             };
 
@@ -7674,10 +7672,7 @@ fn serialize_array_literal(values: &[String]) -> String {
         .map(|value| {
             let special = value.is_empty()
                 || value.contains([',', '"', '\\', '{', '}'])
-                || value.starts_with(' ')
-                || value.ends_with(' ')
-                || value.starts_with('\n')
-                || value.ends_with('\n');
+                || value.contains(char::is_whitespace);
             let token = if special {
                 let mut quoted = String::from("\"");
                 for ch in value.chars() {
@@ -7788,7 +7783,23 @@ fn deparse_partition_literal(data_type: &str, raw: &str) -> Option<String> {
             Some(format!("'{}'::bigint", value))
         }
         DataTypeFamily::Numeric => {
-            if numeric_float_like(&decoded) {
+            // When the column type carries a typmod (e.g. numeric(10,2)), PostgreSQL's
+            // get_const_expr casts and applies the column scale: an integer input `5`
+            // is rendered as `5.00::numeric(10,2)` when scale=2.  Bare `numeric` with
+            // a float-like constant is printed without a cast.
+            let has_typmod = data_type.contains('(');
+            if has_typmod {
+                // Apply the declared scale if the decoded value has no fractional part.
+                // e.g. numeric(10,2) + decoded "5" → "5.00"
+                let scale = numeric_typmod_scale(data_type).unwrap_or(0);
+                let scaled = if !decoded.contains('.') && scale > 0 {
+                    let zeros = "0".repeat(scale as usize);
+                    format!("{decoded}.{zeros}")
+                } else {
+                    decoded
+                };
+                Some(format!("{scaled}::{data_type}"))
+            } else if numeric_float_like(&decoded) {
                 Some(decoded)
             } else {
                 Some(format!("'{}'::numeric", decoded))
@@ -7836,9 +7847,11 @@ fn deparse_partition_literal(data_type: &str, raw: &str) -> Option<String> {
         | DataTypeFamily::CharacterVarying
         | DataTypeFamily::Character
         | DataTypeFamily::BpChar
-        | DataTypeFamily::Timestamp => {
-            Some(format!("'{}'::{}", decoded.replace('\'', "''"), family.to_canonical_type_string(data_type)))
-        }
+        | DataTypeFamily::Timestamp => Some(format!(
+            "'{}'::{}",
+            decoded.replace('\'', "''"),
+            family.to_canonical_type_string(data_type)
+        )),
         _ => None,
     }
 }
@@ -7854,6 +7867,14 @@ fn numeric_float_like(value: &str) -> bool {
         && value[first.len_utf8()..]
             .chars()
             .any(|ch| matches!(ch, '.' | 'e' | 'E'))
+}
+
+/// Extract the scale component from a `numeric(precision, scale)` type string.
+/// Returns `None` for bare `numeric` or `numeric(precision)` (scale 0 implied).
+fn numeric_typmod_scale(type_name: &str) -> Option<u32> {
+    let inner = type_name.split('(').nth(1)?.trim_end_matches(')');
+    let scale_str = inner.split(',').nth(1)?.trim();
+    scale_str.parse().ok()
 }
 
 enum DatumKind {
@@ -8013,7 +8034,6 @@ fn parse_typed_bound(bound: &str) -> Option<TypedBound> {
     }
 }
 
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DataTypeFamily {
     Boolean,
@@ -8046,7 +8066,11 @@ impl DataTypeFamily {
             Some(Self::SmallInt)
         } else if name == "bigint" || name == "int8" {
             Some(Self::BigInt)
-        } else if name == "numeric" || name == "decimal" {
+        } else if name == "numeric"
+            || name == "decimal"
+            || name.starts_with("numeric(")
+            || name.starts_with("decimal(")
+        {
             Some(Self::Numeric)
         } else if name == "real" || name == "float4" {
             Some(Self::Real)
@@ -8062,9 +8086,16 @@ impl DataTypeFamily {
             Some(Self::Name)
         } else if name == "citext" {
             Some(Self::CiText)
-        } else if name == "varchar" || name.starts_with("character varying") {
+        } else if name == "varchar"
+            || name.starts_with("varchar(")
+            || name.starts_with("character varying")
+        {
             Some(Self::CharacterVarying)
-        } else if name == "char" || name.starts_with("char(") || name.starts_with("character(") || name == "character" {
+        } else if name == "char"
+            || name.starts_with("char(")
+            || name.starts_with("character(")
+            || name == "character"
+        {
             Some(Self::Character)
         } else if name.starts_with("bpchar") {
             Some(Self::BpChar)
@@ -8077,7 +8108,7 @@ impl DataTypeFamily {
         }
     }
 
-    fn to_canonical_type_string(&self, original: &str) -> String {
+    fn to_canonical_type_string(self, original: &str) -> String {
         match self {
             Self::CharacterVarying => {
                 if original.starts_with("varchar(") {
@@ -8087,7 +8118,7 @@ impl DataTypeFamily {
                 } else {
                     original.to_string()
                 }
-            },
+            }
             Self::Character => {
                 if original.starts_with("char(") {
                     original.replacen("char(", "character(", 1)
@@ -8096,7 +8127,16 @@ impl DataTypeFamily {
                 } else {
                     original.to_string()
                 }
-            },
+            }
+            Self::BpChar => {
+                // bpchar(N) is the internal name for character(N); pg_get_constraintdef
+                // renders it as character(N). Bare bpchar (no typmod) stays as-is.
+                if original.starts_with("bpchar(") {
+                    original.replacen("bpchar(", "character(", 1)
+                } else {
+                    original.to_string()
+                }
+            }
             Self::Timestamp => "timestamp without time zone".to_string(),
             Self::TimestampTz => "timestamp with time zone".to_string(),
             _ => original.to_string(),

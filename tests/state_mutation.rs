@@ -2356,7 +2356,12 @@ mod state_mutation_tests {
             engine.analyze(&sql, &mut state).unwrap();
             assert_eq!(state.local.confidence, Confidence::Exact, "{bound}");
             let child_id = object_id("public", "child");
-            let constraint = state.local.constraints.values().find(|c| c.table_id == child_id && c.kind == ConstraintKind::Check).unwrap();
+            let constraint = state
+                .local
+                .constraints
+                .values()
+                .find(|c| c.table_id == child_id && c.kind == ConstraintKind::Check)
+                .unwrap();
             assert_eq!(constraint.definition.as_deref(), Some(expected), "{bound}");
         }
     }
@@ -2393,7 +2398,12 @@ mod state_mutation_tests {
             engine.analyze(&sql, &mut state).unwrap();
             assert_eq!(state.local.confidence, Confidence::Exact, "{bound}");
             let child_id = object_id("public", "child");
-            let constraint = state.local.constraints.values().find(|c| c.table_id == child_id && c.kind == ConstraintKind::Check).unwrap();
+            let constraint = state
+                .local
+                .constraints
+                .values()
+                .find(|c| c.table_id == child_id && c.kind == ConstraintKind::Check)
+                .unwrap();
             assert_eq!(constraint.definition.as_deref(), Some(expected), "{bound}");
         }
     }
@@ -2436,7 +2446,12 @@ mod state_mutation_tests {
             engine.analyze(&sql, &mut state).unwrap();
             assert_eq!(state.local.confidence, Confidence::Exact, "{keys}");
             let child_id = object_id("public", "child");
-            let constraint = state.local.constraints.values().find(|c| c.table_id == child_id && c.kind == ConstraintKind::Check).unwrap();
+            let constraint = state
+                .local
+                .constraints
+                .values()
+                .find(|c| c.table_id == child_id && c.kind == ConstraintKind::Check)
+                .unwrap();
             assert_eq!(constraint.definition.as_deref(), Some(expected), "{bound}");
         }
     }

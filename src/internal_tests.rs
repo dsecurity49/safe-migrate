@@ -41,6 +41,8 @@ mod live_cache_encryption;
 mod live_catalog_sync;
 #[path = "../tests/live_differential_harness.rs"]
 mod live_differential_harness;
+#[path = "../tests/live_parity_oracle_file.rs"]
+mod live_parity_oracle;
 #[path = "../tests/performance_scenarios.rs"]
 mod performance_scenarios_file;
 #[path = "../tests/resolver_namespaces.rs"]
@@ -53,8 +55,6 @@ mod rule_evaluation;
 mod state_machine_guards;
 #[path = "../tests/state_mutation.rs"]
 mod state_mutation;
-#[path = "../tests/live_parity_oracle_file.rs"]
-mod live_parity_oracle;
 #[path = "../tests/transaction_lifecycle.rs"]
 mod transaction_lifecycle;
 #[path = "../tests/v045_state.rs"]
