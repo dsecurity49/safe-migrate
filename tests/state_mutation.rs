@@ -1933,6 +1933,81 @@ mod state_mutation_tests {
     }
 
     #[test]
+    fn multi_parent_outside_cone_column_rename_is_rejected_without_mutation() {
+        // child INHERITS (parent_a, parent_b).
+        // Renaming parent_a.id while parent_b also owns child.id is blocked:
+        // child.id has parent_count=2, but only 1 parent is in the rename cone.
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TABLE parent_a (id integer);
+                 CREATE TABLE parent_b (id integer);
+                 CREATE TABLE child () INHERITS (parent_a, parent_b);",
+                &mut state,
+            )
+            .unwrap();
+        let relations_before = state.local.relations.clone();
+        let findings = engine
+            .analyze(
+                "ALTER TABLE parent_a RENAME COLUMN id TO renamed;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict"),
+            "expected chain-conflict finding; got: {findings:?}"
+        );
+        // Nothing mutated on any of the three relations.
+        assert_eq!(state.local.relations, relations_before);
+    }
+
+    #[test]
+    fn multi_parent_both_in_cone_column_rename_succeeds() {
+        // When both parents are renamed together (via two statements in the same
+        // migration the simulator processes sequentially), the child rename goes
+        // through cleanly because every parent is in the already-renamed set by
+        // the time we process parent_b.  Model this via a single shared ancestor:
+        // grandparent → (parent_a, parent_b) → child.
+        // Renaming grandparent.id propagates to both parents and the child, all
+        // of which are descendants of grandparent — all in the cone.
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TABLE grandparent (id integer);
+                 CREATE TABLE parent_a () INHERITS (grandparent);
+                 CREATE TABLE parent_b () INHERITS (grandparent);
+                 CREATE TABLE child () INHERITS (parent_a, parent_b);",
+                &mut state,
+            )
+            .unwrap();
+        engine
+            .analyze(
+                "ALTER TABLE grandparent RENAME COLUMN id TO renamed;",
+                &mut state,
+            )
+            .unwrap();
+        for name in ["grandparent", "parent_a", "parent_b", "child"] {
+            let RelationOverlay::Present(relation) =
+                &state.local.relations[&object_id("public", name)]
+            else {
+                panic!("missing {name}");
+            };
+            assert!(
+                relation.has_column("renamed"),
+                "{name} missing column 'renamed'"
+            );
+            assert!(
+                !relation.has_column("id"),
+                "{name} still has old column 'id'"
+            );
+        }
+    }
+
+    #[test]
     fn partition_key_column_rename_preserves_expressions_and_rollback() {
         let engine = setup_engine();
         let mut state = setup_state();
