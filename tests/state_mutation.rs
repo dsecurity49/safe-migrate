@@ -2120,7 +2120,7 @@ mod state_mutation_tests {
         assert!(retained.validated);
         assert_eq!(
             retained.definition.as_deref(),
-            Some("((id IS NOT NULL) AND (id >= 0) AND (id < 10))")
+            Some("(((id IS NOT NULL) AND (id >= 0) AND (id < 10)))")
         );
 
         let findings = engine
@@ -2156,7 +2156,7 @@ mod state_mutation_tests {
             assert_eq!(
                 check.definition.as_deref(),
                 Some(
-                    format!("(({quoted} IS NOT NULL) AND ({quoted} >= 0) AND ({quoted} < 10))")
+                    format!("((({quoted} IS NOT NULL) AND ({quoted} >= 0) AND ({quoted} < 10)))")
                         .as_str()
                 )
             );
@@ -2279,7 +2279,7 @@ mod state_mutation_tests {
             &state.local.constraints[&(object_id("public", "child"), "child_id_check".into())];
         assert_eq!(
             retained.definition.as_deref(),
-            Some("((id IS NOT NULL) AND (id >= 0) AND (id < 10))")
+            Some("(((id IS NOT NULL) AND (id >= 0) AND (id < 10)))")
         );
         assert!(state.local.graph.edges().iter().any(|edge| {
             edge.dependent == object_id("public", "child")
@@ -2308,7 +2308,7 @@ mod state_mutation_tests {
         assert!(state.local.constraints.values().any(|constraint| {
             constraint.table_id == object_id("public", "child")
                 && constraint.kind == ConstraintKind::Check
-                && constraint.definition.as_deref() == Some("((a IS NOT NULL) AND (b IS NOT NULL) AND ((a > 0) OR ((a = 0) AND (b >= 0))) AND ((a < 10) OR ((a = 10) AND (b < 10))))")
+                && constraint.definition.as_deref() == Some("(((a IS NOT NULL) AND (b IS NOT NULL) AND ((a > 0) OR ((a = 0) AND (b >= 0))) AND ((a < 10) OR ((a = 10) AND (b < 10)))))")
         }));
     }
 
@@ -2320,31 +2320,31 @@ mod state_mutation_tests {
                 "a integer, b integer, c integer",
                 "(a, b, c)",
                 "FROM (1, 2, 3) TO (10, 20, 30)",
-                "((a IS NOT NULL) AND (b IS NOT NULL) AND (c IS NOT NULL) AND ((a > 1) OR ((a = 1) AND (b > 2)) OR ((a = 1) AND (b = 2) AND (c >= 3))) AND ((a < 10) OR ((a = 10) AND (b < 20)) OR ((a = 10) AND (b = 20) AND (c < 30))))",
+                "(((a IS NOT NULL) AND (b IS NOT NULL) AND (c IS NOT NULL) AND ((a > 1) OR ((a = 1) AND (b > 2)) OR ((a = 1) AND (b = 2) AND (c >= 3))) AND ((a < 10) OR ((a = 10) AND (b < 20)) OR ((a = 10) AND (b = 20) AND (c < 30)))))",
             ),
             (
                 "a integer, b integer, c integer",
                 "(a, b, c)",
                 "FROM (1, 2, MINVALUE) TO (10, 20, MAXVALUE)",
-                "((a IS NOT NULL) AND (b IS NOT NULL) AND (c IS NOT NULL) AND ((a > 1) OR ((a = 1) AND (b >= 2))) AND ((a < 10) OR ((a = 10) AND (b <= 20))))",
+                "(((a IS NOT NULL) AND (b IS NOT NULL) AND (c IS NOT NULL) AND ((a > 1) OR ((a = 1) AND (b >= 2))) AND ((a < 10) OR ((a = 10) AND (b <= 20)))))",
             ),
             (
                 "a integer, b integer, c integer",
                 "(a, b, c)",
                 "FROM (1, MINVALUE, MINVALUE) TO (10, MAXVALUE, MAXVALUE)",
-                "((a IS NOT NULL) AND (b IS NOT NULL) AND (c IS NOT NULL) AND (a >= 1) AND (a <= 10))",
+                "(((a IS NOT NULL) AND (b IS NOT NULL) AND (c IS NOT NULL) AND (a >= 1) AND (a <= 10)))",
             ),
             (
                 "a integer, b integer",
                 "(a, b)",
                 "FROM (MINVALUE, MINVALUE) TO (MAXVALUE, MAXVALUE)",
-                "((a IS NOT NULL) AND (b IS NOT NULL))",
+                "(((a IS NOT NULL) AND (b IS NOT NULL)))",
             ),
             (
                 "a integer, b integer",
                 "(a, b)",
                 "FROM (MINVALUE, MINVALUE) TO (10, 20)",
-                "((a IS NOT NULL) AND (b IS NOT NULL) AND ((a < 10) OR ((a = 10) AND (b < 20))))",
+                "(((a IS NOT NULL) AND (b IS NOT NULL) AND ((a < 10) OR ((a = 10) AND (b < 20)))))",
             ),
         ] {
             let mut state = setup_state();
@@ -2355,14 +2355,9 @@ mod state_mutation_tests {
             );
             engine.analyze(&sql, &mut state).unwrap();
             assert_eq!(state.local.confidence, Confidence::Exact, "{bound}");
-            assert!(
-                state.local.constraints.values().any(|constraint| {
-                    constraint.table_id == object_id("public", "child")
-                        && constraint.kind == ConstraintKind::Check
-                        && constraint.definition.as_deref() == Some(expected)
-                }),
-                "{bound}"
-            );
+            let child_id = object_id("public", "child");
+            let constraint = state.local.constraints.values().find(|c| c.table_id == child_id && c.kind == ConstraintKind::Check).unwrap();
+            assert_eq!(constraint.definition.as_deref(), Some(expected), "{bound}");
         }
     }
 
@@ -2374,19 +2369,19 @@ mod state_mutation_tests {
                 "a character varying(32), b character varying(32)",
                 "(a, b)",
                 "FROM ('a', 'b') TO ('m', 'n')",
-                "((a IS NOT NULL) AND (b IS NOT NULL) AND (((a)::text > 'a'::character varying(32)) OR (((a)::text = 'a'::character varying(32)) AND ((b)::text >= 'b'::character varying(32)))) AND (((a)::text < 'm'::character varying(32)) OR (((a)::text = 'm'::character varying(32)) AND ((b)::text < 'n'::character varying(32)))))",
+                "(((a IS NOT NULL) AND (b IS NOT NULL) AND (((a)::text > 'a'::character varying(32)) OR (((a)::text = 'a'::character varying(32)) AND ((b)::text >= 'b'::character varying(32)))) AND (((a)::text < 'm'::character varying(32)) OR (((a)::text = 'm'::character varying(32)) AND ((b)::text < 'n'::character varying(32))))))",
             ),
             (
                 "a character varying(32), b integer",
                 "(a, b)",
                 "FROM ('a', 0) TO ('m', 10)",
-                "((a IS NOT NULL) AND (b IS NOT NULL) AND (((a)::text > 'a'::character varying(32)) OR (((a)::text = 'a'::character varying(32)) AND (b >= 0))) AND (((a)::text < 'm'::character varying(32)) OR (((a)::text = 'm'::character varying(32)) AND (b < 10))))",
+                "(((a IS NOT NULL) AND (b IS NOT NULL) AND (((a)::text > 'a'::character varying(32)) OR (((a)::text = 'a'::character varying(32)) AND (b >= 0))) AND (((a)::text < 'm'::character varying(32)) OR (((a)::text = 'm'::character varying(32)) AND (b < 10)))))",
             ),
             (
                 "a character varying(16), b character varying(16), c character varying(16)",
                 "(a, b, c)",
                 "FROM ('a', 'b', 'c') TO ('x', 'y', 'z')",
-                "((a IS NOT NULL) AND (b IS NOT NULL) AND (c IS NOT NULL) AND (((a)::text > 'a'::character varying(16)) OR (((a)::text = 'a'::character varying(16)) AND ((b)::text > 'b'::character varying(16))) OR (((a)::text = 'a'::character varying(16)) AND ((b)::text = 'b'::character varying(16)) AND ((c)::text >= 'c'::character varying(16)))) AND (((a)::text < 'x'::character varying(16)) OR (((a)::text = 'x'::character varying(16)) AND ((b)::text < 'y'::character varying(16))) OR (((a)::text = 'x'::character varying(16)) AND ((b)::text = 'y'::character varying(16)) AND ((c)::text < 'z'::character varying(16)))))",
+                "(((a IS NOT NULL) AND (b IS NOT NULL) AND (c IS NOT NULL) AND (((a)::text > 'a'::character varying(16)) OR (((a)::text = 'a'::character varying(16)) AND ((b)::text > 'b'::character varying(16))) OR (((a)::text = 'a'::character varying(16)) AND ((b)::text = 'b'::character varying(16)) AND ((c)::text >= 'c'::character varying(16)))) AND (((a)::text < 'x'::character varying(16)) OR (((a)::text = 'x'::character varying(16)) AND ((b)::text < 'y'::character varying(16))) OR (((a)::text = 'x'::character varying(16)) AND ((b)::text = 'y'::character varying(16)) AND ((c)::text < 'z'::character varying(16))))))",
             ),
         ] {
             let mut state = setup_state();
@@ -2397,14 +2392,9 @@ mod state_mutation_tests {
             );
             engine.analyze(&sql, &mut state).unwrap();
             assert_eq!(state.local.confidence, Confidence::Exact, "{bound}");
-            assert!(
-                state.local.constraints.values().any(|constraint| {
-                    constraint.table_id == object_id("public", "child")
-                        && constraint.kind == ConstraintKind::Check
-                        && constraint.definition.as_deref() == Some(expected)
-                }),
-                "{bound}"
-            );
+            let child_id = object_id("public", "child");
+            let constraint = state.local.constraints.values().find(|c| c.table_id == child_id && c.kind == ConstraintKind::Check).unwrap();
+            assert_eq!(constraint.definition.as_deref(), Some(expected), "{bound}");
         }
     }
 
@@ -2416,25 +2406,25 @@ mod state_mutation_tests {
                 "a integer",
                 "((a))",
                 "FROM (10) TO (20)",
-                "((a IS NOT NULL) AND (a >= 10) AND (a < 20))",
+                "(((a IS NOT NULL) AND (a >= 10) AND (a < 20)))",
             ),
             (
                 "a integer, b integer",
                 "((a), (b))",
                 "FROM (0, 0) TO (10, 10)",
-                "((a IS NOT NULL) AND (b IS NOT NULL) AND ((a > 0) OR ((a = 0) AND (b >= 0))) AND ((a < 10) OR ((a = 10) AND (b < 10))))",
+                "(((a IS NOT NULL) AND (b IS NOT NULL) AND ((a > 0) OR ((a = 0) AND (b >= 0))) AND ((a < 10) OR ((a = 10) AND (b < 10)))))",
             ),
             (
                 "a integer, b integer",
                 "(((a)), b)",
                 "FROM (0, 0) TO (10, 10)",
-                "((a IS NOT NULL) AND (b IS NOT NULL) AND ((a > 0) OR ((a = 0) AND (b >= 0))) AND ((a < 10) OR ((a = 10) AND (b < 10))))",
+                "(((a IS NOT NULL) AND (b IS NOT NULL) AND ((a > 0) OR ((a = 0) AND (b >= 0))) AND ((a < 10) OR ((a = 10) AND (b < 10)))))",
             ),
             (
                 "a character varying(32), b integer",
                 "((a), (b))",
                 "FROM ('a', 0) TO ('m', 10)",
-                "((a IS NOT NULL) AND (b IS NOT NULL) AND (((a)::text > 'a'::character varying(32)) OR (((a)::text = 'a'::character varying(32)) AND (b >= 0))) AND (((a)::text < 'm'::character varying(32)) OR (((a)::text = 'm'::character varying(32)) AND (b < 10))))",
+                "(((a IS NOT NULL) AND (b IS NOT NULL) AND (((a)::text > 'a'::character varying(32)) OR (((a)::text = 'a'::character varying(32)) AND (b >= 0))) AND (((a)::text < 'm'::character varying(32)) OR (((a)::text = 'm'::character varying(32)) AND (b < 10)))))",
             ),
         ] {
             let mut state = setup_state();
@@ -2445,14 +2435,9 @@ mod state_mutation_tests {
             );
             engine.analyze(&sql, &mut state).unwrap();
             assert_eq!(state.local.confidence, Confidence::Exact, "{keys}");
-            assert!(
-                state.local.constraints.values().any(|constraint| {
-                    constraint.table_id == object_id("public", "child")
-                        && constraint.kind == ConstraintKind::Check
-                        && constraint.definition.as_deref() == Some(expected)
-                }),
-                "{keys}"
-            );
+            let child_id = object_id("public", "child");
+            let constraint = state.local.constraints.values().find(|c| c.table_id == child_id && c.kind == ConstraintKind::Check).unwrap();
+            assert_eq!(constraint.definition.as_deref(), Some(expected), "{bound}");
         }
     }
 
@@ -2681,7 +2666,7 @@ mod state_mutation_tests {
             &state.local.constraints[&(object_id("public", "child"), "child_a_check".into())];
         assert_eq!(
             retained.definition.as_deref(),
-            Some("((a IS NOT NULL) AND (a = ANY ('{1,2,3}'::integer[])))")
+            Some("(((a IS NOT NULL) AND (a = ANY ('{1,2,3}'::integer[]))))")
         );
     }
 

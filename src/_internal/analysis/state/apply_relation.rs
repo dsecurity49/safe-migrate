@@ -7212,7 +7212,13 @@ impl AnalysisState {
         relation: &RelationState,
     ) -> Option<String> {
         let clauses = self.synthesize_partition_check_clauses(strategy, bound, keys, relation)?;
-        Some(format!("({})", clauses.join(" AND ")))
+        if clauses.is_empty() {
+            None
+        } else if clauses.len() == 1 {
+            Some(format!("({})", clauses[0]))
+        } else {
+            Some(format!("(({}))", clauses.join(" AND ")))
+        }
     }
 
     fn synthesize_partition_check_clauses(
@@ -7236,7 +7242,8 @@ impl AnalysisState {
                 .find(|c| &c.name == key_name)
                 .and_then(|c| c.data_type.as_deref())?;
 
-            let comp_left = if col_type.starts_with("character varying") {
+            let type_family = DataTypeFamily::from_type_name(col_type)?;
+            let comp_left = if type_family.requires_text_cast_for_comparison() {
                 format!("({key})::text")
             } else {
                 key.clone()
@@ -7627,8 +7634,9 @@ fn array_element_type(elements: &[&str], fallback: &str) -> Option<String> {
 /// Render partition-list values in the array-constant element syntax for the
 /// key column type (`t`/`f` for booleans, otherwise the element text as-is).
 fn elements_for_array(values: &[String], column_type: &str) -> Option<Vec<String>> {
-    match column_type {
-        "boolean" => values
+    let family = DataTypeFamily::from_type_name(column_type)?;
+    match family {
+        DataTypeFamily::Boolean => values
             .iter()
             .map(|value| {
                 if value.eq_ignore_ascii_case("true") {
@@ -7640,16 +7648,18 @@ fn elements_for_array(values: &[String], column_type: &str) -> Option<Vec<String
                 }
             })
             .collect(),
-        "integer" | "smallint" | "bigint" | "numeric" | "text" | "name" | "citext" => {
-            Some(values.to_vec())
-        }
-        type_name
-            if type_name.starts_with("character varying")
-                || type_name.starts_with("character(")
-                || type_name.starts_with("bpchar") =>
-        {
-            Some(values.to_vec())
-        }
+        DataTypeFamily::Integer
+        | DataTypeFamily::SmallInt
+        | DataTypeFamily::BigInt
+        | DataTypeFamily::Numeric
+        | DataTypeFamily::Text
+        | DataTypeFamily::Name
+        | DataTypeFamily::CiText
+        | DataTypeFamily::CharacterVarying
+        | DataTypeFamily::Character
+        | DataTypeFamily::BpChar
+        | DataTypeFamily::Date
+        | DataTypeFamily::Timestamp => Some(values.to_vec()),
         _ => None,
     }
 }
@@ -7746,8 +7756,9 @@ fn predicate_column_name(predicate: &str) -> Option<String> {
 /// text-like/uuid/ISO-date values quoted with a `::type` cast.
 fn deparse_partition_literal(data_type: &str, raw: &str) -> Option<String> {
     let decoded = decode_sql_literal(raw)?;
-    match data_type {
-        "boolean" => {
+    let family = DataTypeFamily::from_type_name(data_type)?;
+    match family {
+        DataTypeFamily::Boolean => {
             if decoded.eq_ignore_ascii_case("true") {
                 Some("true".to_string())
             } else if decoded.eq_ignore_ascii_case("false") {
@@ -7756,7 +7767,7 @@ fn deparse_partition_literal(data_type: &str, raw: &str) -> Option<String> {
                 None
             }
         }
-        "integer" => {
+        DataTypeFamily::Integer => {
             let value: i64 = decoded.parse().ok()?;
             if (i32::MIN as i64..=i32::MAX as i64).contains(&value) {
                 if value >= 0 {
@@ -7768,29 +7779,29 @@ fn deparse_partition_literal(data_type: &str, raw: &str) -> Option<String> {
                 None
             }
         }
-        "smallint" => {
+        DataTypeFamily::SmallInt => {
             let value: i16 = decoded.parse().ok()?;
             Some(format!("'{}'::smallint", value))
         }
-        "bigint" => {
+        DataTypeFamily::BigInt => {
             let value: i64 = decoded.parse().ok()?;
             Some(format!("'{}'::bigint", value))
         }
-        "numeric" => {
+        DataTypeFamily::Numeric => {
             if numeric_float_like(&decoded) {
                 Some(decoded)
             } else {
                 Some(format!("'{}'::numeric", decoded))
             }
         }
-        "real" | "double precision" => {
+        DataTypeFamily::Real | DataTypeFamily::DoublePrecision => {
             if numeric_float_like(&decoded) {
                 Some(format!("'{}'::{}", decoded, data_type))
             } else {
                 None
             }
         }
-        "date" => {
+        DataTypeFamily::Date => {
             if decoded.len() == 10
                 && decoded.as_bytes()[4] == b'-'
                 && decoded.as_bytes()[7] == b'-'
@@ -7804,7 +7815,7 @@ fn deparse_partition_literal(data_type: &str, raw: &str) -> Option<String> {
                 None
             }
         }
-        "uuid" => {
+        DataTypeFamily::Uuid => {
             if decoded.len() == 36
                 && decoded.as_bytes()[8] == b'-'
                 && decoded.as_bytes()[13] == b'-'
@@ -7819,16 +7830,14 @@ fn deparse_partition_literal(data_type: &str, raw: &str) -> Option<String> {
                 None
             }
         }
-        type_name
-            if type_name == "text"
-                || type_name == "name"
-                || type_name == "citext"
-                || type_name.starts_with("character varying")
-                || type_name.starts_with("character(")
-                || type_name.starts_with("bpchar")
-                || type_name.starts_with("timestamp") =>
-        {
-            Some(format!("'{}'::{}", decoded.replace('\'', "''"), data_type))
+        DataTypeFamily::Text
+        | DataTypeFamily::Name
+        | DataTypeFamily::CiText
+        | DataTypeFamily::CharacterVarying
+        | DataTypeFamily::Character
+        | DataTypeFamily::BpChar
+        | DataTypeFamily::Timestamp => {
+            Some(format!("'{}'::{}", decoded.replace('\'', "''"), family.to_canonical_type_string(data_type)))
         }
         _ => None,
     }
@@ -8001,5 +8010,100 @@ fn parse_typed_bound(bound: &str) -> Option<TypedBound> {
             })
         }
         PartitionType::PartitionDefault(_) => Some(TypedBound::Default),
+    }
+}
+
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DataTypeFamily {
+    Boolean,
+    Integer,
+    SmallInt,
+    BigInt,
+    Numeric,
+    Real,
+    DoublePrecision,
+    Date,
+    Uuid,
+    Text,
+    Name,
+    CiText,
+    CharacterVarying,
+    Character,
+    BpChar,
+    Timestamp,
+    TimestampTz,
+}
+
+impl DataTypeFamily {
+    fn from_type_name(name: &str) -> Option<Self> {
+        let name = name.trim();
+        if name == "boolean" {
+            Some(Self::Boolean)
+        } else if name == "integer" || name == "int" || name == "int4" {
+            Some(Self::Integer)
+        } else if name == "smallint" || name == "int2" {
+            Some(Self::SmallInt)
+        } else if name == "bigint" || name == "int8" {
+            Some(Self::BigInt)
+        } else if name == "numeric" || name == "decimal" {
+            Some(Self::Numeric)
+        } else if name == "real" || name == "float4" {
+            Some(Self::Real)
+        } else if name == "double precision" || name == "float8" {
+            Some(Self::DoublePrecision)
+        } else if name == "date" {
+            Some(Self::Date)
+        } else if name == "uuid" {
+            Some(Self::Uuid)
+        } else if name == "text" {
+            Some(Self::Text)
+        } else if name == "name" {
+            Some(Self::Name)
+        } else if name == "citext" {
+            Some(Self::CiText)
+        } else if name == "varchar" || name.starts_with("character varying") {
+            Some(Self::CharacterVarying)
+        } else if name == "char" || name.starts_with("char(") || name.starts_with("character(") || name == "character" {
+            Some(Self::Character)
+        } else if name.starts_with("bpchar") {
+            Some(Self::BpChar)
+        } else if name == "timestamp" || name.starts_with("timestamp without time zone") {
+            Some(Self::Timestamp)
+        } else if name == "timestamptz" || name.starts_with("timestamp with time zone") {
+            Some(Self::TimestampTz)
+        } else {
+            None
+        }
+    }
+
+    fn to_canonical_type_string(&self, original: &str) -> String {
+        match self {
+            Self::CharacterVarying => {
+                if original.starts_with("varchar(") {
+                    original.replacen("varchar(", "character varying(", 1)
+                } else if original == "varchar" {
+                    "character varying".to_string()
+                } else {
+                    original.to_string()
+                }
+            },
+            Self::Character => {
+                if original.starts_with("char(") {
+                    original.replacen("char(", "character(", 1)
+                } else if original == "char" {
+                    "character(1)".to_string()
+                } else {
+                    original.to_string()
+                }
+            },
+            Self::Timestamp => "timestamp without time zone".to_string(),
+            Self::TimestampTz => "timestamp with time zone".to_string(),
+            _ => original.to_string(),
+        }
+    }
+
+    fn requires_text_cast_for_comparison(&self) -> bool {
+        matches!(self, Self::CharacterVarying)
     }
 }
