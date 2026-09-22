@@ -535,7 +535,7 @@ pub(crate) struct RelationState {
     /// Populated when the original `CREATE TABLE` statement was parsed by the
     /// simulator; empty for cache-hydrated relations (where `partition_by` is
     /// the canonical fallback).
-    #[serde(default)]
+    #[serde(skip)]
     pub partition_keys: Vec<(String, String)>,
     #[serde(default)]
     pub partition_bound: Option<String>,
