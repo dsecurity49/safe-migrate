@@ -5,6 +5,13 @@ commits and pull requests. Published binaries, checksums, and generated release
 notes are available on the
 [GitHub Releases page](https://github.com/dsecurity49/safe-migrate/releases).
 
+## v0.9.2 — 2026-09-22
+
+- Supported exact recursive propagation for inherited/partitioned column renames.
+- Validated `DETACH CONCURRENTLY` interrupted/crashed catalog states against live PostgreSQL.
+- Unified data-type classification for array elements and partition literals.
+- Extracted exact partition-key definitions natively at AST visitor time.
+
 ## v0.9.1 — 2026-09-19
 
 - Stabilized typed-table catalog synchronization, preventing layout-validation
