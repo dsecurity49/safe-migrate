@@ -746,6 +746,14 @@ impl RelationState {
                     self.partition_by = self.partition_by.as_deref().and_then(|source| {
                         crate::_internal::analysis::expr_visitor::ExprVisitor::rename_partition_key_source(source, &self.id.name, from, to)
                     });
+                    for (resolved, raw) in &mut self.partition_keys {
+                        if resolved == from {
+                            *resolved = to.clone();
+                            if raw == from {
+                                *raw = to.clone();
+                            }
+                        }
+                    }
                     self.partition_constraint = self.partition_constraint.as_deref().and_then(|source| {
                         crate::_internal::analysis::expr_visitor::ExprVisitor::rename_column_source(source, &self.id.name, from, to)
                     });

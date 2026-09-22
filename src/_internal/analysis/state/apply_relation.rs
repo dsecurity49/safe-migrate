@@ -7660,10 +7660,26 @@ fn elements_for_array(values: &[String], column_type: &str) -> Option<Vec<String
                 }
             })
             .collect(),
+        DataTypeFamily::Numeric => {
+            let scale = numeric_typmod_scale(column_type);
+            Some(
+                values
+                    .iter()
+                    .map(|value| {
+                        if let Some(s) = scale {
+                            if !value.contains('.') {
+                                let zeros = "0".repeat(s as usize);
+                                return format!("{value}.{zeros}");
+                            }
+                        }
+                        value.clone()
+                    })
+                    .collect(),
+            )
+        }
         DataTypeFamily::Integer
         | DataTypeFamily::SmallInt
         | DataTypeFamily::BigInt
-        | DataTypeFamily::Numeric
         | DataTypeFamily::Text
         | DataTypeFamily::Name
         | DataTypeFamily::CiText

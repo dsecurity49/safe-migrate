@@ -318,7 +318,14 @@ fn partition_bounds_parity_oracle() {
 
     // ── live mode: connect to PG, rebuild cache from scratch ────────────────
     if let Ok(url) = std::env::var("DATABASE_URL") {
-        let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+        let config: postgres::Config = url.parse().expect("database configuration");
+        assert!(database_hosts_are_local(&config), "live parity test requires a local or Unix-socket DATABASE_URL");
+        assert_eq!(
+            config.get_dbname().unwrap_or(""),
+            "safe_migrate",
+            "live parity test requires the disposable database 'safe_migrate'"
+        );
+        let mut client = config.connect(postgres::NoTls).unwrap();
         let mut fresh_entries: BTreeMap<String, String> = BTreeMap::new();
 
         for (columns, keys, strategy, bound) in verified {
@@ -543,12 +550,6 @@ fn partition_bounds_parity_oracle() {
             .constraints
             .values()
             .find(|c| c.table_id == child_id && c.kind == ConstraintKind::Check)
-            .filter(|c| {
-                c.definition
-                    .as_deref()
-                    .map(|d| !d.contains("IS NOT NULL"))
-                    .unwrap_or(false)
-            })
         {
             failures.push(format!(
                 "DEFAULT FABRICATION: {key}\n  \

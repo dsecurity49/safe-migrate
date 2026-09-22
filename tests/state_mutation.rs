@@ -28,6 +28,30 @@ mod state_mutation_tests {
     use safe_migrate::_internal::model::types::{TypeKind, TypeOverlay, TypeState};
 
     #[test]
+    fn partition_key_rename_updates_keys_for_synthesis() {
+        let mut state = setup_state();
+        let engine = setup_engine();
+        engine
+            .analyze(
+                "CREATE TABLE parent (a integer) PARTITION BY LIST (a);
+                 ALTER TABLE parent RENAME COLUMN a TO b;
+                 CREATE TABLE child PARTITION OF parent FOR VALUES IN (1);",
+                &mut state,
+            )
+            .unwrap();
+
+        let child = object_id("public", "child");
+        let relation = match state.local.relations.get(&child).unwrap() {
+            RelationOverlay::Present(rel) => rel,
+            _ => panic!("missing child"),
+        };
+        // The check must reference 'b' not 'a'
+        let constraint = relation.partition_constraint.as_deref().unwrap();
+        assert!(constraint.contains("(b = 1)"), "found: {}", constraint);
+        assert!(!constraint.contains("a"), "found: {}", constraint);
+    }
+
+    #[test]
     fn key_index_renames_preserve_constraint_and_table_metadata() {
         let engine = setup_engine();
         for rename in [
