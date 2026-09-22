@@ -1784,7 +1784,9 @@
     "safe_048_concurrent_list_detach_retains_check.sql",
     "safe_049_recursive_column_rename.sql",
     "safe_050_autocommit_on_commit_drop.sql",
-    "safe_051_generated_expression_visible_function.sql"
+    "safe_051_generated_expression_visible_function.sql",
+    "safe_052_crashed_detach_finalize.sql",
+    "safe_053_cancelled_detach_finalize.sql"
    ],
    "fixture_transactional": {
     "safe_010_role_transaction_semantics.sql": false,
@@ -1798,13 +1800,17 @@
     "safe_016_transitive_set_role_membership.sql": false,
     "safe_047_concurrent_range_detach_retains_check.sql": false,
     "safe_048_concurrent_list_detach_retains_check.sql": false,
-    "safe_050_autocommit_on_commit_drop.sql": false
+    "safe_050_autocommit_on_commit_drop.sql": false,
+    "safe_052_crashed_detach_finalize.sql": false,
+    "safe_053_cancelled_detach_finalize.sql": false
    },
    "fixture_autocommit": [
     "safe_042_concurrent_hash_detach.sql",
     "021_concurrent_detach_default_partition.sql",
     "safe_047_concurrent_range_detach_retains_check.sql",
-    "safe_048_concurrent_list_detach_retains_check.sql"
+    "safe_048_concurrent_list_detach_retains_check.sql",
+    "safe_052_crashed_detach_finalize.sql",
+    "safe_053_cancelled_detach_finalize.sql"
    ],
    "fixture_min_pg_version": {
     "safe_034_generated_expression_change.sql": 170000,
@@ -1813,7 +1819,29 @@
     "safe_025_table_catalog_lifecycle.sql": 150000,
     "safe_028_sequence_parameters.sql": 150000,
     "safe_035_metadata_reset.sql": 160000,
-    "safe_023_role_options.sql": 160000
+    "safe_023_role_options.sql": 160000,
+    "safe_052_crashed_detach_finalize.sql": 140000,
+    "safe_053_cancelled_detach_finalize.sql": 140000
+   },
+   "pending_detach_setup": {
+    "safe_052_crashed_detach_finalize.sql": {
+     "schema": "sm_core",
+     "parent": "pending_finalize_range_parent",
+     "child": "pending_finalize_range_child",
+     "strategy": "RANGE",
+     "column": "id",
+     "bound": "FROM (0) TO (10)",
+     "crash": true
+    },
+    "safe_053_cancelled_detach_finalize.sql": {
+     "schema": "sm_core",
+     "parent": "pending_finalize_list_parent",
+     "child": "pending_finalize_list_child",
+     "strategy": "LIST",
+     "column": "id",
+     "bound": "IN (1, 2, 3)",
+     "crash": false
+    }
    },
    "expected_live_errors": {
     "011_missing_fk_source_column.sql": {
@@ -2152,10 +2180,22 @@
      "relations",
      "columns"
     ],
-    "safe_051_generated_expression_visible_function.sql": [
+"safe_051_generated_expression_visible_function.sql": [
      "relations",
      "columns",
      "functions"
+    ],
+    "safe_052_crashed_detach_finalize.sql": [
+     "relations",
+     "columns",
+     "constraints",
+     "partitions"
+    ],
+    "safe_053_cancelled_detach_finalize.sql": [
+     "relations",
+     "columns",
+     "constraints",
+     "partitions"
     ]
    },
    "required_relations": [

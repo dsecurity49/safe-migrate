@@ -23,6 +23,7 @@ impl Resolver {
         foreign_keys: &[FkFact],
         table_constraints: &[TableConstraintFact],
         partition_by: &Option<String>,
+        partition_keys: &[(String, String)],
         partition_strategy: &Option<String>,
         partition_of: &Option<QualifiedName>,
         partition_bound: &Option<String>,
@@ -194,6 +195,7 @@ impl Resolver {
             foreign_keys,
             table_constraints: table_constraints.to_vec(),
             partition_by: partition_by.clone(),
+            partition_keys: partition_keys.to_vec(),
             partition_strategy: partition_strategy.clone(),
             partition_of: partition_of
                 .as_ref()

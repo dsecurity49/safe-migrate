@@ -12,8 +12,8 @@ use squawk_syntax::ast::{
     Constraint, CreateDatabase, CreateDomain, CreateIndex, CreateMaterializedView, CreatePolicy,
     CreateSequence, CreateTable, CreateTableAs, CreateTrigger, CreateType, CreateView, CteName,
     DetachPartition, DropDomain, DropIndex, DropMaterializedView, DropPolicy, DropSequence,
-    DropTable, DropTrigger, DropType, DropView, Grant, Lock, NameRef, PartitionType, Path,
-    PathSegment, PathSegmentRef, RelationNameRef, ReleaseSavepoint, Revoke, RevokeCommand,
+    DropTable, DropTrigger, DropType, DropView, Grant, Lock, NameRef, PartitionBy, PartitionType,
+    Path, PathSegment, PathSegmentRef, RelationNameRef, ReleaseSavepoint, Revoke, RevokeCommand,
     Rollback, SelectInto, Set, Stmt, TableArg, TableConstraint, Truncate,
 };
 use squawk_syntax::{SyntaxKind, ast};
@@ -426,6 +426,10 @@ impl AstVisitor {
         }
 
         let partition_by = node.partition_by().map(|p| p.syntax().text().to_string());
+        let partition_keys = node
+            .partition_by()
+            .map(|p| Self::partition_keys_from_partition_by(&p))
+            .unwrap_or_default();
         let partition_strategy = node
             .partition_by()
             .and_then(|partition| partition.partition_strategy())
@@ -482,6 +486,7 @@ impl AstVisitor {
             foreign_keys,
             table_constraints,
             partition_by,
+            partition_keys,
             partition_strategy,
             partition_of,
             partition_bound,
@@ -533,6 +538,7 @@ impl AstVisitor {
             foreign_keys: Vec::new(),
             table_constraints: Vec::new(),
             partition_by: None,
+            partition_keys: Vec::new(),
             partition_strategy: None,
             partition_of: None,
             partition_bound: None,
@@ -618,6 +624,7 @@ impl AstVisitor {
             foreign_keys: Vec::new(),
             table_constraints: Vec::new(),
             partition_by: None,
+            partition_keys: Vec::new(),
             partition_strategy: None,
             partition_of: None,
             partition_bound: None,
@@ -4570,6 +4577,47 @@ impl AstVisitor {
                 .map(|t| Self::resolve_identifier_token(t.text()))
                 .unwrap_or_default(),
         }
+    }
+
+    /// Extract `(resolved_name, raw_spelling)` partition key columns directly
+    /// from a typed `PartitionBy` node, without requiring a synthetic re-parse.
+    /// Returns an empty `Vec` when any key uses unsupported modifiers (collate,
+    /// op-class, expression keys, nulls ordering) so callers fall back to the
+    /// text-based `partition_by` field for those cases.
+    fn partition_keys_from_partition_by(partition_by: &PartitionBy) -> Vec<(String, String)> {
+        use squawk_syntax::ast::Expr;
+        let Some(list) = partition_by.partition_item_list() else {
+            return Vec::new();
+        };
+        let mut keys = Vec::new();
+        for item in list.partition_items() {
+            if item.collate().is_some()
+                || item.op_class_ref().is_some()
+                || item.attribute_list().is_some()
+                || item.nulls_order().is_some()
+            {
+                return Vec::new();
+            }
+            let Some(expr) = item.expr() else {
+                return Vec::new();
+            };
+            // Walk through any parenthesisation to the inner NameRef.
+            let mut current = expr;
+            loop {
+                match current {
+                    Expr::ParenExpr(paren) => match paren.expr() {
+                        Some(inner) => current = inner,
+                        None => return Vec::new(),
+                    },
+                    Expr::NameRef(name) => {
+                        keys.push((name.text().to_string(), name.syntax().text().to_string()));
+                        break;
+                    }
+                    _ => return Vec::new(),
+                }
+            }
+        }
+        keys
     }
 
     fn resolve_identifier_token(text: impl AsRef<str>) -> String {

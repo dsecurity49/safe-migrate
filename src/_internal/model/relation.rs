@@ -531,6 +531,12 @@ pub(crate) struct RelationState {
     pub privileges: PrivilegeMatrix,
     pub partition_type: Option<String>, // e.g., "RANGE", "LIST", "HASH"
     pub partition_by: Option<String>,   // The partition key expression
+    /// Column keys resolved at visitor time — `(resolved_name, raw_spelling)`.
+    /// Populated when the original `CREATE TABLE` statement was parsed by the
+    /// simulator; empty for cache-hydrated relations (where `partition_by` is
+    /// the canonical fallback).
+    #[serde(skip)]
+    pub partition_keys: Vec<(String, String)>,
     #[serde(default)]
     pub partition_bound: Option<String>,
     /// PostgreSQL's effective partition predicate, including ancestor bounds.
@@ -587,6 +593,7 @@ impl Default for RelationState {
             privileges: PrivilegeMatrix::default(),
             partition_type: None,
             partition_by: None,
+            partition_keys: Vec::new(),
             partition_bound: None,
             partition_constraint: None,
             is_fk_dependency: false,
@@ -647,6 +654,7 @@ impl RelationState {
             privileges: PrivilegeMatrix::default(),
             partition_type: None,
             partition_by: None,
+            partition_keys: Vec::new(),
             partition_bound: None,
             partition_constraint: None,
             is_fk_dependency: false,
@@ -738,6 +746,14 @@ impl RelationState {
                     self.partition_by = self.partition_by.as_deref().and_then(|source| {
                         crate::_internal::analysis::expr_visitor::ExprVisitor::rename_partition_key_source(source, &self.id.name, from, to)
                     });
+                    for (resolved, raw) in &mut self.partition_keys {
+                        if resolved == from {
+                            *resolved = to.clone();
+                            if raw == from {
+                                *raw = to.clone();
+                            }
+                        }
+                    }
                     self.partition_constraint = self.partition_constraint.as_deref().and_then(|source| {
                         crate::_internal::analysis::expr_visitor::ExprVisitor::rename_column_source(source, &self.id.name, from, to)
                     });

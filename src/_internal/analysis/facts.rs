@@ -166,6 +166,11 @@ pub(crate) enum StatementFact {
         foreign_keys: Vec<FkFact>,
         table_constraints: Vec<TableConstraintFact>,
         partition_by: Option<String>,
+        /// Column keys extracted directly from the `PARTITION BY` node at
+        /// visitor time — `(resolved_name, raw_spelling)` per key column.
+        /// Empty when the key uses unsupported expressions (collation,
+        /// op-class, expression keys) or when there is no partition clause.
+        partition_keys: Vec<(String, String)>,
         partition_strategy: Option<String>,
         partition_of: Option<QualifiedName>,
         partition_bound: Option<String>,

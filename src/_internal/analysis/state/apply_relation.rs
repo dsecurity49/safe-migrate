@@ -2642,6 +2642,7 @@ impl AnalysisState {
 
         rel_state.partition_type = create.partition_strategy.as_deref().map(str::to_uppercase);
         rel_state.partition_by = create.partition_by.clone();
+        rel_state.partition_keys = create.partition_keys.clone();
         rel_state.partition_bound = create
             .partition_bound
             .as_deref()
@@ -7082,10 +7083,16 @@ impl AnalysisState {
     /// deparses them in normalized form we cannot replicate byte-for-byte;
     /// those keys keep the conservative `CantResolve` taint.
     fn partition_key_columns(&self, parent: &ObjectId) -> Option<Vec<(String, String)>> {
-        use squawk_syntax::ast::{AstNode, PartitionBy, SourceFile};
         let Some(RelationOverlay::Present(parent)) = self.local.relations.get(parent) else {
             return None;
         };
+        // Fast path: visitor already resolved the keys from typed AST nodes.
+        if !parent.partition_keys.is_empty() {
+            return Some(parent.partition_keys.clone());
+        }
+        // Fallback: cache-hydrated relation — re-parse the raw partition_by
+        // text using the synthetic-SQL wrap trick (legacy path).
+        use squawk_syntax::ast::{AstNode, PartitionBy, SourceFile};
         let partition_by = parent.partition_by.as_deref()?;
         let parsed = SourceFile::parse(&format!("CREATE TABLE __key () {partition_by}"));
         if !parsed.errors().is_empty() || parsed.tree().stmts().count() != 1 {
@@ -7212,7 +7219,13 @@ impl AnalysisState {
         relation: &RelationState,
     ) -> Option<String> {
         let clauses = self.synthesize_partition_check_clauses(strategy, bound, keys, relation)?;
-        Some(format!("({})", clauses.join(" AND ")))
+        if clauses.is_empty() {
+            None
+        } else if clauses.len() == 1 {
+            Some(format!("({})", clauses[0]))
+        } else {
+            Some(format!("(({}))", clauses.join(" AND ")))
+        }
     }
 
     fn synthesize_partition_check_clauses(
@@ -7236,7 +7249,8 @@ impl AnalysisState {
                 .find(|c| &c.name == key_name)
                 .and_then(|c| c.data_type.as_deref())?;
 
-            let comp_left = if col_type.starts_with("character varying") {
+            let type_family = DataTypeFamily::from_type_name(col_type)?;
+            let comp_left = if type_family.requires_text_cast_for_comparison() {
                 format!("({key})::text")
             } else {
                 key.clone()
@@ -7390,12 +7404,17 @@ impl AnalysisState {
                     for datum in non_null_datums {
                         values.push(decode_sql_literal(&datum.text)?);
                     }
+                    let type_family = DataTypeFamily::from_type_name(column_type)?;
+                    let canonical_type = type_family.to_canonical_type_string(column_type);
                     let mapped = elements_for_array(&values, column_type)?;
-                    if matches!(column_type, "integer" | "smallint" | "bigint") {
+                    if matches!(
+                        type_family,
+                        DataTypeFamily::Integer | DataTypeFamily::SmallInt | DataTypeFamily::BigInt
+                    ) {
                         format!("({comparison_left} = ANY (ARRAY[{}]))", mapped.join(", "))
                     } else {
                         let array_text = serialize_array_literal(&mapped);
-                        format!("({comparison_left} = ANY ('{array_text}'::{column_type}[]))")
+                        format!("({comparison_left} = ANY ('{array_text}'::{canonical_type}[]))")
                     }
                 }
             };
@@ -7627,8 +7646,9 @@ fn array_element_type(elements: &[&str], fallback: &str) -> Option<String> {
 /// Render partition-list values in the array-constant element syntax for the
 /// key column type (`t`/`f` for booleans, otherwise the element text as-is).
 fn elements_for_array(values: &[String], column_type: &str) -> Option<Vec<String>> {
-    match column_type {
-        "boolean" => values
+    let family = DataTypeFamily::from_type_name(column_type)?;
+    match family {
+        DataTypeFamily::Boolean => values
             .iter()
             .map(|value| {
                 if value.eq_ignore_ascii_case("true") {
@@ -7640,16 +7660,32 @@ fn elements_for_array(values: &[String], column_type: &str) -> Option<Vec<String
                 }
             })
             .collect(),
-        "integer" | "smallint" | "bigint" | "numeric" | "text" | "name" | "citext" => {
-            Some(values.to_vec())
+        DataTypeFamily::Numeric => {
+            let scale = numeric_typmod_scale(column_type);
+            Some(
+                values
+                    .iter()
+                    .map(|value| {
+                        if let Some(s) = scale.filter(|_| is_plain_integer(value)) {
+                            let zeros = "0".repeat(s as usize);
+                            return format!("{value}.{zeros}");
+                        }
+                        value.clone()
+                    })
+                    .collect(),
+            )
         }
-        type_name
-            if type_name.starts_with("character varying")
-                || type_name.starts_with("character(")
-                || type_name.starts_with("bpchar") =>
-        {
-            Some(values.to_vec())
-        }
+        DataTypeFamily::Integer
+        | DataTypeFamily::SmallInt
+        | DataTypeFamily::BigInt
+        | DataTypeFamily::Text
+        | DataTypeFamily::Name
+        | DataTypeFamily::CiText
+        | DataTypeFamily::CharacterVarying
+        | DataTypeFamily::Character
+        | DataTypeFamily::BpChar
+        | DataTypeFamily::Date
+        | DataTypeFamily::Timestamp => Some(values.to_vec()),
         _ => None,
     }
 }
@@ -7664,10 +7700,7 @@ fn serialize_array_literal(values: &[String]) -> String {
         .map(|value| {
             let special = value.is_empty()
                 || value.contains([',', '"', '\\', '{', '}'])
-                || value.starts_with(' ')
-                || value.ends_with(' ')
-                || value.starts_with('\n')
-                || value.ends_with('\n');
+                || value.contains(char::is_whitespace);
             let token = if special {
                 let mut quoted = String::from("\"");
                 for ch in value.chars() {
@@ -7746,8 +7779,9 @@ fn predicate_column_name(predicate: &str) -> Option<String> {
 /// text-like/uuid/ISO-date values quoted with a `::type` cast.
 fn deparse_partition_literal(data_type: &str, raw: &str) -> Option<String> {
     let decoded = decode_sql_literal(raw)?;
-    match data_type {
-        "boolean" => {
+    let family = DataTypeFamily::from_type_name(data_type)?;
+    match family {
+        DataTypeFamily::Boolean => {
             if decoded.eq_ignore_ascii_case("true") {
                 Some("true".to_string())
             } else if decoded.eq_ignore_ascii_case("false") {
@@ -7756,7 +7790,7 @@ fn deparse_partition_literal(data_type: &str, raw: &str) -> Option<String> {
                 None
             }
         }
-        "integer" => {
+        DataTypeFamily::Integer => {
             let value: i64 = decoded.parse().ok()?;
             if (i32::MIN as i64..=i32::MAX as i64).contains(&value) {
                 if value >= 0 {
@@ -7768,29 +7802,45 @@ fn deparse_partition_literal(data_type: &str, raw: &str) -> Option<String> {
                 None
             }
         }
-        "smallint" => {
+        DataTypeFamily::SmallInt => {
             let value: i16 = decoded.parse().ok()?;
             Some(format!("'{}'::smallint", value))
         }
-        "bigint" => {
+        DataTypeFamily::BigInt => {
             let value: i64 = decoded.parse().ok()?;
             Some(format!("'{}'::bigint", value))
         }
-        "numeric" => {
-            if numeric_float_like(&decoded) {
+        DataTypeFamily::Numeric => {
+            // When the column type carries a typmod (e.g. numeric(10,2)), PostgreSQL's
+            // get_const_expr casts and applies the column scale: an integer input `5`
+            // is rendered as `5.00::numeric(10,2)` when scale=2.  Bare `numeric` with
+            // a float-like constant is printed without a cast.
+            let has_typmod = data_type.contains('(');
+            if has_typmod {
+                // Apply the declared scale if the decoded value has no fractional part.
+                // e.g. numeric(10,2) + decoded "5" → "5.00"
+                let scale = numeric_typmod_scale(data_type).unwrap_or(0);
+                let scaled = if is_plain_integer(&decoded) && scale > 0 {
+                    let zeros = "0".repeat(scale as usize);
+                    format!("{decoded}.{zeros}")
+                } else {
+                    decoded
+                };
+                Some(format!("{scaled}::{data_type}"))
+            } else if numeric_float_like(&decoded) {
                 Some(decoded)
             } else {
                 Some(format!("'{}'::numeric", decoded))
             }
         }
-        "real" | "double precision" => {
+        DataTypeFamily::Real | DataTypeFamily::DoublePrecision => {
             if numeric_float_like(&decoded) {
                 Some(format!("'{}'::{}", decoded, data_type))
             } else {
                 None
             }
         }
-        "date" => {
+        DataTypeFamily::Date => {
             if decoded.len() == 10
                 && decoded.as_bytes()[4] == b'-'
                 && decoded.as_bytes()[7] == b'-'
@@ -7804,7 +7854,7 @@ fn deparse_partition_literal(data_type: &str, raw: &str) -> Option<String> {
                 None
             }
         }
-        "uuid" => {
+        DataTypeFamily::Uuid => {
             if decoded.len() == 36
                 && decoded.as_bytes()[8] == b'-'
                 && decoded.as_bytes()[13] == b'-'
@@ -7819,17 +7869,17 @@ fn deparse_partition_literal(data_type: &str, raw: &str) -> Option<String> {
                 None
             }
         }
-        type_name
-            if type_name == "text"
-                || type_name == "name"
-                || type_name == "citext"
-                || type_name.starts_with("character varying")
-                || type_name.starts_with("character(")
-                || type_name.starts_with("bpchar")
-                || type_name.starts_with("timestamp") =>
-        {
-            Some(format!("'{}'::{}", decoded.replace('\'', "''"), data_type))
-        }
+        DataTypeFamily::Text
+        | DataTypeFamily::Name
+        | DataTypeFamily::CiText
+        | DataTypeFamily::CharacterVarying
+        | DataTypeFamily::Character
+        | DataTypeFamily::BpChar
+        | DataTypeFamily::Timestamp => Some(format!(
+            "'{}'::{}",
+            decoded.replace('\'', "''"),
+            family.to_canonical_type_string(data_type)
+        )),
         _ => None,
     }
 }
@@ -7845,6 +7895,26 @@ fn numeric_float_like(value: &str) -> bool {
         && value[first.len_utf8()..]
             .chars()
             .any(|ch| matches!(ch, '.' | 'e' | 'E'))
+}
+
+/// Extract the scale component from a `numeric(precision, scale)` type string.
+/// Returns `None` for bare `numeric` or `numeric(precision)` (scale 0 implied).
+fn numeric_typmod_scale(type_name: &str) -> Option<u32> {
+    let inner = type_name.split('(').nth(1)?.trim_end_matches(')');
+    let scale_str = inner.split(',').nth(1)?.trim();
+    scale_str.parse().ok()
+}
+
+/// True when the value is a plain signed or unsigned integer literal: all ASCII
+/// digits with an optional leading sign. This is the only numeric text that
+/// PostgreSQL's `get_const_expr` rewrites to a scale-padded form; values in
+/// exponent (`5e2`) or decimal (`5.0`) notation must pass through unchanged.
+fn is_plain_integer(value: &str) -> bool {
+    let digits = value
+        .strip_prefix('+')
+        .or_else(|| value.strip_prefix('-'))
+        .unwrap_or(value);
+    !digits.is_empty() && digits.chars().all(|ch| ch.is_ascii_digit())
 }
 
 enum DatumKind {
@@ -8001,5 +8071,119 @@ fn parse_typed_bound(bound: &str) -> Option<TypedBound> {
             })
         }
         PartitionType::PartitionDefault(_) => Some(TypedBound::Default),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DataTypeFamily {
+    Boolean,
+    Integer,
+    SmallInt,
+    BigInt,
+    Numeric,
+    Real,
+    DoublePrecision,
+    Date,
+    Uuid,
+    Text,
+    Name,
+    CiText,
+    CharacterVarying,
+    Character,
+    BpChar,
+    Timestamp,
+    TimestampTz,
+}
+
+impl DataTypeFamily {
+    fn from_type_name(name: &str) -> Option<Self> {
+        let name = name.trim();
+        if name == "boolean" {
+            Some(Self::Boolean)
+        } else if name == "integer" || name == "int" || name == "int4" {
+            Some(Self::Integer)
+        } else if name == "smallint" || name == "int2" {
+            Some(Self::SmallInt)
+        } else if name == "bigint" || name == "int8" {
+            Some(Self::BigInt)
+        } else if name == "numeric"
+            || name == "decimal"
+            || name.starts_with("numeric(")
+            || name.starts_with("decimal(")
+        {
+            Some(Self::Numeric)
+        } else if name == "real" || name == "float4" {
+            Some(Self::Real)
+        } else if name == "double precision" || name == "float8" {
+            Some(Self::DoublePrecision)
+        } else if name == "date" {
+            Some(Self::Date)
+        } else if name == "uuid" {
+            Some(Self::Uuid)
+        } else if name == "text" {
+            Some(Self::Text)
+        } else if name == "name" {
+            Some(Self::Name)
+        } else if name == "citext" {
+            Some(Self::CiText)
+        } else if name == "varchar"
+            || name.starts_with("varchar(")
+            || name.starts_with("character varying")
+        {
+            Some(Self::CharacterVarying)
+        } else if name == "char"
+            || name.starts_with("char(")
+            || name.starts_with("character(")
+            || name == "character"
+        {
+            Some(Self::Character)
+        } else if name.starts_with("bpchar") {
+            Some(Self::BpChar)
+        } else if name == "timestamp" || name.starts_with("timestamp without time zone") {
+            Some(Self::Timestamp)
+        } else if name == "timestamptz" || name.starts_with("timestamp with time zone") {
+            Some(Self::TimestampTz)
+        } else {
+            None
+        }
+    }
+
+    fn to_canonical_type_string(self, original: &str) -> String {
+        match self {
+            Self::CharacterVarying => {
+                if original.starts_with("varchar(") {
+                    original.replacen("varchar(", "character varying(", 1)
+                } else if original == "varchar" {
+                    "character varying".to_string()
+                } else {
+                    original.to_string()
+                }
+            }
+            Self::Character => {
+                if original.starts_with("char(") {
+                    original.replacen("char(", "character(", 1)
+                } else if original == "char" {
+                    "character(1)".to_string()
+                } else {
+                    original.to_string()
+                }
+            }
+            Self::BpChar => {
+                // bpchar(N) is the internal name for character(N); pg_get_constraintdef
+                // renders it as character(N). Bare bpchar (no typmod) stays as-is.
+                if original.starts_with("bpchar(") {
+                    original.replacen("bpchar(", "character(", 1)
+                } else {
+                    original.to_string()
+                }
+            }
+            Self::Timestamp => "timestamp without time zone".to_string(),
+            Self::TimestampTz => "timestamp with time zone".to_string(),
+            _ => original.to_string(),
+        }
+    }
+
+    fn requires_text_cast_for_comparison(&self) -> bool {
+        matches!(self, Self::CharacterVarying)
     }
 }
