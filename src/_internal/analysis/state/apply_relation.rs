@@ -7666,11 +7666,9 @@ fn elements_for_array(values: &[String], column_type: &str) -> Option<Vec<String
                 values
                     .iter()
                     .map(|value| {
-                        if let Some(s) = scale {
-                            if !value.contains('.') {
-                                let zeros = "0".repeat(s as usize);
-                                return format!("{value}.{zeros}");
-                            }
+                        if let Some(s) = scale.filter(|_| !value.contains('.')) {
+                            let zeros = "0".repeat(s as usize);
+                            return format!("{value}.{zeros}");
                         }
                         value.clone()
                     })
