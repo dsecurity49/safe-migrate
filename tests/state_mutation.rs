@@ -52,6 +52,42 @@ mod state_mutation_tests {
     }
 
     #[test]
+    fn exponent_form_numeric_list_bounds_are_not_scale_padded() {
+        let mut state = setup_state();
+        let engine = setup_engine();
+        engine
+            .analyze(
+                "CREATE TABLE parent (a numeric(10,2)) PARTITION BY LIST (a);
+                 CREATE TABLE child_multi PARTITION OF parent FOR VALUES IN (5e2, 6e2);
+                 CREATE TABLE child_single PARTITION OF parent FOR VALUES IN (7e2);",
+                &mut state,
+            )
+            .unwrap();
+
+        for (child, needle) in [
+            ("child_multi", "'{5e2,6e2}'::numeric(10,2)[]"),
+            ("child_single", "7e2::numeric(10,2)"),
+        ] {
+            let relation = match state
+                .local
+                .relations
+                .get(&object_id("public", child))
+                .unwrap()
+            {
+                RelationOverlay::Present(rel) => rel,
+                _ => panic!("missing {child}"),
+            };
+            let constraint = relation.partition_constraint.as_deref().unwrap();
+            assert!(constraint.contains(needle), "{child} found: {}", constraint);
+            assert!(
+                !constraint.contains("5e2.00") && !constraint.contains("7e2.00"),
+                "{child} found: {}",
+                constraint
+            );
+        }
+    }
+
+    #[test]
     fn key_index_renames_preserve_constraint_and_table_metadata() {
         let engine = setup_engine();
         for rename in [

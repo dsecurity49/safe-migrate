@@ -7666,7 +7666,7 @@ fn elements_for_array(values: &[String], column_type: &str) -> Option<Vec<String
                 values
                     .iter()
                     .map(|value| {
-                        if let Some(s) = scale.filter(|_| !value.contains('.')) {
+                        if let Some(s) = scale.filter(|_| is_plain_integer(value)) {
                             let zeros = "0".repeat(s as usize);
                             return format!("{value}.{zeros}");
                         }
@@ -7820,7 +7820,7 @@ fn deparse_partition_literal(data_type: &str, raw: &str) -> Option<String> {
                 // Apply the declared scale if the decoded value has no fractional part.
                 // e.g. numeric(10,2) + decoded "5" → "5.00"
                 let scale = numeric_typmod_scale(data_type).unwrap_or(0);
-                let scaled = if !decoded.contains('.') && scale > 0 {
+                let scaled = if is_plain_integer(&decoded) && scale > 0 {
                     let zeros = "0".repeat(scale as usize);
                     format!("{decoded}.{zeros}")
                 } else {
@@ -7903,6 +7903,18 @@ fn numeric_typmod_scale(type_name: &str) -> Option<u32> {
     let inner = type_name.split('(').nth(1)?.trim_end_matches(')');
     let scale_str = inner.split(',').nth(1)?.trim();
     scale_str.parse().ok()
+}
+
+/// True when the value is a plain signed or unsigned integer literal: all ASCII
+/// digits with an optional leading sign. This is the only numeric text that
+/// PostgreSQL's `get_const_expr` rewrites to a scale-padded form; values in
+/// exponent (`5e2`) or decimal (`5.0`) notation must pass through unchanged.
+fn is_plain_integer(value: &str) -> bool {
+    let digits = value
+        .strip_prefix('+')
+        .or_else(|| value.strip_prefix('-'))
+        .unwrap_or(value);
+    !digits.is_empty() && digits.chars().all(|ch| ch.is_ascii_digit())
 }
 
 enum DatumKind {
