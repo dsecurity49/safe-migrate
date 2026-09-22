@@ -319,7 +319,10 @@ fn partition_bounds_parity_oracle() {
     // ── live mode: connect to PG, rebuild cache from scratch ────────────────
     if let Ok(url) = std::env::var("DATABASE_URL") {
         let config: postgres::Config = url.parse().expect("database configuration");
-        assert!(database_hosts_are_local(&config), "live parity test requires a local or Unix-socket DATABASE_URL");
+        assert!(
+            database_hosts_are_local(&config),
+            "live parity test requires a local or Unix-socket DATABASE_URL"
+        );
         assert_eq!(
             config.get_dbname().unwrap_or(""),
             "safe_migrate",
