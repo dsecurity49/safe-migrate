@@ -531,6 +531,12 @@ pub(crate) struct RelationState {
     pub privileges: PrivilegeMatrix,
     pub partition_type: Option<String>, // e.g., "RANGE", "LIST", "HASH"
     pub partition_by: Option<String>,   // The partition key expression
+    /// Column keys resolved at visitor time — `(resolved_name, raw_spelling)`.
+    /// Populated when the original `CREATE TABLE` statement was parsed by the
+    /// simulator; empty for cache-hydrated relations (where `partition_by` is
+    /// the canonical fallback).
+    #[serde(default)]
+    pub partition_keys: Vec<(String, String)>,
     #[serde(default)]
     pub partition_bound: Option<String>,
     /// PostgreSQL's effective partition predicate, including ancestor bounds.
@@ -587,6 +593,7 @@ impl Default for RelationState {
             privileges: PrivilegeMatrix::default(),
             partition_type: None,
             partition_by: None,
+            partition_keys: Vec::new(),
             partition_bound: None,
             partition_constraint: None,
             is_fk_dependency: false,
@@ -647,6 +654,7 @@ impl RelationState {
             privileges: PrivilegeMatrix::default(),
             partition_type: None,
             partition_by: None,
+            partition_keys: Vec::new(),
             partition_bound: None,
             partition_constraint: None,
             is_fk_dependency: false,

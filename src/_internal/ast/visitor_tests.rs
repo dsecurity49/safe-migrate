@@ -2075,6 +2075,95 @@ mod tests {
     }
 
     #[test]
+    fn partition_keys_resolved_at_visitor_time_for_simple_columns() {
+        // Single-column RANGE, LIST, and HASH keys must be resolved directly
+        // from the typed PartitionBy node — no synthetic re-parse.
+        for (strategy, sql) in [
+            (
+                "RANGE",
+                "CREATE TABLE parent (id integer) PARTITION BY RANGE (id);",
+            ),
+            (
+                "LIST",
+                "CREATE TABLE parent (id integer) PARTITION BY LIST (id);",
+            ),
+            (
+                "HASH",
+                "CREATE TABLE parent (id integer) PARTITION BY HASH (id);",
+            ),
+        ] {
+            let StatementFact::CreateTable {
+                partition_keys,
+                partition_strategy,
+                ..
+            } = parse_and_extract_statement(sql).expect("create table fact")
+            else {
+                panic!("expected create table for {strategy}");
+            };
+            assert_eq!(
+                partition_strategy.as_deref(),
+                Some(&strategy.to_lowercase()[..]),
+                "{strategy}: strategy"
+            );
+            assert_eq!(
+                partition_keys,
+                vec![("id".to_string(), "id".to_string())],
+                "{strategy}: keys"
+            );
+        }
+    }
+
+    #[test]
+    fn partition_keys_resolved_for_multi_column_and_quoted_names() {
+        // Multi-column key and a quoted identifier.
+        let multi = "CREATE TABLE parent (a integer, b integer) PARTITION BY RANGE (a, b);";
+        let StatementFact::CreateTable { partition_keys, .. } =
+            parse_and_extract_statement(multi).expect("multi-column fact")
+        else {
+            panic!("expected create table");
+        };
+        assert_eq!(
+            partition_keys,
+            vec![
+                ("a".to_string(), "a".to_string()),
+                ("b".to_string(), "b".to_string()),
+            ]
+        );
+
+        // Quoted identifier: resolved name is case-preserved, raw spelling
+        // includes the quotes.
+        let quoted = "CREATE TABLE parent (\"MyId\" integer) PARTITION BY LIST (\"MyId\");";
+        let StatementFact::CreateTable { partition_keys, .. } =
+            parse_and_extract_statement(quoted).expect("quoted fact")
+        else {
+            panic!("expected create table");
+        };
+        assert_eq!(partition_keys.len(), 1);
+        assert_eq!(partition_keys[0].0, "MyId");
+        assert!(
+            partition_keys[0].1.contains("MyId"),
+            "raw spelling must contain the identifier"
+        );
+    }
+
+    #[test]
+    fn partition_keys_empty_when_key_has_unsupported_modifiers() {
+        // A key with COLLATE or an op-class cannot be represented as a simple
+        // name — partition_keys must be empty so callers use the partition_by
+        // text fallback.
+        let with_collate = "CREATE TABLE parent (t text) PARTITION BY LIST (t COLLATE \"POSIX\");";
+        let StatementFact::CreateTable { partition_keys, .. } =
+            parse_and_extract_statement(with_collate).expect("collate fact")
+        else {
+            panic!("expected create table");
+        };
+        assert!(
+            partition_keys.is_empty(),
+            "partition_keys must be empty for COLLATE keys, got {partition_keys:?}"
+        );
+    }
+
+    #[test]
     fn test_alter_table_detach_partition() {
         let sql = "ALTER TABLE parent DETACH PARTITION child;";
         let facts = parse_and_extract_statement(sql);

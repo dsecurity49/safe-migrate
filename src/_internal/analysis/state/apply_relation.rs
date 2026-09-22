@@ -2642,6 +2642,7 @@ impl AnalysisState {
 
         rel_state.partition_type = create.partition_strategy.as_deref().map(str::to_uppercase);
         rel_state.partition_by = create.partition_by.clone();
+        rel_state.partition_keys = create.partition_keys.clone();
         rel_state.partition_bound = create
             .partition_bound
             .as_deref()
@@ -7082,10 +7083,16 @@ impl AnalysisState {
     /// deparses them in normalized form we cannot replicate byte-for-byte;
     /// those keys keep the conservative `CantResolve` taint.
     fn partition_key_columns(&self, parent: &ObjectId) -> Option<Vec<(String, String)>> {
-        use squawk_syntax::ast::{AstNode, PartitionBy, SourceFile};
         let Some(RelationOverlay::Present(parent)) = self.local.relations.get(parent) else {
             return None;
         };
+        // Fast path: visitor already resolved the keys from typed AST nodes.
+        if !parent.partition_keys.is_empty() {
+            return Some(parent.partition_keys.clone());
+        }
+        // Fallback: cache-hydrated relation — re-parse the raw partition_by
+        // text using the synthetic-SQL wrap trick (legacy path).
+        use squawk_syntax::ast::{AstNode, PartitionBy, SourceFile};
         let partition_by = parent.partition_by.as_deref()?;
         let parsed = SourceFile::parse(&format!("CREATE TABLE __key () {partition_by}"));
         if !parsed.errors().is_empty() || parsed.tree().stmts().count() != 1 {

@@ -322,6 +322,10 @@ pub(crate) struct CreateTable {
     pub foreign_keys: Vec<FkMutation>,
     pub table_constraints: Vec<TableConstraintFact>,
     pub partition_by: Option<String>,
+    /// Column keys resolved at visitor time — `(resolved_name, raw_spelling)`.
+    /// Empty when the key uses unsupported expressions or there is no
+    /// partition clause; callers fall back to `partition_by` in that case.
+    pub partition_keys: Vec<(String, String)>,
     pub partition_strategy: Option<String>,
     pub partition_of: Option<ObjectId>,
     pub partition_bound: Option<String>,
