@@ -7407,8 +7407,15 @@ impl AnalysisState {
                     let type_family = DataTypeFamily::from_type_name(column_type)?;
                     let canonical_type = type_family.to_canonical_type_string(column_type);
                     let mapped = elements_for_array(&values, column_type)?;
-                    let array_text = serialize_array_literal(&mapped);
-                    format!("({comparison_left} = ANY ('{array_text}'::{canonical_type}[]))")
+                    if matches!(
+                        type_family,
+                        DataTypeFamily::Integer | DataTypeFamily::SmallInt | DataTypeFamily::BigInt
+                    ) {
+                        format!("({comparison_left} = ANY (ARRAY[{}]))", mapped.join(", "))
+                    } else {
+                        let array_text = serialize_array_literal(&mapped);
+                        format!("({comparison_left} = ANY ('{array_text}'::{canonical_type}[]))")
+                    }
                 }
             };
 
