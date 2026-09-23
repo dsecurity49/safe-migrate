@@ -1452,7 +1452,13 @@ fn load_sequences(
              a.attname AS column_name,
              d.deptype::text AS dependency_type,
              CASE WHEN ad.adbin IS NULL THEN false
-                  ELSE pg_catalog.pg_get_expr(ad.adbin, ad.adrelid) LIKE '%nextval(%'
+                  -- Heuristic: We detect serial/identity sequences by checking if the
+                  -- column's default expression invokes nextval. Anchoring the match
+                  -- to the expression start (pg_get_expr canonicalizes a real serial
+                  -- default to `nextval('schema.seq'::regclass)`) rules out string
+                  -- literals such as a default of 'nextval(', which deparse as
+                  -- `'nextval('::text` and would otherwise false-positive.
+                  ELSE pg_catalog.pg_get_expr(ad.adbin, ad.adrelid) LIKE 'nextval(%'
              END AS has_nextval_default,
              pg_catalog.format_type(q.seqtypid, NULL) AS sequence_data_type,
              q.seqstart AS sequence_start,
@@ -1672,11 +1678,11 @@ fn load_relations_and_columns(
             persistence,
             0,
         );
-        state.relpages = Some(
-            relpages
-                .try_into()
-                .with_context(|| format!("relation '{}' has a negative page count", object_id))?,
-        );
+        state.relpages = if relpages < 0 {
+            None
+        } else {
+            Some(relpages as u64)
+        };
         state.last_analyze = last_analyze;
         state.last_autoanalyze = last_autoanalyze;
         let partition_strategy: Option<String> = row
