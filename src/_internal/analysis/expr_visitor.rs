@@ -10,17 +10,16 @@ impl ExprVisitor {
         from: &str,
         to: &str,
     ) -> Option<String> {
-        use squawk_syntax::ast::{PartitionBy, SourceFile};
+        use squawk_syntax::ast::{SourceFile, Stmt};
         let prefix = "CREATE TABLE __partition_key () ";
         let parsed = SourceFile::parse(&format!("{prefix}{source}"));
         if !parsed.errors().is_empty() || parsed.tree().stmts().count() != 1 {
             return None;
         }
-        let partition = parsed
-            .tree()
-            .syntax()
-            .descendants()
-            .find_map(PartitionBy::cast)?;
+        let partition = match parsed.tree().stmts().next() {
+            Some(Stmt::CreateTable(create_table)) => create_table.partition_by(),
+            _ => return None,
+        }?;
         let mut replacements = Vec::new();
         for item in partition.partition_item_list()?.partition_items() {
             let expr = item.expr()?;
@@ -115,7 +114,7 @@ impl ExprVisitor {
     }
 
     fn can_render_unquoted_identifier(identifier: &str) -> bool {
-        use squawk_syntax::ast::{NameRef, SourceFile, Target};
+        use squawk_syntax::ast::{NameRef, SourceFile, Stmt};
 
         let mut chars = identifier.chars();
         if !matches!(chars.next(), Some('a'..='z' | '_'))
@@ -126,14 +125,16 @@ impl ExprVisitor {
         let parsed = SourceFile::parse(&format!("SELECT {identifier}"));
         parsed.errors().is_empty()
             && parsed.tree().stmts().count() == 1
-            && parsed
-                .tree()
-                .syntax()
-                .descendants()
-                .find_map(Target::cast)
-                .and_then(|target| target.expr())
-                .and_then(|expr| NameRef::cast(expr.syntax().clone()))
-                .is_some_and(|name| name.text() == identifier && !name.is_quoted())
+            && match parsed.tree().stmts().next() {
+                Some(Stmt::Select(select)) => select
+                    .select_clause()
+                    .and_then(|clause| clause.target_list())
+                    .and_then(|list| list.targets().next())
+                    .and_then(|target| target.expr())
+                    .and_then(|expr| NameRef::cast(expr.syntax().clone()))
+                    .is_some_and(|name| name.text() == identifier && !name.is_quoted()),
+                _ => false,
+            }
     }
 
     pub(crate) fn convert(expr: Expr) -> ExprIr {
@@ -379,12 +380,7 @@ impl ExprVisitor {
     }
 
     fn convert_postfix_expr(pe: squawk_syntax::ast::PostfixExpr) -> ExprIr {
-        let mut args = Vec::new();
-        for child in pe.syntax().children() {
-            if let Some(expr) = Expr::cast(child) {
-                args.push(Self::convert(expr));
-            }
-        }
+        let args = pe.expr().map(Self::convert).into_iter().collect();
         ExprIr::FunctionCall {
             name: "<postfix>".into(),
             args,

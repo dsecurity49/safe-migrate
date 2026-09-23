@@ -138,6 +138,87 @@ mod tests {
     }
 
     #[test]
+    fn grant_extracts_keyword_token_privileges_from_nested_role_name_ref() {
+        let fact = parse_and_extract_statement(
+            "GRANT TRUNCATE, TRIGGER, EXECUTE, TEMP ON TABLE test_table TO app_user;",
+        )
+        .expect("grant fact");
+
+        let StatementFact::Grant(grant) = fact else {
+            panic!("expected grant fact");
+        };
+        assert_eq!(
+            grant.privileges,
+            crate::_internal::analysis::facts::PrivilegeSpec::List(vec![
+                crate::_internal::analysis::facts::PrivilegeFact::Truncate,
+                crate::_internal::analysis::facts::PrivilegeFact::Trigger,
+                crate::_internal::analysis::facts::PrivilegeFact::Execute,
+                crate::_internal::analysis::facts::PrivilegeFact::Temporary,
+            ])
+        );
+    }
+
+    #[test]
+    fn grant_role_membership_is_not_confused_with_keyword_privileges() {
+        let fact = parse_and_extract_statement("GRANT writer TO app_user;").expect("grant fact");
+
+        let StatementFact::Grant(grant) = fact else {
+            panic!("expected grant fact");
+        };
+        assert_eq!(
+            grant.privileges,
+            crate::_internal::analysis::facts::PrivilegeSpec::List(vec![
+                crate::_internal::analysis::facts::PrivilegeFact::RoleMembership("writer".into()),
+            ])
+        );
+    }
+
+    #[test]
+    fn revoke_extracts_keyword_token_privileges_from_nested_role_name_ref() {
+        for sql in [
+            "REVOKE TRUNCATE, TRIGGER, EXECUTE, TEMP ON TABLE test_table FROM app_user;",
+            "REVOKE INSERT, UPDATE, DELETE ON TABLE test_table FROM app_user;",
+        ] {
+            let fact = parse_and_extract_statement(sql).expect("revoke fact");
+            let StatementFact::Revoke(revoke) = fact else {
+                panic!("expected revoke fact");
+            };
+            if matches!(
+                revoke.privileges,
+                crate::_internal::analysis::facts::PrivilegeSpec::List(_)
+            ) {
+                assert!(
+                    !matches!(
+                        revoke.privileges,
+                        crate::_internal::analysis::facts::PrivilegeSpec::List(ref l) if l.contains(&crate::_internal::analysis::facts::PrivilegeFact::Unknown)
+                    ),
+                    "no privilege may be Unknown: {sql}"
+                );
+            }
+
+            let expected = if sql.contains("TEMP") {
+                vec![
+                    crate::_internal::analysis::facts::PrivilegeFact::Truncate,
+                    crate::_internal::analysis::facts::PrivilegeFact::Trigger,
+                    crate::_internal::analysis::facts::PrivilegeFact::Execute,
+                    crate::_internal::analysis::facts::PrivilegeFact::Temporary,
+                ]
+            } else {
+                vec![
+                    crate::_internal::analysis::facts::PrivilegeFact::Insert,
+                    crate::_internal::analysis::facts::PrivilegeFact::Update,
+                    crate::_internal::analysis::facts::PrivilegeFact::Delete,
+                ]
+            };
+            assert_eq!(
+                revoke.privileges,
+                crate::_internal::analysis::facts::PrivilegeSpec::List(expected),
+                "for {sql}"
+            );
+        }
+    }
+
+    #[test]
     fn postgres17_maintain_privilege_is_extracted_from_grant_and_revoke() {
         for sql in [
             "GRANT MAINTAIN ON TABLE test_table TO app_user;",

@@ -5,6 +5,13 @@ commits and pull requests. Published binaries, checksums, and generated release
 notes are available on the
 [GitHub Releases page](https://github.com/dsecurity49/safe-migrate/releases).
 
+## v0.9.3 — 2026-09-23
+
+- Upgraded the pinned Squawk parser stack from 2.64.0 to 2.65.0.
+- Fixed privilege analysis for role names that are SQL keywords.
+- Fixed serial/identity detection in `sync` so a column default that is the text
+  literal `nextval('...')` is no longer mistaken for an implicit sequence.
+
 ## v0.9.2 — 2026-09-22
 
 - Supported exact recursive propagation for inherited/partitioned column renames.

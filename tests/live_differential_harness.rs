@@ -3946,65 +3946,67 @@ struct BooleanSeparator {
 /// such as `land` are rejected by requiring surrounding whitespace.
 fn top_level_boolean_separators(expression: &str) -> Vec<BooleanSeparator> {
     let mut separators = Vec::new();
-    let bytes = expression.as_bytes();
     let mut depth = 0usize;
     let mut single_quoted = false;
     let mut double_quoted = false;
-    let mut index = 0usize;
-    while index < bytes.len() {
-        let ch = bytes[index];
+    let mut chars = expression.char_indices();
+    let mut last_char_was_whitespace = true;
+
+    while let Some((index, ch)) = chars.next() {
         if single_quoted {
-            if ch == b'\'' {
+            if ch == '\'' {
                 single_quoted = false;
             }
-            index += 1;
+            last_char_was_whitespace = ch.is_whitespace();
             continue;
         }
         if double_quoted {
-            if ch == b'"' {
+            if ch == '"' {
                 double_quoted = false;
             }
-            index += 1;
+            last_char_was_whitespace = ch.is_whitespace();
             continue;
         }
         match ch {
-            b'\'' => single_quoted = true,
-            b'"' => double_quoted = true,
-            b'(' => depth += 1,
-            b')' => depth = depth.saturating_sub(1),
+            '\'' => single_quoted = true,
+            '"' => double_quoted = true,
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
             _ => {}
         }
-        let len =
-            if depth == 0 && (ch.eq_ignore_ascii_case(&b'a') || ch.eq_ignore_ascii_case(&b'o')) {
-                bytes
-                    .get(index..index + 3)
-                    .is_some_and(|word| word.eq_ignore_ascii_case(b"and"))
-                    .then_some(3)
-                    .or_else(|| {
-                        bytes
-                            .get(index..index + 2)
-                            .is_some_and(|word| word.eq_ignore_ascii_case(b"or"))
-                            .then_some(2)
-                    })
+
+        if depth == 0 && last_char_was_whitespace {
+            let tail = &expression[index..];
+            let len = if tail.get(..3).is_some_and(|s| s.eq_ignore_ascii_case("and")) {
+                Some(3)
+            } else if tail.get(..2).is_some_and(|s| s.eq_ignore_ascii_case("or")) {
+                Some(2)
             } else {
                 None
             };
-        if let Some(len) = len {
-            let before = index == 0 || bytes[index - 1].is_ascii_whitespace();
-            let after = index + len;
-            let after_whitespace = after >= bytes.len() || bytes[after].is_ascii_whitespace();
-            if before && after_whitespace {
-                let word = if len == 3 { "AND" } else { "OR" };
-                separators.push(BooleanSeparator {
-                    start: index,
-                    end: after,
-                    word,
-                });
-                index = after;
-                continue;
+
+            if let Some(len) = len {
+                let after = index + len;
+                let after_whitespace = expression[after..]
+                    .chars()
+                    .next()
+                    .is_none_or(|c| c.is_whitespace());
+                if after_whitespace {
+                    let word = if len == 3 { "AND" } else { "OR" };
+                    separators.push(BooleanSeparator {
+                        start: index,
+                        end: after,
+                        word,
+                    });
+                    for _ in 0..len - 1 {
+                        chars.next();
+                    }
+                    last_char_was_whitespace = false;
+                    continue;
+                }
             }
         }
-        index += 1;
+        last_char_was_whitespace = ch.is_whitespace();
     }
     separators
 }
@@ -4013,34 +4015,33 @@ fn outer_parentheses_wrap_expression(expression: &str) -> bool {
     let mut depth = 0usize;
     let mut single_quoted = false;
     let mut double_quoted = false;
-    let bytes = expression.as_bytes();
-    let mut index = 0usize;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'\'' if !double_quoted => {
-                if single_quoted && bytes.get(index + 1) == Some(&b'\'') {
-                    index += 1;
+    let mut chars = expression.char_indices().peekable();
+
+    while let Some((index, ch)) = chars.next() {
+        match ch {
+            '\'' if !double_quoted => {
+                if single_quoted && chars.peek().map(|&(_, c)| c) == Some('\'') {
+                    chars.next();
                 } else {
                     single_quoted = !single_quoted;
                 }
             }
-            b'"' if !single_quoted => {
-                if double_quoted && bytes.get(index + 1) == Some(&b'"') {
-                    index += 1;
+            '"' if !single_quoted => {
+                if double_quoted && chars.peek().map(|&(_, c)| c) == Some('"') {
+                    chars.next();
                 } else {
                     double_quoted = !double_quoted;
                 }
             }
-            b'(' if !single_quoted && !double_quoted => depth += 1,
-            b')' if !single_quoted && !double_quoted => {
+            '(' if !single_quoted && !double_quoted => depth += 1,
+            ')' if !single_quoted && !double_quoted => {
                 depth = depth.saturating_sub(1);
-                if depth == 0 && index + 1 != bytes.len() {
+                if depth == 0 && index + ch.len_utf8() != expression.len() {
                     return false;
                 }
             }
             _ => {}
         }
-        index += 1;
     }
     depth == 0 && !single_quoted && !double_quoted
 }
@@ -4060,10 +4061,10 @@ fn normalize_data_type(data_type: &str) -> String {
         "timestamptz" => "timestamp with time zone".to_string(),
         "time" => "time without time zone".to_string(),
         "timetz" => "time with time zone".to_string(),
-        _ if normalized.starts_with("varchar(") => {
-            normalized.replacen("varchar(", "character varying(", 1)
-        }
-        _ => normalized,
+        _ => match normalized.strip_prefix("varchar(") {
+            Some(inner) => format!("character varying({inner}"),
+            None => normalized,
+        },
     }
 }
 

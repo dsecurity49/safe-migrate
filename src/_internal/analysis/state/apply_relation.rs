@@ -6969,19 +6969,21 @@ impl AnalysisState {
 
     // Effective predicates may reference ancestor columns as well as the immediate key.
     fn register_retained_partition_check(&mut self, child: &ObjectId, definition: String) {
-        use squawk_syntax::ast::{AstNode, SourceFile, Target};
+        use squawk_syntax::ast::{SourceFile, Stmt};
         let parsed = SourceFile::parse(&format!("SELECT {definition}"));
         let columns = if parsed.errors().is_empty() && parsed.tree().stmts().count() == 1 {
-            parsed
-                .tree()
-                .syntax()
-                .descendants()
-                .find_map(Target::cast)
-                .and_then(|target| target.expr())
-                .and_then(|expr| {
-                    crate::_internal::analysis::expr_visitor::ExprVisitor::convert(expr)
-                        .referenced_columns()
-                })
+            match parsed.tree().stmts().next() {
+                Some(Stmt::Select(select)) => select
+                    .select_clause()
+                    .and_then(|clause| clause.target_list())
+                    .and_then(|list| list.targets().next())
+                    .and_then(|target| target.expr())
+                    .and_then(|expr| {
+                        crate::_internal::analysis::expr_visitor::ExprVisitor::convert(expr)
+                            .referenced_columns()
+                    }),
+                _ => None,
+            }
         } else {
             None
         };
@@ -7092,17 +7094,16 @@ impl AnalysisState {
         }
         // Fallback: cache-hydrated relation — re-parse the raw partition_by
         // text using the synthetic-SQL wrap trick (legacy path).
-        use squawk_syntax::ast::{AstNode, PartitionBy, SourceFile};
+        use squawk_syntax::ast::{SourceFile, Stmt};
         let partition_by = parent.partition_by.as_deref()?;
         let parsed = SourceFile::parse(&format!("CREATE TABLE __key () {partition_by}"));
         if !parsed.errors().is_empty() || parsed.tree().stmts().count() != 1 {
             return None;
         }
-        let partition = parsed
-            .tree()
-            .syntax()
-            .descendants()
-            .find_map(PartitionBy::cast)?;
+        let partition = match parsed.tree().stmts().next() {
+            Some(Stmt::CreateTable(create_table)) => create_table.partition_by(),
+            _ => return None,
+        }?;
         let mut columns = Vec::new();
         for item in partition.partition_item_list()?.partition_items() {
             if item.collate().is_some()
@@ -8026,11 +8027,11 @@ fn parse_typed_bound(bound: &str) -> Option<TypedBound> {
         PartitionType::PartitionForValuesFrom(f) => {
             let from_node = f
                 .syntax()
-                .descendants()
+                .children()
                 .find_map(squawk_syntax::ast::PartitionFromValues::cast)?;
             let to_node = f
                 .syntax()
-                .descendants()
+                .children()
                 .find_map(squawk_syntax::ast::PartitionToValues::cast)?;
             let mut from_datums = Vec::new();
             for expr in from_node.exprs() {
@@ -8053,21 +8054,25 @@ fn parse_typed_bound(bound: &str) -> Option<TypedBound> {
             Some(TypedBound::In(datums))
         }
         PartitionType::PartitionForValuesWith(w) => {
-            let modulus = w.modulus()?;
-            let remainder = w.remainder()?;
-            let mod_text = format!(
-                "{} {}",
-                modulus.ident_token()?.text().to_ascii_lowercase(),
-                modulus.int_number_token()?.text()
-            );
-            let rem_text = format!(
-                "{} {}",
-                remainder.ident_token()?.text().to_ascii_lowercase(),
-                remainder.int_number_token()?.text()
-            );
+            let mut mod_text = None;
+            let mut rem_text = None;
+            for bound in w.bounds() {
+                if let (Some(ident), Some(literal)) = (bound.ident_token(), bound.literal()) {
+                    let text = format!(
+                        "{} {}",
+                        ident.text().to_ascii_lowercase(),
+                        literal.syntax().text()
+                    );
+                    match ident.text().to_ascii_uppercase().as_str() {
+                        "MODULUS" => mod_text = Some(text),
+                        "REMAINDER" => rem_text = Some(text),
+                        _ => {}
+                    }
+                }
+            }
             Some(TypedBound::With {
-                modulus: mod_text,
-                remainder: rem_text,
+                modulus: mod_text?,
+                remainder: rem_text?,
             })
         }
         PartitionType::PartitionDefault(_) => Some(TypedBound::Default),

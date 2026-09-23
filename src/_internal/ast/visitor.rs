@@ -397,13 +397,9 @@ impl AstVisitor {
         let path = node.table_name()?.path()?;
         let name = Self::path_to_qualified_name(&path)?;
 
-        let persistence = match node
-            .persistence()
-            .map(|p| p.syntax().text().to_string().to_lowercase())
-            .as_deref()
-        {
-            Some("temporary") | Some("temp") => PersistenceFact::Temporary,
-            Some("unlogged") => PersistenceFact::Unlogged,
+        let persistence = match node.persistence() {
+            Some(squawk_syntax::ast::Persistence::Temp(_)) => PersistenceFact::Temporary,
+            Some(squawk_syntax::ast::Persistence::Unlogged(_)) => PersistenceFact::Unlogged,
             _ => PersistenceFact::Permanent,
         };
         let on_commit = match node
@@ -501,13 +497,9 @@ impl AstVisitor {
 
     fn extract_create_table_as(node: &CreateTableAs) -> Option<StatementFact> {
         let path = node.table_name()?.path()?;
-        let persistence = match node
-            .persistence()
-            .map(|p| p.syntax().text().to_string().to_lowercase())
-            .as_deref()
-        {
-            Some("temporary") | Some("temp") => PersistenceFact::Temporary,
-            Some("unlogged") => PersistenceFact::Unlogged,
+        let persistence = match node.persistence() {
+            Some(squawk_syntax::ast::Persistence::Temp(_)) => PersistenceFact::Temporary,
+            Some(squawk_syntax::ast::Persistence::Unlogged(_)) => PersistenceFact::Unlogged,
             _ => PersistenceFact::Permanent,
         };
         let on_commit = match node
@@ -554,13 +546,9 @@ impl AstVisitor {
     fn extract_select_into(node: &SelectInto) -> Option<StatementFact> {
         let into = node.into_clause()?;
         let name = into.table_name()?.path()?;
-        let persistence = match into
-            .persistence()
-            .map(|persistence| persistence.syntax().text().to_string().to_lowercase())
-            .as_deref()
-        {
-            Some("temporary") | Some("temp") => PersistenceFact::Temporary,
-            Some("unlogged") => PersistenceFact::Unlogged,
+        let persistence = match into.persistence() {
+            Some(squawk_syntax::ast::Persistence::Temp(_)) => PersistenceFact::Temporary,
+            Some(squawk_syntax::ast::Persistence::Unlogged(_)) => PersistenceFact::Unlogged,
             _ => PersistenceFact::Permanent,
         };
         let select_source = node.from_clause().and_then(|from| {
@@ -1734,162 +1722,138 @@ impl AstVisitor {
     fn extract_add_constraint_fact(
         ac: &squawk_syntax::ast::AddConstraint,
     ) -> Option<AlterTableActionFact> {
-        if let Some(fkc) = ac
-            .syntax()
-            .descendants()
-            .find_map(ast::ForeignKeyConstraint::cast)
-        {
-            let not_valid = fkc
-                .constraint_options()
-                .any(|option| matches!(option, ast::ConstraintOption::NotValid(_)));
-            let constraint_name = fkc
-                .constraint_name_clause()
-                .and_then(|cn| cn.constraint_name())
-                .and_then(|cn| cn.ident_token())
-                .map(|t| Self::resolve_identifier_token(t.text()))
-                .or_else(|| {
-                    ac.syntax()
-                        .descendants()
-                        .find_map(ast::ConstraintName::cast)
-                        .and_then(|cn| cn.ident_token())
-                        .map(|t| Self::resolve_identifier_token(t.text()))
-                });
-            let path = fkc.table_name_ref()?.path_ref()?;
-            let references = Self::path_ref_to_qualified_name(&path)?;
-            let column_lists = Self::extract_foreign_key_column_lists(&fkc);
-            return Some(AlterTableActionFact::AddForeignKey {
-                constraint_name,
-                references,
-                from_columns: column_lists.first().cloned().unwrap_or_default(),
-                to_columns: column_lists.get(1).cloned().unwrap_or_default(),
-                not_valid,
-            });
-        }
-
-        if let Some(cc) = ac
-            .syntax()
-            .descendants()
-            .find_map(ast::CheckConstraint::cast)
-        {
-            let not_valid = cc
-                .constraint_options()
-                .any(|option| matches!(option, ast::ConstraintOption::NotValid(_)));
-            let constraint_name = cc
-                .constraint_name_clause()
-                .and_then(|cn| cn.constraint_name())
-                .and_then(|cn| cn.ident_token())
-                .map(|t| Self::resolve_identifier_token(t.text()))
-                .or_else(|| {
-                    ac.syntax()
-                        .descendants()
-                        .find_map(ast::ConstraintName::cast)
-                        .and_then(|cn| cn.ident_token())
-                        .map(|t| Self::resolve_identifier_token(t.text()))
-                });
-            let (columns, columns_complete) = cc
-                .expr()
-                .map(crate::_internal::analysis::expr_visitor::ExprVisitor::convert)
-                .map(Self::expr_columns_with_completeness)
-                .unwrap_or((Vec::new(), false));
-            return Some(AlterTableActionFact::AddCheckConstraint {
-                constraint_name,
-                definition: cc.expr()?.syntax().text().to_string(),
-                columns,
-                columns_complete,
-                not_valid,
-            });
-        }
-
-        if let Some(unique) = ac
-            .syntax()
-            .descendants()
-            .find_map(ast::UniqueConstraint::cast)
-        {
-            let constraint_name = unique
-                .constraint_name_clause()
-                .and_then(|clause| clause.constraint_name())
-                .and_then(|name| name.ident_token())
-                .map(|token| Self::resolve_identifier_token(token.text()));
-            let using_index = unique
-                .using_index()
-                .and_then(|using_index| using_index.index_ref())
-                .and_then(|index_ref| index_ref.path_ref())
-                .and_then(|path| Self::path_ref_to_qualified_name(&path));
-            let columns = unique
-                .syntax()
-                .descendants()
-                .find_map(ast::ConstraintColumnRefList::cast)
-                .map(Self::extract_constraint_column_list_names)
-                .unwrap_or_default();
-            return Some(AlterTableActionFact::AddUniqueConstraint {
-                constraint_name,
-                columns,
-                using_index,
-            });
-        }
-
-        if let Some(primary_key) = ac
-            .syntax()
-            .descendants()
-            .find_map(ast::PrimaryKeyConstraint::cast)
-        {
-            let constraint_name = primary_key
-                .constraint_name_clause()
-                .and_then(|clause| clause.constraint_name())
-                .and_then(|name| name.ident_token())
-                .map(|token| Self::resolve_identifier_token(token.text()));
-            let using_index = primary_key
-                .using_index()
-                .and_then(|using_index| using_index.index_ref())
-                .and_then(|index_ref| index_ref.path_ref())
-                .and_then(|path| Self::path_ref_to_qualified_name(&path));
-            let columns = primary_key
-                .syntax()
-                .descendants()
-                .find_map(ast::ConstraintColumnRefList::cast)
-                .map(Self::extract_constraint_column_list_names)
-                .unwrap_or_default();
-            return Some(AlterTableActionFact::AddPrimaryKeyConstraint {
-                constraint_name,
-                columns,
-                using_index,
-            });
-        }
-
-        if let Some(exclusion) = ac
-            .syntax()
-            .descendants()
-            .find_map(ast::ExcludeConstraint::cast)
-        {
-            let constraint_name = exclusion
-                .constraint_name_clause()
-                .and_then(|clause| clause.constraint_name())
-                .and_then(|name| name.ident_token())
-                .map(|token| Self::resolve_identifier_token(token.text()));
-            let mut columns_complete = true;
-            let columns = exclusion
-                .constraint_exclusion_list()
-                .map(|list| {
-                    list.constraint_exclusions()
-                        .filter_map(|item| item.expr())
-                        .map(crate::_internal::analysis::expr_visitor::ExprVisitor::convert)
-                        .map(Self::expr_columns_with_completeness)
-                        .inspect(|(_, complete)| columns_complete &= *complete)
-                        .flat_map(|(columns, _)| columns)
-                        .collect()
+        let constraint = ac.constraint()?;
+        match constraint {
+            ast::Constraint::ForeignKeyConstraint(fkc) => {
+                let not_valid = fkc
+                    .constraint_options()
+                    .any(|option| matches!(option, ast::ConstraintOption::NotValid(_)));
+                let constraint_name = fkc
+                    .constraint_name_clause()
+                    .and_then(|cn| cn.constraint_name())
+                    .and_then(|cn| cn.ident_token())
+                    .map(|t| Self::resolve_identifier_token(t.text()))
+                    .or_else(|| {
+                        fkc.syntax()
+                            .descendants()
+                            .find_map(ast::ConstraintName::cast)
+                            .and_then(|cn| cn.ident_token())
+                            .map(|t| Self::resolve_identifier_token(t.text()))
+                    });
+                let path = fkc.table_name_ref()?.path_ref()?;
+                let references = Self::path_ref_to_qualified_name(&path)?;
+                let column_lists = Self::extract_foreign_key_column_lists(&fkc);
+                Some(AlterTableActionFact::AddForeignKey {
+                    constraint_name,
+                    references,
+                    from_columns: column_lists.first().cloned().unwrap_or_default(),
+                    to_columns: column_lists.get(1).cloned().unwrap_or_default(),
+                    not_valid,
                 })
-                .unwrap_or_else(|| {
-                    columns_complete = false;
-                    Vec::new()
-                });
-            return Some(AlterTableActionFact::AddExcludeConstraint {
-                constraint_name,
-                columns,
-                columns_complete,
-            });
+            }
+            ast::Constraint::CheckConstraint(cc) => {
+                let not_valid = cc
+                    .constraint_options()
+                    .any(|option| matches!(option, ast::ConstraintOption::NotValid(_)));
+                let constraint_name = cc
+                    .constraint_name_clause()
+                    .and_then(|cn| cn.constraint_name())
+                    .and_then(|cn| cn.ident_token())
+                    .map(|t| Self::resolve_identifier_token(t.text()))
+                    .or_else(|| {
+                        cc.syntax()
+                            .descendants()
+                            .find_map(ast::ConstraintName::cast)
+                            .and_then(|cn| cn.ident_token())
+                            .map(|t| Self::resolve_identifier_token(t.text()))
+                    });
+                let (columns, columns_complete) = cc
+                    .expr()
+                    .map(crate::_internal::analysis::expr_visitor::ExprVisitor::convert)
+                    .map(Self::expr_columns_with_completeness)
+                    .unwrap_or((Vec::new(), false));
+                Some(AlterTableActionFact::AddCheckConstraint {
+                    constraint_name,
+                    definition: cc.expr()?.syntax().text().to_string(),
+                    columns,
+                    columns_complete,
+                    not_valid,
+                })
+            }
+            ast::Constraint::UniqueConstraint(unique) => {
+                let constraint_name = unique
+                    .constraint_name_clause()
+                    .and_then(|clause| clause.constraint_name())
+                    .and_then(|name| name.ident_token())
+                    .map(|token| Self::resolve_identifier_token(token.text()));
+                let using_index = unique
+                    .using_index()
+                    .and_then(|using_index| using_index.index_ref())
+                    .and_then(|index_ref| index_ref.path_ref())
+                    .and_then(|path| Self::path_ref_to_qualified_name(&path));
+                let columns = unique
+                    .index_parameters()
+                    .and_then(|params| params.column_list())
+                    .map(Self::extract_constraint_column_list_names)
+                    .unwrap_or_default();
+                Some(AlterTableActionFact::AddUniqueConstraint {
+                    constraint_name,
+                    columns,
+                    using_index,
+                })
+            }
+            ast::Constraint::PrimaryKeyConstraint(primary_key) => {
+                let constraint_name = primary_key
+                    .constraint_name_clause()
+                    .and_then(|clause| clause.constraint_name())
+                    .and_then(|name| name.ident_token())
+                    .map(|token| Self::resolve_identifier_token(token.text()));
+                let using_index = primary_key
+                    .using_index()
+                    .and_then(|using_index| using_index.index_ref())
+                    .and_then(|index_ref| index_ref.path_ref())
+                    .and_then(|path| Self::path_ref_to_qualified_name(&path));
+                let columns = primary_key
+                    .index_parameters()
+                    .and_then(|params| params.column_list())
+                    .map(Self::extract_constraint_column_list_names)
+                    .unwrap_or_default();
+                Some(AlterTableActionFact::AddPrimaryKeyConstraint {
+                    constraint_name,
+                    columns,
+                    using_index,
+                })
+            }
+            ast::Constraint::ExcludeConstraint(exclusion) => {
+                let constraint_name = exclusion
+                    .constraint_name_clause()
+                    .and_then(|clause| clause.constraint_name())
+                    .and_then(|name| name.ident_token())
+                    .map(|token| Self::resolve_identifier_token(token.text()));
+                let mut columns_complete = true;
+                let columns = exclusion
+                    .constraint_exclusion_list()
+                    .map(|list| {
+                        list.constraint_exclusions()
+                            .filter_map(|item| item.expr())
+                            .map(crate::_internal::analysis::expr_visitor::ExprVisitor::convert)
+                            .map(Self::expr_columns_with_completeness)
+                            .inspect(|(_, complete)| columns_complete &= *complete)
+                            .flat_map(|(columns, _)| columns)
+                            .collect()
+                    })
+                    .unwrap_or_else(|| {
+                        columns_complete = false;
+                        Vec::new()
+                    });
+                Some(AlterTableActionFact::AddExcludeConstraint {
+                    constraint_name,
+                    columns,
+                    columns_complete,
+                })
+            }
+            _ => None,
         }
-
-        None
     }
 
     fn extract_table_constraint_fact(tc: &TableConstraint) -> Option<TableConstraintFact> {
@@ -1901,9 +1865,8 @@ impl AstVisitor {
                     .and_then(|name| name.ident_token())
                     .map(|token| Self::resolve_identifier_token(token.text())),
                 columns: pkc
-                    .syntax()
-                    .descendants()
-                    .find_map(ast::ConstraintColumnRefList::cast)
+                    .index_parameters()
+                    .and_then(|params| params.column_list())
                     .map(Self::extract_constraint_column_list_names)
                     .or_else(|| pkc.using_index().map(|_| Vec::new()))?,
             }),
@@ -1914,9 +1877,8 @@ impl AstVisitor {
                     .and_then(|name| name.ident_token())
                     .map(|token| Self::resolve_identifier_token(token.text())),
                 columns: uc
-                    .syntax()
-                    .descendants()
-                    .find_map(ast::ConstraintColumnRefList::cast)
+                    .index_parameters()
+                    .and_then(|params| params.column_list())
                     .map(Self::extract_constraint_column_list_names)
                     .or_else(|| uc.using_index().map(|_| Vec::new()))?,
             }),
@@ -1986,13 +1948,9 @@ impl AstVisitor {
             .filter_map(|c| {
                 if let ColumnConstraint::ReferencesConstraint(rc) = c {
                     let ref_path = rc
-                        .syntax()
-                        .descendants()
-                        .find_map(ast::PathRef::cast)
-                        .and_then(|pr| {
-                            // Try PathRef first (new parser), then fall back to Path (old)
-                            Self::path_ref_to_qualified_name(&pr)
-                        })
+                        .table()
+                        .and_then(|t| t.path_ref())
+                        .and_then(|path| Self::path_ref_to_qualified_name(&path))
                         .or_else(|| {
                             rc.syntax()
                                 .descendants()
@@ -2054,7 +2012,7 @@ impl AstVisitor {
         // change that positional contract.
         constraint
             .syntax()
-            .descendants()
+            .children()
             .filter_map(ast::ForeignKeyColumnList::cast)
             .map(|list| {
                 list.column_name_refs()
@@ -2107,9 +2065,7 @@ impl AstVisitor {
         let mut has_default_opclasses = true;
         let mut has_default_collations = true;
         for item in node
-            .syntax()
-            .children()
-            .find_map(ast::PartitionItemList::cast)
+            .partition_item_list()
             .into_iter()
             .flat_map(|items| items.partition_items())
         {
@@ -2431,13 +2387,9 @@ impl AstVisitor {
                 ast::SequenceOption::OptionOwnedBy(owned_by) => Self::extract_owned_by(&owned_by),
                 _ => None,
             }),
-            persistence: match node
-                .persistence()
-                .map(|value| value.syntax().text().to_string().to_lowercase())
-                .as_deref()
-            {
-                Some("temporary") | Some("temp") => PersistenceFact::Temporary,
-                Some("unlogged") => PersistenceFact::Unlogged,
+            persistence: match node.persistence() {
+                Some(squawk_syntax::ast::Persistence::Temp(_)) => PersistenceFact::Temporary,
+                Some(squawk_syntax::ast::Persistence::Unlogged(_)) => PersistenceFact::Unlogged,
                 _ => PersistenceFact::Permanent,
             },
             options: Self::extract_sequence_options(node.sequence_options())?,
@@ -2547,7 +2499,7 @@ impl AstVisitor {
         // Domain constraints and collations affect every column using the
         // domain, but are not represented in TypeState.  Do not claim an
         // exact domain when either catalog-visible property is present.
-        if node.collate().is_some() || node.constraints().next().is_some() {
+        if node.domain_qualifiers().next().is_some() {
             return None;
         }
         let path = node.domain()?.path()?;
@@ -2688,14 +2640,18 @@ impl AstVisitor {
                 });
             }
             ast::AlterTypeAction::AddValue(add_value) => {
-                let literals = add_value
-                    .syntax()
-                    .descendants()
-                    .filter_map(ast::Literal::cast)
-                    .map(|literal| Self::resolve_string_literal(&literal))
-                    .collect::<Option<Vec<_>>>()?;
-                let new_value = literals.first()?.clone();
-                let neighbor = literals.get(1).cloned();
+                let new_value = add_value
+                    .literal()
+                    .as_ref()
+                    .and_then(Self::resolve_string_literal)?;
+                let neighbor = add_value.value_position().and_then(|position| {
+                    match position {
+                        ast::ValuePosition::BeforeValue(before) => before.literal(),
+                        ast::ValuePosition::AfterValue(after) => after.literal(),
+                    }
+                    .as_ref()
+                    .and_then(Self::resolve_string_literal)
+                });
                 let before = matches!(
                     add_value.value_position(),
                     Some(ast::ValuePosition::BeforeValue(_))
@@ -3717,23 +3673,28 @@ impl AstVisitor {
     fn extract_role(
         role_ref: &squawk_syntax::ast::RoleRef,
     ) -> crate::_internal::analysis::facts::RoleFact {
-        if let Some(token) = role_ref.ident_token() {
-            let name = Self::resolve_identifier_token(token.text());
-            return crate::_internal::analysis::facts::RoleFact::Named {
-                name,
-                via_legacy_group_syntax: role_ref.group_token().is_some(),
-            };
+        let via_legacy_group_syntax = role_ref.group_token().is_some();
+        if let Some(value) = role_ref.role_ref_value() {
+            match value {
+                squawk_syntax::ast::RoleRefValue::RoleNameRef(r) => {
+                    if let Some(token) = r.ident_token() {
+                        return crate::_internal::analysis::facts::RoleFact::Named {
+                            name: Self::resolve_identifier_token(token.text()),
+                            via_legacy_group_syntax,
+                        };
+                    }
+                }
+                squawk_syntax::ast::RoleRefValue::RoleRefCurrentRole(_) => {
+                    return crate::_internal::analysis::facts::RoleFact::CurrentRole;
+                }
+                squawk_syntax::ast::RoleRefValue::RoleRefCurrentUser(_) => {
+                    return crate::_internal::analysis::facts::RoleFact::CurrentUser;
+                }
+                squawk_syntax::ast::RoleRefValue::RoleRefSessionUser(_) => {
+                    return crate::_internal::analysis::facts::RoleFact::SessionUser;
+                }
+            }
         }
-        if role_ref.current_role_token().is_some() {
-            return crate::_internal::analysis::facts::RoleFact::CurrentRole;
-        }
-        if role_ref.current_user_token().is_some() {
-            return crate::_internal::analysis::facts::RoleFact::CurrentUser;
-        }
-        if role_ref.session_user_token().is_some() {
-            return crate::_internal::analysis::facts::RoleFact::SessionUser;
-        }
-        let via_group = role_ref.group_token().is_some();
         if let Some(token) = role_ref
             .syntax()
             .descendants_with_tokens()
@@ -3743,7 +3704,7 @@ impl AstVisitor {
             let name = Self::resolve_identifier_token(token.text());
             return crate::_internal::analysis::facts::RoleFact::Named {
                 name,
-                via_legacy_group_syntax: via_group,
+                via_legacy_group_syntax,
             };
         }
         crate::_internal::analysis::facts::RoleFact::Unknown
@@ -3752,10 +3713,14 @@ impl AstVisitor {
     fn extract_role_node(
         role: &squawk_syntax::ast::Role,
     ) -> crate::_internal::analysis::facts::RoleFact {
+        let is_group = role.syntax().parent().is_some_and(|p| {
+            use squawk_syntax::SyntaxKind::*;
+            matches!(p.kind(), CREATE_GROUP | DROP_GROUP | ALTER_GROUP)
+        });
         if let Some(token) = role.ident_token() {
             return crate::_internal::analysis::facts::RoleFact::Named {
                 name: Self::resolve_identifier_token(token.text()),
-                via_legacy_group_syntax: role.group_token().is_some(),
+                via_legacy_group_syntax: is_group,
             };
         }
         if role.current_role_token().is_some() {
@@ -3865,7 +3830,14 @@ impl AstVisitor {
         let names = node
             .role_refs()
             .map(|r| {
-                r.ident_token()
+                let ident = if let Some(squawk_syntax::ast::RoleRefValue::RoleNameRef(name)) =
+                    r.role_ref_value()
+                {
+                    name.ident_token()
+                } else {
+                    None
+                };
+                ident
                     .map(|t| Self::resolve_identifier_token(t.text()))
                     .unwrap_or_default()
             })
@@ -3914,31 +3886,73 @@ impl AstVisitor {
                 crate::_internal::analysis::facts::PrivilegeFact::RoleMembership(name)
             }
         } else if let Some(role_ref) = cmd.role_ref() {
-            // Squawk 2.63.0 exposes PostgreSQL 17 MAINTAIN through the
-            // grammar's generic identifier branch (there is no
-            // `maintain_token()` accessor), so recognize it before treating
-            // the same branch as legacy role-membership syntax.
-            if let Some(ident) = role_ref.ident_token() {
-                let raw = ident.text().to_string();
-                let name = Self::resolve_identifier_token(&raw);
-                if !Self::identifier_from_token(&raw).quoted {
-                    match name.as_str() {
-                        "insert" => {
-                            return crate::_internal::analysis::facts::PrivilegeFact::Insert;
+            if let Some(squawk_syntax::ast::RoleRefValue::RoleNameRef(r)) =
+                role_ref.role_ref_value()
+            {
+                // Squawk 2.65.0 models each DML/session privilege that is also
+                // an SQL keyword (INSERT, UPDATE, DELETE, TRUNCATE, TRIGGER,
+                // EXECUTE, TEMP, TEMPORARY) as a keyword token inside the
+                // grammar's generic name slot rather than as a direct child of
+                // the command, so match on the token kind first. PostgreSQL 17
+                // MAINTAIN and legacy role-membership names arrive as IDENT.
+                match r
+                    .syntax()
+                    .descendants_with_tokens()
+                    .find_map(|t| t.into_token())
+                {
+                    Some(tok) if !tok.kind().is_trivia() => {
+                        use SyntaxKind::*;
+                        match tok.kind() {
+                            INSERT_KW => {
+                                return crate::_internal::analysis::facts::PrivilegeFact::Insert;
+                            }
+                            UPDATE_KW => {
+                                return crate::_internal::analysis::facts::PrivilegeFact::Update;
+                            }
+                            DELETE_KW => {
+                                return crate::_internal::analysis::facts::PrivilegeFact::Delete;
+                            }
+                            TRUNCATE_KW => {
+                                return crate::_internal::analysis::facts::PrivilegeFact::Truncate;
+                            }
+                            TRIGGER_KW => {
+                                return crate::_internal::analysis::facts::PrivilegeFact::Trigger;
+                            }
+                            EXECUTE_KW => {
+                                return crate::_internal::analysis::facts::PrivilegeFact::Execute;
+                            }
+                            TEMP_KW | TEMPORARY_KW => {
+                                return crate::_internal::analysis::facts::PrivilegeFact::Temporary;
+                            }
+                            _ => {}
                         }
-                        "update" => {
-                            return crate::_internal::analysis::facts::PrivilegeFact::Update;
-                        }
-                        "delete" => {
-                            return crate::_internal::analysis::facts::PrivilegeFact::Delete;
-                        }
-                        "maintain" => {
-                            return crate::_internal::analysis::facts::PrivilegeFact::Maintain;
-                        }
-                        _ => {}
                     }
+                    _ => {}
                 }
-                crate::_internal::analysis::facts::PrivilegeFact::RoleMembership(name)
+                if let Some(ident) = r.ident_token() {
+                    let raw = ident.text().to_string();
+                    let name = Self::resolve_identifier_token(&raw);
+                    if !Self::identifier_from_token(&raw).quoted {
+                        match name.as_str() {
+                            "insert" => {
+                                return crate::_internal::analysis::facts::PrivilegeFact::Insert;
+                            }
+                            "update" => {
+                                return crate::_internal::analysis::facts::PrivilegeFact::Update;
+                            }
+                            "delete" => {
+                                return crate::_internal::analysis::facts::PrivilegeFact::Delete;
+                            }
+                            "maintain" => {
+                                return crate::_internal::analysis::facts::PrivilegeFact::Maintain;
+                            }
+                            _ => {}
+                        }
+                    }
+                    crate::_internal::analysis::facts::PrivilegeFact::RoleMembership(name)
+                } else {
+                    crate::_internal::analysis::facts::PrivilegeFact::Unknown
+                }
             } else {
                 let text = role_ref.syntax().text().to_string();
                 match text.to_lowercase().as_str() {
@@ -4724,11 +4738,7 @@ impl AstVisitor {
     fn path_to_qualified_name(path: &Path) -> Option<QualifiedName> {
         let mut segments: Vec<Ident> = Vec::new();
 
-        if let Some(pr) = path
-            .syntax()
-            .descendants()
-            .find_map(squawk_syntax::ast::PathRef::cast)
-        {
+        if let Some(pr) = path.qualifier() {
             let mut current_ref = Some(pr);
             while let Some(r) = current_ref {
                 if let Some(seg) = r.segment() {
@@ -4738,10 +4748,10 @@ impl AstVisitor {
             }
         }
 
-        for ps in path.syntax().descendants().filter_map(PathSegment::cast) {
-            if let Some(ident) = Self::segment_ident(ps) {
-                segments.push(ident);
-            }
+        if let Some(ps) = path.segment()
+            && let Some(ident) = Self::segment_ident(ps)
+        {
+            segments.push(ident);
         }
 
         if segments.is_empty() {
