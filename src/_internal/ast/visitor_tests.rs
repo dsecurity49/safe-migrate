@@ -2788,9 +2788,13 @@ mod tests {
                     actions.as_slice(),
                     [AlterTableActionFact::AddForeignKey {
                         constraint_name: Some(name),
+                        from_columns,
+                        to_columns,
                         not_valid: true,
                         ..
                     }] if name == "events_parent_fk"
+                        && from_columns == &["parent_id".to_string()]
+                        && to_columns == &["id".to_string()]
                 )
         ));
         assert!(matches!(

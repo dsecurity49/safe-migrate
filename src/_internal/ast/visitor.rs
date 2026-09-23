@@ -947,6 +947,10 @@ impl AstVisitor {
                 AlterTableAction::AddConstraint(ac) => {
                     if let Some(fact) = Self::extract_add_constraint_fact(&ac) {
                         actions.push(fact);
+                    } else {
+                        // A typed but unmodeled constraint kind must not be
+                        // mistaken for an exact no-op.
+                        unsupported_action = true;
                     }
                 }
                 AlterTableAction::DropConstraint(dc) => {
@@ -4680,13 +4684,14 @@ impl AstVisitor {
             return None;
         }
 
+        let last = segments.len() - 1;
         if segments.len() >= 2 {
             Some(QualifiedName::new(
-                Some(segments[0].clone()),
-                segments[1].clone(),
+                Some(segments[last - 1].clone()),
+                segments[last].clone(),
             ))
         } else {
-            Some(QualifiedName::new(None, segments[0].clone()))
+            Some(QualifiedName::new(None, segments[last].clone()))
         }
     }
 
@@ -4746,6 +4751,7 @@ impl AstVisitor {
                 }
                 current_ref = r.qualifier();
             }
+            segments.reverse();
         }
 
         if let Some(ps) = path.segment()
@@ -4758,13 +4764,14 @@ impl AstVisitor {
             return None;
         }
 
+        let last = segments.len() - 1;
         if segments.len() >= 2 {
             Some(QualifiedName::new(
-                Some(segments[0].clone()),
-                segments[1].clone(),
+                Some(segments[last - 1].clone()),
+                segments[last].clone(),
             ))
         } else {
-            Some(QualifiedName::new(None, segments[0].clone()))
+            Some(QualifiedName::new(None, segments[last].clone()))
         }
     }
 }
