@@ -1,5 +1,6 @@
 pub(crate) mod column;
 pub(crate) mod constraint;
+pub(crate) mod data_type;
 pub(crate) mod function;
 pub(crate) mod relation;
 pub(crate) mod replication;

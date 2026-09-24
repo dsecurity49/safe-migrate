@@ -2,6 +2,7 @@ use crate::_internal::analysis::facts::StatementFact;
 use crate::_internal::analysis::mutations::{Mutation, OpaqueMutation};
 use crate::_internal::analysis::state::AnalysisState;
 use crate::_internal::ast::identifiers::{ObjectId, QualifiedName};
+use crate::_internal::model::data_type::ParsedDataType;
 
 mod relation;
 mod relation_aux;
@@ -139,47 +140,7 @@ impl Resolver {
     }
 
     pub(crate) fn normalize_function_arg_type(raw: &str) -> String {
-        let normalized = Self::fold_unquoted_identifier_case(raw.trim());
-        if let Some(element_type) = normalized.strip_suffix("[]") {
-            return format!("{}[]", Self::normalize_function_arg_type(element_type));
-        }
-        match normalized.as_str() {
-            "int" | "int4" => "integer".to_string(),
-            "int8" => "bigint".to_string(),
-            "int2" => "smallint".to_string(),
-            "float8" => "double precision".to_string(),
-            "float4" => "real".to_string(),
-            "bool" => "boolean".to_string(),
-            "varchar" => "character varying".to_string(),
-            "char" => "character".to_string(),
-            "time" => "time without time zone".to_string(),
-            "timestamp" => "timestamp without time zone".to_string(),
-            "timestamptz" => "timestamp with time zone".to_string(),
-            "decimal" => "numeric".to_string(),
-            _ => normalized,
-        }
-    }
-
-    fn fold_unquoted_identifier_case(raw: &str) -> String {
-        let mut folded = String::with_capacity(raw.len());
-        let mut quoted = false;
-        let mut chars = raw.chars().peekable();
-        while let Some(character) = chars.next() {
-            match character {
-                '"' if quoted && chars.peek() == Some(&'"') => {
-                    folded.push('"');
-                    folded.push('"');
-                    chars.next();
-                }
-                '"' => {
-                    quoted = !quoted;
-                    folded.push(character);
-                }
-                character if quoted => folded.push(character),
-                character => folded.extend(character.to_lowercase()),
-            }
-        }
-        folded
+        ParsedDataType::parse(raw).to_string()
     }
 
     pub(crate) fn resolve(fact: &StatementFact, state: &AnalysisState) -> Vec<Mutation> {

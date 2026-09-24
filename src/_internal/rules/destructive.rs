@@ -1,5 +1,6 @@
 use crate::_internal::analysis::mutations::{AlterTableActionMutation, Mutation};
 use crate::_internal::analysis::state::MutationResult;
+use crate::_internal::model::data_type::ParsedDataType;
 use crate::_internal::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
 use crate::_internal::rules::{
     BASELINE_RELATION_CAPABILITIES, BASELINE_STATS_CAPABILITIES, Rule, RuleCapability, RuleContext,
@@ -556,85 +557,9 @@ impl Rule for ReversibilityRule {
 /// This is used by ReversibilityRule to distinguish between "safe widening" (e.g., INT->BIGINT)
 /// and genuinely lossy changes (e.g., BIGINT->INT, VARCHAR(255)->VARCHAR(50), TEXT->VARCHAR(n)).
 fn is_type_change_lossy(old_type: &str, new_type: &str) -> bool {
-    let old = old_type.to_lowercase().trim().to_string();
-    let new = new_type.to_lowercase().trim().to_string();
-
-    // Same type is trivially safe
-    if old == new {
-        return false;
-    }
-
-    // Extract base types (without parameters)
-    let old_base = old.split('(').next().unwrap_or(&old).trim();
-    let new_base = new.split('(').next().unwrap_or(&new).trim();
-
-    // VARCHAR narrowing check
-    if let (Some(old_lim), Some(new_lim)) =
-        (extract_varchar_limit(&old), extract_varchar_limit(&new))
-    {
-        // Both are varchar - check if narrowing
-        return new_lim < old_lim;
-    }
-
-    // Check for TEXT -> VARCHAR(n) narrowing (text is unbounded, varchar(n) is bounded)
-    // Also handles character varying (unbounded) -> varchar(n)
-    let new_varchar_limit = extract_varchar_limit(&new);
-    if new_varchar_limit.is_some()
-        && (old_base == "text" || old_base == "varchar" || old_base == "character varying")
-    {
-        return true;
-    }
-
-    // Varchar to something smaller/narrower - check if target type can hold all values
-    let old_varchar_limit = extract_varchar_limit(&old);
-    if old_varchar_limit.is_some() {
-        // varchar -> text is safe (widening)
-        if new == "text" || new == "varchar" || new == "character varying" {
-            return false;
-        }
-        // varchar -> other types might be lossy
-        return true;
-    }
-
-    // Widening integer types are safe (though they require a rewrite)
-    // int2 (smallint) -> int4 -> int8 (bigint) are all safe
-    if let (Some(old_sz), Some(new_sz)) = (
-        integer_type_size_bits(old_base),
-        integer_type_size_bits(new_base),
-    ) {
-        // Narrowing is unsafe
-        return new_sz < old_sz;
-    }
-
-    // For other types, assume safe unless we have specific knowledge
-    false
-}
-
-/// Extracts the character limit from a varchar type string.
-/// Returns the limit in bytes (for comparison purposes).
-fn extract_varchar_limit(ty: &str) -> Option<i32> {
-    if ty.starts_with("varchar(") || ty.starts_with("character varying(") {
-        let paren_start = ty.find('(')?;
-        let paren_end = ty[paren_start..].find(')')?;
-        let num_str = &ty[paren_start + 1..paren_start + paren_end];
-        let limit: i32 = num_str.parse().ok()?;
-        Some(limit)
-    } else if ty == "varchar" || ty == "character varying" {
-        // VARCHAR without limit is like TEXT - unbounded
-        None
-    } else {
-        None
-    }
-}
-
-/// Returns the size of integer types in bits.
-fn integer_type_size_bits(ty: &str) -> Option<i32> {
-    match ty {
-        "smallint" | "int2" => Some(16),
-        "integer" | "int4" | "int" => Some(32),
-        "bigint" | "int8" => Some(64),
-        _ => None,
-    }
+    let old_parsed = ParsedDataType::parse(old_type);
+    let new_parsed = ParsedDataType::parse(new_type);
+    old_parsed.is_lossy_narrowing_to(&new_parsed)
 }
 
 pub(crate) struct GeneralCascadeRule;
@@ -825,18 +750,8 @@ fn parse_numeric_params(ty: &str) -> Option<(i32, i32)> {
 /// Used when the new type comes from the migration SQL (not from the cache).
 /// For varchar(N), derives the atttypmod from the character limit.
 pub(crate) fn extract_type_modifier_from_type_string(ty: &str) -> Option<i32> {
-    let lower = ty.to_lowercase().trim().to_string();
-    // Check for varchar(N) or character varying(N)
-    if lower.starts_with("varchar(") || lower.starts_with("character varying(") {
-        let paren_start = lower.find('(')?;
-        let paren_end = lower[paren_start..].find(')')?;
-        let num_str = &lower[paren_start + 1..paren_start + paren_end];
-        let limit: i32 = num_str.parse().ok()?;
-        // VARCHAR atttypmod is the character limit plus VARHDRSZ.
-        Some(limit + 4)
-    } else {
-        None
-    }
+    let parsed = ParsedDataType::parse(ty);
+    parsed.atttypmod_offset()
 }
 
 impl Rule for TypeChangeRewriteRule {

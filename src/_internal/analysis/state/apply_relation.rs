@@ -6,6 +6,7 @@ use crate::_internal::analysis::mutations::{
     AlterTable, AlterTableActionMutation, CreateTable, DropTable, PersistenceMutation, Rename,
 };
 use crate::_internal::ast::identifiers::ObjectId;
+use crate::_internal::model::data_type::DataTypeFamily;
 use crate::_internal::model::constraint::{ConstraintKind, ConstraintState};
 use crate::_internal::model::relation::{ColumnAction, RelationKind, RelationState};
 use crate::_internal::model::sequence::{
@@ -8076,119 +8077,5 @@ fn parse_typed_bound(bound: &str) -> Option<TypedBound> {
             })
         }
         PartitionType::PartitionDefault(_) => Some(TypedBound::Default),
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DataTypeFamily {
-    Boolean,
-    Integer,
-    SmallInt,
-    BigInt,
-    Numeric,
-    Real,
-    DoublePrecision,
-    Date,
-    Uuid,
-    Text,
-    Name,
-    CiText,
-    CharacterVarying,
-    Character,
-    BpChar,
-    Timestamp,
-    TimestampTz,
-}
-
-impl DataTypeFamily {
-    fn from_type_name(name: &str) -> Option<Self> {
-        let name = name.trim();
-        if name == "boolean" {
-            Some(Self::Boolean)
-        } else if name == "integer" || name == "int" || name == "int4" {
-            Some(Self::Integer)
-        } else if name == "smallint" || name == "int2" {
-            Some(Self::SmallInt)
-        } else if name == "bigint" || name == "int8" {
-            Some(Self::BigInt)
-        } else if name == "numeric"
-            || name == "decimal"
-            || name.starts_with("numeric(")
-            || name.starts_with("decimal(")
-        {
-            Some(Self::Numeric)
-        } else if name == "real" || name == "float4" {
-            Some(Self::Real)
-        } else if name == "double precision" || name == "float8" {
-            Some(Self::DoublePrecision)
-        } else if name == "date" {
-            Some(Self::Date)
-        } else if name == "uuid" {
-            Some(Self::Uuid)
-        } else if name == "text" {
-            Some(Self::Text)
-        } else if name == "name" {
-            Some(Self::Name)
-        } else if name == "citext" {
-            Some(Self::CiText)
-        } else if name == "varchar"
-            || name.starts_with("varchar(")
-            || name.starts_with("character varying")
-        {
-            Some(Self::CharacterVarying)
-        } else if name == "char"
-            || name.starts_with("char(")
-            || name.starts_with("character(")
-            || name == "character"
-        {
-            Some(Self::Character)
-        } else if name.starts_with("bpchar") {
-            Some(Self::BpChar)
-        } else if name == "timestamp" || name.starts_with("timestamp without time zone") {
-            Some(Self::Timestamp)
-        } else if name == "timestamptz" || name.starts_with("timestamp with time zone") {
-            Some(Self::TimestampTz)
-        } else {
-            None
-        }
-    }
-
-    fn to_canonical_type_string(self, original: &str) -> String {
-        match self {
-            Self::CharacterVarying => {
-                if original.starts_with("varchar(") {
-                    original.replacen("varchar(", "character varying(", 1)
-                } else if original == "varchar" {
-                    "character varying".to_string()
-                } else {
-                    original.to_string()
-                }
-            }
-            Self::Character => {
-                if original.starts_with("char(") {
-                    original.replacen("char(", "character(", 1)
-                } else if original == "char" {
-                    "character(1)".to_string()
-                } else {
-                    original.to_string()
-                }
-            }
-            Self::BpChar => {
-                // bpchar(N) is the internal name for character(N); pg_get_constraintdef
-                // renders it as character(N). Bare bpchar (no typmod) stays as-is.
-                if original.starts_with("bpchar(") {
-                    original.replacen("bpchar(", "character(", 1)
-                } else {
-                    original.to_string()
-                }
-            }
-            Self::Timestamp => "timestamp without time zone".to_string(),
-            Self::TimestampTz => "timestamp with time zone".to_string(),
-            _ => original.to_string(),
-        }
-    }
-
-    fn requires_text_cast_for_comparison(&self) -> bool {
-        matches!(self, Self::CharacterVarying)
     }
 }
