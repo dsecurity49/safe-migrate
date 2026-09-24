@@ -237,7 +237,7 @@ fn rules_command_lists_registry_descriptors_in_json() {
     let report = parse_json_stdout(&output);
     assert_eq!(report["schema_version"], 2);
     let rules = report["rules"].as_array().expect("rules array");
-    assert_eq!(rules.len(), 29);
+    assert_eq!(rules.len(), 30);
     assert_eq!(rules[0]["id"], "irreversible-migration");
     assert_eq!(rules[0]["title"], "Irreversible migration");
     assert!(
@@ -275,7 +275,7 @@ fn rules_command_separates_human_descriptors() {
             .lines()
             .filter(|line| line.len() >= 40 && line.bytes().all(|byte| byte == b'-'))
             .count(),
-        28
+        29
     );
 }
 

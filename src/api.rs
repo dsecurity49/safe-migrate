@@ -375,6 +375,8 @@ pub enum OperationKind {
     AlterProcedure,
     /// Refreshes a materialized view.
     RefreshMaterializedView,
+    /// Reindexes a table, index, database, schema, or system.
+    Reindex,
     /// Attaches a partition.
     AttachPartition,
     /// Detaches a partition.
@@ -1781,6 +1783,7 @@ impl From<&InternalOperationKind> for OperationKind {
             InternalOperationKind::AlterFunction => Self::AlterFunction,
             InternalOperationKind::AlterProcedure => Self::AlterProcedure,
             InternalOperationKind::RefreshMaterializedView => Self::RefreshMaterializedView,
+            InternalOperationKind::Reindex => Self::Reindex,
             InternalOperationKind::AttachPartition => Self::AttachPartition,
             InternalOperationKind::DetachPartition => Self::DetachPartition,
             InternalOperationKind::VacuumFull => Self::VacuumFull,

@@ -29,6 +29,15 @@ pub(crate) enum ReplicaIdentityMutation {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ReindexTargetMutation {
+    Database(String),
+    Schema(String),
+    System(Option<String>),
+    Table(ObjectId),
+    Index(ObjectId),
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Mutation {
     CreateSchema(CreateSchemaMutation),
     AlterSchema(AlterSchemaMutation),
@@ -111,6 +120,10 @@ pub(crate) enum Mutation {
         is_session_auth: bool,
     },
     Opaque(OpaqueMutation),
+    Reindex {
+        target: Option<ReindexTargetMutation>,
+        concurrently: bool,
+    },
     Vacuum {
         table_id: Option<ObjectId>,
         is_full: bool,

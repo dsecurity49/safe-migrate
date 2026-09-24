@@ -209,3 +209,63 @@ impl Rule for ConcurrentIndexRule {
         violations
     }
 }
+
+pub(crate) struct RequireConcurrentReindexRule;
+
+impl Rule for RequireConcurrentReindexRule {
+    fn id(&self) -> &'static str {
+        "require-concurrent-reindex"
+    }
+
+    fn default_tier(&self) -> ViolationTier {
+        ViolationTier::Tier1
+    }
+
+    fn recipe(&self) -> &'static str {
+        "Reindexing a table or index without `concurrently` blocks reads and writes. Use `CONCURRENTLY` to avoid downtime."
+    }
+
+    fn required_capabilities(&self) -> &'static [RuleCapability] {
+        &[]
+    }
+
+    fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
+        let mut violations = Vec::new();
+
+        if let Mutation::Reindex { target, concurrently } = context.mutation() {
+            // REINDEX SYSTEM does not support CONCURRENTLY, so we do not flag it here.
+            let is_system = matches!(
+                target,
+                Some(crate::_internal::analysis::mutations::ReindexTargetMutation::System(_))
+            );
+
+            if !is_system && !*concurrently {
+                let target_name = match target {
+                    Some(crate::_internal::analysis::mutations::ReindexTargetMutation::Database(n)) => n.clone(),
+                    Some(crate::_internal::analysis::mutations::ReindexTargetMutation::Schema(n)) => n.clone(),
+                    Some(crate::_internal::analysis::mutations::ReindexTargetMutation::Table(id)) => format!("{}.{}", id.schema, id.name),
+                    Some(crate::_internal::analysis::mutations::ReindexTargetMutation::Index(id)) => format!("{}.{}", id.schema, id.name),
+                    Some(crate::_internal::analysis::mutations::ReindexTargetMutation::System(Some(n))) => n.clone(),
+                    Some(crate::_internal::analysis::mutations::ReindexTargetMutation::System(None)) => "current database".to_string(),
+                    None => "unknown".to_string(),
+                };
+
+                violations.push(Violation {
+                    source_range: None,
+                    rule_id: self.id(),
+                    operation_kind: OperationKind::Reindex,
+                    object_kind: ObjectKind::Index,
+                    object_name: target_name.clone(),
+                    tier: ViolationTier::Tier1,
+                    reason: format!("Synchronous REINDEX on {}", target_name),
+                    recipe: self.recipe(),
+                    dedup_key: Some(format!("{}_{}", self.id(), target_name)),
+                    sql: None,
+                    fk_dependency_related: false,
+                });
+            }
+        }
+
+        violations
+    }
+}

@@ -2,7 +2,7 @@ use super::{AnalysisState, MutationResult};
 use crate::_internal::analysis::evidence::{EvidenceCode, EvidenceScope};
 use crate::_internal::analysis::mutations::{
     AlterDatabaseMutation, CreateDatabaseMutation, DropDatabaseMutation, LockTableMutation,
-    TruncateMutation,
+    ReindexTargetMutation, TruncateMutation,
 };
 use crate::_internal::ast::identifiers::ObjectId;
 use crate::_internal::model::relation::RelationKind;
@@ -70,6 +70,51 @@ impl AnalysisState {
         _drop_database: &DropDatabaseMutation,
     ) -> MutationResult {
         self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
+        MutationResult::Applied
+    }
+
+    pub(super) fn apply_reindex(
+        &mut self,
+        target: &Option<ReindexTargetMutation>,
+        _concurrently: bool,
+    ) -> MutationResult {
+        if let Some(target) = target {
+            match target {
+                ReindexTargetMutation::Database(_) 
+                | ReindexTargetMutation::Schema(_) 
+                | ReindexTargetMutation::System(_) => {
+                    // System/Database/Schema reindexes are generally admin tasks.
+                    // REINDEX SYSTEM cannot be concurrent.
+                }
+                ReindexTargetMutation::Table(id) => {
+                    if let Err(result) = self.ensure_relation_target(
+                        id,
+                        |_| true,
+                        format!("reindexed relation '{}' does not exist", id),
+                        format!("reindexed relation '{}' is invalid", id),
+                    ) {
+                        return result;
+                    }
+                }
+                ReindexTargetMutation::Index(id) => {
+                    if !self.index_is_present(id) {
+                        // If we can prove it doesn't exist, we could return a conflict.
+                        // For simplicity, we just taint if it's missing and we have coverage.
+                        if self.baseline_covers_family_object(id, crate::_internal::db::cache::CatalogFamily::Constraints) {
+                            return MutationResult::Conflict {
+                                reason: format!("reindexed index '{}' does not exist", id),
+                            };
+                        }
+                    }
+                }
+            }
+        } else {
+            // Missing target implies parsing issue or unsupported target resolution.
+            self.taint(EvidenceCode::UnsupportedSemantics, EvidenceScope::Statement);
+        }
+
+        // Reindex does not change relation metadata (columns, constraints, etc.) directly.
+        // The rule engine checks for concurrency.
         MutationResult::Applied
     }
 

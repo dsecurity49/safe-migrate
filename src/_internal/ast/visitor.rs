@@ -2,7 +2,7 @@ use crate::_internal::analysis::expr_ir::ExprIr;
 use crate::_internal::analysis::facts::{
     AlterIndexActionFact, AlterTableActionFact, AlterTypeActionFact, AlterTypeFact, ColumnFact,
     CreateTypeFact, FkFact, LikePropertiesFact, LikeSourceFact, LockModeFact, PersistenceFact,
-    RelationTargetFact, ReplicaIdentityFact, ResetSettingTarget, SearchPathTarget, StatementFact,
+    ReindexTargetKindFact, RelationTargetFact, ReplicaIdentityFact, ResetSettingTarget, SearchPathTarget, StatementFact,
     TableConstraintFact, TimeoutSetting, TimeoutSettingValue, TypeCreationKind,
 };
 use crate::_internal::ast::identifiers::{Ident, QualifiedName};
@@ -176,6 +176,7 @@ impl AstVisitor {
                     is_full: node.is_full(),
                 });
             }
+            Stmt::Reindex(node) => return Self::extract_reindex_fact(node),
             _ => {}
         }
 
@@ -324,6 +325,46 @@ impl AstVisitor {
         }
 
         None
+    }
+
+    fn extract_reindex_fact(node: &ast::Reindex) -> Option<StatementFact> {
+        let target = node.reindex_target()?;
+        let concurrently = node.is_concurrently();
+        
+        let (target_kind, target_name) = match target {
+            ast::ReindexTarget::ReindexTargetDatabase(db) => {
+                let name = db.database_ref()
+                    .and_then(|r| r.ident_token())
+                    .map(|t| QualifiedName::new(None, Self::identifier_from_token(t.text())));
+                (ReindexTargetKindFact::Database, name)
+            }
+            ast::ReindexTarget::ReindexTargetIndex(idx) => {
+                let name = idx.index_ref().and_then(|r| Self::path_ref_to_qualified_name(&r.path_ref()?));
+                (ReindexTargetKindFact::Index, name)
+            }
+            ast::ReindexTarget::ReindexTargetSchema(schema) => {
+                let name = schema.schema_ref()
+                    .and_then(|r| r.ident_token())
+                    .map(|t| QualifiedName::new(None, Self::identifier_from_token(t.text())));
+                (ReindexTargetKindFact::Schema, name)
+            }
+            ast::ReindexTarget::ReindexTargetSystem(sys) => {
+                let name = sys.database_ref()
+                    .and_then(|r| r.ident_token())
+                    .map(|t| QualifiedName::new(None, Self::identifier_from_token(t.text())));
+                (ReindexTargetKindFact::System, name)
+            }
+            ast::ReindexTarget::ReindexTargetTable(table) => {
+                let name = table.table_name_ref().and_then(|r| Self::path_ref_to_qualified_name(&r.path_ref()?));
+                (ReindexTargetKindFact::Table, name)
+            }
+        };
+
+        Some(StatementFact::Reindex {
+            target_kind,
+            target_name,
+            concurrently,
+        })
     }
 
     fn extract_create_schema(node: &ast::CreateSchema) -> Option<StatementFact> {

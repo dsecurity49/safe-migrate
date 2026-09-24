@@ -359,6 +359,11 @@ pub(crate) enum StatementFact {
     /// Parsed SQL that changes PostgreSQL metadata but no schema state modeled
     /// by safe-migrate, such as `COMMENT ON`.
     SchemaNeutralNoop,
+    Reindex {
+        target_kind: ReindexTargetKindFact,
+        target_name: Option<QualifiedName>,
+        concurrently: bool,
+    },
     Vacuum {
         relation: Option<QualifiedName>,
         is_full: bool,
@@ -832,6 +837,15 @@ pub(crate) enum GrantTarget {
     Tables(Vec<QualifiedName>),
     AllTablesInSchema(Vec<String>),
     Roles(Vec<String>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ReindexTargetKindFact {
+    Database,
+    Schema,
+    System,
+    Table,
+    Index,
 }
 
 #[derive(Clone, Debug, PartialEq)]

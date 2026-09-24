@@ -1,14 +1,45 @@
 use super::Resolver;
-use crate::_internal::analysis::facts::{AlterIndexActionFact, AlterViewAction, PolicyCommand};
+use crate::_internal::analysis::facts::{AlterIndexActionFact, AlterViewAction, PolicyCommand, ReindexTargetKindFact};
 use crate::_internal::analysis::mutations::{
     CreateIndex, CreateMaterializedView, CreatePolicyMutation, CreateTriggerMutation, CreateView,
     DropPolicyMutation, DropTriggerMutation, Mutation, OpaqueMutation,
-    RefreshMaterializedViewMutation, Rename, RenameTriggerMutation,
+    RefreshMaterializedViewMutation, ReindexTargetMutation, Rename, RenameTriggerMutation,
 };
 use crate::_internal::analysis::state::AnalysisState;
 use crate::_internal::ast::identifiers::{Ident, ObjectId, QualifiedName};
 
 impl Resolver {
+    pub(super) fn resolve_reindex(
+        target_kind: &ReindexTargetKindFact,
+        target_name: Option<&QualifiedName>,
+        concurrently: bool,
+        state: &AnalysisState,
+    ) -> Mutation {
+        let target = match (target_kind, target_name) {
+            (ReindexTargetKindFact::Database, Some(name)) => {
+                Some(ReindexTargetMutation::Database(name.name.resolve()))
+            }
+            (ReindexTargetKindFact::Schema, Some(name)) => {
+                Some(ReindexTargetMutation::Schema(name.name.resolve()))
+            }
+            (ReindexTargetKindFact::System, name_opt) => {
+                Some(ReindexTargetMutation::System(name_opt.map(|n| n.name.resolve())))
+            }
+            (ReindexTargetKindFact::Table, Some(name)) => {
+                Some(ReindexTargetMutation::Table(Self::resolve_relation_lookup_name(name, state)))
+            }
+            (ReindexTargetKindFact::Index, Some(name)) => {
+                Some(ReindexTargetMutation::Index(Self::resolve_relation_lookup_name(name, state)))
+            }
+            _ => None, // Syntax error recovery states (missing required names)
+        };
+
+        Mutation::Reindex {
+            target,
+            concurrently,
+        }
+    }
+
     pub(super) fn resolve_create_view(
         name: &QualifiedName,
         or_replace: bool,

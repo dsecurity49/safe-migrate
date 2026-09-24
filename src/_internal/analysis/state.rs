@@ -3066,6 +3066,7 @@ impl AnalysisState {
             Mutation::AlterDatabase(alter_database) => self.apply_alter_database(alter_database),
             Mutation::DropDatabase(drop_database) => self.apply_drop_database(drop_database),
             Mutation::Vacuum { table_id, is_full } => self.apply_vacuum(table_id, *is_full),
+            Mutation::Reindex { target, concurrently } => self.apply_reindex(target, *concurrently),
         }
     }
 

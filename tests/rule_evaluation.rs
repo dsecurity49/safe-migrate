@@ -1139,4 +1139,52 @@ mod rule_evaluation_tests {
             );
         }
     }
+
+    #[test]
+    fn test_rule_require_concurrent_reindex() {
+        let sql = "
+            CREATE TABLE t1 (id int);
+            CREATE INDEX idx1 ON t1(id);
+            REINDEX TABLE t1; -- blocks, flagged
+            REINDEX INDEX idx1; -- blocks, flagged
+            REINDEX SCHEMA public; -- blocks, flagged
+            REINDEX DATABASE mydb; -- blocks, flagged
+            REINDEX (CONCURRENTLY) TABLE t1; -- safe
+            REINDEX TABLE CONCURRENTLY t1; -- safe
+            REINDEX SYSTEM mydb; -- system doesn't support concurrently, not flagged
+        ";
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let violations = engine.analyze(sql, &mut state).unwrap();
+
+        let reindex_table = violations
+            .iter()
+            .find(|v| v.rule_id == "require-concurrent-reindex" && v.object_name == "public.t1")
+            .expect("should flag synchronous table reindex");
+        assert_eq!(reindex_table.tier, ViolationTier::Tier1);
+
+        let reindex_index = violations
+            .iter()
+            .find(|v| v.rule_id == "require-concurrent-reindex" && v.object_name == "public.idx1")
+            .expect("should flag synchronous index reindex");
+        assert_eq!(reindex_index.tier, ViolationTier::Tier1);
+
+        let reindex_schema = violations
+            .iter()
+            .find(|v| v.rule_id == "require-concurrent-reindex" && v.object_name == "public")
+            .expect("should flag synchronous schema reindex");
+        assert_eq!(reindex_schema.tier, ViolationTier::Tier1);
+
+        let reindex_database = violations
+            .iter()
+            .find(|v| v.rule_id == "require-concurrent-reindex" && v.object_name == "mydb")
+            .expect("should flag synchronous database reindex");
+        assert_eq!(reindex_database.tier, ViolationTier::Tier1);
+
+        assert_eq!(
+            violations.iter().filter(|v| v.rule_id == "require-concurrent-reindex").count(),
+            4,
+            "should not flag CONCURRENTLY or SYSTEM"
+        );
+    }
 }

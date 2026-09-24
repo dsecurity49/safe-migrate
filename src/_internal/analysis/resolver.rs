@@ -158,6 +158,16 @@ impl Resolver {
                 ));
             }
             StatementFact::SchemaNeutralNoop => {}
+            StatementFact::Reindex {
+                target_kind,
+                target_name,
+                concurrently,
+            } => mutations.push(Self::resolve_reindex(
+                target_kind,
+                target_name.as_ref(),
+                *concurrently,
+                state,
+            )),
             StatementFact::AlterSchema { name, action } => {
                 mutations.push(Self::resolve_alter_schema(name, action));
             }

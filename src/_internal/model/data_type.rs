@@ -140,14 +140,13 @@ impl ParsedDataType {
 
         // 2. Extract typmods (e.g., (255) or (10, 2))
         let mut typmods = None;
-        if let Some(paren_start) = text.find('(') {
-            if let Some(paren_end) = text.rfind(')') {
-                if paren_end > paren_start {
-                    // Extract exactly what is between the parentheses
-                    typmods = Some(text[paren_start + 1..paren_end].trim().to_string());
-                    text = text[..paren_start].trim().to_string();
-                }
-            }
+        if let Some(paren_start) = text.find('(')
+            && let Some(paren_end) = text.rfind(')')
+            && paren_end > paren_start
+        {
+            // Extract exactly what is between the parentheses
+            typmods = Some(text[paren_start + 1..paren_end].trim().to_string());
+            text = text[..paren_start].trim().to_string();
         }
 
         // 3. Resolve the base family

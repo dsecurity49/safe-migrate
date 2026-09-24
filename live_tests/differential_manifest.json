@@ -2664,6 +2664,26 @@
     "public.child"
    ],
    "notes": "Parity oracle: validates exact byte-for-byte synthesized CHECK constraints across matrix of pg_type and bound shapes via DETACH PARTITION CONCURRENTLY."
+  },
+  {
+   "rule_dir": "rule_31_require-concurrent-reindex",
+   "enabled": true,
+   "transactional": false,
+   "fixtures": [
+    "001_reindex.sql"
+   ],
+   "schemas": [
+    "public"
+   ],
+   "scope": [
+    "relations",
+    "constraints",
+    "indexes"
+   ],
+   "required_relations": [
+    "public.reindex_test"
+   ],
+   "notes": "Validates that REINDEX operations execute safely and don't destructively impact catalog models."
   }
  ]
 }
