@@ -245,9 +245,7 @@ impl Resolver {
                 ));
             }
             StatementFact::AlterMaterializedView { name, action } => {
-                if let Some(mutation) =
-                    Self::resolve_alter_materialized_view(name, action, state)
-                {
+                if let Some(mutation) = Self::resolve_alter_materialized_view(name, action, state) {
                     mutations.push(mutation);
                 }
             }

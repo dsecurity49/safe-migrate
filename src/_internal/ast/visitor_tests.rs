@@ -3183,7 +3183,7 @@ mod tests {
     #[test]
     fn alter_materialized_view_actions_produce_typed_facts_not_opaque_paths() {
         use crate::_internal::analysis::facts::AlterMaterializedViewActionFact;
-        
+
         let extract_matview_action = |sql: &str| {
             let parsed = SourceFile::parse(sql);
             let stmt = parsed.tree().stmts().next().expect("statement");

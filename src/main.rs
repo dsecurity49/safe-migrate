@@ -197,7 +197,7 @@ fn run() -> Result<()> {
     let cli = Cli::parse();
 
     if cli.no_color {
-        // SAFETY: CLI parsing happens sequentially at process startup before safe-migrate 
+        // SAFETY: CLI parsing happens sequentially at process startup before safe-migrate
         // spawns any worker threads. Mutating the environment here is safe from data races.
         unsafe {
             std::env::set_var("NO_COLOR", "1");

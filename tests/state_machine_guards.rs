@@ -220,10 +220,7 @@ mod state_machine_guards_tests {
             )
             .expect("view setup should analyze");
         engine
-            .analyze(
-                "ALTER VIEW v ALTER COLUMN id SET DEFAULT 0;",
-                &mut state,
-            )
+            .analyze("ALTER VIEW v ALTER COLUMN id SET DEFAULT 0;", &mut state)
             .expect("ALTER VIEW ALTER COLUMN SET DEFAULT should analyze");
 
         assert_eq!(
@@ -244,10 +241,7 @@ mod state_machine_guards_tests {
             )
             .expect("view setup should analyze");
         engine
-            .analyze(
-                "ALTER VIEW v ALTER COLUMN id DROP DEFAULT;",
-                &mut state,
-            )
+            .analyze("ALTER VIEW v ALTER COLUMN id DROP DEFAULT;", &mut state)
             .expect("ALTER VIEW ALTER COLUMN DROP DEFAULT should analyze");
 
         assert_eq!(
@@ -268,10 +262,7 @@ mod state_machine_guards_tests {
             )
             .expect("view setup should analyze");
         engine
-            .analyze(
-                "ALTER VIEW v SET (security_invoker = true);",
-                &mut state,
-            )
+            .analyze("ALTER VIEW v SET (security_invoker = true);", &mut state)
             .expect("ALTER VIEW SET OPTIONS should analyze");
 
         assert_eq!(
@@ -292,10 +283,7 @@ mod state_machine_guards_tests {
             )
             .expect("view setup should analyze");
         engine
-            .analyze(
-                "ALTER VIEW v RESET (security_invoker);",
-                &mut state,
-            )
+            .analyze("ALTER VIEW v RESET (security_invoker);", &mut state)
             .expect("ALTER VIEW RESET OPTIONS should analyze");
 
         assert_eq!(
@@ -331,15 +319,12 @@ mod state_machine_guards_tests {
         let mut state = setup_state();
 
         engine
-            .analyze(
-                "CREATE MATERIALIZED VIEW mv AS SELECT 1 AS id;",
-                &mut state,
-            )
+            .analyze("CREATE MATERIALIZED VIEW mv AS SELECT 1 AS id;", &mut state)
             .expect("matview setup should analyze");
-        
+
         for sql in [
             "ALTER MATERIALIZED VIEW mv SET (fillfactor = 90);",
-            "ALTER MATERIALIZED VIEW mv RESET (fillfactor);"
+            "ALTER MATERIALIZED VIEW mv RESET (fillfactor);",
         ] {
             engine.analyze(sql, &mut state).unwrap();
         }
@@ -356,12 +341,9 @@ mod state_machine_guards_tests {
         let mut state = setup_state();
 
         engine
-            .analyze(
-                "CREATE MATERIALIZED VIEW mv AS SELECT 1 AS id;",
-                &mut state,
-            )
+            .analyze("CREATE MATERIALIZED VIEW mv AS SELECT 1 AS id;", &mut state)
             .expect("matview setup should analyze");
-        
+
         // This unsupported action produces OpaqueMutation::UnsupportedStatement and taints
         engine
             .analyze(

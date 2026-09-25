@@ -1002,7 +1002,9 @@ impl AnalysisState {
                                         cascade_members.push(member.clone());
                                     }
                                 }
-                                Some(_) => unreachable!("reconcile_membership_projection guarantees removal"),
+                                Some(_) => unreachable!(
+                                    "reconcile_membership_projection guarantees removal"
+                                ),
                             }
                         }
                     }
@@ -1060,7 +1062,9 @@ impl AnalysisState {
                                         cascade_grantors.push(member.clone());
                                     }
                                 }
-                                Some(_) => unreachable!("reconcile_membership_projection guarantees removal"),
+                                Some(_) => unreachable!(
+                                    "reconcile_membership_projection guarantees removal"
+                                ),
                             }
                             if revoke_option.is_some()
                                 && matches!(
