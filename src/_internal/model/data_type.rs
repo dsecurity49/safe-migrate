@@ -257,7 +257,11 @@ impl ParsedDataType {
 
 impl fmt::Display for ParsedDataType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut out = self.family.to_canonical_string(&self.original_base);
+        let mut out = if self.family == DataTypeFamily::BpChar && self.typmods.is_none() {
+            "bpchar".to_string()
+        } else {
+            self.family.to_canonical_string(&self.original_base)
+        };
 
         // Bare char/character in DDL means character(1) per the SQL standard.
         if self.typmods.is_none() && self.family == DataTypeFamily::Character {
