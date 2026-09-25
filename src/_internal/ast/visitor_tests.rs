@@ -3191,19 +3191,37 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_alter_view_actions_are_not_silent_noops() {
-        for sql in [
-            "ALTER VIEW report ALTER COLUMN total SET DEFAULT 0;",
-            "ALTER VIEW report ALTER COLUMN total DROP DEFAULT;",
-            "ALTER VIEW report SET (security_barrier = true);",
-        ] {
+    fn alter_view_column_and_options_produce_typed_facts_not_opaque_paths() {
+        // SET DEFAULT, DROP DEFAULT, SET/RESET OPTIONS are parsed-valid view
+        // mutations that produce typed facts. The resolver returns no mutation
+        // for them (they are metadata-only), so they do not taint state.
+        use crate::_internal::analysis::facts::AlterViewAction;
+
+        let extract_view_action = |sql: &str| {
             let parsed = SourceFile::parse(sql);
-            let statement = parsed.tree().stmts().next().expect("statement");
-            assert!(
-                AstVisitor::extract(&statement).is_none(),
-                "unsupported ALTER VIEW action must use the opaque engine path: {sql}"
-            );
-        }
+            let stmt = parsed.tree().stmts().next().expect("statement");
+            match AstVisitor::extract(&stmt).unwrap_or_else(|| panic!("no fact for: {sql}")) {
+                StatementFact::AlterView { action, .. } => action,
+                other => panic!("expected AlterView fact, got {other:?} for: {sql}"),
+            }
+        };
+
+        assert!(matches!(
+            extract_view_action("ALTER VIEW report ALTER COLUMN total SET DEFAULT 0;"),
+            AlterViewAction::SetDefault { column, .. } if column == "total"
+        ));
+        assert!(matches!(
+            extract_view_action("ALTER VIEW report ALTER COLUMN total DROP DEFAULT;"),
+            AlterViewAction::DropDefault { column } if column == "total"
+        ));
+        assert!(matches!(
+            extract_view_action("ALTER VIEW report SET (security_barrier = true);"),
+            AlterViewAction::SetOptions { .. }
+        ));
+        assert!(matches!(
+            extract_view_action("ALTER VIEW report RESET (security_invoker);"),
+            AlterViewAction::ResetOptions { .. }
+        ));
     }
 
     #[test]

@@ -2329,12 +2329,23 @@ impl AstVisitor {
                     },
                 })
             }
-            ast::AlterViewAction::AlterViewColumn(_) => {
-                // View column defaults are not represented by the relation
-                // state and the resolver has no corresponding mutation.
-                // Keep these parser-valid actions opaque rather than
-                // returning a fact that is silently discarded.
-                None
+            ast::AlterViewAction::AlterViewColumn(avc) => {
+                let col_token = avc.name()?.ident_token()?;
+                let column = Self::resolve_identifier_token(col_token.text());
+                let action = match avc.alter_view_column_action()? {
+                    ast::AlterViewColumnAction::SetDefault(sd) => {
+                        crate::_internal::analysis::facts::AlterViewAction::SetDefault {
+                            column,
+                            default: sd.expr().map(
+                                crate::_internal::analysis::expr_visitor::ExprVisitor::convert,
+                            ),
+                        }
+                    }
+                    ast::AlterViewColumnAction::DropDefault(_) => {
+                        crate::_internal::analysis::facts::AlterViewAction::DropDefault { column }
+                    }
+                };
+                Some(StatementFact::AlterView { name, action })
             }
             ast::AlterViewAction::RenameColumn(rc) => {
                 let from_token = rc.column_name_ref()?.ident_token()?;
@@ -2351,7 +2362,24 @@ impl AstVisitor {
                     },
                 })
             }
-            ast::AlterViewAction::SetOptions(_) | ast::AlterViewAction::ResetOptions(_) => None,
+            ast::AlterViewAction::SetOptions(so) => {
+                let options = Self::extract_attribute_list(so.attribute_list());
+                Some(StatementFact::AlterView {
+                    name,
+                    action: crate::_internal::analysis::facts::AlterViewAction::SetOptions {
+                        options,
+                    },
+                })
+            }
+            ast::AlterViewAction::ResetOptions(ro) => {
+                let options = Self::extract_attribute_list(ro.attribute_list());
+                Some(StatementFact::AlterView {
+                    name,
+                    action: crate::_internal::analysis::facts::AlterViewAction::ResetOptions {
+                        options,
+                    },
+                })
+            }
         }
     }
 

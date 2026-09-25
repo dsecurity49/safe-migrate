@@ -111,12 +111,10 @@ pub(crate) enum AlterViewAction {
     SetSchema {
         new_schema: String,
     },
-    #[expect(dead_code, reason = "reserved for typed Squawk view-default support")]
     SetDefault {
         column: String,
         default: Option<ExprIr>,
     },
-    #[expect(dead_code, reason = "reserved for typed Squawk view-default support")]
     DropDefault {
         column: String,
     },
@@ -124,13 +122,11 @@ pub(crate) enum AlterViewAction {
         from: Ident,
         to: Ident,
     },
-    #[expect(dead_code, reason = "reserved for typed Squawk view-option support")]
     SetOptions {
-        options: Vec<String>,
+        options: Vec<AttributeFact>,
     },
-    #[expect(dead_code, reason = "reserved for typed Squawk view-option support")]
     ResetOptions {
-        options: Vec<String>,
+        options: Vec<AttributeFact>,
     },
 }
 

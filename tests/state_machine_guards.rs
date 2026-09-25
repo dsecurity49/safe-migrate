@@ -209,6 +209,102 @@ mod state_machine_guards_tests {
     }
 
     #[test]
+    fn alter_view_set_default_does_not_taint() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE TABLE source (id int); CREATE VIEW v AS SELECT id FROM source;",
+                &mut state,
+            )
+            .expect("view setup should analyze");
+        engine
+            .analyze(
+                "ALTER VIEW v ALTER COLUMN id SET DEFAULT 0;",
+                &mut state,
+            )
+            .expect("ALTER VIEW ALTER COLUMN SET DEFAULT should analyze");
+
+        assert_eq!(
+            state.local.confidence,
+            safe_migrate::_internal::analysis::state::Confidence::Exact
+        );
+    }
+
+    #[test]
+    fn alter_view_drop_default_does_not_taint() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE TABLE source (id int); CREATE VIEW v AS SELECT id FROM source;",
+                &mut state,
+            )
+            .expect("view setup should analyze");
+        engine
+            .analyze(
+                "ALTER VIEW v ALTER COLUMN id DROP DEFAULT;",
+                &mut state,
+            )
+            .expect("ALTER VIEW ALTER COLUMN DROP DEFAULT should analyze");
+
+        assert_eq!(
+            state.local.confidence,
+            safe_migrate::_internal::analysis::state::Confidence::Exact
+        );
+    }
+
+    #[test]
+    fn alter_view_set_options_does_not_taint() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE TABLE source (id int); CREATE VIEW v AS SELECT id FROM source;",
+                &mut state,
+            )
+            .expect("view setup should analyze");
+        engine
+            .analyze(
+                "ALTER VIEW v SET (security_invoker = true);",
+                &mut state,
+            )
+            .expect("ALTER VIEW SET OPTIONS should analyze");
+
+        assert_eq!(
+            state.local.confidence,
+            safe_migrate::_internal::analysis::state::Confidence::Exact
+        );
+    }
+
+    #[test]
+    fn alter_view_reset_options_does_not_taint() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE TABLE source (id int); CREATE VIEW v AS SELECT id FROM source;",
+                &mut state,
+            )
+            .expect("view setup should analyze");
+        engine
+            .analyze(
+                "ALTER VIEW v RESET (security_invoker);",
+                &mut state,
+            )
+            .expect("ALTER VIEW RESET OPTIONS should analyze");
+
+        assert_eq!(
+            state.local.confidence,
+            safe_migrate::_internal::analysis::state::Confidence::Exact
+        );
+    }
+
+    #[test]
     fn alter_view_rename_column_taints_instead_of_becoming_an_exact_noop() {
         let engine = setup_engine();
         let mut state = setup_state();
