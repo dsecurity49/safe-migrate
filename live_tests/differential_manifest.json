@@ -2669,6 +2669,9 @@
    "rule_dir": "rule_31_require-concurrent-reindex",
    "enabled": true,
    "transactional": false,
+   "fixture_autocommit": [
+    "001_reindex.sql"
+   ],
    "fixtures": [
     "001_reindex.sql"
    ],
