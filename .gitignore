@@ -28,3 +28,5 @@ test_migrations/
 *.opencode/
 .safe-migrate.cache
 live_test/
+test_lossy.rs
+test_output.txt
