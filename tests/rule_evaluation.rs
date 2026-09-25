@@ -1182,9 +1182,74 @@ mod rule_evaluation_tests {
         assert_eq!(reindex_database.tier, ViolationTier::Tier1);
 
         assert_eq!(
-            violations.iter().filter(|v| v.rule_id == "require-concurrent-reindex").count(),
+            violations
+                .iter()
+                .filter(|v| v.rule_id == "require-concurrent-reindex")
+                .count(),
             4,
             "should not flag CONCURRENTLY or SYSTEM"
         );
+    }
+
+    #[test]
+    fn alter_index_variants_are_modeled_not_opaque() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let sql = "
+            CREATE TABLE t_alter (id int);
+            CREATE INDEX idx_tablespace ON t_alter(id);
+            CREATE INDEX idx_options ON t_alter(id);
+            CREATE INDEX idx_depends ON t_alter(id);
+            CREATE TABLE part_parent (id int) PARTITION BY RANGE (id);
+            CREATE TABLE part_child (id int);
+            CREATE INDEX part_parent_idx ON part_parent(id);
+            CREATE INDEX part_child_idx ON part_child(id);
+            ALTER INDEX idx_tablespace SET TABLESPACE pg_default;
+            ALTER INDEX idx_options SET (fillfactor = 70);
+            ALTER INDEX idx_options RESET (fillfactor);
+            ALTER INDEX idx_depends DEPENDS ON EXTENSION my_ext;
+            ALTER INDEX idx_depends NO DEPENDS ON EXTENSION my_ext;
+            ALTER INDEX part_parent_idx ATTACH PARTITION part_child_idx;
+        ";
+        let violations = engine.analyze(sql, &mut state).unwrap();
+
+        assert!(
+            !violations.iter().any(|v| v.rule_id == "opaque-dynamic-sql"),
+            "ALTER INDEX actions must be modeled, not opaque: {violations:?}"
+        );
+        assert!(
+            !violations.iter().any(|v| v.rule_id == "schema-drift"),
+            "no schema-drift conflicts expected: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn alter_index_rename_updates_state() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TABLE t_rename_index (id int);
+                 CREATE INDEX idx_old ON t_rename_index(id);
+                 ALTER INDEX idx_old RENAME TO idx_new;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(state.index_is_present(&object_id("public", "idx_new")));
+        assert!(!state.index_is_present(&object_id("public", "idx_old")));
+    }
+
+    #[test]
+    fn alter_index_if_exists_missing_is_safe() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TABLE t_missing (id int);
+                 ALTER INDEX IF EXISTS idx_missing RENAME TO idx_also_missing;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(!state.index_is_present(&object_id("public", "idx_also_missing")));
     }
 }

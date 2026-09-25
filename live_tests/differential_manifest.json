@@ -2681,9 +2681,30 @@
     "indexes"
    ],
    "required_relations": [
-    "public.reindex_test"
+    "public.test_table",
+    "public.child_table"
    ],
    "notes": "Validates that REINDEX operations execute safely and don't destructively impact catalog models."
+  },
+  {
+   "rule_dir": "rule_32_alter-index",
+   "enabled": true,
+   "transactional": true,
+   "fixtures": [
+    "safe_001_alter_index.sql"
+   ],
+   "schemas": [
+    "public"
+   ],
+   "scope": [
+    "relations",
+    "constraints",
+    "indexes"
+   ],
+   "required_relations": [
+    "public.test_table"
+   ],
+   "notes": "Validates ALTER INDEX action parsing, execution safety, and catalog equivalence for rename, tablespace, storage options, and extension dependencies."
   }
  ]
 }

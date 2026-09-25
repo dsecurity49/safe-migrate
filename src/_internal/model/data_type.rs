@@ -29,7 +29,7 @@ pub(crate) enum DataTypeFamily {
 }
 
 impl DataTypeFamily {
-    /// Resolves a raw PostgreSQL type name (without modifiers or array dimensions) 
+    /// Resolves a raw PostgreSQL type name (without modifiers or array dimensions)
     /// into its canonical family.
     pub(crate) fn from_base_name(name: &str) -> Self {
         match name {
@@ -130,7 +130,7 @@ impl ParsedDataType {
     /// Parses a raw string representation of a type (e.g., `varchar(255)[]`) into its structural components.
     pub(crate) fn parse(raw: &str) -> Self {
         let mut text = Self::fold_unquoted_identifier_case(raw.trim());
-        
+
         // 1. Extract array dimensions
         let mut array_dimensions = 0;
         while text.ends_with("[]") {
@@ -185,9 +185,9 @@ impl ParsedDataType {
     /// Returns the character limit if this is a bounded character type.
     pub(crate) fn character_limit(&self) -> Option<i32> {
         match self.family {
-            DataTypeFamily::CharacterVarying | DataTypeFamily::Character | DataTypeFamily::BpChar => {
-                self.typmods.as_ref().and_then(|mods| mods.parse().ok())
-            }
+            DataTypeFamily::CharacterVarying
+            | DataTypeFamily::Character
+            | DataTypeFamily::BpChar => self.typmods.as_ref().and_then(|mods| mods.parse().ok()),
             _ => None,
         }
     }
@@ -200,9 +200,9 @@ impl ParsedDataType {
 
     /// Safely evaluates if migrating from `self` to `new_type` results in irreversible data truncation.
     pub(crate) fn is_lossy_narrowing_to(&self, new_type: &ParsedDataType) -> bool {
-        if self.family == new_type.family 
-            && self.typmods == new_type.typmods 
-            && self.array_dimensions == new_type.array_dimensions 
+        if self.family == new_type.family
+            && self.typmods == new_type.typmods
+            && self.array_dimensions == new_type.array_dimensions
         {
             return false;
         }
@@ -214,13 +214,20 @@ impl ParsedDataType {
         }
 
         // 1. Integer Narrowing (e.g., bigint -> int)
-        if let (Some(old_sz), Some(new_sz)) = (self.family.size_bits(), new_type.family.size_bits()) {
+        if let (Some(old_sz), Some(new_sz)) = (self.family.size_bits(), new_type.family.size_bits())
+        {
             return new_sz < old_sz;
         }
 
         // 2. Varchar/Text Narrowing
-        let old_is_char = matches!(self.family, DataTypeFamily::CharacterVarying | DataTypeFamily::Text);
-        let new_is_char = matches!(new_type.family, DataTypeFamily::CharacterVarying | DataTypeFamily::Text);
+        let old_is_char = matches!(
+            self.family,
+            DataTypeFamily::CharacterVarying | DataTypeFamily::Text
+        );
+        let new_is_char = matches!(
+            new_type.family,
+            DataTypeFamily::CharacterVarying | DataTypeFamily::Text
+        );
 
         if old_is_char && new_is_char {
             match (self.character_limit(), new_type.character_limit()) {
@@ -242,7 +249,7 @@ impl ParsedDataType {
             }
         }
 
-        // Fallback matching legacy safety: Assume other transitions (e.g., timestamp -> date) 
+        // Fallback matching legacy safety: Assume other transitions (e.g., timestamp -> date)
         // are handled by specific rules, but do not blanket-flag them as "varchar narrowing".
         false
     }
@@ -251,7 +258,7 @@ impl ParsedDataType {
 impl fmt::Display for ParsedDataType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut out = self.family.to_canonical_string(&self.original_base);
-        
+
         // PostgreSQL quirk: `char` without limits renders as `character(1)`.
         if self.typmods.is_none() && self.family == DataTypeFamily::Character {
             out.push_str("(1)");
@@ -313,7 +320,7 @@ mod tests {
         let varchar_unbounded = ParsedDataType::parse("character varying");
         let varchar_255 = ParsedDataType::parse("varchar(255)");
         let varchar_50 = ParsedDataType::parse("varchar(50)");
-        
+
         let int = ParsedDataType::parse("int");
         let bigint = ParsedDataType::parse("bigint");
 

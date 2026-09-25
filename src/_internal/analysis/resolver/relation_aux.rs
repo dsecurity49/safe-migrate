@@ -1,9 +1,12 @@
 use super::Resolver;
-use crate::_internal::analysis::facts::{AlterIndexActionFact, AlterViewAction, PolicyCommand, ReindexTargetKindFact};
+use crate::_internal::analysis::facts::{
+    AlterIndexActionFact, AlterViewAction, PolicyCommand, ReindexTargetKindFact, StatisticsTarget,
+};
 use crate::_internal::analysis::mutations::{
-    CreateIndex, CreateMaterializedView, CreatePolicyMutation, CreateTriggerMutation, CreateView,
-    DropPolicyMutation, DropTriggerMutation, Mutation, OpaqueMutation,
-    RefreshMaterializedViewMutation, ReindexTargetMutation, Rename, RenameTriggerMutation,
+    AlterIndexActionMutation, AlterIndexMutation, CreateIndex, CreateMaterializedView,
+    CreatePolicyMutation, CreateTriggerMutation, CreateView, DropPolicyMutation,
+    DropTriggerMutation, Mutation, OpaqueMutation, RefreshMaterializedViewMutation,
+    ReindexTargetMutation, Rename, RenameTriggerMutation,
 };
 use crate::_internal::analysis::state::AnalysisState;
 use crate::_internal::ast::identifiers::{Ident, ObjectId, QualifiedName};
@@ -22,15 +25,15 @@ impl Resolver {
             (ReindexTargetKindFact::Schema, Some(name)) => {
                 Some(ReindexTargetMutation::Schema(name.name.resolve()))
             }
-            (ReindexTargetKindFact::System, name_opt) => {
-                Some(ReindexTargetMutation::System(name_opt.map(|n| n.name.resolve())))
-            }
-            (ReindexTargetKindFact::Table, Some(name)) => {
-                Some(ReindexTargetMutation::Table(Self::resolve_relation_lookup_name(name, state)))
-            }
-            (ReindexTargetKindFact::Index, Some(name)) => {
-                Some(ReindexTargetMutation::Index(Self::resolve_relation_lookup_name(name, state)))
-            }
+            (ReindexTargetKindFact::System, name_opt) => Some(ReindexTargetMutation::System(
+                name_opt.map(|n| n.name.resolve()),
+            )),
+            (ReindexTargetKindFact::Table, Some(name)) => Some(ReindexTargetMutation::Table(
+                Self::resolve_relation_lookup_name(name, state),
+            )),
+            (ReindexTargetKindFact::Index, Some(name)) => Some(ReindexTargetMutation::Index(
+                Self::resolve_relation_lookup_name(name, state),
+            )),
             _ => None, // Syntax error recovery states (missing required names)
         };
 
@@ -244,22 +247,64 @@ impl Resolver {
 
     pub(super) fn resolve_alter_index(
         name: &QualifiedName,
+        if_exists: bool,
         actions: &[AlterIndexActionFact],
         state: &AnalysisState,
-    ) -> Vec<Mutation> {
-        let id = Self::resolve_relation_lookup_name(name, state);
-        actions
+    ) -> Mutation {
+        let index_id = Self::resolve_relation_lookup_name(name, state);
+        let resolved_actions = actions
             .iter()
             .map(|action| match action {
                 AlterIndexActionFact::RenameTo { new_name } => {
-                    let mut new_id = ObjectId::new(id.schema.clone(), new_name.resolve());
-                    new_id.inferred_schema = id.inferred_schema;
-                    Mutation::Rename(Rename {
-                        old_id: id.clone(),
-                        new_id,
-                    })
+                    let mut new_id = ObjectId::new(index_id.schema.clone(), new_name.resolve());
+                    new_id.inferred_schema = index_id.inferred_schema;
+                    AlterIndexActionMutation::RenameTo { new_id }
+                }
+                AlterIndexActionFact::SetTablespace { new_tablespace } => {
+                    AlterIndexActionMutation::SetTablespace {
+                        tablespace_name: new_tablespace.resolve(),
+                    }
+                }
+                AlterIndexActionFact::AttachPartition { partition_name } => {
+                    let partition_id = Self::resolve_relation_lookup_name(partition_name, state);
+                    AlterIndexActionMutation::AttachPartition { partition_id }
+                }
+                AlterIndexActionFact::DependsOnExtension { extension_name } => {
+                    AlterIndexActionMutation::DependsOnExtension {
+                        extension_name: extension_name.resolve(),
+                    }
+                }
+                AlterIndexActionFact::NoDependsOnExtension { extension_name } => {
+                    AlterIndexActionMutation::NoDependsOnExtension {
+                        extension_name: extension_name.resolve(),
+                    }
+                }
+                AlterIndexActionFact::SetStatistics { column, target } => {
+                    AlterIndexActionMutation::SetStatistics {
+                        column_name: column.as_ref().map(|c| c.resolve()).unwrap_or_default(),
+                        target: match target {
+                            StatisticsTarget::Default => StatisticsTarget::Default,
+                            StatisticsTarget::Value(n) => StatisticsTarget::Value(*n),
+                        },
+                    }
+                }
+                AlterIndexActionFact::SetOptions { options } => {
+                    AlterIndexActionMutation::SetOptions {
+                        options: options.clone(),
+                    }
+                }
+                AlterIndexActionFact::ResetOptions { options } => {
+                    AlterIndexActionMutation::ResetOptions {
+                        options: options.clone(),
+                    }
                 }
             })
-            .collect()
+            .collect();
+
+        Mutation::AlterIndex(AlterIndexMutation {
+            index_id,
+            if_exists,
+            actions: resolved_actions,
+        })
     }
 }

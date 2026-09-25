@@ -253,7 +253,12 @@ pub(crate) enum StatementFact {
     },
     AlterIndex {
         name: QualifiedName,
+        if_exists: bool,
         actions: Vec<AlterIndexActionFact>,
+    },
+    AlterIndexAllInTablespace {
+        source_tablespace: Ident,
+        target_tablespace: Ident,
     },
     CreateType(CreateTypeFact),
     AlterType(AlterTypeFact),
@@ -449,9 +454,40 @@ pub(crate) enum AlterSequenceActionFact {
     Other,
 }
 
+// SET STATISTICS accepts an integer (-1..10000) or DEFAULT.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum StatisticsTarget {
+    Default,
+    Value(i32),
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum AlterIndexActionFact {
-    RenameTo { new_name: Ident },
+    RenameTo {
+        new_name: Ident,
+    },
+    SetTablespace {
+        new_tablespace: Ident,
+    },
+    AttachPartition {
+        partition_name: QualifiedName,
+    },
+    DependsOnExtension {
+        extension_name: Ident,
+    },
+    NoDependsOnExtension {
+        extension_name: Ident,
+    },
+    SetStatistics {
+        column: Option<Ident>,
+        target: StatisticsTarget,
+    },
+    SetOptions {
+        options: Vec<AttributeFact>,
+    },
+    ResetOptions {
+        options: Vec<AttributeFact>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]

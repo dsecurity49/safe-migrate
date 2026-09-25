@@ -67,6 +67,8 @@ pub(crate) enum Mutation {
     DropTable(DropTable),
     DropView(DropViewMutation),
     DropMaterializedView(DropMaterializedViewMutation),
+    AlterIndex(AlterIndexMutation),
+    AlterIndexAllInTablespace(AlterIndexAllInTablespaceMutation),
     DropIndex(DropIndex),
     LockTable(LockTableMutation),
     Truncate(TruncateMutation),
@@ -845,5 +847,47 @@ pub(crate) enum AlterTableActionMutation {
     },
     OwnerTo {
         new_owner: crate::_internal::analysis::facts::RoleFact,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct AlterIndexMutation {
+    pub index_id: ObjectId,
+    pub if_exists: bool,
+    pub actions: Vec<AlterIndexActionMutation>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct AlterIndexAllInTablespaceMutation {
+    pub source_tablespace: String,
+    pub target_tablespace: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum AlterIndexActionMutation {
+    RenameTo {
+        new_id: ObjectId,
+    },
+    SetTablespace {
+        tablespace_name: String,
+    },
+    AttachPartition {
+        partition_id: ObjectId,
+    },
+    DependsOnExtension {
+        extension_name: String,
+    },
+    NoDependsOnExtension {
+        extension_name: String,
+    },
+    SetStatistics {
+        column_name: String,
+        target: crate::_internal::analysis::facts::StatisticsTarget,
+    },
+    SetOptions {
+        options: Vec<crate::_internal::analysis::facts::AttributeFact>,
+    },
+    ResetOptions {
+        options: Vec<crate::_internal::analysis::facts::AttributeFact>,
     },
 }

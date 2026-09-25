@@ -335,9 +335,22 @@ impl Resolver {
                 table,
                 new_name,
             } => mutations.push(Self::resolve_alter_trigger(name, table, new_name, state)),
-            StatementFact::AlterIndex { name, actions } => {
-                mutations.extend(Self::resolve_alter_index(name, actions, state));
+            StatementFact::AlterIndex {
+                name,
+                if_exists,
+                actions,
+            } => {
+                mutations.push(Self::resolve_alter_index(name, *if_exists, actions, state));
             }
+            StatementFact::AlterIndexAllInTablespace {
+                source_tablespace,
+                target_tablespace,
+            } => mutations.push(Mutation::AlterIndexAllInTablespace(
+                crate::_internal::analysis::mutations::AlterIndexAllInTablespaceMutation {
+                    source_tablespace: source_tablespace.resolve(),
+                    target_tablespace: target_tablespace.resolve(),
+                },
+            )),
             StatementFact::CreateType(create_type) => {
                 mutations.push(Self::resolve_create_type(create_type, state));
             }

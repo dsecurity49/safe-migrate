@@ -2,8 +2,9 @@ use crate::_internal::analysis::expr_ir::ExprIr;
 use crate::_internal::analysis::facts::{
     AlterIndexActionFact, AlterTableActionFact, AlterTypeActionFact, AlterTypeFact, ColumnFact,
     CreateTypeFact, FkFact, LikePropertiesFact, LikeSourceFact, LockModeFact, PersistenceFact,
-    ReindexTargetKindFact, RelationTargetFact, ReplicaIdentityFact, ResetSettingTarget, SearchPathTarget, StatementFact,
-    TableConstraintFact, TimeoutSetting, TimeoutSettingValue, TypeCreationKind,
+    ReindexTargetKindFact, RelationTargetFact, ReplicaIdentityFact, ResetSettingTarget,
+    SearchPathTarget, StatementFact, TableConstraintFact, TimeoutSetting, TimeoutSettingValue,
+    TypeCreationKind,
 };
 use crate::_internal::ast::identifiers::{Ident, QualifiedName};
 use squawk_syntax::ast::{
@@ -330,32 +331,39 @@ impl AstVisitor {
     fn extract_reindex_fact(node: &ast::Reindex) -> Option<StatementFact> {
         let target = node.reindex_target()?;
         let concurrently = node.is_concurrently();
-        
+
         let (target_kind, target_name) = match target {
             ast::ReindexTarget::ReindexTargetDatabase(db) => {
-                let name = db.database_ref()
+                let name = db
+                    .database_ref()
                     .and_then(|r| r.ident_token())
                     .map(|t| QualifiedName::new(None, Self::identifier_from_token(t.text())));
                 (ReindexTargetKindFact::Database, name)
             }
             ast::ReindexTarget::ReindexTargetIndex(idx) => {
-                let name = idx.index_ref().and_then(|r| Self::path_ref_to_qualified_name(&r.path_ref()?));
+                let name = idx
+                    .index_ref()
+                    .and_then(|r| Self::path_ref_to_qualified_name(&r.path_ref()?));
                 (ReindexTargetKindFact::Index, name)
             }
             ast::ReindexTarget::ReindexTargetSchema(schema) => {
-                let name = schema.schema_ref()
+                let name = schema
+                    .schema_ref()
                     .and_then(|r| r.ident_token())
                     .map(|t| QualifiedName::new(None, Self::identifier_from_token(t.text())));
                 (ReindexTargetKindFact::Schema, name)
             }
             ast::ReindexTarget::ReindexTargetSystem(sys) => {
-                let name = sys.database_ref()
+                let name = sys
+                    .database_ref()
                     .and_then(|r| r.ident_token())
                     .map(|t| QualifiedName::new(None, Self::identifier_from_token(t.text())));
                 (ReindexTargetKindFact::System, name)
             }
             ast::ReindexTarget::ReindexTargetTable(table) => {
-                let name = table.table_name_ref().and_then(|r| Self::path_ref_to_qualified_name(&r.path_ref()?));
+                let name = table
+                    .table_name_ref()
+                    .and_then(|r| Self::path_ref_to_qualified_name(&r.path_ref()?));
                 (ReindexTargetKindFact::Table, name)
             }
         };
@@ -2149,25 +2157,112 @@ impl AstVisitor {
     }
 
     fn extract_alter_index(node: &AlterIndex) -> Option<StatementFact> {
+        // Two grammar shapes: a per-index action list (IndexRef child), and the
+        // bulk relocation form `ALL IN TABLESPACE src SET TABLESPACE dst`
+        // (AllInTablespace child; no index_ref). The bulk form has no single
+        // index to validate, so it becomes its own advisory fact.
+        if let Some(all) = node.all_in_tablespace() {
+            let source = all.tablespace_ref()?.ident_token()?;
+            let target = all.set_tablespace()?.tablespace_ref()?.ident_token()?;
+            return Some(StatementFact::AlterIndexAllInTablespace {
+                source_tablespace: Self::identifier_from_token(source.text()),
+                target_tablespace: Self::identifier_from_token(target.text()),
+            });
+        }
+
         let path = node.index_ref()?.path_ref()?;
         let name = Self::path_ref_to_qualified_name(&path)?;
+        let if_exists = node.if_exists().is_some();
         let mut actions = Vec::new();
 
-        if let Some(squawk_syntax::ast::AlterIndexAction::IndexRenameTo(rt)) = node.action()
-            && let Some(new_name_node) = rt
-                .index()
-                .and_then(|i| i.path())
-                .and_then(|p| Self::path_to_qualified_name(&p))
-        {
-            actions.push(AlterIndexActionFact::RenameTo {
-                new_name: new_name_node.name,
-            });
+        match node.action()? {
+            squawk_syntax::ast::AlterIndexAction::IndexRenameTo(rt) => {
+                let new_name = rt
+                    .index()
+                    .and_then(|i| i.path())
+                    .and_then(|p| Self::path_to_qualified_name(&p))?;
+                actions.push(AlterIndexActionFact::RenameTo {
+                    new_name: new_name.name,
+                });
+            }
+            squawk_syntax::ast::AlterIndexAction::SetTablespace(st) => {
+                let ts = st.tablespace_ref()?.ident_token()?;
+                actions.push(AlterIndexActionFact::SetTablespace {
+                    new_tablespace: Self::identifier_from_token(ts.text()),
+                });
+            }
+            squawk_syntax::ast::AlterIndexAction::AttachIndexPartition(ap) => {
+                let partition_path = ap.index_ref()?.path_ref()?;
+                let partition_name = Self::path_ref_to_qualified_name(&partition_path)?;
+                actions.push(AlterIndexActionFact::AttachPartition { partition_name });
+            }
+            squawk_syntax::ast::AlterIndexAction::DependsOnExtension(dep) => {
+                let ext = dep.extension_ref()?.ident_token()?;
+                actions.push(AlterIndexActionFact::DependsOnExtension {
+                    extension_name: Self::identifier_from_token(ext.text()),
+                });
+            }
+            squawk_syntax::ast::AlterIndexAction::NoDependsOnExtension(dep) => {
+                let ext = dep.extension_ref()?.ident_token()?;
+                actions.push(AlterIndexActionFact::NoDependsOnExtension {
+                    extension_name: Self::identifier_from_token(ext.text()),
+                });
+            }
+            squawk_syntax::ast::AlterIndexAction::AlterSetStatistics(ss) => {
+                // Grammar: 'alter' 'column'? (Expr | ColumnNameRef) (SetStatistics
+                // | SetOptions). The pinned parser realizes only the SetOptions
+                // child here — every SET STATISTICS variant provokes upstream
+                // parse errors — but the grammar keeps SetStatistics in the mix,
+                // so handle it exhaustively instead of degrading an unannotated
+                // form. The optional leading `ALTER COLUMN` scopes SET (options)
+                // to a single index column; both the target and any per-column
+                // storage parameters are advisory planner metadata that the
+                // schema model deliberately does not track.
+                let column = ss
+                    .column_name_ref()
+                    .and_then(|c| c.ident_token())
+                    .map(|col| Self::identifier_from_token(col.text()));
+                if let Some(stat_node) = ss.set_statistics() {
+                    let target = if stat_node.default_token().is_some() {
+                        crate::_internal::analysis::facts::StatisticsTarget::Default
+                    } else {
+                        let n = stat_node
+                            .expr()?
+                            .syntax()
+                            .text()
+                            .to_string()
+                            .parse::<i32>()
+                            .ok()?;
+                        crate::_internal::analysis::facts::StatisticsTarget::Value(n)
+                    };
+                    actions.push(AlterIndexActionFact::SetStatistics { column, target });
+                } else {
+                    // The SetOptions child may be absent from an unannotated
+                    // degenerate form; propagating None models nothing rather
+                    // than silently degrading a reachable SET (options) form.
+                    let so = ss.set_options()?;
+                    let options = Self::extract_attribute_list(so.attribute_list());
+                    actions.push(AlterIndexActionFact::SetOptions { options });
+                }
+            }
+            squawk_syntax::ast::AlterIndexAction::SetOptions(so) => {
+                let options = Self::extract_attribute_list(so.attribute_list());
+                actions.push(AlterIndexActionFact::SetOptions { options });
+            }
+            squawk_syntax::ast::AlterIndexAction::ResetOptions(ro) => {
+                let options = Self::extract_attribute_list(ro.attribute_list());
+                actions.push(AlterIndexActionFact::ResetOptions { options });
+            }
         }
 
         if actions.is_empty() {
             return None;
         }
-        Some(StatementFact::AlterIndex { name, actions })
+        Some(StatementFact::AlterIndex {
+            name,
+            if_exists,
+            actions,
+        })
     }
 
     fn extract_drop_index(node: &DropIndex) -> Option<StatementFact> {

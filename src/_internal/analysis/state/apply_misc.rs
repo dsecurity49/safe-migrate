@@ -1,8 +1,9 @@
 use super::{AnalysisState, MutationResult};
 use crate::_internal::analysis::evidence::{EvidenceCode, EvidenceScope};
 use crate::_internal::analysis::mutations::{
-    AlterDatabaseMutation, CreateDatabaseMutation, DropDatabaseMutation, LockTableMutation,
-    ReindexTargetMutation, TruncateMutation,
+    AlterDatabaseMutation, AlterIndexActionMutation, AlterIndexAllInTablespaceMutation,
+    AlterIndexMutation, CreateDatabaseMutation, DropDatabaseMutation, LockTableMutation,
+    ReindexTargetMutation, Rename, TruncateMutation,
 };
 use crate::_internal::ast::identifiers::ObjectId;
 use crate::_internal::model::relation::RelationKind;
@@ -80,8 +81,8 @@ impl AnalysisState {
     ) -> MutationResult {
         if let Some(target) = target {
             match target {
-                ReindexTargetMutation::Database(_) 
-                | ReindexTargetMutation::Schema(_) 
+                ReindexTargetMutation::Database(_)
+                | ReindexTargetMutation::Schema(_)
                 | ReindexTargetMutation::System(_) => {
                     // System/Database/Schema reindexes are generally admin tasks.
                     // REINDEX SYSTEM cannot be concurrent.
@@ -100,7 +101,10 @@ impl AnalysisState {
                     if !self.index_is_present(id) {
                         // If we can prove it doesn't exist, we could return a conflict.
                         // For simplicity, we just taint if it's missing and we have coverage.
-                        if self.baseline_covers_family_object(id, crate::_internal::db::cache::CatalogFamily::Constraints) {
+                        if self.baseline_covers_family_object(
+                            id,
+                            crate::_internal::db::cache::CatalogFamily::Constraints,
+                        ) {
                             return MutationResult::Conflict {
                                 reason: format!("reindexed index '{}' does not exist", id),
                             };
@@ -128,6 +132,83 @@ impl AnalysisState {
         // normalized relation model. Keep the statement available to rules,
         // but do not claim an exact post-VACUUM catalog state.
         self.taint(EvidenceCode::UnsupportedSemantics, EvidenceScope::Statement);
+        MutationResult::Applied
+    }
+
+    pub(super) fn apply_alter_index(&mut self, alter: &AlterIndexMutation) -> MutationResult {
+        // Validate the index exists before applying any actions.
+        if !self.index_is_present(&alter.index_id) {
+            if alter.if_exists {
+                return MutationResult::Applied;
+            }
+            if self.baseline_covers_family_object(
+                &alter.index_id,
+                crate::_internal::db::cache::CatalogFamily::Indexes,
+            ) {
+                return MutationResult::Conflict {
+                    reason: format!("index '{}' does not exist", alter.index_id),
+                };
+            }
+            self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
+            return MutationResult::Skipped;
+        }
+
+        for action in &alter.actions {
+            match action {
+                AlterIndexActionMutation::RenameTo { new_id } => {
+                    let result = self.apply_rename_relation(&Rename {
+                        old_id: alter.index_id.clone(),
+                        new_id: new_id.clone(),
+                    });
+                    if !matches!(result, MutationResult::Applied) {
+                        return result;
+                    }
+                }
+                // Tablespace, statistics targets, and storage options are
+                // physical/advisory metadata not tracked in the schema model.
+                AlterIndexActionMutation::SetTablespace { .. }
+                | AlterIndexActionMutation::SetStatistics { .. }
+                | AlterIndexActionMutation::SetOptions { .. }
+                | AlterIndexActionMutation::ResetOptions { .. } => {}
+                AlterIndexActionMutation::AttachPartition { partition_id } => {
+                    // The partition index must exist for the attach to succeed.
+                    if !self.index_is_present(partition_id) {
+                        if self.baseline_covers_family_object(
+                            partition_id,
+                            crate::_internal::db::cache::CatalogFamily::Indexes,
+                        ) {
+                            return MutationResult::Conflict {
+                                reason: format!(
+                                    "partition index '{}' does not exist",
+                                    partition_id
+                                ),
+                            };
+                        }
+                        self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
+                        return MutationResult::Skipped;
+                    }
+                }
+                // Extension dependencies are managed by PostgreSQL's extension
+                // machinery, which lives outside the schema catalog model.
+                AlterIndexActionMutation::DependsOnExtension { .. }
+                | AlterIndexActionMutation::NoDependsOnExtension { .. } => {
+                    self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Statement);
+                }
+            }
+        }
+
+        MutationResult::Applied
+    }
+
+    pub(super) fn apply_alter_index_all_in_tablespace(
+        &mut self,
+        all: &AlterIndexAllInTablespaceMutation,
+    ) -> MutationResult {
+        // `ALTER INDEX ALL IN TABLESPACE src SET TABLESPACE dst` relocates every
+        // index in a tablespace. Index tablespace is advisory planner metadata
+        // the model does not track, so relocation never drifts the model; there
+        // is no single index_id to validate.
+        let _ = (&all.source_tablespace, &all.target_tablespace);
         MutationResult::Applied
     }
 }

@@ -232,7 +232,11 @@ impl Rule for RequireConcurrentReindexRule {
     fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
         let mut violations = Vec::new();
 
-        if let Mutation::Reindex { target, concurrently } = context.mutation() {
+        if let Mutation::Reindex {
+            target,
+            concurrently,
+        } = context.mutation()
+        {
             // REINDEX SYSTEM does not support CONCURRENTLY, so we do not flag it here.
             let is_system = matches!(
                 target,
@@ -241,12 +245,24 @@ impl Rule for RequireConcurrentReindexRule {
 
             if !is_system && !*concurrently {
                 let target_name = match target {
-                    Some(crate::_internal::analysis::mutations::ReindexTargetMutation::Database(n)) => n.clone(),
-                    Some(crate::_internal::analysis::mutations::ReindexTargetMutation::Schema(n)) => n.clone(),
-                    Some(crate::_internal::analysis::mutations::ReindexTargetMutation::Table(id)) => format!("{}.{}", id.schema, id.name),
-                    Some(crate::_internal::analysis::mutations::ReindexTargetMutation::Index(id)) => format!("{}.{}", id.schema, id.name),
-                    Some(crate::_internal::analysis::mutations::ReindexTargetMutation::System(Some(n))) => n.clone(),
-                    Some(crate::_internal::analysis::mutations::ReindexTargetMutation::System(None)) => "current database".to_string(),
+                    Some(
+                        crate::_internal::analysis::mutations::ReindexTargetMutation::Database(n),
+                    ) => n.clone(),
+                    Some(crate::_internal::analysis::mutations::ReindexTargetMutation::Schema(
+                        n,
+                    )) => n.clone(),
+                    Some(crate::_internal::analysis::mutations::ReindexTargetMutation::Table(
+                        id,
+                    )) => format!("{}.{}", id.schema, id.name),
+                    Some(crate::_internal::analysis::mutations::ReindexTargetMutation::Index(
+                        id,
+                    )) => format!("{}.{}", id.schema, id.name),
+                    Some(crate::_internal::analysis::mutations::ReindexTargetMutation::System(
+                        Some(n),
+                    )) => n.clone(),
+                    Some(crate::_internal::analysis::mutations::ReindexTargetMutation::System(
+                        None,
+                    )) => "current database".to_string(),
                     None => "unknown".to_string(),
                 };
 

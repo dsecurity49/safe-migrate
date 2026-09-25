@@ -3012,6 +3012,10 @@ impl AnalysisState {
             Mutation::Rename(rename) => self.apply_rename_relation(rename),
             Mutation::DropView(drop) => self.apply_drop_view(drop),
             Mutation::DropMaterializedView(drop) => self.apply_drop_materialized_view(drop),
+            Mutation::AlterIndex(alter) => self.apply_alter_index(alter),
+            Mutation::AlterIndexAllInTablespace(all_in) => {
+                self.apply_alter_index_all_in_tablespace(all_in)
+            }
             Mutation::DropIndex(drop) => self.apply_drop_index(drop),
             Mutation::LockTable(lock) => self.apply_lock_table(lock),
             Mutation::Truncate(truncate) => self.apply_truncate(truncate),
@@ -3066,7 +3070,10 @@ impl AnalysisState {
             Mutation::AlterDatabase(alter_database) => self.apply_alter_database(alter_database),
             Mutation::DropDatabase(drop_database) => self.apply_drop_database(drop_database),
             Mutation::Vacuum { table_id, is_full } => self.apply_vacuum(table_id, *is_full),
-            Mutation::Reindex { target, concurrently } => self.apply_reindex(target, *concurrently),
+            Mutation::Reindex {
+                target,
+                concurrently,
+            } => self.apply_reindex(target, *concurrently),
         }
     }
 

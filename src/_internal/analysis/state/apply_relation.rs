@@ -6,8 +6,8 @@ use crate::_internal::analysis::mutations::{
     AlterTable, AlterTableActionMutation, CreateTable, DropTable, PersistenceMutation, Rename,
 };
 use crate::_internal::ast::identifiers::ObjectId;
-use crate::_internal::model::data_type::DataTypeFamily;
 use crate::_internal::model::constraint::{ConstraintKind, ConstraintState};
+use crate::_internal::model::data_type::DataTypeFamily;
 use crate::_internal::model::relation::{ColumnAction, RelationKind, RelationState};
 use crate::_internal::model::sequence::{
     SequenceKind, SequenceOverlay, SequenceParameters, SequencePersistence, SequenceState,
