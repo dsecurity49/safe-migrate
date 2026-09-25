@@ -1,6 +1,7 @@
 use super::Resolver;
 use crate::_internal::analysis::facts::{
-    AlterIndexActionFact, AlterViewAction, PolicyCommand, ReindexTargetKindFact, StatisticsTarget,
+    AlterIndexActionFact, AlterMaterializedViewActionFact, AlterViewAction, PolicyCommand,
+    ReindexTargetKindFact, StatisticsTarget,
 };
 use crate::_internal::analysis::mutations::{
     AlterIndexActionMutation, AlterIndexMutation, CreateIndex, CreateMaterializedView,
@@ -9,7 +10,7 @@ use crate::_internal::analysis::mutations::{
     ReindexTargetMutation, Rename, RenameTriggerMutation,
 };
 use crate::_internal::analysis::state::AnalysisState;
-use crate::_internal::ast::identifiers::{Ident, ObjectId, QualifiedName};
+use crate::_internal::ast::identifiers::{ObjectId, QualifiedName};
 
 impl Resolver {
     pub(super) fn resolve_reindex(
@@ -106,15 +107,41 @@ impl Resolver {
 
     pub(super) fn resolve_alter_materialized_view(
         name: &QualifiedName,
-        new_name: Option<&Ident>,
+        action: &AlterMaterializedViewActionFact,
         state: &AnalysisState,
     ) -> Option<Mutation> {
-        new_name.map(|new_name| {
-            let id = Self::resolve_relation_lookup_name(name, state);
-            let mut new_id = ObjectId::new(id.schema.clone(), new_name.resolve());
-            new_id.inferred_schema = id.inferred_schema;
-            Mutation::Rename(Rename { old_id: id, new_id })
-        })
+        match action {
+            AlterMaterializedViewActionFact::RenameTo { new_name } => {
+                let id = Self::resolve_relation_lookup_name(name, state);
+                let mut new_id = ObjectId::new(id.schema.clone(), new_name.resolve());
+                new_id.inferred_schema = id.inferred_schema;
+                Some(Mutation::Rename(Rename { old_id: id, new_id }))
+            }
+            AlterMaterializedViewActionFact::SetSchema { new_schema } => {
+                let id = Self::resolve_relation_lookup_name(name, state);
+                let new_id = ObjectId::new(new_schema, &id.name);
+                Some(Mutation::Rename(Rename { old_id: id, new_id }))
+            }
+            AlterMaterializedViewActionFact::OwnerTo { new_owner } => {
+                Some(Mutation::ChangeRelationOwner {
+                    id: Self::resolve_relation_lookup_name(name, state),
+                    new_owner: new_owner.clone(),
+                })
+            }
+            AlterMaterializedViewActionFact::RenameColumn { .. }
+            | AlterMaterializedViewActionFact::SetTablespace { .. }
+            | AlterMaterializedViewActionFact::SetAccessMethod { .. }
+            | AlterMaterializedViewActionFact::ClusterOn { .. }
+            | AlterMaterializedViewActionFact::SetWithoutCluster
+            | AlterMaterializedViewActionFact::SetStorage { .. }
+            | AlterMaterializedViewActionFact::SetCompression { .. }
+            | AlterMaterializedViewActionFact::DependsOnExtension { .. }
+            | AlterMaterializedViewActionFact::NoDependsOnExtension { .. } => {
+                Some(Mutation::Opaque(OpaqueMutation::UnsupportedStatement))
+            }
+            AlterMaterializedViewActionFact::SetOptions { .. }
+            | AlterMaterializedViewActionFact::ResetOptions { .. } => None,
+        }
     }
 
     pub(super) fn resolve_refresh_materialized_view(

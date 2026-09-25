@@ -2402,23 +2402,109 @@ impl AstVisitor {
 
     fn extract_alter_materialized_view(node: &ast::AlterMaterializedView) -> Option<StatementFact> {
         let path = node.view_ref()?.path_ref()?;
-        let Some(squawk_syntax::ast::AlterMaterializedViewAction::ViewRenameTo(rt)) =
-            node.action().next()
-        else {
-            // SET SCHEMA, column changes, extension dependencies, and other
-            // parser-valid actions are not represented by this mutation.
-            // Do not turn them into a fact with no resolver mutation.
-            return None;
+        let name = Self::path_ref_to_qualified_name(&path)?;
+        let action_node = node.action().next()?;
+
+        let action = match action_node {
+            ast::AlterMaterializedViewAction::ViewRenameTo(rt) => {
+                let segment = rt.view()?.path()?.segment()?;
+                crate::_internal::analysis::facts::AlterMaterializedViewActionFact::RenameTo {
+                    new_name: Self::identifier_from_name(segment.text(), segment.is_quoted()),
+                }
+            }
+            ast::AlterMaterializedViewAction::SetSchema(ss) => {
+                let token = ss.schema_ref()?.ident_token()?;
+                crate::_internal::analysis::facts::AlterMaterializedViewActionFact::SetSchema {
+                    new_schema: Self::resolve_identifier_token(token.text()),
+                }
+            }
+            ast::AlterMaterializedViewAction::RenameColumn(rc) => {
+                let from_token = rc.column_name_ref()?.ident_token()?;
+                let from = Self::identifier_from_token(from_token.text());
+
+                let to_token = rc.column_name()?.ident_token()?;
+                let to = Self::identifier_from_token(to_token.text());
+
+                crate::_internal::analysis::facts::AlterMaterializedViewActionFact::RenameColumn {
+                    from,
+                    to,
+                }
+            }
+            ast::AlterMaterializedViewAction::DependsOnExtension(d) => {
+                let ext_token = d.extension_ref()?.ident_token()?;
+                crate::_internal::analysis::facts::AlterMaterializedViewActionFact::DependsOnExtension {
+                    extension_name: Self::identifier_from_token(ext_token.text()),
+                }
+            }
+            ast::AlterMaterializedViewAction::NoDependsOnExtension(nd) => {
+                let ext_token = nd.extension_ref()?.ident_token()?;
+                crate::_internal::analysis::facts::AlterMaterializedViewActionFact::NoDependsOnExtension {
+                    extension_name: Self::identifier_from_token(ext_token.text()),
+                }
+            }
+            ast::AlterMaterializedViewAction::AlterTableAction(ata) => {
+                match ata {
+                    ast::AlterTableAction::SetOptions(so) => {
+                        crate::_internal::analysis::facts::AlterMaterializedViewActionFact::SetOptions {
+                            options: Self::extract_attribute_list(so.attribute_list()),
+                        }
+                    }
+                    ast::AlterTableAction::ResetOptions(ro) => {
+                        crate::_internal::analysis::facts::AlterMaterializedViewActionFact::ResetOptions {
+                            options: Self::extract_attribute_list(ro.attribute_list()),
+                        }
+                    }
+                    ast::AlterTableAction::ClusterOn(co) => {
+                        let idx_path = co.index_ref()?.path_ref()?;
+                        crate::_internal::analysis::facts::AlterMaterializedViewActionFact::ClusterOn {
+                            index_name: Self::path_ref_to_qualified_name(&idx_path)?.name,
+                        }
+                    }
+                    ast::AlterTableAction::SetWithoutCluster(_) => {
+                        crate::_internal::analysis::facts::AlterMaterializedViewActionFact::SetWithoutCluster
+                    }
+                    ast::AlterTableAction::SetTablespace(st) => {
+                        let ts = st.tablespace_ref()?.ident_token()?;
+                        crate::_internal::analysis::facts::AlterMaterializedViewActionFact::SetTablespace {
+                            new_tablespace: Self::identifier_from_token(ts.text()),
+                        }
+                    }
+                    ast::AlterTableAction::SetAccessMethod(sam) => {
+                        let am = sam.access_method_ref()?.ident_token()?;
+                        crate::_internal::analysis::facts::AlterMaterializedViewActionFact::SetAccessMethod {
+                            new_access_method: Self::identifier_from_token(am.text()),
+                        }
+                    }
+                    ast::AlterTableAction::AlterColumn(ac) => {
+                        let col_name_ref = ac.column_name_ref()?;
+                        let col_name = Self::resolve_identifier_token(col_name_ref.ident_token()?.text());
+                        match ac.option()? {
+                            ast::AlterColumnOption::SetStorage(ss) => {
+                                crate::_internal::analysis::facts::AlterMaterializedViewActionFact::SetStorage {
+                                    column: col_name,
+                                    storage: ss.storage_mode()?.syntax().text().to_string(),
+                                }
+                            }
+                            ast::AlterColumnOption::SetCompression(sc) => {
+                                crate::_internal::analysis::facts::AlterMaterializedViewActionFact::SetCompression {
+                                    column: col_name,
+                                    compression: sc.compression_method_name()?.syntax().text().to_string(),
+                                }
+                            }
+                            _ => return None,
+                        }
+                    }
+                    ast::AlterTableAction::OwnerTo(ot) => {
+                        crate::_internal::analysis::facts::AlterMaterializedViewActionFact::OwnerTo {
+                            new_owner: Self::extract_role(&ot.role_ref()?),
+                        }
+                    }
+                    _ => return None,
+                }
+            }
         };
-        let segment = rt.view()?.path()?.segment()?;
-        let new_name = Some(Self::identifier_from_name(
-            segment.text(),
-            segment.is_quoted(),
-        ));
-        Some(StatementFact::AlterMaterializedView {
-            name: Self::path_ref_to_qualified_name(&path)?,
-            new_name,
-        })
+
+        Some(StatementFact::AlterMaterializedView { name, action })
     }
 
     fn extract_refresh(node: &ast::Refresh) -> Option<StatementFact> {

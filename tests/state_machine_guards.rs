@@ -326,6 +326,57 @@ mod state_machine_guards_tests {
     }
 
     #[test]
+    fn alter_materialized_view_metadata_actions_do_not_taint() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE MATERIALIZED VIEW mv AS SELECT 1 AS id;",
+                &mut state,
+            )
+            .expect("matview setup should analyze");
+        
+        for sql in [
+            "ALTER MATERIALIZED VIEW mv SET (fillfactor = 90);",
+            "ALTER MATERIALIZED VIEW mv RESET (fillfactor);"
+        ] {
+            engine.analyze(sql, &mut state).unwrap();
+        }
+
+        assert_eq!(
+            state.local.confidence,
+            safe_migrate::_internal::analysis::state::Confidence::Exact
+        );
+    }
+
+    #[test]
+    fn alter_materialized_view_unsupported_actions_taint_instead_of_failing() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE MATERIALIZED VIEW mv AS SELECT 1 AS id;",
+                &mut state,
+            )
+            .expect("matview setup should analyze");
+        
+        // This unsupported action produces OpaqueMutation::UnsupportedStatement and taints
+        engine
+            .analyze(
+                "ALTER MATERIALIZED VIEW mv RENAME COLUMN id TO new_id;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert_eq!(
+            state.local.confidence,
+            safe_migrate::_internal::analysis::state::Confidence::Tainted
+        );
+    }
+
+    #[test]
     fn all_tables_in_schema_grants_are_tainted_when_relation_scope_is_incomplete() {
         let engine = setup_engine();
         let mut state = setup_state();

@@ -3181,13 +3181,30 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_alter_materialized_view_actions_are_not_silent_noops() {
-        let parsed = SourceFile::parse("ALTER MATERIALIZED VIEW report SET SCHEMA archive;");
-        let statement = parsed.tree().stmts().next().expect("statement");
-        assert!(
-            AstVisitor::extract(&statement).is_none(),
-            "unsupported ALTER MATERIALIZED VIEW action must use the opaque engine path"
-        );
+    fn alter_materialized_view_actions_produce_typed_facts_not_opaque_paths() {
+        use crate::_internal::analysis::facts::AlterMaterializedViewActionFact;
+        
+        let extract_matview_action = |sql: &str| {
+            let parsed = SourceFile::parse(sql);
+            let stmt = parsed.tree().stmts().next().expect("statement");
+            match AstVisitor::extract(&stmt).unwrap_or_else(|| panic!("no fact for: {sql}")) {
+                StatementFact::AlterMaterializedView { action, .. } => action,
+                other => panic!("expected AlterMaterializedView fact, got {other:?} for: {sql}"),
+            }
+        };
+
+        assert!(matches!(
+            extract_matview_action("ALTER MATERIALIZED VIEW mv SET SCHEMA archive;"),
+            AlterMaterializedViewActionFact::SetSchema { new_schema } if new_schema == "archive"
+        ));
+        assert!(matches!(
+            extract_matview_action("ALTER MATERIALIZED VIEW mv SET (fillfactor = 90);"),
+            AlterMaterializedViewActionFact::SetOptions { .. }
+        ));
+        assert!(matches!(
+            extract_matview_action("ALTER MATERIALIZED VIEW mv CLUSTER ON my_idx;"),
+            AlterMaterializedViewActionFact::ClusterOn { index_name } if index_name.resolve() == "my_idx"
+        ));
     }
 
     #[test]

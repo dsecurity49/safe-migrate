@@ -131,6 +131,24 @@ pub(crate) enum AlterViewAction {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub(crate) enum AlterMaterializedViewActionFact {
+    RenameTo { new_name: Ident },
+    SetSchema { new_schema: String },
+    RenameColumn { from: Ident, to: Ident },
+    SetTablespace { new_tablespace: Ident },
+    SetAccessMethod { new_access_method: Ident },
+    DependsOnExtension { extension_name: Ident },
+    NoDependsOnExtension { extension_name: Ident },
+    SetOptions { options: Vec<AttributeFact> },
+    ResetOptions { options: Vec<AttributeFact> },
+    ClusterOn { index_name: Ident },
+    SetWithoutCluster,
+    SetStorage { column: String, storage: String },
+    SetCompression { column: String, compression: String },
+    OwnerTo { new_owner: RoleFact },
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum AlterSchemaActionFact {
     RenameTo { new_name: Ident },
     OwnerTo { new_owner: RoleFact },
@@ -192,7 +210,7 @@ pub(crate) enum StatementFact {
     },
     AlterMaterializedView {
         name: QualifiedName,
-        new_name: Option<Ident>,
+        action: AlterMaterializedViewActionFact,
     },
     RefreshMaterializedView {
         name: QualifiedName,
