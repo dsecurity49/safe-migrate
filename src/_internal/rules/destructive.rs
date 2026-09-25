@@ -666,29 +666,28 @@ impl TypeChangeRewriteRule {
 
         // Varchar widening is a metadata-only change.
         if old_dt.family.is_text_like() && new_dt.family.is_text_like() {
-            if new_dt.family == DataTypeFamily::Text || new_dt.typmods.is_none() {
+            if new_dt.family == DataTypeFamily::Text || !new_dt.has_typmod() {
                 return true; // Widening to unbounded text/varchar.
             }
             if let (Some(old_limit), Some(new_limit)) =
                 (old_dt.character_limit(), new_dt.character_limit())
+                && old_limit <= new_limit
             {
-                if old_limit <= new_limit {
-                    return true;
-                }
+                return true;
             }
         }
 
         // Numeric widening is a metadata-only change in PG >= 12.
         if pg_version >= 120_000 && old_dt.family.is_numeric() && new_dt.family.is_numeric() {
-            if new_dt.typmods.is_none() {
+            if !new_dt.has_typmod() {
                 return true; // Widening to unconstrained numeric.
             }
             if let (Some((old_p, old_s)), Some((new_p, new_s))) =
                 (old_dt.numeric_params(), new_dt.numeric_params())
+                && new_p >= old_p
+                && new_s >= old_s
             {
-                if new_p >= old_p && new_s >= old_s {
-                    return true;
-                }
+                return true;
             }
         }
 
@@ -745,23 +744,22 @@ impl Rule for TypeChangeRewriteRule {
         {
             let pg_version = state.effective_pg_version_num(config.assume_pg_version);
 
-            let (is_safe, rows, old_type_str) =
-                match pre_state.relations.get(&alter.id) {
-                    Some(rel) => {
-                        let col_info = rel.columns.iter().find(|c| c.name == *column);
-                        let old_ty = col_info.and_then(|col| col.data_type.as_ref());
+            let (is_safe, rows, old_type_str) = match pre_state.relations.get(&alter.id) {
+                Some(rel) => {
+                    let col_info = rel.columns.iter().find(|c| c.name == *column);
+                    let old_ty = col_info.and_then(|col| col.data_type.as_ref());
 
-                        let safe = old_ty
-                            .map(|o| Self::is_type_change_safe(o, ty, pg_version))
-                            .unwrap_or(false);
-                        (
-                            safe,
-                            rel.estimated_rows.unwrap_or(config.default_rows),
-                            old_ty.cloned().unwrap_or_else(|| "unknown".to_string()),
-                        )
-                    }
-                    None => (false, config.default_rows, "unknown".to_string()),
-                };
+                    let safe = old_ty
+                        .map(|o| Self::is_type_change_safe(o, ty, pg_version))
+                        .unwrap_or(false);
+                    (
+                        safe,
+                        rel.estimated_rows.unwrap_or(config.default_rows),
+                        old_ty.cloned().unwrap_or_else(|| "unknown".to_string()),
+                    )
+                }
+                None => (false, config.default_rows, "unknown".to_string()),
+            };
 
             if !is_safe {
                 let tier1_threshold = config.rule_tier1_threshold(self.id());

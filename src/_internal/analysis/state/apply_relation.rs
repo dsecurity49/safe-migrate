@@ -7683,8 +7683,10 @@ fn elements_for_array(values: &[String], column_type: &str) -> Option<Vec<String
                 values
                     .iter()
                     .map(|value| {
-                        if let Some(s) = scale.filter(|_| is_plain_integer(value)) {
-                            let zeros = "0".repeat(s as usize);
+                        if is_plain_integer(value)
+                            && let Some(scale) = scale
+                        {
+                            let zeros = "0".repeat(scale.zero_padding());
                             return format!("{value}.{zeros}");
                         }
                         value.clone()
@@ -7837,11 +7839,11 @@ fn deparse_partition_literal(data_type: &str, raw: &str) -> Option<String> {
             // is rendered as `5.00::numeric(10,2)` when scale=2.  Bare `numeric` with
             // a float-like constant is printed without a cast.
             let parsed_dt = ParsedDataType::parse(data_type);
-            let has_typmod = parsed_dt.typmods.is_some();
+            let has_typmod = parsed_dt.has_typmod();
             if has_typmod {
-                let scale = parsed_dt.numeric_scale().unwrap_or(0);
+                let scale = parsed_dt.numeric_scale().map_or(0, |s| s.zero_padding());
                 let scaled = if is_plain_integer(&decoded) && scale > 0 {
-                    let zeros = "0".repeat(scale as usize);
+                    let zeros = "0".repeat(scale);
                     format!("{decoded}.{zeros}")
                 } else {
                     decoded
@@ -7898,7 +7900,7 @@ fn deparse_partition_literal(data_type: &str, raw: &str) -> Option<String> {
         | DataTypeFamily::Timestamp => Some(format!(
             "'{}'::{}",
             decoded.replace('\'', "''"),
-            ParsedDataType::parse(data_type).to_string()
+            ParsedDataType::parse(data_type)
         )),
         _ => None,
     }
