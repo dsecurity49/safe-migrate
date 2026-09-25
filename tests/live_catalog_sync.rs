@@ -95,9 +95,7 @@ fn decode_cache(path: &std::path::Path) -> (crate::_internal::db::cache::DbCache
     (*cache, payload)
 }
 
-fn live_database() -> (postgres::Config, String, i32) {
-    let database_url =
-        std::env::var("DATABASE_URL").expect("DATABASE_URL is required for live catalog sync");
+fn live_database(database_url: &str) -> (postgres::Config, String, i32) {
     let database_config: postgres::Config = database_url
         .parse()
         .expect("live catalog DATABASE_URL is invalid");
@@ -374,8 +372,12 @@ fn live_catalog_database_guard_accepts_only_local_hosts() {
 #[test]
 #[ignore = "requires a live local PostgreSQL database via DATABASE_URL"]
 fn live_sync_preserves_routine_and_replication_catalogs_without_connection_secrets() {
-    let _live_database_guard = crate::internal_tests::live_database_test_lock();
-    let (database_config, expected_owner, version) = live_database();
+    let guard = crate::internal_tests::live_database_test_lock();
+    let (database_config, expected_owner, version) = live_database(
+        &guard
+            .url()
+            .expect("DATABASE_URL is required for live catalog sync"),
+    );
     let _cleanup = CatalogCleanup(database_config.clone());
     let mut client = database_config
         .connect(postgres::NoTls)
@@ -805,8 +807,12 @@ fn live_sync_preserves_routine_and_replication_catalogs_without_connection_secre
 #[test]
 #[ignore = "requires a live local PostgreSQL database via DATABASE_URL"]
 fn live_routine_and_replication_mutations_match_postgresql() {
-    let _live_database_guard = crate::internal_tests::live_database_test_lock();
-    let (database_config, _expected_owner, version) = live_database();
+    let guard = crate::internal_tests::live_database_test_lock();
+    let (database_config, _expected_owner, version) = live_database(
+        &guard
+            .url()
+            .expect("DATABASE_URL is required for live catalog sync"),
+    );
     let _cleanup = CatalogCleanup(database_config.clone());
     let mut client = database_config
         .connect(postgres::NoTls)
@@ -998,7 +1004,7 @@ fn live_routine_and_replication_mutations_match_postgresql() {
 #[test]
 #[ignore = "requires local subscriber and publisher databases"]
 fn live_connected_subscription_round_trip_is_redacted_and_exact() {
-    let _live_database_guard = crate::internal_tests::live_database_test_lock();
+    let guard = crate::internal_tests::live_database_test_lock();
     let publisher_url = std::env::var("PUBLISHER_DATABASE_URL")
         .expect("PUBLISHER_DATABASE_URL is required for connected subscription validation");
     let subscription_url = std::env::var("SUBSCRIPTION_DATABASE_URL")
@@ -1026,7 +1032,11 @@ fn live_connected_subscription_round_trip_is_redacted_and_exact() {
         ))
         .expect("seed logical replication publisher");
 
-    let (subscriber_config, _, subscriber_version) = live_database();
+    let (subscriber_config, _, subscriber_version) = live_database(
+        &guard
+            .url()
+            .expect("DATABASE_URL is required for live catalog sync"),
+    );
     let _cleanup = CatalogCleanup(subscriber_config.clone());
     let mut subscriber = subscriber_config
         .connect(postgres::NoTls)

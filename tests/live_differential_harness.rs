@@ -439,11 +439,12 @@ struct Mismatch {
 #[test]
 #[ignore = "requires a live local PostgreSQL database via DATABASE_URL"]
 fn live_postgres_differential_harness() {
+    let live = crate::internal_tests::live_database_test_lock();
     let verbosity = differential_verbosity();
     let harness_started = Instant::now();
-    let database_url = match std::env::var("DATABASE_URL") {
-        Ok(value) => value,
-        Err(_) => {
+    let database_url = match live.url() {
+        Some(value) => value,
+        None => {
             assert!(
                 !live_database_is_required(),
                 "live differential harness requires DATABASE_URL"
@@ -1143,7 +1144,9 @@ fn plant_pending_detach(
 #[test]
 #[ignore = "requires a disposable local PostgreSQL database via DATABASE_URL"]
 fn live_interrupted_partition_detach_finalize() {
-    let config: PostgresConfig = std::env::var("DATABASE_URL")
+    let live = crate::internal_tests::live_database_test_lock();
+    let config: PostgresConfig = live
+        .url()
         .expect("DATABASE_URL")
         .parse()
         .expect("database configuration");

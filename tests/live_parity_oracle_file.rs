@@ -317,7 +317,11 @@ fn partition_bounds_parity_oracle() {
         .join("tests/golden/partition_bounds_oracle.json");
 
     // ── live mode: connect to PG, rebuild cache from scratch ────────────────
-    if let Ok(url) = std::env::var("DATABASE_URL") {
+    // The guard must be taken before the URL is read: it excludes tests that
+    // temporarily replace or remove DATABASE_URL, and other live tests that
+    // share these disposable fixtures.
+    let live = crate::internal_tests::live_database_test_lock();
+    if let Some(url) = live.url() {
         let config: postgres::Config = url.parse().expect("database configuration");
         assert!(
             database_hosts_are_local(&config),
