@@ -64,7 +64,7 @@ pub(crate) fn compute_verdict(violations: &[Violation]) -> Verdict {
 }
 
 fn no_color() -> bool {
-    std::env::var("NO_COLOR").is_ok()
+    std::env::var_os("NO_COLOR").is_some()
 }
 pub(crate) fn tier_label_colored(tier: &ViolationTier) -> String {
     tier_label_with_color(tier, !no_color())

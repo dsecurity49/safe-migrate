@@ -1,7 +1,5 @@
 use std::fmt;
 
-/// Represents the canonical base families of PostgreSQL data types.
-/// This enum normalizes away spelling differences (e.g., `int4` vs `integer`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum DataTypeFamily {
     Boolean,
@@ -24,13 +22,12 @@ pub(crate) enum DataTypeFamily {
     CharacterVarying,
     Character,
     BpChar,
-    /// Fallback for types not strictly modeled (e.g., user-defined types, geometric types).
+    // Unrecognised type — callers must taint or diagnose rather than assume safe.
     Unknown,
 }
 
 impl DataTypeFamily {
-    /// Resolves a raw PostgreSQL type name (without modifiers or array dimensions)
-    /// into its canonical family.
+    // Single alias table. All PostgreSQL spellings for a built-in type map here.
     pub(crate) fn from_base_name(name: &str) -> Self {
         match name {
             "bool" | "boolean" => Self::Boolean,
@@ -57,7 +54,7 @@ impl DataTypeFamily {
         }
     }
 
-    /// Returns the canonical PostgreSQL spelling for this type family.
+    // Returns the canonical catalog spelling; Unknown round-trips through original_fallback.
     pub(crate) fn to_canonical_string(self, original_fallback: &str) -> String {
         match self {
             Self::Boolean => "boolean".to_string(),
@@ -79,14 +76,13 @@ impl DataTypeFamily {
             Self::CiText => "citext".to_string(),
             Self::CharacterVarying => "character varying".to_string(),
             Self::Character => "character".to_string(),
-            // bpchar without typmod stays as-is, otherwise it renders as character(N)
             Self::BpChar => "character".to_string(),
             Self::Unknown => original_fallback.to_string(),
         }
     }
 
-    /// Returns the fixed size of the type in bits, if applicable.
-    pub(crate) fn size_bits(&self) -> Option<i32> {
+    // Fixed storage size in bits for integer families; None for everything else.
+    pub(crate) fn size_bits(self) -> Option<i32> {
         match self {
             Self::SmallInt => Some(16),
             Self::Integer => Some(32),
@@ -95,29 +91,23 @@ impl DataTypeFamily {
         }
     }
 
-    /// True if the partition strategy synthesis requires casting via text.
-    pub(crate) fn requires_text_cast_for_comparison(&self) -> bool {
+    pub(crate) fn is_text_like(self) -> bool {
+        matches!(
+            self,
+            Self::CharacterVarying | Self::Character | Self::BpChar | Self::Text
+        )
+    }
+
+    pub(crate) fn is_numeric(self) -> bool {
+        matches!(self, Self::Numeric)
+    }
+
+    // Partition synthesiser must cast varchar keys through ::text for byte-identical comparison.
+    pub(crate) fn requires_text_cast_for_comparison(self) -> bool {
         matches!(self, Self::CharacterVarying)
-    }
-
-    /// Legacy shim for existing calls in apply_relation.rs
-    pub(crate) fn from_type_name(name: &str) -> Option<Self> {
-        let parsed = ParsedDataType::parse(name);
-        if parsed.family == Self::Unknown {
-            None
-        } else {
-            Some(parsed.family)
-        }
-    }
-
-    /// Legacy shim for existing calls in apply_relation.rs
-    pub(crate) fn to_canonical_type_string(self, original: &str) -> String {
-        let parsed = ParsedDataType::parse(original);
-        parsed.to_string()
     }
 }
 
-/// A fully parsed representation of a PostgreSQL data type signature.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ParsedDataType {
     pub family: DataTypeFamily,
@@ -127,78 +117,104 @@ pub(crate) struct ParsedDataType {
 }
 
 impl ParsedDataType {
-    /// Parses a raw string representation of a type (e.g., `varchar(255)[]`) into its structural components.
     pub(crate) fn parse(raw: &str) -> Self {
         let mut text = Self::fold_unquoted_identifier_case(raw.trim());
 
-        // 1. Extract array dimensions
         let mut array_dimensions = 0;
         while text.ends_with("[]") {
             array_dimensions += 1;
             text = text.strip_suffix("[]").unwrap().trim().to_string();
         }
 
-        // 2. Extract typmods (e.g., (255) or (10, 2))
+        // rfind so nested parens in unusual type expressions don't truncate the typmod.
         let mut typmods = None;
-        if let Some(paren_start) = text.find('(')
-            && let Some(paren_end) = text.rfind(')')
-            && paren_end > paren_start
+        if let Some(open) = text.find('(')
+            && let Some(close) = text.rfind(')')
+            && close > open
         {
-            // Extract exactly what is between the parentheses
-            typmods = Some(text[paren_start + 1..paren_end].trim().to_string());
-            text = text[..paren_start].trim().to_string();
+            typmods = Some(text[open + 1..close].trim().to_string());
+            text = text[..open].trim().to_string();
         }
 
-        // 3. Resolve the base family
         let family = DataTypeFamily::from_base_name(&text);
-
-        Self {
-            family,
-            original_base: text,
-            typmods,
-            array_dimensions,
-        }
+        Self { family, original_base: text, typmods, array_dimensions }
     }
 
     fn fold_unquoted_identifier_case(raw: &str) -> String {
         let mut folded = String::with_capacity(raw.len());
-        let mut quoted = false;
+        let mut in_quotes = false;
         let mut chars = raw.chars().peekable();
-        while let Some(character) = chars.next() {
-            match character {
-                '"' if quoted && chars.peek() == Some(&'"') => {
+        while let Some(ch) = chars.next() {
+            match ch {
+                '"' if in_quotes && chars.peek() == Some(&'"') => {
                     folded.push('"');
                     folded.push('"');
                     chars.next();
                 }
                 '"' => {
-                    quoted = !quoted;
-                    folded.push(character);
+                    in_quotes = !in_quotes;
+                    folded.push(ch);
                 }
-                character if quoted => folded.push(character),
-                character => folded.extend(character.to_lowercase()),
+                ch if in_quotes => folded.push(ch),
+                ch => folded.extend(ch.to_lowercase()),
             }
         }
         folded
     }
 
-    /// Returns the character limit if this is a bounded character type.
+    // Character limit for bounded character types. None for unbounded and non-character families.
     pub(crate) fn character_limit(&self) -> Option<i32> {
         match self.family {
             DataTypeFamily::CharacterVarying
             | DataTypeFamily::Character
-            | DataTypeFamily::BpChar => self.typmods.as_ref().and_then(|mods| mods.parse().ok()),
+            | DataTypeFamily::BpChar => self.typmods.as_ref().and_then(|m| m.parse().ok()),
             _ => None,
         }
     }
 
-    /// Calculates the `atttypmod` offset as represented in PostgreSQL catalogs.
-    /// For character types, PostgreSQL adds VARHDRSZ (4) to the declared limit.
+    // PostgreSQL stores atttypmod as character_limit + VARHDRSZ (4) for bounded char types.
     pub(crate) fn atttypmod_offset(&self) -> Option<i32> {
         self.character_limit().map(|limit| limit + 4)
     }
 
-    /// Safely evaluates if migrating from `self` to `new_type` results in irreversible data truncation.
+    // Precision and scale for numeric(p, s). numeric(p) returns Some((p, 0)); bare numeric returns None.
+    pub(crate) fn numeric_params(&self) -> Option<(i32, i32)> {
+        if self.family != DataTypeFamily::Numeric {
+            return None;
+        }
+        let mods = self.typmods.as_deref()?;
+        let mut parts = mods.splitn(2, ',');
+        let precision: i32 = parts.next()?.trim().parse().ok()?;
+        let scale: i32 = parts
+            .next()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0);
+        Some((precision, scale))
+    }
+
+    // Scale from numeric(p, s). None when scale is not explicitly declared.
+    pub(crate) fn numeric_scale(&self) -> Option<u32> {
+        if self.family != DataTypeFamily::Numeric {
+            return None;
+        }
+        let mods = self.typmods.as_deref()?;
+        let scale_str = mods.split(',').nth(1)?.trim();
+        scale_str.parse().ok()
+    }
+
+    // Renders as pg_catalog.format_type(oid, NULL) for function-signature identity keys.
+    // Unlike Display, does NOT add the implicit (1) for bare character/char.
+    pub(crate) fn to_function_signature_string(&self) -> String {
+        let mut out = self.family.to_canonical_string(&self.original_base);
+        if let Some(ref mods) = self.typmods {
+            out.push_str(&format!("({})", mods));
+        }
+        for _ in 0..self.array_dimensions {
+            out.push_str("[]");
+        }
+        out
+    }
+
     pub(crate) fn is_lossy_narrowing_to(&self, new_type: &ParsedDataType) -> bool {
         if self.family == new_type.family
             && self.typmods == new_type.typmods
@@ -207,50 +223,34 @@ impl ParsedDataType {
             return false;
         }
 
-        // Arrays must match dimensions to be compared safely for base narrowing here,
-        // though full structural migration handles arrays differently.
+        // Any change in array dimensionality is structurally incompatible.
         if self.array_dimensions != new_type.array_dimensions {
-            return true; // dimension change is inherently destructive/complex
+            return true;
         }
 
-        // 1. Integer Narrowing (e.g., bigint -> int)
-        if let (Some(old_sz), Some(new_sz)) = (self.family.size_bits(), new_type.family.size_bits())
+        if let (Some(old_bits), Some(new_bits)) =
+            (self.family.size_bits(), new_type.family.size_bits())
         {
-            return new_sz < old_sz;
+            return new_bits < old_bits;
         }
 
-        // 2. Varchar/Text Narrowing
-        let old_is_char = matches!(
-            self.family,
-            DataTypeFamily::CharacterVarying | DataTypeFamily::Text
-        );
-        let new_is_char = matches!(
-            new_type.family,
-            DataTypeFamily::CharacterVarying | DataTypeFamily::Text
-        );
+        let old_is_string = self.family.is_text_like();
+        let new_is_string = new_type.family.is_text_like();
 
-        if old_is_char && new_is_char {
-            match (self.character_limit(), new_type.character_limit()) {
-                // Both bounded: lossy if the new limit is strictly smaller
-                (Some(old_lim), Some(new_lim)) => return new_lim < old_lim,
-                // Unbounded to bounded (text -> varchar(50)) is lossy
-                (None, Some(_)) => return true,
-                // Bounded to unbounded (varchar(50) -> text) is safe widening
-                (Some(_), None) => return false,
-                // Unbounded to unbounded (text -> text) is safe
-                (None, None) => return false,
-            }
-        } else if old_is_char {
-            // Changing from string to a different type family entirely.
-            // If the old string type was bounded, it's definitively lossy to blindly cast
-            // to an unrelated type without explicit data assertions.
-            if self.character_limit().is_some() {
-                return true;
-            }
+        if old_is_string && new_is_string {
+            return match (self.character_limit(), new_type.character_limit()) {
+                (Some(old_lim), Some(new_lim)) => new_lim < old_lim,
+                (None, Some(_)) => true,
+                (Some(_), None) => false,
+                (None, None) => false,
+            };
         }
 
-        // Fallback matching legacy safety: Assume other transitions (e.g., timestamp -> date)
-        // are handled by specific rules, but do not blanket-flag them as "varchar narrowing".
+        // String to a non-string family: lossy when the source had an explicit upper bound.
+        if old_is_string {
+            return self.character_limit().is_some();
+        }
+
         false
     }
 }
@@ -259,7 +259,7 @@ impl fmt::Display for ParsedDataType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut out = self.family.to_canonical_string(&self.original_base);
 
-        // PostgreSQL quirk: `char` without limits renders as `character(1)`.
+        // Bare char/character in DDL means character(1) per the SQL standard.
         if self.typmods.is_none() && self.family == DataTypeFamily::Character {
             out.push_str("(1)");
         } else if let Some(ref mods) = self.typmods {
@@ -279,9 +279,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_canonical_alias_probe_gate() {
-        // Assert that every alias maps identically to its PostgreSQL catalog canonical form.
-        let cases = vec![
+    fn canonical_alias_round_trip() {
+        let cases = [
             ("int", "integer"),
             ("int4", "integer"),
             ("int8", "bigint"),
@@ -302,37 +301,77 @@ mod tests {
             ("varchar(50)[][]", "character varying(50)[][]"),
             ("unknown_type", "unknown_type"),
         ];
-
         for (input, expected) in cases {
             let parsed = ParsedDataType::parse(input);
-            assert_eq!(
-                parsed.to_string(),
-                expected,
-                "Alias probe failed for input '{}'",
-                input
-            );
+            assert_eq!(parsed.to_string(), expected, "failed for '{input}'");
         }
     }
 
     #[test]
-    fn test_lossy_narrowing_detection() {
+    fn function_signature_string_no_implicit_char_width() {
+        // pg_catalog.format_type returns "character" bare (no typmod) for bpchar/char.
+        // Function identity keys must match that; Display must not be used here.
+        assert_eq!(ParsedDataType::parse("char").to_function_signature_string(), "character");
+        assert_eq!(ParsedDataType::parse("character").to_function_signature_string(), "character");
+        assert_eq!(ParsedDataType::parse("char(10)").to_function_signature_string(), "character(10)");
+        assert_eq!(ParsedDataType::parse("bpchar").to_function_signature_string(), "character");
+        assert_eq!(ParsedDataType::parse("int").to_function_signature_string(), "integer");
+        assert_eq!(ParsedDataType::parse("varchar(50)").to_function_signature_string(), "character varying(50)");
+    }
+
+    #[test]
+    fn lossy_narrowing_integer() {
+        let s = ParsedDataType::parse("smallint");
+        let i = ParsedDataType::parse("integer");
+        let b = ParsedDataType::parse("bigint");
+        assert!(!s.is_lossy_narrowing_to(&i));
+        assert!(!i.is_lossy_narrowing_to(&b));
+        assert!(b.is_lossy_narrowing_to(&i));
+        assert!(i.is_lossy_narrowing_to(&s));
+    }
+
+    #[test]
+    fn lossy_narrowing_character() {
         let text = ParsedDataType::parse("text");
-        let varchar_unbounded = ParsedDataType::parse("character varying");
-        let varchar_255 = ParsedDataType::parse("varchar(255)");
-        let varchar_50 = ParsedDataType::parse("varchar(50)");
+        let vc_unb = ParsedDataType::parse("character varying");
+        let vc255 = ParsedDataType::parse("varchar(255)");
+        let vc50 = ParsedDataType::parse("varchar(50)");
+        assert!(!vc50.is_lossy_narrowing_to(&vc255));
+        assert!(!vc50.is_lossy_narrowing_to(&text));
+        assert!(vc255.is_lossy_narrowing_to(&vc50));
+        assert!(text.is_lossy_narrowing_to(&vc255));
+        assert!(vc_unb.is_lossy_narrowing_to(&vc255));
+    }
 
-        let int = ParsedDataType::parse("int");
-        let bigint = ParsedDataType::parse("bigint");
+    #[test]
+    fn lossy_narrowing_array_dimension_change() {
+        let i = ParsedDataType::parse("integer");
+        let ia = ParsedDataType::parse("integer[]");
+        assert!(i.is_lossy_narrowing_to(&ia));
+        assert!(ia.is_lossy_narrowing_to(&i));
+    }
 
-        // Safe widenings
-        assert!(!varchar_50.is_lossy_narrowing_to(&varchar_255));
-        assert!(!varchar_50.is_lossy_narrowing_to(&text));
-        assert!(!int.is_lossy_narrowing_to(&bigint));
+    #[test]
+    fn numeric_params_extraction() {
+        assert_eq!(ParsedDataType::parse("numeric").numeric_params(), None);
+        assert_eq!(ParsedDataType::parse("numeric(10)").numeric_params(), Some((10, 0)));
+        assert_eq!(ParsedDataType::parse("numeric(10, 2)").numeric_params(), Some((10, 2)));
+        assert_eq!(ParsedDataType::parse("decimal(5,3)").numeric_params(), Some((5, 3)));
+        assert_eq!(ParsedDataType::parse("integer").numeric_params(), None);
+    }
 
-        // Lossy narrowings
-        assert!(varchar_255.is_lossy_narrowing_to(&varchar_50));
-        assert!(text.is_lossy_narrowing_to(&varchar_255));
-        assert!(varchar_unbounded.is_lossy_narrowing_to(&varchar_255));
-        assert!(bigint.is_lossy_narrowing_to(&int));
+    #[test]
+    fn numeric_scale_extraction() {
+        assert_eq!(ParsedDataType::parse("numeric").numeric_scale(), None);
+        assert_eq!(ParsedDataType::parse("numeric(10)").numeric_scale(), None);
+        assert_eq!(ParsedDataType::parse("numeric(10,2)").numeric_scale(), Some(2));
+    }
+
+    #[test]
+    fn character_limit_and_atttypmod() {
+        let v50 = ParsedDataType::parse("varchar(50)");
+        assert_eq!(v50.character_limit(), Some(50));
+        assert_eq!(v50.atttypmod_offset(), Some(54));
+        assert_eq!(ParsedDataType::parse("text").character_limit(), None);
     }
 }

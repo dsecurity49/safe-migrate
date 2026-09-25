@@ -1,5 +1,6 @@
 use crate::_internal::ast::identifiers::ObjectId;
 use crate::_internal::db::cache::DbCache;
+use crate::_internal::model::data_type::ParsedDataType;
 use crate::_internal::model::relation::{Persistence, RelationKind, RelationState};
 
 #[cfg(test)]
@@ -417,7 +418,7 @@ mod tests {
             default: None,
             avg_width: Some(10),
             default_expr_text: Some("now()".into()),
-            type_modifier: Some(255 + 4),
+            type_modifier: ParsedDataType::parse("varchar(255)").atttypmod_offset(),
             storage: None,
             compression: None,
             statistics_target: None,

@@ -138,7 +138,7 @@ mod destructive_rule_tests {
 
         assert!(
             v.iter().any(|viol| viol.rule_id == "type-change-rewrite"
-                && viol.reason.contains("narrows VARCHAR precision (lossy)")),
+                && viol.reason.contains("lossy narrowing")),
             "Unbounded to bounded varchar change should be flagged as lossy narrowing: {:?}",
             v
         );
@@ -190,7 +190,7 @@ mod destructive_rule_tests {
 
         assert!(
             v.iter()
-                .any(|v| v.rule_id == "type-change-rewrite" && v.reason.contains("narrows")),
+                .any(|v| v.rule_id == "type-change-rewrite" && v.reason.contains("lossy narrowing")),
             "255→50 should be flagged as lossy VARCHAR narrowing"
         );
 
@@ -281,7 +281,7 @@ mod destructive_rule_tests {
 
         assert!(
             v.iter()
-                .any(|v| v.rule_id == "type-change-rewrite" && v.reason.contains("narrows")),
+                .any(|v| v.rule_id == "type-change-rewrite" && v.reason.contains("lossy narrowing")),
             "text->varchar(50) should be flagged as lossy narrowing: {:?}",
             v
         );

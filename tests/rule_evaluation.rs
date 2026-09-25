@@ -1179,7 +1179,7 @@ mod rule_evaluation_tests {
             .iter()
             .find(|v| v.rule_id == "require-concurrent-reindex" && v.object_name == "mydb")
             .expect("should flag synchronous database reindex");
-        assert_eq!(reindex_database.tier, ViolationTier::Tier1);
+        assert_eq!(reindex_database.tier, ViolationTier::Tier2);
 
         assert_eq!(
             violations

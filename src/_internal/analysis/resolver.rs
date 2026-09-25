@@ -140,7 +140,7 @@ impl Resolver {
     }
 
     pub(crate) fn normalize_function_arg_type(raw: &str) -> String {
-        ParsedDataType::parse(raw).to_string()
+        ParsedDataType::parse(raw).to_function_signature_string()
     }
 
     pub(crate) fn resolve(fact: &StatementFact, state: &AnalysisState) -> Vec<Mutation> {

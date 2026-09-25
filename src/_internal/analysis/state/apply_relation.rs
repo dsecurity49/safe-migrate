@@ -7,7 +7,7 @@ use crate::_internal::analysis::mutations::{
 };
 use crate::_internal::ast::identifiers::ObjectId;
 use crate::_internal::model::constraint::{ConstraintKind, ConstraintState};
-use crate::_internal::model::data_type::DataTypeFamily;
+use crate::_internal::model::data_type::{DataTypeFamily, ParsedDataType};
 use crate::_internal::model::relation::{ColumnAction, RelationKind, RelationState};
 use crate::_internal::model::sequence::{
     SequenceKind, SequenceOverlay, SequenceParameters, SequencePersistence, SequenceState,
@@ -5274,9 +5274,12 @@ impl AnalysisState {
                         name: column.clone(),
                         data_type: ty.clone(),
                     });
-                    if let Some(column) = rel.columns.iter_mut().find(|entry| entry.name == *column)
-                    {
-                        column.type_id = action_type_id.clone();
+                    if let Some(col) = rel.columns.iter_mut().find(|entry| entry.name == *column) {
+                        col.type_id = action_type_id.clone();
+                        // Keep type_modifier in sync with the new DDL-declared type so
+                        // partition-column compatibility checks (which compare type_modifier
+                        // between parent and child columns) remain correct after a type change.
+                        col.type_modifier = ParsedDataType::parse(ty).atttypmod_offset();
                     }
                 }
                 AlterTableActionMutation::SetDefault { column, default } => {
@@ -7251,8 +7254,11 @@ impl AnalysisState {
                 .find(|c| &c.name == key_name)
                 .and_then(|c| c.data_type.as_deref())?;
 
-            let type_family = DataTypeFamily::from_type_name(col_type)?;
-            let comp_left = if type_family.requires_text_cast_for_comparison() {
+            let parsed = ParsedDataType::parse(col_type);
+            if parsed.family == DataTypeFamily::Unknown {
+                return None;
+            }
+            let comp_left = if parsed.family.requires_text_cast_for_comparison() {
                 format!("({key})::text")
             } else {
                 key.clone()
@@ -7406,8 +7412,13 @@ impl AnalysisState {
                     for datum in non_null_datums {
                         values.push(decode_sql_literal(&datum.text)?);
                     }
-                    let type_family = DataTypeFamily::from_type_name(column_type)?;
-                    let canonical_type = type_family.to_canonical_type_string(column_type);
+                    let type_parsed = ParsedDataType::parse(column_type);
+                    let type_family = if type_parsed.family == DataTypeFamily::Unknown {
+                        return None;
+                    } else {
+                        type_parsed.family
+                    };
+                    let canonical_type = type_parsed.to_string();
                     let mapped = elements_for_array(&values, column_type)?;
                     if matches!(
                         type_family,
@@ -7648,7 +7659,11 @@ fn array_element_type(elements: &[&str], fallback: &str) -> Option<String> {
 /// Render partition-list values in the array-constant element syntax for the
 /// key column type (`t`/`f` for booleans, otherwise the element text as-is).
 fn elements_for_array(values: &[String], column_type: &str) -> Option<Vec<String>> {
-    let family = DataTypeFamily::from_type_name(column_type)?;
+    let parsed = ParsedDataType::parse(column_type);
+    if parsed.family == DataTypeFamily::Unknown {
+        return None;
+    }
+    let family = parsed.family;
     match family {
         DataTypeFamily::Boolean => values
             .iter()
@@ -7663,7 +7678,7 @@ fn elements_for_array(values: &[String], column_type: &str) -> Option<Vec<String
             })
             .collect(),
         DataTypeFamily::Numeric => {
-            let scale = numeric_typmod_scale(column_type);
+            let scale = ParsedDataType::parse(column_type).numeric_scale();
             Some(
                 values
                     .iter()
@@ -7781,7 +7796,11 @@ fn predicate_column_name(predicate: &str) -> Option<String> {
 /// text-like/uuid/ISO-date values quoted with a `::type` cast.
 fn deparse_partition_literal(data_type: &str, raw: &str) -> Option<String> {
     let decoded = decode_sql_literal(raw)?;
-    let family = DataTypeFamily::from_type_name(data_type)?;
+    let parsed = ParsedDataType::parse(data_type);
+    if parsed.family == DataTypeFamily::Unknown {
+        return None;
+    }
+    let family = parsed.family;
     match family {
         DataTypeFamily::Boolean => {
             if decoded.eq_ignore_ascii_case("true") {
@@ -7817,11 +7836,10 @@ fn deparse_partition_literal(data_type: &str, raw: &str) -> Option<String> {
             // get_const_expr casts and applies the column scale: an integer input `5`
             // is rendered as `5.00::numeric(10,2)` when scale=2.  Bare `numeric` with
             // a float-like constant is printed without a cast.
-            let has_typmod = data_type.contains('(');
+            let parsed_dt = ParsedDataType::parse(data_type);
+            let has_typmod = parsed_dt.typmods.is_some();
             if has_typmod {
-                // Apply the declared scale if the decoded value has no fractional part.
-                // e.g. numeric(10,2) + decoded "5" → "5.00"
-                let scale = numeric_typmod_scale(data_type).unwrap_or(0);
+                let scale = parsed_dt.numeric_scale().unwrap_or(0);
                 let scaled = if is_plain_integer(&decoded) && scale > 0 {
                     let zeros = "0".repeat(scale as usize);
                     format!("{decoded}.{zeros}")
@@ -7880,7 +7898,7 @@ fn deparse_partition_literal(data_type: &str, raw: &str) -> Option<String> {
         | DataTypeFamily::Timestamp => Some(format!(
             "'{}'::{}",
             decoded.replace('\'', "''"),
-            family.to_canonical_type_string(data_type)
+            ParsedDataType::parse(data_type).to_string()
         )),
         _ => None,
     }
@@ -7897,14 +7915,6 @@ fn numeric_float_like(value: &str) -> bool {
         && value[first.len_utf8()..]
             .chars()
             .any(|ch| matches!(ch, '.' | 'e' | 'E'))
-}
-
-/// Extract the scale component from a `numeric(precision, scale)` type string.
-/// Returns `None` for bare `numeric` or `numeric(precision)` (scale 0 implied).
-fn numeric_typmod_scale(type_name: &str) -> Option<u32> {
-    let inner = type_name.split('(').nth(1)?.trim_end_matches(')');
-    let scale_str = inner.split(',').nth(1)?.trim();
-    scale_str.parse().ok()
 }
 
 /// True when the value is a plain signed or unsigned integer literal: all ASCII

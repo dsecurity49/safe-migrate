@@ -281,7 +281,7 @@ impl Resolver {
                 }
                 AlterIndexActionFact::SetStatistics { column, target } => {
                     AlterIndexActionMutation::SetStatistics {
-                        column_name: column.as_ref().map(|c| c.resolve()).unwrap_or_default(),
+                        column_name: column.as_ref().map(|c| c.resolve()),
                         target: match target {
                             StatisticsTarget::Default => StatisticsTarget::Default,
                             StatisticsTarget::Value(n) => StatisticsTarget::Value(*n),

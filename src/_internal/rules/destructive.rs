@@ -655,103 +655,45 @@ pub(crate) struct TypeChangeRewriteRule;
 
 impl TypeChangeRewriteRule {
     fn is_type_change_safe(old_type: &str, new_type: &str, pg_version: u32) -> bool {
-        let old = old_type.to_lowercase();
-        let new = new_type.to_lowercase();
-        if old == new {
+        if old_type.eq_ignore_ascii_case(new_type) {
             return true;
         }
 
-        let old_base = old.split('(').next().unwrap_or(&old).trim();
-        let new_base = new.split('(').next().unwrap_or(&new).trim();
+        let old_dt = ParsedDataType::parse(old_type);
+        let new_dt = ParsedDataType::parse(new_type);
 
-        if (old_base == "varchar" || old_base == "character varying")
-            && (new_base == "varchar" || new_base == "character varying" || new_base == "text")
-        {
-            if new == "text" || new == "varchar" || new == "character varying" {
-                return true;
+        use crate::_internal::model::data_type::DataTypeFamily;
+
+        // Varchar widening is a metadata-only change.
+        if old_dt.family.is_text_like() && new_dt.family.is_text_like() {
+            if new_dt.family == DataTypeFamily::Text || new_dt.typmods.is_none() {
+                return true; // Widening to unbounded text/varchar.
             }
-            if let Some(old_mod) = extract_type_modifier_from_type_string(&old)
-                && let Some(new_mod) = extract_type_modifier_from_type_string(&new)
-                && old_mod <= new_mod
+            if let (Some(old_limit), Some(new_limit)) =
+                (old_dt.character_limit(), new_dt.character_limit())
             {
-                return true;
+                if old_limit <= new_limit {
+                    return true;
+                }
             }
         }
 
-        if pg_version >= 120000
-            && (old_base == "numeric" || old_base == "decimal")
-            && (new_base == "numeric" || new_base == "decimal")
-        {
-            // Changing to unconstrained numeric is always safe (widest form).
-            if !new.contains('(') {
-                return true;
+        // Numeric widening is a metadata-only change in PG >= 12.
+        if pg_version >= 120_000 && old_dt.family.is_numeric() && new_dt.family.is_numeric() {
+            if new_dt.typmods.is_none() {
+                return true; // Widening to unconstrained numeric.
             }
-            // Changing to a constrained numeric(p, s) is safe if the new
-            // precision is >= the old precision and the new scale is >= the
-            // old scale (i.e. the new type can represent every value the old
-            // type could). If the old type is unconstrained we cannot prove
-            // widening, so we fall through to false.
             if let (Some((old_p, old_s)), Some((new_p, new_s))) =
-                (parse_numeric_params(&old), parse_numeric_params(&new))
-                && new_p >= old_p
-                && new_s >= old_s
+                (old_dt.numeric_params(), new_dt.numeric_params())
             {
-                return true;
+                if new_p >= old_p && new_s >= old_s {
+                    return true;
+                }
             }
         }
 
         false
     }
-
-    /// Detects whether a type change narrows a VARCHAR(n) column
-    /// using type_modifier values from the cache.
-    ///
-    /// atttypmod for VARCHAR(n) encodes the character limit:
-    ///   typmod = (limit + VARHDRSZ), where VARHDRSZ is 4
-    ///
-    /// A smaller typmod means a smaller character limit, which is lossy.
-    /// Returns true if the new modifier represents a smaller limit than the old.
-    pub(crate) fn is_lossy_varchar_narrowing(
-        old_modifier: Option<i32>,
-        new_modifier: Option<i32>,
-    ) -> bool {
-        match (old_modifier, new_modifier) {
-            // PostgreSQL uses -1 for an unbounded character limit.
-            (Some(-1), Some(new)) if new != -1 => true,
-            // If the new one is unbounded, it's never narrowing
-            (_, Some(-1)) => false,
-            // Bounded values narrow when the new character limit is smaller.
-            (Some(old), Some(new)) => new < old,
-            // A missing modifier cannot prove a bounded old limit.
-            (None, Some(new)) if new != -1 => true,
-            _ => false,
-        }
-    }
-}
-
-/// Parses precision and scale from a numeric/decimal type string.
-/// Returns `Some((precision, scale))` for `numeric(p, s)` or `numeric(p)` (scale=0).
-/// Returns `None` if the type has no parameters.
-fn parse_numeric_params(ty: &str) -> Option<(i32, i32)> {
-    let lower = ty.to_lowercase();
-    let paren_start = lower.find('(')?;
-    let paren_end = lower.find(')')?;
-    let inner = &lower[paren_start + 1..paren_end];
-    let mut parts = inner.splitn(2, ',');
-    let precision: i32 = parts.next()?.trim().parse().ok()?;
-    let scale: i32 = parts
-        .next()
-        .map(|s| s.trim().parse().unwrap_or(0))
-        .unwrap_or(0);
-    Some((precision, scale))
-}
-
-/// Extracts a synthetic type_modifier-like value from a type string.
-/// Used when the new type comes from the migration SQL (not from the cache).
-/// For varchar(N), derives the atttypmod from the character limit.
-pub(crate) fn extract_type_modifier_from_type_string(ty: &str) -> Option<i32> {
-    let parsed = ParsedDataType::parse(ty);
-    parsed.atttypmod_offset()
 }
 
 impl Rule for TypeChangeRewriteRule {
@@ -803,7 +745,7 @@ impl Rule for TypeChangeRewriteRule {
         {
             let pg_version = state.effective_pg_version_num(config.assume_pg_version);
 
-            let (is_safe, rows, old_type_str, old_modifier) =
+            let (is_safe, rows, old_type_str) =
                 match pre_state.relations.get(&alter.id) {
                     Some(rel) => {
                         let col_info = rel.columns.iter().find(|c| c.name == *column);
@@ -816,10 +758,9 @@ impl Rule for TypeChangeRewriteRule {
                             safe,
                             rel.estimated_rows.unwrap_or(config.default_rows),
                             old_ty.cloned().unwrap_or_else(|| "unknown".to_string()),
-                            col_info.and_then(|col| col.type_modifier),
                         )
                     }
-                    None => (false, config.default_rows, "unknown".to_string(), None),
+                    None => (false, config.default_rows, "unknown".to_string()),
                 };
 
             if !is_safe {
@@ -831,9 +772,7 @@ impl Rule for TypeChangeRewriteRule {
                     ViolationTier::Tier2
                 };
 
-                let new_modifier = extract_type_modifier_from_type_string(ty);
-
-                if Self::is_lossy_varchar_narrowing(old_modifier, new_modifier) {
+                if is_type_change_lossy(&old_type_str, ty) {
                     violations.push(Violation { source_range: None,
                         rule_id: self.id(),
                         operation_kind: OperationKind::AlterColumnType,
@@ -841,10 +780,10 @@ impl Rule for TypeChangeRewriteRule {
                         object_name: format!("{}.{}", alter.id, column),
                         tier,
                         reason: format!(
-                            "Changing column {}.{} type from {} to {} narrows VARCHAR precision (lossy)",
+                            "Changing column {}.{} type from {} to {} truncates data (lossy narrowing)",
                             alter.id, column, old_type_str, ty
                         ),
-                        recipe: "Narrowing VARCHAR(n) precision may cause data truncation. Consider adding a new column, backfilling, and then dropping the old one.",
+                        recipe: "Narrowing a data type may cause data truncation. Consider adding a new column, backfilling, and then dropping the old one.",
                         dedup_key: None,
                                     sql: None,
                                     fk_dependency_related: false,

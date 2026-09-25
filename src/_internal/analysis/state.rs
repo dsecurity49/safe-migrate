@@ -3072,8 +3072,8 @@ impl AnalysisState {
             Mutation::Vacuum { table_id, is_full } => self.apply_vacuum(table_id, *is_full),
             Mutation::Reindex {
                 target,
-                concurrently,
-            } => self.apply_reindex(target, *concurrently),
+                concurrently: _,
+            } => self.apply_reindex(target),
         }
     }
 

@@ -55,7 +55,7 @@ impl Rule for OpaqueDynamicSqlRule {
                 crate::_internal::analysis::mutations::OpaqueMutation::UnresolvedReference {
                     ..
                 } => {
-                    unreachable!()
+                    unreachable!("UnresolvedReference is never treated as a schema drift collision")
                 }
             };
 

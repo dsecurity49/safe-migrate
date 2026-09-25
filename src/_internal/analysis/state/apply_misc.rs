@@ -77,15 +77,16 @@ impl AnalysisState {
     pub(super) fn apply_reindex(
         &mut self,
         target: &Option<ReindexTargetMutation>,
-        _concurrently: bool,
     ) -> MutationResult {
         if let Some(target) = target {
             match target {
                 ReindexTargetMutation::Database(_)
                 | ReindexTargetMutation::Schema(_)
                 | ReindexTargetMutation::System(_) => {
-                    // System/Database/Schema reindexes are generally admin tasks.
-                    // REINDEX SYSTEM cannot be concurrent.
+                    // System/Database/Schema reindexes affect many relations at once.
+                    // Tracking exact concurrent/transaction state for all of them
+                    // is not currently modeled, so we taint the statement.
+                    self.taint(EvidenceCode::UnsupportedSemantics, EvidenceScope::Statement);
                 }
                 ReindexTargetMutation::Table(id) => {
                     if let Err(result) = self.ensure_relation_target(
@@ -99,16 +100,19 @@ impl AnalysisState {
                 }
                 ReindexTargetMutation::Index(id) => {
                     if !self.index_is_present(id) {
-                        // If we can prove it doesn't exist, we could return a conflict.
-                        // For simplicity, we just taint if it's missing and we have coverage.
+                        // When the baseline covers indexes for this schema we
+                        // can be certain the named index does not exist; return
+                        // a hard conflict rather than silently tainting.
                         if self.baseline_covers_family_object(
                             id,
-                            crate::_internal::db::cache::CatalogFamily::Constraints,
+                            crate::_internal::db::cache::CatalogFamily::Indexes,
                         ) {
                             return MutationResult::Conflict {
                                 reason: format!("reindexed index '{}' does not exist", id),
                             };
                         }
+                        // No baseline coverage — we cannot prove it is absent.
+                        self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
                     }
                 }
             }
@@ -202,13 +206,16 @@ impl AnalysisState {
 
     pub(super) fn apply_alter_index_all_in_tablespace(
         &mut self,
-        all: &AlterIndexAllInTablespaceMutation,
+        _all: &AlterIndexAllInTablespaceMutation,
     ) -> MutationResult {
-        // `ALTER INDEX ALL IN TABLESPACE src SET TABLESPACE dst` relocates every
-        // index in a tablespace. Index tablespace is advisory planner metadata
-        // the model does not track, so relocation never drifts the model; there
-        // is no single index_id to validate.
-        let _ = (&all.source_tablespace, &all.target_tablespace);
+        // `ALTER INDEX ALL IN TABLESPACE src SET TABLESPACE dst` bulk-relocates
+        // every index currently residing in tablespace `src` to tablespace `dst`.
+        // Index tablespace is advisory planner metadata (pg_class.reltablespace);
+        // this engine does not model tablespace placement in its relation state,
+        // so this operation never drifts the catalog model and requires no
+        // state mutation. The source/target tablespace names are preserved in
+        // the mutation for rule authors and future diagnostics, but the apply
+        // layer correctly treats this as a no-op against the schema model.
         MutationResult::Applied
     }
 }
