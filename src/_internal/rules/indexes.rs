@@ -244,33 +244,35 @@ impl Rule for RequireConcurrentReindexRule {
             );
 
             if !is_system && !*concurrently {
-                let target_name = match target {
+                // The object kind and the name are derived together so a finding
+                // cannot describe a table as an index.
+                let (object_kind, target_name) = match target {
                     Some(
                         crate::_internal::analysis::mutations::ReindexTargetMutation::Database(n),
-                    ) => n.clone(),
+                    ) => (ObjectKind::Database, n.clone()),
                     Some(crate::_internal::analysis::mutations::ReindexTargetMutation::Schema(
                         n,
-                    )) => n.clone(),
+                    )) => (ObjectKind::Schema, n.clone()),
                     Some(crate::_internal::analysis::mutations::ReindexTargetMutation::Table(
                         id,
-                    )) => format!("{}.{}", id.schema, id.name),
+                    )) => (ObjectKind::Table, format!("{}.{}", id.schema, id.name)),
                     Some(crate::_internal::analysis::mutations::ReindexTargetMutation::Index(
                         id,
-                    )) => format!("{}.{}", id.schema, id.name),
+                    )) => (ObjectKind::Index, format!("{}.{}", id.schema, id.name)),
                     Some(crate::_internal::analysis::mutations::ReindexTargetMutation::System(
                         Some(n),
-                    )) => n.clone(),
+                    )) => (ObjectKind::Database, n.clone()),
                     Some(crate::_internal::analysis::mutations::ReindexTargetMutation::System(
                         None,
-                    )) => "current database".to_string(),
-                    None => "unknown".to_string(),
+                    )) => (ObjectKind::Database, "current database".to_string()),
+                    None => (ObjectKind::Unknown, "unknown".to_string()),
                 };
 
                 violations.push(Violation {
                     source_range: None,
                     rule_id: self.id(),
                     operation_kind: OperationKind::Reindex,
-                    object_kind: ObjectKind::Index,
+                    object_kind,
                     object_name: target_name.clone(),
                     tier: ViolationTier::Tier1,
                     reason: format!("Synchronous REINDEX on {}", target_name),

@@ -18,6 +18,6 @@ if [ -z "${DATABASE_URL:-}" ]; then
     exit 2
 fi
 
-cargo test --locked --lib \
-    internal_tests::live_catalog_sync::live_sync_preserves_routine_and_replication_catalogs_without_connection_secrets \
-    -- --exact --ignored --nocapture
+. "$repository_root/scripts/lib/run-exact-test.sh"
+
+run_exact_test "scripts/live-catalog-sync" internal_tests::live_catalog_sync::live_sync_preserves_routine_and_replication_catalogs_without_connection_secrets

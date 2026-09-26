@@ -1381,5 +1381,60 @@ mod phase10_bug_fixes_and_sorting_tests {
             violations
         );
     }
+
+    /// REINDEX must describe the object it actually targets. The finding used to
+    /// hardcode `ObjectKind::Index`, so `REINDEX TABLE t` was reported as an
+    /// index. Nothing in the resulting catalog differs between the two, so no
+    /// state-level comparison could see it.
+    #[test]
+    fn reindex_reports_the_kind_of_object_it_targets() {
+        let engine = setup_engine();
+        let mut cache = DbCache::new();
+        cache.insert_baseline(
+            object_id("public", "reindex_test"),
+            safe_migrate::_internal::model::relation::RelationState::new(
+                object_id("public", "reindex_test"),
+                ObjectId::new("public", "postgres"),
+                0,
+                Some(1),
+                RelationKind::Table,
+                Persistence::Permanent,
+                0,
+            ),
+        );
+        let mut state = AnalysisState::new(cache);
+
+        let sql = "REINDEX TABLE reindex_test; REINDEX INDEX reindex_test_idx;";
+        let violations = engine.analyze(sql, &mut state).unwrap();
+
+        let reindexes: Vec<(&str, ObjectKind, ViolationTier)> = violations
+            .iter()
+            .filter(|v| v.rule_id == "require-concurrent-reindex")
+            .map(|v| {
+                (
+                    v.object_name.as_str(),
+                    v.object_kind.clone(),
+                    v.tier.clone(),
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            reindexes,
+            vec![
+                (
+                    "public.reindex_test",
+                    ObjectKind::Table,
+                    ViolationTier::Tier1
+                ),
+                (
+                    "public.reindex_test_idx",
+                    ObjectKind::Index,
+                    ViolationTier::Tier1
+                ),
+            ],
+            "each target must be described with its own object kind"
+        );
+    }
 }
 // ─────────────────────────────────────────────

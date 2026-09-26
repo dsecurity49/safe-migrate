@@ -18,6 +18,6 @@ if [ -z "${DATABASE_URL:-}" ]; then
     exit 2
 fi
 
-cargo test --locked --lib \
-    internal_tests::live_catalog_sync::live_routine_and_replication_mutations_match_postgresql \
-    -- --exact --ignored --nocapture
+. "$repository_root/scripts/lib/run-exact-test.sh"
+
+run_exact_test "scripts/live-catalog-differential" internal_tests::live_catalog_sync::live_routine_and_replication_mutations_match_postgresql

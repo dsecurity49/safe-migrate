@@ -20,6 +20,6 @@ if [ -z "${DATABASE_URL:-}" ] || [ -z "${PUBLISHER_DATABASE_URL:-}" ] ||
     exit 2
 fi
 
-cargo test --locked --lib \
-    internal_tests::live_catalog_sync::live_connected_subscription_round_trip_is_redacted_and_exact \
-    -- --exact --ignored --nocapture
+. "$repository_root/scripts/lib/run-exact-test.sh"
+
+run_exact_test "scripts/live-connected-subscription" internal_tests::live_catalog_sync::live_connected_subscription_round_trip_is_redacted_and_exact

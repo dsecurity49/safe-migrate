@@ -1,4 +1,7 @@
 {
+  "provenance": {
+    "generator_version": "0.9.3"
+  },
   "entries": {
     "a bigint|(a)|LIST|FOR VALUES IN (100, 200)": "(((a IS NOT NULL) AND (a = ANY ('{100,200}'::bigint[]))))",
     "a bigint|(a)|LIST|FOR VALUES IN (9223372036854775807)": "(((a IS NOT NULL) AND (a = '9223372036854775807'::bigint)))",
