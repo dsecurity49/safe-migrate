@@ -5,6 +5,22 @@ commits and pull requests. Published binaries, checksums, and generated release
 notes are available on the
 [GitHub Releases page](https://github.com/dsecurity49/safe-migrate/releases).
 
+## v0.10.0 — unreleased
+
+- Added `require-concurrent-reindex` to flag `REINDEX` that should run with
+  `CONCURRENTLY`, bringing the rule count to 30.
+- Added `ALTER MATERIALIZED VIEW` action extraction, state resolution, and
+  advisory apply.
+- Added `ALTER INDEX` extraction, state resolution, and advisory apply, plus
+  `ALTER VIEW` `SET`/`DROP DEFAULT` and `SET`/`RESET OPTIONS` as typed facts.
+- Bounded type modifiers to the ranges PostgreSQL accepts, so a valid negative
+  `numeric` scale is no longer misreported and an unbounded scale can no longer
+  exhaust memory.
+- Fixed `bpchar` without an explicit length to be reported as `bpchar` rather
+  than collapsing to `char`.
+- Hardened `REINDEX` and `ALTER INDEX` resolution against the catalog states left
+  behind by interrupted and crashed concurrent operations.
+
 ## v0.9.3 — 2026-09-23
 
 - Upgraded the pinned Squawk parser stack from 2.64.0 to 2.65.0.

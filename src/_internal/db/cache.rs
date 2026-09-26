@@ -371,10 +371,23 @@ pub(crate) struct DbCache {
     pub subscriptions: HashMap<String, SubscriptionState>,
 }
 
+// Durable cache layout version.
+//
+// Any change to the fields of `DbCache` or `DbCacheVersioned` requires bumping
+// this: bincode carries no field names, so bytes are laid out exactly as the
+// current definitions describe. The header encodes the same number, and the
+// magic must stay one digit wide or the fixed-size prefix read breaks.
 pub(crate) const CACHE_FORMAT_VERSION: u32 = 8;
 
 /// Current durable cache header. V8 adds typed-table row-type identity.
 pub(crate) const CACHE_V8_MAGIC: &[u8] = b"SMCACHE08";
+
+// The header width is fixed, so a two-digit version would break the prefix
+// comparison in `api.rs` and read as corruption rather than an old format.
+const _: () = assert!(
+    CACHE_FORMAT_VERSION < 10,
+    "a two-digit cache version changes the header width; redesign the prefix read first"
+);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum DbCacheVersioned {
