@@ -387,10 +387,28 @@ impl SafeMigrateEngine {
                 }
 
                 for rule in &self.rules {
-                    if file_ignores.contains(rule.id())
-                        || stmt_ignores.contains(rule.id())
-                        || self.config.is_rule_disabled(rule.id())
-                    {
+                    let is_inline_ignored = file_ignores.contains(rule.id()) || stmt_ignores.contains(rule.id());
+
+                    if is_inline_ignored && !self.config.allow_inline_suppressions {
+                        statement_violations.push(crate::_internal::report::violations::Violation {
+                            source_range: None,
+                            rule_id: "inline-suppression-disabled",
+                            operation_kind: crate::_internal::report::violations::OperationKind::Other("config".to_string()),
+                            object_kind: crate::_internal::report::violations::ObjectKind::Unknown,
+                            object_name: "".to_string(),
+                            tier: crate::_internal::report::violations::ViolationTier::Tier1,
+                            reason: format!("Inline suppression of rule '{}' is not allowed by configuration", rule.id()),
+                            recipe: "Remove the inline directive. To bypass a rule, explicitly disable it in safe-migrate.toml.",
+                            dedup_key: None,
+                            sql: None,
+                            fk_dependency_related: false,
+                        });
+                        // Skip evaluating the rule since it was requested to be ignored,
+                        // but the build will fail anyway due to the Tier1 config violation.
+                        continue;
+                    }
+
+                    if self.config.is_rule_disabled(rule.id()) || is_inline_ignored {
                         continue;
                     }
 
