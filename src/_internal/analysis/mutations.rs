@@ -330,6 +330,7 @@ pub(crate) struct CreateTable {
     pub id: ObjectId,
     pub if_not_exists: bool,
     pub as_select: bool,
+    pub as_select_with_data: bool,
     pub as_select_columns_known: bool,
     pub persistence: PersistenceMutation,
     pub on_commit: Option<OnCommitMutation>,

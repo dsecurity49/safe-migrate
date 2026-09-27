@@ -18,7 +18,7 @@ impl Rule for CascadingDropRule {
         ViolationTier::Tier1
     }
     fn recipe(&self) -> &'static str {
-        "Avoid CASCADE on DROP TABLE in production. Handle dependencies explicitly."
+        "Avoid CASCADE on DROP in production. Handle dependencies explicitly."
     }
 
     fn required_capabilities(&self) -> &'static [RuleCapability] {
@@ -32,6 +32,26 @@ impl Rule for CascadingDropRule {
         let state = context.state();
         let cascade_closure = context.cascade_closure();
         let mut violations = Vec::new();
+
+        if let Mutation::DropType(drop) = mutation
+            && drop.cascade
+        {
+            for id in &drop.ids {
+                violations.push(Violation {
+                    source_range: None,
+                    rule_id: self.id(),
+                    operation_kind: OperationKind::DropType,
+                    object_kind: ObjectKind::Type,
+                    object_name: id.to_string(),
+                    tier: self.default_tier(),
+                    reason: format!("DROP TYPE {} CASCADE destroys all columns using this type", id),
+                    recipe: self.recipe(),
+                    dedup_key: None,
+                    sql: None,
+                    fk_dependency_related: false,
+                });
+            }
+        }
 
         if !matches!(result, MutationResult::Conflict { .. })
             && let Mutation::DropTable(drop) = mutation
@@ -338,7 +358,8 @@ impl Rule for CreateTableAsSelectRule {
             return vec![];
         }
         if let Mutation::CreateTable(c) = mutation
-            && c.as_select
+            && c.as_select 
+            && c.as_select_with_data
         {
             return vec![Violation {
                 source_range: None,

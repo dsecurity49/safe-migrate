@@ -1321,23 +1321,34 @@ fn load_provenance(
         .context("PostgreSQL returned an invalid server_version_num")?;
     ensure_supported_postgres_version(pg_version_num)?;
 
+    let search_path_row = client
+        .query_one("SHOW search_path;", &[])
+        .context("Failed to load search_path setting")?;
+    let search_path_setting: String = search_path_row
+        .try_get(0)
+        .context("search_path field")?;
+
+    // Protect all subsequent catalog queries from shadowing by explicitly
+    // selecting the system schema. This prevents an attacker from creating
+    // a public.pg_class view to inject forged baseline data.
+    client
+        .execute("SET LOCAL search_path = pg_catalog;", &[])
+        .context("Failed to secure search_path")?;
+
     let row = client
         .query_one(
-            "SELECT current_database(), current_user, session_user, current_setting('search_path'),
+            "SELECT current_database(), current_user, session_user,
                     (SELECT setting::bigint FROM pg_settings WHERE name = 'lock_timeout'),
                     (SELECT setting::bigint FROM pg_settings WHERE name = 'statement_timeout');",
             &[],
         )
         .context("Failed to load synchronization provenance and timeout settings")?;
-    let search_path_setting: String = row
-        .try_get(3)
-        .context("synchronization provenance search_path")?;
     let lock_timeout_ms = row
-        .try_get::<_, Option<i64>>(4)
+        .try_get::<_, Option<i64>>(3)
         .context("synchronization provenance lock_timeout field")?
         .context("PostgreSQL did not report lock_timeout")?;
     let statement_timeout_ms = row
-        .try_get::<_, Option<i64>>(5)
+        .try_get::<_, Option<i64>>(4)
         .context("synchronization provenance statement_timeout field")?
         .context("PostgreSQL did not report statement_timeout")?;
 

@@ -525,6 +525,7 @@ impl AstVisitor {
             name,
             if_not_exists: node.if_not_exists().is_some(),
             as_select: false,
+            as_select_with_data: false,
             persistence,
             on_commit,
             columns,
@@ -569,10 +570,17 @@ impl AstVisitor {
         if on_commit.is_some() && !matches!(persistence, PersistenceFact::Temporary) {
             return None;
         }
+        
+        let as_select_with_data = !matches!(
+            node.data_option(),
+            Some(ast::DataOption::WithNoData(_))
+        );
+
         Some(StatementFact::CreateTable {
             name: Self::path_to_qualified_name(&path)?,
             if_not_exists: node.if_not_exists().is_some(),
             as_select: true,
+            as_select_with_data,
             persistence,
             on_commit,
             columns: Vec::new(),
@@ -655,6 +663,7 @@ impl AstVisitor {
             name: Self::path_to_qualified_name(&name)?,
             if_not_exists: false,
             as_select: true,
+            as_select_with_data: true,
             persistence,
             on_commit: None,
             columns: Vec::new(),
