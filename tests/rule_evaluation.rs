@@ -1192,6 +1192,29 @@ mod rule_evaluation_tests {
     }
 
     #[test]
+    fn reindex_of_temporary_table_is_not_flagged() {
+        // PostgreSQL rejects REINDEX ... CONCURRENTLY on a temporary relation, so
+        // the synchronous form is the only legal statement. Demanding CONCURRENTLY
+        // here would be a false positive with no correct alternative.
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let violations = engine
+            .analyze(
+                "CREATE TEMP TABLE scratch (id int); REINDEX TABLE scratch;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(
+            !violations
+                .iter()
+                .any(|v| v.rule_id == "require-concurrent-reindex"
+                    && v.object_name == "public.scratch"),
+            "temporary table reindex must not be flagged: {violations:?}"
+        );
+    }
+
+    #[test]
     fn alter_index_variants_are_modeled_not_opaque() {
         let engine = setup_engine();
         let mut state = setup_state();

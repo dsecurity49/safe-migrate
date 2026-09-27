@@ -570,11 +570,9 @@ impl AstVisitor {
         if on_commit.is_some() && !matches!(persistence, PersistenceFact::Temporary) {
             return None;
         }
-        
-        let as_select_with_data = !matches!(
-            node.data_option(),
-            Some(ast::DataOption::WithNoData(_))
-        );
+
+        let as_select_with_data =
+            !matches!(node.data_option(), Some(ast::DataOption::WithNoData(_)));
 
         Some(StatementFact::CreateTable {
             name: Self::path_to_qualified_name(&path)?,

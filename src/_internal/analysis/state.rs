@@ -1692,15 +1692,17 @@ impl AnalysisState {
         object_name: &'a str,
     ) -> Option<&'a str> {
         let schemas = self.baseline_schemas.as_ref()?;
-        
+
         // Avoid falsely extracting "a" from "a.b" when a schema contains a dot.
         // If the object name is prefixed by a known scope, it is covered.
         for schema in schemas {
-            if object_name.starts_with(schema) && object_name.as_bytes().get(schema.len()) == Some(&b'.') {
+            if object_name.starts_with(schema)
+                && object_name.as_bytes().get(schema.len()) == Some(&b'.')
+            {
                 return None;
             }
         }
-        
+
         let (schema, _) = object_name.split_once('.')?;
         Some(schema)
     }

@@ -20,6 +20,21 @@ notes are available on the
   than collapsing to `char`.
 - Hardened `REINDEX` and `ALTER INDEX` resolution against the catalog states left
   behind by interrupted and crashed concurrent operations.
+- Inline suppressions (`-- safe-migrate: ignore(...)`) are now **disabled by
+  default**. When a suppression directive is seen and `allow_inline_suppressions`
+  is not set to `true` in `safe-migrate.toml`, the engine emits a Tier 1
+  `inline-suppression-disabled` finding instead of silently honouring the
+  directive. This makes suppression bypasses visible in pull request diffs.
+  Existing `safe-migrate.toml` files that relied on inline suppressions must add
+  `allow_inline_suppressions = true` to restore the previous behavior.
+- Fixed `REINDEX CONCURRENTLY` inside an explicit transaction block being
+  accepted without a `concurrent-in-transaction` finding.
+- Fixed `require-concurrent-reindex` emitting a false positive when the target
+  table is known from baseline to be temporary (temporary tables cannot use
+  `CONCURRENTLY`).
+- Fixed `timestamp(p) with time zone` and `time(p) with time zone` being
+  misclassified as `timestamp without time zone` / `time without time zone`
+  when a precision modifier preceded the timezone qualifier.
 
 ## v0.9.3 — 2026-09-23
 

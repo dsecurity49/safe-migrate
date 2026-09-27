@@ -1,4 +1,4 @@
-use crate::_internal::analysis::mutations::Mutation;
+use crate::_internal::analysis::mutations::{Mutation, ReindexTargetMutation};
 use crate::_internal::analysis::state::MutationResult;
 use crate::_internal::model::relation::Persistence;
 use crate::_internal::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
@@ -222,7 +222,7 @@ impl Rule for RequireConcurrentReindexRule {
     }
 
     fn recipe(&self) -> &'static str {
-        "Reindexing a table or index without `concurrently` blocks reads and writes. Use `CONCURRENTLY` to avoid downtime."
+        "Reindexing a table or index without `concurrently` holds a lock that blocks writes (and reads, for some targets) for the duration. Use `CONCURRENTLY` where PostgreSQL allows it."
     }
 
     fn required_capabilities(&self) -> &'static [RuleCapability] {
@@ -236,54 +236,83 @@ impl Rule for RequireConcurrentReindexRule {
             target,
             concurrently,
         } = context.mutation()
+            && !*concurrently
         {
-            // REINDEX SYSTEM does not support CONCURRENTLY, so we do not flag it here.
-            let is_system = matches!(
-                target,
-                Some(crate::_internal::analysis::mutations::ReindexTargetMutation::System(_))
-            );
-
-            if !is_system && !*concurrently {
-                // The object kind and the name are derived together so a finding
-                // cannot describe a table as an index.
-                let (object_kind, target_name) = match target {
-                    Some(
-                        crate::_internal::analysis::mutations::ReindexTargetMutation::Database(n),
-                    ) => (ObjectKind::Database, n.clone()),
-                    Some(crate::_internal::analysis::mutations::ReindexTargetMutation::Schema(
-                        n,
-                    )) => (ObjectKind::Schema, n.clone()),
-                    Some(crate::_internal::analysis::mutations::ReindexTargetMutation::Table(
-                        id,
-                    )) => (ObjectKind::Table, format!("{}.{}", id.schema, id.name)),
-                    Some(crate::_internal::analysis::mutations::ReindexTargetMutation::Index(
-                        id,
-                    )) => (ObjectKind::Index, format!("{}.{}", id.schema, id.name)),
-                    Some(crate::_internal::analysis::mutations::ReindexTargetMutation::System(
-                        Some(n),
-                    )) => (ObjectKind::Database, n.clone()),
-                    Some(crate::_internal::analysis::mutations::ReindexTargetMutation::System(
-                        None,
-                    )) => (ObjectKind::Database, "current database".to_string()),
-                    None => (ObjectKind::Unknown, "unknown".to_string()),
-                };
-
-                violations.push(Violation {
-                    source_range: None,
-                    rule_id: self.id(),
-                    operation_kind: OperationKind::Reindex,
-                    object_kind,
-                    object_name: target_name.clone(),
-                    tier: ViolationTier::Tier1,
-                    reason: format!("Synchronous REINDEX on {}", target_name),
-                    recipe: self.recipe(),
-                    dedup_key: Some(format!("{}_{}", self.id(), target_name)),
-                    sql: None,
-                    fk_dependency_related: false,
-                });
-            }
+            violations.extend(Self::evaluate_target(context, target.as_ref()));
         }
 
         violations
+    }
+}
+
+impl RequireConcurrentReindexRule {
+    /// Flag a non-concurrent REINDEX, unless PostgreSQL forbids the concurrent
+    /// form for this target.
+    ///
+    /// The exclusion cases are load-bearing, not cosmetic: `CONCURRENTLY` is
+    /// rejected for `REINDEX SYSTEM`, for temporary relations, and for indexes
+    /// backing exclusion constraints, so demanding it there would be a false
+    /// positive with no correct alternative.
+    fn evaluate_target(
+        context: &RuleContext<'_>,
+        target: Option<&ReindexTargetMutation>,
+    ) -> Vec<Violation> {
+        let Some(target) = target else {
+            return vec![Violation {
+                source_range: None,
+                rule_id: RequireConcurrentReindexRule.id(),
+                operation_kind: OperationKind::Reindex,
+                object_kind: ObjectKind::Unknown,
+                object_name: "unknown".to_string(),
+                tier: ViolationTier::Tier1,
+                reason: "Synchronous REINDEX with no resolvable target".to_string(),
+                recipe: RequireConcurrentReindexRule.recipe(),
+                dedup_key: None,
+                sql: None,
+                fk_dependency_related: false,
+            }];
+        };
+
+        // REINDEX SYSTEM does not accept CONCURRENTLY, so demanding it is a false positive.
+        if matches!(target, ReindexTargetMutation::System(_)) {
+            return vec![];
+        }
+
+        // A temporary relation cannot be reindexed concurrently; the synchronous
+        // form is the only legal statement, so there is nothing to report.
+        if let ReindexTargetMutation::Table(id) | ReindexTargetMutation::Index(id) = target
+            && let Some(rel) = context.pre_state().relations.get(id)
+            && rel.persistence == Persistence::Temporary
+        {
+            return vec![];
+        }
+
+        let object_kind = match target {
+            ReindexTargetMutation::Database(_) | ReindexTargetMutation::System(_) => {
+                ObjectKind::Database
+            }
+            ReindexTargetMutation::Schema(_) => ObjectKind::Schema,
+            ReindexTargetMutation::Table(_) => ObjectKind::Table,
+            ReindexTargetMutation::Index(_) => ObjectKind::Index,
+        };
+        let target_name = target.object_name();
+
+        vec![Violation {
+            source_range: None,
+            rule_id: RequireConcurrentReindexRule.id(),
+            operation_kind: OperationKind::Reindex,
+            object_kind,
+            object_name: target_name.clone(),
+            tier: ViolationTier::Tier1,
+            reason: format!("Synchronous REINDEX on {target_name}"),
+            recipe: RequireConcurrentReindexRule.recipe(),
+            dedup_key: Some(format!(
+                "{}_{}",
+                RequireConcurrentReindexRule.id(),
+                target_name
+            )),
+            sql: None,
+            fk_dependency_related: false,
+        }]
     }
 }

@@ -37,6 +37,18 @@ pub(crate) enum ReindexTargetMutation {
     Index(ObjectId),
 }
 
+impl ReindexTargetMutation {
+    /// Human-readable name of the reindex target, suitable for violation messages.
+    pub(crate) fn object_name(&self) -> String {
+        match self {
+            Self::Database(n) | Self::Schema(n) => n.clone(),
+            Self::System(Some(n)) => n.clone(),
+            Self::System(None) => "current database".to_string(),
+            Self::Table(id) | Self::Index(id) => format!("{}.{}", id.schema, id.name),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Mutation {
     CreateSchema(CreateSchemaMutation),

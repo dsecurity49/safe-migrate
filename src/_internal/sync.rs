@@ -1324,9 +1324,7 @@ fn load_provenance(
     let search_path_row = client
         .query_one("SHOW search_path;", &[])
         .context("Failed to load search_path setting")?;
-    let search_path_setting: String = search_path_row
-        .try_get(0)
-        .context("search_path field")?;
+    let search_path_setting: String = search_path_row.try_get(0).context("search_path field")?;
 
     // Protect all subsequent catalog queries from shadowing by explicitly
     // selecting the system schema. This prevents an attacker from creating

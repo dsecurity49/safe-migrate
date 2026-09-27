@@ -36,11 +36,12 @@ jobs:
       - name: Check formatting
         run: cargo fmt -- --check
       - name: Check shell syntax
-        # A syntax error in live_tests/run.sh would make the whole fixture suite
-        # silently skip, so the load-bearing shell is checked, not just scripts/.
+        # A syntax error in any load-bearing shell script would make the fixture
+        # suite silently skip. scripts/lib/ is a subdirectory not matched by
+        # scripts/*, so it is enumerated explicitly.
         run: |
           set -eu
-          for script in scripts/* live_tests/*.sh install.sh; do
+          for script in scripts/* scripts/lib/* live_tests/*.sh install.sh; do
             [ -f "$script" ] || continue
             bash -n "$script"
           done

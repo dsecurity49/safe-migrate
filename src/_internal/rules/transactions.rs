@@ -1,5 +1,7 @@
 use crate::_internal::analysis::facts::LockModeFact;
-use crate::_internal::analysis::mutations::{AlterTypeActionMutation, Mutation};
+use crate::_internal::analysis::mutations::{
+    AlterTypeActionMutation, Mutation, ReindexTargetMutation,
+};
 use crate::_internal::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
 use crate::_internal::rules::{Rule, RuleCapability, RuleContext, TRANSACTION_CAPABILITIES};
 
@@ -13,7 +15,7 @@ impl Rule for ConcurrentInsideTransactionRule {
         ViolationTier::Tier1
     }
     fn recipe(&self) -> &'static str {
-        "PostgreSQL does not allow concurrent index creation/drop or materialized-view refresh inside a transaction block (BEGIN/COMMIT)."
+        "PostgreSQL does not allow concurrent operations (CREATE INDEX CONCURRENTLY, DROP INDEX CONCURRENTLY, REFRESH MATERIALIZED VIEW CONCURRENTLY, REINDEX CONCURRENTLY) inside a transaction block (BEGIN/COMMIT)."
     }
 
     fn required_capabilities(&self) -> &'static [RuleCapability] {
@@ -73,6 +75,31 @@ impl Rule for ConcurrentInsideTransactionRule {
                         ),
                         recipe: self.recipe(),
                         dedup_key: Some(format!("{}_{}", self.id(), refresh.id)),
+                        sql: None,
+                        fk_dependency_related: false,
+                    });
+                }
+                Mutation::Reindex { target, concurrently: true }
+                    // REINDEX SYSTEM does not support CONCURRENTLY at all, so it
+                    // can never appear here as a valid concurrent form; skip it.
+                    if !matches!(target, Some(ReindexTargetMutation::System(_))) =>
+                {
+                    let target_name = target
+                        .as_ref()
+                        .map(ReindexTargetMutation::object_name)
+                        .unwrap_or_else(|| "unknown".to_string());
+                    violations.push(Violation {
+                        source_range: None,
+                        rule_id: self.id(),
+                        operation_kind: OperationKind::Reindex,
+                        object_kind: ObjectKind::Index,
+                        object_name: target_name.clone(),
+                        tier: self.default_tier(),
+                        reason: format!(
+                            "REINDEX CONCURRENTLY on {target_name} inside a transaction block"
+                        ),
+                        recipe: self.recipe(),
+                        dedup_key: Some(format!("{}_{}", self.id(), target_name)),
                         sql: None,
                         fk_dependency_related: false,
                     });

@@ -211,6 +211,26 @@ impl Config {
         self
     }
 
+    /// Return whether inline `-- safe-migrate: ignore(...)` directives in SQL
+    /// files are honoured.
+    ///
+    /// When `false` (the default), inline suppressions are rejected and produce
+    /// a Tier 1 `inline-suppression-disabled` finding. Suppressions must be
+    /// declared explicitly in `safe-migrate.toml` so that they appear in pull
+    /// request diffs and are subject to code review.
+    pub fn allow_inline_suppressions(&self) -> bool {
+        self.allow_inline_suppressions
+    }
+
+    /// Allow or disallow inline `-- safe-migrate: ignore(...)` directives.
+    ///
+    /// Set to `true` only when per-migration inline suppressions are part of
+    /// your review workflow. The recommended default is `false`.
+    pub fn with_allow_inline_suppressions(mut self, allow: bool) -> Self {
+        self.allow_inline_suppressions = allow;
+        self
+    }
+
     /// Add or replace a per-rule configuration override.
     pub fn with_rule(mut self, rule_id: impl Into<String>, rule: RuleConfig) -> Self {
         self.rules.insert(rule_id.into(), rule);
@@ -291,8 +311,10 @@ impl Config {
         if let Some(Some(disabled)) = self.rules.get(rule_id).map(|rule| rule.disabled) {
             return disabled;
         }
-        
-        self.disabled_rules.iter().any(|disabled| disabled == rule_id)
+
+        self.disabled_rules
+            .iter()
+            .any(|disabled| disabled == rule_id)
     }
 
     /// Return a rule's effective Tier 1 threshold.

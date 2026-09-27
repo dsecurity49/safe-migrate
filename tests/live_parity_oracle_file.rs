@@ -344,7 +344,9 @@ fn partition_bounds_parity_oracle_impl(force_live: bool) {
     // share these disposable fixtures.
     let live = crate::internal_tests::live_database_test_lock();
     if force_live {
-        let url = live.url().expect("DATABASE_URL must be set for live oracle run");
+        let url = live
+            .url()
+            .expect("DATABASE_URL must be set for live oracle run");
         let config: postgres::Config = url.parse().expect("database configuration");
         assert!(
             database_hosts_are_local(&config),

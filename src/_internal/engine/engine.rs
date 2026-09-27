@@ -144,7 +144,8 @@ impl SafeMigrateEngine {
                 .stmts()
                 .map(|statement| statement.syntax().text_range())
                 .collect();
-            let violations = self.analyze_parsed_file(filename, &normalized_sql, sql, &parsed, state)?;
+            let violations =
+                self.analyze_parsed_file(filename, &normalized_sql, sql, &parsed, state)?;
             findings.extend(
                 violations
                     .into_iter()
@@ -387,7 +388,8 @@ impl SafeMigrateEngine {
                 }
 
                 for rule in &self.rules {
-                    let is_inline_ignored = file_ignores.contains(rule.id()) || stmt_ignores.contains(rule.id());
+                    let is_inline_ignored =
+                        file_ignores.contains(rule.id()) || stmt_ignores.contains(rule.id());
 
                     if is_inline_ignored && !self.config.allow_inline_suppressions {
                         statement_violations.push(crate::_internal::report::violations::Violation {

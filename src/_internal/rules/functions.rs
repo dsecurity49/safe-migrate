@@ -27,7 +27,10 @@ impl Rule for FunctionVolatilityRule {
 
         let (target_id, new_opts, is_create) = match context.mutation() {
             Mutation::AlterFunction(alter) => {
-                if let crate::_internal::analysis::facts::AlterFunctionAction::OptionsChange(new_opts) = &alter.action {
+                if let crate::_internal::analysis::facts::AlterFunctionAction::OptionsChange(
+                    new_opts,
+                ) = &alter.action
+                {
                     (&alter.id, new_opts, false)
                 } else {
                     return violations;

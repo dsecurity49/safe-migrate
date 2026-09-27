@@ -168,6 +168,20 @@ Suppress a reviewed finding with its primary rule ID:
 CREATE INDEX users_email_idx ON users (email);
 ```
 
+Inline suppressions are **disabled by default**. To enable them, add to
+`safe-migrate.toml`:
+
+```toml
+allow_inline_suppressions = true
+```
+
+Without this setting, an inline directive produces a Tier 1
+`inline-suppression-disabled` finding instead of suppressing the rule.
+This is intentional: keeping suppressions in the TOML file makes them
+visible in pull request diffs and subject to review. Use per-rule
+`[rules.require-concurrent-index] disabled = true` in `safe-migrate.toml`
+as the standard suppression path.
+
 Keep suppressions narrow and explain the reason in the migration review.
 
 ## Migration timeouts

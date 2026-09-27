@@ -44,7 +44,10 @@ impl Rule for CascadingDropRule {
                     object_kind: ObjectKind::Type,
                     object_name: id.to_string(),
                     tier: self.default_tier(),
-                    reason: format!("DROP TYPE {} CASCADE destroys all columns using this type", id),
+                    reason: format!(
+                        "DROP TYPE {} CASCADE destroys all columns using this type",
+                        id
+                    ),
                     recipe: self.recipe(),
                     dedup_key: None,
                     sql: None,
@@ -165,16 +168,19 @@ impl Rule for SizeAwareAddColumnRule {
             } = &alter.action
         {
             let is_volatile = default.as_ref().is_some_and(|def| def.is_volatile());
-            let is_stored_generated = matches!(generation, crate::_internal::analysis::facts::ColumnGeneration::GeneratedStored);
+            let is_stored_generated = matches!(
+                generation,
+                crate::_internal::analysis::facts::ColumnGeneration::GeneratedStored
+            );
             let is_identity = matches!(
                 generation,
-                crate::_internal::analysis::facts::ColumnGeneration::IdentityAlways 
-                | crate::_internal::analysis::facts::ColumnGeneration::IdentityByDefault
+                crate::_internal::analysis::facts::ColumnGeneration::IdentityAlways
+                    | crate::_internal::analysis::facts::ColumnGeneration::IdentityByDefault
             );
 
-            let requires_rewrite = is_volatile 
-                || is_stored_generated 
-                || is_identity 
+            let requires_rewrite = is_volatile
+                || is_stored_generated
+                || is_identity
                 || (default.is_some() && pg_version < 110000);
 
             if requires_rewrite {
@@ -358,7 +364,7 @@ impl Rule for CreateTableAsSelectRule {
             return vec![];
         }
         if let Mutation::CreateTable(c) = mutation
-            && c.as_select 
+            && c.as_select
             && c.as_select_with_data
         {
             return vec![Violation {
@@ -783,9 +789,10 @@ impl Rule for TypeChangeRewriteRule {
                     let old_ty = col_info.and_then(|col| col.data_type.as_ref());
 
                     // A USING expression always forces a full table rewrite.
-                    let safe = !has_using && old_ty
-                        .map(|o| Self::is_type_change_safe(o, ty, pg_version))
-                        .unwrap_or(false);
+                    let safe = !has_using
+                        && old_ty
+                            .map(|o| Self::is_type_change_safe(o, ty, pg_version))
+                            .unwrap_or(false);
                     (
                         safe,
                         rel.estimated_rows.unwrap_or(config.default_rows),

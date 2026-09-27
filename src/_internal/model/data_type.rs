@@ -81,6 +81,27 @@ impl DataTypeFamily {
         }
     }
 
+    /// Split the canonical spelling into (base, timezone_suffix) so that a
+    /// precision modifier can be inserted between them when rendering.
+    ///
+    /// For example, `TimestampTz` returns `("timestamp", " with time zone")`,
+    /// which lets the Display impl emit `"timestamp(6) with time zone"` rather
+    /// than `"timestamp with time zone(6)"`.
+    ///
+    /// All other families return `(canonical, "")`.
+    pub(crate) fn canonical_base_and_tz_suffix(
+        self,
+        original_fallback: &str,
+    ) -> (String, &'static str) {
+        match self {
+            Self::Time => ("time".to_string(), " without time zone"),
+            Self::TimeTz => ("time".to_string(), " with time zone"),
+            Self::Timestamp => ("timestamp".to_string(), " without time zone"),
+            Self::TimestampTz => ("timestamp".to_string(), " with time zone"),
+            _ => (self.to_canonical_string(original_fallback), ""),
+        }
+    }
+
     // Fixed storage size in bits for integer families; None for everything else.
     pub(crate) fn size_bits(self) -> Option<i32> {
         match self {
@@ -223,20 +244,42 @@ impl ParsedDataType {
         }
 
         // rfind so nested parens in unusual type expressions don't truncate the typmod.
+        //
+        // PostgreSQL permits a precision modifier *inside* a type qualifier phrase:
+        //   timestamp(6) with time zone
+        //   time(3) without time zone
+        // The qualifier " with time zone" / " without time zone" follows the closing
+        // parenthesis, so it must be re-joined with the pre-paren base name before
+        // the family lookup, otherwise the timezone half is silently discarded and
+        // `timestamp(6) with time zone` resolves to `timestamp without time zone`.
         let mut typmods = None;
+        let original_base;
         if let Some(open) = text.find('(')
             && let Some(close) = text.rfind(')')
             && close > open
         {
             typmods = Some(text[open + 1..close].trim().to_string());
-            text = text[..open].trim().to_string();
+            let pre = text[..open].trim();
+            let post = text[close + 1..].trim();
+            original_base = pre.to_string();
+            // Build a compound name only when there is a post-close qualifier.
+            // This keeps the lookup path for plain `timestamp(6)` identical to
+            // before: `from_base_name("timestamp")`.
+            let lookup = if post.is_empty() {
+                pre.to_string()
+            } else {
+                format!("{pre} {post}")
+            };
+            text = lookup;
+        } else {
+            original_base = text.clone();
         }
 
         let family = DataTypeFamily::from_base_name(&text);
         let typmod = Self::classify_typmod(family, typmods.as_deref());
         Self {
             family,
-            original_base: text,
+            original_base,
             raw_typmods: typmods,
             array_dimensions,
             typmod,
@@ -371,10 +414,14 @@ impl ParsedDataType {
     // Renders as pg_catalog.format_type(oid, NULL) for function-signature identity keys.
     // Unlike Display, does NOT add the implicit (1) for bare character/char.
     pub(crate) fn to_function_signature_string(&self) -> String {
-        let mut out = self.family.to_canonical_string(&self.original_base);
+        let (base, tz_suffix) = self
+            .family
+            .canonical_base_and_tz_suffix(&self.original_base);
+        let mut out = base;
         if let Some(mods) = self.raw_typmods() {
             out.push_str(&format!("({})", mods));
         }
+        out.push_str(tz_suffix);
         for _ in 0..self.array_dimensions {
             out.push_str("[]");
         }
@@ -423,11 +470,14 @@ impl ParsedDataType {
 
 impl fmt::Display for ParsedDataType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut out = if self.family == DataTypeFamily::BpChar && !self.has_typmod() {
-            "bpchar".to_string()
+        let (base, tz_suffix) = if self.family == DataTypeFamily::BpChar && !self.has_typmod() {
+            ("bpchar".to_string(), "")
         } else {
-            self.family.to_canonical_string(&self.original_base)
+            self.family
+                .canonical_base_and_tz_suffix(&self.original_base)
         };
+
+        let mut out = base;
 
         // Bare char/character in DDL means character(1) per the SQL standard.
         if !self.has_typmod() && self.family == DataTypeFamily::Character {
@@ -435,6 +485,11 @@ impl fmt::Display for ParsedDataType {
         } else if let Some(mods) = self.raw_typmods() {
             out.push_str(&format!("({})", mods));
         }
+
+        // Re-attach the timezone suffix after any precision modifier so that
+        // `timestamp(6) with time zone` renders correctly rather than as
+        // `timestamp with time zone(6)`.
+        out.push_str(tz_suffix);
 
         for _ in 0..self.array_dimensions {
             out.push_str("[]");
@@ -470,6 +525,17 @@ mod tests {
             ("int[]", "integer[]"),
             ("varchar(50)[][]", "character varying(50)[][]"),
             ("unknown_type", "unknown_type"),
+            // Precision modifier combined with timezone qualifier (F7 regression).
+            // The qualifier trails the closing paren and must not be discarded.
+            // PostgreSQL renders the precision before the timezone qualifier.
+            ("timestamp(6) with time zone", "timestamp(6) with time zone"),
+            ("timestamp(0) with time zone", "timestamp(0) with time zone"),
+            (
+                "timestamp(3) without time zone",
+                "timestamp(3) without time zone",
+            ),
+            ("time(3) with time zone", "time(3) with time zone"),
+            ("time(0) without time zone", "time(0) without time zone"),
         ];
         for (input, expected) in cases {
             let parsed = ParsedDataType::parse(input);
