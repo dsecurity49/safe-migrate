@@ -285,17 +285,12 @@ impl Config {
 
     /// Return whether a rule is disabled by either configuration form.
     pub fn is_rule_disabled(&self, rule_id: &str) -> bool {
-        if self
-            .disabled_rules
-            .iter()
-            .any(|disabled| disabled == rule_id)
-        {
-            return true;
+        // Explicit granular configuration overrides the legacy list.
+        if let Some(Some(disabled)) = self.rules.get(rule_id).map(|rule| rule.disabled) {
+            return disabled;
         }
-        self.rules
-            .get(rule_id)
-            .and_then(|rule| rule.disabled)
-            .unwrap_or(false)
+        
+        self.disabled_rules.iter().any(|disabled| disabled == rule_id)
     }
 
     /// Return a rule's effective Tier 1 threshold.

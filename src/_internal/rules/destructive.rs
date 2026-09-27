@@ -139,11 +139,23 @@ impl Rule for SizeAwareAddColumnRule {
 
         if let Mutation::AlterTable(alter) = mutation
             && let AlterTableActionMutation::AddColumn {
-                default: Some(def), ..
+                default,
+                generation,
+                ..
             } = &alter.action
         {
-            let is_volatile = def.is_volatile();
-            let requires_rewrite = is_volatile || pg_version < 110000;
+            let is_volatile = default.as_ref().is_some_and(|def| def.is_volatile());
+            let is_stored_generated = matches!(generation, crate::_internal::analysis::facts::ColumnGeneration::GeneratedStored);
+            let is_identity = matches!(
+                generation,
+                crate::_internal::analysis::facts::ColumnGeneration::IdentityAlways 
+                | crate::_internal::analysis::facts::ColumnGeneration::IdentityByDefault
+            );
+
+            let requires_rewrite = is_volatile 
+                || is_stored_generated 
+                || is_identity 
+                || (default.is_some() && pg_version < 110000);
 
             if requires_rewrite {
                 let (has_wide_columns, is_stale, rows) = match pre_state.relations.get(&alter.id) {
@@ -739,7 +751,7 @@ impl Rule for TypeChangeRewriteRule {
             && let AlterTableActionMutation::SetType {
                 column,
                 ty,
-                has_using: _,
+                has_using,
             } = &alter.action
         {
             let pg_version = state.effective_pg_version_num(config.assume_pg_version);
@@ -749,7 +761,8 @@ impl Rule for TypeChangeRewriteRule {
                     let col_info = rel.columns.iter().find(|c| c.name == *column);
                     let old_ty = col_info.and_then(|col| col.data_type.as_ref());
 
-                    let safe = old_ty
+                    // A USING expression always forces a full table rewrite.
+                    let safe = !has_using && old_ty
                         .map(|o| Self::is_type_change_safe(o, ty, pg_version))
                         .unwrap_or(false);
                     (

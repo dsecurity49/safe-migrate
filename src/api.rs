@@ -1780,6 +1780,7 @@ impl From<&InternalOperationKind> for OperationKind {
             InternalOperationKind::CreateIndex => Self::CreateIndex,
             InternalOperationKind::CreateTable => Self::CreateTable,
             InternalOperationKind::CreateView => Self::CreateView,
+            InternalOperationKind::CreateFunction => Self::CreateFunction,
             InternalOperationKind::AlterFunction => Self::AlterFunction,
             InternalOperationKind::AlterProcedure => Self::AlterProcedure,
             InternalOperationKind::RefreshMaterializedView => Self::RefreshMaterializedView,

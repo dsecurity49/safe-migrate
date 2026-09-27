@@ -48,7 +48,17 @@ const REBUILD_ORACLE_ENV: &str = "SAFE_MIGRATE_REBUILD_PARTITION_BOUNDS_ORACLE";
 /// simulator must not crash and must not synthesize a concrete bound predicate
 /// for the `DEFAULT` child.
 #[test]
-fn partition_bounds_parity_oracle() {
+fn partition_bounds_parity_oracle_offline() {
+    partition_bounds_parity_oracle_impl(false);
+}
+
+#[test]
+#[ignore = "requires a live local PostgreSQL database via DATABASE_URL"]
+fn partition_bounds_parity_oracle_live() {
+    partition_bounds_parity_oracle_impl(true);
+}
+
+fn partition_bounds_parity_oracle_impl(force_live: bool) {
     // ── verified cases ──────────────────────────────────────────────────────
     // (columns_ddl, keys, strategy, bound)
     // Every entry here must have a golden-cache counterpart after live regen.
@@ -333,7 +343,8 @@ fn partition_bounds_parity_oracle() {
     // temporarily replace or remove DATABASE_URL, and other live tests that
     // share these disposable fixtures.
     let live = crate::internal_tests::live_database_test_lock();
-    if let Some(url) = live.url() {
+    if force_live {
+        let url = live.url().expect("DATABASE_URL must be set for live oracle run");
         let config: postgres::Config = url.parse().expect("database configuration");
         assert!(
             database_hosts_are_local(&config),

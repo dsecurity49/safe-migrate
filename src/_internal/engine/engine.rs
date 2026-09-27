@@ -144,7 +144,7 @@ impl SafeMigrateEngine {
                 .stmts()
                 .map(|statement| statement.syntax().text_range())
                 .collect();
-            let violations = self.analyze_parsed_file(filename, &normalized_sql, &parsed, state)?;
+            let violations = self.analyze_parsed_file(filename, &normalized_sql, sql, &parsed, state)?;
             findings.extend(
                 violations
                     .into_iter()
@@ -243,13 +243,14 @@ impl SafeMigrateEngine {
         state: &mut AnalysisState,
     ) -> Result<Vec<Violation>, Vec<String>> {
         let parsed = SourceFile::parse(sql);
-        self.analyze_parsed_file(filename, sql, &parsed, state)
+        self.analyze_parsed_file(filename, sql, sql, &parsed, state)
     }
 
     fn analyze_parsed_file(
         &self,
         filename: &str,
         sql: &str,
+        original_sql: &str,
         parsed: &Parse<SourceFile>,
         state: &mut AnalysisState,
     ) -> Result<Vec<Violation>, Vec<String>> {
@@ -306,7 +307,16 @@ impl SafeMigrateEngine {
             }
 
             // Capture raw statement text for sql field on violations (strip leading comments)
-            let stmt_text = Self::strip_sql_leading_comments(&stmt.syntax().text().to_string());
+            // Use original_sql to preserve EXECUTE '...' instead of normalized DO block
+            let raw_start = usize::from(stmt.syntax().text_range().start());
+            let raw_end = usize::from(stmt.syntax().text_range().end());
+            let raw_stmt = if raw_start < original_sql.len() && raw_end <= original_sql.len() {
+                &original_sql[raw_start..raw_end]
+            } else {
+                // Fallback (should not occur since lengths are preserved byte-for-byte)
+                sql.get(raw_start..raw_end).unwrap_or("")
+            };
+            let stmt_text = Self::strip_sql_leading_comments(raw_stmt);
 
             // PostgreSQL executes a statement atomically. Keep both state
             // and diagnostics local until all resolved actions succeed so an
@@ -443,8 +453,8 @@ impl SafeMigrateEngine {
                             if let Some(range) = v.source_range {
                                 let start = usize::from(range.start());
                                 let end = usize::from(range.end());
-                                if start < sql.len() && end <= sql.len() {
-                                    v.sql = Some(sql[start..end].trim().to_string());
+                                if start < original_sql.len() && end <= original_sql.len() {
+                                    v.sql = Some(original_sql[start..end].trim().to_string());
                                 } else {
                                     v.sql = Some(stmt_text.trim().to_string());
                                 }

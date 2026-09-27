@@ -25,10 +25,21 @@ impl Rule for FunctionVolatilityRule {
     fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
         let mut violations = Vec::new();
 
-        if let Mutation::AlterFunction(alter) = context.mutation()
-            && let Some(old_func) = context.pre_state().functions.get(&alter.id)
-            && let crate::_internal::analysis::facts::AlterFunctionAction::OptionsChange(new_opts) =
-                &alter.action
+        let (target_id, new_opts, is_create) = match context.mutation() {
+            Mutation::AlterFunction(alter) => {
+                if let crate::_internal::analysis::facts::AlterFunctionAction::OptionsChange(new_opts) = &alter.action {
+                    (&alter.id, new_opts, false)
+                } else {
+                    return violations;
+                }
+            }
+            Mutation::CreateFunction(create) if create.or_replace => {
+                (&create.id, &create.options, true)
+            }
+            _ => return violations,
+        };
+
+        if let Some(old_func) = context.pre_state().functions.get(target_id)
             && let Some(nv) = new_opts.iter().find_map(|opt| {
                 if let crate::_internal::analysis::facts::FuncOptionFact::Volatility(v) = opt {
                     match v {
@@ -52,13 +63,17 @@ impl Rule for FunctionVolatilityRule {
                 violations.push(Violation {
                     source_range: None,
                     rule_id: self.id(),
-                    operation_kind: OperationKind::AlterFunction,
+                    operation_kind: if is_create {
+                        OperationKind::CreateFunction
+                    } else {
+                        OperationKind::AlterFunction
+                    },
                     object_kind: ObjectKind::Function,
-                    object_name: alter.id.to_string(),
+                    object_name: target_id.to_string(),
                     tier: self.default_tier(),
                     reason: format!(
                         "Function {} volatility changed from {:?} to {:?}",
-                        alter.id, ov, nv
+                        target_id, ov, nv
                     ),
                     recipe: self.recipe(),
                     dedup_key: None,
