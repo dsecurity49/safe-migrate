@@ -497,22 +497,38 @@ mod exhaustive_fuzz_tests {
     // Confidence and tier changes.
 
     #[test]
-    fn fuzz_tier_001_do_block_downgrades_tier1() {
+    fn fuzz_tier_001_do_block_taints_certainty_not_severity() {
+        use safe_migrate::_internal::analysis::state::Confidence;
+        use safe_migrate::_internal::report::violations::ViolationTier;
+
         let engine = setup_engine();
         let cache = cache_with_table("public", "users", Some(100));
         let mut state = AnalysisState::new(cache);
 
-        let v = engine
-            .analyze("DO $$ BEGIN NULL; END $$; DROP TABLE users;", &mut state)
+        let findings = engine
+            .analyze_chain_with_locations(
+                &[(
+                    "001.sql".to_string(),
+                    "DO $$ BEGIN NULL; END $$; DROP TABLE users;".to_string(),
+                )],
+                &mut state,
+            )
             .unwrap();
-        for violation in &v {
-            if violation.tier == safe_migrate::_internal::report::violations::ViolationTier::Tier1 {
-                panic!(
-                    "Expected no Tier1 after DO block taint, got: {} ({})",
-                    violation.rule_id, violation.reason
-                );
-            }
-        }
+
+        let drops: Vec<_> = findings
+            .iter()
+            .filter(|f| f.violation.object_name.contains("users"))
+            .collect();
+        assert!(
+            drops
+                .iter()
+                .any(|f| f.violation.tier == ViolationTier::Tier1),
+            "DROP TABLE keeps Tier1 regardless of earlier unmodeled state: {drops:?}"
+        );
+        assert!(
+            drops.iter().all(|f| f.certainty == Confidence::Tainted),
+            "state after a DO block is unknowable, so certainty must drop: {drops:?}"
+        );
     }
 
     #[test]
@@ -552,7 +568,10 @@ mod exhaustive_fuzz_tests {
     }
 
     #[test]
-    fn fuzz_tier_004_multiple_taints_stay_downgraded() {
+    fn fuzz_tier_004_multiple_taints_stay_uncertain() {
+        use safe_migrate::_internal::analysis::state::Confidence;
+        use safe_migrate::_internal::report::violations::ViolationTier;
+
         let engine = setup_engine();
         let cache = cache_with_table("public", "users", Some(100));
         let mut state = AnalysisState::new(cache);
@@ -563,12 +582,23 @@ mod exhaustive_fuzz_tests {
         engine
             .analyze("DO $$ BEGIN NULL; END $$;", &mut state)
             .unwrap();
-        let v = engine.analyze("DROP TABLE users;", &mut state).unwrap();
-        assert!(
-            !v.iter().any(
-                |v| v.tier == safe_migrate::_internal::report::violations::ViolationTier::Tier1
+        let findings = engine
+            .analyze_chain_with_locations(
+                &[("001.sql".to_string(), "DROP TABLE users;".to_string())],
+                &mut state,
             )
+            .unwrap();
+
+        let drops: Vec<_> = findings
+            .iter()
+            .filter(|f| f.violation.object_name.contains("users"))
+            .collect();
+        assert!(
+            drops
+                .iter()
+                .any(|f| f.violation.tier == ViolationTier::Tier1)
         );
+        assert!(drops.iter().all(|f| f.certainty == Confidence::Tainted));
     }
 
     // Cascades and dependencies.

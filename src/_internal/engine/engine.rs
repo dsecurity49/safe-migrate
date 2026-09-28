@@ -135,6 +135,7 @@ impl SafeMigrateEngine {
         state: &mut AnalysisState,
     ) -> Result<Vec<ReportFinding>, Vec<String>> {
         let mut findings = Vec::new();
+        let file_order: Vec<String> = files.iter().map(|(name, _)| name.clone()).collect();
 
         for (file_index, (filename, sql)) in files.iter().enumerate() {
             let normalized_sql = Self::normalize_execute(sql);
@@ -149,19 +150,30 @@ impl SafeMigrateEngine {
             findings.extend(
                 violations
                     .into_iter()
-                    .map(|violation| ReportFinding {
-                        location: Self::source_location(
-                            filename,
-                            &normalized_sql,
-                            violation.source_range,
-                        ),
-                        statement_index: violation.source_range.and_then(|range| {
+                    .map(|violation| {
+                        let statement_index = violation.source_range.and_then(|range| {
                             statement_ranges
                                 .iter()
                                 .position(|statement| statement.contains_range(range))
                                 .map(|index| index + 1)
-                        }),
-                        violation,
+                        });
+                        let certainty =
+                            crate::_internal::report::violations::certainty_for_statement(
+                                state.evidence(),
+                                &file_order,
+                                file_index,
+                                statement_index,
+                            );
+                        ReportFinding {
+                            location: Self::source_location(
+                                filename,
+                                &normalized_sql,
+                                violation.source_range,
+                            ),
+                            statement_index,
+                            certainty,
+                            violation,
+                        }
                     })
                     .map(|finding| (file_index, finding)),
             );
@@ -325,7 +337,6 @@ impl SafeMigrateEngine {
             // state, findings, or deduplication keys. A parsed statement
             // without a typed extractor is explicitly opaque: silently
             // ignoring it would claim exact confidence for later SQL.
-            let statement_confidence = state.confidence().clone();
             let mut statement_violations = Vec::new();
             let mut statement_warned_keys = HashSet::new();
             let mut mutations = match AstVisitor::extract(&stmt) {
@@ -482,14 +493,8 @@ impl SafeMigrateEngine {
                                 v.sql = Some(stmt_text.trim().to_string());
                             }
                         }
-                        // A taint produced by this statement must not
-                        // downgrade that same statement's findings.
-                        if statement_confidence
-                            == crate::_internal::analysis::state::Confidence::Tainted
-                            && v.tier == crate::_internal::report::violations::ViolationTier::Tier1
-                        {
-                            v.tier = crate::_internal::report::violations::ViolationTier::Tier2;
-                        }
+                        // Severity belongs to the rule alone; certainty is
+                        // derived per finding from the evidence log.
                         statement_violations.push(v);
                     }
                 }

@@ -32,7 +32,7 @@ mod apply_transaction;
 mod apply_type;
 mod apply_view_index;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub(crate) enum Confidence {
     Exact,
     Tainted,

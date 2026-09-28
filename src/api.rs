@@ -600,7 +600,7 @@ pub struct Finding {
     pub object_kind: ObjectKind,
     /// Qualified object name when known.
     pub object_name: String,
-    /// Effective finding severity.
+    /// A property of the operation alone; see [`Finding::certainty`].
     pub tier: Tier,
     /// Explanation of the detected risk.
     pub reason: String,
@@ -628,6 +628,9 @@ pub struct Finding {
     /// One-based statement position within the source file.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub statement_index: Option<usize>,
+    /// How well-supported this finding is by the evidence behind it. Reduced
+    /// certainty never reduces severity.
+    pub certainty: Confidence,
 }
 
 /// One named SQL migration in its intended analysis order.
@@ -1712,6 +1715,7 @@ impl From<&InternalFinding> for Finding {
                 column: location.column,
             }),
             statement_index: finding.statement_index,
+            certainty: finding.certainty.clone().into(),
         }
     }
 }

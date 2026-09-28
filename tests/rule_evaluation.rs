@@ -336,7 +336,7 @@ mod rule_evaluation_tests {
     }
 
     #[test]
-    fn test_tainted_confidence_downgrades_tier1_to_tier2() {
+    fn test_earlier_taint_lowers_certainty_but_not_severity() {
         let engine = setup_engine();
         let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
         let tid = object_id("public", "t");
@@ -367,17 +367,19 @@ mod rule_evaluation_tests {
             .filter(|v| v.rule_id == "destructive-cascade" || v.rule_id == "irreversible-migration")
             .collect();
 
+        // An unmodeled statement makes later state unknowable, not the
+        // operation less destructive.
         assert!(
-            db_violations.iter().all(|v| v.tier == ViolationTier::Tier2),
-            "DROP DATABASE after taint should be Tier2: {:?}",
+            db_violations.iter().all(|v| v.tier == ViolationTier::Tier1),
+            "DROP DATABASE severity must survive earlier taint: {:?}",
             db_violations
         );
 
         assert!(
             drop_table_violations
                 .iter()
-                .all(|v| v.tier == ViolationTier::Tier2),
-            "DROP TABLE CASCADE after taint should be Tier2: {:?}",
+                .all(|v| v.tier == ViolationTier::Tier1),
+            "DROP TABLE CASCADE severity must survive earlier taint: {:?}",
             drop_table_violations
         );
     }
@@ -433,7 +435,9 @@ mod rule_evaluation_tests {
     }
 
     #[test]
-    fn test_confidence_taint_does_not_affect_prior_violations() {
+    fn test_earlier_taint_lowers_certainty_of_later_findings_only() {
+        use safe_migrate::_internal::analysis::state::Confidence;
+
         let engine = setup_engine();
         let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
         let tid = object_id("public", "t");
@@ -451,33 +455,49 @@ mod rule_evaluation_tests {
         );
         let mut state = AnalysisState::new(cache);
 
-        let v = engine
-            .analyze(
-                "DROP DATABASE mydb; DO $$ BEGIN END $$; DROP TABLE t CASCADE;",
+        let findings = engine
+            .analyze_chain_with_locations(
+                &[(
+                    "001.sql".to_string(),
+                    "DROP DATABASE mydb; DO $$ BEGIN END $$; DROP TABLE t CASCADE;".to_string(),
+                )],
                 &mut state,
             )
             .unwrap();
 
-        let db_violations: Vec<_> = v.iter().filter(|v| v.rule_id == "drop-database").collect();
-        let drop_table_violations: Vec<_> = v
+        let db: Vec<_> = findings
             .iter()
-            .filter(|v| v.rule_id == "destructive-cascade" || v.rule_id == "irreversible-migration")
+            .filter(|f| f.violation.rule_id == "drop-database")
+            .collect();
+        let drop: Vec<_> = findings
+            .iter()
+            .filter(|f| {
+                matches!(
+                    f.violation.rule_id,
+                    "destructive-cascade" | "irreversible-migration"
+                )
+            })
             .collect();
 
-        // DROP DATABASE should remain Tier1 (it appeared before the taint)
+        // Severity ignores position in the file; certainty does not.
         assert!(
-            db_violations.iter().any(|v| v.tier == ViolationTier::Tier1),
-            "DROP DATABASE should stay Tier1 (violation before taint): {:?}",
-            db_violations
+            db.iter().all(|f| f.violation.tier == ViolationTier::Tier1),
+            "DROP DATABASE is destructive regardless of what follows: {db:?}"
+        );
+        assert!(
+            drop.iter()
+                .all(|f| f.violation.tier == ViolationTier::Tier1),
+            "DROP TABLE CASCADE is destructive regardless of what precedes: {drop:?}"
         );
 
-        // DROP TABLE CASCADE should be Tier2 (confidence was tainted when evaluated)
+        // The DO block can only invalidate state observed after it.
         assert!(
-            drop_table_violations
-                .iter()
-                .any(|v| v.tier == ViolationTier::Tier2),
-            "DROP TABLE CASCADE should be Tier2 (violation after taint): {:?}",
-            drop_table_violations
+            db.iter().all(|f| f.certainty == Confidence::Exact),
+            "a finding produced before the unmodeled statement is still exact: {db:?}"
+        );
+        assert!(
+            drop.iter().all(|f| f.certainty == Confidence::Tainted),
+            "a finding produced after the unmodeled statement is uncertain: {drop:?}"
         );
     }
 
@@ -1179,7 +1199,7 @@ mod rule_evaluation_tests {
             .iter()
             .find(|v| v.rule_id == "require-concurrent-reindex" && v.object_name == "mydb")
             .expect("should flag synchronous database reindex");
-        assert_eq!(reindex_database.tier, ViolationTier::Tier2);
+        assert_eq!(reindex_database.tier, ViolationTier::Tier1);
 
         assert_eq!(
             violations

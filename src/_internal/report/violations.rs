@@ -1,3 +1,6 @@
+use crate::_internal::analysis::evidence::{EvidenceRecord, EvidenceScope};
+use crate::_internal::analysis::state::Confidence;
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub(crate) enum OperationKind {
     DropColumn,
@@ -190,4 +193,48 @@ pub(crate) struct ReportFinding {
     /// One-based statement position within the source file.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub statement_index: Option<usize>,
+    /// Certainty is independent of `violation.tier`: severity describes the
+    /// operation, certainty describes the evidence behind it.
+    pub certainty: Confidence,
+}
+
+/// Certainty of a finding produced at `statement_index` of `file_index`.
+///
+/// Chain evidence taints later statements, never earlier ones nor its own.
+/// Statement evidence taints only its own statement. Anything unplaceable on
+/// either side taints conservatively.
+pub(crate) fn certainty_for_statement(
+    evidence: &[EvidenceRecord],
+    file_order: &[String],
+    file_index: usize,
+    statement_index: Option<usize>,
+) -> Confidence {
+    let here = statement_index.map(|index| (file_index, index));
+    let mut unattributed_statement_evidence = false;
+
+    for record in evidence {
+        let at = record_position(record, file_order);
+        match record.scope {
+            EvidenceScope::Chain => match (at, here) {
+                (Some(at), Some(here)) if at >= here => {}
+                _ => return Confidence::Tainted,
+            },
+            EvidenceScope::Statement => match (at, here) {
+                (Some(at), Some(here)) if at == here => return Confidence::Tainted,
+                (Some(_), Some(_)) => {}
+                _ => unattributed_statement_evidence = true,
+            },
+        }
+    }
+
+    if unattributed_statement_evidence {
+        return Confidence::Tainted;
+    }
+    Confidence::Exact
+}
+
+fn record_position(record: &EvidenceRecord, file_order: &[String]) -> Option<(usize, usize)> {
+    let location = record.location.as_ref()?;
+    let file_index = file_order.iter().position(|name| name == &location.file)?;
+    Some((file_index, location.statement_index))
 }
