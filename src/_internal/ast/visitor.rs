@@ -15,7 +15,7 @@ use squawk_syntax::ast::{
     DetachPartition, DropDomain, DropIndex, DropMaterializedView, DropPolicy, DropSequence,
     DropTable, DropTrigger, DropType, DropView, Grant, Lock, NameRef, PartitionBy, PartitionType,
     Path, PathSegment, PathSegmentRef, RelationNameRef, ReleaseSavepoint, Revoke, RevokeCommand,
-    Rollback, SelectInto, Set, Stmt, TableArg, TableConstraint, Truncate,
+    Rollback, SchemaRef, SelectInto, Set, SetSchema, Stmt, TableArg, TableConstraint, Truncate,
 };
 use squawk_syntax::{SyntaxKind, ast};
 
@@ -1070,24 +1070,29 @@ impl AstVisitor {
                     };
                     actions.push(AlterTableActionFact::EnableTrigger { trigger_name });
                 }
-                AlterTableAction::SetSchema(ss) => {
-                    if let Some(nr) = ss.schema_ref().and_then(|sr| sr.ident_token()) {
-                        actions.push(AlterTableActionFact::SetSchema {
-                            new_schema: Self::resolve_identifier_token(nr.text()),
+                AlterTableAction::SetSchema(ss) => match ss.schema_ref() {
+                    Some(schema_ref) => actions.push(AlterTableActionFact::SetSchema {
+                        new_schema: Self::resolve_schema_ref(&schema_ref),
+                    }),
+                    None => unsupported_action = true,
+                },
+                AlterTableAction::SetTablespace(st) => {
+                    match st.tablespace_ref().and_then(|tr| tr.ident_token()) {
+                        Some(token) => {
+                            let tablespace = Self::resolve_identifier_token(token.text());
+                            actions.push(AlterTableActionFact::SetTablespace { tablespace });
+                        }
+                        None => unsupported_action = true,
+                    }
+                }
+                AlterTableAction::OwnerTo(ot) => match ot.role_ref() {
+                    Some(role) => {
+                        actions.push(AlterTableActionFact::OwnerTo {
+                            new_owner: Self::extract_role(&role),
                         });
                     }
-                }
-                AlterTableAction::SetTablespace(st) => {
-                    if let Some(token) = st.tablespace_ref().and_then(|tr| tr.ident_token()) {
-                        let tablespace = Self::resolve_identifier_token(token.text());
-                        actions.push(AlterTableActionFact::SetTablespace { tablespace });
-                    }
-                }
-                AlterTableAction::OwnerTo(ot) => {
-                    if let Some(new_owner) = ot.role_ref().map(|role| Self::extract_role(&role)) {
-                        actions.push(AlterTableActionFact::OwnerTo { new_owner });
-                    }
-                }
+                    None => unsupported_action = true,
+                },
                 AlterTableAction::SetLogged(_) => {
                     actions.push(AlterTableActionFact::SetLogged);
                 }
@@ -1296,6 +1301,20 @@ impl AstVisitor {
             }
         }
 
+        // The parser does not always put SET SCHEMA in the action list, so
+        // fall back to the direct child when the loop did not supply one.
+        for child in node.syntax().children() {
+            if let Some(ss) = SetSchema::cast(child)
+                && !actions
+                    .iter()
+                    .any(|a| matches!(a, AlterTableActionFact::SetSchema { .. }))
+                && let Some(schema_ref) = ss.schema_ref()
+            {
+                actions.push(AlterTableActionFact::SetSchema {
+                    new_schema: Self::resolve_schema_ref(&schema_ref),
+                });
+            }
+        }
         if unsupported_action {
             return None;
         }
@@ -4927,6 +4946,15 @@ impl AstVisitor {
             }
         }
         keys
+    }
+
+    // Schema name from a SchemaRef, which the parser builds either as a leaf
+    // node or one wrapping an identifier token.
+    fn resolve_schema_ref(schema_ref: &SchemaRef) -> String {
+        schema_ref.ident_token().map_or_else(
+            || Self::resolve_identifier_token(schema_ref.syntax().text().to_string()),
+            |token| Self::resolve_identifier_token(token.text()),
+        )
     }
 
     fn resolve_identifier_token(text: impl AsRef<str>) -> String {

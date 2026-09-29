@@ -176,7 +176,9 @@ impl Resolver {
                     authorization,
                 ));
             }
-            StatementFact::SchemaNeutralNoop => {}
+            StatementFact::SchemaNeutralNoop => mutations.push(Mutation::NoStateChange {
+                reason: "metadata outside the modeled schema state",
+            }),
             StatementFact::Reindex {
                 target_kind,
                 target_name,
@@ -260,9 +262,7 @@ impl Resolver {
                 ));
             }
             StatementFact::AlterView { name, action } => {
-                if let Some(mutation) = Self::resolve_alter_view(name, action, state) {
-                    mutations.push(mutation);
-                }
+                mutations.push(Self::resolve_alter_view(name, action, state));
             }
             StatementFact::CreateMaterializedView { name, depends_on } => {
                 mutations.push(Self::resolve_create_materialized_view(
@@ -270,9 +270,7 @@ impl Resolver {
                 ));
             }
             StatementFact::AlterMaterializedView { name, action } => {
-                if let Some(mutation) = Self::resolve_alter_materialized_view(name, action, state) {
-                    mutations.push(mutation);
-                }
+                mutations.push(Self::resolve_alter_materialized_view(name, action, state));
             }
             StatementFact::RefreshMaterializedView { name, concurrently } => {
                 mutations.push(Self::resolve_refresh_materialized_view(
@@ -609,6 +607,11 @@ impl Resolver {
                 mutations.push(Self::resolve_set_role(role, *local, *is_session_auth));
             }
         }
+        debug_assert!(
+            !mutations.is_empty(),
+            "a recognized statement must produce at least one mutation; \
+             a statement that changes nothing modeled needs NoStateChange"
+        );
         mutations
     }
 }

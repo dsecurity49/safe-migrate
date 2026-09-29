@@ -63,6 +63,12 @@ notes are available on the
   synchronized from the catalog, with types normalised the way `format_type`
   reports them. A projection that is not a plain column reference cannot be
   typed offline, so the view is still created but the analysis taints.
+- Fixed `ALTER TABLE ... SET SCHEMA` being silently dropped, leaving the
+  relation in its old schema.
+- A recognized statement can no longer produce no state change without saying
+  so. `ALTER VIEW ... ALTER COLUMN SET/DROP DEFAULT` is now recorded, and a
+  statement that provably changes nothing outside the modeled state uses an
+  explicit no-op rather than an absent mutation.
 
 ## v0.9.3 — 2026-09-23
 

@@ -3101,6 +3101,12 @@ impl AnalysisState {
                 kind,
                 attributes,
             } => self.apply_set_reloptions(id, *kind, attributes),
+            Mutation::SetColumnDefault {
+                id,
+                column,
+                default,
+            } => self.apply_set_column_default(id, column, default.as_ref()),
+            Mutation::NoStateChange { .. } => MutationResult::Applied,
             Mutation::ResetReloptions { id, kind, names } => {
                 self.apply_reset_reloptions(id, *kind, names)
             }

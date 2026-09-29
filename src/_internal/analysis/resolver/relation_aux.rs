@@ -117,37 +117,46 @@ impl Resolver {
         name: &QualifiedName,
         action: &AlterViewAction,
         state: &AnalysisState,
-    ) -> Option<Mutation> {
+    ) -> Mutation {
         match action {
             AlterViewAction::RenameTo { new_name } => {
                 let id = Self::resolve_relation_lookup_name(name, state);
                 let mut new_id = ObjectId::new(id.schema.clone(), new_name.resolve());
                 new_id.inferred_schema = id.inferred_schema;
-                Some(Mutation::Rename(Rename { old_id: id, new_id }))
+                Mutation::Rename(Rename { old_id: id, new_id })
             }
             AlterViewAction::SetSchema { new_schema } => {
                 let id = Self::resolve_relation_lookup_name(name, state);
                 let new_id = ObjectId::new(new_schema, &id.name);
-                Some(Mutation::Rename(Rename { old_id: id, new_id }))
+                Mutation::Rename(Rename { old_id: id, new_id })
             }
-            AlterViewAction::OwnerTo { new_owner } => Some(Mutation::ChangeRelationOwner {
+            AlterViewAction::OwnerTo { new_owner } => Mutation::ChangeRelationOwner {
                 id: Self::resolve_relation_lookup_name(name, state),
                 new_owner: new_owner.clone(),
-            }),
+            },
             AlterViewAction::RenameColumn { .. } => {
-                Some(Mutation::Opaque(OpaqueMutation::UnsupportedStatement))
+                Mutation::Opaque(OpaqueMutation::UnsupportedStatement)
             }
-            AlterViewAction::SetDefault { .. } | AlterViewAction::DropDefault { .. } => None,
-            AlterViewAction::SetOptions { options } => Some(Mutation::SetReloptions {
+            AlterViewAction::SetDefault { column, default } => Mutation::SetColumnDefault {
+                id: Self::resolve_relation_lookup_name(name, state),
+                column: column.clone(),
+                default: default.clone(),
+            },
+            AlterViewAction::DropDefault { column } => Mutation::SetColumnDefault {
+                id: Self::resolve_relation_lookup_name(name, state),
+                column: column.clone(),
+                default: None,
+            },
+            AlterViewAction::SetOptions { options } => Mutation::SetReloptions {
                 id: Self::resolve_relation_lookup_name(name, state),
                 kind: ReloptionTarget::View,
                 attributes: options.clone(),
-            }),
-            AlterViewAction::ResetOptions { options } => Some(Mutation::ResetReloptions {
+            },
+            AlterViewAction::ResetOptions { options } => Mutation::ResetReloptions {
                 id: Self::resolve_relation_lookup_name(name, state),
                 kind: ReloptionTarget::View,
                 names: options.iter().map(|option| option.name.clone()).collect(),
-            }),
+            },
         }
     }
 
@@ -169,24 +178,24 @@ impl Resolver {
         name: &QualifiedName,
         action: &AlterMaterializedViewActionFact,
         state: &AnalysisState,
-    ) -> Option<Mutation> {
+    ) -> Mutation {
         match action {
             AlterMaterializedViewActionFact::RenameTo { new_name } => {
                 let id = Self::resolve_relation_lookup_name(name, state);
                 let mut new_id = ObjectId::new(id.schema.clone(), new_name.resolve());
                 new_id.inferred_schema = id.inferred_schema;
-                Some(Mutation::Rename(Rename { old_id: id, new_id }))
+                Mutation::Rename(Rename { old_id: id, new_id })
             }
             AlterMaterializedViewActionFact::SetSchema { new_schema } => {
                 let id = Self::resolve_relation_lookup_name(name, state);
                 let new_id = ObjectId::new(new_schema, &id.name);
-                Some(Mutation::Rename(Rename { old_id: id, new_id }))
+                Mutation::Rename(Rename { old_id: id, new_id })
             }
             AlterMaterializedViewActionFact::OwnerTo { new_owner } => {
-                Some(Mutation::ChangeRelationOwner {
+                Mutation::ChangeRelationOwner {
                     id: Self::resolve_relation_lookup_name(name, state),
                     new_owner: new_owner.clone(),
-                })
+                }
             }
             AlterMaterializedViewActionFact::RenameColumn { .. }
             | AlterMaterializedViewActionFact::SetTablespace { .. }
@@ -197,21 +206,19 @@ impl Resolver {
             | AlterMaterializedViewActionFact::SetCompression { .. }
             | AlterMaterializedViewActionFact::DependsOnExtension { .. }
             | AlterMaterializedViewActionFact::NoDependsOnExtension { .. } => {
-                Some(Mutation::Opaque(OpaqueMutation::UnsupportedStatement))
+                Mutation::Opaque(OpaqueMutation::UnsupportedStatement)
             }
-            AlterMaterializedViewActionFact::SetOptions { options } => {
-                Some(Mutation::SetReloptions {
-                    id: Self::resolve_relation_lookup_name(name, state),
-                    kind: ReloptionTarget::MaterializedView,
-                    attributes: options.clone(),
-                })
-            }
+            AlterMaterializedViewActionFact::SetOptions { options } => Mutation::SetReloptions {
+                id: Self::resolve_relation_lookup_name(name, state),
+                kind: ReloptionTarget::MaterializedView,
+                attributes: options.clone(),
+            },
             AlterMaterializedViewActionFact::ResetOptions { options } => {
-                Some(Mutation::ResetReloptions {
+                Mutation::ResetReloptions {
                     id: Self::resolve_relation_lookup_name(name, state),
                     kind: ReloptionTarget::MaterializedView,
                     names: options.iter().map(|option| option.name.clone()).collect(),
-                })
+                }
             }
         }
     }

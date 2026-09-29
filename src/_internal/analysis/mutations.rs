@@ -108,6 +108,17 @@ pub(crate) enum Mutation {
         kind: ReloptionTarget,
         names: Vec<String>,
     },
+    /// Recognized, and provably irrelevant to the state the analyzer models.
+    /// This is the only way a statement may change nothing, so silence has to
+    /// be written down rather than implied by an absent mutation.
+    NoStateChange {
+        reason: &'static str,
+    },
+    SetColumnDefault {
+        id: ObjectId,
+        column: String,
+        default: Option<crate::_internal::analysis::expr_ir::ExprIr>,
+    },
     SearchPath(SearchPathChange),
     TimeoutSetting(TimeoutSettingChange),
     ResetSettings(ResetSettingTarget),

@@ -17,6 +17,34 @@ type RelationLookup = ObjectLookup;
 type IndexLookup = ObjectLookup;
 
 impl AnalysisState {
+    /// Record or clear a view column default, which PostgreSQL applies to
+    /// `INSERT` through the view.
+    pub(super) fn apply_set_column_default(
+        &mut self,
+        id: &ObjectId,
+        column: &str,
+        default: Option<&crate::_internal::analysis::expr_ir::ExprIr>,
+    ) -> MutationResult {
+        if !matches!(
+            self.local.relations.get(id),
+            Some(RelationOverlay::Present(_))
+        ) {
+            return MutationResult::Skipped;
+        }
+        self.snapshot_relation(id);
+        let Some(RelationOverlay::Present(relation)) = self.local.relations.get_mut(id) else {
+            return MutationResult::Skipped;
+        };
+        let Some(entry) = relation.columns.iter_mut().find(|c| c.name == column) else {
+            return MutationResult::Conflict {
+                reason: format!("column '{column}' of view '{}' does not exist", id),
+            };
+        };
+        entry.default = default.cloned();
+        entry.default_expr_text = None;
+        MutationResult::Applied
+    }
+
     /// Apply `SET (...)` on a view or materialized view. A name the analyzer
     /// cannot place is stored but taints, since PostgreSQL's accepted surface
     /// grows between releases and a false conflict would be worse.

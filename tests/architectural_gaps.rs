@@ -1,6 +1,6 @@
 mod architectural_gap_tests {
     use crate::common::*;
-    use safe_migrate::_internal::analysis::state::Confidence;
+    use safe_migrate::_internal::analysis::state::{AnalysisState, Confidence};
     use safe_migrate::_internal::ast::identifiers::ObjectId;
     use safe_migrate::_internal::model::relation::{Persistence, RelationKind, RelationOverlay};
     use safe_migrate::_internal::model::types::TypeOverlay;
@@ -806,6 +806,42 @@ mod architectural_gap_tests {
             .unwrap();
         let result = engine.analyze("ALTER TABLE t SET SCHEMA target;", &mut state);
         assert!(result.is_ok(), "SetSchema should not crash");
+    }
+
+    #[test]
+    fn alter_table_set_schema_moves_the_relation() {
+        // The parser does not always put SET SCHEMA in the action list; both
+        // spellings must still be recognised rather than silently dropped.
+        for prefix in ["", "public."] {
+            let engine = setup_engine();
+            let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+            let owner = object_id("", "owner");
+            for name in ["public", "target"] {
+                cache.schemas.insert(
+                    name.into(),
+                    safe_migrate::_internal::model::schema::SchemaState {
+                        name: name.into(),
+                        owner: owner.clone(),
+                        generation: 0,
+                    },
+                );
+            }
+            let mut state = AnalysisState::new(cache);
+            engine
+                .analyze(
+                    &format!("CREATE TABLE t(id int); ALTER TABLE {prefix}t SET SCHEMA target;"),
+                    &mut state,
+                )
+                .unwrap();
+            assert!(
+                state.relation_is_present(&object_id("target", "t")),
+                "SET SCHEMA must move the relation: {prefix}"
+            );
+            assert!(
+                !state.relation_is_present(&object_id("public", "t")),
+                "the old identity must be gone: {prefix}"
+            );
+        }
     }
 
     #[test]
