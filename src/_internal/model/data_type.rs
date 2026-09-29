@@ -411,23 +411,6 @@ impl ParsedDataType {
         }
     }
 
-    // Renders as pg_catalog.format_type(oid, NULL) for function-signature identity keys.
-    // Unlike Display, does NOT add the implicit (1) for bare character/char.
-    pub(crate) fn to_function_signature_string(&self) -> String {
-        let (base, tz_suffix) = self
-            .family
-            .canonical_base_and_tz_suffix(&self.original_base);
-        let mut out = base;
-        if let Some(mods) = self.raw_typmods() {
-            out.push_str(&format!("({})", mods));
-        }
-        out.push_str(tz_suffix);
-        for _ in 0..self.array_dimensions {
-            out.push_str("[]");
-        }
-        out
-    }
-
     pub(crate) fn is_lossy_narrowing_to(&self, new_type: &ParsedDataType) -> bool {
         if self.family == new_type.family
             && self.raw_typmods == new_type.raw_typmods
@@ -465,6 +448,40 @@ impl ParsedDataType {
         }
 
         false
+    }
+}
+
+/// A type's catalog identity: how PostgreSQL decides two types are the same.
+///
+/// Distinct from [`ParsedDataType`], which records what the user wrote.
+/// PostgreSQL discards parenthesized modifiers for routine identity, so this
+/// type has no typmod field — a declaration cannot smuggle one in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct TypeIdentity {
+    family: DataTypeFamily,
+    array_dimensions: usize,
+}
+
+impl TypeIdentity {
+    pub(crate) fn from_syntax(syntax: &ParsedDataType) -> Self {
+        Self {
+            family: syntax.family,
+            array_dimensions: syntax.array_dimensions,
+        }
+    }
+
+    /// Renders as `pg_catalog.format_type(oid, NULL)`, so bare `character` is
+    /// not expanded to `character(1)`.
+    pub(crate) fn render(&self) -> String {
+        let (base, tz_suffix) = self
+            .family
+            .canonical_base_and_tz_suffix(&self.family.to_canonical_string(""));
+        let mut out = base;
+        out.push_str(tz_suffix);
+        for _ in 0..self.array_dimensions {
+            out.push_str("[]");
+        }
+        out
     }
 }
 
@@ -544,33 +561,30 @@ mod tests {
     }
 
     #[test]
-    fn function_signature_string_no_implicit_char_width() {
-        // pg_catalog.format_type returns "character" bare (no typmod) for bpchar/char.
-        // Function identity keys must match that; Display must not be used here.
+    fn type_identity_discards_typmods_like_postgres() {
+        let identity = |raw: &str| {
+            TypeIdentity::from_syntax(&ParsedDataType::parse(raw))
+                .render()
+                .to_string()
+        };
+
+        // CREATE FUNCTION discards parenthesized modifiers, and
+        // pg_catalog.format_type(oid, NULL) is bare for bpchar/char.
+        assert_eq!(identity("char"), "character");
+        assert_eq!(identity("character"), "character");
+        assert_eq!(identity("char(10)"), "character");
+        assert_eq!(identity("bpchar"), "character");
+        assert_eq!(identity("int"), "integer");
+        assert_eq!(identity("varchar(50)"), "character varying");
+        assert_eq!(identity("numeric(10,2)"), "numeric");
         assert_eq!(
-            ParsedDataType::parse("char").to_function_signature_string(),
-            "character"
+            identity("timestamp(6) with time zone"),
+            "timestamp with time zone"
         );
-        assert_eq!(
-            ParsedDataType::parse("character").to_function_signature_string(),
-            "character"
-        );
-        assert_eq!(
-            ParsedDataType::parse("char(10)").to_function_signature_string(),
-            "character(10)"
-        );
-        assert_eq!(
-            ParsedDataType::parse("bpchar").to_function_signature_string(),
-            "character"
-        );
-        assert_eq!(
-            ParsedDataType::parse("int").to_function_signature_string(),
-            "integer"
-        );
-        assert_eq!(
-            ParsedDataType::parse("varchar(50)").to_function_signature_string(),
-            "character varying(50)"
-        );
+        assert_eq!(identity("varchar(50)[]"), "character varying[]");
+
+        assert_eq!(identity("varchar(10)"), identity("varchar"));
+        assert_eq!(identity("numeric(3,5)"), identity("numeric"));
     }
 
     #[test]
@@ -863,8 +877,8 @@ mod tests {
         );
         assert_eq!(ParsedDataType::parse("text(50)").to_string(), "text(50)");
         assert_eq!(
-            ParsedDataType::parse("numeric(10,4000000000)").to_function_signature_string(),
-            "numeric(10,4000000000)"
+            TypeIdentity::from_syntax(&ParsedDataType::parse("numeric(10,4000000000)")).render(),
+            "numeric"
         );
     }
 

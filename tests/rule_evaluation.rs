@@ -1161,6 +1161,38 @@ mod rule_evaluation_tests {
     }
 
     #[test]
+    fn function_identity_ignores_typmods() {
+        // PostgreSQL treats foo(varchar) and foo(varchar(10)) as one function,
+        // so the second declaration must conflict.
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let sql = "
+            CREATE FUNCTION f(a character varying) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;
+            CREATE FUNCTION f(a character varying(10)) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;
+        ";
+        let v = engine.analyze(sql, &mut state).unwrap();
+        assert!(
+            v.iter().any(|v| v.rule_id == "chain-conflict"),
+            "duplicate function differing only by typmod must conflict: {v:?}"
+        );
+    }
+
+    #[test]
+    fn distinct_function_signatures_do_not_conflict() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let sql = "
+            CREATE FUNCTION f(a character varying) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;
+            CREATE FUNCTION f(a integer) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;
+        ";
+        let v = engine.analyze(sql, &mut state).unwrap();
+        assert!(
+            !v.iter().any(|v| v.rule_id == "chain-conflict"),
+            "differing argument types are distinct overloads: {v:?}"
+        );
+    }
+
+    #[test]
     fn test_rule_require_concurrent_reindex() {
         let sql = "
             CREATE TABLE t1 (id int);

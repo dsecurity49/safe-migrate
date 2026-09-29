@@ -1163,6 +1163,7 @@ fn load_scoped_external_routine_dependencies(
                 .iter()
                 .map(|arg| {
                     crate::_internal::analysis::resolver::Resolver::normalize_function_arg_type(arg)
+                        .render()
                 })
                 .collect::<Vec<_>>();
             Ok(ObjectId::new(
@@ -2951,6 +2952,7 @@ fn load_routines(
                     crate::_internal::analysis::resolver::Resolver::normalize_function_arg_type(
                         arg_type,
                     )
+                    .render()
                 })
                 .collect::<Vec<_>>();
             let id = ObjectId::new(

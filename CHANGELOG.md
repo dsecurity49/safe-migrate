@@ -34,6 +34,9 @@ notes are available on the
 - Finding severity is no longer weakened by uncertainty elsewhere in the
   migration. `Finding` gains a `certainty` field for this instead, derived from
   the evidence log so an unmodeled statement taints only what follows it.
+- Function and routine identity now discards type modifiers, matching
+  PostgreSQL. `foo(varchar)` and `foo(varchar(10))` are one function, so a
+  duplicate declaration is reported instead of silently creating two.
 
 ## v0.9.3 — 2026-09-23
 

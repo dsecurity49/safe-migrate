@@ -2,7 +2,7 @@ use crate::_internal::analysis::facts::StatementFact;
 use crate::_internal::analysis::mutations::{Mutation, OpaqueMutation};
 use crate::_internal::analysis::state::AnalysisState;
 use crate::_internal::ast::identifiers::{ObjectId, QualifiedName};
-use crate::_internal::model::data_type::ParsedDataType;
+use crate::_internal::model::data_type::{ParsedDataType, TypeIdentity};
 
 mod relation;
 mod relation_aux;
@@ -87,7 +87,7 @@ impl Resolver {
     ) -> ObjectId {
         let signature = params
             .iter()
-            .map(|param| Self::normalize_function_arg_type(param))
+            .map(|param| Self::normalize_function_arg_type(param).render())
             .collect::<Vec<_>>()
             .join(",");
         let object_name = format!("{}({signature})", name.name.resolve());
@@ -124,10 +124,10 @@ impl Resolver {
     }
 
     fn resolve_function_id_by_sig(base_id: &ObjectId, sig: &str) -> ObjectId {
-        // Normalize types in signature to match pg_proc standard names
         let normalized_sig = sig
             .split(',')
             .map(Self::normalize_function_arg_type)
+            .map(|identity| identity.render())
             .collect::<Vec<_>>()
             .join(",");
 
@@ -139,8 +139,8 @@ impl Resolver {
         id
     }
 
-    pub(crate) fn normalize_function_arg_type(raw: &str) -> String {
-        ParsedDataType::parse(raw).to_function_signature_string()
+    pub(crate) fn normalize_function_arg_type(raw: &str) -> TypeIdentity {
+        TypeIdentity::from_syntax(&ParsedDataType::parse(raw))
     }
 
     pub(crate) fn resolve(fact: &StatementFact, state: &AnalysisState) -> Vec<Mutation> {

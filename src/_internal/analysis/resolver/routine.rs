@@ -110,7 +110,7 @@ impl Resolver {
                 signature.params = signature
                     .params
                     .into_iter()
-                    .map(|param| Self::normalize_function_arg_type(&param))
+                    .map(|param| Self::normalize_function_arg_type(&param).render())
                     .collect();
                 signature
             })
