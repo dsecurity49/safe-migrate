@@ -1305,11 +1305,7 @@ impl AnalysisState {
                 return schema.clone();
             }
         }
-        self.local
-            .search_path
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "public".to_string())
+        self.local.search_path.first().cloned().unwrap_or_default()
     }
 
     pub(crate) fn resolve_relation_id(
@@ -1327,12 +1323,8 @@ impl AnalysisState {
                 return candidate;
             }
         }
-        let schema = self
-            .local
-            .search_path
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "public".to_string());
+        // An empty path searches nothing, so no schema may be inferred.
+        let schema = self.local.search_path.first().cloned().unwrap_or_default();
         let mut id = ObjectId::new(schema, resolved_name);
         id.inferred_schema = true;
         id
@@ -1615,7 +1607,11 @@ impl AnalysisState {
             ObjectLookup::Present => Ok(()),
             ObjectLookup::Tombstone | ObjectLookup::AuthoritativelyAbsent => {
                 Err(MutationResult::Conflict {
-                    reason: format!("schema '{}' does not exist", schema),
+                    reason: if schema.is_empty() {
+                        "no schema has been selected to create in".to_string()
+                    } else {
+                        format!("schema '{}' does not exist", schema)
+                    },
                 })
             }
             ObjectLookup::Unknown => {

@@ -40,6 +40,8 @@ notes are available on the
 - A `numeric` scale outside `0..=precision` is now checked against the
   PostgreSQL version, which widened the range in 15. Without a baseline the
   declaration taints rather than being reported as an error.
+- An empty effective `search_path` no longer places unqualified names in
+  `public`. PostgreSQL has no creation target in that case and errors.
 
 ## v0.9.3 — 2026-09-23
 

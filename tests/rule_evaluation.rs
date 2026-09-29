@@ -1286,6 +1286,56 @@ mod rule_evaluation_tests {
     }
 
     #[test]
+    fn empty_search_path_cannot_place_an_unqualified_name() {
+        let engine = setup_engine();
+        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        cache.pg_version_num = Some(150_000);
+        let mut state = AnalysisState::new(cache);
+        state.baseline_available = true;
+
+        // A path naming only a schema the baseline proves absent resolves to
+        // nothing, so PostgreSQL has no creation target.
+        engine
+            .analyze(
+                "SET search_path TO no_such_schema; CREATE TABLE t (id int);",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !state.relation_is_present(&object_id("public", "t")),
+            "an unplaceable name must not be assumed to land in public"
+        );
+
+        let v = engine
+            .analyze(
+                "SET search_path TO no_such_schema; CREATE TABLE t2 (id int);",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            v.iter()
+                .any(|v| v.reason.contains("no schema has been selected")),
+            "expected the PostgreSQL wording: {v:?}"
+        );
+    }
+
+    #[test]
+    fn qualified_name_ignores_the_search_path() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "SET search_path TO no_such_schema; CREATE TABLE public.t (id int);",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            state.relation_is_present(&object_id("public", "t")),
+            "a qualified name is unaffected by the path"
+        );
+    }
+
+    #[test]
     fn test_rule_require_concurrent_reindex() {
         let sql = "
             CREATE TABLE t1 (id int);

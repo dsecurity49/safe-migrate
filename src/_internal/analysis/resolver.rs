@@ -18,18 +18,14 @@ pub(crate) struct Resolver;
 
 impl Resolver {
     fn resolve_creation_name(name: &QualifiedName, state: &AnalysisState) -> ObjectId {
+        // An empty path leaves PostgreSQL with no creation target, so the
+        // namespace is left empty for the state machine to reject rather than
+        // silently assuming `public`.
         let schema = name
             .schema
             .as_ref()
             .map(|i| i.resolve())
-            .unwrap_or_else(|| {
-                state
-                    .search_path()
-                    .first()
-                    .map(|s| s.as_str())
-                    .unwrap_or("public")
-                    .to_string()
-            });
+            .unwrap_or_else(|| state.search_path().first().cloned().unwrap_or_default());
 
         ObjectId::new(schema, name.name.resolve())
     }
@@ -52,11 +48,8 @@ impl Resolver {
             }
         }
 
-        let schema = state
-            .search_path()
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "public".to_string());
+        // An empty path searches nothing, so no schema may be inferred.
+        let schema = state.search_path().first().cloned().unwrap_or_default();
         let mut id = ObjectId::new(schema, object_name);
         id.inferred_schema = true;
         id
