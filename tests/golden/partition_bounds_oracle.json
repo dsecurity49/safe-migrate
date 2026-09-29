@@ -1,6 +1,6 @@
 {
   "provenance": {
-    "generator_version": "0.9.3"
+    "generator_version": "0.10.0"
   },
   "entries": {
     "a bigint|(a)|LIST|FOR VALUES IN (100, 200)": "(((a IS NOT NULL) AND (a = ANY ('{100,200}'::bigint[]))))",

@@ -9410,4 +9410,82 @@ mod state_mutation_tests {
                     .contains("rule 'missing_rule' does not exist")
         }));
     }
+
+    /// Verified against PostgreSQL 18: the range is checked first, a target
+    /// above 10000 is clamped with only a warning, and a non-expression index
+    /// column is rejected last.
+    #[test]
+    fn alter_index_set_statistics_matches_postgres_acceptance() {
+        let cases = [
+            (
+                "ALTER INDEX idx_plain ALTER COLUMN 1 SET STATISTICS 100;",
+                true,
+                "non-expression column",
+            ),
+            (
+                "ALTER INDEX idx_expr ALTER COLUMN 1 SET STATISTICS 100;",
+                false,
+                "",
+            ),
+            (
+                "ALTER INDEX idx_plain ALTER COLUMN 1 SET STATISTICS 10001;",
+                false,
+                "",
+            ),
+            (
+                "ALTER INDEX idx_plain ALTER COLUMN 1 SET STATISTICS -2;",
+                true,
+                "is too low",
+            ),
+            (
+                "ALTER INDEX idx_expr ALTER COLUMN 1 SET STATISTICS -1;",
+                false,
+                "",
+            ),
+        ];
+
+        for (statement, expect_conflict, reason) in cases {
+            let engine = setup_engine();
+            let mut state = setup_state();
+            engine
+                .analyze(
+                    "CREATE TABLE st (a int, b text);
+                     CREATE INDEX idx_plain ON st (a);
+                     CREATE INDEX idx_expr ON st (lower(b));",
+                    &mut state,
+                )
+                .unwrap();
+            let findings = engine.analyze(statement, &mut state).unwrap();
+
+            let conflict = findings.iter().find(|finding| {
+                finding.rule_id == "chain-conflict" && finding.reason.contains(reason)
+            });
+            assert_eq!(
+                conflict.is_some(),
+                expect_conflict,
+                "unexpected result for {statement}: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn alter_index_set_statistics_column_number_is_parsed() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let findings = engine
+            .analyze(
+                "CREATE TABLE st (a int, b text);
+                 CREATE INDEX idx_expr ON st (lower(b));
+                 ALTER INDEX idx_expr ALTER COLUMN 1 SET STATISTICS 250;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict"),
+            "a column number must be recognized, not parsed as no column: {findings:?}"
+        );
+    }
 }

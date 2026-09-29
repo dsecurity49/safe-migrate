@@ -472,6 +472,23 @@ pub(crate) enum StatisticsTarget {
     Value(i32),
 }
 
+/// The index column `ALTER INDEX ... ALTER [COLUMN] c SET STATISTICS` names.
+/// PostgreSQL accepts either a column name or a 1-based column number.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum IndexStatisticsColumn {
+    Name(String),
+    Number(i32),
+}
+
+impl std::fmt::Display for IndexStatisticsColumn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Name(name) => write!(f, "{name}"),
+            Self::Number(number) => write!(f, "{number}"),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum AlterIndexActionFact {
     RenameTo {
@@ -490,7 +507,9 @@ pub(crate) enum AlterIndexActionFact {
         extension_name: Ident,
     },
     SetStatistics {
-        column: Option<Ident>,
+        /// The index column the target applies to. PostgreSQL requires one:
+        /// the bare `SET STATISTICS` form is a syntax error.
+        column: IndexStatisticsColumn,
         target: StatisticsTarget,
     },
     SetOptions {

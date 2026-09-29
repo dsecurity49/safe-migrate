@@ -1,4 +1,5 @@
 use crate::_internal::analysis::expr_ir::ExprIr;
+use crate::_internal::analysis::facts::IndexStatisticsColumn;
 use crate::_internal::analysis::facts::{
     AlterIndexActionFact, AlterTableActionFact, AlterTypeActionFact, AlterTypeFact, ColumnFact,
     CreateTypeFact, FkFact, LikePropertiesFact, LikeSourceFact, LockModeFact, PersistenceFact,
@@ -2200,19 +2201,15 @@ impl AstVisitor {
                 });
             }
             squawk_syntax::ast::AlterIndexAction::AlterSetStatistics(ss) => {
-                // Grammar: 'alter' 'column'? (Expr | ColumnNameRef) (SetStatistics
-                // | SetOptions). The pinned parser realizes only the SetOptions
-                // child here — every SET STATISTICS variant provokes upstream
-                // parse errors — but the grammar keeps SetStatistics in the mix,
-                // so handle it exhaustively instead of degrading an unannotated
-                // form. The optional leading `ALTER COLUMN` scopes SET (options)
-                // to a single index column; both the target and any per-column
-                // storage parameters are advisory planner metadata that the
-                // schema model deliberately does not track.
-                let column = ss
-                    .column_name_ref()
-                    .and_then(|c| c.ident_token())
-                    .map(|col| Self::identifier_from_token(col.text()));
+                // PostgreSQL requires a column, by name or 1-based number;
+                // the bare form is a syntax error.
+                let column = if let Some(name_ref) = ss.column_name_ref() {
+                    let name = name_ref.ident_token()?.text().to_string();
+                    IndexStatisticsColumn::Name(Self::identifier_from_token(&name).resolve())
+                } else {
+                    let number = ss.expr()?.syntax().text().to_string();
+                    IndexStatisticsColumn::Number(number.parse::<i32>().ok()?)
+                };
                 if let Some(stat_node) = ss.set_statistics() {
                     let target = if stat_node.default_token().is_some() {
                         crate::_internal::analysis::facts::StatisticsTarget::Default

@@ -1,9 +1,5 @@
-//! Resolving the catalog object a mutation most directly concerns.
-//!
-//! Synthetic mutations such as the timeout check carry no payload of their
-//! own, so rules reporting on them need the subject of the statement they were
-//! raised for. Keeping that mapping in one place stops each rule from
-//! inventing its own placeholder name.
+//! Maps a mutation to the catalog object it acts on, for rules that report on
+//! synthetic mutations carrying no payload of their own.
 
 use crate::_internal::analysis::mutations::{
     CreatePolicyMutation, Mutation, ReindexTargetMutation, RelationTargetMutation,
@@ -12,11 +8,8 @@ use crate::_internal::ast::identifiers::ObjectId;
 use crate::_internal::report::violations::ObjectKind;
 
 impl Mutation {
-    /// The single object a mutation acts on, when it has exactly one.
-    ///
-    /// Returns `None` for control flow, settings, and synthetic mutations, and
-    /// for statements naming several targets. Callers must then report an
-    /// unknown subject rather than guessing one.
+    /// `None` for control flow, settings, synthetic mutations, and statements
+    /// naming several targets; callers must then report an unknown subject.
     pub(crate) fn primary_object(&self) -> Option<(ObjectKind, String)> {
         let one = |kind: ObjectKind, id: &ObjectId| Some((kind, id.to_string()));
         let many = |kind: ObjectKind, ids: &[ObjectId]| match ids {

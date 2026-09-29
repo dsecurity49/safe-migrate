@@ -932,11 +932,8 @@ pub(crate) enum AlterIndexActionMutation {
         extension_name: String,
     },
     SetStatistics {
-        /// The column name targeted by `ALTER COLUMN col SET STATISTICS n`.
-        /// `None` when the SET STATISTICS applies to the index itself (no
-        /// `COLUMN` keyword), which is the grammar form that targets the
-        /// expression index's statistics directly rather than a named column.
-        column_name: Option<String>,
+        /// The index column targeted, by name or 1-based number.
+        column: crate::_internal::analysis::facts::IndexStatisticsColumn,
         target: crate::_internal::analysis::facts::StatisticsTarget,
     },
     SetOptions {

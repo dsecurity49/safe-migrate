@@ -83,19 +83,14 @@ impl Resolver {
         )
     }
 
-    /// A `schema-drift` diagnostic for a statement that names an object the
-    /// baseline does not contain.
-    ///
-    /// Only emitted when absence is authoritative: without a synced baseline
-    /// the object may simply be unknown, which is a taint rather than drift.
+    /// A `schema-drift` diagnostic for an object the baseline provably lacks.
     pub(super) fn unresolved_reference(
         kind: ObjectKind,
         id: &ObjectId,
         state: &AnalysisState,
     ) -> Option<Mutation> {
-        // Absence must be both real and authoritative: an object created
-        // earlier in the migration is present locally, and without a synced
-        // baseline a miss only means unknown.
+        // A miss only proves absence with a synced baseline; an object created
+        // earlier in the migration is present locally.
         let absent = !state.relation_namespace_object_is_present(id)
             && state.relation_absence_is_authoritative(id);
         absent.then(|| {

@@ -1,6 +1,6 @@
 [package]
 name = "safe-migrate"
-version = "0.9.3"
+version = "0.10.0"
 edition = "2024"
 autotests = false
 rust-version = "1.94"

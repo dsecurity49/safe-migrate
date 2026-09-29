@@ -387,7 +387,7 @@ impl Resolver {
                 }
                 AlterIndexActionFact::SetStatistics { column, target } => {
                     AlterIndexActionMutation::SetStatistics {
-                        column_name: column.as_ref().map(|c| c.resolve()),
+                        column: column.clone(),
                         target: match target {
                             StatisticsTarget::Default => StatisticsTarget::Default,
                             StatisticsTarget::Value(n) => StatisticsTarget::Value(*n),

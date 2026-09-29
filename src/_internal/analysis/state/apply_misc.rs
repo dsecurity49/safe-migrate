@@ -1,5 +1,7 @@
 use super::{AnalysisState, MutationResult};
 use crate::_internal::analysis::evidence::{EvidenceCode, EvidenceScope};
+use crate::_internal::analysis::facts::{IndexStatisticsColumn, StatisticsTarget};
+use crate::_internal::analysis::graph::DependencyKind;
 use crate::_internal::analysis::mutations::{
     AlterDatabaseMutation, AlterIndexActionMutation, AlterIndexAllInTablespaceMutation,
     AlterIndexMutation, CreateDatabaseMutation, DropDatabaseMutation, LockTableMutation,
@@ -7,6 +9,11 @@ use crate::_internal::analysis::mutations::{
 };
 use crate::_internal::ast::identifiers::ObjectId;
 use crate::_internal::model::relation::RelationKind;
+
+/// Smallest statistics target PostgreSQL accepts; -1 means the server default.
+const SET_STATISTICS_MIN: i32 = -1;
+/// Largest statistics target PostgreSQL stores without clamping.
+const SET_STATISTICS_MAX: i32 = 10_000;
 
 impl AnalysisState {
     pub(super) fn apply_lock_table(&mut self, lock: &LockTableMutation) -> MutationResult {
@@ -168,12 +175,14 @@ impl AnalysisState {
                         return result;
                     }
                 }
-                // Tablespace, statistics targets, and storage options are
-                // physical/advisory metadata not tracked in the schema model.
+                // Tablespace, storage options and reloptions are physical or
+                // advisory metadata not tracked in the schema model.
                 AlterIndexActionMutation::SetTablespace { .. }
-                | AlterIndexActionMutation::SetStatistics { .. }
                 | AlterIndexActionMutation::SetOptions { .. }
                 | AlterIndexActionMutation::ResetOptions { .. } => {}
+                AlterIndexActionMutation::SetStatistics { column, target } => {
+                    return self.apply_alter_index_set_statistics(&alter.index_id, column, target);
+                }
                 AlterIndexActionMutation::AttachPartition { partition_id } => {
                     // The partition index must exist for the attach to succeed.
                     if !self.index_is_present(partition_id) {
@@ -202,6 +211,54 @@ impl AnalysisState {
         }
 
         MutationResult::Applied
+    }
+
+    /// PostgreSQL checks the range, then clamps above 10000, then the column.
+    pub(super) fn apply_alter_index_set_statistics(
+        &mut self,
+        index: &ObjectId,
+        column: &IndexStatisticsColumn,
+        target: &StatisticsTarget,
+    ) -> MutationResult {
+        let StatisticsTarget::Value(value) = target else {
+            return MutationResult::Applied;
+        };
+        if *value < SET_STATISTICS_MIN {
+            return MutationResult::Conflict {
+                reason: format!("statistics target {value} is too low"),
+            };
+        }
+        if *value > SET_STATISTICS_MAX {
+            // Accepted and stored as 10000, so it does not match what was written.
+            self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Statement);
+        } else if self.index_has_expression_keys(index) == Some(false) {
+            return MutationResult::Conflict {
+                reason: format!(
+                    "cannot alter statistics on non-expression column \"{column}\" of index \"{index}\""
+                ),
+            };
+        }
+        MutationResult::Applied
+    }
+
+    /// Whether the index is known to have expression keys, or `None` when that
+    /// is not established.
+    fn index_has_expression_keys(&self, index: &ObjectId) -> Option<bool> {
+        self.local
+            .graph
+            .edges()
+            .iter()
+            .find(|edge| {
+                matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
+                    && edge.dependent == *index
+            })
+            .map(|edge| match &edge.kind {
+                DependencyKind::IndexOnRelation {
+                    has_expression_keys,
+                    ..
+                } => *has_expression_keys,
+                _ => unreachable!("index lookup matched an IndexOnRelation edge"),
+            })
     }
 
     pub(super) fn apply_alter_index_all_in_tablespace(

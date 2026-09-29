@@ -5,8 +5,7 @@ use safe_migrate::_internal::model::schema::SchemaState;
 use safe_migrate::_internal::report::violations::ObjectKind;
 use safe_migrate::api::Config;
 
-/// A cache that claims a complete, synced baseline containing schema `public`
-/// but no relations, so a reference to anything else is provably absent.
+/// A synced baseline holding schema `public` and no relations.
 fn synced_empty_baseline() -> DbCache {
     let mut cache = DbCache::new();
     cache.metadata.schemas = Some(vec!["public".to_string()]);
@@ -58,8 +57,7 @@ fn timeout_findings_name_the_object_the_statement_acts_on() {
 
 #[test]
 fn timeout_finding_reports_an_unknown_subject_when_there_is_none() {
-    // LOCK has no single object, so the finding must say so rather than
-    // invent a name.
+    // LOCK names two relations, so there is no single subject.
     let engine = SafeMigrateEngine::new(Config::default());
     let mut state = AnalysisState::with_baseline(DbCache::new(), true);
     let violations = engine.analyze("LOCK TABLE a, b;", &mut state).unwrap();
@@ -93,8 +91,7 @@ fn missing_baseline_object_is_reported_as_schema_drift() {
 
 #[test]
 fn unknown_object_is_not_drift_without_a_synced_baseline() {
-    // Without a baseline the object may simply be unknown, so only a taint
-    // is justified; claiming drift would be a false alarm.
+    // Without a baseline the object is unknown, so drift would be a false alarm.
     let engine = SafeMigrateEngine::new(Config::default());
     let mut state = AnalysisState::with_baseline(DbCache::new(), false);
     let violations = engine

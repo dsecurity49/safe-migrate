@@ -346,10 +346,8 @@ impl SafeMigrateEngine {
                 )],
             };
             if squawk_linter::analyze::possibly_slow_stmt(&stmt) {
-                // Report against the object the statement acts on, so the
-                // finding names it instead of the statement as a whole.
-                // `primary_object` is None for diagnostic mutations, so a
-                // drift finding is never mistaken for the subject.
+                // Name the object the statement acts on. Diagnostic mutations
+                // have no subject, so they are never mistaken for one.
                 let subject = mutations.iter().find_map(|m| m.primary_object());
                 mutations.push(Mutation::CheckTimeouts { subject });
             }

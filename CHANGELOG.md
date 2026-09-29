@@ -21,6 +21,12 @@ notes are available on the
   provably absent from a synchronized baseline. Without a baseline, or for an
   object created earlier in the same migration, only a taint is raised, so an
   unknown object is never reported as drift.
+- `ALTER INDEX ... ALTER [COLUMN] c SET STATISTICS n` is now validated instead
+  of being accepted unconditionally. A target below `-1`, and a target on a
+  non-expression index column, are reported as conflicts; a target above
+  `10000`, which PostgreSQL clamps with a warning, is accepted and taints.
+  A column given by number is now recognized, where it was previously parsed as
+  no column at all.
 - Added `require-concurrent-reindex` to flag `REINDEX` that should run with
   `CONCURRENTLY`, bringing the rule count to 30.
 - Added `ALTER MATERIALIZED VIEW` action extraction, state resolution, and
