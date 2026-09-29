@@ -9,7 +9,7 @@ use crate::_internal::analysis::transaction::{NamespaceSnapshot, StateChange, Tr
 use crate::_internal::ast::identifiers::ObjectId;
 use crate::_internal::db::cache::CatalogCoverage;
 use crate::_internal::db::cache::DbCache;
-use crate::_internal::model::constraint::ConstraintState;
+use crate::_internal::model::constraint::{ConstraintKind, ConstraintState};
 use crate::_internal::model::function::FunctionOverlay;
 pub(crate) use crate::_internal::model::relation::RelationOverlay;
 use crate::_internal::model::relation::{Persistence, Privilege, RelationKind};
@@ -1384,6 +1384,15 @@ impl AnalysisState {
 
     pub(crate) fn note_temp_object_created(&mut self) {
         self.local.saw_temp_object = true;
+    }
+
+    /// Whether the index backs an exclusion constraint, which PostgreSQL
+    /// refuses to rebuild concurrently.
+    pub(crate) fn index_backs_exclusion_constraint(&self, index: &ObjectId) -> bool {
+        self.local.constraints.values().any(|constraint| {
+            matches!(constraint.kind, ConstraintKind::Exclusion)
+                && constraint.backing_index.as_ref() == Some(index)
+        })
     }
 
     /// Returns whether a cache-backed absence is authoritative for an object.

@@ -257,10 +257,9 @@ impl Rule for BlockingConstraintRule {
                 }
                 | AlterTableActionMutation::AddPrimaryKeyConstraint {
                     using_index: None, ..
-                }
-                | AlterTableActionMutation::AddExcludeConstraint { .. } => {
+                } => {
                     let mut reason = format!(
-                        "Building an index for a UNIQUE, PRIMARY KEY, or EXCLUDE constraint on {}",
+                        "Building an index for a UNIQUE or PRIMARY KEY constraint on {}",
                         alter.id
                     );
                     if is_stale {
@@ -275,6 +274,28 @@ impl Rule for BlockingConstraintRule {
                         tier,
                         reason,
                         recipe: "Build a UNIQUE index CONCURRENTLY first, then add the constraint USING INDEX.",
+                        dedup_key: None,
+                                    sql: None,
+                                    fk_dependency_related: false,
+                    });
+                }
+                AlterTableActionMutation::AddExcludeConstraint { .. } => {
+                    let mut reason = format!(
+                        "Building an index for an EXCLUDE constraint on {}",
+                        alter.id
+                    );
+                    if is_stale {
+                        reason.push_str(" [WARNING: Based on offline/stale statistics]");
+                    }
+
+                    violations.push(Violation { source_range: None,
+                        rule_id: "blocking-index-constraint",
+                        operation_kind: OperationKind::AddConstraint,
+                        object_kind: ObjectKind::Table,
+                        object_name: alter.id.to_string(),
+                        tier,
+                        reason,
+                        recipe: "EXCLUDE constraints cannot be added USING INDEX; add them directly and expect the table to be locked while the supporting index is built.",
                         dedup_key: None,
                                     sql: None,
                                     fk_dependency_related: false,

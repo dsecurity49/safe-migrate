@@ -1336,6 +1336,72 @@ mod rule_evaluation_tests {
     }
 
     #[test]
+    fn reindex_of_an_exclusion_backing_index_is_not_flagged() {
+        // PostgreSQL raises an error if an exclusion-constraint index is named
+        // directly in a concurrent REINDEX, so the synchronous form is required.
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let sql = "
+            CREATE TABLE bookings (
+                room int, during tsrange,
+                CONSTRAINT bookings_no_overlap EXCLUDE USING gist (room WITH =, during WITH &&));
+            REINDEX INDEX bookings_no_overlap;
+        ";
+        let v = engine.analyze(sql, &mut state).unwrap();
+        assert!(
+            !v.iter().any(|v| v.rule_id == "require-concurrent-reindex"
+                && v.object_name.contains("bookings_no_overlap")),
+            "an exclusion backing index must not demand CONCURRENTLY: {v:?}"
+        );
+        assert!(
+            !v.iter().any(|v| v.rule_id == "chain-conflict"),
+            "the backing index must exist in the simulated state: {v:?}"
+        );
+    }
+
+    #[test]
+    fn exclude_constraint_recipe_does_not_recommend_using_index() {
+        let engine = setup_engine();
+        let cache = cache_with_table("public", "bookings", Some(500_000));
+        let mut state = AnalysisState::new(cache);
+        let v = engine
+            .analyze(
+                "ALTER TABLE bookings ADD EXCLUDE USING gist (room WITH =, during WITH &&);",
+                &mut state,
+            )
+            .unwrap();
+        let finding = v
+            .iter()
+            .find(|v| v.rule_id == "blocking-index-constraint")
+            .expect("adding an exclusion constraint should be reported");
+        // PostgreSQL rejects EXCLUDE ... USING INDEX outright.
+        assert!(
+            !finding.recipe.contains("add the constraint USING INDEX"),
+            "must not recommend a form PostgreSQL rejects: {}",
+            finding.recipe
+        );
+    }
+
+    #[test]
+    fn unique_constraint_recipe_still_recommends_using_index() {
+        let engine = setup_engine();
+        let cache = cache_with_table("public", "bookings", Some(500_000));
+        let mut state = AnalysisState::new(cache);
+        let v = engine
+            .analyze("ALTER TABLE bookings ADD UNIQUE (room);", &mut state)
+            .unwrap();
+        let finding = v
+            .iter()
+            .find(|v| v.rule_id == "blocking-index-constraint")
+            .expect("adding a unique constraint should be reported");
+        assert!(
+            finding.recipe.contains("USING INDEX"),
+            "USING INDEX is valid for UNIQUE: {}",
+            finding.recipe
+        );
+    }
+
+    #[test]
     fn test_rule_require_concurrent_reindex() {
         let sql = "
             CREATE TABLE t1 (id int);

@@ -47,6 +47,10 @@ notes are available on the
   A temporary table no longer collides with a permanent table of the same
   name, and a later unqualified `ALTER TABLE` correctly targets the temporary
   one.
+- `require-concurrent-reindex` no longer flags an index backing an exclusion
+  constraint, which PostgreSQL refuses to rebuild concurrently.
+- The `EXCLUDE` constraint finding no longer recommends `USING INDEX`, a form
+  PostgreSQL rejects with a syntax error.
 
 ## v0.9.3 — 2026-09-23
 

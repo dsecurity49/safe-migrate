@@ -282,6 +282,12 @@ impl RequireConcurrentReindexRule {
             return vec![];
         }
 
+        if let ReindexTargetMutation::Index(id) = target
+            && context.state().index_backs_exclusion_constraint(id)
+        {
+            return vec![];
+        }
+
         let object_kind = match target {
             ReindexTargetMutation::Database(_) | ReindexTargetMutation::System(_) => {
                 ObjectKind::Database
