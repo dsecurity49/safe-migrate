@@ -2927,9 +2927,10 @@ impl AstVisitor {
                     })
                     .collect::<Option<Vec<_>>>()?,
             },
-            // Range/base types carry subtype or function metadata that the
-            // state model does not retain.
-            ast::CreateTypeKind::RangeType(_) | ast::CreateTypeKind::BaseType(_) => return None,
+            // The model records these kinds without their subtype or I/O
+            // metadata, matching what the catalog sync reports for them.
+            ast::CreateTypeKind::RangeType(_) => TypeCreationKind::Range,
+            ast::CreateTypeKind::BaseType(_) => TypeCreationKind::Base,
         };
 
         Some(StatementFact::CreateType(CreateTypeFact { name, kind }))

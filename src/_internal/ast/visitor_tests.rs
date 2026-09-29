@@ -3091,14 +3091,29 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_create_non_enum_types_are_not_silent() {
-        let sql = "CREATE TYPE floatrange AS RANGE (subtype = float8);";
-        let parsed = SourceFile::parse(sql);
-        let statement = parsed.tree().stmts().next().expect("statement");
-        assert!(
-            AstVisitor::extract(&statement).is_none(),
-            "unmodeled CREATE TYPE semantics must use the opaque engine path: {sql}"
-        );
+    fn range_and_base_types_match_the_synced_catalog_kinds() {
+        // The cache reports these kinds from `pg_type.typtype`, so a type
+        // created by the migration must be modeled the same way.
+        for (sql, expected) in [
+            (
+                "CREATE TYPE floatrange AS RANGE (subtype = float8);",
+                TypeCreationKind::Range,
+            ),
+            (
+                "CREATE TYPE my_input (INPUT = int4in, OUTPUT = int4out);",
+                TypeCreationKind::Base,
+            ),
+        ] {
+            let parsed = SourceFile::parse(sql);
+            let statement = parsed.tree().stmts().next().expect("statement");
+            let Some(StatementFact::CreateType(
+                crate::_internal::analysis::facts::CreateTypeFact { kind, .. },
+            )) = AstVisitor::extract(&statement)
+            else {
+                panic!("expected a typed CREATE TYPE fact: {sql}");
+            };
+            assert_eq!(kind, expected, "unexpected creation kind for: {sql}");
+        }
     }
 
     #[test]

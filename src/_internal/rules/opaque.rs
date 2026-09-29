@@ -1,4 +1,4 @@
-use crate::_internal::analysis::mutations::Mutation;
+use crate::_internal::analysis::mutations::{Mutation, OpaqueMutation};
 use crate::_internal::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
 use crate::_internal::rules::{Rule, RuleContext};
 
@@ -16,80 +16,45 @@ impl Rule for OpaqueDynamicSqlRule {
     }
 
     fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
-        let mut violations = Vec::new();
-
-        if let Mutation::Opaque(op) = context.mutation() {
-            if matches!(
-                op,
-                crate::_internal::analysis::mutations::OpaqueMutation::UnresolvedReference { .. }
-            ) {
-                return vec![];
-            }
-            let (block_type, is_collision, recipe) = match &op {
-                crate::_internal::analysis::mutations::OpaqueMutation::UnsupportedStatement => (
-                    "unsupported SQL statement",
-                    false,
-                    "This SQL statement is not modeled. Review its PostgreSQL behavior before deploying.",
-                ),
-                crate::_internal::analysis::mutations::OpaqueMutation::DoBlock => {
-                    ("DO block", false, self.recipe())
-                }
-                crate::_internal::analysis::mutations::OpaqueMutation::Execute => {
-                    ("EXECUTE statement", false, self.recipe())
-                }
-                crate::_internal::analysis::mutations::OpaqueMutation::DynamicSql => {
-                    ("Dynamic SQL", false, self.recipe())
-                }
-                crate::_internal::analysis::mutations::OpaqueMutation::PrepareTransaction => {
-                    ("PREPARE TRANSACTION", false, self.recipe())
-                }
-                crate::_internal::analysis::mutations::OpaqueMutation::SetTransaction => {
-                    ("SET TRANSACTION", false, self.recipe())
-                }
-                crate::_internal::analysis::mutations::OpaqueMutation::SetConstraints => {
-                    ("SET CONSTRAINTS", false, self.recipe())
-                }
-                crate::_internal::analysis::mutations::OpaqueMutation::StateCollision(msg) => {
-                    (msg.as_str(), true, self.recipe())
-                }
-                crate::_internal::analysis::mutations::OpaqueMutation::UnresolvedReference {
-                    ..
-                } => {
-                    unreachable!("UnresolvedReference is never treated as a schema drift collision")
-                }
-            };
-
-            if is_collision {
-                violations.push(Violation {
-                    source_range: None,
-                    rule_id: "schema-drift",
-                    operation_kind: OperationKind::Conflict,
-                    object_kind: ObjectKind::Opaque,
-                    object_name: "<dynamic>".to_string(),
-                    tier: ViolationTier::Tier1,
-                    reason: format!("Migration state conflict: {}", block_type),
-                    recipe: "This migration attempts to create an object that already exists, or alter an object that does not. The simulated state has derailed.",
-                    dedup_key: None,
-                    sql: None,
-                    fk_dependency_related: false,
-                });
-            } else {
-                violations.push(Violation {
-                    source_range: None,
-                    rule_id: self.id(),
-                    operation_kind: OperationKind::OpaqueSql,
-                    object_kind: ObjectKind::Opaque,
-                    object_name: "<dynamic>".to_string(),
-                    tier: self.default_tier(),
-                    reason: format!("Encountered opaque {}", block_type),
-                    recipe,
-                    dedup_key: None,
-                    sql: None,
-                    fk_dependency_related: false,
-                });
-            }
+        // A missing baseline object is `schema-drift`'s concern, not opaque SQL.
+        if matches!(
+            context.mutation(),
+            Mutation::Opaque(OpaqueMutation::UnresolvedReference { .. })
+        ) {
+            return Vec::new();
         }
 
-        violations
+        let Mutation::Opaque(op) = context.mutation() else {
+            return Vec::new();
+        };
+
+        let (block_type, recipe) = match op {
+            OpaqueMutation::UnsupportedStatement => (
+                "unsupported SQL statement",
+                "This SQL statement is not modeled. Review its PostgreSQL behavior before deploying.",
+            ),
+            OpaqueMutation::DoBlock => ("DO block", self.recipe()),
+            OpaqueMutation::Execute => ("EXECUTE statement", self.recipe()),
+            OpaqueMutation::PrepareTransaction => ("PREPARE TRANSACTION", self.recipe()),
+            OpaqueMutation::SetTransaction => ("SET TRANSACTION", self.recipe()),
+            OpaqueMutation::SetConstraints => ("SET CONSTRAINTS", self.recipe()),
+            OpaqueMutation::UnresolvedReference { .. } => return Vec::new(),
+        };
+
+        // The statement is deliberately unmodeled, so it has no catalog object
+        // to name; `object_name` reports that honestly instead of inventing one.
+        vec![Violation {
+            source_range: None,
+            rule_id: self.id(),
+            operation_kind: OperationKind::OpaqueSql,
+            object_kind: ObjectKind::Opaque,
+            object_name: "opaque statement".to_string(),
+            tier: self.default_tier(),
+            reason: format!("Encountered opaque {}", block_type),
+            recipe,
+            dedup_key: None,
+            sql: None,
+            fk_dependency_related: false,
+        }]
     }
 }

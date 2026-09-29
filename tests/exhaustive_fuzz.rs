@@ -487,7 +487,7 @@ mod exhaustive_fuzz_tests {
             })
             .expect("releasing a savepoint discarded by ROLLBACK TO must be reported");
         assert_eq!(conflict.object_kind, ObjectKind::Unknown);
-        assert_eq!(conflict.object_name, "<migration-state>");
+        assert_eq!(conflict.object_name, "migration state");
         assert!(conflict.recipe.contains("schema state"));
         assert!(!conflict.recipe.contains("each column"));
         assert!(state.local.transactions.is_empty());

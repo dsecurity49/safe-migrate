@@ -10,7 +10,7 @@ use crate::_internal::analysis::mutations::{
 };
 use crate::_internal::analysis::state::AnalysisState;
 use crate::_internal::ast::identifiers::{ObjectId, QualifiedName};
-
+use crate::_internal::report::violations::ObjectKind;
 impl Resolver {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn resolve_create_table(
@@ -230,6 +230,7 @@ impl Resolver {
     ) -> Vec<Mutation> {
         let id = Self::resolve_relation_lookup_name(name, state);
         let mut mutations = Vec::with_capacity(actions.len());
+        mutations.extend(Self::unresolved_reference(ObjectKind::Table, &id, state));
         for action_fact in actions {
             let action = match action_fact {
                 AlterTableActionFact::AddColumn {

@@ -82,15 +82,9 @@ pub(crate) enum ResetSettingTarget {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum TypeCreationKind {
-    Enum {
-        variants: Vec<String>,
-    },
-    #[expect(dead_code, reason = "reserved for typed Squawk range support")]
+    Enum { variants: Vec<String> },
     Range,
-    Composite {
-        fields: Vec<CompositeFieldFact>,
-    },
-    #[expect(dead_code, reason = "reserved for typed Squawk base-type support")]
+    Composite { fields: Vec<CompositeFieldFact> },
     Base,
 }
 

@@ -61,3 +61,5 @@ mod transaction_lifecycle;
 mod v045_state;
 #[path = "../tests/v060_timeouts.rs"]
 mod v060_timeouts;
+#[path = "../tests/v070_stub_removal.rs"]
+mod v070_stub_removal;

@@ -124,7 +124,11 @@ pub(crate) enum Mutation {
     ResetSettings(ResetSettingTarget),
     /// Statement-scoped no-op evaluated after real mutations so timeout
     /// rules do not report on statements PostgreSQL would not execute.
-    CheckTimeouts,
+    /// Synthetic check raised for a statement that may block. `subject` is
+    /// the object the statement acts on, absent when it has no single one.
+    CheckTimeouts {
+        subject: Option<(crate::_internal::report::violations::ObjectKind, String)>,
+    },
     BeginTransaction,
     CommitTransaction,
     CommitAndChain,
@@ -707,20 +711,11 @@ pub(crate) enum OpaqueMutation {
     UnsupportedStatement,
     DoBlock,
     Execute,
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "reserved for dynamic SQL extracted from procedural bodies"
-        )
-    )]
-    DynamicSql,
     PrepareTransaction,
     SetTransaction,
     SetConstraints,
-    #[expect(dead_code, reason = "reserved for opaque resolver collisions")]
-    StateCollision(String),
-    #[expect(dead_code, reason = "reserved for unresolved typed references")]
+    /// A statement named a catalog object that the baseline does not contain.
+    /// `schema-drift` reports which object was missing.
     UnresolvedReference {
         object_kind: crate::_internal::report::violations::ObjectKind,
         object_name: String,

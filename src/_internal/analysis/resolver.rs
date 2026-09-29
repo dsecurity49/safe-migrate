@@ -4,6 +4,7 @@ use crate::_internal::analysis::namespace::temp_object_id;
 use crate::_internal::analysis::state::AnalysisState;
 use crate::_internal::ast::identifiers::{ObjectId, QualifiedName};
 use crate::_internal::model::data_type::{ParsedDataType, TypeIdentity};
+use crate::_internal::report::violations::ObjectKind;
 
 mod relation;
 mod relation_aux;
@@ -80,6 +81,29 @@ impl Resolver {
             AnalysisState::relation_namespace_object_is_present,
             AnalysisState::relation_search_path,
         )
+    }
+
+    /// A `schema-drift` diagnostic for a statement that names an object the
+    /// baseline does not contain.
+    ///
+    /// Only emitted when absence is authoritative: without a synced baseline
+    /// the object may simply be unknown, which is a taint rather than drift.
+    pub(super) fn unresolved_reference(
+        kind: ObjectKind,
+        id: &ObjectId,
+        state: &AnalysisState,
+    ) -> Option<Mutation> {
+        // Absence must be both real and authoritative: an object created
+        // earlier in the migration is present locally, and without a synced
+        // baseline a miss only means unknown.
+        let absent = !state.relation_namespace_object_is_present(id)
+            && state.relation_absence_is_authoritative(id);
+        absent.then(|| {
+            Mutation::Opaque(OpaqueMutation::UnresolvedReference {
+                object_kind: kind,
+                object_name: id.to_string(),
+            })
+        })
     }
 
     fn resolve_type_lookup_name(name: &QualifiedName, state: &AnalysisState) -> ObjectId {

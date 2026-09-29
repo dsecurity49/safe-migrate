@@ -47,7 +47,7 @@ impl Rule for ConflictRule {
                 rule_id: Self::ID,
                 operation_kind: OperationKind::Conflict,
                 object_kind: ObjectKind::Unknown,
-                object_name: "<migration-state>".to_string(),
+                object_name: "migration state".to_string(),
                 tier: Self::DEFAULT_TIER,
                 reason: format!("Migration chain conflict: {}", reason),
                 recipe: Self::RECIPE,
@@ -77,7 +77,7 @@ mod tests {
                     .to_string(),
         };
         let mutation =
-            Mutation::Opaque(crate::_internal::analysis::mutations::OpaqueMutation::DynamicSql);
+            Mutation::Opaque(crate::_internal::analysis::mutations::OpaqueMutation::DoBlock);
         let pre_state = crate::_internal::analysis::state::PreState {
             relations: HashMap::new(),
             functions: HashMap::new(),
@@ -99,7 +99,7 @@ mod tests {
         assert_eq!(violations[0].rule_id, "chain-conflict");
         assert_eq!(violations[0].tier, ViolationTier::Tier1);
         assert_eq!(violations[0].object_kind, ObjectKind::Unknown);
-        assert_eq!(violations[0].object_name, "<migration-state>");
+        assert_eq!(violations[0].object_name, "migration state");
         assert!(violations[0].reason.contains("Migration chain conflict"));
         assert!(violations[0].recipe.contains("schema state"));
         assert!(!violations[0].recipe.contains("each column"));
@@ -110,7 +110,7 @@ mod tests {
         let rule = ConflictRule;
         let result = MutationResult::Applied;
         let mutation =
-            Mutation::Opaque(crate::_internal::analysis::mutations::OpaqueMutation::DynamicSql);
+            Mutation::Opaque(crate::_internal::analysis::mutations::OpaqueMutation::DoBlock);
         let pre_state = crate::_internal::analysis::state::PreState {
             relations: HashMap::new(),
             functions: HashMap::new(),

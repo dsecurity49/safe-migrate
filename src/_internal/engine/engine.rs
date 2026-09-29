@@ -123,7 +123,7 @@ impl SafeMigrateEngine {
         sql: &str,
         state: &mut AnalysisState,
     ) -> Result<Vec<Violation>, Vec<String>> {
-        self.analyze_chain(&[("<inline>".to_string(), sql.to_string())], state)
+        self.analyze_chain(&[("inline".to_string(), sql.to_string())], state)
     }
 
     /// Analyze ordered files and retain reportable source locations for every
@@ -346,7 +346,12 @@ impl SafeMigrateEngine {
                 )],
             };
             if squawk_linter::analyze::possibly_slow_stmt(&stmt) {
-                mutations.push(Mutation::CheckTimeouts);
+                // Report against the object the statement acts on, so the
+                // finding names it instead of the statement as a whole.
+                // `primary_object` is None for diagnostic mutations, so a
+                // drift finding is never mistaken for the subject.
+                let subject = mutations.iter().find_map(|m| m.primary_object());
+                mutations.push(Mutation::CheckTimeouts { subject });
             }
             let started_in_transaction = state.in_transaction();
             let transaction_control = mutations.iter().any(|mutation| {

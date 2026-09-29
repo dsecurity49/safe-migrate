@@ -1924,6 +1924,16 @@ impl AnalysisState {
         self.relation_is_present(id) || self.sequence_is_present(id) || self.index_is_present(id)
     }
 
+    /// Whether a miss on `id` proves the object is absent from the baseline
+    /// rather than merely unknown. Only a synced baseline with relation
+    /// coverage can support a `schema-drift` claim.
+    pub(crate) fn relation_absence_is_authoritative(&self, id: &ObjectId) -> bool {
+        self.schema_absence_is_authoritative(&id.schema)
+            && self
+                .baseline_coverage
+                .has(crate::_internal::db::cache::CatalogFamily::Relations)
+    }
+
     /// Pick a generated name while also avoiding names reserved by other
     /// constraints in the same CREATE TABLE statement. The ordinary helper
     /// only sees already-applied state, which is not enough for a batch of
@@ -3113,7 +3123,7 @@ impl AnalysisState {
             Mutation::SearchPath(search_path) => self.apply_search_path(search_path),
             Mutation::TimeoutSetting(timeout) => self.apply_timeout_setting(timeout),
             Mutation::ResetSettings(target) => self.apply_reset_settings(target),
-            Mutation::CheckTimeouts => self.apply_check_timeouts(),
+            Mutation::CheckTimeouts { .. } => self.apply_check_timeouts(),
             Mutation::SwitchRole {
                 role,
                 local,
@@ -3400,7 +3410,6 @@ impl AnalysisState {
         }
     }
 
-    #[allow(dead_code)]
     fn snapshot_pending_validation(&mut self) {
         if let Some(frame) = self.local.transactions.last_mut() {
             frame.undo_log.push(StateChange::PendingValidationSnapshot {

@@ -1127,7 +1127,7 @@ impl DbCache {
                                 }
                                 format!(
                                     "table:{}:{table_name}",
-                                    schema.unwrap_or_else(|| "<unqualified>".to_string())
+                                    schema.unwrap_or_else(|| "unqualified".to_string())
                                 )
                             }
                             crate::_internal::analysis::facts::PublicationObjectFact::SchemaTables {

@@ -168,7 +168,7 @@ impl Rule for BlockingConstraintRule {
                     not_valid: false,
                     ..
                 } => {
-                    let name_str = constraint_name.as_deref().unwrap_or("<unnamed>");
+                    let name_str = constraint_name.as_deref().unwrap_or("unnamed");
                     let mut reason = format!(
                         "Synchronous CHECK constraint '{}' addition on {}",
                         name_str, alter.id
@@ -197,7 +197,7 @@ impl Rule for BlockingConstraintRule {
                     to_table,
                     ..
                 } => {
-                    let name_str = constraint_name.as_deref().unwrap_or("<unnamed>");
+                    let name_str = constraint_name.as_deref().unwrap_or("unnamed");
 
                     let mut reason = format!(
                         "Synchronous FOREIGN KEY constraint '{}' addition locks {} and {}",

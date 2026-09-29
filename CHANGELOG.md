@@ -7,6 +7,20 @@ notes are available on the
 
 ## v0.10.0 — unreleased
 
+- Findings now name the object they concern. `require-lock-timeout` and
+  `require-statement-timeout` report the table, index, view, or function the
+  slow statement acts on instead of `<statement>`, and fall back to
+  `unknown statement` when a statement has no single subject.
+- Report placeholders are now plain names rather than angle-bracket tokens:
+  `opaque statement`, `migration state`, `unnamed`, and `unqualified`.
+- `CREATE TYPE ... AS RANGE` and `CREATE TYPE ... (INPUT = ...)` are now
+  modeled as the `range` and `base` type kinds the catalog reports, instead of
+  falling through to the opaque path. A migration that creates one no longer
+  taints confidence to `Tainted`.
+- `schema-drift` now fires when a migration references a relation that is
+  provably absent from a synchronized baseline. Without a baseline, or for an
+  object created earlier in the same migration, only a taint is raised, so an
+  unknown object is never reported as drift.
 - Added `require-concurrent-reindex` to flag `REINDEX` that should run with
   `CONCURRENTLY`, bringing the rule count to 30.
 - Added `ALTER MATERIALIZED VIEW` action extraction, state resolution, and

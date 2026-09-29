@@ -3,6 +3,7 @@ pub(crate) mod expr_ir;
 pub(crate) mod expr_visitor;
 pub(crate) mod facts;
 pub(crate) mod graph;
+mod mutation_object;
 pub(crate) mod mutations;
 pub(crate) mod namespace;
 pub(crate) mod outcome;
