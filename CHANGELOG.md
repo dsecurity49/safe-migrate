@@ -21,6 +21,12 @@ notes are available on the
   provably absent from a synchronized baseline. Without a baseline, or for an
   object created earlier in the same migration, only a taint is raised, so an
   unknown object is never reported as drift.
+- Renaming a type now preserves the schema qualification its dependents were
+  written with, matching PostgreSQL. A domain declared over `sm_core.mood`
+  reported `sm_core.emotion` after the rename rather than a bare `emotion`.
+- Fixed the `require-concurrent-reindex` and `alter-index` differential
+  fixtures being scoped to `public` only, while their SQL uses unqualified
+  names that resolve in the harness schema.
 - `ALTER INDEX ... ALTER [COLUMN] c SET STATISTICS n` is now validated instead
   of being accepted unconditionally. A target below `-1`, and a target on a
   non-expression index column, are reported as conflicts; a target above

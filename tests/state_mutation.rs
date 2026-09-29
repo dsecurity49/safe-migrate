@@ -4557,7 +4557,7 @@ mod state_mutation_tests {
                 .unwrap()
                 .data_type
                 .as_deref(),
-            Some("\"Emotion\"")
+            Some("public.\"Emotion\"")
         );
         assert_eq!(
             quoted_entries.get_column("status").unwrap().type_id,
@@ -4579,11 +4579,11 @@ mod state_mutation_tests {
         let Some(FunctionOverlay::Present(function)) = state
             .local
             .functions
-            .get(&object_id("other", "quoted_mood(\"Emotion\")"))
+            .get(&object_id("other", "quoted_mood(public.\"Emotion\")"))
         else {
             panic!("quoted remapped function missing");
         };
-        assert_eq!(function.return_type, "\"Emotion\"");
+        assert_eq!(function.return_type, "public.\"Emotion\"");
     }
 
     #[test]

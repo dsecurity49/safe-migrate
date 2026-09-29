@@ -1907,9 +1907,13 @@ impl AnalysisState {
 
     fn remapped_type_display(raw: &str, new_id: &ObjectId, schema_changed: bool) -> String {
         let suffix = raw.find('[').map(|index| &raw[index..]).unwrap_or("");
+        // Keep the qualification the reference was written with; a moved type
+        // gains one, or the reference would no longer resolve.
+        let was_qualified =
+            Self::parse_type_reference(raw).is_some_and(|(schema, _)| schema.is_some());
         format!(
             "{}{}",
-            Self::type_reference_name(new_id, schema_changed),
+            Self::type_reference_name(new_id, was_qualified || schema_changed),
             suffix
         )
     }

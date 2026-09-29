@@ -2667,7 +2667,14 @@
     "001_reindex.sql"
    ],
    "schemas": [
-    "public"
+    "public",
+    "sm_identity",
+    "sm_core",
+    "sm_catalog",
+    "sm_billing",
+    "sm_fulfillment",
+    "sm_audit",
+    "sm_analytics"
    ],
    "scope": [
     "relations",
@@ -2688,7 +2695,14 @@
     "safe_001_alter_index.sql"
    ],
    "schemas": [
-    "public"
+    "public",
+    "sm_identity",
+    "sm_core",
+    "sm_catalog",
+    "sm_billing",
+    "sm_fulfillment",
+    "sm_audit",
+    "sm_analytics"
    ],
    "scope": [
     "relations",
