@@ -42,6 +42,11 @@ notes are available on the
   declaration taints rather than being reported as an error.
 - An empty effective `search_path` no longer places unqualified names in
   `public`. PostgreSQL has no creation target in that case and errors.
+- Temporary relations are now placed in the session's temporary schema, which
+  is searched ahead of the path for relations and types but not for routines.
+  A temporary table no longer collides with a permanent table of the same
+  name, and a later unqualified `ALTER TABLE` correctly targets the temporary
+  one.
 
 ## v0.9.3 — 2026-09-23
 

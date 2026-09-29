@@ -5,6 +5,7 @@ use crate::_internal::analysis::graph::{DependencyEdge, DependencyKind};
 use crate::_internal::analysis::mutations::{
     AlterTable, AlterTableActionMutation, CreateTable, DropTable, PersistenceMutation, Rename,
 };
+use crate::_internal::analysis::namespace::is_session_temp_schema;
 use crate::_internal::ast::identifiers::ObjectId;
 use crate::_internal::model::constraint::{ConstraintKind, ConstraintState};
 use crate::_internal::model::data_type::{
@@ -1285,6 +1286,13 @@ impl AnalysisState {
         {
             return MutationResult::Conflict {
                 reason: format!("unrecognized partitioning strategy '{strategy}'"),
+            };
+        }
+        if matches!(create.persistence, PersistenceMutation::Temporary)
+            && !is_session_temp_schema(&create.id.schema)
+        {
+            return MutationResult::Conflict {
+                reason: "cannot create temporary relation in non-temporary schema".to_string(),
             };
         }
         if let Err(result) = self.ensure_schema_target(&create.id.schema) {
@@ -2632,6 +2640,9 @@ impl AnalysisState {
             resolved_persistence,
             self.local.transactions.len(),
         );
+        if matches!(create.persistence, PersistenceMutation::Temporary) {
+            self.note_temp_object_created();
+        }
         rel_state.on_commit = create.on_commit.map(|action| match action {
             crate::_internal::analysis::mutations::OnCommitMutation::PreserveRows => {
                 crate::_internal::model::relation::OnCommitAction::PreserveRows

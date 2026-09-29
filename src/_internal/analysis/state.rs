@@ -3,6 +3,7 @@ use crate::_internal::analysis::evidence::{
 };
 use crate::_internal::analysis::graph::{DependencyEdge, DependencyGraph, DependencyKind};
 use crate::_internal::analysis::mutations::Mutation;
+use crate::_internal::analysis::namespace::{SESSION_TEMP_SCHEMA, is_session_temp_schema};
 use crate::_internal::analysis::settings::ScopedSetting;
 use crate::_internal::analysis::transaction::{NamespaceSnapshot, StateChange, TransactionFrame};
 use crate::_internal::ast::identifiers::ObjectId;
@@ -110,6 +111,10 @@ pub(crate) struct LocalState {
     pub constraints: HashMap<(ObjectId, String), ConstraintState>,
     pub graph: DependencyGraph,
     pub search_path: Vec<String>,
+    /// Performance hint: a temporary object has been created in this session.
+    /// `temp_namespace_exists` derives the real answer, so this only has to be
+    /// a superset to stay correct across rollback and `ON COMMIT DROP`.
+    pub saw_temp_object: bool,
     pub default_search_path: Vec<String>,
     pub search_path_template: Vec<String>,
     pub session_search_path_template: Vec<String>,
@@ -1240,6 +1245,7 @@ impl AnalysisState {
                 constraints,
                 graph,
                 search_path: default_search_path.clone(),
+                saw_temp_object: false,
                 default_search_path,
                 search_path_template: default_search_path_template.clone(),
                 session_search_path_template: default_search_path_template.clone(),
@@ -1348,6 +1354,36 @@ impl AnalysisState {
     /// this accessor prevents callers from coupling themselves to `LocalState`.
     pub(crate) fn search_path(&self) -> &[String] {
         &self.local.search_path
+    }
+
+    /// Whether this session has a temporary schema, which is searched before
+    /// every explicit path entry for relations and types.
+    pub(crate) fn temp_namespace_exists(&self) -> bool {
+        self.local.saw_temp_object
+            && (self
+                .local
+                .relations
+                .keys()
+                .any(|id| is_session_temp_schema(&id.schema))
+                || self
+                    .local
+                    .types
+                    .keys()
+                    .any(|id| is_session_temp_schema(&id.schema)))
+    }
+
+    /// Schemas to search for an unqualified relation or type, implicit first.
+    pub(crate) fn relation_search_path(&self) -> Vec<String> {
+        if !self.temp_namespace_exists() {
+            return self.local.search_path.clone();
+        }
+        let mut path = vec![SESSION_TEMP_SCHEMA.to_string()];
+        path.extend(self.local.search_path.iter().cloned());
+        path
+    }
+
+    pub(crate) fn note_temp_object_created(&mut self) {
+        self.local.saw_temp_object = true;
     }
 
     /// Returns whether a cache-backed absence is authoritative for an object.
@@ -1603,6 +1639,11 @@ impl AnalysisState {
     /// can prove that a schema exists.  An omitted scoped schema is unknown;
     /// do not manufacture an object there while claiming an exact result.
     pub(super) fn ensure_schema_target(&mut self, schema: &str) -> Result<(), MutationResult> {
+        // The session temporary schema is created on first use, so it is always
+        // a valid target and never something the catalog can prove absent.
+        if is_session_temp_schema(schema) {
+            return Ok(());
+        }
         match self.schema_lookup(schema) {
             ObjectLookup::Present => Ok(()),
             ObjectLookup::Tombstone | ObjectLookup::AuthoritativelyAbsent => {

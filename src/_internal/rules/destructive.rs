@@ -365,7 +365,6 @@ impl Rule for CreateTableAsSelectRule {
         }
         if let Mutation::CreateTable(c) = mutation
             && c.as_select
-            && c.as_select_with_data
         {
             return vec![Violation {
                 source_range: None,

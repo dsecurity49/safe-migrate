@@ -474,14 +474,14 @@
     "009_ctas_where.sql",
     "010_ctas_subquery.sql",
     "005_select_into.sql"
-   ],
-   "excluded_fixtures": [
+  ],
+  "excluded_fixtures": [
     {
-     "fixture": "003_ctas_temp.sql",
-     "reason": "PostgreSQL creates unqualified temporary relations in a session pg_temp_* schema outside the current schema-scoped projection."
+      "fixture": "003_ctas_temp.sql",
+      "reason": "The simulator now places the relation in the session schema, but the harness projection does not include pg_temp, so live PostgreSQL reports it as absent."
     },
     {
-     "fixture": "safe_001_create.sql",
+      "fixture": "safe_001_create.sql",
      "reason": "The cumulative canonical baseline contains sm_core.t for rule_18."
     },
     {
@@ -489,11 +489,11 @@
      "reason": "Already represented by rule_18 and produces no CTAS-specific state."
     },
     {
-     "fixture": "safe_003_create_temp.sql",
-     "reason": "Temporary relations live in a session pg_temp_* schema outside the current projection."
+      "fixture": "safe_003_create_temp.sql",
+      "reason": "The session temporary schema is outside the harness projection, so live PostgreSQL reports the relation as absent."
     },
     {
-     "fixture": "safe_004_create_unlogged.sql",
+      "fixture": "safe_004_create_unlogged.sql",
      "reason": "The cumulative canonical baseline contains sm_core.t for rule_18."
     },
     {

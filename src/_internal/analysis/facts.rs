@@ -174,7 +174,6 @@ pub(crate) enum StatementFact {
         name: QualifiedName,
         if_not_exists: bool,
         as_select: bool,
-        as_select_with_data: bool,
         persistence: PersistenceFact,
         on_commit: Option<OnCommitFact>,
         columns: Vec<ColumnFact>,

@@ -3527,10 +3527,77 @@ mod state_mutation_tests {
             .unwrap();
 
         assert!(matches!(
-            state.get_relation(&object_id("public", "work")),
+            state.get_relation(&object_id("pg_temp", "work")),
             Some(RelationOverlay::Present(relation))
                 if relation.has_column("id") && relation.estimated_rows == Some(0)
         ));
+    }
+
+    #[test]
+    fn temporary_relation_shadows_a_permanent_one_of_the_same_name() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TABLE users (id int);
+                 CREATE TEMP TABLE users (id int, temp_only int);
+                 ALTER TABLE users ADD COLUMN seen int;",
+                &mut state,
+            )
+            .unwrap();
+
+        // The unqualified ALTER targets the temporary relation, because the
+        // session schema is searched first.
+        let temp = state
+            .get_relation(&object_id("pg_temp", "users"))
+            .expect("temporary table must exist in the session schema");
+        assert!(
+            matches!(temp, RelationOverlay::Present(relation) if relation.has_column("temp_only")
+                && relation.has_column("seen")),
+            "the ALTER must land on the temporary relation: {temp:?}"
+        );
+
+        let permanent = state
+            .get_relation(&object_id("public", "users"))
+            .expect("permanent table must be untouched");
+        assert!(
+            matches!(permanent, RelationOverlay::Present(relation) if !relation.has_column("seen")),
+            "the permanent relation must not be modified: {permanent:?}"
+        );
+    }
+
+    #[test]
+    fn a_named_schema_is_rejected_for_a_temporary_relation() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let v = engine
+            .analyze("CREATE TEMP TABLE public.work (id int);", &mut state)
+            .unwrap();
+        assert!(
+            v.iter().any(|v| v
+                .reason
+                .contains("cannot create temporary relation in non-temporary schema")),
+            "expected PostgreSQL's rejection: {v:?}"
+        );
+    }
+
+    #[test]
+    fn routines_do_not_resolve_through_the_temporary_schema() {
+        // PostgreSQL skips the temp namespace for functions and operators, so a
+        // temp table must never satisfy a routine reference.
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let v = engine
+            .analyze(
+                "CREATE TEMP TABLE f (id int);
+                 DROP FUNCTION f();",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !state.relation_is_present(&object_id("public", "f")),
+            "the temp table must not be visible under public: {v:?}"
+        );
     }
 
     #[test]

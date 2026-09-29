@@ -1,5 +1,6 @@
 use crate::_internal::analysis::facts::StatementFact;
 use crate::_internal::analysis::mutations::{Mutation, OpaqueMutation};
+use crate::_internal::analysis::namespace::temp_object_id;
 use crate::_internal::analysis::state::AnalysisState;
 use crate::_internal::ast::identifiers::{ObjectId, QualifiedName};
 use crate::_internal::model::data_type::{ParsedDataType, TypeIdentity};
@@ -30,18 +31,34 @@ impl Resolver {
         ObjectId::new(schema, name.name.resolve())
     }
 
+    /// Creation target for a relation declared `TEMPORARY`, which PostgreSQL
+    /// always places in the session schema rather than the path.
+    ///
+    /// An explicitly named schema is kept so the state machine can reject it,
+    /// as PostgreSQL does for a temporary relation in a permanent schema.
+    pub(super) fn resolve_temp_creation_name(
+        name: &QualifiedName,
+        _state: &AnalysisState,
+    ) -> ObjectId {
+        match &name.schema {
+            Some(schema) => ObjectId::new(schema.resolve(), name.name.resolve()),
+            None => temp_object_id(&name.name.resolve()),
+        }
+    }
+
     fn resolve_in_namespace(
         name: &QualifiedName,
         object_name: String,
         state: &AnalysisState,
         present: impl Fn(&AnalysisState, &ObjectId) -> bool,
+        search: impl Fn(&AnalysisState) -> Vec<String>,
     ) -> ObjectId {
         if let Some(schema_ident) = &name.schema {
             return ObjectId::new(schema_ident.resolve(), object_name);
         }
 
-        for schema in state.search_path() {
-            let mut candidate = ObjectId::new(schema.clone(), object_name.clone());
+        for schema in search(state) {
+            let mut candidate = ObjectId::new(schema, object_name.clone());
             if present(state, &candidate) {
                 candidate.inferred_schema = true;
                 return candidate;
@@ -61,6 +78,7 @@ impl Resolver {
             name.name.resolve(),
             state,
             AnalysisState::relation_namespace_object_is_present,
+            AnalysisState::relation_search_path,
         )
     }
 
@@ -70,6 +88,7 @@ impl Resolver {
             name.name.resolve(),
             state,
             AnalysisState::type_is_present,
+            AnalysisState::relation_search_path,
         )
     }
 
@@ -84,7 +103,14 @@ impl Resolver {
             .collect::<Vec<_>>()
             .join(",");
         let object_name = format!("{}({signature})", name.name.resolve());
-        Self::resolve_in_namespace(name, object_name, state, AnalysisState::routine_is_present)
+        // Routines deliberately skip the temporary schema; PostgreSQL does too.
+        Self::resolve_in_namespace(
+            name,
+            object_name,
+            state,
+            AnalysisState::routine_is_present,
+            |state| state.search_path().to_vec(),
+        )
     }
 
     fn resolve_constraint_index_name(name: &QualifiedName, table: &ObjectId) -> ObjectId {
@@ -175,7 +201,6 @@ impl Resolver {
                 name,
                 if_not_exists,
                 as_select,
-                as_select_with_data,
                 persistence,
                 on_commit,
                 columns,
@@ -197,7 +222,6 @@ impl Resolver {
                     name,
                     *if_not_exists,
                     *as_select,
-                    *as_select_with_data,
                     persistence,
                     *on_commit,
                     columns,

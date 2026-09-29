@@ -17,7 +17,6 @@ impl Resolver {
         name: &QualifiedName,
         if_not_exists: bool,
         as_select: bool,
-        as_select_with_data: bool,
         persistence: &PersistenceFact,
         on_commit: Option<crate::_internal::analysis::facts::OnCommitFact>,
         columns: &[ColumnFact],
@@ -185,11 +184,16 @@ impl Resolver {
                 to_columns: foreign_key.to_columns.clone(),
             })
             .collect();
+        let is_temporary = matches!(persistence, PersistenceMutation::Temporary);
+        let id = if is_temporary {
+            Self::resolve_temp_creation_name(name, state)
+        } else {
+            Self::resolve_creation_name(name, state)
+        };
         Mutation::CreateTable(CreateTable {
-            id: Self::resolve_creation_name(name, state),
+            id,
             if_not_exists,
             as_select,
-            as_select_with_data,
             as_select_columns_known,
             persistence,
             on_commit,
