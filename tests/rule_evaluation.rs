@@ -1,6 +1,6 @@
 mod rule_evaluation_tests {
     use crate::common::*;
-    use safe_migrate::_internal::analysis::state::{AnalysisState, Confidence};
+    use safe_migrate::_internal::analysis::state::{AnalysisState, Confidence, RelationOverlay};
     use safe_migrate::_internal::ast::identifiers::ObjectId;
     use safe_migrate::_internal::engine::engine::SafeMigrateEngine;
     use safe_migrate::_internal::model::column::Column;
@@ -1398,6 +1398,144 @@ mod rule_evaluation_tests {
             finding.recipe.contains("USING INDEX"),
             "USING INDEX is valid for UNIQUE: {}",
             finding.recipe
+        );
+    }
+
+    #[test]
+    fn view_reloptions_are_modelled_rather_than_ignored() {
+        let engine = setup_engine();
+        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        cache.pg_version_num = Some(180_000);
+        let mut state = AnalysisState::new(cache);
+        state.baseline_available = true;
+
+        let v = engine
+            .analyze(
+                "CREATE TABLE base_v (id int);
+                 CREATE VIEW v AS SELECT id FROM base_v;
+                 ALTER VIEW v SET (security_barrier = true);",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !v.iter().any(|v| v.rule_id == "chain-conflict"),
+            "a recognised option must apply cleanly: {v:?}"
+        );
+        assert_eq!(
+            state.local.confidence,
+            safe_migrate::_internal::analysis::state::Confidence::Exact
+        );
+
+        let relation = state
+            .get_relation(&object_id("public", "v"))
+            .expect("view must exist");
+        assert!(
+            matches!(relation, RelationOverlay::Present(r)
+                if r.table_options.get("security_barrier") == Some(&"true".to_string())),
+            "the option must be stored: {relation:?}"
+        );
+    }
+
+    #[test]
+    fn view_reloption_rejected_by_version_is_a_conflict() {
+        let engine = setup_engine();
+        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        cache.pg_version_num = Some(140_000);
+        let mut state = AnalysisState::new(cache);
+        state.baseline_available = true;
+
+        // security_invoker arrived in PostgreSQL 15.
+        let v = engine
+            .analyze(
+                "CREATE TABLE base_v (id int);
+                 CREATE VIEW v AS SELECT id FROM base_v;
+                 ALTER VIEW v SET (security_invoker = true);",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            v.iter()
+                .any(|v| v.reason.contains("unrecognized parameter")),
+            "PG14 must reject security_invoker: {v:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_view_reloption_taints_without_claiming_an_error() {
+        let engine = setup_engine();
+        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        cache.pg_version_num = Some(180_000);
+        let mut state = AnalysisState::new(cache);
+        state.baseline_available = true;
+
+        let v = engine
+            .analyze(
+                "CREATE TABLE base_v (id int);
+                 CREATE VIEW v AS SELECT id FROM base_v;
+                 ALTER VIEW v SET (some_future_option = 1);",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !v.iter().any(|v| v.rule_id == "chain-conflict"),
+            "an unplaceable name must not be reported as an error: {v:?}"
+        );
+        assert_eq!(
+            state.local.confidence,
+            safe_migrate::_internal::analysis::state::Confidence::Tainted
+        );
+    }
+
+    #[test]
+    fn version_dependent_reloption_without_a_baseline_does_not_conflict() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let v = engine
+            .analyze(
+                "CREATE TABLE base_v (id int);
+                 CREATE VIEW v AS SELECT id FROM base_v;
+                 ALTER VIEW v SET (security_invoker = true);",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !v.iter()
+                .any(|v| v.reason.contains("unrecognized parameter")),
+            "an unknown version cannot justify rejecting a name: {v:?}"
+        );
+    }
+
+    #[test]
+    fn view_reloptions_are_version_specific() {
+        // security_definer is the pre-15 inverse of security_invoker.
+        assert_eq!(
+            crate::_internal::model::reloption::classify(
+                crate::_internal::model::reloption::view_reloption("security_definer"),
+                Some(140_000)
+            ),
+            crate::_internal::model::reloption::ReloptionOutcome::Accepted
+        );
+        assert_eq!(
+            crate::_internal::model::reloption::classify(
+                crate::_internal::model::reloption::view_reloption("security_definer"),
+                Some(180_000)
+            ),
+            crate::_internal::model::reloption::ReloptionOutcome::Rejected
+        );
+    }
+
+    #[test]
+    fn materialized_view_accepts_storage_reloptions_views_reject() {
+        use crate::_internal::model::reloption::{
+            ReloptionOutcome, classify, materialized_view_reloption, view_reloption,
+        };
+        assert_eq!(
+            classify(materialized_view_reloption("fillfactor"), Some(180_000)),
+            ReloptionOutcome::Accepted
+        );
+        assert_eq!(
+            classify(view_reloption("fillfactor"), Some(180_000)),
+            ReloptionOutcome::Unknown
         );
     }
 

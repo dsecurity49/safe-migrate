@@ -3079,6 +3079,14 @@ impl AnalysisState {
             Mutation::ChangeRelationOwner { id, new_owner } => {
                 self.apply_change_relation_owner(id, new_owner)
             }
+            Mutation::SetReloptions {
+                id,
+                kind,
+                attributes,
+            } => self.apply_set_reloptions(id, *kind, attributes),
+            Mutation::ResetReloptions { id, kind, names } => {
+                self.apply_reset_reloptions(id, *kind, names)
+            }
             Mutation::SearchPath(search_path) => self.apply_search_path(search_path),
             Mutation::TimeoutSetting(timeout) => self.apply_timeout_setting(timeout),
             Mutation::ResetSettings(target) => self.apply_reset_settings(target),

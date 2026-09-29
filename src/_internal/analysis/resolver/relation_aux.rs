@@ -7,7 +7,7 @@ use crate::_internal::analysis::mutations::{
     AlterIndexActionMutation, AlterIndexMutation, CreateIndex, CreateMaterializedView,
     CreatePolicyMutation, CreateTriggerMutation, CreateView, DropPolicyMutation,
     DropTriggerMutation, Mutation, OpaqueMutation, RefreshMaterializedViewMutation,
-    ReindexTargetMutation, Rename, RenameTriggerMutation,
+    ReindexTargetMutation, ReloptionTarget, Rename, RenameTriggerMutation,
 };
 use crate::_internal::analysis::state::AnalysisState;
 use crate::_internal::ast::identifiers::{ObjectId, QualifiedName};
@@ -84,10 +84,17 @@ impl Resolver {
             AlterViewAction::RenameColumn { .. } => {
                 Some(Mutation::Opaque(OpaqueMutation::UnsupportedStatement))
             }
-            AlterViewAction::SetDefault { .. }
-            | AlterViewAction::DropDefault { .. }
-            | AlterViewAction::SetOptions { .. }
-            | AlterViewAction::ResetOptions { .. } => None,
+            AlterViewAction::SetDefault { .. } | AlterViewAction::DropDefault { .. } => None,
+            AlterViewAction::SetOptions { options } => Some(Mutation::SetReloptions {
+                id: Self::resolve_relation_lookup_name(name, state),
+                kind: ReloptionTarget::View,
+                attributes: options.clone(),
+            }),
+            AlterViewAction::ResetOptions { options } => Some(Mutation::ResetReloptions {
+                id: Self::resolve_relation_lookup_name(name, state),
+                kind: ReloptionTarget::View,
+                names: options.iter().map(|option| option.name.clone()).collect(),
+            }),
         }
     }
 
@@ -139,8 +146,20 @@ impl Resolver {
             | AlterMaterializedViewActionFact::NoDependsOnExtension { .. } => {
                 Some(Mutation::Opaque(OpaqueMutation::UnsupportedStatement))
             }
-            AlterMaterializedViewActionFact::SetOptions { .. }
-            | AlterMaterializedViewActionFact::ResetOptions { .. } => None,
+            AlterMaterializedViewActionFact::SetOptions { options } => {
+                Some(Mutation::SetReloptions {
+                    id: Self::resolve_relation_lookup_name(name, state),
+                    kind: ReloptionTarget::MaterializedView,
+                    attributes: options.clone(),
+                })
+            }
+            AlterMaterializedViewActionFact::ResetOptions { options } => {
+                Some(Mutation::ResetReloptions {
+                    id: Self::resolve_relation_lookup_name(name, state),
+                    kind: ReloptionTarget::MaterializedView,
+                    names: options.iter().map(|option| option.name.clone()).collect(),
+                })
+            }
         }
     }
 

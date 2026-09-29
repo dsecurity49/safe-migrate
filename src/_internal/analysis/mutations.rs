@@ -37,6 +37,14 @@ pub(crate) enum ReindexTargetMutation {
     Index(ObjectId),
 }
 
+/// Which relation kind a reloption statement targets, so the state machine can
+/// validate the name against the accepted surface for that kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReloptionTarget {
+    View,
+    MaterializedView,
+}
+
 impl ReindexTargetMutation {
     /// Human-readable name of the reindex target, suitable for violation messages.
     pub(crate) fn object_name(&self) -> String {
@@ -87,6 +95,18 @@ pub(crate) enum Mutation {
     ChangeRelationOwner {
         id: ObjectId,
         new_owner: crate::_internal::analysis::facts::RoleFact,
+    },
+    /// Reloptions on a view or materialized view, which stores them in the
+    /// same map as table reloptions.
+    SetReloptions {
+        id: ObjectId,
+        kind: ReloptionTarget,
+        attributes: Vec<crate::_internal::analysis::facts::AttributeFact>,
+    },
+    ResetReloptions {
+        id: ObjectId,
+        kind: ReloptionTarget,
+        names: Vec<String>,
     },
     SearchPath(SearchPathChange),
     TimeoutSetting(TimeoutSettingChange),

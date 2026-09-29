@@ -251,7 +251,30 @@ mod state_machine_guards_tests {
     }
 
     #[test]
-    fn alter_view_set_options_does_not_taint() {
+    fn alter_view_set_options_stays_exact_for_a_version_agnostic_option() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE TABLE source (id int); CREATE VIEW v AS SELECT id FROM source;",
+                &mut state,
+            )
+            .expect("view setup should analyze");
+        engine
+            .analyze("ALTER VIEW v SET (security_barrier = true);", &mut state)
+            .expect("ALTER VIEW SET OPTIONS should analyze");
+
+        assert_eq!(
+            state.local.confidence,
+            safe_migrate::_internal::analysis::state::Confidence::Exact
+        );
+    }
+
+    #[test]
+    fn alter_view_set_options_taints_when_the_version_cannot_place_the_option() {
+        // security_invoker arrived in PostgreSQL 15. Without a baseline the
+        // version is unknown, so the option cannot be placed either way.
         let engine = setup_engine();
         let mut state = setup_state();
 
@@ -267,7 +290,7 @@ mod state_machine_guards_tests {
 
         assert_eq!(
             state.local.confidence,
-            safe_migrate::_internal::analysis::state::Confidence::Exact
+            safe_migrate::_internal::analysis::state::Confidence::Tainted
         );
     }
 

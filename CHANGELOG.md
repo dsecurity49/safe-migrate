@@ -55,6 +55,10 @@ notes are available on the
   search path is now read before the catalog queries are pinned to
   `pg_catalog`, so a schema-scoped baseline resolves unqualified names the same
   way the live server does.
+- `ALTER VIEW` and `ALTER MATERIALIZED VIEW` `SET`/`RESET` options are now
+  modelled rather than silently dropped. The option is stored, a name the
+  target version rejects is reported as an error, and a name the analyzer
+  cannot place taints instead of claiming an exact result.
 
 ## v0.9.3 — 2026-09-23
 

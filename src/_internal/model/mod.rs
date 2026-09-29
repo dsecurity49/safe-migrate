@@ -3,6 +3,7 @@ pub(crate) mod constraint;
 pub(crate) mod data_type;
 pub(crate) mod function;
 pub(crate) mod relation;
+pub(crate) mod reloption;
 pub(crate) mod replication;
 pub(crate) mod role;
 pub(crate) mod schema;
