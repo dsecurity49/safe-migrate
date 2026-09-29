@@ -51,6 +51,10 @@ notes are available on the
   constraint, which PostgreSQL refuses to rebuild concurrently.
 - The `EXCLUDE` constraint finding no longer recommends `USING INDEX`, a form
   PostgreSQL rejects with a syntax error.
+- Fixed scoped `sync` recording the wrong name-resolution order. The effective
+  search path is now read before the catalog queries are pinned to
+  `pg_catalog`, so a schema-scoped baseline resolves unqualified names the same
+  way the live server does.
 
 ## v0.9.3 — 2026-09-23
 

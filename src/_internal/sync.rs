@@ -1327,6 +1327,14 @@ fn load_provenance(
         .context("Failed to load search_path setting")?;
     let search_path_setting: String = search_path_row.try_get(0).context("search_path field")?;
 
+    // Must be read before the path is pinned below, or the recorded resolution
+    // order would describe pg_catalog rather than the real search path.
+    let effective_search_path: Vec<String> = client
+        .query_one("SELECT current_schemas(false);", &[])
+        .context("Failed to load the effective PostgreSQL search path")?
+        .try_get(0)
+        .context("effective PostgreSQL search path field")?;
+
     // Protect all subsequent catalog queries from shadowing by explicitly
     // selecting the system schema. This prevents an attacker from creating
     // a public.pg_class view to inject forged baseline data.
@@ -1350,13 +1358,6 @@ fn load_provenance(
         .try_get::<_, Option<i64>>(4)
         .context("synchronization provenance statement_timeout field")?
         .context("PostgreSQL did not report statement_timeout")?;
-
-    let search_path_row = client
-        .query_one("SELECT current_schemas(false);", &[])
-        .context("Failed to load the effective PostgreSQL search path")?;
-    let effective_search_path = search_path_row
-        .try_get(0)
-        .context("effective PostgreSQL search path field")?;
 
     Ok(ProvenanceCatalog {
         pg_version_num,
