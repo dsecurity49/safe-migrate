@@ -199,6 +199,9 @@ pub(crate) enum StatementFact {
         name: QualifiedName,
         or_replace: bool,
         depends_on: Vec<QualifiedName>,
+        select_outputs: Vec<SelectOutputFact>,
+        select_projection_complete: bool,
+        select_source: Option<QualifiedName>,
     },
     AlterView {
         name: QualifiedName,

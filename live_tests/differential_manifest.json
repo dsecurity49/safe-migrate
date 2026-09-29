@@ -723,13 +723,16 @@
     "003_create_index.sql",
     "006_drop_view.sql",
     "007_drop_matview.sql",
+    "008_add_column.sql",
     "014_create_view.sql",
+    "018_add_column_not_null.sql",
     "safe_001_create_if_not_exists.sql",
     "safe_002_drop_if_exists.sql",
     "safe_003_create_index_if_not_exists.sql",
     "safe_006_drop_view_if_exists.sql",
-    "safe_007_drop_matview_if_exists.sql"
-   ],
+    "safe_007_drop_matview_if_exists.sql",
+    "safe_008_add_column_if_not_exists.sql"
+  ],
    "excluded_fixtures": [
     {
      "fixture": "004_drop_index.sql",
@@ -740,12 +743,8 @@
      "reason": "Cache V7 synchronizes sequences, but this rule does not compare sequence state."
     },
     {
-     "fixture": "008_add_column.sql",
-     "reason": "Column-presence scope conflicts with create-view fixtures whose projected output columns are not modeled by the simulator."
-    },
-    {
-     "fixture": "009_drop_column.sql",
-     "reason": "Requires column c in the canonical baseline, which conflicts with add-column fixtures."
+      "fixture": "009_drop_column.sql",
+      "reason": "Requires column c in the canonical baseline, which conflicts with add-column fixtures."
     },
     {
      "fixture": "010_drop_policy.sql",
@@ -772,11 +771,7 @@
      "reason": "Schema existence is not represented in normalized simulator state."
     },
     {
-     "fixture": "018_add_column_not_null.sql",
-     "reason": "Column-presence scope conflicts with create-view fixtures whose projected output columns are not modeled by the simulator."
-    },
-    {
-     "fixture": "safe_004_drop_index_if_exists.sql",
+      "fixture": "safe_004_drop_index_if_exists.sql",
      "reason": "Requires index i in the canonical baseline to produce a state change, which conflicts with enabled create-index fixtures."
     },
     {
@@ -784,11 +779,7 @@
      "reason": "Cache V7 synchronizes sequences, but this rule does not compare sequence state."
     },
     {
-     "fixture": "safe_008_add_column_if_not_exists.sql",
-     "reason": "Column-presence scope conflicts with create-view fixtures whose projected output columns are not modeled by the simulator."
-    },
-    {
-     "fixture": "safe_009_drop_column_if_exists.sql",
+      "fixture": "safe_009_drop_column_if_exists.sql",
      "reason": "Requires column c in the canonical baseline to produce a state change, which conflicts with add-column fixtures."
     },
     {

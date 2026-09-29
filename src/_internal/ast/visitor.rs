@@ -621,36 +621,7 @@ impl AstVisitor {
         });
         let select_outputs = node
             .select_clause()
-            .and_then(|select| select.target_list())
-            .and_then(|targets| {
-                targets
-                    .targets()
-                    .map(|target| {
-                        if target.star_token().is_some() {
-                            return Some(
-                                crate::_internal::analysis::facts::SelectOutputFact::AllColumns,
-                            );
-                        }
-                        let ast::Expr::NameRef(name) = target.expr()? else {
-                            return None;
-                        };
-                        let source_name =
-                            Self::resolve_identifier_token(name.syntax().first_token()?.text());
-                        let output_name = target
-                            .as_name()
-                            .and_then(|alias| alias.name())
-                            .and_then(|name| name.syntax().first_token())
-                            .map(|token| Self::resolve_identifier_token(token.text()))
-                            .unwrap_or_else(|| source_name.clone());
-                        Some(
-                            crate::_internal::analysis::facts::SelectOutputFact::Column {
-                                source_name,
-                                output_name,
-                            },
-                        )
-                    })
-                    .collect::<Option<Vec<_>>>()
-            });
+            .and_then(|select| Self::extract_select_outputs(&select));
         let select_projection_complete = select_source.is_some() && select_outputs.is_some();
         Some(StatementFact::CreateTable {
             name: Self::path_to_qualified_name(&name)?,
@@ -2283,6 +2254,40 @@ impl AstVisitor {
         })
     }
 
+    /// Output columns of a `SELECT`, or `None` when the projection is anything
+    /// other than plain column references. A view's column types come from
+    /// analysing the query, so an expression output cannot be typed offline.
+    fn extract_select_outputs(
+        select: &ast::SelectClause,
+    ) -> Option<Vec<crate::_internal::analysis::facts::SelectOutputFact>> {
+        select
+            .target_list()?
+            .targets()
+            .map(|target| {
+                if target.star_token().is_some() {
+                    return Some(crate::_internal::analysis::facts::SelectOutputFact::AllColumns);
+                }
+                let ast::Expr::NameRef(name) = target.expr()? else {
+                    return None;
+                };
+                let source_name =
+                    Self::resolve_identifier_token(name.syntax().first_token()?.text());
+                let output_name = target
+                    .as_name()
+                    .and_then(|alias| alias.name())
+                    .and_then(|name| name.syntax().first_token())
+                    .map(|token| Self::resolve_identifier_token(token.text()))
+                    .unwrap_or_else(|| source_name.clone());
+                Some(
+                    crate::_internal::analysis::facts::SelectOutputFact::Column {
+                        source_name,
+                        output_name,
+                    },
+                )
+            })
+            .collect::<Option<Vec<_>>>()
+    }
+
     fn extract_create_view(node: &CreateView) -> Option<StatementFact> {
         // View options and WITH CHECK OPTION alter write/security semantics
         // that are not represented by the relation state or dependency graph.
@@ -2290,10 +2295,45 @@ impl AstVisitor {
             return None;
         }
         let path = node.view()?.path()?;
+        // Only a plain `SELECT` exposes a target list. Compound, parenthesized
+        // and `VALUES` queries still create the view, but its columns are then
+        // unknown, so the projection is left incomplete.
+        let (select_source, select_outputs) = match node.query() {
+            Some(ast::SelectVariant::Select(select)) => {
+                let source = select.from_clause().and_then(|from| {
+                    let mut items = from.items();
+                    let item = items.next()?;
+                    if items.next().is_some() {
+                        return None;
+                    }
+                    let ast::FromListItem::FromItem(ast::FromItem::RelationFromItem(relation)) =
+                        item
+                    else {
+                        return None;
+                    };
+                    if relation.tablesample_clause().is_some() {
+                        return None;
+                    }
+                    relation
+                        .relation_name_ref()?
+                        .path_ref()
+                        .and_then(|path| Self::path_ref_to_qualified_name(&path))
+                });
+                let outputs = select
+                    .select_clause()
+                    .and_then(|clause| Self::extract_select_outputs(&clause));
+                (source, outputs)
+            }
+            _ => (None, None),
+        };
+        let select_projection_complete = select_source.is_some() && select_outputs.is_some();
         Some(StatementFact::CreateView {
             name: Self::path_to_qualified_name(&path)?,
             or_replace: node.or_replace().is_some(),
             depends_on: Self::extract_view_dependencies(node.syntax()),
+            select_outputs: select_outputs.unwrap_or_default(),
+            select_projection_complete,
+            select_source,
         })
     }
 

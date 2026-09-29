@@ -1386,6 +1386,23 @@ impl AnalysisState {
         self.local.saw_temp_object = true;
     }
 
+    /// Column names and types of a present relation, for view projection.
+    pub(crate) fn relation_column_types(
+        &self,
+        id: &ObjectId,
+    ) -> Option<Vec<(String, Option<String>)>> {
+        match self.local.relations.get(id) {
+            Some(RelationOverlay::Present(relation)) => Some(
+                relation
+                    .columns
+                    .iter()
+                    .map(|column| (column.name.clone(), column.data_type.clone()))
+                    .collect(),
+            ),
+            _ => None,
+        }
+    }
+
     /// Whether the index backs an exclusion constraint, which PostgreSQL
     /// refuses to rebuild concurrently.
     pub(crate) fn index_backs_exclusion_constraint(&self, index: &ObjectId) -> bool {

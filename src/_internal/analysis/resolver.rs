@@ -245,11 +245,17 @@ impl Resolver {
                 name,
                 or_replace,
                 depends_on,
+                select_outputs,
+                select_projection_complete,
+                select_source,
             } => {
                 mutations.push(Self::resolve_create_view(
                     name,
                     *or_replace,
                     depends_on,
+                    select_outputs,
+                    *select_projection_complete,
+                    select_source.as_ref(),
                     state,
                 ));
             }

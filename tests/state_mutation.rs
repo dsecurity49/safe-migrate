@@ -3534,6 +3534,84 @@ mod state_mutation_tests {
     }
 
     #[test]
+    fn view_projection_is_derived_from_the_source_relation() {
+        // Column names and types verified against PostgreSQL 18.2.
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TABLE vsrc (id int, label text, extra numeric);
+                 CREATE VIEW vplain AS SELECT id, label FROM vsrc;
+                 CREATE VIEW vstar AS SELECT * FROM vsrc;
+                 CREATE VIEW valias AS SELECT id AS user_id, label FROM vsrc;",
+                &mut state,
+            )
+            .unwrap();
+
+        let columns = |name: &str| {
+            state
+                .get_relation(&object_id("public", name))
+                .and_then(|overlay| match overlay {
+                    RelationOverlay::Present(relation) => Some(
+                        relation
+                            .columns
+                            .iter()
+                            .map(|c| (c.name.clone(), c.data_type.clone()))
+                            .collect::<Vec<_>>(),
+                    ),
+                    _ => None,
+                })
+                .unwrap_or_default()
+        };
+
+        assert_eq!(
+            columns("vplain"),
+            vec![
+                ("id".to_string(), Some("integer".to_string())),
+                ("label".to_string(), Some("text".to_string())),
+            ]
+        );
+        assert_eq!(
+            columns("vstar"),
+            vec![
+                ("id".to_string(), Some("integer".to_string())),
+                ("label".to_string(), Some("text".to_string())),
+                ("extra".to_string(), Some("numeric".to_string())),
+            ]
+        );
+        assert_eq!(
+            columns("valias"),
+            vec![
+                ("user_id".to_string(), Some("integer".to_string())),
+                ("label".to_string(), Some("text".to_string())),
+            ]
+        );
+    }
+
+    #[test]
+    fn view_with_an_expression_projection_reports_unknown_columns() {
+        // PostgreSQL types the output by analysing the query, so an expression
+        // cannot be typed offline; the view still exists but taints.
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TABLE vsrc (id int, label text);
+                 CREATE VIEW vexpr AS SELECT id + 1 AS bumped FROM vsrc;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            state.relation_is_present(&object_id("public", "vexpr")),
+            "the view must still be created"
+        );
+        assert_eq!(
+            state.local.confidence,
+            safe_migrate::_internal::analysis::state::Confidence::Tainted
+        );
+    }
+
+    #[test]
     fn temporary_relation_shadows_a_permanent_one_of_the_same_name() {
         let engine = setup_engine();
         let mut state = setup_state();

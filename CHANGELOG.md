@@ -59,6 +59,10 @@ notes are available on the
   modelled rather than silently dropped. The option is stored, a name the
   target version rejects is reported as an error, and a name the analyzer
   cannot place taints instead of claiming an exact result.
+- A view created from DDL now carries the same columns as the same view
+  synchronized from the catalog, with types normalised the way `format_type`
+  reports them. A projection that is not a plain column reference cannot be
+  typed offline, so the view is still created but the analysis taints.
 
 ## v0.9.3 — 2026-09-23
 

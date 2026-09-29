@@ -433,6 +433,19 @@ pub(crate) struct CreateView {
     pub id: ObjectId,
     pub or_replace: bool,
     pub depends_on: Vec<ObjectId>,
+    /// Projected columns, empty when the projection could not be derived.
+    pub columns: Vec<ViewColumn>,
+    pub projection_complete: bool,
+}
+
+/// A view's output column. The type is only known when the projection is a
+/// plain reference to a known column.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ViewColumn {
+    pub name: String,
+    /// Catalog type name, normalised the way `format_type` reports it.
+    pub data_type: Option<String>,
+    pub type_modifier: Option<i32>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

@@ -6,6 +6,7 @@ use crate::_internal::analysis::mutations::{
     DropViewMutation, RefreshMaterializedViewMutation, ReloptionTarget,
 };
 use crate::_internal::ast::identifiers::ObjectId;
+use crate::_internal::model::column::Column;
 use crate::_internal::model::relation::{Persistence, RelationKind, RelationState};
 use crate::_internal::model::reloption::{
     ReloptionOutcome, classify, materialized_view_reloption, view_reloption,
@@ -321,6 +322,31 @@ impl AnalysisState {
         relation.generation = generation;
         relation.kind = RelationKind::View;
         relation.persistence = Persistence::Permanent;
+        if !create.projection_complete {
+            // A view whose output list could not be derived still exists, but
+            // its columns are unknown, so any column-level claim is unsound.
+            self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Statement);
+        } else if !create.or_replace || !existing_view {
+            relation.columns = create
+                .columns
+                .iter()
+                .map(|column| Column {
+                    name: column.name.clone(),
+                    data_type: column.data_type.clone(),
+                    type_id: None,
+                    is_nullable: true,
+                    default: None,
+                    avg_width: None,
+                    default_expr_text: None,
+                    type_modifier: column.type_modifier,
+                    storage: None,
+                    compression: None,
+                    statistics_target: None,
+                    options: Default::default(),
+                    generated: None,
+                })
+                .collect();
+        }
         self.local
             .relations
             .insert(create.id.clone(), RelationOverlay::Present(relation));

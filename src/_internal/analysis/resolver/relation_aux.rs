@@ -1,16 +1,17 @@
 use super::Resolver;
 use crate::_internal::analysis::facts::{
     AlterIndexActionFact, AlterMaterializedViewActionFact, AlterViewAction, PolicyCommand,
-    ReindexTargetKindFact, StatisticsTarget,
+    ReindexTargetKindFact, SelectOutputFact, StatisticsTarget,
 };
 use crate::_internal::analysis::mutations::{
     AlterIndexActionMutation, AlterIndexMutation, CreateIndex, CreateMaterializedView,
     CreatePolicyMutation, CreateTriggerMutation, CreateView, DropPolicyMutation,
     DropTriggerMutation, Mutation, OpaqueMutation, RefreshMaterializedViewMutation,
-    ReindexTargetMutation, ReloptionTarget, Rename, RenameTriggerMutation,
+    ReindexTargetMutation, ReloptionTarget, Rename, RenameTriggerMutation, ViewColumn,
 };
 use crate::_internal::analysis::state::AnalysisState;
 use crate::_internal::ast::identifiers::{ObjectId, QualifiedName};
+use crate::_internal::model::data_type::{ParsedDataType, TypeIdentity};
 
 impl Resolver {
     pub(super) fn resolve_reindex(
@@ -48,8 +49,13 @@ impl Resolver {
         name: &QualifiedName,
         or_replace: bool,
         depends_on: &[QualifiedName],
+        select_outputs: &[SelectOutputFact],
+        projection_complete: bool,
+        select_source: Option<&QualifiedName>,
         state: &AnalysisState,
     ) -> Mutation {
+        let source = select_source.map(|source| Self::resolve_relation_lookup_name(source, state));
+        let columns = Self::resolve_view_columns(select_outputs, source.as_ref(), state);
         Mutation::CreateView(CreateView {
             id: Self::resolve_creation_name(name, state),
             or_replace,
@@ -57,7 +63,54 @@ impl Resolver {
                 .iter()
                 .map(|dependency| Self::resolve_relation_lookup_name(dependency, state))
                 .collect(),
+            columns,
+            projection_complete,
         })
+    }
+
+    /// Project a view's output list, taking types from the source relation
+    /// where the output is a plain column reference.
+    ///
+    /// Types are normalised the way `format_type` reports them, so a view
+    /// created from DDL matches the same view synchronized from the catalog.
+    fn resolve_view_columns(
+        select_outputs: &[SelectOutputFact],
+        source: Option<&ObjectId>,
+        state: &AnalysisState,
+    ) -> Vec<ViewColumn> {
+        let source_columns = source
+            .and_then(|id| state.relation_column_types(id))
+            .unwrap_or_default();
+        let find = |source_name: &str| {
+            source_columns
+                .iter()
+                .find(|(name, _)| name == source_name)
+                .and_then(|(_, data_type)| data_type.as_deref())
+        };
+        let view_column = |output_name: String, declared: Option<&str>| ViewColumn {
+            name: output_name,
+            data_type: declared.map(|declared| {
+                TypeIdentity::from_syntax(&ParsedDataType::parse(declared)).render()
+            }),
+            type_modifier: declared
+                .and_then(|declared| ParsedDataType::parse(declared).atttypmod_offset()),
+        };
+
+        let mut columns = Vec::new();
+        for output in select_outputs {
+            match output {
+                SelectOutputFact::AllColumns => columns.extend(
+                    source_columns
+                        .iter()
+                        .map(|(name, data_type)| view_column(name.clone(), data_type.as_deref())),
+                ),
+                SelectOutputFact::Column {
+                    source_name,
+                    output_name,
+                } => columns.push(view_column(output_name.clone(), find(source_name))),
+            }
+        }
+        columns
     }
 
     pub(super) fn resolve_alter_view(
