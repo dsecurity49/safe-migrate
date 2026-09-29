@@ -7,7 +7,9 @@ use crate::_internal::analysis::mutations::{
 };
 use crate::_internal::ast::identifiers::ObjectId;
 use crate::_internal::model::constraint::{ConstraintKind, ConstraintState};
-use crate::_internal::model::data_type::{DataTypeFamily, ParsedDataType};
+use crate::_internal::model::data_type::{
+    DataTypeFamily, ParsedDataType, WIDENED_NUMERIC_SCALE_VERSION,
+};
 use crate::_internal::model::relation::{ColumnAction, RelationKind, RelationState};
 use crate::_internal::model::sequence::{
     SequenceKind, SequenceOverlay, SequenceParameters, SequencePersistence, SequenceState,
@@ -18,6 +20,29 @@ use std::collections::HashSet;
 type RelationLookup = ObjectLookup;
 
 impl AnalysisState {
+    /// Reject a column type the target server version would refuse. Without a
+    /// baseline the version is unknown, so this taints instead.
+    pub(super) fn check_declared_type(&mut self, declared: &str) -> Option<MutationResult> {
+        if !ParsedDataType::parse(declared).needs_widened_numeric_scale() {
+            return None;
+        }
+        match self.pg_version_num {
+            Some(version) if version < WIDENED_NUMERIC_SCALE_VERSION => {
+                Some(MutationResult::Conflict {
+                    reason: format!(
+                        "type '{declared}' requires PostgreSQL 15 or later, \
+                         but the baseline reports {version}"
+                    ),
+                })
+            }
+            Some(_) => None,
+            None => {
+                self.taint(EvidenceCode::UnsupportedSemantics, EvidenceScope::Statement);
+                None
+            }
+        }
+    }
+
     fn inherited_descendants(&self, root: &ObjectId) -> Vec<ObjectId> {
         let mut pending = vec![root.clone()];
         let mut visited = HashSet::from([root.clone()]);
@@ -2664,6 +2689,11 @@ impl AnalysisState {
 
         let mut not_null_columns = Vec::new();
         for col in &create.columns {
+            if let Some(ty) = &col.ty
+                && let Some(conflict) = self.check_declared_type(ty)
+            {
+                return conflict;
+            }
             let is_pk = col.is_primary_key || pk_columns.contains(col.name.as_str());
             if col.not_null || is_pk {
                 not_null_columns.push(col.name.clone());
@@ -5103,6 +5133,12 @@ impl AnalysisState {
         // `rel` here and replay them once the `rel` borrow (below) is released
         // so the `&mut self` calls do not contend with the overlay borrow.
         let mut deferred_not_null: Vec<(String, bool)> = Vec::new();
+        // Before the overlay borrow: tainting needs `&mut self`.
+        if let AlterTableActionMutation::SetType { ty, .. } = &alter.action
+            && let Some(conflict) = self.check_declared_type(ty)
+        {
+            return conflict;
+        }
         let rel_overlay = self.local.relations.get_mut(&alter.id);
         #[allow(clippy::collapsible_if)]
         if let Some(RelationOverlay::Present(rel)) = rel_overlay {

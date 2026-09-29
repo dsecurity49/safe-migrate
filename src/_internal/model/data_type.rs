@@ -81,14 +81,8 @@ impl DataTypeFamily {
         }
     }
 
-    /// Split the canonical spelling into (base, timezone_suffix) so that a
-    /// precision modifier can be inserted between them when rendering.
-    ///
-    /// For example, `TimestampTz` returns `("timestamp", " with time zone")`,
-    /// which lets the Display impl emit `"timestamp(6) with time zone"` rather
-    /// than `"timestamp with time zone(6)"`.
-    ///
-    /// All other families return `(canonical, "")`.
+    /// Canonical name split so a modifier renders before any timezone suffix:
+    /// `TimestampTz` gives `("timestamp", " with time zone")`.
     pub(crate) fn canonical_base_and_tz_suffix(
         self,
         original_fallback: &str,
@@ -233,6 +227,9 @@ pub(crate) struct ParsedDataType {
     typmod: TypeTypmod,
 }
 
+/// First `server_version_num` accepting a widened `numeric` scale.
+pub(crate) const WIDENED_NUMERIC_SCALE_VERSION: u32 = 150_000;
+
 impl ParsedDataType {
     pub(crate) fn parse(raw: &str) -> Self {
         let mut text = Self::fold_unquoted_identifier_case(raw.trim());
@@ -244,14 +241,8 @@ impl ParsedDataType {
         }
 
         // rfind so nested parens in unusual type expressions don't truncate the typmod.
-        //
-        // PostgreSQL permits a precision modifier *inside* a type qualifier phrase:
-        //   timestamp(6) with time zone
-        //   time(3) without time zone
-        // The qualifier " with time zone" / " without time zone" follows the closing
-        // parenthesis, so it must be re-joined with the pre-paren base name before
-        // the family lookup, otherwise the timezone half is silently discarded and
-        // `timestamp(6) with time zone` resolves to `timestamp without time zone`.
+        // A timezone qualifier can trail the closing paren, so re-join it before
+        // the family lookup or it is silently discarded.
         let mut typmods = None;
         let original_base;
         if let Some(open) = text.find('(')
@@ -262,15 +253,11 @@ impl ParsedDataType {
             let pre = text[..open].trim();
             let post = text[close + 1..].trim();
             original_base = pre.to_string();
-            // Build a compound name only when there is a post-close qualifier.
-            // This keeps the lookup path for plain `timestamp(6)` identical to
-            // before: `from_base_name("timestamp")`.
-            let lookup = if post.is_empty() {
+            text = if post.is_empty() {
                 pre.to_string()
             } else {
                 format!("{pre} {post}")
             };
-            text = lookup;
         } else {
             original_base = text.clone();
         }
@@ -403,6 +390,21 @@ impl ParsedDataType {
         }
     }
 
+    /// True when the declared scale is only legal from
+    /// `WIDENED_NUMERIC_SCALE_VERSION` onward.
+    pub(crate) fn needs_widened_numeric_scale(&self) -> bool {
+        match self.typmod {
+            TypeTypmod::Numeric {
+                precision,
+                scale: Some(scale),
+            } => {
+                let scale = scale.get();
+                scale < 0 || scale > precision.get()
+            }
+            _ => false,
+        }
+    }
+
     /// The scale numeric(p, s) declares, if any.
     pub(crate) fn numeric_scale(&self) -> Option<NumericScale> {
         match self.typmod {
@@ -451,11 +453,8 @@ impl ParsedDataType {
     }
 }
 
-/// A type's catalog identity: how PostgreSQL decides two types are the same.
-///
-/// Distinct from [`ParsedDataType`], which records what the user wrote.
-/// PostgreSQL discards parenthesized modifiers for routine identity, so this
-/// type has no typmod field — a declaration cannot smuggle one in.
+/// A type's catalog identity, as PostgreSQL compares it. `ParsedDataType` records
+/// what the user wrote; this discards parenthesized modifiers, so it has no typmod.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct TypeIdentity {
     family: DataTypeFamily,

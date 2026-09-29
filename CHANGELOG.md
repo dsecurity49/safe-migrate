@@ -37,6 +37,9 @@ notes are available on the
 - Function and routine identity now discards type modifiers, matching
   PostgreSQL. `foo(varchar)` and `foo(varchar(10))` are one function, so a
   duplicate declaration is reported instead of silently creating two.
+- A `numeric` scale outside `0..=precision` is now checked against the
+  PostgreSQL version, which widened the range in 15. Without a baseline the
+  declaration taints rather than being reported as an error.
 
 ## v0.9.3 — 2026-09-23
 

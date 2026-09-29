@@ -1193,6 +1193,99 @@ mod rule_evaluation_tests {
     }
 
     #[test]
+    fn numeric_scale_outside_zero_to_precision_is_version_dependent() {
+        fn column_type(
+            state: &safe_migrate::_internal::analysis::state::AnalysisState,
+            name: &str,
+        ) -> Option<String> {
+            state
+                .local
+                .relations
+                .get(&object_id("public", "t"))
+                .and_then(|overlay| match overlay {
+                    safe_migrate::_internal::analysis::state::RelationOverlay::Present(rel) => rel
+                        .columns
+                        .iter()
+                        .find(|c| c.name == name)
+                        .and_then(|c| c.data_type.clone()),
+                    _ => None,
+                })
+        }
+
+        let engine = setup_engine();
+        let sql = "CREATE TABLE t (v numeric(10, -2));";
+
+        // PostgreSQL 14 rejects a negative scale outright.
+        let mut pg14 = setup_state();
+        pg14.baseline_available = true;
+        pg14.pg_version_num = Some(140_000);
+        engine.analyze(sql, &mut pg14).unwrap();
+        assert!(
+            !pg14.relation_is_present(&object_id("public", "t")),
+            "PG14 must not accept a negative numeric scale"
+        );
+
+        // PostgreSQL 15 widened the range, so the same declaration is valid.
+        let mut pg15 = setup_state();
+        pg15.baseline_available = true;
+        pg15.pg_version_num = Some(150_000);
+        engine.analyze(sql, &mut pg15).unwrap();
+        assert!(
+            pg15.relation_is_present(&object_id("public", "t")),
+            "PG15 accepts a negative numeric scale"
+        );
+
+        // ALTER COLUMN TYPE is checked on the same rule.
+        let alter = "ALTER TABLE t ALTER COLUMN v TYPE numeric(3, 5);";
+        engine
+            .analyze("CREATE TABLE t (v numeric);", &mut pg14)
+            .unwrap();
+        let before = column_type(&pg14, "v");
+        engine.analyze(alter, &mut pg14).unwrap();
+        assert_eq!(
+            before,
+            column_type(&pg14, "v"),
+            "a PG14-rejected type change must not apply"
+        );
+    }
+
+    #[test]
+    fn widened_numeric_scale_without_a_baseline_taints_rather_than_conflicting() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let v = engine
+            .analyze("CREATE TABLE t (v numeric(10, -2));", &mut state)
+            .unwrap();
+
+        // Without a version we cannot call it an error, so it must not be
+        // reported as a conflict.
+        assert!(
+            !v.iter().any(|v| v.rule_id == "chain-conflict"),
+            "an unjudgeable version must not be reported as a conflict: {v:?}"
+        );
+        assert_eq!(
+            state.local.confidence,
+            safe_migrate::_internal::analysis::state::Confidence::Tainted
+        );
+    }
+
+    #[test]
+    fn ordinary_numeric_scale_never_taints() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TABLE t (a numeric(10, 2), b numeric(4));",
+                &mut state,
+            )
+            .unwrap();
+        assert_eq!(
+            state.local.confidence,
+            safe_migrate::_internal::analysis::state::Confidence::Exact
+        );
+    }
+
+    #[test]
     fn test_rule_require_concurrent_reindex() {
         let sql = "
             CREATE TABLE t1 (id int);

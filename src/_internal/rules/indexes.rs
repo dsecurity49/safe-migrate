@@ -246,13 +246,8 @@ impl Rule for RequireConcurrentReindexRule {
 }
 
 impl RequireConcurrentReindexRule {
-    /// Flag a non-concurrent REINDEX, unless PostgreSQL forbids the concurrent
-    /// form for this target.
-    ///
-    /// The exclusion cases are load-bearing, not cosmetic: `CONCURRENTLY` is
-    /// rejected for `REINDEX SYSTEM`, for temporary relations, and for indexes
-    /// backing exclusion constraints, so demanding it there would be a false
-    /// positive with no correct alternative.
+    /// Flag a non-concurrent REINDEX. Targets where PostgreSQL rejects
+    /// `CONCURRENTLY` are exempt, since there is no correct alternative.
     fn evaluate_target(
         context: &RuleContext<'_>,
         target: Option<&ReindexTargetMutation>,
