@@ -411,6 +411,7 @@ enum MismatchCategory {
     SubscriptionDefinitionMismatch,
     RoleMembershipMismatch,
     BaselineObjectAbsent,
+    BaselineSearchPathMismatch,
     LiveExecutionFailed,
     ExpectedLiveErrorMismatch,
     MissingExpectedSimulatorFinding,
@@ -739,6 +740,12 @@ fn live_postgres_differential_harness() {
 
             mismatches.extend(check_required_relations(rule, fixture, &baseline_cache));
             mismatches.extend(check_role_membership_cache(rule, fixture, &baseline_cache));
+            mismatches.extend(check_recorded_search_path(
+                rule,
+                fixture,
+                &mut client,
+                &baseline_cache,
+            ));
 
             let mut simulator_state = AnalysisState::new(baseline_cache);
             let simulator_violations = match engine.analyze(&sql, &mut simulator_state) {
@@ -1778,6 +1785,48 @@ fn sql_fixture_names(path: &Path) -> BTreeSet<String> {
             })
         })
         .collect()
+}
+
+/// The recorded search path must begin with the schema live PostgreSQL would
+/// resolve unqualified names in, or every unqualified fixture compares against
+/// the wrong namespace.
+fn check_recorded_search_path(
+    rule: &RuleManifest,
+    fixture: &str,
+    client: &mut Client,
+    cache: &DbCache,
+) -> Vec<Mismatch> {
+    let live: Vec<String> = match client
+        .query_one("SELECT current_schemas(false);", &[])
+        .and_then(|row| row.try_get::<_, Vec<String>>(0))
+    {
+        Ok(path) => path,
+        Err(error) => {
+            return vec![Mismatch {
+                rule_dir: rule.rule_dir.clone(),
+                fixture: fixture.to_string(),
+                category: MismatchCategory::LiveExecutionFailed,
+                root_cause: RootCauseClassification::EnvironmentIssue,
+                note: format!("failed to read the live search path: {error}"),
+            }];
+        }
+    };
+    let Some(expected) = live.first() else {
+        return Vec::new();
+    };
+    if cache.search_path.first() == Some(expected) {
+        return Vec::new();
+    }
+    vec![Mismatch {
+        rule_dir: rule.rule_dir.clone(),
+        fixture: fixture.to_string(),
+        category: MismatchCategory::BaselineSearchPathMismatch,
+        root_cause: RootCauseClassification::SimulatorBug,
+        note: format!(
+            "baseline records search_path {:?} but live PostgreSQL resolves unqualified names in {expected}",
+            cache.search_path
+        ),
+    }]
 }
 
 fn check_required_relations(rule: &RuleManifest, fixture: &str, cache: &DbCache) -> Vec<Mismatch> {
