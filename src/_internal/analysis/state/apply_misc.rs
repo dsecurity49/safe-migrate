@@ -1,7 +1,7 @@
 use super::{AnalysisState, MutationResult};
 use crate::_internal::analysis::evidence::{EvidenceCode, EvidenceScope};
 use crate::_internal::analysis::facts::{IndexStatisticsColumn, StatisticsTarget};
-use crate::_internal::analysis::graph::DependencyKind;
+use crate::_internal::analysis::graph::{DependencyEdge, DependencyKind};
 use crate::_internal::analysis::mutations::{
     AlterDatabaseMutation, AlterIndexActionMutation, AlterIndexAllInTablespaceMutation,
     AlterIndexMutation, CreateDatabaseMutation, DropDatabaseMutation, LockTableMutation,
@@ -200,6 +200,14 @@ impl AnalysisState {
                         self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
                         return MutationResult::Skipped;
                     }
+                    // Record the link so dropping the parent also drops the
+                    // child, which PostgreSQL does.
+                    self.snapshot_graph();
+                    self.local.graph.add_edge(DependencyEdge::new(
+                        partition_id.clone(),
+                        alter.index_id.clone(),
+                        DependencyKind::IndexPartitionOf,
+                    ));
                 }
                 // Extension dependencies are managed by PostgreSQL's extension
                 // machinery, which lives outside the schema catalog model.

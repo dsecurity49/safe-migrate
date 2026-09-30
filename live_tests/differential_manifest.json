@@ -2668,8 +2668,15 @@
    "enabled": true,
    "transactional": true,
    "fixtures": [
+    "002_attach_partition_drop_child.sql",
     "safe_001_alter_index.sql"
    ],
+   "expected_live_errors": {
+    "002_attach_partition_drop_child.sql": {
+     "sqlstate": "42704",
+     "simulator_rule": "chain-conflict"
+    }
+   },
    "schemas": [
     "public",
     "sm_identity",

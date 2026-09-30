@@ -21,6 +21,10 @@ notes are available on the
   provably absent from a synchronized baseline. Without a baseline, or for an
   object created earlier in the same migration, only a taint is raised, so an
   unknown object is never reported as drift.
+- `ALTER INDEX ... ATTACH PARTITION` now records the parent/child index
+  relationship. Dropping a partitioned index removes its attached children, as
+  PostgreSQL does, so a later `DROP INDEX` of such a child is now reported
+  instead of silently accepted.
 - Routine identity now matches PostgreSQL, which keys a function on its
   argument type OIDs. A type written as `pg_catalog.text` is the same argument
   as `text`, and a catalog type written `mood` is the same as `sm_core.mood`

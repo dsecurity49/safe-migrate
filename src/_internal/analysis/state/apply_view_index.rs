@@ -810,6 +810,23 @@ impl AnalysisState {
                 return MutationResult::Skipped;
             }
         }
+        // An attached partition index goes with its parent.
+        let attached_children = self
+            .local
+            .graph
+            .edges()
+            .iter()
+            .filter(|edge| {
+                matches!(edge.kind, DependencyKind::IndexPartitionOf)
+                    && targets.iter().any(|target| {
+                        self.local.graph.resolve_rename(target)
+                            == self.local.graph.resolve_rename(&edge.referenced)
+                    })
+            })
+            .map(|edge| edge.dependent.clone())
+            .collect::<Vec<_>>();
+        let mut removed = targets.clone();
+        removed.extend(attached_children.iter().cloned());
         let table_indexes = self
             .local
             .graph
@@ -817,7 +834,7 @@ impl AnalysisState {
             .iter()
             .filter(|edge| {
                 matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
-                    && targets.iter().any(|target| {
+                    && removed.iter().any(|target| {
                         self.local.graph.resolve_rename(target)
                             == self.local.graph.resolve_rename(&edge.dependent)
                     })
@@ -832,12 +849,17 @@ impl AnalysisState {
         }
         self.snapshot_graph_full();
         let resolution_graph = self.local.graph.clone();
-        self.local.graph.retain_edges(|edge| {
-            !(matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
-                && targets.iter().any(|target| {
-                    resolution_graph.resolve_rename(target)
-                        == resolution_graph.resolve_rename(&edge.dependent)
-                }))
+        let dropped = |id: &ObjectId| {
+            removed.iter().any(|target| {
+                resolution_graph.resolve_rename(target) == resolution_graph.resolve_rename(id)
+            })
+        };
+        self.local.graph.retain_edges(|edge| match edge.kind {
+            DependencyKind::IndexOnRelation { .. } => !dropped(&edge.dependent),
+            DependencyKind::IndexPartitionOf => {
+                !dropped(&edge.dependent) && !dropped(&edge.referenced)
+            }
+            _ => true,
         });
         MutationResult::Applied
     }

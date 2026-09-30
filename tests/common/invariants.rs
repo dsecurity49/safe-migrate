@@ -246,6 +246,18 @@ pub(crate) fn assert_state_invariants(state: &AnalysisState) {
                     .contains_key(&(edge.dependent.clone(), constraint_name.clone())),
                 "constraint dependency edge must have a matching constraint"
             ),
+            DependencyKind::IndexPartitionOf => {
+                let present = |id: &crate::_internal::ast::identifiers::ObjectId| {
+                    local.graph.edges().iter().any(|other| {
+                        matches!(other.kind, DependencyKind::IndexOnRelation { .. })
+                            && other.dependent == *id
+                    })
+                };
+                assert!(
+                    present(&edge.dependent) && present(&edge.referenced),
+                    "index-partition edge must join two present indexes"
+                );
+            }
             DependencyKind::IndexOnRelation { .. }
             | DependencyKind::RenameTo
             | DependencyKind::InheritanceOf

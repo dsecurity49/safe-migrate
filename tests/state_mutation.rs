@@ -9564,4 +9564,57 @@ mod state_mutation_tests {
             "distinct argument types are distinct routines: {findings:?}"
         );
     }
+
+    #[test]
+    fn dropping_a_partitioned_index_drops_its_attached_child() {
+        // PostgreSQL removes an attached partition index with its parent, so
+        // dropping the child afterwards must fail.
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let findings = engine
+            .analyze(
+                "CREATE TABLE parent_tbl (a int) PARTITION BY RANGE (a);
+                 CREATE TABLE child_tbl (a int);
+                 CREATE INDEX child_idx ON child_tbl (a);
+                 CREATE INDEX parent_idx ON parent_tbl (a);
+                 ALTER TABLE parent_tbl ATTACH PARTITION child_tbl FOR VALUES FROM (0) TO (10);
+                 ALTER INDEX parent_idx ATTACH PARTITION child_idx;
+                 DROP INDEX parent_idx;
+                 DROP INDEX child_idx;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(
+            findings.iter().any(|finding| {
+                finding.rule_id == "chain-conflict"
+                    && finding.reason.contains("does not exist")
+                    && finding.reason.contains("child_idx")
+            }),
+            "the child index is gone with its parent: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn dropping_an_unattached_index_leaves_others_alone() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let findings = engine
+            .analyze(
+                "CREATE TABLE t (a int);
+                 CREATE INDEX keep_idx ON t (a);
+                 CREATE INDEX drop_idx ON t (a);
+                 DROP INDEX drop_idx;
+                 DROP INDEX keep_idx;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict"),
+            "an unrelated index must survive its neighbour's drop: {findings:?}"
+        );
+    }
 }
