@@ -29,11 +29,11 @@
     },
     {
      "fixture": "007_multi_three_cascade.sql",
-     "reason": "Requires three non-harness empty schemas whose existence is not represented in normalized simulator state."
+     "reason": "Requires schema \"a\", which the canonical baseline does not contain, so live PostgreSQL rejects the fixture before any rule can be compared."
     },
     {
      "fixture": "008_cascade_long_name.sql",
-     "reason": "Requires a non-harness empty schema whose existence is not represented in normalized simulator state."
+     "reason": "Requires schema \"some_very_long_schema_name\", which the canonical baseline does not contain, so live PostgreSQL rejects the fixture before any rule can be compared."
     },
     {
      "fixture": "safe_001_no_cascade.sql",
@@ -161,8 +161,10 @@
    "fixtures": [
     "001_drop_view_cascade.sql",
     "002_drop_matview_cascade.sql",
+    "005_drop_func_cascade.sql",
     "008_drop_view_if_exists_cascade.sql",
     "009_drop_matview_if_exists_cascade.sql",
+    "010_drop_seq_if_exists_cascade.sql",
     "safe_001_drop_view.sql",
     "safe_002_drop_matview.sql",
     "safe_008_drop_view_if_exists.sql",
@@ -175,39 +177,31 @@
    "excluded_fixtures": [
     {
      "fixture": "003_drop_seq_cascade.sql",
-     "reason": "Cache V7 synchronizes sequences, but this rule does not compare sequence state."
+     "reason": "Requires sequence \"myseq\", which the canonical baseline does not contain, so live PostgreSQL rejects the fixture before any rule can be compared."
     },
     {
      "fixture": "004_drop_domain_cascade.sql",
-     "reason": "Domain state is not yet hydrated from the live baseline into simulator type state."
-    },
-    {
-     "fixture": "005_drop_func_cascade.sql",
-     "reason": "Cache V7 synchronizes routine identity and kind, but this rule does not compare routine state."
+     "reason": "Requires type \"mydomain\", which the canonical baseline does not contain, so live PostgreSQL rejects the fixture before any rule can be compared."
     },
     {
      "fixture": "006_drop_proc_cascade.sql",
-     "reason": "Cache V7 synchronizes routine identity and kind, but this rule does not compare routine state."
-    },
-    {
-     "fixture": "010_drop_seq_if_exists_cascade.sql",
-     "reason": "Cache V7 synchronizes sequences, but this rule does not compare sequence state."
+     "reason": "Requires procedure p(), which the canonical baseline does not contain, so live PostgreSQL rejects the fixture before any rule can be compared."
     },
     {
      "fixture": "safe_003_drop_seq.sql",
-     "reason": "Cache V7 synchronizes sequences, but this rule does not compare sequence state."
+     "reason": "Requires sequence \"myseq\", which the canonical baseline does not contain, so live PostgreSQL rejects the fixture before any rule can be compared."
     },
     {
      "fixture": "safe_004_drop_func.sql",
-     "reason": "Cache V7 synchronizes routine identity and kind, but this rule does not compare routine state."
+     "reason": "PostgreSQL rejects the fixture: cannot drop function f() because other objects depend on it. It cannot execute live, so there is nothing to compare the simulator against."
     },
     {
      "fixture": "safe_005_drop_proc.sql",
-     "reason": "Cache V7 synchronizes routine identity and kind, but this rule does not compare routine state."
+     "reason": "Requires procedure p(), which the canonical baseline does not contain, so live PostgreSQL rejects the fixture before any rule can be compared."
     },
     {
      "fixture": "safe_007_drop_domain.sql",
-     "reason": "Domain state is not yet hydrated from the live baseline into simulator type state."
+     "reason": "Requires type \"mydomain\", which the canonical baseline does not contain, so live PostgreSQL rejects the fixture before any rule can be compared."
     }
    ],
    "schemas": [
@@ -724,14 +718,19 @@
     "006_drop_view.sql",
     "007_drop_matview.sql",
     "008_add_column.sql",
+    "013_create_sequence.sql",
     "014_create_view.sql",
+    "016_create_schema.sql",
     "018_add_column_not_null.sql",
     "safe_001_create_if_not_exists.sql",
     "safe_002_drop_if_exists.sql",
     "safe_003_create_index_if_not_exists.sql",
+    "safe_005_drop_sequence_if_exists.sql",
     "safe_006_drop_view_if_exists.sql",
     "safe_007_drop_matview_if_exists.sql",
-    "safe_008_add_column_if_not_exists.sql"
+    "safe_008_add_column_if_not_exists.sql",
+    "safe_010_drop_policy_if_exists.sql",
+    "safe_011_create_schema_if_not_exists.sql"
   ],
    "excluded_fixtures": [
     {
@@ -740,7 +739,7 @@
     },
     {
      "fixture": "005_drop_sequence.sql",
-     "reason": "Cache V7 synchronizes sequences, but this rule does not compare sequence state."
+     "reason": "Requires sequence \"s\", which the canonical baseline does not contain, so live PostgreSQL rejects the fixture before any rule can be compared."
     },
     {
       "fixture": "009_drop_column.sql",
@@ -748,47 +747,27 @@
     },
     {
      "fixture": "010_drop_policy.sql",
-     "reason": "Policy state is not yet normalized by the differential harness."
+     "reason": "Requires policy \"p\" for table \"t\", which the canonical baseline does not contain, so live PostgreSQL rejects the fixture before any rule can be compared."
     },
     {
      "fixture": "011_drop_trigger.sql",
-     "reason": "Trigger state is imported as dependency edges but is not yet normalized by this harness."
+     "reason": "Requires trigger \"trg\" for table \"t\", which the canonical baseline does not contain, so live PostgreSQL rejects the fixture before any rule can be compared."
     },
     {
      "fixture": "012_drop_domain.sql",
-     "reason": "Domain state is not yet hydrated from the live baseline into simulator type state."
-    },
-    {
-     "fixture": "013_create_sequence.sql",
-     "reason": "Cache V7 synchronizes sequences, but this rule does not compare sequence state."
-    },
-    {
-     "fixture": "016_create_schema.sql",
-     "reason": "Schema existence is not represented in normalized simulator state."
+     "reason": "Requires type \"d\", which the canonical baseline does not contain, so live PostgreSQL rejects the fixture before any rule can be compared."
     },
     {
      "fixture": "017_drop_schema.sql",
-     "reason": "Schema existence is not represented in normalized simulator state."
+     "reason": "Requires schema \"s_unique\", which the canonical baseline does not contain, so live PostgreSQL rejects the fixture before any rule can be compared."
     },
     {
       "fixture": "safe_004_drop_index_if_exists.sql",
      "reason": "Requires index i in the canonical baseline to produce a state change, which conflicts with enabled create-index fixtures."
     },
     {
-     "fixture": "safe_005_drop_sequence_if_exists.sql",
-     "reason": "Cache V7 synchronizes sequences, but this rule does not compare sequence state."
-    },
-    {
       "fixture": "safe_009_drop_column_if_exists.sql",
      "reason": "Requires column c in the canonical baseline to produce a state change, which conflicts with add-column fixtures."
-    },
-    {
-     "fixture": "safe_010_drop_policy_if_exists.sql",
-     "reason": "Policy state is not yet normalized by the differential harness."
-    },
-    {
-     "fixture": "safe_011_create_schema_if_not_exists.sql",
-     "reason": "Schema existence is not represented in normalized simulator state."
     }
    ],
    "schemas": [
@@ -986,7 +965,7 @@
     },
     {
      "fixture": "007_drop_unknown_type.sql",
-     "reason": "PostgreSQL rejects the unknown type and type state is not hydrated."
+     "reason": "Requires type \"unknown_type\", which the canonical baseline does not contain, so live PostgreSQL rejects the fixture before any rule can be compared."
     },
     {
      "fixture": "008_rename_unknown_table.sql",
@@ -1286,6 +1265,7 @@
    "rule_dir": "rule_16_broken-compute",
    "enabled": true,
    "fixtures": [
+    "safe_012_create_sequence.sql",
     "safe_019_drop_func_public.sql",
     "safe_003_drop_func_cascade.sql",
     "safe_003_alter_table.sql",
@@ -1350,10 +1330,6 @@
     {
      "fixture": "safe_011_delete.sql",
      "reason": "Data writes do not change normalized schema state."
-    },
-    {
-     "fixture": "safe_012_create_sequence.sql",
-     "reason": "Cache V7 synchronizes sequences, but this rule does not compare sequence state."
     }
    ],
    "schemas": [
