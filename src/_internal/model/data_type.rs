@@ -262,6 +262,11 @@ impl ParsedDataType {
             original_base = text.clone();
         }
 
+        // A built-in type is the same whether or not it is written
+        // `pg_catalog.text`. Any other qualifier names a distinct user type.
+        let text = Self::strip_pg_catalog_qualifier(&text).to_string();
+        let original_base = Self::strip_pg_catalog_qualifier(&original_base).to_string();
+
         let family = DataTypeFamily::from_base_name(&text);
         let typmod = Self::classify_typmod(family, typmods.as_deref());
         Self {
@@ -271,6 +276,12 @@ impl ParsedDataType {
             array_dimensions,
             typmod,
         }
+    }
+
+    fn strip_pg_catalog_qualifier(name: &str) -> &str {
+        name.strip_prefix("pg_catalog.")
+            .or_else(|| name.strip_prefix("\"pg_catalog\"."))
+            .unwrap_or(name)
     }
 
     // Anything the server would reject becomes OutOfRange rather than a value.
@@ -467,6 +478,12 @@ impl TypeIdentity {
             family: syntax.family,
             array_dimensions: syntax.array_dimensions,
         }
+    }
+
+    /// A type PostgreSQL did not resolve to a catalog family, such as a
+    /// user-defined type. Its written name is all that distinguishes it.
+    pub(crate) fn is_unknown(&self) -> bool {
+        self.family == DataTypeFamily::Unknown
     }
 
     /// Renders as `pg_catalog.format_type(oid, NULL)`, so bare `character` is
@@ -892,5 +909,45 @@ mod tests {
                 .raw_typmods()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn pg_catalog_qualifier_does_not_change_a_builtin_identity() {
+        // PostgreSQL resolves both spellings to the same type OID.
+        for (qualified, bare) in [
+            ("pg_catalog.text", "text"),
+            ("pg_catalog.int4", "int"),
+            ("pg_catalog.varchar(10)", "varchar(10)"),
+            ("pg_catalog.timestamptz", "timestamptz"),
+            ("pg_catalog.text[]", "text[]"),
+            ("\"pg_catalog\".numeric", "numeric"),
+        ] {
+            assert_eq!(
+                TypeIdentity::from_syntax(&ParsedDataType::parse(qualified)),
+                TypeIdentity::from_syntax(&ParsedDataType::parse(bare)),
+                "{qualified} must be the same identity as {bare}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_custom_type_has_no_catalog_rendering_of_its_own() {
+        // Callers must key an unresolved custom type on its written name;
+        // `render` alone cannot tell two of them apart.
+        let identity = |raw: &str| TypeIdentity::from_syntax(&ParsedDataType::parse(raw));
+        assert!(identity("sm_core.text").is_unknown());
+        assert!(identity("sm_core.text[]").is_unknown());
+        assert!(!identity("text").is_unknown());
+        assert!(!identity("pg_catalog.text").is_unknown());
+
+        // The built-in renders canonically once the qualifier is dropped.
+        assert_eq!(identity("pg_catalog.text").render(), "text");
+        assert_eq!(identity("pg_catalog.int").render(), "integer");
+
+        // Distinct custom types keep distinct written forms.
+        let written = |raw: &str| ParsedDataType::parse(raw).to_string();
+        assert_ne!(written("sm_core.text"), written("other.text"));
+        assert_ne!(written("sm_core.text"), written("text"));
+        assert_ne!(written("sm_core.mood"), written("sm_core.mood[]"));
     }
 }

@@ -1863,7 +1863,7 @@ impl AnalysisState {
         })
     }
 
-    fn resolve_type_reference(&self, raw: &str) -> Option<ObjectId> {
+    pub(crate) fn resolve_type_reference(&self, raw: &str) -> Option<ObjectId> {
         Self::resolve_type_reference_from_catalog(
             raw,
             &self.local.types,

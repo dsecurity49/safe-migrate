@@ -158,14 +158,17 @@ impl Resolver {
             .map(|p| p.ty.clone())
             .collect::<Vec<_>>()
             .join(",");
-        Self::resolve_function_id_by_sig(&base_id, &sig)
+        Self::resolve_function_id_by_sig(&base_id, &sig, state)
     }
 
-    fn resolve_function_id_by_sig(base_id: &ObjectId, sig: &str) -> ObjectId {
+    fn resolve_function_id_by_sig(
+        base_id: &ObjectId,
+        sig: &str,
+        state: &AnalysisState,
+    ) -> ObjectId {
         let normalized_sig = sig
             .split(',')
-            .map(Self::normalize_function_arg_type)
-            .map(|identity| identity.render())
+            .map(|raw| Self::routine_arg_identity(raw, state))
             .collect::<Vec<_>>()
             .join(",");
 
@@ -175,6 +178,22 @@ impl Resolver {
         );
         id.inferred_schema = base_id.inferred_schema;
         id
+    }
+
+    /// PostgreSQL identifies a routine by its argument type OIDs, so two
+    /// spellings of one type are one signature. Resolve against state where
+    /// possible and fall back to the canonical spelling otherwise.
+    fn routine_arg_identity(raw: &str, state: &AnalysisState) -> String {
+        if let Some(id) = state.resolve_type_reference(raw) {
+            return id.to_string();
+        }
+        let identity = Self::normalize_function_arg_type(raw);
+        // An unresolved custom type renders to nothing, so two distinct ones
+        // would collapse into one signature. Keep its written name instead.
+        if identity.is_unknown() {
+            return ParsedDataType::parse(raw).to_string();
+        }
+        identity.render()
     }
 
     pub(crate) fn normalize_function_arg_type(raw: &str) -> TypeIdentity {

@@ -9488,4 +9488,80 @@ mod state_mutation_tests {
             "a column number must be recognized, not parsed as no column: {findings:?}"
         );
     }
+
+    /// PostgreSQL keys a routine on its argument type OIDs, so these spellings
+    /// are one function and the second declaration must conflict.
+    #[test]
+    fn routine_identity_ignores_type_spelling() {
+        for (first, second) in [
+            ("text", "pg_catalog.text"),
+            ("int4", "pg_catalog.int"),
+            ("varchar", "pg_catalog.varchar"),
+        ] {
+            let engine = setup_engine();
+            let mut state = setup_state();
+            let findings = engine
+                .analyze(
+                    &format!(
+                        "CREATE FUNCTION probe(a {first}) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;
+                         CREATE FUNCTION probe(a {second}) RETURNS int LANGUAGE sql AS $$ SELECT 2 $$;"
+                    ),
+                    &mut state,
+                )
+                .unwrap();
+
+            assert!(
+                findings.iter().any(|finding| {
+                    finding.rule_id == "chain-conflict" && finding.reason.contains("already exists")
+                }),
+                "probe({first}) and probe({second}) are one routine: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn routine_identity_ignores_schema_qualification_of_a_user_type() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let findings = engine
+            .analyze(
+                "CREATE SCHEMA sm_ident;
+                 CREATE TYPE sm_ident.mood AS ENUM ('sad');
+                 SET search_path TO sm_ident, public;
+                 CREATE FUNCTION probe(a mood) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;
+                 CREATE FUNCTION probe(a sm_ident.mood) RETURNS int LANGUAGE sql AS $$ SELECT 2 $$;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            findings.iter().any(|finding| {
+                finding.rule_id == "chain-conflict" && finding.reason.contains("already exists")
+            }),
+            "both spellings resolve to sm_ident.mood: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn distinct_custom_types_are_not_collapsed_into_one_signature() {
+        // An unresolved custom type renders to nothing, so without care these
+        // two different signatures would both become `probe()`.
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let findings = engine
+            .analyze(
+                "CREATE TYPE alpha_t AS ENUM ('a');
+                 CREATE TYPE beta_t AS ENUM ('b');
+                 CREATE FUNCTION probe(a alpha_t) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;
+                 CREATE FUNCTION probe(a beta_t) RETURNS int LANGUAGE sql AS $$ SELECT 2 $$;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict"),
+            "distinct argument types are distinct routines: {findings:?}"
+        );
+    }
 }

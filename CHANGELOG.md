@@ -21,6 +21,14 @@ notes are available on the
   provably absent from a synchronized baseline. Without a baseline, or for an
   object created earlier in the same migration, only a taint is raised, so an
   unknown object is never reported as drift.
+- Routine identity now matches PostgreSQL, which keys a function on its
+  argument type OIDs. A type written as `pg_catalog.text` is the same argument
+  as `text`, and a catalog type written `mood` is the same as `sm_core.mood`
+  when that is what it resolves to. Both previously produced a distinct
+  signature, so a genuine duplicate declaration went unreported.
+- Fixed a false `chain-conflict` on valid SQL: two functions taking different
+  custom types both rendered an empty signature and were reported as the same
+  routine, for example `routine 'public.probe()' already exists`.
 - Renaming a type now preserves the schema qualification its dependents were
   written with, matching PostgreSQL. A domain declared over `sm_core.mood`
   reported `sm_core.emotion` after the rename rather than a bare `emotion`.
