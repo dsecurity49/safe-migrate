@@ -8,13 +8,14 @@ use safe_migrate::_internal::analysis::facts::{
 use safe_migrate::_internal::analysis::graph::DependencyKind;
 use safe_migrate::_internal::analysis::state::AnalysisState;
 use safe_migrate::_internal::ast::identifiers::ObjectId;
-use safe_migrate::_internal::db::cache::{CACHE_V8_MAGIC, DbCacheVersioned};
+use safe_migrate::_internal::db::cache::{CACHE_V9_MAGIC, DbCacheVersioned};
 use safe_migrate::_internal::engine::engine::SafeMigrateEngine;
 use safe_migrate::_internal::model::constraint::ConstraintKind;
 use safe_migrate::_internal::model::function::{
     FunctionOverlay, RoutineKind, SecurityMode, Volatility,
 };
 use safe_migrate::_internal::model::replication::{PublicationOverlay, SubscriptionOverlay};
+use safe_migrate::_internal::model::types::TypeKind;
 use safe_migrate::_internal::sync::sync_cache;
 use safe_migrate::api::Config;
 
@@ -83,13 +84,13 @@ fn decode_cache(path: &std::path::Path) -> (crate::_internal::db::cache::DbCache
         .read_to_end(&mut payload)
         .expect("read decoded cache payload");
     let v7_payload = payload
-        .strip_prefix(CACHE_V8_MAGIC)
+        .strip_prefix(CACHE_V9_MAGIC)
         .expect("catalog sync must write a V8 cache");
     let config = bincode::config::standard().with_variable_int_encoding();
     let (versioned, bytes_read): (DbCacheVersioned, usize) =
         bincode::serde::decode_from_slice(v7_payload, config).expect("decode V8 cache");
     assert_eq!(bytes_read, v7_payload.len());
-    let DbCacheVersioned::V8(cache) = versioned else {
+    let DbCacheVersioned::V9(cache) = versioned else {
         panic!("catalog sync must encode the V8 cache variant");
     };
     (*cache, payload)
@@ -180,6 +181,10 @@ fn seed_catalog(client: &mut postgres::Client, version: i32) {
                STYPE = integer,
                INITCOND = '0'
              );
+             CREATE DOMAIN {SCHEMA}.positive_score AS integer CHECK (VALUE > 0);
+             CREATE TYPE {SCHEMA}.mood AS ENUM ('calm', 'anxious');
+             CREATE TYPE {SCHEMA}.score_span AS RANGE (subtype = float8);
+             CREATE TYPE {SCHEMA}.reading AS (value integer, taken_at timestamp);
              CREATE FUNCTION {SCHEMA}.win_rank() RETURNS bigint
                AS 'window_row_number' LANGUAGE internal WINDOW;"
         ))
@@ -240,6 +245,10 @@ fn seed_catalog(client: &mut postgres::Client, version: i32) {
             subscription_options.join(", ")
         ))
         .expect("create disconnected live subscription");
+}
+
+fn same_type_kind(left: &TypeKind, right: &TypeKind) -> bool {
+    std::mem::discriminant(left) == std::mem::discriminant(right)
 }
 
 fn inspect_cache(path: &std::path::Path) -> serde_json::Value {
@@ -659,7 +668,55 @@ fn live_sync_preserves_routine_and_replication_catalogs_without_connection_secre
             SecurityMode::Invoker,
             "security for {name}"
         );
+        assert_eq!(
+            routine.internal_type_owner, None,
+            "only a range type owns its constructors, so {name} must not be owned"
+        );
     }
+
+    // `Types` coverage is what lets the analyzer assert a type is absent, so
+    // every independently-nameable typtype must reach the cache. PostgreSQL
+    // auto-creates a multirange alongside each range.
+    for (name, expected_kind) in [
+        ("mood", TypeKind::Enum { variants: vec![] }),
+        (
+            "positive_score",
+            TypeKind::Domain {
+                base_type: "integer".into(),
+                base_type_id: None,
+            },
+        ),
+        ("reading", TypeKind::Composite { fields: vec![] }),
+        ("score_span", TypeKind::Range),
+        ("score_span_multirange", TypeKind::Multirange),
+    ] {
+        let type_state = cache
+            .types
+            .get(&ObjectId::new(SCHEMA, name))
+            .unwrap_or_else(|| panic!("synchronized type {SCHEMA}.{name}"));
+        // Only the variant is compared; the modeled payload is asserted
+        // separately so this check cannot drift with layout changes.
+        assert!(
+            same_type_kind(&type_state.kind, &expected_kind),
+            "type kind for {SCHEMA}.{name}: got {:?}",
+            type_state.kind
+        );
+    }
+
+    // PostgreSQL records the range constructor as an internal part of the
+    // range type, so the type owns it rather than the reverse.
+    let constructor = cache
+        .functions
+        .get(&ObjectId::new(
+            SCHEMA,
+            "score_span(double precision,double precision)",
+        ))
+        .expect("synchronized range constructor");
+    assert_eq!(
+        constructor.internal_type_owner,
+        Some(ObjectId::new(SCHEMA, "score_span")),
+        "range constructor ownership"
+    );
 
     let publication = cache
         .publications

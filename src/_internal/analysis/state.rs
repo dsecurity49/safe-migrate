@@ -1285,11 +1285,19 @@ impl AnalysisState {
 
     /// Construct state from a cache after validating its cross-record
     /// invariants, preserving the requested baseline-availability flag.
+    ///
+    /// An unavailable baseline is a synthetic empty cache with no coverage, so
+    /// validating it would reject the very state `--no-cache` asks for.
     pub(crate) fn try_with_baseline(
         cache: DbCache,
         baseline_available: bool,
     ) -> Result<Self, String> {
-        Ok(Self::with_baseline(cache.validated()?, baseline_available))
+        let cache = if baseline_available {
+            cache.validated()?
+        } else {
+            cache
+        };
+        Ok(Self::with_baseline(cache, baseline_available))
     }
 
     #[cfg(test)]
@@ -1437,6 +1445,15 @@ impl AnalysisState {
         family: crate::_internal::db::cache::CatalogFamily,
     ) -> bool {
         self.baseline_covers_object(id) && self.baseline_coverage.has(family)
+    }
+
+    /// The type a routine was created as an internal part of, if any. Only
+    /// PostgreSQL creates these; a user cannot define one directly.
+    pub(crate) fn routine_internal_type_owner(&self, id: &ObjectId) -> Option<&ObjectId> {
+        match self.local.functions.get(id)? {
+            FunctionOverlay::Present(function) => function.internal_type_owner.as_ref(),
+            FunctionOverlay::Dropped => None,
+        }
     }
 
     /// Read-only semantic views used by rules instead of exposing the
@@ -3696,6 +3713,36 @@ impl AnalysisState {
 mod evidence_tests {
     use super::*;
     use crate::_internal::analysis::evidence::{EvidenceCode, EvidenceRecord, EvidenceScope};
+    use crate::_internal::db::cache::{CatalogFamily, SchemaCoverage};
+
+    /// Coverage for a hand-built baseline that retrieved `families`.
+    fn covering(schemas: Option<&[String]>, families: &[CatalogFamily]) -> CatalogCoverage {
+        CatalogCoverage::for_families(SchemaCoverage::from_sync_scope(schemas), families)
+    }
+
+    /// Coverage for a hand-built baseline that retrieved the whole catalog.
+    fn fully_covering(schemas: Option<&[String]>) -> CatalogCoverage {
+        covering(schemas, CatalogFamily::ALL)
+    }
+
+    /// A hand-built baseline that retrieved the whole catalog.
+    fn synced_cache() -> DbCache {
+        let mut cache = DbCache::new();
+        cache.coverage = fully_covering(cache.metadata.schemas.as_deref());
+        cache
+    }
+
+    /// Whole-catalog coverage minus `family`, to exercise incomplete coverage.
+    fn covering_except(schemas: Option<&[String]>, family: CatalogFamily) -> CatalogCoverage {
+        covering(
+            schemas,
+            &CatalogFamily::ALL
+                .iter()
+                .copied()
+                .filter(|candidate| *candidate != family)
+                .collect::<Vec<_>>(),
+        )
+    }
 
     fn table_with_columns(
         id: ObjectId,
@@ -3769,9 +3816,9 @@ mod evidence_tests {
 
     #[test]
     fn scoped_schema_lookup_records_unknown_object_evidence() {
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.metadata.schemas = Some(vec!["public".to_string()]);
-        cache.coverage = CatalogCoverage::from_sync_scope(cache.metadata.schemas.as_deref());
+        cache.coverage = fully_covering(cache.metadata.schemas.as_deref());
         let mut state = AnalysisState::new(cache);
         let result = state.apply(
             &Mutation::CreateSchema(
@@ -3795,13 +3842,10 @@ mod evidence_tests {
 
     #[test]
     fn schema_absence_requires_schema_catalog_coverage() {
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.metadata.schemas = Some(vec!["public".to_string()]);
-        cache.coverage = CatalogCoverage::from_sync_scope(cache.metadata.schemas.as_deref());
-        cache
-            .coverage
-            .families
-            .remove(&crate::_internal::db::cache::CatalogFamily::Schemas);
+        // Everything except the schema catalog, so absence cannot be proven.
+        cache.coverage = covering_except(cache.metadata.schemas.as_deref(), CatalogFamily::Schemas);
         let mut state = AnalysisState::new(cache);
 
         let result = state.apply(
@@ -3860,13 +3904,10 @@ mod evidence_tests {
 
     #[test]
     fn relation_absence_requires_relation_catalog_coverage() {
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.metadata.schemas = Some(vec!["public".to_string()]);
-        cache.coverage = CatalogCoverage::from_sync_scope(cache.metadata.schemas.as_deref());
-        cache
-            .coverage
-            .families
-            .remove(&crate::_internal::db::cache::CatalogFamily::Relations);
+        cache.coverage =
+            covering_except(cache.metadata.schemas.as_deref(), CatalogFamily::Relations);
         let mut state = AnalysisState::new(cache);
         let result = state.apply(
             &Mutation::DropTable(crate::_internal::analysis::mutations::DropTable {
@@ -3889,7 +3930,7 @@ mod evidence_tests {
     #[test]
     fn baseline_drop_requires_dependency_catalog_coverage() {
         let table_id = ObjectId::new("public", "known_table");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.insert_baseline(
             table_id.clone(),
             table_with_columns(table_id.clone(), &["id"]),
@@ -3921,7 +3962,7 @@ mod evidence_tests {
     #[test]
     fn scoped_boundary_authority_requires_explicit_completion_marker() {
         let table_id = ObjectId::new("app", "known_table");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.metadata.schemas = Some(vec!["app".to_string()]);
         cache.metadata.created_at_unix_secs = Some(1);
         cache.insert_baseline(
@@ -3947,7 +3988,7 @@ mod evidence_tests {
     fn local_drop_cascade_requires_dependency_coverage_for_baseline_dependents() {
         let parent = ObjectId::new("public", "new_parent");
         let child = ObjectId::new("public", "baseline_child");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.insert_baseline(
             child.clone(),
             table_with_columns(child.clone(), &["parent_id"]),
@@ -3997,7 +4038,7 @@ mod evidence_tests {
     #[test]
     fn baseline_sequence_drop_requires_dependency_coverage() {
         let sequence_id = ObjectId::new("public", "known_sequence");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.sequences.insert(
             sequence_id.clone(),
             crate::_internal::model::sequence::SequenceState {
@@ -4041,9 +4082,9 @@ mod evidence_tests {
     #[test]
     fn scoped_baseline_sequence_drop_requires_cross_schema_dependency_proof() {
         let sequence_id = ObjectId::new("public", "scoped_sequence");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.metadata.schemas = Some(vec!["public".to_string()]);
-        cache.coverage = CatalogCoverage::from_sync_scope(cache.metadata.schemas.as_deref());
+        cache.coverage = fully_covering(cache.metadata.schemas.as_deref());
         cache.sequences.insert(
             sequence_id.clone(),
             crate::_internal::model::sequence::SequenceState {
@@ -4082,7 +4123,7 @@ mod evidence_tests {
     #[test]
     fn baseline_drop_column_requires_dependency_coverage() {
         let table_id = ObjectId::new("public", "known_table");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.insert_baseline(
             table_id.clone(),
             table_with_columns(table_id.clone(), &["id"]),
@@ -4121,9 +4162,9 @@ mod evidence_tests {
     #[test]
     fn scoped_baseline_type_drop_requires_cross_schema_dependency_proof() {
         let type_id = ObjectId::new("public", "known_type");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.metadata.schemas = Some(vec!["public".to_string()]);
-        cache.coverage = CatalogCoverage::from_sync_scope(cache.metadata.schemas.as_deref());
+        cache.coverage = fully_covering(cache.metadata.schemas.as_deref());
         cache.types.insert(
             type_id.clone(),
             crate::_internal::model::types::TypeState {
@@ -4157,13 +4198,14 @@ mod evidence_tests {
     #[test]
     fn scoped_baseline_function_drop_requires_cross_schema_dependency_proof() {
         let function_id = ObjectId::new("public", "work(integer)");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.metadata.schemas = Some(vec!["public".to_string()]);
-        cache.coverage = CatalogCoverage::from_sync_scope(cache.metadata.schemas.as_deref());
+        cache.coverage = fully_covering(cache.metadata.schemas.as_deref());
         cache.functions.insert(
             function_id.clone(),
             crate::_internal::model::function::FunctionState {
                 id: function_id.clone(),
+                internal_type_owner: None,
                 routine_kind: crate::_internal::model::function::RoutineKind::Function,
                 arg_types: vec!["integer".to_string()],
                 arg_type_ids: Vec::new(),
@@ -4213,6 +4255,7 @@ mod evidence_tests {
         let id = ObjectId::new("public", "work(integer)");
         let routine = |kind| crate::_internal::model::function::FunctionState {
             id: id.clone(),
+            internal_type_owner: None,
             routine_kind: kind,
             arg_types: vec!["integer".to_string()],
             arg_type_ids: Vec::new(),
@@ -4436,7 +4479,7 @@ mod evidence_tests {
     #[test]
     fn concurrent_refresh_rejects_unpopulated_materialized_view() {
         let view_id = ObjectId::new("public", "empty_mv");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         let mut view = crate::_internal::model::relation::RelationState::new(
             view_id.clone(),
             ObjectId::new("", "postgres"),
@@ -4466,7 +4509,7 @@ mod evidence_tests {
         let parent = ObjectId::new("public", "parent");
         let child = ObjectId::new("public", "child");
         let view = ObjectId::new("public", "parent_view");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.insert_baseline(parent.clone(), table_with_columns(parent.clone(), &["id"]));
         cache.insert_baseline(
             child.clone(),
@@ -4515,7 +4558,7 @@ mod evidence_tests {
     fn unhydrated_generation_edge_remains_conservative() {
         let parent = ObjectId::new("public", "parent");
         let omitted_view = ObjectId::new("tenant", "parent_view");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.insert_baseline(parent.clone(), table_with_columns(parent.clone(), &["id"]));
         let mut state = AnalysisState::new(cache);
         state.local.graph.add_edge(DependencyEdge::new(
@@ -4548,7 +4591,7 @@ mod evidence_tests {
 
     #[test]
     fn stale_trigger_generation_does_not_block_schema_restrict() {
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.schemas.insert(
             "old_schema".to_string(),
             crate::_internal::model::schema::SchemaState {
@@ -4602,7 +4645,7 @@ mod evidence_tests {
     #[test]
     fn baseline_constraint_keys_hydrate_into_the_dependency_graph() {
         let parent = ObjectId::new("public", "parent");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.insert_baseline(parent.clone(), table_with_columns(parent.clone(), &["id"]));
         cache.constraints.push(ConstraintState {
             table_id: parent.clone(),
@@ -4640,7 +4683,7 @@ mod evidence_tests {
     fn malformed_baseline_fk_operator_evidence_is_tainted_not_claimed_exact() {
         let child = ObjectId::new("public", "child");
         let parent = ObjectId::new("public", "parent");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.insert_baseline(
             child.clone(),
             table_with_columns(child.clone(), &["parent_id"]),
@@ -4682,7 +4725,7 @@ mod evidence_tests {
     fn complete_baseline_fk_operator_evidence_reaches_graph_edge() {
         let child = ObjectId::new("public", "child");
         let parent = ObjectId::new("public", "parent");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.insert_baseline(
             child.clone(),
             table_with_columns(child.clone(), &["parent_id"]),
@@ -4718,7 +4761,7 @@ mod evidence_tests {
 
     #[test]
     fn try_new_rejects_semantically_invalid_cache_before_hydration() {
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.schemas.insert(
             "public".into(),
             crate::_internal::model::schema::SchemaState {
@@ -4737,7 +4780,7 @@ mod evidence_tests {
 
     #[test]
     fn role_catalog_coverage_is_authoritative_without_session_provenance() {
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         let role = ObjectId::new("", "app_role");
         cache.roles.insert(
             role.clone(),

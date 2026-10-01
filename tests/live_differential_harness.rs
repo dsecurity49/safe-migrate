@@ -1,4 +1,4 @@
-use crate::common::database_hosts_are_local;
+use crate::common::{database_hosts_are_local, synced_cache};
 use postgres::{Client, Config as PostgresConfig, NoTls};
 use safe_migrate::_internal::analysis::graph::DependencyKind;
 use safe_migrate::_internal::analysis::state::AnalysisState;
@@ -334,6 +334,7 @@ enum NormalizedType {
     Base,
     Composite,
     Range,
+    Multirange,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -1945,14 +1946,14 @@ fn required_role_edges_distinguish_missing_roles_from_incorrect_edges() {
         }"#,
     )
     .expect("role edge manifest");
-    let missing = check_role_membership_cache(&rule, "fixture.sql", &DbCache::new());
+    let missing = check_role_membership_cache(&rule, "fixture.sql", &synced_cache());
     assert_eq!(missing.len(), 2);
     assert!(missing.iter().all(|mismatch| {
         mismatch.category == MismatchCategory::BaselineObjectAbsent
             && mismatch.root_cause == RootCauseClassification::BaselineSetupGap
     }));
 
-    let mut cache = DbCache::new();
+    let mut cache = synced_cache();
     for name in ["member", "target"] {
         let id = safe_migrate::_internal::ast::identifiers::ObjectId::new("", name);
         cache.roles.insert(
@@ -3754,7 +3755,9 @@ fn normalize_column_storage(
                     data_type = normalize_data_type_with_identity(base_type, base_type_id.as_ref());
                     continue;
                 }
-                TypeKind::Composite { .. } | TypeKind::Range => return Some("EXTENDED".into()),
+                TypeKind::Composite { .. } | TypeKind::Range | TypeKind::Multirange => {
+                    return Some("EXTENDED".into());
+                }
                 TypeKind::Enum { .. } => return Some("PLAIN".into()),
                 TypeKind::Base => return None,
             },
@@ -3896,6 +3899,7 @@ fn normalize_type_kind(kind: &TypeKind) -> NormalizedType {
         TypeKind::Base => NormalizedType::Base,
         TypeKind::Composite { .. } => NormalizedType::Composite,
         TypeKind::Range => NormalizedType::Range,
+        TypeKind::Multirange => NormalizedType::Multirange,
     }
 }
 

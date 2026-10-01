@@ -535,7 +535,7 @@ mod architectural_gap_tests {
     #[test]
     fn test_tablespace_access_method_rewrite() {
         let engine = setup_engine();
-        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut cache = crate::common::synced_cache();
         cache.metadata.schemas = Some(vec!["public".to_string()]);
         cache.search_path = vec!["public".to_string()];
         cache.schemas.insert(
@@ -814,7 +814,7 @@ mod architectural_gap_tests {
         // spellings must still be recognised rather than silently dropped.
         for prefix in ["", "public."] {
             let engine = setup_engine();
-            let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+            let mut cache = crate::common::synced_cache();
             let owner = object_id("", "owner");
             for name in ["public", "target"] {
                 cache.schemas.insert(

@@ -7,106 +7,41 @@ notes are available on the
 
 ## v0.10.0 — unreleased
 
-- Findings now name the object they concern. `require-lock-timeout` and
-  `require-statement-timeout` report the table, index, view, or function the
-  slow statement acts on instead of `<statement>`, and fall back to
-  `unknown statement` when a statement has no single subject.
-- Report placeholders are now plain names rather than angle-bracket tokens:
-  `opaque statement`, `migration state`, `unnamed`, and `unqualified`.
-- `CREATE TYPE ... AS RANGE` and `CREATE TYPE ... (INPUT = ...)` are now
-  modeled as the `range` and `base` type kinds the catalog reports, instead of
-  falling through to the opaque path. A migration that creates one no longer
-  taints confidence to `Tainted`.
-- `schema-drift` now fires when a migration references a relation that is
-  provably absent from a synchronized baseline. Without a baseline, or for an
-  object created earlier in the same migration, only a taint is raised, so an
-  unknown object is never reported as drift.
-- `ALTER INDEX ... ATTACH PARTITION` now records the parent/child index
-  relationship. Dropping a partitioned index removes its attached children, as
-  PostgreSQL does, so a later `DROP INDEX` of such a child is now reported
-  instead of silently accepted.
-- Routine identity now matches PostgreSQL, which keys a function on its
-  argument type OIDs. A type written as `pg_catalog.text` is the same argument
-  as `text`, and a catalog type written `mood` is the same as `sm_core.mood`
-  when that is what it resolves to. Both previously produced a distinct
-  signature, so a genuine duplicate declaration went unreported.
-- Fixed a false `chain-conflict` on valid SQL: two functions taking different
-  custom types both rendered an empty signature and were reported as the same
-  routine, for example `routine 'public.probe()' already exists`.
-- Renaming a type now preserves the schema qualification its dependents were
-  written with, matching PostgreSQL. A domain declared over `sm_core.mood`
-  reported `sm_core.emotion` after the rename rather than a bare `emotion`.
-- Fixed the `require-concurrent-reindex` and `alter-index` differential
-  fixtures being scoped to `public` only, while their SQL uses unqualified
-  names that resolve in the harness schema.
-- `ALTER INDEX ... ALTER [COLUMN] c SET STATISTICS n` is now validated instead
-  of being accepted unconditionally. A target below `-1`, and a target on a
-  non-expression index column, are reported as conflicts; a target above
-  `10000`, which PostgreSQL clamps with a warning, is accepted and taints.
-  A column given by number is now recognized, where it was previously parsed as
-  no column at all.
-- Added `require-concurrent-reindex` to flag `REINDEX` that should run with
-  `CONCURRENTLY`, bringing the rule count to 30.
-- Added `ALTER MATERIALIZED VIEW` action extraction, state resolution, and
-  advisory apply.
-- Added `ALTER INDEX` extraction, state resolution, and advisory apply, plus
-  `ALTER VIEW` `SET`/`DROP DEFAULT` and `SET`/`RESET OPTIONS` as typed facts.
-- Bounded type modifiers to the ranges PostgreSQL accepts, so a valid negative
-  `numeric` scale is no longer misreported and an unbounded scale can no longer
-  exhaust memory.
-- Fixed `bpchar` without an explicit length to be reported as `bpchar` rather
-  than collapsing to `char`.
-- Hardened `REINDEX` and `ALTER INDEX` resolution against the catalog states left
-  behind by interrupted and crashed concurrent operations.
-- Inline suppressions (`-- safe-migrate: ignore(...)`) are now **disabled by
-  default**; set `allow_inline_suppressions = true` in `safe-migrate.toml` to
-  restore the previous behavior. This keeps bypasses visible in review diffs.
-- Fixed `REINDEX CONCURRENTLY` inside an explicit transaction block being
-  accepted without a `concurrent-in-transaction` finding.
-- Fixed `require-concurrent-reindex` emitting a false positive when the target
-  table is known from baseline to be temporary (temporary tables cannot use
-  `CONCURRENTLY`).
-- Fixed `timestamp(p) with time zone` and `time(p) with time zone` being
-  misclassified as `timestamp without time zone` / `time without time zone`
-  when a precision modifier preceded the timezone qualifier.
+- Range types are read from the baseline and their constructor is owned by the
+  type, so `DROP TYPE` no longer halts and dropping the constructor is reported.
+  Cache format V9; run `safe-migrate sync`.
+- Findings name the object they concern, using plain names instead of
+  angle-bracket placeholders, and fall back to `unknown statement`.
+- `CREATE TYPE ... AS RANGE` and `CREATE TYPE ... (INPUT = ...)` are modeled as
+  the `range` and `base` type kinds instead of the opaque path.
+- `schema-drift` fires for a relation provably absent from the baseline, and
+  only taints otherwise.
+- `ALTER INDEX ... ATTACH PARTITION` records the parent/child relationship, so
+  dropping a partitioned index drops its attached children.
+- Routine identity matches PostgreSQL's argument-type-OID keying, and renaming
+  a type preserves dependents' schema qualification.
+- `ALTER INDEX ... SET STATISTICS n` is validated, including numeric column
+  targets and PostgreSQL's clamped upper bound.
+- Added `require-concurrent-reindex` and `ALTER MATERIALIZED VIEW` /
+  `ALTER INDEX` modeling, bringing the rule count to 30.
+- Type modifiers are bounded to the ranges PostgreSQL accepts, `bpchar` without
+  a length no longer collapses to `char`, and `timestamp(p) with time zone`
+  keeps its qualifier when a precision precedes it.
+- `REINDEX` and `ALTER INDEX` resolve against interrupted and crashed
+  concurrent-operation catalog states; `REINDEX CONCURRENTLY` in a transaction
+  block is flagged, and temporary tables and exclusion-backing indexes no
+  longer draw false positives.
+- Inline suppressions are disabled by default; set
+  `allow_inline_suppressions = true` to restore them.
 - Finding severity is no longer weakened by uncertainty elsewhere in the
-  migration. `Finding` gains a `certainty` field for this instead, derived from
-  the evidence log so an unmodeled statement taints only what follows it.
-- Function and routine identity now discards type modifiers, matching
-  PostgreSQL. `foo(varchar)` and `foo(varchar(10))` are one function, so a
-  duplicate declaration is reported instead of silently creating two.
-- A `numeric` scale outside `0..=precision` is now checked against the
-  PostgreSQL version, which widened the range in 15. Without a baseline the
-  declaration taints rather than being reported as an error.
-- An empty effective `search_path` no longer places unqualified names in
-  `public`. PostgreSQL has no creation target in that case and errors.
-- Temporary relations are now placed in the session's temporary schema, which
-  is searched ahead of the path for relations and types but not for routines.
-  A temporary table no longer collides with a permanent table of the same
-  name, and a later unqualified `ALTER TABLE` correctly targets the temporary
-  one.
-- `require-concurrent-reindex` no longer flags an index backing an exclusion
-  constraint, which PostgreSQL refuses to rebuild concurrently.
-- The `EXCLUDE` constraint finding no longer recommends `USING INDEX`, a form
-  PostgreSQL rejects with a syntax error.
-- Fixed scoped `sync` recording the wrong name-resolution order. The effective
-  search path is now read before the catalog queries are pinned to
-  `pg_catalog`, so a schema-scoped baseline resolves unqualified names the same
-  way the live server does.
-- `ALTER VIEW` and `ALTER MATERIALIZED VIEW` `SET`/`RESET` options are now
-  modelled rather than silently dropped. The option is stored, a name the
-  target version rejects is reported as an error, and a name the analyzer
-  cannot place taints instead of claiming an exact result.
-- A view created from DDL now carries the same columns as the same view
-  synchronized from the catalog, with types normalised the way `format_type`
-  reports them. A projection that is not a plain column reference cannot be
-  typed offline, so the view is still created but the analysis taints.
-- Fixed `ALTER TABLE ... SET SCHEMA` being silently dropped, leaving the
-  relation in its old schema.
-- A recognized statement can no longer produce no state change without saying
-  so. `ALTER VIEW ... ALTER COLUMN SET/DROP DEFAULT` is now recorded, and a
-  statement that provably changes nothing outside the modeled state uses an
-  explicit no-op rather than an absent mutation.
+  migration; `Finding.certainty` carries that instead.
+- Name resolution now matches the live server: an empty `search_path` places
+  nothing in `public`, temporary relations resolve in the session's temporary
+  schema, and scoped `sync` reads the path before pinning to `pg_catalog`.
+- `ALTER VIEW` / `ALTER MATERIALIZED VIEW` `SET`/`RESET` options are modeled,
+  rejected by version, or tainted rather than dropped.
+- Views created from DDL carry the same columns as catalog-synchronized views;
+  `ALTER TABLE ... SET SCHEMA` is no longer silently dropped.
 
 ## v0.9.3 — 2026-09-23
 

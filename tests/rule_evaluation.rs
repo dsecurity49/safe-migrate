@@ -53,7 +53,7 @@ mod rule_evaluation_tests {
     fn test_rule_size_aware_toast_escalation() {
         let engine = setup_engine();
 
-        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut cache = crate::common::synced_cache();
 
         let tid = object_id("public", "t_toast");
 
@@ -106,7 +106,7 @@ mod rule_evaluation_tests {
     fn test_rule_blocking_constraint_check_and_not_valid_fast_path() {
         let engine = setup_engine();
 
-        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut cache = crate::common::synced_cache();
 
         cache.insert_baseline(
             object_id("public", "t"),
@@ -152,7 +152,7 @@ mod rule_evaluation_tests {
     fn test_rule_blocking_constraint_pk_and_unique() {
         let engine = setup_engine();
 
-        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut cache = crate::common::synced_cache();
 
         cache.insert_baseline(
             object_id("public", "t"),
@@ -213,7 +213,7 @@ mod rule_evaluation_tests {
     fn test_rule_mat_view_refresh() {
         let engine = setup_engine();
 
-        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut cache = crate::common::synced_cache();
 
         cache.insert_baseline(
             object_id("public", "mv"),
@@ -250,7 +250,7 @@ mod rule_evaluation_tests {
     fn test_rule_partition_attach_detach() {
         let engine = setup_engine();
 
-        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut cache = crate::common::synced_cache();
 
         cache.insert_baseline(
             object_id("public", "p"),
@@ -338,7 +338,7 @@ mod rule_evaluation_tests {
     #[test]
     fn test_earlier_taint_lowers_certainty_but_not_severity() {
         let engine = setup_engine();
-        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut cache = crate::common::synced_cache();
         let tid = object_id("public", "t");
         cache.insert_baseline(
             tid.clone(),
@@ -387,7 +387,7 @@ mod rule_evaluation_tests {
     #[test]
     fn missing_relation_statistics_taint_only_statistics_based_findings() {
         let engine = setup_engine();
-        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut cache = crate::common::synced_cache();
         let table_id = object_id("public", "stats_unknown");
         let mut relation = RelationState::new(
             table_id.clone(),
@@ -439,7 +439,7 @@ mod rule_evaluation_tests {
         use safe_migrate::_internal::analysis::state::Confidence;
 
         let engine = setup_engine();
-        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut cache = crate::common::synced_cache();
         let tid = object_id("public", "t");
         cache.insert_baseline(
             tid.clone(),
@@ -504,7 +504,7 @@ mod rule_evaluation_tests {
     #[test]
     fn test_exact_confidence_keeps_tier1() {
         let engine = setup_engine();
-        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut cache = crate::common::synced_cache();
         let tid = object_id("public", "t");
         cache.insert_baseline(
             tid.clone(),
@@ -602,7 +602,7 @@ mod rule_evaluation_tests {
     fn grant_all_owner_exemption_requires_every_grantee_to_own_every_table() {
         let engine = setup_engine();
         let table_id = object_id("public", "owned_table");
-        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut cache = crate::common::synced_cache();
         cache.insert_baseline(
             table_id.clone(),
             RelationState::new(
@@ -668,7 +668,7 @@ mod rule_evaluation_tests {
     #[test]
     fn test_rule_volatile_default_alter() {
         let engine = setup_engine();
-        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut cache = crate::common::synced_cache();
         let tid = object_id("public", "t");
         let rel = RelationState::new(
             tid.clone(),
@@ -870,6 +870,7 @@ mod rule_evaluation_tests {
                 volatility: Volatility::Volatile,
                 language: "plpgsql".into(),
                 security: SecurityMode::Invoker,
+                internal_type_owner: None,
             }),
         );
 
@@ -991,7 +992,7 @@ mod rule_evaluation_tests {
         );
         let engine = SafeMigrateEngine::new(config);
 
-        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut cache = crate::common::synced_cache();
         cache.insert_baseline(
             object_id("public", "t"),
             safe_migrate::_internal::model::relation::RelationState::new(
@@ -1024,7 +1025,7 @@ mod rule_evaluation_tests {
     fn test_rule_concurrent_drop_index_small() {
         let engine = setup_engine();
 
-        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut cache = crate::common::synced_cache();
         cache.insert_baseline(
             object_id("public", "t"),
             safe_migrate::_internal::model::relation::RelationState::new(
@@ -1056,7 +1057,7 @@ mod rule_evaluation_tests {
     #[test]
     fn scoped_cache_reports_unknown_schema_as_coverage_not_drift() {
         let engine = setup_engine();
-        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut cache = crate::common::synced_cache();
         cache.metadata.schemas = Some(vec!["app".to_string()]);
         let mut state = AnalysisState::new(cache);
 
@@ -1128,11 +1129,12 @@ mod rule_evaluation_tests {
         let routine_id = object_id("public", "work(integer)");
 
         for routine_kind in [RoutineKind::Function, RoutineKind::Procedure] {
-            let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+            let mut cache = crate::common::synced_cache();
             cache.functions.insert(
                 routine_id.clone(),
                 FunctionState {
                     id: routine_id.clone(),
+                    internal_type_owner: None,
                     routine_kind,
                     arg_types: vec!["integer".into()],
                     arg_type_ids: Vec::new(),
@@ -1288,7 +1290,7 @@ mod rule_evaluation_tests {
     #[test]
     fn empty_search_path_cannot_place_an_unqualified_name() {
         let engine = setup_engine();
-        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut cache = crate::common::synced_cache();
         cache.pg_version_num = Some(150_000);
         let mut state = AnalysisState::new(cache);
         state.baseline_available = true;
@@ -1404,7 +1406,7 @@ mod rule_evaluation_tests {
     #[test]
     fn view_reloptions_are_modelled_rather_than_ignored() {
         let engine = setup_engine();
-        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut cache = crate::common::synced_cache();
         cache.pg_version_num = Some(180_000);
         let mut state = AnalysisState::new(cache);
         state.baseline_available = true;
@@ -1439,7 +1441,7 @@ mod rule_evaluation_tests {
     #[test]
     fn view_reloption_rejected_by_version_is_a_conflict() {
         let engine = setup_engine();
-        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut cache = crate::common::synced_cache();
         cache.pg_version_num = Some(140_000);
         let mut state = AnalysisState::new(cache);
         state.baseline_available = true;
@@ -1463,7 +1465,7 @@ mod rule_evaluation_tests {
     #[test]
     fn unknown_view_reloption_taints_without_claiming_an_error() {
         let engine = setup_engine();
-        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut cache = crate::common::synced_cache();
         cache.pg_version_num = Some(180_000);
         let mut state = AnalysisState::new(cache);
         state.baseline_available = true;

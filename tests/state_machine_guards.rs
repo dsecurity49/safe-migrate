@@ -29,7 +29,7 @@ mod state_machine_guards_tests {
     #[test]
     fn test_reversibility_type_widen() {
         let engine = setup_engine();
-        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut cache = crate::common::synced_cache();
         let tid = object_id("public", "t");
         let mut rel = RelationState::new(
             tid.clone(),
@@ -140,7 +140,7 @@ mod state_machine_guards_tests {
     #[test]
     fn unknown_scoped_target_in_multi_drop_preserves_known_targets() {
         let engine = setup_engine();
-        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut cache = crate::common::synced_cache();
         cache.metadata.schemas = Some(vec!["app".to_string()]);
         let table_id = object_id("app", "known_table");
         let view_id = object_id("app", "known_view");

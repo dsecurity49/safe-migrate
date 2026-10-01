@@ -1,7 +1,7 @@
 use crate::_internal::ast::identifiers::ObjectId;
 use crate::_internal::db::cache::{
-    CACHE_V8_MAGIC, CatalogCoverage, ConstraintDependencyCache, ConstraintKeyCache, DbCache,
-    DbCacheVersioned, DefaultSequenceDependencyCache, ForeignKeyCache,
+    CACHE_V9_MAGIC, CatalogCoverageBuilder, CatalogFamily, ConstraintDependencyCache,
+    ConstraintKeyCache, DbCache, DbCacheVersioned, DefaultSequenceDependencyCache, ForeignKeyCache,
     GeneratedColumnDependencyCache, IndexCache, InheritanceCache, ViewDependencyCache,
 };
 use crate::_internal::db::cache_file::{
@@ -361,7 +361,7 @@ fn write_cache_with_protection_and_limits(
     cache
         .validate_semantics()
         .map_err(anyhow::Error::msg)
-        .context("Refusing to write a semantically invalid Cache V8 baseline")?;
+        .context("Refusing to write a semantically invalid cache baseline")?;
     let parent = cache_parent(out_path);
     let mut temp_file = NamedTempFile::new_in(parent).with_context(|| {
         format!(
@@ -374,17 +374,17 @@ fn write_cache_with_protection_and_limits(
         .context("Failed to init zstd compression")?;
     let mut encoder = SizeLimitedWriter::new(encoder, max_decode_bytes);
 
-    if let Err(error) = encoder.write_all(CACHE_V8_MAGIC) {
+    if let Err(error) = encoder.write_all(CACHE_V9_MAGIC) {
         if encoder.limit_exceeded() {
             anyhow::bail!(
                 "Cache payload exceeds the {} MiB decoded-size limit",
                 max_decode_bytes / (1024 * 1024)
             );
         }
-        return Err(error).context("Failed to write cache V8 payload header");
+        return Err(error).context("Failed to write cache payload header");
     }
 
-    let versioned = DbCacheVersioned::V8(Box::new(cache));
+    let versioned = DbCacheVersioned::V9(Box::new(cache));
     let bincode_config = bincode::config::standard().with_variable_int_encoding();
 
     let encode_result =
@@ -2924,10 +2924,23 @@ fn load_routines(
             p.provolatile::text AS volatility,
             p.prokind::text AS routine_kind,
             l.lanname AS language,
-            p.prosecdef AS security_definer
+            p.prosecdef AS security_definer,
+            owner_ns.nspname AS internal_owner_schema,
+            owner_t.typname AS internal_owner_name
         FROM pg_proc p
         JOIN pg_namespace n ON n.oid = p.pronamespace
         JOIN pg_language l ON l.oid = p.prolang
+        LEFT JOIN LATERAL (
+            SELECT d.refobjid AS owner_oid
+            FROM pg_depend d
+            WHERE d.classid = 'pg_proc'::regclass
+              AND d.objid = p.oid
+              AND d.refclassid = 'pg_type'::regclass
+              AND d.deptype = 'i'
+            LIMIT 1
+        ) owner ON TRUE
+        LEFT JOIN pg_type owner_t ON owner_t.oid = owner.owner_oid
+        LEFT JOIN pg_namespace owner_ns ON owner_ns.oid = owner_t.typnamespace
         WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
           AND p.prokind IN ('f', 'p', 'a', 'w')
           {schema_filter};
@@ -2982,6 +2995,15 @@ fn load_routines(
                     } else {
                         crate::_internal::model::function::SecurityMode::Invoker
                     },
+                    internal_type_owner: match (
+                        row.try_get::<_, Option<String>>("internal_owner_schema")
+                            .context("internal owner schema")?,
+                        row.try_get::<_, Option<String>>("internal_owner_name")
+                            .context("internal owner name")?,
+                    ) {
+                        (Some(schema), Some(name)) => Some(ObjectId::new(schema, name)),
+                        _ => None,
+                    },
                 },
             ))
         })
@@ -2993,6 +3015,11 @@ fn load_types(
     schema_values: &Option<Vec<String>>,
     schema_filter: &str,
 ) -> Result<std::collections::HashMap<ObjectId, crate::_internal::model::types::TypeState>> {
+    // Every `typtype` a user can name in `DROP TYPE` / `ALTER TYPE`. Array
+    // types are excluded because PostgreSQL refuses both for them ("cannot
+    // alter/drop array type"), so they are never independently addressable.
+    let type_predicate = "t.typtype IN ('e', 'd', 'c', 'r', 'm') \
+                          OR (t.typtype = 'b' AND t.typelem = 0)";
     let query = format!(
         "
         SELECT
@@ -3037,7 +3064,7 @@ fn load_types(
         LEFT JOIN pg_type field_type ON field_type.oid = a.atttypid
         LEFT JOIN pg_namespace field_type_ns ON field_type_ns.oid = field_type.typnamespace
         WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
-          AND t.typtype IN ('e', 'd', 'c')
+          AND ({type_predicate})
           AND (t.typtype <> 'c' OR composite_rel.relkind = 'c')
           {schema_filter}
         GROUP BY n.nspname, t.typname, t.typtype, t.typbasetype, t.typtypmod;
@@ -3060,6 +3087,9 @@ fn load_types(
                         .context("PostgreSQL omitted the base type for a domain")?,
                     base_type_id: None,
                 },
+                "r" => crate::_internal::model::types::TypeKind::Range,
+                "m" => crate::_internal::model::types::TypeKind::Multirange,
+                "b" => crate::_internal::model::types::TypeKind::Base,
                 "c" => {
                     let names: Vec<String> = row
                         .try_get("composite_field_names")
@@ -3498,7 +3528,7 @@ fn populate_cache_from_client(
     let provenance = load_provenance(client, schemas)?;
     cache.pg_version_num = Some(provenance.pg_version_num);
     cache.metadata = provenance.metadata;
-    cache.coverage = CatalogCoverage::from_sync_scope(schemas);
+    let mut coverage = CatalogCoverageBuilder::from_sync_scope(schemas);
     cache.search_path = provenance.search_path;
 
     let schema_filter = "AND ($1::text[] IS NULL OR n.nspname = ANY($1))";
@@ -3544,6 +3574,7 @@ fn populate_cache_from_client(
     // Schemas are an authoritative catalog only for the requested sync scope.
     // FK-only external schemas pulled in below deliberately do not enter it.
     cache.schemas = load_schemas(client, &schema_values, schema_filter)?;
+    coverage.record(CatalogFamily::Schemas);
     // A scoped request can name schemas that do not exist yet. PostgreSQL's
     // effective search path skips those entries, so do not let them become
     // inferred-present namespaces when the cache is hydrated.
@@ -3552,9 +3583,11 @@ fn populate_cache_from_client(
         .retain(|schema| cache.schemas.contains_key(schema));
 
     cache.sequences = load_sequences(client, &schema_values)?;
+    coverage.record(CatalogFamily::Sequences);
 
     cache.relations =
         load_relations_and_columns(client, schemas, &schema_values, schema_filter_with_fk)?;
+    coverage.record(CatalogFamily::Relations);
 
     let (relation_decorations, relation_grants) =
         load_relation_decorations(client, &schema_values, schema_filter_with_fk)?;
@@ -3595,6 +3628,7 @@ fn populate_cache_from_client(
     }
 
     cache.triggers = load_triggers(client, &schema_values, schema_filter_with_fk)?;
+    coverage.record(CatalogFamily::Triggers);
 
     cache.constraints = load_constraints(client, &schema_values, schema_filter_with_fk)?;
     cache.constraint_keys = load_constraint_keys(client, &schema_values, schema_filter_with_fk)?;
@@ -3602,6 +3636,7 @@ fn populate_cache_from_client(
         load_constraint_dependencies(client, &schema_values, schema_filter_with_fk)?;
     cache.generated_column_dependencies =
         load_generated_column_dependencies(client, &schema_values, schema_filter_with_fk)?;
+    coverage.record(CatalogFamily::Constraints);
     cache.default_sequence_dependencies =
         load_default_sequence_dependencies(client, &schema_values, schema_filter_with_fk)?;
 
@@ -3609,21 +3644,27 @@ fn populate_cache_from_client(
         load_foreign_keys(client, schemas, &schema_values, schema_filter_n1_or_n2)?;
 
     cache.inheritances = load_inheritances(client, &schema_values)?;
+    coverage.record(CatalogFamily::Inheritance);
 
     cache.indexes = load_indexes(client, &schema_values, schema_filter_nt)?;
+    coverage.record(CatalogFamily::Indexes);
 
     cache.functions = load_routines(client, &schema_values, schema_filter)?;
+    coverage.record(CatalogFamily::Routines);
 
     cache.publications = load_publications(client, cache.pg_version_num.unwrap_or_default())?;
-
     cache.subscriptions = load_subscriptions(client, cache.pg_version_num.unwrap_or_default())?;
+    coverage.record(CatalogFamily::Publications);
+    coverage.record(CatalogFamily::Subscriptions);
 
     cache.types = load_types(client, &schema_values, schema_filter)?;
+    coverage.record(CatalogFamily::Types);
 
     // Only view dependencies are consumed by cache hydration. Generic
     // pg_depend rows use PostgreSQL dependency codes (n/a/i) and were ignored
     // after synchronization, so avoid loading them into Cache V8.
     cache.dependencies = load_view_dependencies(client, &schema_values)?;
+    coverage.record(CatalogFamily::Dependencies);
     cache.scoped_external_relation_dependencies =
         load_scoped_external_relation_dependencies(client, &schema_values)?;
     cache.scoped_external_type_dependencies =
@@ -3645,6 +3686,11 @@ fn populate_cache_from_client(
     cache.role_membership_grantors =
         load_role_membership_grantors(client, cache.pg_version_num.unwrap_or_default())?;
     cache.role_membership_grantors_complete = true;
+    coverage.record(CatalogFamily::Roles);
+
+    // Every loader above is fallible, so reaching this point means each one
+    // completed and recorded its own family.
+    cache.coverage = coverage.finish();
 
     // The bootstrap superuser (pg_authid OID 10, `BOOTSTRAP_SUPERUSERID`)
     // receives implicit superuser-issued role grantor attribution on modern
@@ -3661,7 +3707,7 @@ fn populate_cache_from_client(
     cache
         .validate_semantics()
         .map_err(anyhow::Error::msg)
-        .context("PostgreSQL catalogs produced a semantically invalid Cache V8 baseline")?;
+        .context("PostgreSQL catalogs produced a semantically invalid cache baseline")?;
     Ok(cache)
 }
 
@@ -3777,6 +3823,21 @@ mod catalog_conversion_tests {
 #[cfg(test)]
 mod atomic_write_tests {
     use super::*;
+
+    /// The writer validates coverage before encoding, so writer tests need a
+    /// The writer validates coverage before encoding, so writer tests need a
+    /// cache that claims the families a real synchronization would record.
+    fn writable_cache() -> DbCache {
+        use crate::_internal::db::cache::{CatalogCoverage, SchemaCoverage};
+
+        let mut cache = DbCache::new();
+        cache.coverage = CatalogCoverage::for_families(
+            SchemaCoverage::from_sync_scope(None),
+            CatalogFamily::ALL,
+        );
+        cache
+    }
+
     use crate::_internal::db::cache::DbCacheVersioned;
     use std::fs;
     use std::io::Read;
@@ -3788,8 +3849,8 @@ mod atomic_write_tests {
         let mut payload = Vec::new();
         decoder.read_to_end(&mut payload).unwrap();
         let payload = payload
-            .strip_prefix(CACHE_V8_MAGIC)
-            .expect("writer must prefix V8 cache payloads");
+            .strip_prefix(CACHE_V9_MAGIC)
+            .expect("writer must prefix cache payloads");
         let config = bincode::config::standard().with_variable_int_encoding();
         let versioned: DbCacheVersioned = bincode::serde::decode_from_slice(payload, config)
             .unwrap()
@@ -3812,7 +3873,7 @@ mod atomic_write_tests {
         let cache_path = temp_dir.path().join("baseline.cache");
         fs::write(&cache_path, b"old-cache").unwrap();
 
-        let mut cache = DbCache::new();
+        let mut cache = writable_cache();
         cache.pg_version_num = Some(180002);
         write_cache(&cache_path, cache, false).unwrap();
 
@@ -3833,7 +3894,7 @@ mod atomic_write_tests {
             let cache_path = cache_path.clone();
             let barrier = barrier.clone();
             writers.push(std::thread::spawn(move || {
-                let mut cache = DbCache::new();
+                let mut cache = writable_cache();
                 cache.pg_version_num = Some(version);
                 barrier.wait();
                 write_cache(&cache_path, cache, false)
@@ -3859,7 +3920,7 @@ mod atomic_write_tests {
         let cache_path = temp_dir.path().join("baseline.cache");
         fs::write(&cache_path, b"known-good-cache").unwrap();
 
-        let error = write_cache_with_protection(&cache_path, DbCache::new(), |_| {
+        let error = write_cache_with_protection(&cache_path, writable_cache(), |_| {
             Err(anyhow::anyhow!("injected payload-protection failure"))
         })
         .unwrap_err();
@@ -3881,10 +3942,10 @@ mod atomic_write_tests {
 
         let error = write_cache_with_protection_and_limits(
             &cache_path,
-            DbCache::new(),
+            writable_cache(),
             Ok,
             MAX_CACHE_FILE_BYTES,
-            CACHE_V8_MAGIC.len(),
+            CACHE_V9_MAGIC.len(),
         )
         .unwrap_err();
 
@@ -3902,7 +3963,7 @@ mod atomic_write_tests {
 
         let error = write_cache_with_protection_and_limits(
             &cache_path,
-            DbCache::new(),
+            writable_cache(),
             |_| Ok(vec![0; max_file_bytes as usize + 1]),
             max_file_bytes,
             MAX_CACHE_DECODE_BYTES,

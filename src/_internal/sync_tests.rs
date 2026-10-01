@@ -324,8 +324,8 @@ mod tests {
             },
         );
 
-        // Cache V8 uses bincode.
-        let versioned = crate::_internal::db::cache::DbCacheVersioned::V8(Box::new(cache));
+        // The current cache format uses bincode.
+        let versioned = crate::_internal::db::cache::DbCacheVersioned::V9(Box::new(cache));
         let config = bincode::config::standard().with_variable_int_encoding();
         let encoded = bincode::serde::encode_to_vec(&versioned, config).unwrap();
 
@@ -333,8 +333,8 @@ mod tests {
             bincode::serde::decode_from_slice(&encoded, config)
                 .unwrap()
                 .0;
-        let crate::_internal::db::cache::DbCacheVersioned::V8(deserialized) = decoded else {
-            panic!("Expected V8");
+        let crate::_internal::db::cache::DbCacheVersioned::V9(deserialized) = decoded else {
+            panic!("Expected the current cache format");
         };
         assert_eq!(deserialized.pg_version_num, Some(160000));
         assert_eq!(
@@ -427,15 +427,15 @@ mod tests {
         });
         cache.insert_baseline(id.clone(), rel);
 
-        let versioned = crate::_internal::db::cache::DbCacheVersioned::V8(Box::new(cache));
+        let versioned = crate::_internal::db::cache::DbCacheVersioned::V9(Box::new(cache));
         let config = bincode::config::standard().with_variable_int_encoding();
         let encoded = bincode::serde::encode_to_vec(&versioned, config).unwrap();
         let decoded: crate::_internal::db::cache::DbCacheVersioned =
             bincode::serde::decode_from_slice(&encoded, config)
                 .unwrap()
                 .0;
-        let crate::_internal::db::cache::DbCacheVersioned::V8(deserialized) = decoded else {
-            panic!("Expected V8");
+        let crate::_internal::db::cache::DbCacheVersioned::V9(deserialized) = decoded else {
+            panic!("Expected the current cache format");
         };
         let rel = deserialized.relations.get(&id).unwrap();
         assert_eq!(rel.columns[0].default_expr_text, Some("now()".into()));
@@ -487,6 +487,7 @@ mod tests {
         ] {
             let current = crate::_internal::model::function::FunctionState {
                 id: id.clone(),
+                internal_type_owner: None,
                 routine_kind,
                 arg_types: vec!["mood".into()],
                 arg_type_ids: vec![Some(ObjectId::new("public", "mood"))],

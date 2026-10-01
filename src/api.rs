@@ -50,7 +50,7 @@ use crate::_internal::analysis::state::{
     AnalysisState as InternalAnalysisState, Confidence as InternalConfidence,
 };
 use crate::_internal::db::cache::{
-    CACHE_FORMAT_VERSION, CACHE_V8_MAGIC, DbCache as InternalDbCache, DbCacheVersioned,
+    CACHE_FORMAT_VERSION, CACHE_V9_MAGIC, DbCache as InternalDbCache, DbCacheVersioned,
 };
 use crate::_internal::db::cache_file::{
     MAX_CACHE_DECODE_BYTES, decode_hex_key, is_encrypted_cache_bytes, read_cache_bytes,
@@ -1556,10 +1556,10 @@ fn decode_cache_payload(
         )
     })?;
     let mut decoder = decoder.take(MAX_CACHE_DECODE_BYTES as u64 + 1);
-    let mut header = Vec::with_capacity(CACHE_V8_MAGIC.len());
+    let mut header = Vec::with_capacity(CACHE_V9_MAGIC.len());
     decoder
         .by_ref()
-        .take(CACHE_V8_MAGIC.len() as u64)
+        .take(CACHE_V9_MAGIC.len() as u64)
         .read_to_end(&mut header)
         .map_err(|error| {
             Error::with_source(
@@ -1568,13 +1568,13 @@ fn decode_cache_payload(
                 error,
             )
         })?;
-    if header.len() < CACHE_V8_MAGIC.len() && CACHE_V8_MAGIC.starts_with(&header) {
+    if header.len() < CACHE_V9_MAGIC.len() && CACHE_V9_MAGIC.starts_with(&header) {
         return Err(Error::cache(format!(
             "{} is truncated or corrupted",
             path.display()
         )));
     }
-    if header != CACHE_V8_MAGIC {
+    if header != CACHE_V9_MAGIC {
         return Err(Error::cache(format!(
             "{} uses an unsupported cache format; run `safe-migrate sync`",
             path.display()

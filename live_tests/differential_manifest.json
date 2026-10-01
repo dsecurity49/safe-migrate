@@ -1701,6 +1701,9 @@
     "019_concurrent_detach_in_transaction.sql",
     "020_invalid_partition_strategy.sql",
     "021_concurrent_detach_default_partition.sql",
+    "safe_054_drop_range_type.sql",
+    "safe_055_rename_range_multirange.sql",
+    "022_drop_range_constructor.sql",
     "004_conflict.sql",
     "safe_001_chain.sql",
     "safe_001_create_table.sql",
@@ -1853,6 +1856,10 @@
     },
     "021_concurrent_detach_default_partition.sql": {
      "sqlstate": "55000",
+     "simulator_rule": "chain-conflict"
+    },
+"022_drop_range_constructor.sql": {
+    "sqlstate": "2BP01",
      "simulator_rule": "chain-conflict"
     }
    },
@@ -2668,12 +2675,12 @@
    "enabled": true,
    "transactional": true,
    "fixtures": [
-    "002_attach_partition_drop_child.sql",
+    "safe_003_attach_partition_drop_child.sql",
     "safe_001_alter_index.sql"
    ],
    "expected_live_errors": {
-    "002_attach_partition_drop_child.sql": {
-     "sqlstate": "42704",
+"safe_003_attach_partition_drop_child.sql": {
+   "sqlstate": "42704",
      "simulator_rule": "chain-conflict"
     }
    },

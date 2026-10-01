@@ -2,7 +2,7 @@ mod phase10_bug_fixes_and_sorting_tests {
     use crate::common::*;
     use safe_migrate::_internal::analysis::state::{AnalysisState, Confidence};
     use safe_migrate::_internal::ast::identifiers::ObjectId;
-    use safe_migrate::_internal::db::cache::DbCache;
+
     use safe_migrate::_internal::model::relation::{Persistence, RelationKind};
     use safe_migrate::_internal::report::violations::{
         ObjectKind, OperationKind, Violation, ViolationTier,
@@ -89,7 +89,7 @@ mod phase10_bug_fixes_and_sorting_tests {
 
     #[test]
     fn test_bug008_index_not_in_baseline_relations() {
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.indexes.push(baseline_index(
             object_id("public", "idx_accounts_username"),
             object_id("public", "accounts"),
@@ -104,7 +104,7 @@ mod phase10_bug_fixes_and_sorting_tests {
 
     #[test]
     fn test_bug008_index_in_baseline_indexes() {
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.indexes.push(baseline_index(
             object_id("public", "idx_accounts_username"),
             object_id("public", "accounts"),
@@ -120,7 +120,7 @@ mod phase10_bug_fixes_and_sorting_tests {
     #[test]
     fn test_bug008_stale_stats_does_not_fire_on_index() {
         let engine = setup_engine();
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.insert_baseline(
             object_id("public", "accounts"),
             safe_migrate::_internal::model::relation::RelationState::new(
@@ -157,7 +157,7 @@ mod phase10_bug_fixes_and_sorting_tests {
     #[test]
     fn stale_constraint_stats_do_not_flag_unrelated_alter_table_actions() {
         let engine = setup_engine();
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.insert_baseline(
             object_id("public", "accounts"),
             safe_migrate::_internal::model::relation::RelationState::new(
@@ -189,7 +189,7 @@ mod phase10_bug_fixes_and_sorting_tests {
     #[test]
     fn test_add_column_now_default_not_flagged() {
         let engine = setup_engine();
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.pg_version_num = Some(110000);
         cache.insert_baseline(
             object_id("public", "t"),
@@ -225,7 +225,7 @@ mod phase10_bug_fixes_and_sorting_tests {
     #[test]
     fn test_drop_index_no_stale_stats_warning() {
         let engine = setup_engine();
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.insert_baseline(
             object_id("public", "t"),
             safe_migrate::_internal::model::relation::RelationState::new(
@@ -267,7 +267,7 @@ mod phase10_bug_fixes_and_sorting_tests {
     fn test_deterministic_violation_sorting() {
         let engine = setup_engine();
 
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.insert_baseline(
             object_id("public", "t"),
             safe_migrate::_internal::model::relation::RelationState::new(
@@ -502,7 +502,7 @@ mod phase10_bug_fixes_and_sorting_tests {
     #[test]
     fn test_bug013_confidence_restored_on_rollback() {
         let engine = setup_engine();
-        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut cache = crate::common::synced_cache();
         let tid = object_id("public", "t");
         cache.insert_baseline(
             tid.clone(),
@@ -656,7 +656,7 @@ mod phase10_bug_fixes_and_sorting_tests {
     #[test]
     fn test_finding2_partition_strategy_mismatch_silent_on_regular_child() {
         let engine = setup_engine();
-        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut cache = crate::common::synced_cache();
         let parent_id = object_id("public", "parent");
         let mut parent = safe_migrate::_internal::model::relation::RelationState::new(
             parent_id.clone(),
@@ -702,7 +702,7 @@ mod phase10_bug_fixes_and_sorting_tests {
     #[test]
     fn test_finding2_partition_strategy_mismatch_fires_on_mismatch() {
         let engine = setup_engine();
-        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut cache = crate::common::synced_cache();
         let parent_id = object_id("public", "parent");
         let mut parent = safe_migrate::_internal::model::relation::RelationState::new(
             parent_id.clone(),
@@ -1256,7 +1256,7 @@ mod phase10_bug_fixes_and_sorting_tests {
             ..Default::default()
         };
         let engine = safe_migrate::_internal::engine::engine::SafeMigrateEngine::new(config);
-        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut cache = crate::common::synced_cache();
 
         let parent_id = object_id("public", "parent");
         let child_id = object_id("public", "child");
@@ -1389,7 +1389,7 @@ mod phase10_bug_fixes_and_sorting_tests {
     #[test]
     fn reindex_reports_the_kind_of_object_it_targets() {
         let engine = setup_engine();
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.insert_baseline(
             object_id("public", "reindex_test"),
             safe_migrate::_internal::model::relation::RelationState::new(

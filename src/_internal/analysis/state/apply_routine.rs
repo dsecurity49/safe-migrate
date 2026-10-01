@@ -116,10 +116,21 @@ impl AnalysisState {
             self.taint(EvidenceCode::UnsupportedSemantics, EvidenceScope::Chain);
         }
 
+        // Ownership by a type is a property of the routine's identity, so a
+        // replacement keeps it rather than dropping the fact.
+        let internal_type_owner =
+            self.local
+                .functions
+                .get(&function.id)
+                .and_then(|overlay| match overlay {
+                    FunctionOverlay::Present(existing) => existing.internal_type_owner.clone(),
+                    FunctionOverlay::Dropped => None,
+                });
         self.local.functions.insert(
             function.id.clone(),
             FunctionOverlay::Present(FunctionState {
                 id: function.id.clone(),
+                internal_type_owner,
                 routine_kind,
                 arg_types: function
                     .params
@@ -295,6 +306,17 @@ impl AnalysisState {
                     return MutationResult::Skipped;
                 }
                 RoutineLookup::Present => {
+                    // PostgreSQL created this routine as an internal part of a
+                    // type (a range constructor) and refuses to drop it while
+                    // that type exists.
+                    if let Some(owner) = self.routine_internal_type_owner(&id) {
+                        return MutationResult::Conflict {
+                            reason: format!(
+                                "function '{}' cannot be dropped because type '{}' requires it",
+                                id, owner
+                            ),
+                        };
+                    }
                     let dependent_triggers: Vec<(ObjectId, ObjectId)> = self
                         .local
                         .graph
@@ -458,6 +480,9 @@ impl AnalysisState {
             procedure.id.clone(),
             FunctionOverlay::Present(FunctionState {
                 id: procedure.id.clone(),
+                // PostgreSQL only auto-creates range constructors, never a
+                // procedure or aggregate, so neither can be type-owned.
+                internal_type_owner: None,
                 routine_kind: RoutineKind::Procedure,
                 arg_types: procedure
                     .params
@@ -635,6 +660,9 @@ impl AnalysisState {
             aggregate.id.clone(),
             FunctionOverlay::Present(FunctionState {
                 id: aggregate.id.clone(),
+                // PostgreSQL only auto-creates range constructors, never a
+                // procedure or aggregate, so neither can be type-owned.
+                internal_type_owner: None,
                 routine_kind: RoutineKind::Aggregate,
                 arg_types: aggregate
                     .params

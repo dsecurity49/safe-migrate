@@ -612,7 +612,7 @@ mod transaction_lifecycle_tests {
     #[test]
     fn test_rename_propagation_rollback() {
         let engine = setup_engine();
-        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut cache = crate::common::synced_cache();
 
         let t1_id = object_id("public", "t1");
         let v1_id = object_id("public", "v1");

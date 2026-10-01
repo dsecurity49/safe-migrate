@@ -40,6 +40,11 @@ pub(crate) struct FunctionState {
     pub volatility: Volatility,
     pub language: String,
     pub security: SecurityMode,
+    /// Set when `pg_depend` records an internal (`deptype = 'i'`) dependency on
+    /// a type, which is how PostgreSQL marks the range constructors it creates
+    /// for a range type. The type owns them: dropping the type drops them, and
+    /// PostgreSQL refuses to drop them while the type exists.
+    pub internal_type_owner: Option<ObjectId>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

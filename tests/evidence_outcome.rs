@@ -65,7 +65,7 @@ fn foreign_key_type_compatibility_gap_has_catalog_evidence_not_legacy_taint() {
 fn unknown_sequence_target_has_typed_object_state_evidence() {
     let engine = common::setup_engine();
     let mut state = crate::_internal::analysis::state::AnalysisState::with_baseline(
-        safe_migrate::_internal::db::cache::DbCache::new(),
+        crate::common::synced_cache(),
         false,
     );
     let outcome = engine
@@ -88,7 +88,7 @@ fn unknown_sequence_target_has_typed_object_state_evidence() {
 fn unavailable_rule_capability_is_recorded_before_rule_evaluation() {
     let engine = common::setup_engine();
     let mut state = crate::_internal::analysis::state::AnalysisState::with_baseline(
-        safe_migrate::_internal::db::cache::DbCache::new(),
+        crate::common::synced_cache(),
         false,
     );
     let outcome = engine
