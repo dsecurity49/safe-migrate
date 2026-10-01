@@ -92,7 +92,14 @@ impl Rule for ConcurrentInsideTransactionRule {
                         source_range: None,
                         rule_id: self.id(),
                         operation_kind: OperationKind::Reindex,
-                        object_kind: ObjectKind::Index,
+                        object_kind: match target {
+                            Some(
+                                ReindexTargetMutation::Database(_) | ReindexTargetMutation::System(_),
+                            ) => ObjectKind::Database,
+                            Some(ReindexTargetMutation::Schema(_)) => ObjectKind::Schema,
+                            Some(ReindexTargetMutation::Table(_)) => ObjectKind::Table,
+                            _ => ObjectKind::Index,
+                        },
                         object_name: target_name.clone(),
                         tier: self.default_tier(),
                         reason: format!(

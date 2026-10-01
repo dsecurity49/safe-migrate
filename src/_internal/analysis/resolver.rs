@@ -118,7 +118,7 @@ impl Resolver {
     ) -> ObjectId {
         let signature = params
             .iter()
-            .map(|param| Self::normalize_function_arg_type(param).render())
+            .map(|param| Self::routine_arg_identity(param, state))
             .collect::<Vec<_>>()
             .join(",");
         let object_name = format!("{}({signature})", name.name.resolve());
@@ -575,7 +575,7 @@ impl Resolver {
                 mutations.push(Self::resolve_alter_function(f, state));
             }
             StatementFact::DropFunction(f) => {
-                mutations.push(Self::resolve_drop_function(f));
+                mutations.push(Self::resolve_drop_function(f, state));
             }
             StatementFact::CreateProcedure(p) => {
                 mutations.push(Self::resolve_create_procedure(p, state));
@@ -584,7 +584,7 @@ impl Resolver {
                 mutations.push(Self::resolve_alter_procedure(p, state));
             }
             StatementFact::DropProcedure(p) => {
-                mutations.push(Self::resolve_drop_procedure(p));
+                mutations.push(Self::resolve_drop_procedure(p, state));
             }
             StatementFact::CreateAggregate(a) => {
                 mutations.push(Self::resolve_create_aggregate(a, state));
@@ -593,7 +593,7 @@ impl Resolver {
                 mutations.push(Self::resolve_alter_aggregate(a, state));
             }
             StatementFact::DropAggregate(a) => {
-                mutations.push(Self::resolve_drop_aggregate(a));
+                mutations.push(Self::resolve_drop_aggregate(a, state));
             }
             StatementFact::CreatePublication(p) => {
                 mutations.push(Self::resolve_create_publication(p, state));

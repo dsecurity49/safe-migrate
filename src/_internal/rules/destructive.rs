@@ -238,6 +238,16 @@ impl Rule for SizeAwareAddColumnRule {
                         "Adding column with volatile DEFAULT to {} triggers a table rewrite",
                         alter.id
                     )
+                } else if is_stored_generated {
+                    format!(
+                        "Adding a STORED generated column to {} triggers a table rewrite",
+                        alter.id
+                    )
+                } else if is_identity {
+                    format!(
+                        "Adding an identity column to {} triggers a table rewrite",
+                        alter.id
+                    )
                 } else {
                     format!(
                         "Adding column with DEFAULT to {} triggers a table rewrite on Postgres < 11",

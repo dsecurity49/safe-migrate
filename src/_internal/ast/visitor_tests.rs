@@ -3225,8 +3225,8 @@ mod tests {
     #[test]
     fn alter_view_column_and_options_produce_typed_facts_not_opaque_paths() {
         // SET DEFAULT, DROP DEFAULT, SET/RESET OPTIONS are parsed-valid view
-        // mutations that produce typed facts. The resolver returns no mutation
-        // for them (they are metadata-only), so they do not taint state.
+        // mutations that produce typed facts, which the resolver turns into
+        // SetColumnDefault/SetReloptions/ResetReloptions mutations.
         use crate::_internal::analysis::facts::AlterViewAction;
 
         let extract_view_action = |sql: &str| {

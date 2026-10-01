@@ -28,10 +28,10 @@ impl Mutation {
             Mutation::CreateSequence(m) => one(ObjectKind::Sequence, &m.id),
             Mutation::CreateFunction(m) => one(ObjectKind::Function, &m.id),
             Mutation::CreateProcedure(m) => one(ObjectKind::Procedure, &m.id),
-            Mutation::CreateAggregate(m) => one(ObjectKind::Type, &m.id),
+            Mutation::CreateAggregate(m) => one(ObjectKind::Function, &m.id),
             Mutation::CreatePublication(m) => Some((ObjectKind::Publication, m.name.clone())),
             Mutation::CreateSubscription(m) => {
-                Some((ObjectKind::Publication, m.name.clone().unwrap_or_default()))
+                m.name.clone().map(|name| (ObjectKind::Subscription, name))
             }
             Mutation::CreateRole(m) => Some((ObjectKind::Role, m.name.clone())),
             Mutation::CreatePolicy(m) => Some((ObjectKind::Policy, policy_name(m))),

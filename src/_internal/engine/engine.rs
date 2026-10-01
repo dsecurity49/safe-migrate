@@ -415,7 +415,7 @@ impl SafeMigrateEngine {
                             tier: crate::_internal::report::violations::ViolationTier::Tier1,
                             reason: format!("Inline suppression of rule '{}' is not allowed by configuration", rule.id()),
                             recipe: "Remove the inline directive. To bypass a rule, explicitly disable it in safe-migrate.toml.",
-                            dedup_key: None,
+                            dedup_key: Some(format!("inline-suppression-disabled:{}", rule.id())),
                             sql: None,
                             fk_dependency_related: false,
                         });

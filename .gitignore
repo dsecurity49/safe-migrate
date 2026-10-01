@@ -17,7 +17,9 @@
 /.cline*
 /.vscode/
 /.idea/
-/.env
+# Unanchored so a nested credential file cannot be committed by accident.
+.env
+*.env
 
 # Generated database caches, statistics and scratch databases
 /.safe-migrate.cache
@@ -35,6 +37,7 @@
 /heap.c.*
 /pg_*.h.*
 /log.txt
+*.log
 
 # Editor and OS noise
 *.swp

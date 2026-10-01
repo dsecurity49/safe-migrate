@@ -181,7 +181,11 @@ impl AnalysisState {
                 | AlterIndexActionMutation::SetOptions { .. }
                 | AlterIndexActionMutation::ResetOptions { .. } => {}
                 AlterIndexActionMutation::SetStatistics { column, target } => {
-                    return self.apply_alter_index_set_statistics(&alter.index_id, column, target);
+                    let result =
+                        self.apply_alter_index_set_statistics(&alter.index_id, column, target);
+                    if !matches!(result, MutationResult::Applied) {
+                        return result;
+                    }
                 }
                 AlterIndexActionMutation::AttachPartition { partition_id } => {
                     // The partition index must exist for the attach to succeed.

@@ -1826,6 +1826,7 @@ impl From<&InternalObjectKind> for ObjectKind {
             InternalObjectKind::Schema => Self::Schema,
             InternalObjectKind::Role => Self::Role,
             InternalObjectKind::Publication => Self::Publication,
+            InternalObjectKind::Subscription => Self::Subscription,
             InternalObjectKind::Database => Self::Database,
             InternalObjectKind::Domain => Self::Domain,
             InternalObjectKind::Policy => Self::Policy,

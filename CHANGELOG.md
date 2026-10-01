@@ -5,13 +5,14 @@ commits and pull requests. Published binaries, checksums, and generated release
 notes are available on the
 [GitHub Releases page](https://github.com/dsecurity49/safe-migrate/releases).
 
-## v0.10.0 — unreleased
+## v0.10.0 — 2026-10-02
 
 - Range types are read from the baseline and their constructor is owned by the
   type, so `DROP TYPE` no longer halts and dropping the constructor is reported.
   Cache format V9; run `safe-migrate sync`.
 - Findings name the object they concern, using plain names instead of
-  angle-bracket placeholders, and fall back to `unknown statement`.
+  angle-bracket placeholders, and fall back to `unknown statement`. A
+  subscription is now reported as one rather than as a publication.
 - `CREATE TYPE ... AS RANGE` and `CREATE TYPE ... (INPUT = ...)` are modeled as
   the `range` and `base` type kinds instead of the opaque path.
 - `schema-drift` fires for a relation provably absent from the baseline, and

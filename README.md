@@ -31,7 +31,7 @@ Prebuilt binaries are available from
 installer verifies release checksums:
 
 ```bash
-VERSION='v0.9.3'
+VERSION='v0.10.0'
 curl -fsSL "https://raw.githubusercontent.com/dsecurity49/safe-migrate/${VERSION}/install.sh" |
   bash -s -- --version "${VERSION}"
 ```
