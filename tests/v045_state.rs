@@ -1,5 +1,5 @@
 use crate::_internal::analysis::state::AnalysisState;
-use crate::common::{object_id, setup_engine};
+use crate::common::{object_id, setup_engine, synced_cache};
 use safe_migrate::_internal::analysis::facts::{PublicationObjectFact, PublicationScope};
 use safe_migrate::_internal::analysis::graph::DependencyKind;
 use safe_migrate::_internal::db::cache::{DbCache, IndexCache};
@@ -10,7 +10,7 @@ use safe_migrate::_internal::model::sequence::{SequenceKind, SequenceOverlay, Se
 use safe_migrate::_internal::model::types::{TypeKind, TypeState};
 
 fn cache_with_public_schema() -> DbCache {
-    let mut cache = DbCache::new();
+    let mut cache = synced_cache();
     cache.metadata.source_role = Some("owner".into());
     cache.metadata.source_session_role = Some("owner".into());
     let owner = object_id("", "owner");

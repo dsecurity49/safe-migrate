@@ -3091,14 +3091,29 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_create_non_enum_types_are_not_silent() {
-        let sql = "CREATE TYPE floatrange AS RANGE (subtype = float8);";
-        let parsed = SourceFile::parse(sql);
-        let statement = parsed.tree().stmts().next().expect("statement");
-        assert!(
-            AstVisitor::extract(&statement).is_none(),
-            "unmodeled CREATE TYPE semantics must use the opaque engine path: {sql}"
-        );
+    fn range_and_base_types_match_the_synced_catalog_kinds() {
+        // The cache reports these kinds from `pg_type.typtype`, so a type
+        // created by the migration must be modeled the same way.
+        for (sql, expected) in [
+            (
+                "CREATE TYPE floatrange AS RANGE (subtype = float8);",
+                TypeCreationKind::Range,
+            ),
+            (
+                "CREATE TYPE my_input (INPUT = int4in, OUTPUT = int4out);",
+                TypeCreationKind::Base,
+            ),
+        ] {
+            let parsed = SourceFile::parse(sql);
+            let statement = parsed.tree().stmts().next().expect("statement");
+            let Some(StatementFact::CreateType(
+                crate::_internal::analysis::facts::CreateTypeFact { kind, .. },
+            )) = AstVisitor::extract(&statement)
+            else {
+                panic!("expected a typed CREATE TYPE fact: {sql}");
+            };
+            assert_eq!(kind, expected, "unexpected creation kind for: {sql}");
+        }
     }
 
     #[test]
@@ -3181,29 +3196,64 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_alter_materialized_view_actions_are_not_silent_noops() {
-        let parsed = SourceFile::parse("ALTER MATERIALIZED VIEW report SET SCHEMA archive;");
-        let statement = parsed.tree().stmts().next().expect("statement");
-        assert!(
-            AstVisitor::extract(&statement).is_none(),
-            "unsupported ALTER MATERIALIZED VIEW action must use the opaque engine path"
-        );
+    fn alter_materialized_view_actions_produce_typed_facts_not_opaque_paths() {
+        use crate::_internal::analysis::facts::AlterMaterializedViewActionFact;
+
+        let extract_matview_action = |sql: &str| {
+            let parsed = SourceFile::parse(sql);
+            let stmt = parsed.tree().stmts().next().expect("statement");
+            match AstVisitor::extract(&stmt).unwrap_or_else(|| panic!("no fact for: {sql}")) {
+                StatementFact::AlterMaterializedView { action, .. } => action,
+                other => panic!("expected AlterMaterializedView fact, got {other:?} for: {sql}"),
+            }
+        };
+
+        assert!(matches!(
+            extract_matview_action("ALTER MATERIALIZED VIEW mv SET SCHEMA archive;"),
+            AlterMaterializedViewActionFact::SetSchema { new_schema } if new_schema == "archive"
+        ));
+        assert!(matches!(
+            extract_matview_action("ALTER MATERIALIZED VIEW mv SET (fillfactor = 90);"),
+            AlterMaterializedViewActionFact::SetOptions { .. }
+        ));
+        assert!(matches!(
+            extract_matview_action("ALTER MATERIALIZED VIEW mv CLUSTER ON my_idx;"),
+            AlterMaterializedViewActionFact::ClusterOn { index_name } if index_name.resolve() == "my_idx"
+        ));
     }
 
     #[test]
-    fn unsupported_alter_view_actions_are_not_silent_noops() {
-        for sql in [
-            "ALTER VIEW report ALTER COLUMN total SET DEFAULT 0;",
-            "ALTER VIEW report ALTER COLUMN total DROP DEFAULT;",
-            "ALTER VIEW report SET (security_barrier = true);",
-        ] {
+    fn alter_view_column_and_options_produce_typed_facts_not_opaque_paths() {
+        // SET DEFAULT, DROP DEFAULT, SET/RESET OPTIONS are parsed-valid view
+        // mutations that produce typed facts, which the resolver turns into
+        // SetColumnDefault/SetReloptions/ResetReloptions mutations.
+        use crate::_internal::analysis::facts::AlterViewAction;
+
+        let extract_view_action = |sql: &str| {
             let parsed = SourceFile::parse(sql);
-            let statement = parsed.tree().stmts().next().expect("statement");
-            assert!(
-                AstVisitor::extract(&statement).is_none(),
-                "unsupported ALTER VIEW action must use the opaque engine path: {sql}"
-            );
-        }
+            let stmt = parsed.tree().stmts().next().expect("statement");
+            match AstVisitor::extract(&stmt).unwrap_or_else(|| panic!("no fact for: {sql}")) {
+                StatementFact::AlterView { action, .. } => action,
+                other => panic!("expected AlterView fact, got {other:?} for: {sql}"),
+            }
+        };
+
+        assert!(matches!(
+            extract_view_action("ALTER VIEW report ALTER COLUMN total SET DEFAULT 0;"),
+            AlterViewAction::SetDefault { column, .. } if column == "total"
+        ));
+        assert!(matches!(
+            extract_view_action("ALTER VIEW report ALTER COLUMN total DROP DEFAULT;"),
+            AlterViewAction::DropDefault { column } if column == "total"
+        ));
+        assert!(matches!(
+            extract_view_action("ALTER VIEW report SET (security_barrier = true);"),
+            AlterViewAction::SetOptions { .. }
+        ));
+        assert!(matches!(
+            extract_view_action("ALTER VIEW report RESET (security_invoker);"),
+            AlterViewAction::ResetOptions { .. }
+        ));
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use crate::_internal::analysis::mutations::Mutation;
+use crate::_internal::analysis::mutations::{Mutation, ReindexTargetMutation};
 use crate::_internal::analysis::state::MutationResult;
 use crate::_internal::model::relation::Persistence;
 use crate::_internal::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
@@ -207,5 +207,113 @@ impl Rule for ConcurrentIndexRule {
             _ => {}
         }
         violations
+    }
+}
+
+pub(crate) struct RequireConcurrentReindexRule;
+
+impl Rule for RequireConcurrentReindexRule {
+    fn id(&self) -> &'static str {
+        "require-concurrent-reindex"
+    }
+
+    fn default_tier(&self) -> ViolationTier {
+        ViolationTier::Tier1
+    }
+
+    fn recipe(&self) -> &'static str {
+        "Reindexing a table or index without `concurrently` holds a lock that blocks writes (and reads, for some targets) for the duration. Use `CONCURRENTLY` where PostgreSQL allows it."
+    }
+
+    fn required_capabilities(&self) -> &'static [RuleCapability] {
+        &[]
+    }
+
+    fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
+        let mut violations = Vec::new();
+
+        if let Mutation::Reindex {
+            target,
+            concurrently,
+        } = context.mutation()
+            && !*concurrently
+        {
+            violations.extend(Self::evaluate_target(context, target.as_ref()));
+        }
+
+        violations
+    }
+}
+
+impl RequireConcurrentReindexRule {
+    /// Flag a non-concurrent REINDEX. Targets where PostgreSQL rejects
+    /// `CONCURRENTLY` are exempt, since there is no correct alternative.
+    fn evaluate_target(
+        context: &RuleContext<'_>,
+        target: Option<&ReindexTargetMutation>,
+    ) -> Vec<Violation> {
+        let Some(target) = target else {
+            return vec![Violation {
+                source_range: None,
+                rule_id: RequireConcurrentReindexRule.id(),
+                operation_kind: OperationKind::Reindex,
+                object_kind: ObjectKind::Unknown,
+                object_name: "unknown".to_string(),
+                tier: ViolationTier::Tier1,
+                reason: "Synchronous REINDEX with no resolvable target".to_string(),
+                recipe: RequireConcurrentReindexRule.recipe(),
+                dedup_key: None,
+                sql: None,
+                fk_dependency_related: false,
+            }];
+        };
+
+        // REINDEX SYSTEM does not accept CONCURRENTLY, so demanding it is a false positive.
+        if matches!(target, ReindexTargetMutation::System(_)) {
+            return vec![];
+        }
+
+        // A temporary relation cannot be reindexed concurrently; the synchronous
+        // form is the only legal statement, so there is nothing to report.
+        if let ReindexTargetMutation::Table(id) | ReindexTargetMutation::Index(id) = target
+            && let Some(rel) = context.pre_state().relations.get(id)
+            && rel.persistence == Persistence::Temporary
+        {
+            return vec![];
+        }
+
+        if let ReindexTargetMutation::Index(id) = target
+            && context.state().index_backs_exclusion_constraint(id)
+        {
+            return vec![];
+        }
+
+        let object_kind = match target {
+            ReindexTargetMutation::Database(_) | ReindexTargetMutation::System(_) => {
+                ObjectKind::Database
+            }
+            ReindexTargetMutation::Schema(_) => ObjectKind::Schema,
+            ReindexTargetMutation::Table(_) => ObjectKind::Table,
+            ReindexTargetMutation::Index(_) => ObjectKind::Index,
+        };
+        let target_name = target.object_name();
+
+        vec![Violation {
+            source_range: None,
+            rule_id: RequireConcurrentReindexRule.id(),
+            operation_kind: OperationKind::Reindex,
+            object_kind,
+            object_name: target_name.clone(),
+            tier: ViolationTier::Tier1,
+            reason: format!("Synchronous REINDEX on {target_name}"),
+            recipe: RequireConcurrentReindexRule.recipe(),
+            dedup_key: Some(format!(
+                "{}_{}",
+                RequireConcurrentReindexRule.id(),
+                target_name
+            )),
+            sql: None,
+            fk_dependency_related: false,
+        }]
     }
 }

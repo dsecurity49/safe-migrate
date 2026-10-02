@@ -11,6 +11,7 @@ DROP SCHEMA IF EXISTS sm_role_quote CASCADE;
 DROP SCHEMA IF EXISTS app_user CASCADE;
 DROP SCHEMA IF EXISTS staging CASCADE;
 DROP SCHEMA IF EXISTS pub CASCADE;
+DROP MATERIALIZED VIEW IF EXISTS public.mymatview CASCADE;
 DROP FUNCTION IF EXISTS public.g() CASCADE;
 DROP FUNCTION IF EXISTS public.f() CASCADE;
 DROP TABLE IF EXISTS public.new_table CASCADE;
@@ -100,6 +101,8 @@ CREATE SCHEMA sm_role_quote AUTHORIZATION "owner's_role";
 GRANT CREATE ON SCHEMA sm_core TO sm_set_target;
 
 CREATE TYPE sm_identity.user_state AS ENUM ('invited', 'active', 'suspended', 'deleted');
+CREATE TYPE sm_core.energy_span AS RANGE (subtype = float8);
+CREATE TYPE sm_catalog.label_set AS RANGE (subtype = text, multirange_type_name = label_set_multirange);
 CREATE TYPE sm_core.environment_kind AS ENUM ('development', 'staging', 'production');
 CREATE TYPE sm_core.my_enum AS ENUM ('a', 'b', 'c', 'old', 'existing_val');
 CREATE TYPE sm_core.status_type AS ENUM ('active', 'disabled');
@@ -270,6 +273,12 @@ CREATE MATERIALIZED VIEW sm_core.mymatview AS
 SELECT id, name
 FROM sm_core.matview_source;
 CREATE UNIQUE INDEX mymatview_id_idx ON sm_core.mymatview (id);
+
+-- rule_11 lints `mymatview` unqualified, which resolves to public first on the
+-- frozen-cache search path. Declaring it here keeps the cached fixture suite and
+-- the live differential reading the same baseline.
+CREATE MATERIALIZED VIEW public.mymatview AS
+SELECT 1 AS id;
 
 CREATE TABLE public.test_table (
     id integer PRIMARY KEY,

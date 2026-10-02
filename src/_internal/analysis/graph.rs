@@ -61,6 +61,9 @@ pub(crate) enum DependencyKind {
     /// ordinary table inheritance.
     InheritanceOf,
     PartitionOf,
+    /// An index attached to a partitioned index with `ALTER INDEX ... ATTACH
+    /// PARTITION`. PostgreSQL drops the child with its parent.
+    IndexPartitionOf,
     /// A `DETACH PARTITION CONCURRENTLY` interrupted after its first internal
     /// transaction remains attached until `FINALIZE` completes it.
     PartitionDetachPending,
@@ -523,6 +526,8 @@ impl DependencyGraph {
         for edge in &mut self.edges {
             match &mut edge.kind {
                 DependencyKind::RenameTo => {}
+                // Index-to-index: a relation rename never moves an index.
+                DependencyKind::IndexPartitionOf => {}
                 DependencyKind::ForeignKey { .. }
                 | DependencyKind::ViewDependency { .. }
                 | DependencyKind::InheritanceOf

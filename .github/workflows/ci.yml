@@ -17,6 +17,7 @@ jobs:
   test:
     name: Build and Test
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     steps:
       - name: Checkout repository
@@ -34,6 +35,16 @@ jobs:
 
       - name: Check formatting
         run: cargo fmt -- --check
+      - name: Check shell syntax
+        # A syntax error in any load-bearing shell script would make the fixture
+        # suite silently skip. scripts/lib/ is a subdirectory not matched by
+        # scripts/*, so it is enumerated explicitly.
+        run: |
+          set -eu
+          for script in scripts/* scripts/lib/* live_tests/*.sh install.sh; do
+            [ -f "$script" ] || continue
+            bash -n "$script"
+          done
 
       - name: Verify installer contract
         run: sh scripts/test-install-dry-run
@@ -50,6 +61,7 @@ jobs:
 
       - name: Run tests (locked)
         run: cargo test --locked --verbose
+
 
       - name: Verify crate package
         run: cargo package --locked
@@ -69,6 +81,7 @@ jobs:
   msrv:
     name: Rust 1.94 MSRV
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
       - name: Checkout repository
@@ -87,6 +100,7 @@ jobs:
   platform-smoke:
     name: Runtime smoke (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -110,6 +124,7 @@ jobs:
   live-differential:
     name: PostgreSQL ${{ matrix.postgres }} differential harness
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -243,6 +258,7 @@ jobs:
   action-smoke:
     name: Reusable Action smoke test
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     services:
       postgres:
         image: postgres:18@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280
@@ -308,7 +324,7 @@ jobs:
         run: |
           test "$SYNC_STATUS" = "refreshed"
           test "$BASELINE_SOURCE" = "synced"
-          test "$CACHE_PATH" = "$HOME/.cache/safe-migrate-action/baselines/action-smoke/baseline-v8.cache"
+          test "$CACHE_PATH" = "$HOME/.cache/safe-migrate-action/baselines/action-smoke/baseline-v9.cache"
           test -z "$JSON_REPORT"
           rm -f -- "$CACHE_PATH"
 

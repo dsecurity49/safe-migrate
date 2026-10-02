@@ -1,4 +1,4 @@
-use crate::common::database_hosts_are_local;
+use crate::common::{database_hosts_are_local, synced_cache};
 use postgres::{Client, Config as PostgresConfig, NoTls};
 use safe_migrate::_internal::analysis::graph::DependencyKind;
 use safe_migrate::_internal::analysis::state::AnalysisState;
@@ -334,6 +334,7 @@ enum NormalizedType {
     Base,
     Composite,
     Range,
+    Multirange,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -411,6 +412,7 @@ enum MismatchCategory {
     SubscriptionDefinitionMismatch,
     RoleMembershipMismatch,
     BaselineObjectAbsent,
+    BaselineSearchPathMismatch,
     LiveExecutionFailed,
     ExpectedLiveErrorMismatch,
     MissingExpectedSimulatorFinding,
@@ -439,11 +441,12 @@ struct Mismatch {
 #[test]
 #[ignore = "requires a live local PostgreSQL database via DATABASE_URL"]
 fn live_postgres_differential_harness() {
+    let live = crate::internal_tests::live_database_test_lock();
     let verbosity = differential_verbosity();
     let harness_started = Instant::now();
-    let database_url = match std::env::var("DATABASE_URL") {
-        Ok(value) => value,
-        Err(_) => {
+    let database_url = match live.url() {
+        Some(value) => value,
+        None => {
             assert!(
                 !live_database_is_required(),
                 "live differential harness requires DATABASE_URL"
@@ -738,6 +741,12 @@ fn live_postgres_differential_harness() {
 
             mismatches.extend(check_required_relations(rule, fixture, &baseline_cache));
             mismatches.extend(check_role_membership_cache(rule, fixture, &baseline_cache));
+            mismatches.extend(check_recorded_search_path(
+                rule,
+                fixture,
+                &mut client,
+                &baseline_cache,
+            ));
 
             let mut simulator_state = AnalysisState::new(baseline_cache);
             let simulator_violations = match engine.analyze(&sql, &mut simulator_state) {
@@ -1143,7 +1152,9 @@ fn plant_pending_detach(
 #[test]
 #[ignore = "requires a disposable local PostgreSQL database via DATABASE_URL"]
 fn live_interrupted_partition_detach_finalize() {
-    let config: PostgresConfig = std::env::var("DATABASE_URL")
+    let live = crate::internal_tests::live_database_test_lock();
+    let config: PostgresConfig = live
+        .url()
         .expect("DATABASE_URL")
         .parse()
         .expect("database configuration");
@@ -1777,6 +1788,48 @@ fn sql_fixture_names(path: &Path) -> BTreeSet<String> {
         .collect()
 }
 
+/// The recorded search path must begin with the schema live PostgreSQL would
+/// resolve unqualified names in, or every unqualified fixture compares against
+/// the wrong namespace.
+fn check_recorded_search_path(
+    rule: &RuleManifest,
+    fixture: &str,
+    client: &mut Client,
+    cache: &DbCache,
+) -> Vec<Mismatch> {
+    let live: Vec<String> = match client
+        .query_one("SELECT current_schemas(false);", &[])
+        .and_then(|row| row.try_get::<_, Vec<String>>(0))
+    {
+        Ok(path) => path,
+        Err(error) => {
+            return vec![Mismatch {
+                rule_dir: rule.rule_dir.clone(),
+                fixture: fixture.to_string(),
+                category: MismatchCategory::LiveExecutionFailed,
+                root_cause: RootCauseClassification::EnvironmentIssue,
+                note: format!("failed to read the live search path: {error}"),
+            }];
+        }
+    };
+    let Some(expected) = live.first() else {
+        return Vec::new();
+    };
+    if cache.search_path.first() == Some(expected) {
+        return Vec::new();
+    }
+    vec![Mismatch {
+        rule_dir: rule.rule_dir.clone(),
+        fixture: fixture.to_string(),
+        category: MismatchCategory::BaselineSearchPathMismatch,
+        root_cause: RootCauseClassification::SimulatorBug,
+        note: format!(
+            "baseline records search_path {:?} but live PostgreSQL resolves unqualified names in {expected}",
+            cache.search_path
+        ),
+    }]
+}
+
 fn check_required_relations(rule: &RuleManifest, fixture: &str, cache: &DbCache) -> Vec<Mismatch> {
     let mut mismatches = Vec::new();
     for relation in &rule.required_relations {
@@ -1893,14 +1946,14 @@ fn required_role_edges_distinguish_missing_roles_from_incorrect_edges() {
         }"#,
     )
     .expect("role edge manifest");
-    let missing = check_role_membership_cache(&rule, "fixture.sql", &DbCache::new());
+    let missing = check_role_membership_cache(&rule, "fixture.sql", &synced_cache());
     assert_eq!(missing.len(), 2);
     assert!(missing.iter().all(|mismatch| {
         mismatch.category == MismatchCategory::BaselineObjectAbsent
             && mismatch.root_cause == RootCauseClassification::BaselineSetupGap
     }));
 
-    let mut cache = DbCache::new();
+    let mut cache = synced_cache();
     for name in ["member", "target"] {
         let id = safe_migrate::_internal::ast::identifiers::ObjectId::new("", name);
         cache.roles.insert(
@@ -3702,7 +3755,9 @@ fn normalize_column_storage(
                     data_type = normalize_data_type_with_identity(base_type, base_type_id.as_ref());
                     continue;
                 }
-                TypeKind::Composite { .. } | TypeKind::Range => return Some("EXTENDED".into()),
+                TypeKind::Composite { .. } | TypeKind::Range | TypeKind::Multirange => {
+                    return Some("EXTENDED".into());
+                }
                 TypeKind::Enum { .. } => return Some("PLAIN".into()),
                 TypeKind::Base => return None,
             },
@@ -3844,6 +3899,7 @@ fn normalize_type_kind(kind: &TypeKind) -> NormalizedType {
         TypeKind::Base => NormalizedType::Base,
         TypeKind::Composite { .. } => NormalizedType::Composite,
         TypeKind::Range => NormalizedType::Range,
+        TypeKind::Multirange => NormalizedType::Multirange,
     }
 }
 

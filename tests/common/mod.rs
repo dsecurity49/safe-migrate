@@ -3,7 +3,7 @@
 pub(crate) mod invariants;
 
 use safe_migrate::_internal::ast::identifiers::ObjectId;
-use safe_migrate::_internal::db::cache::DbCache;
+use safe_migrate::_internal::db::cache::{CatalogCoverage, CatalogFamily, DbCache, SchemaCoverage};
 use safe_migrate::_internal::engine::engine::SafeMigrateEngine;
 use safe_migrate::_internal::model::relation::{Persistence, RelationKind, RelationState};
 use safe_migrate::api::Config;
@@ -44,10 +44,25 @@ pub(crate) fn setup_state() -> crate::_internal::analysis::state::AnalysisState 
 }
 
 fn cache_with_safe_timeouts() -> DbCache {
-    let mut cache = DbCache::new();
+    let mut cache = synced_cache();
     cache.metadata.source_lock_timeout_ms = 1_000;
     cache.metadata.source_statement_timeout_ms = 10_000;
     cache
+}
+
+/// A hand-built baseline that retrieved the whole catalog. Coverage is a claim
+/// about what was read, so a test asserting exact behavior must state it.
+pub(crate) fn synced_cache() -> DbCache {
+    let mut cache = DbCache::new();
+    cache.coverage =
+        CatalogCoverage::for_families(SchemaCoverage::from_sync_scope(None), CatalogFamily::ALL);
+    cache
+}
+
+/// The synthetic empty cache `Baseline::unavailable()` produces, whose coverage
+/// is empty because nothing was ever read.
+pub(crate) fn unavailable_cache() -> DbCache {
+    DbCache::new()
 }
 
 pub(crate) fn object_id(schema: &str, name: &str) -> ObjectId {

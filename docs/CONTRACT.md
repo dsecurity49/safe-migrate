@@ -1,6 +1,6 @@
 # CLI and Report Contract
 
-This document defines safe-migrate v0.9.3's CLI, report, cache, and GitHub
+This document defines safe-migrate v0.10.0's CLI, report, cache, and GitHub
 Action behavior.
 
 If you are learning safe-migrate, start with the [README](../README.md). This
@@ -151,7 +151,7 @@ PostgreSQL conflicts such as dropping a missing column produce a Tier 1
 `chain-conflict`, leave state unchanged, and do not taint confidence by
 themselves. This applies to both `lint` and `lint-chain`.
 
-Cache V8 supplies typed evidence for:
+Cache V9 supplies typed evidence for:
 
 - catalog coverage, schema scope, roles, privileges, and session settings;
 - constraint keys and expressions, generated-column sources, and PostgreSQL's
@@ -159,11 +159,16 @@ Cache V8 supplies typed evidence for:
 - indexes, including included and expression/predicate dependency columns;
 - inheritance and partition topology, view dependencies, sequence ownership,
   and standalone sequence references;
-- every `pg_proc.prokind`, publications, and redacted subscriptions.
+- every `pg_proc.prokind`, publications, and redacted subscriptions;
+- every `pg_type.typtype` a user can name, including range types and the
+  multirange PostgreSQL creates beside them, plus the range constructors it
+  records as internally owned by that type.
 
-Missing required evidence never becomes invented state: the transition is
-skipped and confidence is tainted. Independent syntax findings still report,
-and multi-target view drops remain atomic.
+Catalog coverage is recorded by the loader that produced it, so a family is
+claimed only once its catalog query has completed. Missing required evidence
+never becomes invented state: the transition is skipped and confidence is
+tainted. Independent syntax findings still report, and multi-target view drops
+remain atomic.
 
 The principal precision boundaries are:
 
@@ -184,7 +189,7 @@ They require positive effective values for statements identified by Squawk's
 pinned `possibly_slow_stmt` classifier. `lock_timeout` must also be shorter than
 a positive `statement_timeout`.
 
-Values begin from Cache V8, or unknown without a cache. Ordered `SET`, local
+Values begin from Cache V9, or unknown without a cache. Ordered `SET`, local
 settings, resets, commits, and rollbacks follow PostgreSQL session/local
 behavior. `SET LOCAL` outside a transaction has no modeled effect. Each rule
 reports at most once per input file.
@@ -201,15 +206,15 @@ These conditions exit `1` instead of producing a clean report:
 - internal serialization or analysis failure.
 
 Sync replaces a cache only after its new payload is complete. An automatic
-refresh failure is recorded in JSON and may reuse a readable V8 cache; otherwise
+refresh failure is recorded in JSON and may reuse a readable V9 cache; otherwise
 analysis continues without a baseline and is `Tainted`.
 
 Encrypted mode requires `cache_encryption = true` and a valid
 `SAFE_MIGRATE_CACHE_KEY`. Cache modes cannot be mixed; switching requires a new
-`sync`. V8 carries an explicit header, coverage and scope-completion markers,
+`sync`. V9 carries an explicit header, coverage and scope-completion markers,
 role/session provenance, schemas, settings, dependencies, and redacted catalog
 metadata. It never contains password hashes or subscription connection strings.
-V1–V6 and unheadered caches are rejected with resync guidance.
+V1–V8 and unheadered caches are rejected with resync guidance.
 
 ### GitHub Action
 

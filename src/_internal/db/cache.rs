@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// Catalog families whose completeness is independently meaningful to the
-/// analyzer. The V8 cache records this explicitly instead of treating one
+/// analyzer. The cache records this explicitly instead of treating one
 /// optional schema list as evidence for every object class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -33,6 +33,24 @@ pub(crate) enum CatalogFamily {
 }
 
 impl CatalogFamily {
+    /// Every family a full synchronization retrieves. Kept as the single list
+    /// so validation and hand-built baselines cannot disagree about it.
+    pub(crate) const ALL: &'static [CatalogFamily] = &[
+        CatalogFamily::Schemas,
+        CatalogFamily::Relations,
+        CatalogFamily::Sequences,
+        CatalogFamily::Indexes,
+        CatalogFamily::Constraints,
+        CatalogFamily::Triggers,
+        CatalogFamily::Routines,
+        CatalogFamily::Types,
+        CatalogFamily::Dependencies,
+        CatalogFamily::Inheritance,
+        CatalogFamily::Roles,
+        CatalogFamily::Publications,
+        CatalogFamily::Subscriptions,
+    ];
+
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Schemas => "schemas",
@@ -93,26 +111,14 @@ pub(crate) struct CatalogCoverage {
 }
 
 impl CatalogCoverage {
-    pub(crate) fn from_sync_scope(schemas: Option<&[String]>) -> Self {
+    /// Coverage for a baseline known to have retrieved exactly `families`.
+    /// Naming them keeps a hand-built baseline honest: an unlisted family
+    /// proves nothing, so absence raises a taint rather than a finding.
+    #[cfg(test)]
+    pub(crate) fn for_families(schema_scope: SchemaCoverage, families: &[CatalogFamily]) -> Self {
         Self {
-            schema_scope: SchemaCoverage::from_sync_scope(schemas),
-            families: [
-                CatalogFamily::Schemas,
-                CatalogFamily::Relations,
-                CatalogFamily::Sequences,
-                CatalogFamily::Indexes,
-                CatalogFamily::Constraints,
-                CatalogFamily::Triggers,
-                CatalogFamily::Routines,
-                CatalogFamily::Types,
-                CatalogFamily::Dependencies,
-                CatalogFamily::Inheritance,
-                CatalogFamily::Roles,
-                CatalogFamily::Publications,
-                CatalogFamily::Subscriptions,
-            ]
-            .into_iter()
-            .collect(),
+            schema_scope,
+            families: families.iter().copied().collect(),
         }
     }
 
@@ -125,12 +131,40 @@ impl CatalogCoverage {
     }
 }
 
+/// Accumulates catalog coverage as loaders run. A family becomes covered when
+/// its loader completes, so the claim cannot drift from what was retrieved.
+#[derive(Debug, Clone)]
+pub(crate) struct CatalogCoverageBuilder {
+    schema_scope: SchemaCoverage,
+    families: BTreeSet<CatalogFamily>,
+}
+
+impl CatalogCoverageBuilder {
+    pub(crate) fn from_sync_scope(schemas: Option<&[String]>) -> Self {
+        Self {
+            schema_scope: SchemaCoverage::from_sync_scope(schemas),
+            families: BTreeSet::new(),
+        }
+    }
+
+    pub(crate) fn record(&mut self, family: CatalogFamily) {
+        self.families.insert(family);
+    }
+
+    pub(crate) fn finish(self) -> CatalogCoverage {
+        CatalogCoverage {
+            schema_scope: self.schema_scope,
+            families: self.families,
+        }
+    }
+}
+
 impl Default for CatalogCoverage {
     fn default() -> Self {
-        // Programmatic test baselines retain the historical all-schema
-        // assumption. Production sync always overwrites this with its actual
-        // requested scope before a V8 cache can be written.
-        Self::from_sync_scope(None)
+        // A hand-built cache retrieved nothing, so it covers no family and can
+        // never prove absence. Synchronization replaces this with what its
+        // loaders actually read.
+        CatalogCoverageBuilder::from_sync_scope(None).finish()
     }
 }
 
@@ -175,7 +209,7 @@ impl ForeignKeyCache {
 
 /// Ordered key columns for a primary or unique constraint. This is separate
 /// from `ConstraintState` so the runtime state model remains focused on the
-/// mutable constraint lifecycle while Cache V8 can preserve catalog proof.
+/// mutable constraint lifecycle while the cache can preserve catalog proof.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ConstraintKeyCache {
     pub table_id: ObjectId,
@@ -371,10 +405,24 @@ pub(crate) struct DbCache {
     pub subscriptions: HashMap<String, SubscriptionState>,
 }
 
-pub(crate) const CACHE_FORMAT_VERSION: u32 = 8;
+// Durable cache layout version.
+//
+// Any change to the fields of `DbCache` or `DbCacheVersioned` requires bumping
+// this: bincode carries no field names, so bytes are laid out exactly as the
+// current definitions describe. The header encodes the same number, and the
+// magic must stay one digit wide or the fixed-size prefix read breaks.
+pub(crate) const CACHE_FORMAT_VERSION: u32 = 9;
 
-/// Current durable cache header. V8 adds typed-table row-type identity.
-pub(crate) const CACHE_V8_MAGIC: &[u8] = b"SMCACHE08";
+/// Current durable cache header. V9 records every independently-nameable type,
+/// including ranges and multiranges, so `Types` coverage is honest.
+pub(crate) const CACHE_V9_MAGIC: &[u8] = b"SMCACHE09";
+
+// The header width is fixed, so a two-digit version would break the prefix
+// comparison in `api.rs` and read as corruption rather than an old format.
+const _: () = assert!(
+    CACHE_FORMAT_VERSION < 10,
+    "a two-digit cache version changes the header width; redesign the prefix read first"
+);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum DbCacheVersioned {
@@ -389,6 +437,7 @@ pub(crate) enum DbCacheVersioned {
     V6(Box<DbCache>),
     V7(Box<DbCache>),
     V8(Box<DbCache>),
+    V9(Box<DbCache>),
 }
 
 impl DbCacheVersioned {
@@ -402,6 +451,7 @@ impl DbCacheVersioned {
             DbCacheVersioned::V6(_) => 6,
             DbCacheVersioned::V7(_) => 7,
             DbCacheVersioned::V8(_) => 8,
+            DbCacheVersioned::V9(_) => 9,
         }
     }
 
@@ -413,11 +463,12 @@ impl DbCacheVersioned {
             | DbCacheVersioned::V4
             | DbCacheVersioned::V5(_)
             | DbCacheVersioned::V6(_)
-            | DbCacheVersioned::V7(_) => Err(
+            | DbCacheVersioned::V7(_)
+            | DbCacheVersioned::V8(_) => Err(
                 "This cache format is unsupported. Run `safe-migrate sync` to rebuild it."
                     .to_string(),
             ),
-            DbCacheVersioned::V8(c) => {
+            DbCacheVersioned::V9(c) => {
                 c.validate_semantics()?;
                 Ok(*c)
             }
@@ -543,7 +594,7 @@ impl DbCache {
         };
 
         if self.pg_version_num.is_some_and(|version| version < 140_000) {
-            return Err("Cache V8 was synchronized from an unsupported PostgreSQL version; PostgreSQL 14 or newer is required".to_string());
+            return Err("This cache was synchronized from an unsupported PostgreSQL version; PostgreSQL 14 or newer is required".to_string());
         }
 
         if let Some(schemas) = &self.metadata.schemas {
@@ -591,25 +642,10 @@ impl DbCache {
                 ));
             }
         }
-        let required_families = [
-            CatalogFamily::Schemas,
-            CatalogFamily::Relations,
-            CatalogFamily::Sequences,
-            CatalogFamily::Indexes,
-            CatalogFamily::Constraints,
-            CatalogFamily::Triggers,
-            CatalogFamily::Routines,
-            CatalogFamily::Types,
-            CatalogFamily::Dependencies,
-            CatalogFamily::Inheritance,
-            CatalogFamily::Roles,
-            CatalogFamily::Publications,
-            CatalogFamily::Subscriptions,
-        ];
-        for family in required_families {
-            if !self.coverage.has(family) {
+        for family in CatalogFamily::ALL {
+            if !self.coverage.has(*family) {
                 return Err(format!(
-                    "Cache V8 coverage is missing the required '{}' catalog family",
+                    "Cache coverage is missing the required '{}' catalog family",
                     family.as_str(),
                 ));
             }
@@ -682,7 +718,7 @@ impl DbCache {
             .map(|schemas| schemas.iter().cloned().collect::<BTreeSet<_>>());
         if coverage_scope != metadata_scope {
             return Err(
-                "Cache V8 schema coverage disagrees with legacy metadata schema scope".to_string(),
+                "Cache schema coverage disagrees with legacy metadata schema scope".to_string(),
             );
         }
         let mut extended_statistics_ids = HashSet::new();
@@ -1114,7 +1150,7 @@ impl DbCache {
                                 }
                                 format!(
                                     "table:{}:{table_name}",
-                                    schema.unwrap_or_else(|| "<unqualified>".to_string())
+                                    schema.unwrap_or_else(|| "unqualified".to_string())
                                 )
                             }
                             crate::_internal::analysis::facts::PublicationObjectFact::SchemaTables {
@@ -2161,6 +2197,19 @@ impl DbCache {
 mod tests {
     use super::*;
 
+    /// Coverage for a hand-built cache that retrieved the whole catalog.
+    fn fully_covering(schemas: Option<&[String]>) -> CatalogCoverage {
+        CatalogCoverage::for_families(SchemaCoverage::from_sync_scope(schemas), CatalogFamily::ALL)
+    }
+
+    /// A hand-built cache that retrieved the whole catalog, ready for
+    /// `validate_semantics`.
+    fn synced_cache() -> DbCache {
+        let mut cache = DbCache::new();
+        cache.coverage = fully_covering(None);
+        cache
+    }
+
     fn table(id: ObjectId, columns: &[&str]) -> RelationState {
         let mut relation = RelationState::new(
             id,
@@ -2221,15 +2270,47 @@ mod tests {
     }
 
     #[test]
-    fn current_cache_format_is_v8() {
-        assert_eq!(CACHE_FORMAT_VERSION, 8);
-        assert_eq!(DbCacheVersioned::V8(Box::default()).format_version(), 8);
-        assert_eq!(CACHE_V8_MAGIC, b"SMCACHE08");
+    fn current_cache_format_is_v9() {
+        assert_eq!(CACHE_FORMAT_VERSION, 9);
+        assert_eq!(DbCacheVersioned::V9(Box::default()).format_version(), 9);
+        assert_eq!(CACHE_V9_MAGIC, b"SMCACHE09");
+    }
+
+    #[test]
+    fn a_default_cache_claims_no_coverage_and_is_therefore_invalid() {
+        // Nothing was read, so nothing can be proven absent.
+        let cache = DbCache::new();
+        assert!(cache.coverage.families.is_empty());
+        assert!(cache.validate_semantics().is_err());
+    }
+
+    #[test]
+    fn coverage_records_exactly_the_families_whose_loaders_ran() {
+        let mut builder = CatalogCoverageBuilder::from_sync_scope(None);
+        builder.record(CatalogFamily::Schemas);
+        builder.record(CatalogFamily::Types);
+
+        let coverage = builder.finish();
+        assert!(coverage.has(CatalogFamily::Schemas));
+        assert!(coverage.has(CatalogFamily::Types));
+        assert!(!coverage.has(CatalogFamily::Relations));
+    }
+
+    #[test]
+    fn a_synchronized_baseline_records_every_family() {
+        // Reaching the end of `populate_cache_from_client` records all of them.
+        let mut builder = CatalogCoverageBuilder::from_sync_scope(None);
+        for family in CatalogFamily::ALL {
+            builder.record(*family);
+        }
+        let coverage = builder.finish();
+        assert_eq!(coverage.families.len(), CatalogFamily::ALL.len());
+        assert!(synced_cache().validate_semantics().is_ok());
     }
 
     #[test]
     fn current_cache_rejects_an_unsupported_postgresql_version() {
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.pg_version_num = Some(130_000);
 
         let error = cache.validate_semantics().unwrap_err();
@@ -2239,7 +2320,7 @@ mod tests {
     #[test]
     fn current_cache_rejects_malformed_relation_and_column_options() {
         let id = ObjectId::new("public", "entries");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         let mut relation = table(id.clone(), &["id"]);
         relation
             .table_options
@@ -2252,7 +2333,7 @@ mod tests {
                 .contains("malformed table option")
         );
 
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         let mut relation = table(id.clone(), &["id"]);
         relation.columns[0]
             .options
@@ -2268,9 +2349,9 @@ mod tests {
 
     #[test]
     fn current_cache_rejects_external_boundary_identity_outside_scope() {
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         let schemas = vec!["public".to_string()];
-        cache.coverage = CatalogCoverage::from_sync_scope(Some(&schemas));
+        cache.coverage = fully_covering(Some(&schemas));
         cache.metadata.schemas = Some(schemas);
         cache
             .scoped_external_relation_dependencies
@@ -2282,7 +2363,7 @@ mod tests {
 
     #[test]
     fn current_cache_rejects_mismatched_embedded_identity() {
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.schemas.insert(
             "app".to_string(),
             SchemaState {
@@ -2292,7 +2373,7 @@ mod tests {
             },
         );
 
-        let error = DbCacheVersioned::V8(Box::new(cache))
+        let error = DbCacheVersioned::V9(Box::new(cache))
             .into_cache()
             .unwrap_err();
         assert!(error.contains("schema cache key 'app'"));
@@ -2300,10 +2381,10 @@ mod tests {
 
     #[test]
     fn current_cache_rejects_mismatched_schema_coverage() {
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.metadata.schemas = Some(vec!["app".to_string()]);
 
-        let error = DbCacheVersioned::V8(Box::new(cache))
+        let error = DbCacheVersioned::V9(Box::new(cache))
             .into_cache()
             .unwrap_err();
         assert!(error.contains("schema coverage disagrees"));
@@ -2313,7 +2394,7 @@ mod tests {
     fn current_cache_rejects_typed_table_with_missing_or_mismatched_type() {
         let table_id = ObjectId::new("public", "addresses");
         let type_id = ObjectId::new("public", "address");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         let mut relation = table(table_id.clone(), &["zip"]);
         relation.of_type = Some(type_id.clone());
         cache.insert_baseline(table_id.clone(), relation.clone());
@@ -2349,7 +2430,7 @@ mod tests {
     fn current_cache_rejects_invalid_foreign_key_column_identity() {
         let child = ObjectId::new("public", "child");
         let parent = ObjectId::new("public", "parent");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.insert_baseline(child.clone(), table(child.clone(), &["parent_id"]));
         cache.insert_baseline(parent.clone(), table(parent.clone(), &["id"]));
         cache.constraints.push(ConstraintState {
@@ -2379,7 +2460,7 @@ mod tests {
     fn current_cache_rejects_repeated_foreign_key_columns() {
         let child = ObjectId::new("public", "child");
         let parent = ObjectId::new("public", "parent");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.insert_baseline(child.clone(), table(child.clone(), &["a", "b"]));
         cache.insert_baseline(parent.clone(), table(parent.clone(), &["id", "other"]));
         cache.constraints.push(ConstraintState {
@@ -2409,7 +2490,7 @@ mod tests {
     fn current_cache_rejects_incomplete_foreign_key_operator_evidence() {
         let child = ObjectId::new("public", "child");
         let parent = ObjectId::new("public", "parent");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.insert_baseline(child.clone(), table(child.clone(), &["parent_id"]));
         cache.insert_baseline(parent.clone(), table(parent.clone(), &["id"]));
         cache.constraints.push(ConstraintState {
@@ -2438,7 +2519,7 @@ mod tests {
     #[test]
     fn current_cache_accepts_a_valid_primary_key_record() {
         let parent = ObjectId::new("public", "parent");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.insert_baseline(parent.clone(), table(parent.clone(), &["id"]));
         cache.constraints.push(ConstraintState {
             table_id: parent.clone(),
@@ -2462,7 +2543,7 @@ mod tests {
     fn current_cache_accepts_non_unique_exclusion_backing_index() {
         let table_id = ObjectId::new("public", "ranges");
         let index_id = ObjectId::new("public", "ranges_excl");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.insert_baseline(table_id.clone(), table(table_id.clone(), &["id"]));
         cache.indexes.push(IndexCache {
             index_id: index_id.clone(),
@@ -2500,7 +2581,7 @@ mod tests {
         let table_id = ObjectId::new("public", "events");
         let mut relation = table(table_id.clone(), &[]);
         relation.is_populated = Some(true);
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.insert_baseline(table_id, relation);
 
         let error = cache.validate_semantics().unwrap_err();
@@ -2511,7 +2592,7 @@ mod tests {
     fn current_cache_rejects_inconsistent_role_membership_edges() {
         let member = ObjectId::new("", "member");
         let parent = ObjectId::new("", "parent");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.roles.insert(
             member.clone(),
             RoleState {
@@ -2547,7 +2628,7 @@ mod tests {
     fn current_cache_rejects_membership_options_without_membership() {
         let member = ObjectId::new("", "member");
         let parent = ObjectId::new("", "parent");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.roles.insert(
             member.clone(),
             RoleState {
@@ -2583,7 +2664,7 @@ mod tests {
     fn current_cache_rejects_circular_role_membership() {
         let first = ObjectId::new("", "first");
         let second = ObjectId::new("", "second");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.roles.insert(
             first.clone(),
             RoleState {
@@ -2618,7 +2699,7 @@ mod tests {
     #[test]
     fn current_cache_rejects_schema_qualified_role_identity() {
         let role = ObjectId::new("public", "app_role");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.roles.insert(
             role.clone(),
             RoleState {
@@ -2641,7 +2722,7 @@ mod tests {
     fn current_cache_rejects_schema_qualified_role_membership_target() {
         let member = ObjectId::new("", "member");
         let parent = ObjectId::new("public", "parent");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.roles.insert(
             member.clone(),
             RoleState {
@@ -2689,7 +2770,7 @@ mod tests {
                     is_local,
                 },
             );
-            let mut cache = DbCache::new();
+            let mut cache = synced_cache();
             cache.insert_baseline(id, relation);
             assert!(
                 cache
@@ -2703,7 +2784,7 @@ mod tests {
     #[test]
     fn current_cache_rejects_ambiguous_relation_columns() {
         let table_id = ObjectId::new("public", "entries");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.insert_baseline(table_id.clone(), table(table_id, &["id", "id"]));
 
         let error = cache.validate_semantics().unwrap_err();
@@ -2713,7 +2794,7 @@ mod tests {
     #[test]
     fn current_cache_rejects_empty_relation_column_identity() {
         let table_id = ObjectId::new("public", "entries");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.insert_baseline(table_id.clone(), table(table_id, &[""]));
 
         let error = cache.validate_semantics().unwrap_err();
@@ -2722,20 +2803,20 @@ mod tests {
 
     #[test]
     fn current_cache_rejects_noncanonical_object_identities() {
-        let mut quoted_whitespace = DbCache::new();
+        let mut quoted_whitespace = synced_cache();
         let id = ObjectId::new("public", " ");
         quoted_whitespace
             .relations
             .insert(id.clone(), table(id, &[" "]));
         assert!(quoted_whitespace.validate_semantics().is_ok());
 
-        let mut empty_name = DbCache::new();
+        let mut empty_name = synced_cache();
         let id = ObjectId::new("public", "");
         empty_name.relations.insert(id.clone(), table(id, &[]));
         let error = empty_name.validate_semantics().unwrap_err();
         assert!(error.contains("empty object name"));
 
-        let mut inferred = DbCache::new();
+        let mut inferred = synced_cache();
         let mut id = ObjectId::new("public", "items");
         id.inferred_schema = true;
         inferred.relations.insert(id.clone(), table(id, &[]));
@@ -2759,16 +2840,16 @@ mod tests {
     #[test]
     fn current_cache_accepts_explicit_scope_in_caller_order() {
         let scope = vec!["public".to_string(), "app".to_string()];
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.metadata.schemas = Some(scope.clone());
-        cache.coverage = CatalogCoverage::from_sync_scope(Some(&scope));
+        cache.coverage = fully_covering(Some(&scope));
         assert!(cache.validate_semantics().is_ok());
     }
 
     #[test]
     fn current_cache_rejects_owner_absent_from_role_catalog() {
         let table_id = ObjectId::new("public", "items");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.insert_baseline(table_id.clone(), table(table_id, &[]));
         let role_id = ObjectId::new("", "known_owner");
         cache.roles.insert(
@@ -2790,12 +2871,12 @@ mod tests {
 
     #[test]
     fn current_cache_rejects_empty_provenance_identities() {
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.metadata.source_role = Some(String::new());
         let error = cache.validate_semantics().unwrap_err();
         assert!(error.contains("empty source role identity"));
 
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.metadata.source_search_path = Some(vec![String::new()]);
         let error = cache.validate_semantics().unwrap_err();
         assert!(error.contains("source search path contains an empty"));
@@ -2815,7 +2896,7 @@ mod tests {
             columns: Some(vec!["id".into(), "id".into()]),
             row_filter: None,
         };
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.publications.insert(
             "pub_items".into(),
             PublicationState {
@@ -2830,7 +2911,7 @@ mod tests {
             },
         );
 
-        let error = DbCacheVersioned::V8(Box::new(cache))
+        let error = DbCacheVersioned::V9(Box::new(cache))
             .into_cache()
             .unwrap_err();
         assert!(error.contains("empty or duplicate table column"));
@@ -2838,7 +2919,7 @@ mod tests {
 
     #[test]
     fn current_cache_rejects_subscription_owner_outside_role_catalog() {
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.roles.insert(
             ObjectId::new("", "present_owner"),
             RoleState {
@@ -2866,7 +2947,7 @@ mod tests {
             },
         );
 
-        let error = DbCacheVersioned::V8(Box::new(cache))
+        let error = DbCacheVersioned::V9(Box::new(cache))
             .into_cache()
             .unwrap_err();
         assert!(error.contains("owner 'missing_owner' is absent"));
@@ -2876,7 +2957,7 @@ mod tests {
     fn current_cache_rejects_duplicate_view_dependencies() {
         let view = ObjectId::new("public", "active_entries");
         let table_id = ObjectId::new("public", "entries");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         let mut view_state = table(view.clone(), &["id"]);
         view_state.kind = RelationKind::View;
         cache.insert_baseline(view.clone(), view_state);
@@ -2896,7 +2977,7 @@ mod tests {
     fn current_cache_rejects_empty_view_dependency_column() {
         let view = ObjectId::new("public", "active_entries");
         let table_id = ObjectId::new("public", "entries");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         let mut view_state = table(view.clone(), &["id"]);
         view_state.kind = RelationKind::View;
         cache.insert_baseline(view.clone(), view_state);
@@ -2914,7 +2995,7 @@ mod tests {
     #[test]
     fn current_cache_rejects_privilege_for_missing_role() {
         let table_id = ObjectId::new("public", "entries");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         let mut relation = table(table_id.clone(), &["id"]);
         relation.privileges.grants.insert(
             ObjectId::new("", "missing_role"),
@@ -2931,7 +3012,7 @@ mod tests {
     #[test]
     fn current_cache_allows_public_privilege_grantee() {
         let table_id = ObjectId::new("public", "entries");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         let mut relation = table(table_id.clone(), &["id"]);
         relation.privileges.grants.insert(
             ObjectId::new("", "public"),
@@ -2947,7 +3028,7 @@ mod tests {
     #[test]
     fn current_cache_rejects_repeated_constraint_key_columns() {
         let table_id = ObjectId::new("public", "entries");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.insert_baseline(
             table_id.clone(),
             table(table_id.clone(), &["id", "tenant_id"]),
@@ -2974,9 +3055,9 @@ mod tests {
     #[test]
     fn scoped_cache_accepts_a_dependency_to_an_omitted_schema() {
         let view_id = ObjectId::new("app", "v");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.metadata.schemas = Some(vec!["app".to_string()]);
-        cache.coverage = CatalogCoverage::from_sync_scope(cache.metadata.schemas.as_deref());
+        cache.coverage = fully_covering(cache.metadata.schemas.as_deref());
         cache.insert_baseline(
             view_id.clone(),
             RelationState::new(
@@ -3002,7 +3083,7 @@ mod tests {
     fn current_cache_rejects_view_dependency_on_a_missing_column() {
         let table_id = ObjectId::new("public", "entries");
         let view_id = ObjectId::new("public", "entry_view");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.insert_baseline(table_id.clone(), table(table_id.clone(), &["id"]));
         cache.insert_baseline(
             view_id.clone(),
@@ -3034,7 +3115,7 @@ mod tests {
     fn current_cache_rejects_view_dependency_with_a_non_view_dependent() {
         let table_id = ObjectId::new("public", "entries");
         let referenced_id = ObjectId::new("public", "source");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.insert_baseline(table_id.clone(), table(table_id.clone(), &["id"]));
         cache.insert_baseline(referenced_id.clone(), table(referenced_id.clone(), &["id"]));
         cache.dependencies.push(ViewDependencyCache {
@@ -3054,7 +3135,7 @@ mod tests {
     #[test]
     fn current_cache_rejects_constraint_dependency_on_a_missing_column() {
         let table_id = ObjectId::new("public", "entries");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.insert_baseline(table_id.clone(), table(table_id.clone(), &["id"]));
         cache
             .constraints
@@ -3085,7 +3166,7 @@ mod tests {
     #[test]
     fn current_cache_rejects_generated_dependency_on_a_missing_source_column() {
         let table_id = ObjectId::new("public", "entries");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.insert_baseline(table_id.clone(), table(table_id.clone(), &["id", "total"]));
         cache
             .generated_column_dependencies
@@ -3106,7 +3187,7 @@ mod tests {
     #[test]
     fn current_cache_rejects_self_referencing_generated_dependency() {
         let table_id = ObjectId::new("public", "entries");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.insert_baseline(table_id.clone(), table(table_id.clone(), &["total"]));
         cache
             .generated_column_dependencies
@@ -3123,7 +3204,7 @@ mod tests {
     #[test]
     fn current_cache_rejects_duplicate_generated_dependency_rows() {
         let table_id = ObjectId::new("public", "entries");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.insert_baseline(table_id.clone(), table(table_id.clone(), &["id", "total"]));
         let dependency = GeneratedColumnDependencyCache {
             table_id,
@@ -3139,7 +3220,7 @@ mod tests {
     }
     #[test]
     fn current_cache_rejects_dangling_index_relationship() {
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.indexes.push(IndexCache {
             index_id: ObjectId::new("public", "items_idx"),
             table_id: ObjectId::new("public", "items"),
@@ -3160,7 +3241,7 @@ mod tests {
             has_default_collations: true,
         });
 
-        let error = DbCacheVersioned::V8(Box::new(cache))
+        let error = DbCacheVersioned::V9(Box::new(cache))
             .into_cache()
             .unwrap_err();
         assert!(error.contains("references missing relation 'public.items'"));
@@ -3169,7 +3250,7 @@ mod tests {
     #[test]
     fn current_cache_rejects_index_in_a_different_schema_than_relation() {
         let table_id = ObjectId::new("public", "items");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.insert_baseline(table_id.clone(), table(table_id.clone(), &["id"]));
         cache.indexes.push(IndexCache {
             index_id: ObjectId::new("other", "items_idx"),
@@ -3191,7 +3272,7 @@ mod tests {
             has_default_collations: true,
         });
 
-        let error = DbCacheVersioned::V8(Box::new(cache))
+        let error = DbCacheVersioned::V9(Box::new(cache))
             .into_cache()
             .unwrap_err();
         assert!(error.contains("must be in the same schema as indexed relation"));
@@ -3201,7 +3282,7 @@ mod tests {
     fn current_cache_rejects_index_colliding_with_relation_namespace_object() {
         let table_id = ObjectId::new("public", "items");
         let index_id = ObjectId::new("public", "shared_name");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.insert_baseline(table_id.clone(), table(table_id, &["id"]));
         cache.insert_baseline(index_id.clone(), table(index_id.clone(), &["id"]));
         cache.indexes.push(IndexCache {
@@ -3224,7 +3305,7 @@ mod tests {
             has_default_collations: true,
         });
 
-        let error = DbCacheVersioned::V8(Box::new(cache))
+        let error = DbCacheVersioned::V9(Box::new(cache))
             .into_cache()
             .unwrap_err();
         assert!(error.contains("collides with another relation-namespace object"));
@@ -3234,7 +3315,7 @@ mod tests {
     fn current_cache_rejects_sequence_colliding_with_relation_namespace_object() {
         let table_id = ObjectId::new("public", "items");
         let shared_id = ObjectId::new("public", "shared_name");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.insert_baseline(table_id.clone(), table(table_id, &["id"]));
         cache.insert_baseline(shared_id.clone(), table(shared_id.clone(), &["id"]));
         cache.sequences.insert(
@@ -3249,7 +3330,7 @@ mod tests {
             },
         );
 
-        let error = DbCacheVersioned::V8(Box::new(cache))
+        let error = DbCacheVersioned::V9(Box::new(cache))
             .into_cache()
             .unwrap_err();
         assert!(error.contains("collides with another relation-namespace object"));
@@ -3258,7 +3339,7 @@ mod tests {
     #[test]
     fn current_cache_rejects_trigger_in_a_different_schema_than_table() {
         let table_id = ObjectId::new("public", "items");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.insert_baseline(table_id.clone(), table(table_id.clone(), &["id"]));
         cache.triggers.push(TriggerCache {
             trigger_id: ObjectId::new("other", "items_trigger"),
@@ -3269,7 +3350,7 @@ mod tests {
             enabled_mode: TriggerEnableMode::Origin,
         });
 
-        let error = DbCacheVersioned::V8(Box::new(cache))
+        let error = DbCacheVersioned::V9(Box::new(cache))
             .into_cache()
             .unwrap_err();
         assert!(error.contains("must be in the same schema as trigger table"));
@@ -3278,7 +3359,7 @@ mod tests {
     #[test]
     fn current_cache_rejects_index_without_complete_dependency_evidence() {
         let table_id = ObjectId::new("public", "items");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.insert_baseline(table_id.clone(), table(table_id.clone(), &["id"]));
         cache.indexes.push(IndexCache {
             index_id: ObjectId::new("public", "items_idx"),
@@ -3301,7 +3382,7 @@ mod tests {
         });
 
         assert!(
-            DbCacheVersioned::V8(Box::new(cache))
+            DbCacheVersioned::V9(Box::new(cache))
                 .into_cache()
                 .unwrap_err()
                 .contains("missing complete dependency-column evidence")
@@ -3312,7 +3393,7 @@ mod tests {
     fn current_cache_validates_stable_direct_inheritance() {
         let parent = ObjectId::new("public", "parent");
         let child = ObjectId::new("public", "child");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.search_path.clear();
         cache.insert_baseline(parent.clone(), table(parent.clone(), &["id"]));
         cache.insert_baseline(child.clone(), table(child.clone(), &["id"]));
@@ -3324,13 +3405,13 @@ mod tests {
             detach_pending: false,
         });
         assert!(
-            DbCacheVersioned::V8(Box::new(cache.clone()))
+            DbCacheVersioned::V9(Box::new(cache.clone()))
                 .into_cache()
                 .is_ok()
         );
 
         cache.inheritances[0].detach_pending = true;
-        let error = DbCacheVersioned::V8(Box::new(cache))
+        let error = DbCacheVersioned::V9(Box::new(cache))
             .into_cache()
             .unwrap_err();
         assert!(error.contains("pending detach requires"));
@@ -3340,7 +3421,7 @@ mod tests {
     fn current_cache_accepts_pending_partition_detach() {
         let parent = ObjectId::new("public", "parent");
         let child = ObjectId::new("public", "child");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.search_path.clear();
         let mut parent_relation = table(parent.clone(), &["id"]);
         parent_relation.partition_type = Some("RANGE".into());
@@ -3355,12 +3436,12 @@ mod tests {
             is_partition: true,
             detach_pending: true,
         });
-        assert!(DbCacheVersioned::V8(Box::new(cache)).into_cache().is_ok());
+        assert!(DbCacheVersioned::V9(Box::new(cache)).into_cache().is_ok());
     }
 
     #[test]
     fn current_cache_rejects_cross_catalog_contradictions() {
-        let mut missing_search_schema = DbCache::new();
+        let mut missing_search_schema = synced_cache();
         missing_search_schema.schemas.insert(
             "app".to_string(),
             SchemaState {
@@ -3376,7 +3457,7 @@ mod tests {
                 .contains("search path references missing schema 'public'")
         );
 
-        let mut missing_sequence_owner = DbCache::new();
+        let mut missing_sequence_owner = synced_cache();
         let sequence_id = ObjectId::new("public", "items_id_seq");
         missing_sequence_owner.sequences.insert(
             sequence_id.clone(),
@@ -3396,7 +3477,7 @@ mod tests {
                 .contains("ownership references missing relation 'public.items'")
         );
 
-        let mut cross_schema_sequence_owner = DbCache::new();
+        let mut cross_schema_sequence_owner = synced_cache();
         let table_id = ObjectId::new("public", "items");
         cross_schema_sequence_owner.insert_baseline(table_id.clone(), table(table_id, &["id"]));
         cross_schema_sequence_owner.sequences.insert(
@@ -3417,7 +3498,7 @@ mod tests {
                 .contains("must be in the same schema as owning table")
         );
 
-        let mut missing_membership_role = DbCache::new();
+        let mut missing_membership_role = synced_cache();
         let role_id = ObjectId::new("", "member");
         missing_membership_role.roles.insert(
             role_id.clone(),
@@ -3439,7 +3520,7 @@ mod tests {
                 .contains("membership references missing role")
         );
 
-        let mut invalid_view_dependency = DbCache::new();
+        let mut invalid_view_dependency = synced_cache();
         invalid_view_dependency
             .dependencies
             .push(ViewDependencyCache {

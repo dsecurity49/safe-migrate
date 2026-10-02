@@ -123,7 +123,7 @@ impl SafeMigrateEngine {
         sql: &str,
         state: &mut AnalysisState,
     ) -> Result<Vec<Violation>, Vec<String>> {
-        self.analyze_chain(&[("<inline>".to_string(), sql.to_string())], state)
+        self.analyze_chain(&[("inline".to_string(), sql.to_string())], state)
     }
 
     /// Analyze ordered files and retain reportable source locations for every
@@ -135,6 +135,7 @@ impl SafeMigrateEngine {
         state: &mut AnalysisState,
     ) -> Result<Vec<ReportFinding>, Vec<String>> {
         let mut findings = Vec::new();
+        let file_order: Vec<String> = files.iter().map(|(name, _)| name.clone()).collect();
 
         for (file_index, (filename, sql)) in files.iter().enumerate() {
             let normalized_sql = Self::normalize_execute(sql);
@@ -144,23 +145,35 @@ impl SafeMigrateEngine {
                 .stmts()
                 .map(|statement| statement.syntax().text_range())
                 .collect();
-            let violations = self.analyze_parsed_file(filename, &normalized_sql, &parsed, state)?;
+            let violations =
+                self.analyze_parsed_file(filename, &normalized_sql, sql, &parsed, state)?;
             findings.extend(
                 violations
                     .into_iter()
-                    .map(|violation| ReportFinding {
-                        location: Self::source_location(
-                            filename,
-                            &normalized_sql,
-                            violation.source_range,
-                        ),
-                        statement_index: violation.source_range.and_then(|range| {
+                    .map(|violation| {
+                        let statement_index = violation.source_range.and_then(|range| {
                             statement_ranges
                                 .iter()
                                 .position(|statement| statement.contains_range(range))
                                 .map(|index| index + 1)
-                        }),
-                        violation,
+                        });
+                        let certainty =
+                            crate::_internal::report::violations::certainty_for_statement(
+                                state.evidence(),
+                                &file_order,
+                                file_index,
+                                statement_index,
+                            );
+                        ReportFinding {
+                            location: Self::source_location(
+                                filename,
+                                &normalized_sql,
+                                violation.source_range,
+                            ),
+                            statement_index,
+                            certainty,
+                            violation,
+                        }
                     })
                     .map(|finding| (file_index, finding)),
             );
@@ -243,13 +256,14 @@ impl SafeMigrateEngine {
         state: &mut AnalysisState,
     ) -> Result<Vec<Violation>, Vec<String>> {
         let parsed = SourceFile::parse(sql);
-        self.analyze_parsed_file(filename, sql, &parsed, state)
+        self.analyze_parsed_file(filename, sql, sql, &parsed, state)
     }
 
     fn analyze_parsed_file(
         &self,
         filename: &str,
         sql: &str,
+        original_sql: &str,
         parsed: &Parse<SourceFile>,
         state: &mut AnalysisState,
     ) -> Result<Vec<Violation>, Vec<String>> {
@@ -306,7 +320,16 @@ impl SafeMigrateEngine {
             }
 
             // Capture raw statement text for sql field on violations (strip leading comments)
-            let stmt_text = Self::strip_sql_leading_comments(&stmt.syntax().text().to_string());
+            // Use original_sql to preserve EXECUTE '...' instead of normalized DO block
+            let raw_start = usize::from(stmt.syntax().text_range().start());
+            let raw_end = usize::from(stmt.syntax().text_range().end());
+            let raw_stmt = if raw_start < original_sql.len() && raw_end <= original_sql.len() {
+                &original_sql[raw_start..raw_end]
+            } else {
+                // Fallback (should not occur since lengths are preserved byte-for-byte)
+                sql.get(raw_start..raw_end).unwrap_or("")
+            };
+            let stmt_text = Self::strip_sql_leading_comments(raw_stmt);
 
             // PostgreSQL executes a statement atomically. Keep both state
             // and diagnostics local until all resolved actions succeed so an
@@ -314,7 +337,6 @@ impl SafeMigrateEngine {
             // state, findings, or deduplication keys. A parsed statement
             // without a typed extractor is explicitly opaque: silently
             // ignoring it would claim exact confidence for later SQL.
-            let statement_confidence = state.confidence().clone();
             let mut statement_violations = Vec::new();
             let mut statement_warned_keys = HashSet::new();
             let mut mutations = match AstVisitor::extract(&stmt) {
@@ -324,7 +346,10 @@ impl SafeMigrateEngine {
                 )],
             };
             if squawk_linter::analyze::possibly_slow_stmt(&stmt) {
-                mutations.push(Mutation::CheckTimeouts);
+                // Name the object the statement acts on. Diagnostic mutations
+                // have no subject, so they are never mistaken for one.
+                let subject = mutations.iter().find_map(|m| m.primary_object());
+                mutations.push(Mutation::CheckTimeouts { subject });
             }
             let started_in_transaction = state.in_transaction();
             let transaction_control = mutations.iter().any(|mutation| {
@@ -377,10 +402,29 @@ impl SafeMigrateEngine {
                 }
 
                 for rule in &self.rules {
-                    if file_ignores.contains(rule.id())
-                        || stmt_ignores.contains(rule.id())
-                        || self.config.is_rule_disabled(rule.id())
-                    {
+                    let is_inline_ignored =
+                        file_ignores.contains(rule.id()) || stmt_ignores.contains(rule.id());
+
+                    if is_inline_ignored && !self.config.allow_inline_suppressions {
+                        statement_violations.push(crate::_internal::report::violations::Violation {
+                            source_range: None,
+                            rule_id: "inline-suppression-disabled",
+                            operation_kind: crate::_internal::report::violations::OperationKind::Other("config".to_string()),
+                            object_kind: crate::_internal::report::violations::ObjectKind::Unknown,
+                            object_name: "".to_string(),
+                            tier: crate::_internal::report::violations::ViolationTier::Tier1,
+                            reason: format!("Inline suppression of rule '{}' is not allowed by configuration", rule.id()),
+                            recipe: "Remove the inline directive. To bypass a rule, explicitly disable it in safe-migrate.toml.",
+                            dedup_key: Some(format!("inline-suppression-disabled:{}", rule.id())),
+                            sql: None,
+                            fk_dependency_related: false,
+                        });
+                        // Skip evaluating the rule since it was requested to be ignored,
+                        // but the build will fail anyway due to the Tier1 config violation.
+                        continue;
+                    }
+
+                    if self.config.is_rule_disabled(rule.id()) || is_inline_ignored {
                         continue;
                     }
 
@@ -443,8 +487,8 @@ impl SafeMigrateEngine {
                             if let Some(range) = v.source_range {
                                 let start = usize::from(range.start());
                                 let end = usize::from(range.end());
-                                if start < sql.len() && end <= sql.len() {
-                                    v.sql = Some(sql[start..end].trim().to_string());
+                                if start < original_sql.len() && end <= original_sql.len() {
+                                    v.sql = Some(original_sql[start..end].trim().to_string());
                                 } else {
                                     v.sql = Some(stmt_text.trim().to_string());
                                 }
@@ -452,14 +496,8 @@ impl SafeMigrateEngine {
                                 v.sql = Some(stmt_text.trim().to_string());
                             }
                         }
-                        // A taint produced by this statement must not
-                        // downgrade that same statement's findings.
-                        if statement_confidence
-                            == crate::_internal::analysis::state::Confidence::Tainted
-                            && v.tier == crate::_internal::report::violations::ViolationTier::Tier1
-                        {
-                            v.tier = crate::_internal::report::violations::ViolationTier::Tier2;
-                        }
+                        // Severity belongs to the rule alone; certainty is
+                        // derived per finding from the evidence log.
                         statement_violations.push(v);
                     }
                 }

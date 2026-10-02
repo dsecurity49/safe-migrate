@@ -29,7 +29,7 @@ mod state_machine_guards_tests {
     #[test]
     fn test_reversibility_type_widen() {
         let engine = setup_engine();
-        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut cache = crate::common::synced_cache();
         let tid = object_id("public", "t");
         let mut rel = RelationState::new(
             tid.clone(),
@@ -140,7 +140,7 @@ mod state_machine_guards_tests {
     #[test]
     fn unknown_scoped_target_in_multi_drop_preserves_known_targets() {
         let engine = setup_engine();
-        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut cache = crate::common::synced_cache();
         cache.metadata.schemas = Some(vec!["app".to_string()]);
         let table_id = object_id("app", "known_table");
         let view_id = object_id("app", "known_view");
@@ -209,6 +209,113 @@ mod state_machine_guards_tests {
     }
 
     #[test]
+    fn alter_view_set_default_does_not_taint() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE TABLE source (id int); CREATE VIEW v AS SELECT id FROM source;",
+                &mut state,
+            )
+            .expect("view setup should analyze");
+        engine
+            .analyze("ALTER VIEW v ALTER COLUMN id SET DEFAULT 0;", &mut state)
+            .expect("ALTER VIEW ALTER COLUMN SET DEFAULT should analyze");
+
+        assert_eq!(
+            state.local.confidence,
+            safe_migrate::_internal::analysis::state::Confidence::Exact
+        );
+    }
+
+    #[test]
+    fn alter_view_drop_default_does_not_taint() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE TABLE source (id int); CREATE VIEW v AS SELECT id FROM source;",
+                &mut state,
+            )
+            .expect("view setup should analyze");
+        engine
+            .analyze("ALTER VIEW v ALTER COLUMN id DROP DEFAULT;", &mut state)
+            .expect("ALTER VIEW ALTER COLUMN DROP DEFAULT should analyze");
+
+        assert_eq!(
+            state.local.confidence,
+            safe_migrate::_internal::analysis::state::Confidence::Exact
+        );
+    }
+
+    #[test]
+    fn alter_view_set_options_stays_exact_for_a_version_agnostic_option() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE TABLE source (id int); CREATE VIEW v AS SELECT id FROM source;",
+                &mut state,
+            )
+            .expect("view setup should analyze");
+        engine
+            .analyze("ALTER VIEW v SET (security_barrier = true);", &mut state)
+            .expect("ALTER VIEW SET OPTIONS should analyze");
+
+        assert_eq!(
+            state.local.confidence,
+            safe_migrate::_internal::analysis::state::Confidence::Exact
+        );
+    }
+
+    #[test]
+    fn alter_view_set_options_taints_when_the_version_cannot_place_the_option() {
+        // security_invoker arrived in PostgreSQL 15. Without a baseline the
+        // version is unknown, so the option cannot be placed either way.
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE TABLE source (id int); CREATE VIEW v AS SELECT id FROM source;",
+                &mut state,
+            )
+            .expect("view setup should analyze");
+        engine
+            .analyze("ALTER VIEW v SET (security_invoker = true);", &mut state)
+            .expect("ALTER VIEW SET OPTIONS should analyze");
+
+        assert_eq!(
+            state.local.confidence,
+            safe_migrate::_internal::analysis::state::Confidence::Tainted
+        );
+    }
+
+    #[test]
+    fn alter_view_reset_options_does_not_taint() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze(
+                "CREATE TABLE source (id int); CREATE VIEW v AS SELECT id FROM source;",
+                &mut state,
+            )
+            .expect("view setup should analyze");
+        engine
+            .analyze("ALTER VIEW v RESET (security_invoker);", &mut state)
+            .expect("ALTER VIEW RESET OPTIONS should analyze");
+
+        assert_eq!(
+            state.local.confidence,
+            safe_migrate::_internal::analysis::state::Confidence::Exact
+        );
+    }
+
+    #[test]
     fn alter_view_rename_column_taints_instead_of_becoming_an_exact_noop() {
         let engine = setup_engine();
         let mut state = setup_state();
@@ -222,6 +329,51 @@ mod state_machine_guards_tests {
         engine
             .analyze("ALTER VIEW v RENAME COLUMN id TO renamed_id;", &mut state)
             .expect("typed but unsupported view alteration should analyze");
+
+        assert_eq!(
+            state.local.confidence,
+            safe_migrate::_internal::analysis::state::Confidence::Tainted
+        );
+    }
+
+    #[test]
+    fn alter_materialized_view_metadata_actions_do_not_taint() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze("CREATE MATERIALIZED VIEW mv AS SELECT 1 AS id;", &mut state)
+            .expect("matview setup should analyze");
+
+        for sql in [
+            "ALTER MATERIALIZED VIEW mv SET (fillfactor = 90);",
+            "ALTER MATERIALIZED VIEW mv RESET (fillfactor);",
+        ] {
+            engine.analyze(sql, &mut state).unwrap();
+        }
+
+        assert_eq!(
+            state.local.confidence,
+            safe_migrate::_internal::analysis::state::Confidence::Exact
+        );
+    }
+
+    #[test]
+    fn alter_materialized_view_unsupported_actions_taint_instead_of_failing() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        engine
+            .analyze("CREATE MATERIALIZED VIEW mv AS SELECT 1 AS id;", &mut state)
+            .expect("matview setup should analyze");
+
+        // This unsupported action produces OpaqueMutation::UnsupportedStatement and taints
+        engine
+            .analyze(
+                "ALTER MATERIALIZED VIEW mv RENAME COLUMN id TO new_id;",
+                &mut state,
+            )
+            .unwrap();
 
         assert_eq!(
             state.local.confidence,

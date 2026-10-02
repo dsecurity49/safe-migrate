@@ -1,7 +1,10 @@
 use crate::_internal::analysis::facts::StatementFact;
 use crate::_internal::analysis::mutations::{Mutation, OpaqueMutation};
+use crate::_internal::analysis::namespace::temp_object_id;
 use crate::_internal::analysis::state::AnalysisState;
 use crate::_internal::ast::identifiers::{ObjectId, QualifiedName};
+use crate::_internal::model::data_type::{ParsedDataType, TypeIdentity};
+use crate::_internal::report::violations::ObjectKind;
 
 mod relation;
 mod relation_aux;
@@ -17,20 +20,31 @@ pub(crate) struct Resolver;
 
 impl Resolver {
     fn resolve_creation_name(name: &QualifiedName, state: &AnalysisState) -> ObjectId {
+        // An empty path leaves PostgreSQL with no creation target, so the
+        // namespace is left empty for the state machine to reject rather than
+        // silently assuming `public`.
         let schema = name
             .schema
             .as_ref()
             .map(|i| i.resolve())
-            .unwrap_or_else(|| {
-                state
-                    .search_path()
-                    .first()
-                    .map(|s| s.as_str())
-                    .unwrap_or("public")
-                    .to_string()
-            });
+            .unwrap_or_else(|| state.search_path().first().cloned().unwrap_or_default());
 
         ObjectId::new(schema, name.name.resolve())
+    }
+
+    /// Creation target for a relation declared `TEMPORARY`, which PostgreSQL
+    /// always places in the session schema rather than the path.
+    ///
+    /// An explicitly named schema is kept so the state machine can reject it,
+    /// as PostgreSQL does for a temporary relation in a permanent schema.
+    pub(super) fn resolve_temp_creation_name(
+        name: &QualifiedName,
+        _state: &AnalysisState,
+    ) -> ObjectId {
+        match &name.schema {
+            Some(schema) => ObjectId::new(schema.resolve(), name.name.resolve()),
+            None => temp_object_id(&name.name.resolve()),
+        }
     }
 
     fn resolve_in_namespace(
@@ -38,24 +52,22 @@ impl Resolver {
         object_name: String,
         state: &AnalysisState,
         present: impl Fn(&AnalysisState, &ObjectId) -> bool,
+        search: impl Fn(&AnalysisState) -> Vec<String>,
     ) -> ObjectId {
         if let Some(schema_ident) = &name.schema {
             return ObjectId::new(schema_ident.resolve(), object_name);
         }
 
-        for schema in state.search_path() {
-            let mut candidate = ObjectId::new(schema.clone(), object_name.clone());
+        for schema in search(state) {
+            let mut candidate = ObjectId::new(schema, object_name.clone());
             if present(state, &candidate) {
                 candidate.inferred_schema = true;
                 return candidate;
             }
         }
 
-        let schema = state
-            .search_path()
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "public".to_string());
+        // An empty path searches nothing, so no schema may be inferred.
+        let schema = state.search_path().first().cloned().unwrap_or_default();
         let mut id = ObjectId::new(schema, object_name);
         id.inferred_schema = true;
         id
@@ -67,7 +79,26 @@ impl Resolver {
             name.name.resolve(),
             state,
             AnalysisState::relation_namespace_object_is_present,
+            AnalysisState::relation_search_path,
         )
+    }
+
+    /// A `schema-drift` diagnostic for an object the baseline provably lacks.
+    pub(super) fn unresolved_reference(
+        kind: ObjectKind,
+        id: &ObjectId,
+        state: &AnalysisState,
+    ) -> Option<Mutation> {
+        // A miss only proves absence with a synced baseline; an object created
+        // earlier in the migration is present locally.
+        let absent = !state.relation_namespace_object_is_present(id)
+            && state.relation_absence_is_authoritative(id);
+        absent.then(|| {
+            Mutation::Opaque(OpaqueMutation::UnresolvedReference {
+                object_kind: kind,
+                object_name: id.to_string(),
+            })
+        })
     }
 
     fn resolve_type_lookup_name(name: &QualifiedName, state: &AnalysisState) -> ObjectId {
@@ -76,6 +107,7 @@ impl Resolver {
             name.name.resolve(),
             state,
             AnalysisState::type_is_present,
+            AnalysisState::relation_search_path,
         )
     }
 
@@ -86,11 +118,18 @@ impl Resolver {
     ) -> ObjectId {
         let signature = params
             .iter()
-            .map(|param| Self::normalize_function_arg_type(param))
+            .map(|param| Self::routine_arg_identity(param, state))
             .collect::<Vec<_>>()
             .join(",");
         let object_name = format!("{}({signature})", name.name.resolve());
-        Self::resolve_in_namespace(name, object_name, state, AnalysisState::routine_is_present)
+        // Routines deliberately skip the temporary schema; PostgreSQL does too.
+        Self::resolve_in_namespace(
+            name,
+            object_name,
+            state,
+            AnalysisState::routine_is_present,
+            |state| state.search_path().to_vec(),
+        )
     }
 
     fn resolve_constraint_index_name(name: &QualifiedName, table: &ObjectId) -> ObjectId {
@@ -119,14 +158,17 @@ impl Resolver {
             .map(|p| p.ty.clone())
             .collect::<Vec<_>>()
             .join(",");
-        Self::resolve_function_id_by_sig(&base_id, &sig)
+        Self::resolve_function_id_by_sig(&base_id, &sig, state)
     }
 
-    fn resolve_function_id_by_sig(base_id: &ObjectId, sig: &str) -> ObjectId {
-        // Normalize types in signature to match pg_proc standard names
+    fn resolve_function_id_by_sig(
+        base_id: &ObjectId,
+        sig: &str,
+        state: &AnalysisState,
+    ) -> ObjectId {
         let normalized_sig = sig
             .split(',')
-            .map(Self::normalize_function_arg_type)
+            .map(|raw| Self::routine_arg_identity(raw, state))
             .collect::<Vec<_>>()
             .join(",");
 
@@ -138,48 +180,24 @@ impl Resolver {
         id
     }
 
-    pub(crate) fn normalize_function_arg_type(raw: &str) -> String {
-        let normalized = Self::fold_unquoted_identifier_case(raw.trim());
-        if let Some(element_type) = normalized.strip_suffix("[]") {
-            return format!("{}[]", Self::normalize_function_arg_type(element_type));
+    /// PostgreSQL identifies a routine by its argument type OIDs, so two
+    /// spellings of one type are one signature. Resolve against state where
+    /// possible and fall back to the canonical spelling otherwise.
+    fn routine_arg_identity(raw: &str, state: &AnalysisState) -> String {
+        if let Some(id) = state.resolve_type_reference(raw) {
+            return id.to_string();
         }
-        match normalized.as_str() {
-            "int" | "int4" => "integer".to_string(),
-            "int8" => "bigint".to_string(),
-            "int2" => "smallint".to_string(),
-            "float8" => "double precision".to_string(),
-            "float4" => "real".to_string(),
-            "bool" => "boolean".to_string(),
-            "varchar" => "character varying".to_string(),
-            "char" => "character".to_string(),
-            "time" => "time without time zone".to_string(),
-            "timestamp" => "timestamp without time zone".to_string(),
-            "timestamptz" => "timestamp with time zone".to_string(),
-            "decimal" => "numeric".to_string(),
-            _ => normalized,
+        let identity = Self::normalize_function_arg_type(raw);
+        // An unresolved custom type renders to nothing, so two distinct ones
+        // would collapse into one signature. Keep its written name instead.
+        if identity.is_unknown() {
+            return ParsedDataType::parse(raw).to_string();
         }
+        identity.render()
     }
 
-    fn fold_unquoted_identifier_case(raw: &str) -> String {
-        let mut folded = String::with_capacity(raw.len());
-        let mut quoted = false;
-        let mut chars = raw.chars().peekable();
-        while let Some(character) = chars.next() {
-            match character {
-                '"' if quoted && chars.peek() == Some(&'"') => {
-                    folded.push('"');
-                    folded.push('"');
-                    chars.next();
-                }
-                '"' => {
-                    quoted = !quoted;
-                    folded.push(character);
-                }
-                character if quoted => folded.push(character),
-                character => folded.extend(character.to_lowercase()),
-            }
-        }
-        folded
+    pub(crate) fn normalize_function_arg_type(raw: &str) -> TypeIdentity {
+        TypeIdentity::from_syntax(&ParsedDataType::parse(raw))
     }
 
     pub(crate) fn resolve(fact: &StatementFact, state: &AnalysisState) -> Vec<Mutation> {
@@ -196,7 +214,19 @@ impl Resolver {
                     authorization,
                 ));
             }
-            StatementFact::SchemaNeutralNoop => {}
+            StatementFact::SchemaNeutralNoop => mutations.push(Mutation::NoStateChange {
+                reason: "metadata outside the modeled schema state",
+            }),
+            StatementFact::Reindex {
+                target_kind,
+                target_name,
+                concurrently,
+            } => mutations.push(Self::resolve_reindex(
+                target_kind,
+                target_name.as_ref(),
+                *concurrently,
+                state,
+            )),
             StatementFact::AlterSchema { name, action } => {
                 mutations.push(Self::resolve_alter_schema(name, action));
             }
@@ -255,30 +285,30 @@ impl Resolver {
                 name,
                 or_replace,
                 depends_on,
+                select_outputs,
+                select_projection_complete,
+                select_source,
             } => {
                 mutations.push(Self::resolve_create_view(
                     name,
                     *or_replace,
                     depends_on,
+                    select_outputs,
+                    *select_projection_complete,
+                    select_source.as_ref(),
                     state,
                 ));
             }
             StatementFact::AlterView { name, action } => {
-                if let Some(mutation) = Self::resolve_alter_view(name, action, state) {
-                    mutations.push(mutation);
-                }
+                mutations.push(Self::resolve_alter_view(name, action, state));
             }
             StatementFact::CreateMaterializedView { name, depends_on } => {
                 mutations.push(Self::resolve_create_materialized_view(
                     name, depends_on, state,
                 ));
             }
-            StatementFact::AlterMaterializedView { name, new_name } => {
-                if let Some(mutation) =
-                    Self::resolve_alter_materialized_view(name, new_name.as_ref(), state)
-                {
-                    mutations.push(mutation);
-                }
+            StatementFact::AlterMaterializedView { name, action } => {
+                mutations.push(Self::resolve_alter_materialized_view(name, action, state));
             }
             StatementFact::RefreshMaterializedView { name, concurrently } => {
                 mutations.push(Self::resolve_refresh_materialized_view(
@@ -364,9 +394,22 @@ impl Resolver {
                 table,
                 new_name,
             } => mutations.push(Self::resolve_alter_trigger(name, table, new_name, state)),
-            StatementFact::AlterIndex { name, actions } => {
-                mutations.extend(Self::resolve_alter_index(name, actions, state));
+            StatementFact::AlterIndex {
+                name,
+                if_exists,
+                actions,
+            } => {
+                mutations.push(Self::resolve_alter_index(name, *if_exists, actions, state));
             }
+            StatementFact::AlterIndexAllInTablespace {
+                source_tablespace,
+                target_tablespace,
+            } => mutations.push(Mutation::AlterIndexAllInTablespace(
+                crate::_internal::analysis::mutations::AlterIndexAllInTablespaceMutation {
+                    source_tablespace: source_tablespace.resolve(),
+                    target_tablespace: target_tablespace.resolve(),
+                },
+            )),
             StatementFact::CreateType(create_type) => {
                 mutations.push(Self::resolve_create_type(create_type, state));
             }
@@ -532,7 +575,7 @@ impl Resolver {
                 mutations.push(Self::resolve_alter_function(f, state));
             }
             StatementFact::DropFunction(f) => {
-                mutations.push(Self::resolve_drop_function(f));
+                mutations.push(Self::resolve_drop_function(f, state));
             }
             StatementFact::CreateProcedure(p) => {
                 mutations.push(Self::resolve_create_procedure(p, state));
@@ -541,7 +584,7 @@ impl Resolver {
                 mutations.push(Self::resolve_alter_procedure(p, state));
             }
             StatementFact::DropProcedure(p) => {
-                mutations.push(Self::resolve_drop_procedure(p));
+                mutations.push(Self::resolve_drop_procedure(p, state));
             }
             StatementFact::CreateAggregate(a) => {
                 mutations.push(Self::resolve_create_aggregate(a, state));
@@ -550,7 +593,7 @@ impl Resolver {
                 mutations.push(Self::resolve_alter_aggregate(a, state));
             }
             StatementFact::DropAggregate(a) => {
-                mutations.push(Self::resolve_drop_aggregate(a));
+                mutations.push(Self::resolve_drop_aggregate(a, state));
             }
             StatementFact::CreatePublication(p) => {
                 mutations.push(Self::resolve_create_publication(p, state));
@@ -602,6 +645,11 @@ impl Resolver {
                 mutations.push(Self::resolve_set_role(role, *local, *is_session_auth));
             }
         }
+        debug_assert!(
+            !mutations.is_empty(),
+            "a recognized statement must produce at least one mutation; \
+             a statement that changes nothing modeled needs NoStateChange"
+        );
         mutations
     }
 }

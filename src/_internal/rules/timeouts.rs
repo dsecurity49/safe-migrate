@@ -5,6 +5,18 @@ use crate::_internal::rules::{Rule, RuleContext};
 
 pub(crate) struct RequireLockTimeoutRule;
 
+impl RequireLockTimeoutRule {
+    /// The object the timed statement acts on, or an honest unknown.
+    fn subject(context: &RuleContext<'_>) -> (ObjectKind, String) {
+        match context.mutation() {
+            Mutation::CheckTimeouts {
+                subject: Some(subject),
+            } => subject.clone(),
+            _ => (ObjectKind::Unknown, "unknown statement".to_string()),
+        }
+    }
+}
+
 impl Rule for RequireLockTimeoutRule {
     fn id(&self) -> &'static str {
         "require-lock-timeout"
@@ -19,11 +31,12 @@ impl Rule for RequireLockTimeoutRule {
     }
 
     fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
-        if !matches!(context.mutation(), Mutation::CheckTimeouts)
+        if !matches!(context.mutation(), Mutation::CheckTimeouts { .. })
             || context.result() != &MutationResult::Applied
         {
             return Vec::new();
         }
+        let subject = Self::subject(context);
 
         let reason = match context.state().effective_lock_timeout() {
             None => "No lock_timeout is known from SQL or a synchronized cache.".to_string(),
@@ -44,8 +57,8 @@ impl Rule for RequireLockTimeoutRule {
             source_range: None,
             rule_id: self.id(),
             operation_kind: OperationKind::Other("timeout_check".to_string()),
-            object_kind: ObjectKind::Unknown,
-            object_name: "<statement>".to_string(),
+            object_kind: subject.0,
+            object_name: subject.1,
             tier: self.default_tier(),
             reason,
             recipe: self.recipe(),
@@ -57,6 +70,17 @@ impl Rule for RequireLockTimeoutRule {
 }
 
 pub(crate) struct RequireStatementTimeoutRule;
+
+impl RequireStatementTimeoutRule {
+    fn subject(context: &RuleContext<'_>) -> (ObjectKind, String) {
+        match context.mutation() {
+            Mutation::CheckTimeouts {
+                subject: Some(subject),
+            } => subject.clone(),
+            _ => (ObjectKind::Unknown, "unknown statement".to_string()),
+        }
+    }
+}
 
 impl Rule for RequireStatementTimeoutRule {
     fn id(&self) -> &'static str {
@@ -72,11 +96,12 @@ impl Rule for RequireStatementTimeoutRule {
     }
 
     fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
-        if !matches!(context.mutation(), Mutation::CheckTimeouts)
+        if !matches!(context.mutation(), Mutation::CheckTimeouts { .. })
             || context.result() != &MutationResult::Applied
         {
             return Vec::new();
         }
+        let subject = Self::subject(context);
 
         let reason = match context.state().effective_statement_timeout() {
             None => "No statement_timeout is known from SQL or a synchronized cache.".to_string(),
@@ -88,8 +113,8 @@ impl Rule for RequireStatementTimeoutRule {
             source_range: None,
             rule_id: self.id(),
             operation_kind: OperationKind::Other("timeout_check".to_string()),
-            object_kind: ObjectKind::Unknown,
-            object_name: "<statement>".to_string(),
+            object_kind: subject.0,
+            object_name: subject.1,
             tier: self.default_tier(),
             reason,
             recipe: self.recipe(),

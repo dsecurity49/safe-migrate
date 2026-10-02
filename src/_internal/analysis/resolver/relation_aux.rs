@@ -1,20 +1,61 @@
 use super::Resolver;
-use crate::_internal::analysis::facts::{AlterIndexActionFact, AlterViewAction, PolicyCommand};
+use crate::_internal::analysis::facts::{
+    AlterIndexActionFact, AlterMaterializedViewActionFact, AlterViewAction, PolicyCommand,
+    ReindexTargetKindFact, SelectOutputFact, StatisticsTarget,
+};
 use crate::_internal::analysis::mutations::{
-    CreateIndex, CreateMaterializedView, CreatePolicyMutation, CreateTriggerMutation, CreateView,
-    DropPolicyMutation, DropTriggerMutation, Mutation, OpaqueMutation,
-    RefreshMaterializedViewMutation, Rename, RenameTriggerMutation,
+    AlterIndexActionMutation, AlterIndexMutation, CreateIndex, CreateMaterializedView,
+    CreatePolicyMutation, CreateTriggerMutation, CreateView, DropPolicyMutation,
+    DropTriggerMutation, Mutation, OpaqueMutation, RefreshMaterializedViewMutation,
+    ReindexTargetMutation, ReloptionTarget, Rename, RenameTriggerMutation, ViewColumn,
 };
 use crate::_internal::analysis::state::AnalysisState;
-use crate::_internal::ast::identifiers::{Ident, ObjectId, QualifiedName};
+use crate::_internal::ast::identifiers::{ObjectId, QualifiedName};
+use crate::_internal::model::data_type::{ParsedDataType, TypeIdentity};
 
 impl Resolver {
+    pub(super) fn resolve_reindex(
+        target_kind: &ReindexTargetKindFact,
+        target_name: Option<&QualifiedName>,
+        concurrently: bool,
+        state: &AnalysisState,
+    ) -> Mutation {
+        let target = match (target_kind, target_name) {
+            (ReindexTargetKindFact::Database, Some(name)) => {
+                Some(ReindexTargetMutation::Database(name.name.resolve()))
+            }
+            (ReindexTargetKindFact::Schema, Some(name)) => {
+                Some(ReindexTargetMutation::Schema(name.name.resolve()))
+            }
+            (ReindexTargetKindFact::System, name_opt) => Some(ReindexTargetMutation::System(
+                name_opt.map(|n| n.name.resolve()),
+            )),
+            (ReindexTargetKindFact::Table, Some(name)) => Some(ReindexTargetMutation::Table(
+                Self::resolve_relation_lookup_name(name, state),
+            )),
+            (ReindexTargetKindFact::Index, Some(name)) => Some(ReindexTargetMutation::Index(
+                Self::resolve_relation_lookup_name(name, state),
+            )),
+            _ => None, // Syntax error recovery states (missing required names)
+        };
+
+        Mutation::Reindex {
+            target,
+            concurrently,
+        }
+    }
+
     pub(super) fn resolve_create_view(
         name: &QualifiedName,
         or_replace: bool,
         depends_on: &[QualifiedName],
+        select_outputs: &[SelectOutputFact],
+        projection_complete: bool,
+        select_source: Option<&QualifiedName>,
         state: &AnalysisState,
     ) -> Mutation {
+        let source = select_source.map(|source| Self::resolve_relation_lookup_name(source, state));
+        let columns = Self::resolve_view_columns(select_outputs, source.as_ref(), state);
         Mutation::CreateView(CreateView {
             id: Self::resolve_creation_name(name, state),
             or_replace,
@@ -22,37 +63,100 @@ impl Resolver {
                 .iter()
                 .map(|dependency| Self::resolve_relation_lookup_name(dependency, state))
                 .collect(),
+            columns,
+            projection_complete,
         })
+    }
+
+    /// Project a view's output list, taking types from the source relation
+    /// where the output is a plain column reference.
+    ///
+    /// Types are normalised the way `format_type` reports them, so a view
+    /// created from DDL matches the same view synchronized from the catalog.
+    fn resolve_view_columns(
+        select_outputs: &[SelectOutputFact],
+        source: Option<&ObjectId>,
+        state: &AnalysisState,
+    ) -> Vec<ViewColumn> {
+        let source_columns = source
+            .and_then(|id| state.relation_column_types(id))
+            .unwrap_or_default();
+        let find = |source_name: &str| {
+            source_columns
+                .iter()
+                .find(|(name, _)| name == source_name)
+                .and_then(|(_, data_type)| data_type.as_deref())
+        };
+        let view_column = |output_name: String, declared: Option<&str>| ViewColumn {
+            name: output_name,
+            data_type: declared.map(|declared| {
+                TypeIdentity::from_syntax(&ParsedDataType::parse(declared)).render()
+            }),
+            type_modifier: declared
+                .and_then(|declared| ParsedDataType::parse(declared).atttypmod_offset()),
+        };
+
+        let mut columns = Vec::new();
+        for output in select_outputs {
+            match output {
+                SelectOutputFact::AllColumns => columns.extend(
+                    source_columns
+                        .iter()
+                        .map(|(name, data_type)| view_column(name.clone(), data_type.as_deref())),
+                ),
+                SelectOutputFact::Column {
+                    source_name,
+                    output_name,
+                } => columns.push(view_column(output_name.clone(), find(source_name))),
+            }
+        }
+        columns
     }
 
     pub(super) fn resolve_alter_view(
         name: &QualifiedName,
         action: &AlterViewAction,
         state: &AnalysisState,
-    ) -> Option<Mutation> {
+    ) -> Mutation {
         match action {
             AlterViewAction::RenameTo { new_name } => {
                 let id = Self::resolve_relation_lookup_name(name, state);
                 let mut new_id = ObjectId::new(id.schema.clone(), new_name.resolve());
                 new_id.inferred_schema = id.inferred_schema;
-                Some(Mutation::Rename(Rename { old_id: id, new_id }))
+                Mutation::Rename(Rename { old_id: id, new_id })
             }
             AlterViewAction::SetSchema { new_schema } => {
                 let id = Self::resolve_relation_lookup_name(name, state);
                 let new_id = ObjectId::new(new_schema, &id.name);
-                Some(Mutation::Rename(Rename { old_id: id, new_id }))
+                Mutation::Rename(Rename { old_id: id, new_id })
             }
-            AlterViewAction::OwnerTo { new_owner } => Some(Mutation::ChangeRelationOwner {
+            AlterViewAction::OwnerTo { new_owner } => Mutation::ChangeRelationOwner {
                 id: Self::resolve_relation_lookup_name(name, state),
                 new_owner: new_owner.clone(),
-            }),
+            },
             AlterViewAction::RenameColumn { .. } => {
-                Some(Mutation::Opaque(OpaqueMutation::UnsupportedStatement))
+                Mutation::Opaque(OpaqueMutation::UnsupportedStatement)
             }
-            AlterViewAction::SetDefault { .. }
-            | AlterViewAction::DropDefault { .. }
-            | AlterViewAction::SetOptions { .. }
-            | AlterViewAction::ResetOptions { .. } => None,
+            AlterViewAction::SetDefault { column, default } => Mutation::SetColumnDefault {
+                id: Self::resolve_relation_lookup_name(name, state),
+                column: column.clone(),
+                default: default.clone(),
+            },
+            AlterViewAction::DropDefault { column } => Mutation::SetColumnDefault {
+                id: Self::resolve_relation_lookup_name(name, state),
+                column: column.clone(),
+                default: None,
+            },
+            AlterViewAction::SetOptions { options } => Mutation::SetReloptions {
+                id: Self::resolve_relation_lookup_name(name, state),
+                kind: ReloptionTarget::View,
+                attributes: options.clone(),
+            },
+            AlterViewAction::ResetOptions { options } => Mutation::ResetReloptions {
+                id: Self::resolve_relation_lookup_name(name, state),
+                kind: ReloptionTarget::View,
+                names: options.iter().map(|option| option.name.clone()).collect(),
+            },
         }
     }
 
@@ -72,15 +176,51 @@ impl Resolver {
 
     pub(super) fn resolve_alter_materialized_view(
         name: &QualifiedName,
-        new_name: Option<&Ident>,
+        action: &AlterMaterializedViewActionFact,
         state: &AnalysisState,
-    ) -> Option<Mutation> {
-        new_name.map(|new_name| {
-            let id = Self::resolve_relation_lookup_name(name, state);
-            let mut new_id = ObjectId::new(id.schema.clone(), new_name.resolve());
-            new_id.inferred_schema = id.inferred_schema;
-            Mutation::Rename(Rename { old_id: id, new_id })
-        })
+    ) -> Mutation {
+        match action {
+            AlterMaterializedViewActionFact::RenameTo { new_name } => {
+                let id = Self::resolve_relation_lookup_name(name, state);
+                let mut new_id = ObjectId::new(id.schema.clone(), new_name.resolve());
+                new_id.inferred_schema = id.inferred_schema;
+                Mutation::Rename(Rename { old_id: id, new_id })
+            }
+            AlterMaterializedViewActionFact::SetSchema { new_schema } => {
+                let id = Self::resolve_relation_lookup_name(name, state);
+                let new_id = ObjectId::new(new_schema, &id.name);
+                Mutation::Rename(Rename { old_id: id, new_id })
+            }
+            AlterMaterializedViewActionFact::OwnerTo { new_owner } => {
+                Mutation::ChangeRelationOwner {
+                    id: Self::resolve_relation_lookup_name(name, state),
+                    new_owner: new_owner.clone(),
+                }
+            }
+            AlterMaterializedViewActionFact::RenameColumn { .. }
+            | AlterMaterializedViewActionFact::SetTablespace { .. }
+            | AlterMaterializedViewActionFact::SetAccessMethod { .. }
+            | AlterMaterializedViewActionFact::ClusterOn { .. }
+            | AlterMaterializedViewActionFact::SetWithoutCluster
+            | AlterMaterializedViewActionFact::SetStorage { .. }
+            | AlterMaterializedViewActionFact::SetCompression { .. }
+            | AlterMaterializedViewActionFact::DependsOnExtension { .. }
+            | AlterMaterializedViewActionFact::NoDependsOnExtension { .. } => {
+                Mutation::Opaque(OpaqueMutation::UnsupportedStatement)
+            }
+            AlterMaterializedViewActionFact::SetOptions { options } => Mutation::SetReloptions {
+                id: Self::resolve_relation_lookup_name(name, state),
+                kind: ReloptionTarget::MaterializedView,
+                attributes: options.clone(),
+            },
+            AlterMaterializedViewActionFact::ResetOptions { options } => {
+                Mutation::ResetReloptions {
+                    id: Self::resolve_relation_lookup_name(name, state),
+                    kind: ReloptionTarget::MaterializedView,
+                    names: options.iter().map(|option| option.name.clone()).collect(),
+                }
+            }
+        }
     }
 
     pub(super) fn resolve_refresh_materialized_view(
@@ -213,22 +353,64 @@ impl Resolver {
 
     pub(super) fn resolve_alter_index(
         name: &QualifiedName,
+        if_exists: bool,
         actions: &[AlterIndexActionFact],
         state: &AnalysisState,
-    ) -> Vec<Mutation> {
-        let id = Self::resolve_relation_lookup_name(name, state);
-        actions
+    ) -> Mutation {
+        let index_id = Self::resolve_relation_lookup_name(name, state);
+        let resolved_actions = actions
             .iter()
             .map(|action| match action {
                 AlterIndexActionFact::RenameTo { new_name } => {
-                    let mut new_id = ObjectId::new(id.schema.clone(), new_name.resolve());
-                    new_id.inferred_schema = id.inferred_schema;
-                    Mutation::Rename(Rename {
-                        old_id: id.clone(),
-                        new_id,
-                    })
+                    let mut new_id = ObjectId::new(index_id.schema.clone(), new_name.resolve());
+                    new_id.inferred_schema = index_id.inferred_schema;
+                    AlterIndexActionMutation::RenameTo { new_id }
+                }
+                AlterIndexActionFact::SetTablespace { new_tablespace } => {
+                    AlterIndexActionMutation::SetTablespace {
+                        tablespace_name: new_tablespace.resolve(),
+                    }
+                }
+                AlterIndexActionFact::AttachPartition { partition_name } => {
+                    let partition_id = Self::resolve_relation_lookup_name(partition_name, state);
+                    AlterIndexActionMutation::AttachPartition { partition_id }
+                }
+                AlterIndexActionFact::DependsOnExtension { extension_name } => {
+                    AlterIndexActionMutation::DependsOnExtension {
+                        extension_name: extension_name.resolve(),
+                    }
+                }
+                AlterIndexActionFact::NoDependsOnExtension { extension_name } => {
+                    AlterIndexActionMutation::NoDependsOnExtension {
+                        extension_name: extension_name.resolve(),
+                    }
+                }
+                AlterIndexActionFact::SetStatistics { column, target } => {
+                    AlterIndexActionMutation::SetStatistics {
+                        column: column.clone(),
+                        target: match target {
+                            StatisticsTarget::Default => StatisticsTarget::Default,
+                            StatisticsTarget::Value(n) => StatisticsTarget::Value(*n),
+                        },
+                    }
+                }
+                AlterIndexActionFact::SetOptions { options } => {
+                    AlterIndexActionMutation::SetOptions {
+                        options: options.clone(),
+                    }
+                }
+                AlterIndexActionFact::ResetOptions { options } => {
+                    AlterIndexActionMutation::ResetOptions {
+                        options: options.clone(),
+                    }
                 }
             })
-            .collect()
+            .collect();
+
+        Mutation::AlterIndex(AlterIndexMutation {
+            index_id,
+            if_exists,
+            actions: resolved_actions,
+        })
     }
 }

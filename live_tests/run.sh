@@ -13,6 +13,24 @@ fi
 
 CACHE_FILE="${SCRIPT_DIR}/.safe-migrate.cache"
 
+# Print the comma-separated rule_ids in a report, or fail. This must never
+# degrade to an empty list on unreadable input: the caller treats "no rules" as
+# a pass for a safe_* fixture, so a swallowed parse error marks a
+# dangerous-migration check green.
+extract_rules() {
+    python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+if not isinstance(data.get('violations'), list):
+    raise SystemExit('report has no violations list')
+for violation in data['violations']:
+    rule_id = violation.get('rule_id')
+    if not isinstance(rule_id, str) or not rule_id:
+        raise SystemExit('violation without a string rule_id')
+print(','.join(v['rule_id'] for v in data['violations']))
+"
+}
+
 VERBOSE=0
 OFFLINE=0
 TARGET_DIR=""
@@ -127,25 +145,21 @@ for dir in "${dirs[@]}"; do
             dir_fail=$((dir_fail + 1))
             failures="$failures  [CRASH] $rule_dir\n"
         else
-            violation_rules=$(echo "$json" | python3 -c "
-import sys, json
-try:
-    data = json.load(sys.stdin)
-    rules = [v.get('rule_id','') for v in data.get('violations',[])]
-    print(','.join(rules))
-except:
-    print('')
-" 2>/dev/null || echo "")
-
-            has_expected=$(echo "$violation_rules" | tr ',' '\n' | grep -x -c "$rule_id" || true)
-
-            if [ "$has_expected" -gt 0 ]; then
-                [ "$VERBOSE" -eq 1 ] && echo "  [PASS] $rule_dir"
-                dir_pass=$((dir_pass + 1))
-            else
-                [ "$VERBOSE" -eq 1 ] && echo "  [FAIL] $rule_dir (no '$rule_id', got: $violation_rules)"
+            if ! violation_rules=$(printf '%s' "$json" | extract_rules); then
+                [ "$VERBOSE" -eq 1 ] && echo "  [UNREADABLE] $rule_dir"
                 dir_fail=$((dir_fail + 1))
-                failures="$failures  [FAIL]  $rule_dir (missed expected $rule_id)\n"
+                failures="$failures  [UNREADABLE]  $rule_dir\n"
+            else
+                has_expected=$(echo "$violation_rules" | tr ',' '\n' | grep -x -c "$rule_id" || true)
+
+                if [ "$has_expected" -gt 0 ]; then
+                    [ "$VERBOSE" -eq 1 ] && echo "  [PASS] $rule_dir"
+                    dir_pass=$((dir_pass + 1))
+                else
+                    [ "$VERBOSE" -eq 1 ] && echo "  [FAIL] $rule_dir (no '$rule_id', got: $violation_rules)"
+                    dir_fail=$((dir_fail + 1))
+                    failures="$failures  [FAIL]  $rule_dir (missed expected $rule_id)\n"
+                fi
             fi
         fi
     else
@@ -171,15 +185,15 @@ except:
                 continue
             fi
 
-            violation_rules=$(echo "$json" | python3 -c "
-import sys, json
-try:
-    data = json.load(sys.stdin)
-    rules = [v.get('rule_id','') for v in data.get('violations',[])]
-    print(','.join(rules))
-except:
-    print('')
-" 2>/dev/null || echo "")
+            if ! violation_rules=$(printf '%s' "$json" | extract_rules); then
+                # A safe_* fixture expects zero findings. An unreadable report
+                # used to yield an empty rule list and score as a pass, so a
+                # crash or a report schema change turned this check green.
+                [ "$VERBOSE" -eq 1 ] && echo "  [UNREADABLE] $rule_dir/$fname"
+                dir_fail=$((dir_fail + 1))
+                failures="$failures  [UNREADABLE]  $rule_dir/$fname\n"
+                continue
+            fi
 
             has_expected=$(echo "$violation_rules" | tr ',' '\n' | grep -x -c "$rule_id" || true)
 

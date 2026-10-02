@@ -29,6 +29,35 @@ pub(crate) enum ReplicaIdentityMutation {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ReindexTargetMutation {
+    Database(String),
+    Schema(String),
+    System(Option<String>),
+    Table(ObjectId),
+    Index(ObjectId),
+}
+
+/// Which relation kind a reloption statement targets, so the state machine can
+/// validate the name against the accepted surface for that kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReloptionTarget {
+    View,
+    MaterializedView,
+}
+
+impl ReindexTargetMutation {
+    /// Human-readable name of the reindex target, suitable for violation messages.
+    pub(crate) fn object_name(&self) -> String {
+        match self {
+            Self::Database(n) | Self::Schema(n) => n.clone(),
+            Self::System(Some(n)) => n.clone(),
+            Self::System(None) => "current database".to_string(),
+            Self::Table(id) | Self::Index(id) => format!("{}.{}", id.schema, id.name),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Mutation {
     CreateSchema(CreateSchemaMutation),
     AlterSchema(AlterSchemaMutation),
@@ -58,6 +87,8 @@ pub(crate) enum Mutation {
     DropTable(DropTable),
     DropView(DropViewMutation),
     DropMaterializedView(DropMaterializedViewMutation),
+    AlterIndex(AlterIndexMutation),
+    AlterIndexAllInTablespace(AlterIndexAllInTablespaceMutation),
     DropIndex(DropIndex),
     LockTable(LockTableMutation),
     Truncate(TruncateMutation),
@@ -65,12 +96,39 @@ pub(crate) enum Mutation {
         id: ObjectId,
         new_owner: crate::_internal::analysis::facts::RoleFact,
     },
+    /// Reloptions on a view or materialized view, which stores them in the
+    /// same map as table reloptions.
+    SetReloptions {
+        id: ObjectId,
+        kind: ReloptionTarget,
+        attributes: Vec<crate::_internal::analysis::facts::AttributeFact>,
+    },
+    ResetReloptions {
+        id: ObjectId,
+        kind: ReloptionTarget,
+        names: Vec<String>,
+    },
+    /// Recognized, and provably irrelevant to the state the analyzer models.
+    /// This is the only way a statement may change nothing, so silence has to
+    /// be written down rather than implied by an absent mutation.
+    NoStateChange {
+        reason: &'static str,
+    },
+    SetColumnDefault {
+        id: ObjectId,
+        column: String,
+        default: Option<crate::_internal::analysis::expr_ir::ExprIr>,
+    },
     SearchPath(SearchPathChange),
     TimeoutSetting(TimeoutSettingChange),
     ResetSettings(ResetSettingTarget),
     /// Statement-scoped no-op evaluated after real mutations so timeout
     /// rules do not report on statements PostgreSQL would not execute.
-    CheckTimeouts,
+    /// Synthetic check raised for a statement that may block. `subject` is
+    /// the object the statement acts on, absent when it has no single one.
+    CheckTimeouts {
+        subject: Option<(crate::_internal::report::violations::ObjectKind, String)>,
+    },
     BeginTransaction,
     CommitTransaction,
     CommitAndChain,
@@ -111,6 +169,10 @@ pub(crate) enum Mutation {
         is_session_auth: bool,
     },
     Opaque(OpaqueMutation),
+    Reindex {
+        target: Option<ReindexTargetMutation>,
+        concurrently: bool,
+    },
     Vacuum {
         table_id: Option<ObjectId>,
         is_full: bool,
@@ -386,6 +448,19 @@ pub(crate) struct CreateView {
     pub id: ObjectId,
     pub or_replace: bool,
     pub depends_on: Vec<ObjectId>,
+    /// Projected columns, empty when the projection could not be derived.
+    pub columns: Vec<ViewColumn>,
+    pub projection_complete: bool,
+}
+
+/// A view's output column. The type is only known when the projection is a
+/// plain reference to a known column.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ViewColumn {
+    pub name: String,
+    /// Catalog type name, normalised the way `format_type` reports it.
+    pub data_type: Option<String>,
+    pub type_modifier: Option<i32>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -636,20 +711,11 @@ pub(crate) enum OpaqueMutation {
     UnsupportedStatement,
     DoBlock,
     Execute,
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "reserved for dynamic SQL extracted from procedural bodies"
-        )
-    )]
-    DynamicSql,
     PrepareTransaction,
     SetTransaction,
     SetConstraints,
-    #[expect(dead_code, reason = "reserved for opaque resolver collisions")]
-    StateCollision(String),
-    #[expect(dead_code, reason = "reserved for unresolved typed references")]
+    /// A statement named a catalog object that the baseline does not contain.
+    /// `schema-drift` reports which object was missing.
     UnresolvedReference {
         object_kind: crate::_internal::report::violations::ObjectKind,
         object_name: String,
@@ -832,5 +898,48 @@ pub(crate) enum AlterTableActionMutation {
     },
     OwnerTo {
         new_owner: crate::_internal::analysis::facts::RoleFact,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct AlterIndexMutation {
+    pub index_id: ObjectId,
+    pub if_exists: bool,
+    pub actions: Vec<AlterIndexActionMutation>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct AlterIndexAllInTablespaceMutation {
+    pub source_tablespace: String,
+    pub target_tablespace: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum AlterIndexActionMutation {
+    RenameTo {
+        new_id: ObjectId,
+    },
+    SetTablespace {
+        tablespace_name: String,
+    },
+    AttachPartition {
+        partition_id: ObjectId,
+    },
+    DependsOnExtension {
+        extension_name: String,
+    },
+    NoDependsOnExtension {
+        extension_name: String,
+    },
+    SetStatistics {
+        /// The index column targeted, by name or 1-based number.
+        column: crate::_internal::analysis::facts::IndexStatisticsColumn,
+        target: crate::_internal::analysis::facts::StatisticsTarget,
+    },
+    SetOptions {
+        options: Vec<crate::_internal::analysis::facts::AttributeFact>,
+    },
+    ResetOptions {
+        options: Vec<crate::_internal::analysis::facts::AttributeFact>,
     },
 }

@@ -1,30 +1,46 @@
+# Build output
 /target
-.safe-migrate-stats.json
-.aider*
+
+# Local scratch workspace: audit reports, investigation notes, repro SQL.
+# Tracked here rather than left to per-clone local excludes so every
+# contributor gets the same behaviour without configuring anything.
+# See temp/README.md for what belongs here.
+/temp/
+
+# Structural-tooling caches
+/.ast-bro/
+
+# Agent and editor configuration that is intentionally not part of the project
+/AGENTS.md
+/.aider*
+/.clinerules
+/.cline*
+/.vscode/
+/.idea/
+# Unanchored so a nested credential file cannot be committed by accident.
 .env
-.vscode/
-.idea/
-*.swp
-*.swo
-.DS_Store
-*.sql
+*.env
+
+# Generated database caches, statistics and scratch databases
+/.safe-migrate.cache
+/.safe-migrate-stats.json
+/live_test/
+/test_migrations/
 *.db
 *.sqlite
 *.sqlite3
-*cache.json
+
+# Local planning documents
+/ROADMAP.md
+
+# Artefacts left behind by crash and lock investigation
+/heap.c.*
+/pg_*.h.*
+/log.txt
 *.log
-*.clinerules
-.cline*
-roadmap.md
-graph.json
-AGENTS.md
-.git/
-*.json
-!tests/golden/*.json
-!live_tests/differential_baseline.sql
-!live_tests/differential_manifest.json
-!live_tests/**/*.sql
-test_migrations/
-*.opencode/
-.safe-migrate.cache
-live_test/
+
+# Editor and OS noise
+*.swp
+*.swo
+*~
+.DS_Store

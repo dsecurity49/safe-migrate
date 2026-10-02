@@ -1,6 +1,6 @@
 mod rule_evaluation_tests {
     use crate::common::*;
-    use safe_migrate::_internal::analysis::state::{AnalysisState, Confidence};
+    use safe_migrate::_internal::analysis::state::{AnalysisState, Confidence, RelationOverlay};
     use safe_migrate::_internal::ast::identifiers::ObjectId;
     use safe_migrate::_internal::engine::engine::SafeMigrateEngine;
     use safe_migrate::_internal::model::column::Column;
@@ -53,7 +53,7 @@ mod rule_evaluation_tests {
     fn test_rule_size_aware_toast_escalation() {
         let engine = setup_engine();
 
-        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut cache = crate::common::synced_cache();
 
         let tid = object_id("public", "t_toast");
 
@@ -106,7 +106,7 @@ mod rule_evaluation_tests {
     fn test_rule_blocking_constraint_check_and_not_valid_fast_path() {
         let engine = setup_engine();
 
-        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut cache = crate::common::synced_cache();
 
         cache.insert_baseline(
             object_id("public", "t"),
@@ -152,7 +152,7 @@ mod rule_evaluation_tests {
     fn test_rule_blocking_constraint_pk_and_unique() {
         let engine = setup_engine();
 
-        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut cache = crate::common::synced_cache();
 
         cache.insert_baseline(
             object_id("public", "t"),
@@ -213,7 +213,7 @@ mod rule_evaluation_tests {
     fn test_rule_mat_view_refresh() {
         let engine = setup_engine();
 
-        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut cache = crate::common::synced_cache();
 
         cache.insert_baseline(
             object_id("public", "mv"),
@@ -250,7 +250,7 @@ mod rule_evaluation_tests {
     fn test_rule_partition_attach_detach() {
         let engine = setup_engine();
 
-        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut cache = crate::common::synced_cache();
 
         cache.insert_baseline(
             object_id("public", "p"),
@@ -336,9 +336,9 @@ mod rule_evaluation_tests {
     }
 
     #[test]
-    fn test_tainted_confidence_downgrades_tier1_to_tier2() {
+    fn test_earlier_taint_lowers_certainty_but_not_severity() {
         let engine = setup_engine();
-        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut cache = crate::common::synced_cache();
         let tid = object_id("public", "t");
         cache.insert_baseline(
             tid.clone(),
@@ -367,17 +367,19 @@ mod rule_evaluation_tests {
             .filter(|v| v.rule_id == "destructive-cascade" || v.rule_id == "irreversible-migration")
             .collect();
 
+        // An unmodeled statement makes later state unknowable, not the
+        // operation less destructive.
         assert!(
-            db_violations.iter().all(|v| v.tier == ViolationTier::Tier2),
-            "DROP DATABASE after taint should be Tier2: {:?}",
+            db_violations.iter().all(|v| v.tier == ViolationTier::Tier1),
+            "DROP DATABASE severity must survive earlier taint: {:?}",
             db_violations
         );
 
         assert!(
             drop_table_violations
                 .iter()
-                .all(|v| v.tier == ViolationTier::Tier2),
-            "DROP TABLE CASCADE after taint should be Tier2: {:?}",
+                .all(|v| v.tier == ViolationTier::Tier1),
+            "DROP TABLE CASCADE severity must survive earlier taint: {:?}",
             drop_table_violations
         );
     }
@@ -385,7 +387,7 @@ mod rule_evaluation_tests {
     #[test]
     fn missing_relation_statistics_taint_only_statistics_based_findings() {
         let engine = setup_engine();
-        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut cache = crate::common::synced_cache();
         let table_id = object_id("public", "stats_unknown");
         let mut relation = RelationState::new(
             table_id.clone(),
@@ -433,9 +435,11 @@ mod rule_evaluation_tests {
     }
 
     #[test]
-    fn test_confidence_taint_does_not_affect_prior_violations() {
+    fn test_earlier_taint_lowers_certainty_of_later_findings_only() {
+        use safe_migrate::_internal::analysis::state::Confidence;
+
         let engine = setup_engine();
-        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut cache = crate::common::synced_cache();
         let tid = object_id("public", "t");
         cache.insert_baseline(
             tid.clone(),
@@ -451,40 +455,56 @@ mod rule_evaluation_tests {
         );
         let mut state = AnalysisState::new(cache);
 
-        let v = engine
-            .analyze(
-                "DROP DATABASE mydb; DO $$ BEGIN END $$; DROP TABLE t CASCADE;",
+        let findings = engine
+            .analyze_chain_with_locations(
+                &[(
+                    "001.sql".to_string(),
+                    "DROP DATABASE mydb; DO $$ BEGIN END $$; DROP TABLE t CASCADE;".to_string(),
+                )],
                 &mut state,
             )
             .unwrap();
 
-        let db_violations: Vec<_> = v.iter().filter(|v| v.rule_id == "drop-database").collect();
-        let drop_table_violations: Vec<_> = v
+        let db: Vec<_> = findings
             .iter()
-            .filter(|v| v.rule_id == "destructive-cascade" || v.rule_id == "irreversible-migration")
+            .filter(|f| f.violation.rule_id == "drop-database")
+            .collect();
+        let drop: Vec<_> = findings
+            .iter()
+            .filter(|f| {
+                matches!(
+                    f.violation.rule_id,
+                    "destructive-cascade" | "irreversible-migration"
+                )
+            })
             .collect();
 
-        // DROP DATABASE should remain Tier1 (it appeared before the taint)
+        // Severity ignores position in the file; certainty does not.
         assert!(
-            db_violations.iter().any(|v| v.tier == ViolationTier::Tier1),
-            "DROP DATABASE should stay Tier1 (violation before taint): {:?}",
-            db_violations
+            db.iter().all(|f| f.violation.tier == ViolationTier::Tier1),
+            "DROP DATABASE is destructive regardless of what follows: {db:?}"
+        );
+        assert!(
+            drop.iter()
+                .all(|f| f.violation.tier == ViolationTier::Tier1),
+            "DROP TABLE CASCADE is destructive regardless of what precedes: {drop:?}"
         );
 
-        // DROP TABLE CASCADE should be Tier2 (confidence was tainted when evaluated)
+        // The DO block can only invalidate state observed after it.
         assert!(
-            drop_table_violations
-                .iter()
-                .any(|v| v.tier == ViolationTier::Tier2),
-            "DROP TABLE CASCADE should be Tier2 (violation after taint): {:?}",
-            drop_table_violations
+            db.iter().all(|f| f.certainty == Confidence::Exact),
+            "a finding produced before the unmodeled statement is still exact: {db:?}"
+        );
+        assert!(
+            drop.iter().all(|f| f.certainty == Confidence::Tainted),
+            "a finding produced after the unmodeled statement is uncertain: {drop:?}"
         );
     }
 
     #[test]
     fn test_exact_confidence_keeps_tier1() {
         let engine = setup_engine();
-        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut cache = crate::common::synced_cache();
         let tid = object_id("public", "t");
         cache.insert_baseline(
             tid.clone(),
@@ -582,7 +602,7 @@ mod rule_evaluation_tests {
     fn grant_all_owner_exemption_requires_every_grantee_to_own_every_table() {
         let engine = setup_engine();
         let table_id = object_id("public", "owned_table");
-        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut cache = crate::common::synced_cache();
         cache.insert_baseline(
             table_id.clone(),
             RelationState::new(
@@ -648,7 +668,7 @@ mod rule_evaluation_tests {
     #[test]
     fn test_rule_volatile_default_alter() {
         let engine = setup_engine();
-        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut cache = crate::common::synced_cache();
         let tid = object_id("public", "t");
         let rel = RelationState::new(
             tid.clone(),
@@ -850,6 +870,7 @@ mod rule_evaluation_tests {
                 volatility: Volatility::Volatile,
                 language: "plpgsql".into(),
                 security: SecurityMode::Invoker,
+                internal_type_owner: None,
             }),
         );
 
@@ -971,7 +992,7 @@ mod rule_evaluation_tests {
         );
         let engine = SafeMigrateEngine::new(config);
 
-        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut cache = crate::common::synced_cache();
         cache.insert_baseline(
             object_id("public", "t"),
             safe_migrate::_internal::model::relation::RelationState::new(
@@ -1004,7 +1025,7 @@ mod rule_evaluation_tests {
     fn test_rule_concurrent_drop_index_small() {
         let engine = setup_engine();
 
-        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut cache = crate::common::synced_cache();
         cache.insert_baseline(
             object_id("public", "t"),
             safe_migrate::_internal::model::relation::RelationState::new(
@@ -1036,7 +1057,7 @@ mod rule_evaluation_tests {
     #[test]
     fn scoped_cache_reports_unknown_schema_as_coverage_not_drift() {
         let engine = setup_engine();
-        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut cache = crate::common::synced_cache();
         cache.metadata.schemas = Some(vec!["app".to_string()]);
         let mut state = AnalysisState::new(cache);
 
@@ -1108,11 +1129,12 @@ mod rule_evaluation_tests {
         let routine_id = object_id("public", "work(integer)");
 
         for routine_kind in [RoutineKind::Function, RoutineKind::Procedure] {
-            let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+            let mut cache = crate::common::synced_cache();
             cache.functions.insert(
                 routine_id.clone(),
                 FunctionState {
                     id: routine_id.clone(),
+                    internal_type_owner: None,
                     routine_kind,
                     arg_types: vec!["integer".into()],
                     arg_type_ids: Vec::new(),
@@ -1138,5 +1160,520 @@ mod rule_evaluation_tests {
                 usize::from(routine_kind == RoutineKind::Function)
             );
         }
+    }
+
+    #[test]
+    fn function_identity_ignores_typmods() {
+        // PostgreSQL treats foo(varchar) and foo(varchar(10)) as one function,
+        // so the second declaration must conflict.
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let sql = "
+            CREATE FUNCTION f(a character varying) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;
+            CREATE FUNCTION f(a character varying(10)) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;
+        ";
+        let v = engine.analyze(sql, &mut state).unwrap();
+        assert!(
+            v.iter().any(|v| v.rule_id == "chain-conflict"),
+            "duplicate function differing only by typmod must conflict: {v:?}"
+        );
+    }
+
+    #[test]
+    fn distinct_function_signatures_do_not_conflict() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let sql = "
+            CREATE FUNCTION f(a character varying) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;
+            CREATE FUNCTION f(a integer) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;
+        ";
+        let v = engine.analyze(sql, &mut state).unwrap();
+        assert!(
+            !v.iter().any(|v| v.rule_id == "chain-conflict"),
+            "differing argument types are distinct overloads: {v:?}"
+        );
+    }
+
+    #[test]
+    fn numeric_scale_outside_zero_to_precision_is_version_dependent() {
+        fn column_type(
+            state: &safe_migrate::_internal::analysis::state::AnalysisState,
+            name: &str,
+        ) -> Option<String> {
+            state
+                .local
+                .relations
+                .get(&object_id("public", "t"))
+                .and_then(|overlay| match overlay {
+                    safe_migrate::_internal::analysis::state::RelationOverlay::Present(rel) => rel
+                        .columns
+                        .iter()
+                        .find(|c| c.name == name)
+                        .and_then(|c| c.data_type.clone()),
+                    _ => None,
+                })
+        }
+
+        let engine = setup_engine();
+        let sql = "CREATE TABLE t (v numeric(10, -2));";
+
+        // PostgreSQL 14 rejects a negative scale outright.
+        let mut pg14 = setup_state();
+        pg14.baseline_available = true;
+        pg14.pg_version_num = Some(140_000);
+        engine.analyze(sql, &mut pg14).unwrap();
+        assert!(
+            !pg14.relation_is_present(&object_id("public", "t")),
+            "PG14 must not accept a negative numeric scale"
+        );
+
+        // PostgreSQL 15 widened the range, so the same declaration is valid.
+        let mut pg15 = setup_state();
+        pg15.baseline_available = true;
+        pg15.pg_version_num = Some(150_000);
+        engine.analyze(sql, &mut pg15).unwrap();
+        assert!(
+            pg15.relation_is_present(&object_id("public", "t")),
+            "PG15 accepts a negative numeric scale"
+        );
+
+        // ALTER COLUMN TYPE is checked on the same rule.
+        let alter = "ALTER TABLE t ALTER COLUMN v TYPE numeric(3, 5);";
+        engine
+            .analyze("CREATE TABLE t (v numeric);", &mut pg14)
+            .unwrap();
+        let before = column_type(&pg14, "v");
+        engine.analyze(alter, &mut pg14).unwrap();
+        assert_eq!(
+            before,
+            column_type(&pg14, "v"),
+            "a PG14-rejected type change must not apply"
+        );
+    }
+
+    #[test]
+    fn widened_numeric_scale_without_a_baseline_taints_rather_than_conflicting() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let v = engine
+            .analyze("CREATE TABLE t (v numeric(10, -2));", &mut state)
+            .unwrap();
+
+        // Without a version we cannot call it an error, so it must not be
+        // reported as a conflict.
+        assert!(
+            !v.iter().any(|v| v.rule_id == "chain-conflict"),
+            "an unjudgeable version must not be reported as a conflict: {v:?}"
+        );
+        assert_eq!(
+            state.local.confidence,
+            safe_migrate::_internal::analysis::state::Confidence::Tainted
+        );
+    }
+
+    #[test]
+    fn ordinary_numeric_scale_never_taints() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TABLE t (a numeric(10, 2), b numeric(4));",
+                &mut state,
+            )
+            .unwrap();
+        assert_eq!(
+            state.local.confidence,
+            safe_migrate::_internal::analysis::state::Confidence::Exact
+        );
+    }
+
+    #[test]
+    fn empty_search_path_cannot_place_an_unqualified_name() {
+        let engine = setup_engine();
+        let mut cache = crate::common::synced_cache();
+        cache.pg_version_num = Some(150_000);
+        let mut state = AnalysisState::new(cache);
+        state.baseline_available = true;
+
+        // A path naming only a schema the baseline proves absent resolves to
+        // nothing, so PostgreSQL has no creation target.
+        engine
+            .analyze(
+                "SET search_path TO no_such_schema; CREATE TABLE t (id int);",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !state.relation_is_present(&object_id("public", "t")),
+            "an unplaceable name must not be assumed to land in public"
+        );
+
+        let v = engine
+            .analyze(
+                "SET search_path TO no_such_schema; CREATE TABLE t2 (id int);",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            v.iter()
+                .any(|v| v.reason.contains("no schema has been selected")),
+            "expected the PostgreSQL wording: {v:?}"
+        );
+    }
+
+    #[test]
+    fn qualified_name_ignores_the_search_path() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "SET search_path TO no_such_schema; CREATE TABLE public.t (id int);",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            state.relation_is_present(&object_id("public", "t")),
+            "a qualified name is unaffected by the path"
+        );
+    }
+
+    #[test]
+    fn reindex_of_an_exclusion_backing_index_is_not_flagged() {
+        // PostgreSQL raises an error if an exclusion-constraint index is named
+        // directly in a concurrent REINDEX, so the synchronous form is required.
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let sql = "
+            CREATE TABLE bookings (
+                room int, during tsrange,
+                CONSTRAINT bookings_no_overlap EXCLUDE USING gist (room WITH =, during WITH &&));
+            REINDEX INDEX bookings_no_overlap;
+        ";
+        let v = engine.analyze(sql, &mut state).unwrap();
+        assert!(
+            !v.iter().any(|v| v.rule_id == "require-concurrent-reindex"
+                && v.object_name.contains("bookings_no_overlap")),
+            "an exclusion backing index must not demand CONCURRENTLY: {v:?}"
+        );
+        assert!(
+            !v.iter().any(|v| v.rule_id == "chain-conflict"),
+            "the backing index must exist in the simulated state: {v:?}"
+        );
+    }
+
+    #[test]
+    fn exclude_constraint_recipe_does_not_recommend_using_index() {
+        let engine = setup_engine();
+        let cache = cache_with_table("public", "bookings", Some(500_000));
+        let mut state = AnalysisState::new(cache);
+        let v = engine
+            .analyze(
+                "ALTER TABLE bookings ADD EXCLUDE USING gist (room WITH =, during WITH &&);",
+                &mut state,
+            )
+            .unwrap();
+        let finding = v
+            .iter()
+            .find(|v| v.rule_id == "blocking-index-constraint")
+            .expect("adding an exclusion constraint should be reported");
+        // PostgreSQL rejects EXCLUDE ... USING INDEX outright.
+        assert!(
+            !finding.recipe.contains("add the constraint USING INDEX"),
+            "must not recommend a form PostgreSQL rejects: {}",
+            finding.recipe
+        );
+    }
+
+    #[test]
+    fn unique_constraint_recipe_still_recommends_using_index() {
+        let engine = setup_engine();
+        let cache = cache_with_table("public", "bookings", Some(500_000));
+        let mut state = AnalysisState::new(cache);
+        let v = engine
+            .analyze("ALTER TABLE bookings ADD UNIQUE (room);", &mut state)
+            .unwrap();
+        let finding = v
+            .iter()
+            .find(|v| v.rule_id == "blocking-index-constraint")
+            .expect("adding a unique constraint should be reported");
+        assert!(
+            finding.recipe.contains("USING INDEX"),
+            "USING INDEX is valid for UNIQUE: {}",
+            finding.recipe
+        );
+    }
+
+    #[test]
+    fn view_reloptions_are_modelled_rather_than_ignored() {
+        let engine = setup_engine();
+        let mut cache = crate::common::synced_cache();
+        cache.pg_version_num = Some(180_000);
+        let mut state = AnalysisState::new(cache);
+        state.baseline_available = true;
+
+        let v = engine
+            .analyze(
+                "CREATE TABLE base_v (id int);
+                 CREATE VIEW v AS SELECT id FROM base_v;
+                 ALTER VIEW v SET (security_barrier = true);",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !v.iter().any(|v| v.rule_id == "chain-conflict"),
+            "a recognised option must apply cleanly: {v:?}"
+        );
+        assert_eq!(
+            state.local.confidence,
+            safe_migrate::_internal::analysis::state::Confidence::Exact
+        );
+
+        let relation = state
+            .get_relation(&object_id("public", "v"))
+            .expect("view must exist");
+        assert!(
+            matches!(relation, RelationOverlay::Present(r)
+                if r.table_options.get("security_barrier") == Some(&"true".to_string())),
+            "the option must be stored: {relation:?}"
+        );
+    }
+
+    #[test]
+    fn view_reloption_rejected_by_version_is_a_conflict() {
+        let engine = setup_engine();
+        let mut cache = crate::common::synced_cache();
+        cache.pg_version_num = Some(140_000);
+        let mut state = AnalysisState::new(cache);
+        state.baseline_available = true;
+
+        // security_invoker arrived in PostgreSQL 15.
+        let v = engine
+            .analyze(
+                "CREATE TABLE base_v (id int);
+                 CREATE VIEW v AS SELECT id FROM base_v;
+                 ALTER VIEW v SET (security_invoker = true);",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            v.iter()
+                .any(|v| v.reason.contains("unrecognized parameter")),
+            "PG14 must reject security_invoker: {v:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_view_reloption_taints_without_claiming_an_error() {
+        let engine = setup_engine();
+        let mut cache = crate::common::synced_cache();
+        cache.pg_version_num = Some(180_000);
+        let mut state = AnalysisState::new(cache);
+        state.baseline_available = true;
+
+        let v = engine
+            .analyze(
+                "CREATE TABLE base_v (id int);
+                 CREATE VIEW v AS SELECT id FROM base_v;
+                 ALTER VIEW v SET (some_future_option = 1);",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !v.iter().any(|v| v.rule_id == "chain-conflict"),
+            "an unplaceable name must not be reported as an error: {v:?}"
+        );
+        assert_eq!(
+            state.local.confidence,
+            safe_migrate::_internal::analysis::state::Confidence::Tainted
+        );
+    }
+
+    #[test]
+    fn version_dependent_reloption_without_a_baseline_does_not_conflict() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let v = engine
+            .analyze(
+                "CREATE TABLE base_v (id int);
+                 CREATE VIEW v AS SELECT id FROM base_v;
+                 ALTER VIEW v SET (security_invoker = true);",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !v.iter()
+                .any(|v| v.reason.contains("unrecognized parameter")),
+            "an unknown version cannot justify rejecting a name: {v:?}"
+        );
+    }
+
+    #[test]
+    fn view_reloptions_are_version_specific() {
+        // security_definer is the pre-15 inverse of security_invoker.
+        assert_eq!(
+            crate::_internal::model::reloption::classify(
+                crate::_internal::model::reloption::view_reloption("security_definer"),
+                Some(140_000)
+            ),
+            crate::_internal::model::reloption::ReloptionOutcome::Accepted
+        );
+        assert_eq!(
+            crate::_internal::model::reloption::classify(
+                crate::_internal::model::reloption::view_reloption("security_definer"),
+                Some(180_000)
+            ),
+            crate::_internal::model::reloption::ReloptionOutcome::Rejected
+        );
+    }
+
+    #[test]
+    fn materialized_view_accepts_storage_reloptions_views_reject() {
+        use crate::_internal::model::reloption::{
+            ReloptionOutcome, classify, materialized_view_reloption, view_reloption,
+        };
+        assert_eq!(
+            classify(materialized_view_reloption("fillfactor"), Some(180_000)),
+            ReloptionOutcome::Accepted
+        );
+        assert_eq!(
+            classify(view_reloption("fillfactor"), Some(180_000)),
+            ReloptionOutcome::Unknown
+        );
+    }
+
+    #[test]
+    fn test_rule_require_concurrent_reindex() {
+        let sql = "
+            CREATE TABLE t1 (id int);
+            CREATE INDEX idx1 ON t1(id);
+            REINDEX TABLE t1; -- blocks, flagged
+            REINDEX INDEX idx1; -- blocks, flagged
+            REINDEX SCHEMA public; -- blocks, flagged
+            REINDEX DATABASE mydb; -- blocks, flagged
+            REINDEX (CONCURRENTLY) TABLE t1; -- safe
+            REINDEX TABLE CONCURRENTLY t1; -- safe
+            REINDEX SYSTEM mydb; -- system doesn't support concurrently, not flagged
+        ";
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let violations = engine.analyze(sql, &mut state).unwrap();
+
+        let reindex_table = violations
+            .iter()
+            .find(|v| v.rule_id == "require-concurrent-reindex" && v.object_name == "public.t1")
+            .expect("should flag synchronous table reindex");
+        assert_eq!(reindex_table.tier, ViolationTier::Tier1);
+
+        let reindex_index = violations
+            .iter()
+            .find(|v| v.rule_id == "require-concurrent-reindex" && v.object_name == "public.idx1")
+            .expect("should flag synchronous index reindex");
+        assert_eq!(reindex_index.tier, ViolationTier::Tier1);
+
+        let reindex_schema = violations
+            .iter()
+            .find(|v| v.rule_id == "require-concurrent-reindex" && v.object_name == "public")
+            .expect("should flag synchronous schema reindex");
+        assert_eq!(reindex_schema.tier, ViolationTier::Tier1);
+
+        let reindex_database = violations
+            .iter()
+            .find(|v| v.rule_id == "require-concurrent-reindex" && v.object_name == "mydb")
+            .expect("should flag synchronous database reindex");
+        assert_eq!(reindex_database.tier, ViolationTier::Tier1);
+
+        assert_eq!(
+            violations
+                .iter()
+                .filter(|v| v.rule_id == "require-concurrent-reindex")
+                .count(),
+            4,
+            "should not flag CONCURRENTLY or SYSTEM"
+        );
+    }
+
+    #[test]
+    fn reindex_of_temporary_table_is_not_flagged() {
+        // PostgreSQL rejects REINDEX ... CONCURRENTLY on a temporary relation, so
+        // the synchronous form is the only legal statement. Demanding CONCURRENTLY
+        // here would be a false positive with no correct alternative.
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let violations = engine
+            .analyze(
+                "CREATE TEMP TABLE scratch (id int); REINDEX TABLE scratch;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(
+            !violations
+                .iter()
+                .any(|v| v.rule_id == "require-concurrent-reindex"
+                    && v.object_name == "public.scratch"),
+            "temporary table reindex must not be flagged: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn alter_index_variants_are_modeled_not_opaque() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let sql = "
+            CREATE TABLE t_alter (id int);
+            CREATE INDEX idx_tablespace ON t_alter(id);
+            CREATE INDEX idx_options ON t_alter(id);
+            CREATE INDEX idx_depends ON t_alter(id);
+            CREATE TABLE part_parent (id int) PARTITION BY RANGE (id);
+            CREATE TABLE part_child (id int);
+            CREATE INDEX part_parent_idx ON part_parent(id);
+            CREATE INDEX part_child_idx ON part_child(id);
+            ALTER INDEX idx_tablespace SET TABLESPACE pg_default;
+            ALTER INDEX idx_options SET (fillfactor = 70);
+            ALTER INDEX idx_options RESET (fillfactor);
+            ALTER INDEX idx_depends DEPENDS ON EXTENSION my_ext;
+            ALTER INDEX idx_depends NO DEPENDS ON EXTENSION my_ext;
+            ALTER INDEX part_parent_idx ATTACH PARTITION part_child_idx;
+        ";
+        let violations = engine.analyze(sql, &mut state).unwrap();
+
+        assert!(
+            !violations.iter().any(|v| v.rule_id == "opaque-dynamic-sql"),
+            "ALTER INDEX actions must be modeled, not opaque: {violations:?}"
+        );
+        assert!(
+            !violations.iter().any(|v| v.rule_id == "schema-drift"),
+            "no schema-drift conflicts expected: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn alter_index_rename_updates_state() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TABLE t_rename_index (id int);
+                 CREATE INDEX idx_old ON t_rename_index(id);
+                 ALTER INDEX idx_old RENAME TO idx_new;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(state.index_is_present(&object_id("public", "idx_new")));
+        assert!(!state.index_is_present(&object_id("public", "idx_old")));
+    }
+
+    #[test]
+    fn alter_index_if_exists_missing_is_safe() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TABLE t_missing (id int);
+                 ALTER INDEX IF EXISTS idx_missing RENAME TO idx_also_missing;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(!state.index_is_present(&object_id("public", "idx_also_missing")));
     }
 }

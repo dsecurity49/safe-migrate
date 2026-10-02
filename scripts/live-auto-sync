@@ -18,6 +18,6 @@ if [ -z "${DATABASE_URL:-}" ]; then
     exit 2
 fi
 
-cargo test --locked --lib \
-    internal_tests::live_auto_sync::live_auto_sync_refreshes_lint_and_lint_chain \
-    -- --exact --ignored --nocapture
+. "$repository_root/scripts/lib/run-exact-test.sh"
+
+run_exact_test "scripts/live-auto-sync" internal_tests::live_auto_sync::live_auto_sync_refreshes_lint_and_lint_chain

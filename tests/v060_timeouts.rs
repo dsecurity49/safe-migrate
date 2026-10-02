@@ -7,7 +7,7 @@ use safe_migrate::_internal::report::violations::Violation;
 use safe_migrate::api::{Config, RuleConfig};
 
 fn cache_with_timeouts(lock_timeout_ms: u64, statement_timeout_ms: u64) -> DbCache {
-    let mut cache = DbCache::new();
+    let mut cache = crate::common::synced_cache();
     cache.metadata.source_lock_timeout_ms = lock_timeout_ms;
     cache.metadata.source_statement_timeout_ms = statement_timeout_ms;
     cache
@@ -64,7 +64,7 @@ fn synchronized_timeout_values_control_timeout_findings() {
 
 #[test]
 fn unavailable_baseline_reports_unknown_timeout_evidence() {
-    let mut state = AnalysisState::with_baseline(DbCache::new(), false);
+    let mut state = AnalysisState::with_baseline(crate::common::synced_cache(), false);
     let violations = analyze_slow_statement(&mut state);
     let timeout_findings = timeout_findings(&violations);
 

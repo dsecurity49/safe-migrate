@@ -3,16 +3,116 @@ use crate::_internal::analysis::evidence::{EvidenceCode, EvidenceScope};
 use crate::_internal::analysis::graph::{DependencyEdge, DependencyKind};
 use crate::_internal::analysis::mutations::{
     CreateIndex, CreateMaterializedView, CreateView, DropIndex, DropMaterializedViewMutation,
-    DropViewMutation, RefreshMaterializedViewMutation,
+    DropViewMutation, RefreshMaterializedViewMutation, ReloptionTarget,
 };
 use crate::_internal::ast::identifiers::ObjectId;
+use crate::_internal::model::column::Column;
 use crate::_internal::model::relation::{Persistence, RelationKind, RelationState};
+use crate::_internal::model::reloption::{
+    ReloptionOutcome, classify, materialized_view_reloption, view_reloption,
+};
 use std::collections::HashSet;
 
 type RelationLookup = ObjectLookup;
 type IndexLookup = ObjectLookup;
 
 impl AnalysisState {
+    /// Record or clear a view column default, which PostgreSQL applies to
+    /// `INSERT` through the view.
+    pub(super) fn apply_set_column_default(
+        &mut self,
+        id: &ObjectId,
+        column: &str,
+        default: Option<&crate::_internal::analysis::expr_ir::ExprIr>,
+    ) -> MutationResult {
+        if !matches!(
+            self.local.relations.get(id),
+            Some(RelationOverlay::Present(_))
+        ) {
+            return MutationResult::Skipped;
+        }
+        self.snapshot_relation(id);
+        let Some(RelationOverlay::Present(relation)) = self.local.relations.get_mut(id) else {
+            return MutationResult::Skipped;
+        };
+        let Some(entry) = relation.columns.iter_mut().find(|c| c.name == column) else {
+            return MutationResult::Conflict {
+                reason: format!("column '{column}' of view '{}' does not exist", id),
+            };
+        };
+        entry.default = default.cloned();
+        entry.default_expr_text = None;
+        MutationResult::Applied
+    }
+
+    /// Apply `SET (...)` on a view or materialized view. A name the analyzer
+    /// cannot place is stored but taints, since PostgreSQL's accepted surface
+    /// grows between releases and a false conflict would be worse.
+    pub(super) fn apply_set_reloptions(
+        &mut self,
+        id: &ObjectId,
+        kind: ReloptionTarget,
+        attributes: &[crate::_internal::analysis::facts::AttributeFact],
+    ) -> MutationResult {
+        let version = self.pg_version_num;
+        for attribute in attributes {
+            let verdict = match kind {
+                ReloptionTarget::View => view_reloption(&attribute.name),
+                ReloptionTarget::MaterializedView => materialized_view_reloption(&attribute.name),
+            };
+            match classify(verdict, version) {
+                ReloptionOutcome::Rejected => {
+                    return MutationResult::Conflict {
+                        reason: format!("unrecognized parameter \"{}\"", attribute.name),
+                    };
+                }
+                ReloptionOutcome::Unknown => {
+                    self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Statement);
+                }
+                ReloptionOutcome::Accepted => {}
+            }
+        }
+
+        if !matches!(
+            self.local.relations.get(id),
+            Some(RelationOverlay::Present(_))
+        ) {
+            return MutationResult::Skipped;
+        }
+        self.snapshot_relation(id);
+        if let Some(RelationOverlay::Present(relation)) = self.local.relations.get_mut(id) {
+            for attribute in attributes {
+                relation
+                    .table_options
+                    .insert(attribute.name.clone(), attribute.value.clone());
+            }
+        }
+        MutationResult::Applied
+    }
+
+    /// Apply `RESET (...)` on a view or materialized view. `RESET` of an option
+    /// PostgreSQL does not accept is not an error, unlike `SET`.
+    pub(super) fn apply_reset_reloptions(
+        &mut self,
+        id: &ObjectId,
+        _kind: ReloptionTarget,
+        names: &[String],
+    ) -> MutationResult {
+        if !matches!(
+            self.local.relations.get(id),
+            Some(RelationOverlay::Present(_))
+        ) {
+            return MutationResult::Skipped;
+        }
+        self.snapshot_relation(id);
+        if let Some(RelationOverlay::Present(relation)) = self.local.relations.get_mut(id) {
+            for name in names {
+                relation.table_options.remove(name);
+            }
+        }
+        MutationResult::Applied
+    }
+
     fn validate_view_dependencies(
         &mut self,
         dependent: &ObjectId,
@@ -250,6 +350,31 @@ impl AnalysisState {
         relation.generation = generation;
         relation.kind = RelationKind::View;
         relation.persistence = Persistence::Permanent;
+        if !create.projection_complete {
+            // A view whose output list could not be derived still exists, but
+            // its columns are unknown, so any column-level claim is unsound.
+            self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Statement);
+        } else if !create.or_replace || !existing_view {
+            relation.columns = create
+                .columns
+                .iter()
+                .map(|column| Column {
+                    name: column.name.clone(),
+                    data_type: column.data_type.clone(),
+                    type_id: None,
+                    is_nullable: true,
+                    default: None,
+                    avg_width: None,
+                    default_expr_text: None,
+                    type_modifier: column.type_modifier,
+                    storage: None,
+                    compression: None,
+                    statistics_target: None,
+                    options: Default::default(),
+                    generated: None,
+                })
+                .collect();
+        }
         self.local
             .relations
             .insert(create.id.clone(), RelationOverlay::Present(relation));
@@ -685,6 +810,23 @@ impl AnalysisState {
                 return MutationResult::Skipped;
             }
         }
+        // An attached partition index goes with its parent.
+        let attached_children = self
+            .local
+            .graph
+            .edges()
+            .iter()
+            .filter(|edge| {
+                matches!(edge.kind, DependencyKind::IndexPartitionOf)
+                    && targets.iter().any(|target| {
+                        self.local.graph.resolve_rename(target)
+                            == self.local.graph.resolve_rename(&edge.referenced)
+                    })
+            })
+            .map(|edge| edge.dependent.clone())
+            .collect::<Vec<_>>();
+        let mut removed = targets.clone();
+        removed.extend(attached_children.iter().cloned());
         let table_indexes = self
             .local
             .graph
@@ -692,7 +834,7 @@ impl AnalysisState {
             .iter()
             .filter(|edge| {
                 matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
-                    && targets.iter().any(|target| {
+                    && removed.iter().any(|target| {
                         self.local.graph.resolve_rename(target)
                             == self.local.graph.resolve_rename(&edge.dependent)
                     })
@@ -707,12 +849,17 @@ impl AnalysisState {
         }
         self.snapshot_graph_full();
         let resolution_graph = self.local.graph.clone();
-        self.local.graph.retain_edges(|edge| {
-            !(matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
-                && targets.iter().any(|target| {
-                    resolution_graph.resolve_rename(target)
-                        == resolution_graph.resolve_rename(&edge.dependent)
-                }))
+        let dropped = |id: &ObjectId| {
+            removed.iter().any(|target| {
+                resolution_graph.resolve_rename(target) == resolution_graph.resolve_rename(id)
+            })
+        };
+        self.local.graph.retain_edges(|edge| match edge.kind {
+            DependencyKind::IndexOnRelation { .. } => !dropped(&edge.dependent),
+            DependencyKind::IndexPartitionOf => {
+                !dropped(&edge.dependent) && !dropped(&edge.referenced)
+            }
+            _ => true,
         });
         MutationResult::Applied
     }

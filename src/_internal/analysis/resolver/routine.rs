@@ -35,9 +35,12 @@ impl Resolver {
         })
     }
 
-    pub(super) fn resolve_drop_function(fact: &DropFunctionFact) -> Mutation {
+    pub(super) fn resolve_drop_function(
+        fact: &DropFunctionFact,
+        state: &AnalysisState,
+    ) -> Mutation {
         Mutation::DropFunction(DropFunctionMutation {
-            signatures: Self::normalize_signatures(&fact.signatures),
+            signatures: Self::normalize_signatures(&fact.signatures, state),
             if_exists: fact.if_exists,
             cascade: fact.cascade,
         })
@@ -65,9 +68,12 @@ impl Resolver {
         })
     }
 
-    pub(super) fn resolve_drop_procedure(fact: &DropProcedureFact) -> Mutation {
+    pub(super) fn resolve_drop_procedure(
+        fact: &DropProcedureFact,
+        state: &AnalysisState,
+    ) -> Mutation {
         Mutation::DropProcedure(DropProcedureMutation {
-            signatures: Self::normalize_signatures(&fact.signatures),
+            signatures: Self::normalize_signatures(&fact.signatures, state),
             if_exists: fact.if_exists,
             cascade: fact.cascade,
         })
@@ -94,15 +100,21 @@ impl Resolver {
         })
     }
 
-    pub(super) fn resolve_drop_aggregate(fact: &DropAggregateFact) -> Mutation {
+    pub(super) fn resolve_drop_aggregate(
+        fact: &DropAggregateFact,
+        state: &AnalysisState,
+    ) -> Mutation {
         Mutation::DropAggregate(DropAggregateMutation {
-            signatures: Self::normalize_signatures(&fact.signatures),
+            signatures: Self::normalize_signatures(&fact.signatures, state),
             if_exists: fact.if_exists,
             cascade: fact.cascade,
         })
     }
 
-    fn normalize_signatures(signatures: &[FunctionSigFact]) -> Vec<FunctionSigFact> {
+    fn normalize_signatures(
+        signatures: &[FunctionSigFact],
+        state: &AnalysisState,
+    ) -> Vec<FunctionSigFact> {
         signatures
             .iter()
             .cloned()
@@ -110,7 +122,7 @@ impl Resolver {
                 signature.params = signature
                     .params
                     .into_iter()
-                    .map(|param| Self::normalize_function_arg_type(&param))
+                    .map(|param| Self::routine_arg_identity(&param, state))
                     .collect();
                 signature
             })

@@ -1,3 +1,6 @@
+use crate::_internal::analysis::evidence::{EvidenceRecord, EvidenceScope};
+use crate::_internal::analysis::state::Confidence;
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub(crate) enum OperationKind {
     DropColumn,
@@ -21,12 +24,14 @@ pub(crate) enum OperationKind {
     CreateIndex,
     CreateTable,
     CreateView,
+    CreateFunction,
     AlterFunction,
     AlterProcedure,
     RefreshMaterializedView,
     AttachPartition,
     DetachPartition,
     VacuumFull,
+    Reindex,
     LockTable,
     TruncateTable,
     Grant,
@@ -69,12 +74,14 @@ impl std::fmt::Display for OperationKind {
             OperationKind::CreateIndex => write!(f, "create_index"),
             OperationKind::CreateTable => write!(f, "create_table"),
             OperationKind::CreateView => write!(f, "create_view"),
+            OperationKind::CreateFunction => write!(f, "create_function"),
             OperationKind::AlterFunction => write!(f, "alter_function"),
             OperationKind::AlterProcedure => write!(f, "alter_procedure"),
             OperationKind::RefreshMaterializedView => write!(f, "refresh_materialized_view"),
             OperationKind::AttachPartition => write!(f, "attach_partition"),
             OperationKind::DetachPartition => write!(f, "detach_partition"),
             OperationKind::VacuumFull => write!(f, "vacuum_full"),
+            OperationKind::Reindex => write!(f, "reindex"),
             OperationKind::LockTable => write!(f, "lock_table"),
             OperationKind::TruncateTable => write!(f, "truncate_table"),
             OperationKind::Grant => write!(f, "grant"),
@@ -108,6 +115,7 @@ pub(crate) enum ObjectKind {
     Schema,
     Role,
     Publication,
+    Subscription,
     Database,
     Domain,
     Policy,
@@ -130,6 +138,7 @@ impl std::fmt::Display for ObjectKind {
             ObjectKind::Schema => write!(f, "schema"),
             ObjectKind::Role => write!(f, "role"),
             ObjectKind::Publication => write!(f, "publication"),
+            ObjectKind::Subscription => write!(f, "subscription"),
             ObjectKind::Database => write!(f, "database"),
             ObjectKind::Domain => write!(f, "domain"),
             ObjectKind::Policy => write!(f, "policy"),
@@ -186,4 +195,48 @@ pub(crate) struct ReportFinding {
     /// One-based statement position within the source file.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub statement_index: Option<usize>,
+    /// Certainty is independent of `violation.tier`: severity describes the
+    /// operation, certainty describes the evidence behind it.
+    pub certainty: Confidence,
+}
+
+/// Certainty of a finding produced at `statement_index` of `file_index`.
+///
+/// Chain evidence taints later statements, never earlier ones nor its own.
+/// Statement evidence taints only its own statement. Anything unplaceable on
+/// either side taints conservatively.
+pub(crate) fn certainty_for_statement(
+    evidence: &[EvidenceRecord],
+    file_order: &[String],
+    file_index: usize,
+    statement_index: Option<usize>,
+) -> Confidence {
+    let here = statement_index.map(|index| (file_index, index));
+    let mut unattributed_statement_evidence = false;
+
+    for record in evidence {
+        let at = record_position(record, file_order);
+        match record.scope {
+            EvidenceScope::Chain => match (at, here) {
+                (Some(at), Some(here)) if at >= here => {}
+                _ => return Confidence::Tainted,
+            },
+            EvidenceScope::Statement => match (at, here) {
+                (Some(at), Some(here)) if at == here => return Confidence::Tainted,
+                (Some(_), Some(_)) => {}
+                _ => unattributed_statement_evidence = true,
+            },
+        }
+    }
+
+    if unattributed_statement_evidence {
+        return Confidence::Tainted;
+    }
+    Confidence::Exact
+}
+
+fn record_position(record: &EvidenceRecord, file_order: &[String]) -> Option<(usize, usize)> {
+    let location = record.location.as_ref()?;
+    let file_index = file_order.iter().position(|name| name == &location.file)?;
+    Some((file_index, location.statement_index))
 }

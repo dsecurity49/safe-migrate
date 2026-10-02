@@ -64,7 +64,7 @@ mod destructive_rule_tests {
     fn test_rule_type_change_rewrite_varchar_to_text() {
         let engine = setup_engine();
 
-        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut cache = crate::common::synced_cache();
         let mut relation = safe_migrate::_internal::model::relation::RelationState::new(
             object_id("public", "t"),
             ObjectId::new("public", "postgres"),
@@ -107,7 +107,7 @@ mod destructive_rule_tests {
     #[test]
     fn test_rule_type_change_narrow_varchar_unbounded() {
         let engine = setup_engine();
-        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut cache = crate::common::synced_cache();
         let tid = object_id("public", "t");
         let mut rel = RelationState::new(
             tid.clone(),
@@ -138,7 +138,7 @@ mod destructive_rule_tests {
 
         assert!(
             v.iter().any(|viol| viol.rule_id == "type-change-rewrite"
-                && viol.reason.contains("narrows VARCHAR precision (lossy)")),
+                && viol.reason.contains("lossy narrowing")),
             "Unbounded to bounded varchar change should be flagged as lossy narrowing: {:?}",
             v
         );
@@ -149,7 +149,7 @@ mod destructive_rule_tests {
     fn test_rule_varchar_narrowing_lossy() {
         let engine = setup_engine();
 
-        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut cache = crate::common::synced_cache();
         let mut rel = safe_migrate::_internal::model::relation::RelationState::new(
             object_id("public", "t"),
             ObjectId::new("public", "postgres"),
@@ -190,12 +190,12 @@ mod destructive_rule_tests {
 
         assert!(
             v.iter()
-                .any(|v| v.rule_id == "type-change-rewrite" && v.reason.contains("narrows")),
+                .any(|v| v.rule_id == "type-change-rewrite" && v.reason.contains("lossy narrowing")),
             "255→50 should be flagged as lossy VARCHAR narrowing"
         );
 
         // Now try widening: varchar(50) → varchar(255) should NOT flag as lossy
-        let mut cache2 = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut cache2 = crate::common::synced_cache();
         let mut rel2 = safe_migrate::_internal::model::relation::RelationState::new(
             object_id("public", "t"),
             ObjectId::new("public", "postgres"),
@@ -243,7 +243,7 @@ mod destructive_rule_tests {
     fn test_rule_text_to_varchar_narrowing() {
         let engine = setup_engine();
 
-        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut cache = crate::common::synced_cache();
         let mut rel = safe_migrate::_internal::model::relation::RelationState::new(
             object_id("public", "t"),
             ObjectId::new("public", "postgres"),
@@ -281,7 +281,7 @@ mod destructive_rule_tests {
 
         assert!(
             v.iter()
-                .any(|v| v.rule_id == "type-change-rewrite" && v.reason.contains("narrows")),
+                .any(|v| v.rule_id == "type-change-rewrite" && v.reason.contains("lossy narrowing")),
             "text->varchar(50) should be flagged as lossy narrowing: {:?}",
             v
         );
@@ -291,7 +291,7 @@ mod destructive_rule_tests {
     #[test]
     fn test_rule_drift_detection_drop_missing_table() {
         // Simulate a live DB cache with table "existing_tbl"
-        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut cache = crate::common::synced_cache();
         cache.insert_baseline(
             object_id("public", "existing_tbl"),
             safe_migrate::_internal::model::relation::RelationState::new(
@@ -328,7 +328,7 @@ mod destructive_rule_tests {
     /// DriftDetectionRule: ALTER TABLE that doesn't exist in baseline → Tier 1
     #[test]
     fn test_rule_drift_detection_alter_missing_table() {
-        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut cache = crate::common::synced_cache();
         cache.insert_baseline(
             object_id("public", "existing_tbl"),
             safe_migrate::_internal::model::relation::RelationState::new(
@@ -362,7 +362,7 @@ mod destructive_rule_tests {
 
     #[test]
     fn test_rule_drift_detection_drop_existing_table() {
-        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut cache = crate::common::synced_cache();
         cache.insert_baseline(
             object_id("public", "existing_tbl"),
             safe_migrate::_internal::model::relation::RelationState::new(
@@ -436,7 +436,7 @@ mod destructive_rule_tests {
     fn test_rule_type_change_rewrite_unsafe_small() {
         let engine = setup_engine();
 
-        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut cache = crate::common::synced_cache();
         cache.insert_baseline(
             object_id("public", "t"),
             safe_migrate::_internal::model::relation::RelationState::new(

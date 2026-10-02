@@ -25,6 +25,9 @@ pub(crate) enum TypeKind {
         fields: Vec<CompositeFieldState>,
     },
     Range,
+    /// PostgreSQL's automatically created companion of a [`TypeKind::Range`]
+    /// (`typtype = 'm'`). Renameable independently, so it needs its own row.
+    Multirange,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

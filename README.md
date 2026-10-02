@@ -18,6 +18,8 @@ PostgreSQL 14–18 are supported.
 
 ## Install
 
+Requires Rust 1.94 or newer.
+
 With Rust installed:
 
 ```bash
@@ -29,7 +31,7 @@ Prebuilt binaries are available from
 installer verifies release checksums:
 
 ```bash
-VERSION='v0.9.3'
+VERSION='v0.10.0'
 curl -fsSL "https://raw.githubusercontent.com/dsecurity49/safe-migrate/${VERSION}/install.sh" |
   bash -s -- --version "${VERSION}"
 ```
@@ -50,7 +52,7 @@ Run `safe-migrate cache inspect` to view its provenance and redacted contents.
 
 ## What it checks
 
-The 29 built-in rules cover:
+The built-in rules cover:
 
 - blocking locks, table rewrites, constraints, indexes, partitions, and
   materialized-view refreshes;
@@ -165,6 +167,20 @@ Suppress a reviewed finding with its primary rule ID:
 -- safe-migrate: ignore(require-concurrent-index)
 CREATE INDEX users_email_idx ON users (email);
 ```
+
+Inline suppressions are **disabled by default**. To enable them, add to
+`safe-migrate.toml`:
+
+```toml
+allow_inline_suppressions = true
+```
+
+Without this setting, an inline directive produces a Tier 1
+`inline-suppression-disabled` finding instead of suppressing the rule.
+This is intentional: keeping suppressions in the TOML file makes them
+visible in pull request diffs and subject to review. Use per-rule
+`[rules.require-concurrent-index] disabled = true` in `safe-migrate.toml`
+as the standard suppression path.
 
 Keep suppressions narrow and explain the reason in the migration review.
 

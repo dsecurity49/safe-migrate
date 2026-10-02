@@ -11,7 +11,7 @@ mod state_mutation_tests {
     use safe_migrate::_internal::analysis::state::{Confidence, MutationResult};
     use safe_migrate::_internal::ast::identifiers::{Ident, ObjectId, QualifiedName};
     use safe_migrate::_internal::db::cache::{
-        CatalogFamily, ConstraintDependencyCache, DbCache, GeneratedColumnDependencyCache,
+        CatalogFamily, ConstraintDependencyCache, GeneratedColumnDependencyCache,
         ViewDependencyCache,
     };
     use safe_migrate::_internal::model::column::Column;
@@ -747,8 +747,10 @@ mod state_mutation_tests {
     #[test]
     fn unavailable_baseline_never_claims_schema_coverage() {
         let engine = setup_engine();
+        // `Baseline::unavailable()` hands analysis a default-constructed cache,
+        // whose coverage is empty because nothing was ever read.
         let mut state = crate::_internal::analysis::state::AnalysisState::with_baseline(
-            safe_migrate::_internal::db::cache::DbCache::new(),
+            crate::common::unavailable_cache(),
             false,
         );
         let missing = object_id("public", "not_loaded");
@@ -866,7 +868,7 @@ mod state_mutation_tests {
     fn cached_view_rewrite_self_edge_is_ignored_but_real_dependency_is_kept() {
         let view_id = object_id("public", "v");
         let table_id = object_id("public", "t");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
 
         for (id, kind) in [
             (view_id.clone(), RelationKind::View),
@@ -911,7 +913,7 @@ mod state_mutation_tests {
     fn cached_view_column_dependencies_allow_dropping_an_unreferenced_column() {
         let table_id = object_id("public", "t");
         let view_id = object_id("public", "v");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         let mut table = RelationState::new(
             table_id.clone(),
             object_id("public", "owner"),
@@ -1003,7 +1005,7 @@ mod state_mutation_tests {
     fn cached_expression_index_dependencies_follow_the_referenced_columns() {
         let table_id = object_id("public", "t");
         let index_id = object_id("public", "t_lower_note_idx");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         let mut table = RelationState::new(
             table_id.clone(),
             object_id("public", "owner"),
@@ -1081,7 +1083,7 @@ mod state_mutation_tests {
     fn scoped_view_dependencies_keep_edges_to_omitted_schemas() {
         let view_id = object_id("app", "v");
         let external_table = object_id("tenant", "base");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.metadata.schemas = Some(vec!["app".to_string()]);
         cache.insert_baseline(
             view_id.clone(),
@@ -1113,7 +1115,7 @@ mod state_mutation_tests {
     fn scoped_view_dependencies_keep_omitted_dependents() {
         let in_scope_table = object_id("app", "base");
         let omitted_view = object_id("tenant", "v");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.metadata.schemas = Some(vec!["app".to_string()]);
         cache.insert_baseline(
             in_scope_table.clone(),
@@ -1145,7 +1147,7 @@ mod state_mutation_tests {
     fn scoped_drop_with_incomplete_dependency_coverage_stays_unchanged() {
         let in_scope_table = object_id("app", "base");
         let omitted_view = object_id("tenant", "v");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.metadata.schemas = Some(vec!["app".to_string()]);
         cache.insert_baseline(
             in_scope_table.clone(),
@@ -1185,7 +1187,7 @@ mod state_mutation_tests {
     fn empty_typed_view_dependency_cache_does_not_create_graph_edges() {
         let view_id = object_id("public", "v");
         let table_id = object_id("public", "t");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         for (id, kind) in [
             (view_id.clone(), RelationKind::View),
             (table_id.clone(), RelationKind::Table),
@@ -2656,7 +2658,7 @@ mod state_mutation_tests {
         use safe_migrate::_internal::db::cache::InheritanceCache;
 
         let engine = setup_engine();
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         let parent_id = object_id("public", "parent");
         let child_id = object_id("public", "child");
         let owner = object_id("public", "postgres");
@@ -2731,7 +2733,7 @@ mod state_mutation_tests {
         use safe_migrate::_internal::db::cache::InheritanceCache;
 
         let engine = setup_engine();
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         let parent_id = object_id("public", "parent");
         let child_id = object_id("public", "child");
         let owner = object_id("public", "postgres");
@@ -3527,10 +3529,155 @@ mod state_mutation_tests {
             .unwrap();
 
         assert!(matches!(
-            state.get_relation(&object_id("public", "work")),
+            state.get_relation(&object_id("pg_temp", "work")),
             Some(RelationOverlay::Present(relation))
                 if relation.has_column("id") && relation.estimated_rows == Some(0)
         ));
+    }
+
+    #[test]
+    fn view_projection_is_derived_from_the_source_relation() {
+        // Column names and types verified against PostgreSQL 18.2.
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TABLE vsrc (id int, label text, extra numeric);
+                 CREATE VIEW vplain AS SELECT id, label FROM vsrc;
+                 CREATE VIEW vstar AS SELECT * FROM vsrc;
+                 CREATE VIEW valias AS SELECT id AS user_id, label FROM vsrc;",
+                &mut state,
+            )
+            .unwrap();
+
+        let columns = |name: &str| {
+            state
+                .get_relation(&object_id("public", name))
+                .and_then(|overlay| match overlay {
+                    RelationOverlay::Present(relation) => Some(
+                        relation
+                            .columns
+                            .iter()
+                            .map(|c| (c.name.clone(), c.data_type.clone()))
+                            .collect::<Vec<_>>(),
+                    ),
+                    _ => None,
+                })
+                .unwrap_or_default()
+        };
+
+        assert_eq!(
+            columns("vplain"),
+            vec![
+                ("id".to_string(), Some("integer".to_string())),
+                ("label".to_string(), Some("text".to_string())),
+            ]
+        );
+        assert_eq!(
+            columns("vstar"),
+            vec![
+                ("id".to_string(), Some("integer".to_string())),
+                ("label".to_string(), Some("text".to_string())),
+                ("extra".to_string(), Some("numeric".to_string())),
+            ]
+        );
+        assert_eq!(
+            columns("valias"),
+            vec![
+                ("user_id".to_string(), Some("integer".to_string())),
+                ("label".to_string(), Some("text".to_string())),
+            ]
+        );
+    }
+
+    #[test]
+    fn view_with_an_expression_projection_reports_unknown_columns() {
+        // PostgreSQL types the output by analysing the query, so an expression
+        // cannot be typed offline; the view still exists but taints.
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TABLE vsrc (id int, label text);
+                 CREATE VIEW vexpr AS SELECT id + 1 AS bumped FROM vsrc;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            state.relation_is_present(&object_id("public", "vexpr")),
+            "the view must still be created"
+        );
+        assert_eq!(
+            state.local.confidence,
+            safe_migrate::_internal::analysis::state::Confidence::Tainted
+        );
+    }
+
+    #[test]
+    fn temporary_relation_shadows_a_permanent_one_of_the_same_name() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TABLE users (id int);
+                 CREATE TEMP TABLE users (id int, temp_only int);
+                 ALTER TABLE users ADD COLUMN seen int;",
+                &mut state,
+            )
+            .unwrap();
+
+        // The unqualified ALTER targets the temporary relation, because the
+        // session schema is searched first.
+        let temp = state
+            .get_relation(&object_id("pg_temp", "users"))
+            .expect("temporary table must exist in the session schema");
+        assert!(
+            matches!(temp, RelationOverlay::Present(relation) if relation.has_column("temp_only")
+                && relation.has_column("seen")),
+            "the ALTER must land on the temporary relation: {temp:?}"
+        );
+
+        let permanent = state
+            .get_relation(&object_id("public", "users"))
+            .expect("permanent table must be untouched");
+        assert!(
+            matches!(permanent, RelationOverlay::Present(relation) if !relation.has_column("seen")),
+            "the permanent relation must not be modified: {permanent:?}"
+        );
+    }
+
+    #[test]
+    fn a_named_schema_is_rejected_for_a_temporary_relation() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let v = engine
+            .analyze("CREATE TEMP TABLE public.work (id int);", &mut state)
+            .unwrap();
+        assert!(
+            v.iter().any(|v| v
+                .reason
+                .contains("cannot create temporary relation in non-temporary schema")),
+            "expected PostgreSQL's rejection: {v:?}"
+        );
+    }
+
+    #[test]
+    fn routines_do_not_resolve_through_the_temporary_schema() {
+        // PostgreSQL skips the temp namespace for functions and operators, so a
+        // temp table must never satisfy a routine reference.
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let v = engine
+            .analyze(
+                "CREATE TEMP TABLE f (id int);
+                 DROP FUNCTION f();",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !state.relation_is_present(&object_id("public", "f")),
+            "the temp table must not be visible under public: {v:?}"
+        );
     }
 
     #[test]
@@ -4044,7 +4191,7 @@ mod state_mutation_tests {
     fn dropping_schema_cascade_removes_cross_schema_sequence_defaults() {
         let engine = setup_engine();
         let mut cache = {
-            let mut cache = DbCache::new();
+            let mut cache = synced_cache();
             cache.metadata.source_lock_timeout_ms = 1_000;
             cache.metadata.source_statement_timeout_ms = 10_000;
             cache
@@ -4184,7 +4331,7 @@ mod state_mutation_tests {
     #[test]
     fn test_enum_add_value_preserves_postgres_ordering() {
         let engine = setup_engine();
-        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut cache = crate::common::synced_cache();
         let id = object_id("public", "e");
         cache.types.insert(
             id.clone(),
@@ -4412,7 +4559,7 @@ mod state_mutation_tests {
                 .unwrap()
                 .data_type
                 .as_deref(),
-            Some("\"Emotion\"")
+            Some("public.\"Emotion\"")
         );
         assert_eq!(
             quoted_entries.get_column("status").unwrap().type_id,
@@ -4434,11 +4581,11 @@ mod state_mutation_tests {
         let Some(FunctionOverlay::Present(function)) = state
             .local
             .functions
-            .get(&object_id("other", "quoted_mood(\"Emotion\")"))
+            .get(&object_id("other", "quoted_mood(public.\"Emotion\")"))
         else {
             panic!("quoted remapped function missing");
         };
-        assert_eq!(function.return_type, "\"Emotion\"");
+        assert_eq!(function.return_type, "public.\"Emotion\"");
     }
 
     #[test]
@@ -4509,7 +4656,7 @@ mod state_mutation_tests {
     #[test]
     fn rename_type_updates_cached_routine_signatures_and_undo_restores_them() {
         let engine = setup_engine();
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         let type_id = object_id("public", "mood");
         cache.types.insert(
             type_id.clone(),
@@ -4526,6 +4673,7 @@ mod state_mutation_tests {
             function_id.clone(),
             FunctionState {
                 id: function_id.clone(),
+                internal_type_owner: None,
                 routine_kind: safe_migrate::_internal::model::function::RoutineKind::Function,
                 arg_types: vec!["mood".into()],
                 arg_type_ids: Vec::new(),
@@ -4671,7 +4819,7 @@ mod state_mutation_tests {
     #[test]
     fn enum_value_rename_obeys_cached_explicit_and_default_search_path_order() {
         let engine = setup_engine();
-        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut cache = crate::common::synced_cache();
         cache.search_path = vec!["sm_core".into(), "public".into()];
         for schema in ["sm_core", "public"] {
             let id = object_id(schema, "mood");
@@ -4718,7 +4866,7 @@ mod state_mutation_tests {
     #[test]
     fn enum_value_rename_expands_user_search_path_from_v4_role_provenance() {
         let engine = setup_engine();
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.metadata.source_role = Some("app_user".into());
         for schema in ["app_user", "public"] {
             let id = object_id(schema, "mood");
@@ -4763,7 +4911,7 @@ mod state_mutation_tests {
     #[test]
     fn cache_without_role_provenance_taints_explicit_user_search_path() {
         let engine = setup_engine();
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         let id = object_id("public", "mood");
         cache.types.insert(
             id.clone(),
@@ -4793,7 +4941,7 @@ mod state_mutation_tests {
     #[test]
     fn enum_value_rename_skips_dropped_type_tombstones_in_the_search_path() {
         let engine = setup_engine();
-        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut cache = crate::common::synced_cache();
         cache.search_path = vec!["first".into(), "second".into()];
         for schema in ["first", "second"] {
             let id = object_id(schema, "mood");
@@ -4857,7 +5005,7 @@ mod state_mutation_tests {
             ),
         ] {
             let engine = setup_engine();
-            let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+            let mut cache = crate::common::synced_cache();
             let id = object_id("public", "mood");
             cache.types.insert(
                 id.clone(),
@@ -5279,7 +5427,7 @@ mod state_mutation_tests {
     #[test]
     fn test_synced_search_path_is_initial_and_default_path() {
         let engine = setup_engine();
-        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut cache = crate::common::synced_cache();
         cache.search_path = vec!["tenant_app".to_string(), "shared".to_string()];
         let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
 
@@ -5519,7 +5667,7 @@ mod state_mutation_tests {
         let engine = setup_engine();
 
         for routine_kind in [RoutineKind::Aggregate, RoutineKind::Window] {
-            let mut cache = DbCache::new();
+            let mut cache = synced_cache();
             let id = object_id("public", "work(integer)");
             cache.functions.insert(
                 id.clone(),
@@ -5533,6 +5681,7 @@ mod state_mutation_tests {
                     volatility: Volatility::Immutable,
                     language: "internal".into(),
                     security: SecurityMode::Invoker,
+                    internal_type_owner: None,
                 },
             );
             let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
@@ -5644,7 +5793,7 @@ mod state_mutation_tests {
     #[test]
     fn cached_aggregate_and_window_routines_accept_their_postgresql_commands() {
         let engine = setup_engine();
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         for (name, routine_kind) in [
             ("total(integer)", RoutineKind::Aggregate),
             ("ranked()", RoutineKind::Window),
@@ -5666,6 +5815,7 @@ mod state_mutation_tests {
                     volatility: Volatility::Volatile,
                     language: "internal".into(),
                     security: SecurityMode::Invoker,
+                    internal_type_owner: None,
                 },
             );
         }
@@ -5722,11 +5872,12 @@ mod state_mutation_tests {
                 "DROP FUNCTION IF EXISTS work(int);",
             ),
         ] {
-            let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+            let mut cache = crate::common::synced_cache();
             cache.functions.insert(
                 routine_id.clone(),
                 FunctionState {
                     id: routine_id.clone(),
+                    internal_type_owner: None,
                     routine_kind,
                     arg_types: vec!["integer".into()],
                     arg_type_ids: Vec::new(),
@@ -5773,6 +5924,7 @@ mod state_mutation_tests {
                 volatility: Volatility::Volatile,
                 language: "sql".into(),
                 security: SecurityMode::Invoker,
+                internal_type_owner: None,
             }
         }
 
@@ -5802,7 +5954,7 @@ mod state_mutation_tests {
             (RoutineKind::Procedure, function_drop("public", true)),
             (RoutineKind::Function, procedure_drop("public", true)),
         ] {
-            let mut cache = DbCache::new();
+            let mut cache = synced_cache();
             cache
                 .functions
                 .insert(object_id("public", "work(integer)"), routine(kind));
@@ -5814,7 +5966,7 @@ mod state_mutation_tests {
             assert_eq!(state.local.confidence, Confidence::Exact);
         }
 
-        let mut wrong_kind_cache = DbCache::new();
+        let mut wrong_kind_cache = synced_cache();
         wrong_kind_cache.functions.insert(
             object_id("public", "work(integer)"),
             routine(RoutineKind::Function),
@@ -5842,14 +5994,14 @@ mod state_mutation_tests {
             procedure_drop("tenant", false),
             aggregate_drop("tenant", false),
         ] {
-            let mut cache = DbCache::new();
+            let mut cache = synced_cache();
             cache.metadata.schemas = Some(vec!["public".into()]);
             let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
             assert_eq!(state.apply(&drop, None), MutationResult::Skipped);
             assert_eq!(state.local.confidence, Confidence::Tainted);
         }
 
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.metadata.schemas = Some(vec!["public".into()]);
         let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
         assert_eq!(
@@ -5971,7 +6123,7 @@ mod state_mutation_tests {
         }));
         assert_eq!(exact_state.local.confidence, Confidence::Exact);
 
-        let mut scoped_cache = DbCache::new();
+        let mut scoped_cache = synced_cache();
         scoped_cache.metadata.schemas = Some(vec!["public".into()]);
         let mut scoped_state = crate::_internal::analysis::state::AnalysisState::new(scoped_cache);
         let violations = engine
@@ -6114,7 +6266,7 @@ mod state_mutation_tests {
 
     #[test]
     fn subscription_publication_conflicts_do_not_partially_mutate_direct_state() {
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.subscriptions.insert(
             "subscriber".into(),
             safe_migrate::_internal::model::replication::SubscriptionState {
@@ -6559,7 +6711,7 @@ mod state_mutation_tests {
     fn object_granted_by_must_match_the_current_role() {
         let engine = setup_engine();
         let table_id = object_id("public", "explicit_grantor_table");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.metadata.source_role = Some("current_user".into());
         cache.metadata.source_session_role = Some("current_user".into());
         for name in ["current_user", "other_grantor", "reader"] {
@@ -6636,7 +6788,7 @@ mod state_mutation_tests {
         let table_id = object_id("public", "inherited_grant_table");
         let parent = object_id("", "grant_parent");
         let member = object_id("", "grant_member");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.pg_version_num = Some(160_000);
         cache.metadata.source_role = Some("grant_member".into());
         cache.metadata.source_session_role = Some("grant_member".into());
@@ -6721,7 +6873,7 @@ mod state_mutation_tests {
         let table_id = object_id("public", "non_inherited_grant_table");
         let parent = object_id("", "grant_parent");
         let member = object_id("", "grant_member");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.pg_version_num = Some(160_000);
         cache.metadata.source_role = Some("grant_member".into());
         cache.metadata.source_session_role = Some("grant_member".into());
@@ -6801,7 +6953,7 @@ mod state_mutation_tests {
         let parent = object_id("", "grant_parent");
         let member = object_id("", "grant_member");
         let delegated = object_id("", "delegated_user");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.pg_version_num = Some(160_000);
         cache.metadata.source_role = Some(member.name.clone());
         cache.metadata.source_session_role = Some(member.name.clone());
@@ -6862,7 +7014,7 @@ mod state_mutation_tests {
         let parent = object_id("", "grant_parent");
         let member = object_id("", "grant_member");
         let delegated = object_id("", "delegated_user");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.pg_version_num = Some(150_000);
         cache.metadata.source_role = Some(member.name.clone());
         cache.metadata.source_session_role = Some(member.name.clone());
@@ -6925,7 +7077,7 @@ mod state_mutation_tests {
         let delegator = object_id("", "membership_delegator");
         let target = object_id("", "membership_target");
         let recipient = object_id("", "membership_recipient");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.pg_version_num = Some(160_000);
         cache.metadata.source_role = Some(actor.name.clone());
         cache.metadata.source_session_role = Some(actor.name.clone());
@@ -6990,7 +7142,7 @@ mod state_mutation_tests {
         let owner = object_id("", "grant_owner");
         let delegate = object_id("", "grant_delegate");
         let reader = object_id("", "grant_reader");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.metadata.source_role = Some("grant_owner".into());
         cache.metadata.source_session_role = Some("grant_owner".into());
         for (id, can_set_role_to) in [
@@ -7061,7 +7213,7 @@ mod state_mutation_tests {
         use safe_migrate::_internal::model::role::RoleState;
 
         let engine = setup_engine();
-        let mut cache = crate::_internal::db::cache::DbCache::new();
+        let mut cache = crate::common::synced_cache();
         let table_id = object_id("public", "revoke_all_table");
         let owner = object_id("", "owner");
         let intermediate = object_id("", "intermediate");
@@ -7921,18 +8073,18 @@ mod state_mutation_tests {
 
     #[test]
     fn test_variadic_function_drop_normalizes_array_alias() {
-        use safe_migrate::_internal::db::cache::DbCache;
         use safe_migrate::_internal::model::function::{
             FunctionOverlay, FunctionState, SecurityMode, Volatility,
         };
 
         let engine = setup_engine();
         let function_id = object_id("public", "f_safe(integer[])");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.functions.insert(
             function_id.clone(),
             FunctionState {
                 id: function_id.clone(),
+                internal_type_owner: None,
                 routine_kind: safe_migrate::_internal::model::function::RoutineKind::Function,
                 arg_types: vec!["integer[]".to_string()],
                 arg_type_ids: vec![None],
@@ -8351,7 +8503,7 @@ mod state_mutation_tests {
                 options: Default::default(),
                 generated: None,
             });
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.insert_baseline(table_id, relation);
         let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
         let violations = engine
@@ -8432,7 +8584,7 @@ mod state_mutation_tests {
     #[test]
     fn set_session_authorization_updates_session_role_and_allows_reset() {
         let engine = setup_engine();
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.metadata.source_role = Some("app_user".to_string());
         cache.metadata.source_session_role = Some("app_user".to_string());
         for (name, superuser) in [
@@ -8655,7 +8807,7 @@ mod state_mutation_tests {
     #[test]
     fn role_switch_recomputes_user_search_path_and_owner_keywords() {
         let engine = setup_engine();
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.metadata.source_role = Some("login_role".into());
         cache.metadata.source_session_role = Some("login_role".into());
         cache.metadata.source_search_path = Some(vec!["$user".into(), "public".into()]);
@@ -8709,7 +8861,7 @@ mod state_mutation_tests {
     #[test]
     fn alter_view_owner_updates_relation_metadata() {
         let engine = setup_engine();
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         let view = object_id("public", "owned_view");
         cache.insert_baseline(
             view.clone(),
@@ -8741,7 +8893,7 @@ mod state_mutation_tests {
     #[test]
     fn alter_table_owner_moves_owned_sequence_owner() {
         let engine = setup_engine();
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         let table = object_id("public", "owned_table");
         let sequence = object_id("public", "owned_table_id_seq");
         cache.insert_baseline(
@@ -8787,7 +8939,7 @@ mod state_mutation_tests {
     #[test]
     fn complete_role_catalog_rejects_missing_role_switch() {
         let engine = setup_engine();
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.metadata.source_role = Some("login_role".into());
         cache.metadata.source_session_role = Some("login_role".into());
         let login = object_id("", "login_role");
@@ -8820,7 +8972,7 @@ mod state_mutation_tests {
     #[test]
     fn set_role_follows_transitive_set_option_edges() {
         let engine = setup_engine();
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.metadata.source_role = Some("member".into());
         cache.metadata.source_session_role = Some("member".into());
         for (name, can_set_role_to) in [
@@ -8865,7 +9017,7 @@ mod state_mutation_tests {
     #[test]
     fn membership_without_set_option_does_not_authorize_set_role() {
         let engine = setup_engine();
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.metadata.source_role = Some("member".into());
         cache.metadata.source_session_role = Some("member".into());
         for (name, member_of) in [
@@ -8898,7 +9050,7 @@ mod state_mutation_tests {
     #[test]
     fn grant_set_option_authorizes_set_role_and_revoke_removes_it() {
         let engine = setup_engine();
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.metadata.source_role = Some("member".into());
         cache.metadata.source_session_role = Some("member".into());
         for name in ["member", "parent"] {
@@ -8960,7 +9112,7 @@ mod state_mutation_tests {
     #[test]
     fn role_membership_admin_and_inherit_options_round_trip() {
         let engine = setup_engine();
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         for name in ["member", "parent"] {
             let id = object_id("", name);
             cache.roles.insert(
@@ -9012,7 +9164,7 @@ mod state_mutation_tests {
     #[test]
     fn role_membership_revoke_cascade_removes_dependent_grants() {
         let engine = setup_engine();
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.metadata.source_role = Some("admin".into());
         cache.metadata.source_session_role = Some("admin".into());
         for name in ["admin", "parent", "member", "child"] {
@@ -9079,7 +9231,7 @@ mod state_mutation_tests {
     #[test]
     fn role_grant_to_public_is_rejected_before_partial_mutation() {
         let engine = setup_engine();
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         for name in ["member", "parent"] {
             let id = object_id("", name);
             cache.roles.insert(
@@ -9114,7 +9266,7 @@ mod state_mutation_tests {
     #[test]
     fn role_grant_rejects_cycles_before_mutating_the_batch() {
         let engine = setup_engine();
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         for name in ["role_a", "role_b"] {
             let id = object_id("", name);
             cache.roles.insert(
@@ -9264,5 +9416,212 @@ mod state_mutation_tests {
                     .reason
                     .contains("rule 'missing_rule' does not exist")
         }));
+    }
+
+    /// Verified against PostgreSQL 18: the range is checked first, a target
+    /// above 10000 is clamped with only a warning, and a non-expression index
+    /// column is rejected last.
+    #[test]
+    fn alter_index_set_statistics_matches_postgres_acceptance() {
+        let cases = [
+            (
+                "ALTER INDEX idx_plain ALTER COLUMN 1 SET STATISTICS 100;",
+                true,
+                "non-expression column",
+            ),
+            (
+                "ALTER INDEX idx_expr ALTER COLUMN 1 SET STATISTICS 100;",
+                false,
+                "",
+            ),
+            (
+                "ALTER INDEX idx_plain ALTER COLUMN 1 SET STATISTICS 10001;",
+                false,
+                "",
+            ),
+            (
+                "ALTER INDEX idx_plain ALTER COLUMN 1 SET STATISTICS -2;",
+                true,
+                "is too low",
+            ),
+            (
+                "ALTER INDEX idx_expr ALTER COLUMN 1 SET STATISTICS -1;",
+                false,
+                "",
+            ),
+        ];
+
+        for (statement, expect_conflict, reason) in cases {
+            let engine = setup_engine();
+            let mut state = setup_state();
+            engine
+                .analyze(
+                    "CREATE TABLE st (a int, b text);
+                     CREATE INDEX idx_plain ON st (a);
+                     CREATE INDEX idx_expr ON st (lower(b));",
+                    &mut state,
+                )
+                .unwrap();
+            let findings = engine.analyze(statement, &mut state).unwrap();
+
+            let conflict = findings.iter().find(|finding| {
+                finding.rule_id == "chain-conflict" && finding.reason.contains(reason)
+            });
+            assert_eq!(
+                conflict.is_some(),
+                expect_conflict,
+                "unexpected result for {statement}: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn alter_index_set_statistics_column_number_is_parsed() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let findings = engine
+            .analyze(
+                "CREATE TABLE st (a int, b text);
+                 CREATE INDEX idx_expr ON st (lower(b));
+                 ALTER INDEX idx_expr ALTER COLUMN 1 SET STATISTICS 250;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict"),
+            "a column number must be recognized, not parsed as no column: {findings:?}"
+        );
+    }
+
+    /// PostgreSQL keys a routine on its argument type OIDs, so these spellings
+    /// are one function and the second declaration must conflict.
+    #[test]
+    fn routine_identity_ignores_type_spelling() {
+        for (first, second) in [
+            ("text", "pg_catalog.text"),
+            ("int4", "pg_catalog.int"),
+            ("varchar", "pg_catalog.varchar"),
+        ] {
+            let engine = setup_engine();
+            let mut state = setup_state();
+            let findings = engine
+                .analyze(
+                    &format!(
+                        "CREATE FUNCTION probe(a {first}) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;
+                         CREATE FUNCTION probe(a {second}) RETURNS int LANGUAGE sql AS $$ SELECT 2 $$;"
+                    ),
+                    &mut state,
+                )
+                .unwrap();
+
+            assert!(
+                findings.iter().any(|finding| {
+                    finding.rule_id == "chain-conflict" && finding.reason.contains("already exists")
+                }),
+                "probe({first}) and probe({second}) are one routine: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn routine_identity_ignores_schema_qualification_of_a_user_type() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let findings = engine
+            .analyze(
+                "CREATE SCHEMA sm_ident;
+                 CREATE TYPE sm_ident.mood AS ENUM ('sad');
+                 SET search_path TO sm_ident, public;
+                 CREATE FUNCTION probe(a mood) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;
+                 CREATE FUNCTION probe(a sm_ident.mood) RETURNS int LANGUAGE sql AS $$ SELECT 2 $$;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            findings.iter().any(|finding| {
+                finding.rule_id == "chain-conflict" && finding.reason.contains("already exists")
+            }),
+            "both spellings resolve to sm_ident.mood: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn distinct_custom_types_are_not_collapsed_into_one_signature() {
+        // An unresolved custom type renders to nothing, so without care these
+        // two different signatures would both become `probe()`.
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let findings = engine
+            .analyze(
+                "CREATE TYPE alpha_t AS ENUM ('a');
+                 CREATE TYPE beta_t AS ENUM ('b');
+                 CREATE FUNCTION probe(a alpha_t) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;
+                 CREATE FUNCTION probe(a beta_t) RETURNS int LANGUAGE sql AS $$ SELECT 2 $$;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict"),
+            "distinct argument types are distinct routines: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn dropping_a_partitioned_index_drops_its_attached_child() {
+        // PostgreSQL removes an attached partition index with its parent, so
+        // dropping the child afterwards must fail.
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let findings = engine
+            .analyze(
+                "CREATE TABLE parent_tbl (a int) PARTITION BY RANGE (a);
+                 CREATE TABLE child_tbl (a int);
+                 CREATE INDEX child_idx ON child_tbl (a);
+                 CREATE INDEX parent_idx ON parent_tbl (a);
+                 ALTER TABLE parent_tbl ATTACH PARTITION child_tbl FOR VALUES FROM (0) TO (10);
+                 ALTER INDEX parent_idx ATTACH PARTITION child_idx;
+                 DROP INDEX parent_idx;
+                 DROP INDEX child_idx;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(
+            findings.iter().any(|finding| {
+                finding.rule_id == "chain-conflict"
+                    && finding.reason.contains("does not exist")
+                    && finding.reason.contains("child_idx")
+            }),
+            "the child index is gone with its parent: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn dropping_an_unattached_index_leaves_others_alone() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let findings = engine
+            .analyze(
+                "CREATE TABLE t (a int);
+                 CREATE INDEX keep_idx ON t (a);
+                 CREATE INDEX drop_idx ON t (a);
+                 DROP INDEX drop_idx;
+                 DROP INDEX keep_idx;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict"),
+            "an unrelated index must survive its neighbour's drop: {findings:?}"
+        );
     }
 }

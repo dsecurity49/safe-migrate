@@ -461,8 +461,12 @@ impl AnalysisState {
                 if relation.columns.iter().any(|column| column.type_id.as_ref() == Some(id)))
         }) || self.local.functions.values().any(|overlay| {
             matches!(overlay, FunctionOverlay::Present(function)
-                if function.arg_type_ids.iter().flatten().any(|type_id| type_id == id)
-                    || function.return_type_id.as_ref() == Some(id))
+                // A routine PostgreSQL created as an internal part of the type
+                // (a range constructor) is dropped with it, so it does not
+                // require CASCADE.
+                if function.internal_type_owner.as_ref() != Some(id)
+                    && (function.arg_type_ids.iter().flatten().any(|type_id| type_id == id)
+                        || function.return_type_id.as_ref() == Some(id)))
         }) || self.local.types.values().any(|overlay| {
             matches!(overlay, TypeOverlay::Present(TypeState {
                 kind: TypeKind::Domain { base_type_id: Some(base), .. },

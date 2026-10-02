@@ -83,7 +83,9 @@ impl RuleCapability {
             }
             Self::CatalogDependencies => crate::_internal::db::cache::CatalogFamily::Dependencies,
             Self::FunctionCatalog => crate::_internal::db::cache::CatalogFamily::Routines,
-            Self::TransactionState => unreachable!(),
+            Self::TransactionState => {
+                unreachable!("TransactionState is not tied to a single catalog family")
+            }
         };
         state.baseline_has_coverage(family)
     }

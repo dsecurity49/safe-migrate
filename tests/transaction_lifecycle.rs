@@ -77,6 +77,43 @@ mod transaction_lifecycle_tests {
     }
 
     #[test]
+    fn concurrent_reindex_is_reported_inside_transaction() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let violations = engine
+            .analyze(
+                "CREATE TABLE users (id int); BEGIN; REINDEX TABLE CONCURRENTLY users; ROLLBACK;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(violations.iter().any(|violation| {
+            violation.rule_id == "concurrent-in-transaction"
+                && violation.reason.contains("REINDEX CONCURRENTLY")
+        }));
+    }
+
+    #[test]
+    fn concurrent_reindex_outside_transaction_is_not_reported() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        let violations = engine
+            .analyze(
+                "CREATE TABLE users (id int); REINDEX TABLE CONCURRENTLY users;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.rule_id == "concurrent-in-transaction")
+        );
+    }
+
+    #[test]
     fn test_txn_rollback() {
         let engine = setup_engine();
         let mut state = setup_state();
@@ -575,7 +612,7 @@ mod transaction_lifecycle_tests {
     #[test]
     fn test_rename_propagation_rollback() {
         let engine = setup_engine();
-        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut cache = crate::common::synced_cache();
 
         let t1_id = object_id("public", "t1");
         let v1_id = object_id("public", "v1");

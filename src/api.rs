@@ -50,7 +50,7 @@ use crate::_internal::analysis::state::{
     AnalysisState as InternalAnalysisState, Confidence as InternalConfidence,
 };
 use crate::_internal::db::cache::{
-    CACHE_FORMAT_VERSION, CACHE_V8_MAGIC, DbCache as InternalDbCache, DbCacheVersioned,
+    CACHE_FORMAT_VERSION, CACHE_V9_MAGIC, DbCache as InternalDbCache, DbCacheVersioned,
 };
 use crate::_internal::db::cache_file::{
     MAX_CACHE_DECODE_BYTES, decode_hex_key, is_encrypted_cache_bytes, read_cache_bytes,
@@ -375,6 +375,8 @@ pub enum OperationKind {
     AlterProcedure,
     /// Refreshes a materialized view.
     RefreshMaterializedView,
+    /// Reindexes a table, index, database, schema, or system.
+    Reindex,
     /// Attaches a partition.
     AttachPartition,
     /// Detaches a partition.
@@ -598,7 +600,7 @@ pub struct Finding {
     pub object_kind: ObjectKind,
     /// Qualified object name when known.
     pub object_name: String,
-    /// Effective finding severity.
+    /// A property of the operation alone; see [`Finding::certainty`].
     pub tier: Tier,
     /// Explanation of the detected risk.
     pub reason: String,
@@ -626,6 +628,9 @@ pub struct Finding {
     /// One-based statement position within the source file.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub statement_index: Option<usize>,
+    /// How well-supported this finding is by the evidence behind it. Reduced
+    /// certainty never reduces severity.
+    pub certainty: Confidence,
 }
 
 /// One named SQL migration in its intended analysis order.
@@ -1551,10 +1556,10 @@ fn decode_cache_payload(
         )
     })?;
     let mut decoder = decoder.take(MAX_CACHE_DECODE_BYTES as u64 + 1);
-    let mut header = Vec::with_capacity(CACHE_V8_MAGIC.len());
+    let mut header = Vec::with_capacity(CACHE_V9_MAGIC.len());
     decoder
         .by_ref()
-        .take(CACHE_V8_MAGIC.len() as u64)
+        .take(CACHE_V9_MAGIC.len() as u64)
         .read_to_end(&mut header)
         .map_err(|error| {
             Error::with_source(
@@ -1563,13 +1568,13 @@ fn decode_cache_payload(
                 error,
             )
         })?;
-    if header.len() < CACHE_V8_MAGIC.len() && CACHE_V8_MAGIC.starts_with(&header) {
+    if header.len() < CACHE_V9_MAGIC.len() && CACHE_V9_MAGIC.starts_with(&header) {
         return Err(Error::cache(format!(
             "{} is truncated or corrupted",
             path.display()
         )));
     }
-    if header != CACHE_V8_MAGIC {
+    if header != CACHE_V9_MAGIC {
         return Err(Error::cache(format!(
             "{} uses an unsupported cache format; run `safe-migrate sync`",
             path.display()
@@ -1710,6 +1715,7 @@ impl From<&InternalFinding> for Finding {
                 column: location.column,
             }),
             statement_index: finding.statement_index,
+            certainty: finding.certainty.clone().into(),
         }
     }
 }
@@ -1778,9 +1784,11 @@ impl From<&InternalOperationKind> for OperationKind {
             InternalOperationKind::CreateIndex => Self::CreateIndex,
             InternalOperationKind::CreateTable => Self::CreateTable,
             InternalOperationKind::CreateView => Self::CreateView,
+            InternalOperationKind::CreateFunction => Self::CreateFunction,
             InternalOperationKind::AlterFunction => Self::AlterFunction,
             InternalOperationKind::AlterProcedure => Self::AlterProcedure,
             InternalOperationKind::RefreshMaterializedView => Self::RefreshMaterializedView,
+            InternalOperationKind::Reindex => Self::Reindex,
             InternalOperationKind::AttachPartition => Self::AttachPartition,
             InternalOperationKind::DetachPartition => Self::DetachPartition,
             InternalOperationKind::VacuumFull => Self::VacuumFull,
@@ -1818,6 +1826,7 @@ impl From<&InternalObjectKind> for ObjectKind {
             InternalObjectKind::Schema => Self::Schema,
             InternalObjectKind::Role => Self::Role,
             InternalObjectKind::Publication => Self::Publication,
+            InternalObjectKind::Subscription => Self::Subscription,
             InternalObjectKind::Database => Self::Database,
             InternalObjectKind::Domain => Self::Domain,
             InternalObjectKind::Policy => Self::Policy,

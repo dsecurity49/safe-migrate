@@ -3,12 +3,13 @@ use crate::_internal::analysis::evidence::{
 };
 use crate::_internal::analysis::graph::{DependencyEdge, DependencyGraph, DependencyKind};
 use crate::_internal::analysis::mutations::Mutation;
+use crate::_internal::analysis::namespace::{SESSION_TEMP_SCHEMA, is_session_temp_schema};
 use crate::_internal::analysis::settings::ScopedSetting;
 use crate::_internal::analysis::transaction::{NamespaceSnapshot, StateChange, TransactionFrame};
 use crate::_internal::ast::identifiers::ObjectId;
 use crate::_internal::db::cache::CatalogCoverage;
 use crate::_internal::db::cache::DbCache;
-use crate::_internal::model::constraint::ConstraintState;
+use crate::_internal::model::constraint::{ConstraintKind, ConstraintState};
 use crate::_internal::model::function::FunctionOverlay;
 pub(crate) use crate::_internal::model::relation::RelationOverlay;
 use crate::_internal::model::relation::{Persistence, Privilege, RelationKind};
@@ -32,7 +33,7 @@ mod apply_transaction;
 mod apply_type;
 mod apply_view_index;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub(crate) enum Confidence {
     Exact,
     Tainted,
@@ -110,6 +111,10 @@ pub(crate) struct LocalState {
     pub constraints: HashMap<(ObjectId, String), ConstraintState>,
     pub graph: DependencyGraph,
     pub search_path: Vec<String>,
+    /// Performance hint: a temporary object has been created in this session.
+    /// `temp_namespace_exists` derives the real answer, so this only has to be
+    /// a superset to stay correct across rollback and `ON COMMIT DROP`.
+    pub saw_temp_object: bool,
     pub default_search_path: Vec<String>,
     pub search_path_template: Vec<String>,
     pub session_search_path_template: Vec<String>,
@@ -1240,6 +1245,7 @@ impl AnalysisState {
                 constraints,
                 graph,
                 search_path: default_search_path.clone(),
+                saw_temp_object: false,
                 default_search_path,
                 search_path_template: default_search_path_template.clone(),
                 session_search_path_template: default_search_path_template.clone(),
@@ -1279,11 +1285,19 @@ impl AnalysisState {
 
     /// Construct state from a cache after validating its cross-record
     /// invariants, preserving the requested baseline-availability flag.
+    ///
+    /// An unavailable baseline is a synthetic empty cache with no coverage, so
+    /// validating it would reject the very state `--no-cache` asks for.
     pub(crate) fn try_with_baseline(
         cache: DbCache,
         baseline_available: bool,
     ) -> Result<Self, String> {
-        Ok(Self::with_baseline(cache.validated()?, baseline_available))
+        let cache = if baseline_available {
+            cache.validated()?
+        } else {
+            cache
+        };
+        Ok(Self::with_baseline(cache, baseline_available))
     }
 
     #[cfg(test)]
@@ -1305,11 +1319,7 @@ impl AnalysisState {
                 return schema.clone();
             }
         }
-        self.local
-            .search_path
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "public".to_string())
+        self.local.search_path.first().cloned().unwrap_or_default()
     }
 
     pub(crate) fn resolve_relation_id(
@@ -1327,12 +1337,8 @@ impl AnalysisState {
                 return candidate;
             }
         }
-        let schema = self
-            .local
-            .search_path
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "public".to_string());
+        // An empty path searches nothing, so no schema may be inferred.
+        let schema = self.local.search_path.first().cloned().unwrap_or_default();
         let mut id = ObjectId::new(schema, resolved_name);
         id.inferred_schema = true;
         id
@@ -1356,6 +1362,62 @@ impl AnalysisState {
     /// this accessor prevents callers from coupling themselves to `LocalState`.
     pub(crate) fn search_path(&self) -> &[String] {
         &self.local.search_path
+    }
+
+    /// Whether this session has a temporary schema, which is searched before
+    /// every explicit path entry for relations and types.
+    pub(crate) fn temp_namespace_exists(&self) -> bool {
+        self.local.saw_temp_object
+            && (self
+                .local
+                .relations
+                .keys()
+                .any(|id| is_session_temp_schema(&id.schema))
+                || self
+                    .local
+                    .types
+                    .keys()
+                    .any(|id| is_session_temp_schema(&id.schema)))
+    }
+
+    /// Schemas to search for an unqualified relation or type, implicit first.
+    pub(crate) fn relation_search_path(&self) -> Vec<String> {
+        if !self.temp_namespace_exists() {
+            return self.local.search_path.clone();
+        }
+        let mut path = vec![SESSION_TEMP_SCHEMA.to_string()];
+        path.extend(self.local.search_path.iter().cloned());
+        path
+    }
+
+    pub(crate) fn note_temp_object_created(&mut self) {
+        self.local.saw_temp_object = true;
+    }
+
+    /// Column names and types of a present relation, for view projection.
+    pub(crate) fn relation_column_types(
+        &self,
+        id: &ObjectId,
+    ) -> Option<Vec<(String, Option<String>)>> {
+        match self.local.relations.get(id) {
+            Some(RelationOverlay::Present(relation)) => Some(
+                relation
+                    .columns
+                    .iter()
+                    .map(|column| (column.name.clone(), column.data_type.clone()))
+                    .collect(),
+            ),
+            _ => None,
+        }
+    }
+
+    /// Whether the index backs an exclusion constraint, which PostgreSQL
+    /// refuses to rebuild concurrently.
+    pub(crate) fn index_backs_exclusion_constraint(&self, index: &ObjectId) -> bool {
+        self.local.constraints.values().any(|constraint| {
+            matches!(constraint.kind, ConstraintKind::Exclusion)
+                && constraint.backing_index.as_ref() == Some(index)
+        })
     }
 
     /// Returns whether a cache-backed absence is authoritative for an object.
@@ -1383,6 +1445,15 @@ impl AnalysisState {
         family: crate::_internal::db::cache::CatalogFamily,
     ) -> bool {
         self.baseline_covers_object(id) && self.baseline_coverage.has(family)
+    }
+
+    /// The type a routine was created as an internal part of, if any. Only
+    /// PostgreSQL creates these; a user cannot define one directly.
+    pub(crate) fn routine_internal_type_owner(&self, id: &ObjectId) -> Option<&ObjectId> {
+        match self.local.functions.get(id)? {
+            FunctionOverlay::Present(function) => function.internal_type_owner.as_ref(),
+            FunctionOverlay::Dropped => None,
+        }
     }
 
     /// Read-only semantic views used by rules instead of exposing the
@@ -1611,11 +1682,20 @@ impl AnalysisState {
     /// can prove that a schema exists.  An omitted scoped schema is unknown;
     /// do not manufacture an object there while claiming an exact result.
     pub(super) fn ensure_schema_target(&mut self, schema: &str) -> Result<(), MutationResult> {
+        // The session temporary schema is created on first use, so it is always
+        // a valid target and never something the catalog can prove absent.
+        if is_session_temp_schema(schema) {
+            return Ok(());
+        }
         match self.schema_lookup(schema) {
             ObjectLookup::Present => Ok(()),
             ObjectLookup::Tombstone | ObjectLookup::AuthoritativelyAbsent => {
                 Err(MutationResult::Conflict {
-                    reason: format!("schema '{}' does not exist", schema),
+                    reason: if schema.is_empty() {
+                        "no schema has been selected to create in".to_string()
+                    } else {
+                        format!("schema '{}' does not exist", schema)
+                    },
                 })
             }
             ObjectLookup::Unknown => {
@@ -1692,8 +1772,19 @@ impl AnalysisState {
         object_name: &'a str,
     ) -> Option<&'a str> {
         let schemas = self.baseline_schemas.as_ref()?;
+
+        // Avoid falsely extracting "a" from "a.b" when a schema contains a dot.
+        // If the object name is prefixed by a known scope, it is covered.
+        for schema in schemas {
+            if object_name.starts_with(schema)
+                && object_name.as_bytes().get(schema.len()) == Some(&b'.')
+            {
+                return None;
+            }
+        }
+
         let (schema, _) = object_name.split_once('.')?;
-        (!schemas.contains(schema)).then_some(schema)
+        Some(schema)
     }
 
     pub(crate) fn sequence_is_present(&self, id: &ObjectId) -> bool {
@@ -1789,7 +1880,7 @@ impl AnalysisState {
         })
     }
 
-    fn resolve_type_reference(&self, raw: &str) -> Option<ObjectId> {
+    pub(crate) fn resolve_type_reference(&self, raw: &str) -> Option<ObjectId> {
         Self::resolve_type_reference_from_catalog(
             raw,
             &self.local.types,
@@ -1833,9 +1924,13 @@ impl AnalysisState {
 
     fn remapped_type_display(raw: &str, new_id: &ObjectId, schema_changed: bool) -> String {
         let suffix = raw.find('[').map(|index| &raw[index..]).unwrap_or("");
+        // Keep the qualification the reference was written with; a moved type
+        // gains one, or the reference would no longer resolve.
+        let was_qualified =
+            Self::parse_type_reference(raw).is_some_and(|(schema, _)| schema.is_some());
         format!(
             "{}{}",
-            Self::type_reference_name(new_id, schema_changed),
+            Self::type_reference_name(new_id, was_qualified || schema_changed),
             suffix
         )
     }
@@ -1848,6 +1943,16 @@ impl AnalysisState {
 
     pub(crate) fn relation_namespace_object_is_present(&self, id: &ObjectId) -> bool {
         self.relation_is_present(id) || self.sequence_is_present(id) || self.index_is_present(id)
+    }
+
+    /// Whether a miss on `id` proves the object is absent from the baseline
+    /// rather than merely unknown. Only a synced baseline with relation
+    /// coverage can support a `schema-drift` claim.
+    pub(crate) fn relation_absence_is_authoritative(&self, id: &ObjectId) -> bool {
+        self.schema_absence_is_authoritative(&id.schema)
+            && self
+                .baseline_coverage
+                .has(crate::_internal::db::cache::CatalogFamily::Relations)
     }
 
     /// Pick a generated name while also avoiding names reserved by other
@@ -3012,16 +3117,34 @@ impl AnalysisState {
             Mutation::Rename(rename) => self.apply_rename_relation(rename),
             Mutation::DropView(drop) => self.apply_drop_view(drop),
             Mutation::DropMaterializedView(drop) => self.apply_drop_materialized_view(drop),
+            Mutation::AlterIndex(alter) => self.apply_alter_index(alter),
+            Mutation::AlterIndexAllInTablespace(all_in) => {
+                self.apply_alter_index_all_in_tablespace(all_in)
+            }
             Mutation::DropIndex(drop) => self.apply_drop_index(drop),
             Mutation::LockTable(lock) => self.apply_lock_table(lock),
             Mutation::Truncate(truncate) => self.apply_truncate(truncate),
             Mutation::ChangeRelationOwner { id, new_owner } => {
                 self.apply_change_relation_owner(id, new_owner)
             }
+            Mutation::SetReloptions {
+                id,
+                kind,
+                attributes,
+            } => self.apply_set_reloptions(id, *kind, attributes),
+            Mutation::SetColumnDefault {
+                id,
+                column,
+                default,
+            } => self.apply_set_column_default(id, column, default.as_ref()),
+            Mutation::NoStateChange { .. } => MutationResult::Applied,
+            Mutation::ResetReloptions { id, kind, names } => {
+                self.apply_reset_reloptions(id, *kind, names)
+            }
             Mutation::SearchPath(search_path) => self.apply_search_path(search_path),
             Mutation::TimeoutSetting(timeout) => self.apply_timeout_setting(timeout),
             Mutation::ResetSettings(target) => self.apply_reset_settings(target),
-            Mutation::CheckTimeouts => self.apply_check_timeouts(),
+            Mutation::CheckTimeouts { .. } => self.apply_check_timeouts(),
             Mutation::SwitchRole {
                 role,
                 local,
@@ -3066,6 +3189,10 @@ impl AnalysisState {
             Mutation::AlterDatabase(alter_database) => self.apply_alter_database(alter_database),
             Mutation::DropDatabase(drop_database) => self.apply_drop_database(drop_database),
             Mutation::Vacuum { table_id, is_full } => self.apply_vacuum(table_id, *is_full),
+            Mutation::Reindex {
+                target,
+                concurrently: _,
+            } => self.apply_reindex(target),
         }
     }
 
@@ -3304,7 +3431,6 @@ impl AnalysisState {
         }
     }
 
-    #[allow(dead_code)]
     fn snapshot_pending_validation(&mut self) {
         if let Some(frame) = self.local.transactions.last_mut() {
             frame.undo_log.push(StateChange::PendingValidationSnapshot {
@@ -3587,6 +3713,36 @@ impl AnalysisState {
 mod evidence_tests {
     use super::*;
     use crate::_internal::analysis::evidence::{EvidenceCode, EvidenceRecord, EvidenceScope};
+    use crate::_internal::db::cache::{CatalogFamily, SchemaCoverage};
+
+    /// Coverage for a hand-built baseline that retrieved `families`.
+    fn covering(schemas: Option<&[String]>, families: &[CatalogFamily]) -> CatalogCoverage {
+        CatalogCoverage::for_families(SchemaCoverage::from_sync_scope(schemas), families)
+    }
+
+    /// Coverage for a hand-built baseline that retrieved the whole catalog.
+    fn fully_covering(schemas: Option<&[String]>) -> CatalogCoverage {
+        covering(schemas, CatalogFamily::ALL)
+    }
+
+    /// A hand-built baseline that retrieved the whole catalog.
+    fn synced_cache() -> DbCache {
+        let mut cache = DbCache::new();
+        cache.coverage = fully_covering(cache.metadata.schemas.as_deref());
+        cache
+    }
+
+    /// Whole-catalog coverage minus `family`, to exercise incomplete coverage.
+    fn covering_except(schemas: Option<&[String]>, family: CatalogFamily) -> CatalogCoverage {
+        covering(
+            schemas,
+            &CatalogFamily::ALL
+                .iter()
+                .copied()
+                .filter(|candidate| *candidate != family)
+                .collect::<Vec<_>>(),
+        )
+    }
 
     fn table_with_columns(
         id: ObjectId,
@@ -3660,9 +3816,9 @@ mod evidence_tests {
 
     #[test]
     fn scoped_schema_lookup_records_unknown_object_evidence() {
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.metadata.schemas = Some(vec!["public".to_string()]);
-        cache.coverage = CatalogCoverage::from_sync_scope(cache.metadata.schemas.as_deref());
+        cache.coverage = fully_covering(cache.metadata.schemas.as_deref());
         let mut state = AnalysisState::new(cache);
         let result = state.apply(
             &Mutation::CreateSchema(
@@ -3686,13 +3842,10 @@ mod evidence_tests {
 
     #[test]
     fn schema_absence_requires_schema_catalog_coverage() {
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.metadata.schemas = Some(vec!["public".to_string()]);
-        cache.coverage = CatalogCoverage::from_sync_scope(cache.metadata.schemas.as_deref());
-        cache
-            .coverage
-            .families
-            .remove(&crate::_internal::db::cache::CatalogFamily::Schemas);
+        // Everything except the schema catalog, so absence cannot be proven.
+        cache.coverage = covering_except(cache.metadata.schemas.as_deref(), CatalogFamily::Schemas);
         let mut state = AnalysisState::new(cache);
 
         let result = state.apply(
@@ -3751,13 +3904,10 @@ mod evidence_tests {
 
     #[test]
     fn relation_absence_requires_relation_catalog_coverage() {
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.metadata.schemas = Some(vec!["public".to_string()]);
-        cache.coverage = CatalogCoverage::from_sync_scope(cache.metadata.schemas.as_deref());
-        cache
-            .coverage
-            .families
-            .remove(&crate::_internal::db::cache::CatalogFamily::Relations);
+        cache.coverage =
+            covering_except(cache.metadata.schemas.as_deref(), CatalogFamily::Relations);
         let mut state = AnalysisState::new(cache);
         let result = state.apply(
             &Mutation::DropTable(crate::_internal::analysis::mutations::DropTable {
@@ -3780,7 +3930,7 @@ mod evidence_tests {
     #[test]
     fn baseline_drop_requires_dependency_catalog_coverage() {
         let table_id = ObjectId::new("public", "known_table");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.insert_baseline(
             table_id.clone(),
             table_with_columns(table_id.clone(), &["id"]),
@@ -3812,7 +3962,7 @@ mod evidence_tests {
     #[test]
     fn scoped_boundary_authority_requires_explicit_completion_marker() {
         let table_id = ObjectId::new("app", "known_table");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.metadata.schemas = Some(vec!["app".to_string()]);
         cache.metadata.created_at_unix_secs = Some(1);
         cache.insert_baseline(
@@ -3838,7 +3988,7 @@ mod evidence_tests {
     fn local_drop_cascade_requires_dependency_coverage_for_baseline_dependents() {
         let parent = ObjectId::new("public", "new_parent");
         let child = ObjectId::new("public", "baseline_child");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.insert_baseline(
             child.clone(),
             table_with_columns(child.clone(), &["parent_id"]),
@@ -3888,7 +4038,7 @@ mod evidence_tests {
     #[test]
     fn baseline_sequence_drop_requires_dependency_coverage() {
         let sequence_id = ObjectId::new("public", "known_sequence");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.sequences.insert(
             sequence_id.clone(),
             crate::_internal::model::sequence::SequenceState {
@@ -3932,9 +4082,9 @@ mod evidence_tests {
     #[test]
     fn scoped_baseline_sequence_drop_requires_cross_schema_dependency_proof() {
         let sequence_id = ObjectId::new("public", "scoped_sequence");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.metadata.schemas = Some(vec!["public".to_string()]);
-        cache.coverage = CatalogCoverage::from_sync_scope(cache.metadata.schemas.as_deref());
+        cache.coverage = fully_covering(cache.metadata.schemas.as_deref());
         cache.sequences.insert(
             sequence_id.clone(),
             crate::_internal::model::sequence::SequenceState {
@@ -3973,7 +4123,7 @@ mod evidence_tests {
     #[test]
     fn baseline_drop_column_requires_dependency_coverage() {
         let table_id = ObjectId::new("public", "known_table");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.insert_baseline(
             table_id.clone(),
             table_with_columns(table_id.clone(), &["id"]),
@@ -4012,9 +4162,9 @@ mod evidence_tests {
     #[test]
     fn scoped_baseline_type_drop_requires_cross_schema_dependency_proof() {
         let type_id = ObjectId::new("public", "known_type");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.metadata.schemas = Some(vec!["public".to_string()]);
-        cache.coverage = CatalogCoverage::from_sync_scope(cache.metadata.schemas.as_deref());
+        cache.coverage = fully_covering(cache.metadata.schemas.as_deref());
         cache.types.insert(
             type_id.clone(),
             crate::_internal::model::types::TypeState {
@@ -4048,13 +4198,14 @@ mod evidence_tests {
     #[test]
     fn scoped_baseline_function_drop_requires_cross_schema_dependency_proof() {
         let function_id = ObjectId::new("public", "work(integer)");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.metadata.schemas = Some(vec!["public".to_string()]);
-        cache.coverage = CatalogCoverage::from_sync_scope(cache.metadata.schemas.as_deref());
+        cache.coverage = fully_covering(cache.metadata.schemas.as_deref());
         cache.functions.insert(
             function_id.clone(),
             crate::_internal::model::function::FunctionState {
                 id: function_id.clone(),
+                internal_type_owner: None,
                 routine_kind: crate::_internal::model::function::RoutineKind::Function,
                 arg_types: vec!["integer".to_string()],
                 arg_type_ids: Vec::new(),
@@ -4104,6 +4255,7 @@ mod evidence_tests {
         let id = ObjectId::new("public", "work(integer)");
         let routine = |kind| crate::_internal::model::function::FunctionState {
             id: id.clone(),
+            internal_type_owner: None,
             routine_kind: kind,
             arg_types: vec!["integer".to_string()],
             arg_type_ids: Vec::new(),
@@ -4327,7 +4479,7 @@ mod evidence_tests {
     #[test]
     fn concurrent_refresh_rejects_unpopulated_materialized_view() {
         let view_id = ObjectId::new("public", "empty_mv");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         let mut view = crate::_internal::model::relation::RelationState::new(
             view_id.clone(),
             ObjectId::new("", "postgres"),
@@ -4357,7 +4509,7 @@ mod evidence_tests {
         let parent = ObjectId::new("public", "parent");
         let child = ObjectId::new("public", "child");
         let view = ObjectId::new("public", "parent_view");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.insert_baseline(parent.clone(), table_with_columns(parent.clone(), &["id"]));
         cache.insert_baseline(
             child.clone(),
@@ -4406,7 +4558,7 @@ mod evidence_tests {
     fn unhydrated_generation_edge_remains_conservative() {
         let parent = ObjectId::new("public", "parent");
         let omitted_view = ObjectId::new("tenant", "parent_view");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.insert_baseline(parent.clone(), table_with_columns(parent.clone(), &["id"]));
         let mut state = AnalysisState::new(cache);
         state.local.graph.add_edge(DependencyEdge::new(
@@ -4439,7 +4591,7 @@ mod evidence_tests {
 
     #[test]
     fn stale_trigger_generation_does_not_block_schema_restrict() {
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.schemas.insert(
             "old_schema".to_string(),
             crate::_internal::model::schema::SchemaState {
@@ -4493,7 +4645,7 @@ mod evidence_tests {
     #[test]
     fn baseline_constraint_keys_hydrate_into_the_dependency_graph() {
         let parent = ObjectId::new("public", "parent");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.insert_baseline(parent.clone(), table_with_columns(parent.clone(), &["id"]));
         cache.constraints.push(ConstraintState {
             table_id: parent.clone(),
@@ -4531,7 +4683,7 @@ mod evidence_tests {
     fn malformed_baseline_fk_operator_evidence_is_tainted_not_claimed_exact() {
         let child = ObjectId::new("public", "child");
         let parent = ObjectId::new("public", "parent");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.insert_baseline(
             child.clone(),
             table_with_columns(child.clone(), &["parent_id"]),
@@ -4573,7 +4725,7 @@ mod evidence_tests {
     fn complete_baseline_fk_operator_evidence_reaches_graph_edge() {
         let child = ObjectId::new("public", "child");
         let parent = ObjectId::new("public", "parent");
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.insert_baseline(
             child.clone(),
             table_with_columns(child.clone(), &["parent_id"]),
@@ -4609,7 +4761,7 @@ mod evidence_tests {
 
     #[test]
     fn try_new_rejects_semantically_invalid_cache_before_hydration() {
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         cache.schemas.insert(
             "public".into(),
             crate::_internal::model::schema::SchemaState {
@@ -4628,7 +4780,7 @@ mod evidence_tests {
 
     #[test]
     fn role_catalog_coverage_is_authoritative_without_session_provenance() {
-        let mut cache = DbCache::new();
+        let mut cache = synced_cache();
         let role = ObjectId::new("", "app_role");
         cache.roles.insert(
             role.clone(),

@@ -75,7 +75,7 @@ mod expression_parsing_tests {
     #[test]
     fn test_parser_syntax_error_rejection() {
         let engine = setup_engine();
-        let mut state = AnalysisState::new(safe_migrate::_internal::db::cache::DbCache::new());
+        let mut state = AnalysisState::new(crate::common::synced_cache());
         assert!(engine.analyze("CREATE TABLE (;", &mut state).is_err());
     }
 }

@@ -71,6 +71,6 @@ else
     unset SAFE_MIGRATE_DIFF_FIXTURE
 fi
 
-cargo test --locked --lib \
-    internal_tests::live_differential_harness::live_postgres_differential_harness \
-    -- --exact --ignored --nocapture
+. "$repository_root/scripts/lib/run-exact-test.sh"
+
+run_exact_test "scripts/live-differential" internal_tests::live_differential_harness::live_postgres_differential_harness

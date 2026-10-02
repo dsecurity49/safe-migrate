@@ -70,7 +70,7 @@ mod performance_scenarios {
     }
 
     fn large_baseline() -> DbCache {
-        let mut cache = DbCache::new();
+        let mut cache = crate::common::synced_cache();
         cache.search_path = vec!["public".to_string()];
         for index in 0..LARGE_BASELINE_RELATIONS {
             let id = object_id("public", &format!("perf_baseline_{index}"));
@@ -234,7 +234,7 @@ mod performance_scenarios {
         let cache = large_baseline();
         let started = Instant::now();
         let config = bincode::config::standard().with_variable_int_encoding();
-        let payload = bincode::serde::encode_to_vec(DbCacheVersioned::V8(Box::new(cache)), config)
+        let payload = bincode::serde::encode_to_vec(DbCacheVersioned::V9(Box::new(cache)), config)
             .expect("cache should encode");
         let compressed = zstd::stream::encode_all(Cursor::new(payload), 3)
             .expect("cache payload should compress");

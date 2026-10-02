@@ -1002,7 +1002,9 @@ impl AnalysisState {
                                         cascade_members.push(member.clone());
                                     }
                                 }
-                                Some(_) => unreachable!(),
+                                Some(_) => unreachable!(
+                                    "reconcile_membership_projection guarantees removal"
+                                ),
                             }
                         }
                     }
@@ -1060,7 +1062,9 @@ impl AnalysisState {
                                         cascade_grantors.push(member.clone());
                                     }
                                 }
-                                Some(_) => unreachable!(),
+                                Some(_) => unreachable!(
+                                    "reconcile_membership_projection guarantees removal"
+                                ),
                             }
                             if revoke_option.is_some()
                                 && matches!(
@@ -1143,7 +1147,9 @@ impl AnalysisState {
                 return Err(MutationResult::Skipped);
             };
             // PUBLIC is a PostgreSQL pseudo-role, not a row in pg_roles.
-            if name.eq_ignore_ascii_case("public") {
+            // Unquoted PUBLIC is resolved to "public" by the AST identifier rules.
+            // A quoted "PUBLIC" resolves to "PUBLIC", which is a distinct literal role.
+            if name == "public" {
                 ids.push(ObjectId::new("", "public"));
                 continue;
             }

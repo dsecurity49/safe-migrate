@@ -64,6 +64,7 @@ pub struct Config {
     pub(crate) default_rows: u64,
     pub(crate) auto_sync: bool,
     pub(crate) cache_encryption: bool,
+    pub(crate) allow_inline_suppressions: bool,
     pub(crate) rules: BTreeMap<String, RuleConfig>,
     pub(crate) assume_pg_version: u32,
     pub(crate) disabled_rules: Vec<String>,
@@ -80,6 +81,7 @@ impl Default for Config {
             default_rows: 10_000,
             auto_sync: false,
             cache_encryption: false,
+            allow_inline_suppressions: false,
             assume_pg_version: 100000,
             disabled_rules: Vec::new(),
             rules: BTreeMap::new(),
@@ -209,6 +211,26 @@ impl Config {
         self
     }
 
+    /// Return whether inline `-- safe-migrate: ignore(...)` directives in SQL
+    /// files are honoured.
+    ///
+    /// When `false` (the default), inline suppressions are rejected and produce
+    /// a Tier 1 `inline-suppression-disabled` finding. Suppressions must be
+    /// declared explicitly in `safe-migrate.toml` so that they appear in pull
+    /// request diffs and are subject to code review.
+    pub fn allow_inline_suppressions(&self) -> bool {
+        self.allow_inline_suppressions
+    }
+
+    /// Allow or disallow inline `-- safe-migrate: ignore(...)` directives.
+    ///
+    /// Set to `true` only when per-migration inline suppressions are part of
+    /// your review workflow. The recommended default is `false`.
+    pub fn with_allow_inline_suppressions(mut self, allow: bool) -> Self {
+        self.allow_inline_suppressions = allow;
+        self
+    }
+
     /// Add or replace a per-rule configuration override.
     pub fn with_rule(mut self, rule_id: impl Into<String>, rule: RuleConfig) -> Self {
         self.rules.insert(rule_id.into(), rule);
@@ -285,6 +307,8 @@ impl Config {
 
     /// Return whether a rule is disabled by either configuration form.
     pub fn is_rule_disabled(&self, rule_id: &str) -> bool {
+        // Either form disables the rule; an explicit `enabled` cannot re-enable
+        // something the legacy list still names.
         if self
             .disabled_rules
             .iter()
@@ -292,10 +316,8 @@ impl Config {
         {
             return true;
         }
-        self.rules
-            .get(rule_id)
-            .and_then(|rule| rule.disabled)
-            .unwrap_or(false)
+
+        self.rules.get(rule_id).and_then(|rule| rule.disabled) == Some(true)
     }
 
     /// Return a rule's effective Tier 1 threshold.

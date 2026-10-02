@@ -1,5 +1,6 @@
 use crate::_internal::analysis::mutations::{AlterTableActionMutation, Mutation};
 use crate::_internal::analysis::state::MutationResult;
+use crate::_internal::model::data_type::ParsedDataType;
 use crate::_internal::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
 use crate::_internal::rules::{
     BASELINE_RELATION_CAPABILITIES, BASELINE_STATS_CAPABILITIES, Rule, RuleCapability, RuleContext,
@@ -17,7 +18,7 @@ impl Rule for CascadingDropRule {
         ViolationTier::Tier1
     }
     fn recipe(&self) -> &'static str {
-        "Avoid CASCADE on DROP TABLE in production. Handle dependencies explicitly."
+        "Avoid CASCADE on DROP in production. Handle dependencies explicitly."
     }
 
     fn required_capabilities(&self) -> &'static [RuleCapability] {
@@ -31,6 +32,29 @@ impl Rule for CascadingDropRule {
         let state = context.state();
         let cascade_closure = context.cascade_closure();
         let mut violations = Vec::new();
+
+        if let Mutation::DropType(drop) = mutation
+            && drop.cascade
+        {
+            for id in &drop.ids {
+                violations.push(Violation {
+                    source_range: None,
+                    rule_id: self.id(),
+                    operation_kind: OperationKind::DropType,
+                    object_kind: ObjectKind::Type,
+                    object_name: id.to_string(),
+                    tier: self.default_tier(),
+                    reason: format!(
+                        "DROP TYPE {} CASCADE destroys all columns using this type",
+                        id
+                    ),
+                    recipe: self.recipe(),
+                    dedup_key: None,
+                    sql: None,
+                    fk_dependency_related: false,
+                });
+            }
+        }
 
         if !matches!(result, MutationResult::Conflict { .. })
             && let Mutation::DropTable(drop) = mutation
@@ -138,11 +162,26 @@ impl Rule for SizeAwareAddColumnRule {
 
         if let Mutation::AlterTable(alter) = mutation
             && let AlterTableActionMutation::AddColumn {
-                default: Some(def), ..
+                default,
+                generation,
+                ..
             } = &alter.action
         {
-            let is_volatile = def.is_volatile();
-            let requires_rewrite = is_volatile || pg_version < 110000;
+            let is_volatile = default.as_ref().is_some_and(|def| def.is_volatile());
+            let is_stored_generated = matches!(
+                generation,
+                crate::_internal::analysis::facts::ColumnGeneration::GeneratedStored
+            );
+            let is_identity = matches!(
+                generation,
+                crate::_internal::analysis::facts::ColumnGeneration::IdentityAlways
+                    | crate::_internal::analysis::facts::ColumnGeneration::IdentityByDefault
+            );
+
+            let requires_rewrite = is_volatile
+                || is_stored_generated
+                || is_identity
+                || (default.is_some() && pg_version < 110000);
 
             if requires_rewrite {
                 let (has_wide_columns, is_stale, rows) = match pre_state.relations.get(&alter.id) {
@@ -197,6 +236,16 @@ impl Rule for SizeAwareAddColumnRule {
                 let mut reason = if is_volatile {
                     format!(
                         "Adding column with volatile DEFAULT to {} triggers a table rewrite",
+                        alter.id
+                    )
+                } else if is_stored_generated {
+                    format!(
+                        "Adding a STORED generated column to {} triggers a table rewrite",
+                        alter.id
+                    )
+                } else if is_identity {
+                    format!(
+                        "Adding an identity column to {} triggers a table rewrite",
                         alter.id
                     )
                 } else {
@@ -556,85 +605,9 @@ impl Rule for ReversibilityRule {
 /// This is used by ReversibilityRule to distinguish between "safe widening" (e.g., INT->BIGINT)
 /// and genuinely lossy changes (e.g., BIGINT->INT, VARCHAR(255)->VARCHAR(50), TEXT->VARCHAR(n)).
 fn is_type_change_lossy(old_type: &str, new_type: &str) -> bool {
-    let old = old_type.to_lowercase().trim().to_string();
-    let new = new_type.to_lowercase().trim().to_string();
-
-    // Same type is trivially safe
-    if old == new {
-        return false;
-    }
-
-    // Extract base types (without parameters)
-    let old_base = old.split('(').next().unwrap_or(&old).trim();
-    let new_base = new.split('(').next().unwrap_or(&new).trim();
-
-    // VARCHAR narrowing check
-    if let (Some(old_lim), Some(new_lim)) =
-        (extract_varchar_limit(&old), extract_varchar_limit(&new))
-    {
-        // Both are varchar - check if narrowing
-        return new_lim < old_lim;
-    }
-
-    // Check for TEXT -> VARCHAR(n) narrowing (text is unbounded, varchar(n) is bounded)
-    // Also handles character varying (unbounded) -> varchar(n)
-    let new_varchar_limit = extract_varchar_limit(&new);
-    if new_varchar_limit.is_some()
-        && (old_base == "text" || old_base == "varchar" || old_base == "character varying")
-    {
-        return true;
-    }
-
-    // Varchar to something smaller/narrower - check if target type can hold all values
-    let old_varchar_limit = extract_varchar_limit(&old);
-    if old_varchar_limit.is_some() {
-        // varchar -> text is safe (widening)
-        if new == "text" || new == "varchar" || new == "character varying" {
-            return false;
-        }
-        // varchar -> other types might be lossy
-        return true;
-    }
-
-    // Widening integer types are safe (though they require a rewrite)
-    // int2 (smallint) -> int4 -> int8 (bigint) are all safe
-    if let (Some(old_sz), Some(new_sz)) = (
-        integer_type_size_bits(old_base),
-        integer_type_size_bits(new_base),
-    ) {
-        // Narrowing is unsafe
-        return new_sz < old_sz;
-    }
-
-    // For other types, assume safe unless we have specific knowledge
-    false
-}
-
-/// Extracts the character limit from a varchar type string.
-/// Returns the limit in bytes (for comparison purposes).
-fn extract_varchar_limit(ty: &str) -> Option<i32> {
-    if ty.starts_with("varchar(") || ty.starts_with("character varying(") {
-        let paren_start = ty.find('(')?;
-        let paren_end = ty[paren_start..].find(')')?;
-        let num_str = &ty[paren_start + 1..paren_start + paren_end];
-        let limit: i32 = num_str.parse().ok()?;
-        Some(limit)
-    } else if ty == "varchar" || ty == "character varying" {
-        // VARCHAR without limit is like TEXT - unbounded
-        None
-    } else {
-        None
-    }
-}
-
-/// Returns the size of integer types in bits.
-fn integer_type_size_bits(ty: &str) -> Option<i32> {
-    match ty {
-        "smallint" | "int2" => Some(16),
-        "integer" | "int4" | "int" => Some(32),
-        "bigint" | "int8" => Some(64),
-        _ => None,
-    }
+    let old_parsed = ParsedDataType::parse(old_type);
+    let new_parsed = ParsedDataType::parse(new_type);
+    old_parsed.is_lossy_narrowing_to(&new_parsed)
 }
 
 pub(crate) struct GeneralCascadeRule;
@@ -730,44 +703,35 @@ pub(crate) struct TypeChangeRewriteRule;
 
 impl TypeChangeRewriteRule {
     fn is_type_change_safe(old_type: &str, new_type: &str, pg_version: u32) -> bool {
-        let old = old_type.to_lowercase();
-        let new = new_type.to_lowercase();
-        if old == new {
+        if old_type.eq_ignore_ascii_case(new_type) {
             return true;
         }
 
-        let old_base = old.split('(').next().unwrap_or(&old).trim();
-        let new_base = new.split('(').next().unwrap_or(&new).trim();
+        let old_dt = ParsedDataType::parse(old_type);
+        let new_dt = ParsedDataType::parse(new_type);
 
-        if (old_base == "varchar" || old_base == "character varying")
-            && (new_base == "varchar" || new_base == "character varying" || new_base == "text")
-        {
-            if new == "text" || new == "varchar" || new == "character varying" {
-                return true;
+        use crate::_internal::model::data_type::DataTypeFamily;
+
+        // Varchar widening is a metadata-only change.
+        if old_dt.family.is_text_like() && new_dt.family.is_text_like() {
+            if new_dt.family == DataTypeFamily::Text || !new_dt.has_typmod() {
+                return true; // Widening to unbounded text/varchar.
             }
-            if let Some(old_mod) = extract_type_modifier_from_type_string(&old)
-                && let Some(new_mod) = extract_type_modifier_from_type_string(&new)
-                && old_mod <= new_mod
+            if let (Some(old_limit), Some(new_limit)) =
+                (old_dt.character_limit(), new_dt.character_limit())
+                && old_limit <= new_limit
             {
                 return true;
             }
         }
 
-        if pg_version >= 120000
-            && (old_base == "numeric" || old_base == "decimal")
-            && (new_base == "numeric" || new_base == "decimal")
-        {
-            // Changing to unconstrained numeric is always safe (widest form).
-            if !new.contains('(') {
-                return true;
+        // Numeric widening is a metadata-only change in PG >= 12.
+        if pg_version >= 120_000 && old_dt.family.is_numeric() && new_dt.family.is_numeric() {
+            if !new_dt.has_typmod() {
+                return true; // Widening to unconstrained numeric.
             }
-            // Changing to a constrained numeric(p, s) is safe if the new
-            // precision is >= the old precision and the new scale is >= the
-            // old scale (i.e. the new type can represent every value the old
-            // type could). If the old type is unconstrained we cannot prove
-            // widening, so we fall through to false.
             if let (Some((old_p, old_s)), Some((new_p, new_s))) =
-                (parse_numeric_params(&old), parse_numeric_params(&new))
+                (old_dt.numeric_params(), new_dt.numeric_params())
                 && new_p >= old_p
                 && new_s >= old_s
             {
@@ -776,66 +740,6 @@ impl TypeChangeRewriteRule {
         }
 
         false
-    }
-
-    /// Detects whether a type change narrows a VARCHAR(n) column
-    /// using type_modifier values from the cache.
-    ///
-    /// atttypmod for VARCHAR(n) encodes the character limit:
-    ///   typmod = (limit + VARHDRSZ), where VARHDRSZ is 4
-    ///
-    /// A smaller typmod means a smaller character limit, which is lossy.
-    /// Returns true if the new modifier represents a smaller limit than the old.
-    pub(crate) fn is_lossy_varchar_narrowing(
-        old_modifier: Option<i32>,
-        new_modifier: Option<i32>,
-    ) -> bool {
-        match (old_modifier, new_modifier) {
-            // PostgreSQL uses -1 for an unbounded character limit.
-            (Some(-1), Some(new)) if new != -1 => true,
-            // If the new one is unbounded, it's never narrowing
-            (_, Some(-1)) => false,
-            // Bounded values narrow when the new character limit is smaller.
-            (Some(old), Some(new)) => new < old,
-            // A missing modifier cannot prove a bounded old limit.
-            (None, Some(new)) if new != -1 => true,
-            _ => false,
-        }
-    }
-}
-
-/// Parses precision and scale from a numeric/decimal type string.
-/// Returns `Some((precision, scale))` for `numeric(p, s)` or `numeric(p)` (scale=0).
-/// Returns `None` if the type has no parameters.
-fn parse_numeric_params(ty: &str) -> Option<(i32, i32)> {
-    let lower = ty.to_lowercase();
-    let paren_start = lower.find('(')?;
-    let paren_end = lower.find(')')?;
-    let inner = &lower[paren_start + 1..paren_end];
-    let mut parts = inner.splitn(2, ',');
-    let precision: i32 = parts.next()?.trim().parse().ok()?;
-    let scale: i32 = parts
-        .next()
-        .map(|s| s.trim().parse().unwrap_or(0))
-        .unwrap_or(0);
-    Some((precision, scale))
-}
-
-/// Extracts a synthetic type_modifier-like value from a type string.
-/// Used when the new type comes from the migration SQL (not from the cache).
-/// For varchar(N), derives the atttypmod from the character limit.
-pub(crate) fn extract_type_modifier_from_type_string(ty: &str) -> Option<i32> {
-    let lower = ty.to_lowercase().trim().to_string();
-    // Check for varchar(N) or character varying(N)
-    if lower.starts_with("varchar(") || lower.starts_with("character varying(") {
-        let paren_start = lower.find('(')?;
-        let paren_end = lower[paren_start..].find(')')?;
-        let num_str = &lower[paren_start + 1..paren_start + paren_end];
-        let limit: i32 = num_str.parse().ok()?;
-        // VARCHAR atttypmod is the character limit plus VARHDRSZ.
-        Some(limit + 4)
-    } else {
-        None
     }
 }
 
@@ -883,29 +787,29 @@ impl Rule for TypeChangeRewriteRule {
             && let AlterTableActionMutation::SetType {
                 column,
                 ty,
-                has_using: _,
+                has_using,
             } = &alter.action
         {
             let pg_version = state.effective_pg_version_num(config.assume_pg_version);
 
-            let (is_safe, rows, old_type_str, old_modifier) =
-                match pre_state.relations.get(&alter.id) {
-                    Some(rel) => {
-                        let col_info = rel.columns.iter().find(|c| c.name == *column);
-                        let old_ty = col_info.and_then(|col| col.data_type.as_ref());
+            let (is_safe, rows, old_type_str) = match pre_state.relations.get(&alter.id) {
+                Some(rel) => {
+                    let col_info = rel.columns.iter().find(|c| c.name == *column);
+                    let old_ty = col_info.and_then(|col| col.data_type.as_ref());
 
-                        let safe = old_ty
+                    // A USING expression always forces a full table rewrite.
+                    let safe = !has_using
+                        && old_ty
                             .map(|o| Self::is_type_change_safe(o, ty, pg_version))
                             .unwrap_or(false);
-                        (
-                            safe,
-                            rel.estimated_rows.unwrap_or(config.default_rows),
-                            old_ty.cloned().unwrap_or_else(|| "unknown".to_string()),
-                            col_info.and_then(|col| col.type_modifier),
-                        )
-                    }
-                    None => (false, config.default_rows, "unknown".to_string(), None),
-                };
+                    (
+                        safe,
+                        rel.estimated_rows.unwrap_or(config.default_rows),
+                        old_ty.cloned().unwrap_or_else(|| "unknown".to_string()),
+                    )
+                }
+                None => (false, config.default_rows, "unknown".to_string()),
+            };
 
             if !is_safe {
                 let tier1_threshold = config.rule_tier1_threshold(self.id());
@@ -916,9 +820,7 @@ impl Rule for TypeChangeRewriteRule {
                     ViolationTier::Tier2
                 };
 
-                let new_modifier = extract_type_modifier_from_type_string(ty);
-
-                if Self::is_lossy_varchar_narrowing(old_modifier, new_modifier) {
+                if is_type_change_lossy(&old_type_str, ty) {
                     violations.push(Violation { source_range: None,
                         rule_id: self.id(),
                         operation_kind: OperationKind::AlterColumnType,
@@ -926,10 +828,10 @@ impl Rule for TypeChangeRewriteRule {
                         object_name: format!("{}.{}", alter.id, column),
                         tier,
                         reason: format!(
-                            "Changing column {}.{} type from {} to {} narrows VARCHAR precision (lossy)",
+                            "Changing column {}.{} type from {} to {} truncates data (lossy narrowing)",
                             alter.id, column, old_type_str, ty
                         ),
-                        recipe: "Narrowing VARCHAR(n) precision may cause data truncation. Consider adding a new column, backfilling, and then dropping the old one.",
+                        recipe: "Narrowing a data type may cause data truncation. Consider adding a new column, backfilling, and then dropping the old one.",
                         dedup_key: None,
                                     sql: None,
                                     fk_dependency_related: false,

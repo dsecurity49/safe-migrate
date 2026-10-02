@@ -10,7 +10,7 @@ use crate::_internal::rules::drift::DriftDetectionRule;
 use crate::_internal::rules::expressions::VolatileDefaultRule;
 use crate::_internal::rules::functions::{BrokenComputeRule, FunctionVolatilityRule};
 use crate::_internal::rules::idempotency::IdempotencyRule;
-use crate::_internal::rules::indexes::ConcurrentIndexRule;
+use crate::_internal::rules::indexes::{ConcurrentIndexRule, RequireConcurrentReindexRule};
 use crate::_internal::rules::opaque::OpaqueDynamicSqlRule;
 use crate::_internal::rules::partitions::{PartitionLockRule, PartitionStrategyMismatchRule};
 use crate::_internal::rules::policies::RestrictivePolicyRule;
@@ -172,6 +172,13 @@ pub(crate) static PRIMARY_RULES: &[RuleDescriptor] = &[
         "locking",
         ConcurrentIndexRule,
         WITH_ROW_THRESHOLDS
+    ),
+    descriptor!(
+        "require-concurrent-reindex",
+        "Require concurrent reindex",
+        "Flags reindex operations that should use CONCURRENTLY.",
+        "locking",
+        RequireConcurrentReindexRule
     ),
     descriptor!(
         "require-lock-timeout",

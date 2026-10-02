@@ -82,15 +82,9 @@ pub(crate) enum ResetSettingTarget {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum TypeCreationKind {
-    Enum {
-        variants: Vec<String>,
-    },
-    #[expect(dead_code, reason = "reserved for typed Squawk range support")]
+    Enum { variants: Vec<String> },
     Range,
-    Composite {
-        fields: Vec<CompositeFieldFact>,
-    },
-    #[expect(dead_code, reason = "reserved for typed Squawk base-type support")]
+    Composite { fields: Vec<CompositeFieldFact> },
     Base,
 }
 
@@ -111,12 +105,10 @@ pub(crate) enum AlterViewAction {
     SetSchema {
         new_schema: String,
     },
-    #[expect(dead_code, reason = "reserved for typed Squawk view-default support")]
     SetDefault {
         column: String,
         default: Option<ExprIr>,
     },
-    #[expect(dead_code, reason = "reserved for typed Squawk view-default support")]
     DropDefault {
         column: String,
     },
@@ -124,14 +116,30 @@ pub(crate) enum AlterViewAction {
         from: Ident,
         to: Ident,
     },
-    #[expect(dead_code, reason = "reserved for typed Squawk view-option support")]
     SetOptions {
-        options: Vec<String>,
+        options: Vec<AttributeFact>,
     },
-    #[expect(dead_code, reason = "reserved for typed Squawk view-option support")]
     ResetOptions {
-        options: Vec<String>,
+        options: Vec<AttributeFact>,
     },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum AlterMaterializedViewActionFact {
+    RenameTo { new_name: Ident },
+    SetSchema { new_schema: String },
+    RenameColumn { from: Ident, to: Ident },
+    SetTablespace { new_tablespace: Ident },
+    SetAccessMethod { new_access_method: Ident },
+    DependsOnExtension { extension_name: Ident },
+    NoDependsOnExtension { extension_name: Ident },
+    SetOptions { options: Vec<AttributeFact> },
+    ResetOptions { options: Vec<AttributeFact> },
+    ClusterOn { index_name: Ident },
+    SetWithoutCluster,
+    SetStorage { column: String, storage: String },
+    SetCompression { column: String, compression: String },
+    OwnerTo { new_owner: RoleFact },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -185,6 +193,9 @@ pub(crate) enum StatementFact {
         name: QualifiedName,
         or_replace: bool,
         depends_on: Vec<QualifiedName>,
+        select_outputs: Vec<SelectOutputFact>,
+        select_projection_complete: bool,
+        select_source: Option<QualifiedName>,
     },
     AlterView {
         name: QualifiedName,
@@ -196,7 +207,7 @@ pub(crate) enum StatementFact {
     },
     AlterMaterializedView {
         name: QualifiedName,
-        new_name: Option<Ident>,
+        action: AlterMaterializedViewActionFact,
     },
     RefreshMaterializedView {
         name: QualifiedName,
@@ -253,7 +264,12 @@ pub(crate) enum StatementFact {
     },
     AlterIndex {
         name: QualifiedName,
+        if_exists: bool,
         actions: Vec<AlterIndexActionFact>,
+    },
+    AlterIndexAllInTablespace {
+        source_tablespace: Ident,
+        target_tablespace: Ident,
     },
     CreateType(CreateTypeFact),
     AlterType(AlterTypeFact),
@@ -359,6 +375,11 @@ pub(crate) enum StatementFact {
     /// Parsed SQL that changes PostgreSQL metadata but no schema state modeled
     /// by safe-migrate, such as `COMMENT ON`.
     SchemaNeutralNoop,
+    Reindex {
+        target_kind: ReindexTargetKindFact,
+        target_name: Option<QualifiedName>,
+        concurrently: bool,
+    },
     Vacuum {
         relation: Option<QualifiedName>,
         is_full: bool,
@@ -444,9 +465,59 @@ pub(crate) enum AlterSequenceActionFact {
     Other,
 }
 
+// SET STATISTICS accepts an integer (-1..10000) or DEFAULT.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum StatisticsTarget {
+    Default,
+    Value(i32),
+}
+
+/// The index column `ALTER INDEX ... ALTER [COLUMN] c SET STATISTICS` names.
+/// PostgreSQL accepts either a column name or a 1-based column number.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum IndexStatisticsColumn {
+    Name(String),
+    Number(i32),
+}
+
+impl std::fmt::Display for IndexStatisticsColumn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Name(name) => write!(f, "{name}"),
+            Self::Number(number) => write!(f, "{number}"),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum AlterIndexActionFact {
-    RenameTo { new_name: Ident },
+    RenameTo {
+        new_name: Ident,
+    },
+    SetTablespace {
+        new_tablespace: Ident,
+    },
+    AttachPartition {
+        partition_name: QualifiedName,
+    },
+    DependsOnExtension {
+        extension_name: Ident,
+    },
+    NoDependsOnExtension {
+        extension_name: Ident,
+    },
+    SetStatistics {
+        /// The index column the target applies to. PostgreSQL requires one:
+        /// the bare `SET STATISTICS` form is a syntax error.
+        column: IndexStatisticsColumn,
+        target: StatisticsTarget,
+    },
+    SetOptions {
+        options: Vec<AttributeFact>,
+    },
+    ResetOptions {
+        options: Vec<AttributeFact>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -832,6 +903,15 @@ pub(crate) enum GrantTarget {
     Tables(Vec<QualifiedName>),
     AllTablesInSchema(Vec<String>),
     Roles(Vec<String>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ReindexTargetKindFact {
+    Database,
+    Schema,
+    System,
+    Table,
+    Index,
 }
 
 #[derive(Clone, Debug, PartialEq)]

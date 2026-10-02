@@ -73,6 +73,7 @@ mod tests {
                 column: 5,
             }),
             statement_index: Some(1),
+            certainty: Confidence::Exact,
         };
 
         let markdown =
@@ -95,6 +96,7 @@ mod tests {
             ),
             location: None,
             statement_index: Some(1),
+            certainty: Confidence::Exact,
         };
 
         let report = Reporter::json_report_with_locations(&[finding], &Confidence::Exact);
@@ -114,6 +116,7 @@ mod tests {
             violation: make_violation("test-rule", ViolationTier::Tier2, "needs review"),
             location: None,
             statement_index: Some(1),
+            certainty: Confidence::Exact,
         };
         let outcome = AnalysisOutcome::new(
             vec![finding],
@@ -149,6 +152,7 @@ mod tests {
                 column: 5,
             }),
             statement_index: Some(1),
+            certainty: Confidence::Exact,
         };
 
         let json = Reporter::json_report_with_locations(
@@ -192,6 +196,7 @@ mod tests {
         let finding = ReportFinding {
             location: None,
             statement_index: None,
+            certainty: Confidence::Exact,
             violation: Violation {
                 source_range: None,
                 rule_id: "test-rule",
@@ -219,6 +224,7 @@ mod tests {
             violation,
             location: None,
             statement_index: None,
+            certainty: Confidence::Exact,
         };
 
         let markdown = Reporter::markdown_report(&[finding], &Confidence::Exact);
@@ -235,6 +241,7 @@ mod tests {
                 column: 1,
             }),
             statement_index: Some(1),
+            certainty: Confidence::Exact,
             violation: Violation {
                 source_range: None,
                 rule_id: "test-rule",
@@ -265,6 +272,7 @@ mod tests {
                 column: 1,
             }),
             statement_index: None,
+            certainty: Confidence::Exact,
             violation: Violation {
                 source_range: None,
                 rule_id: "test-rule",

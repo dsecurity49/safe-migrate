@@ -1,9 +1,11 @@
 use crate::_internal::analysis::expr_ir::ExprIr;
+use crate::_internal::analysis::facts::IndexStatisticsColumn;
 use crate::_internal::analysis::facts::{
     AlterIndexActionFact, AlterTableActionFact, AlterTypeActionFact, AlterTypeFact, ColumnFact,
     CreateTypeFact, FkFact, LikePropertiesFact, LikeSourceFact, LockModeFact, PersistenceFact,
-    RelationTargetFact, ReplicaIdentityFact, ResetSettingTarget, SearchPathTarget, StatementFact,
-    TableConstraintFact, TimeoutSetting, TimeoutSettingValue, TypeCreationKind,
+    ReindexTargetKindFact, RelationTargetFact, ReplicaIdentityFact, ResetSettingTarget,
+    SearchPathTarget, StatementFact, TableConstraintFact, TimeoutSetting, TimeoutSettingValue,
+    TypeCreationKind,
 };
 use crate::_internal::ast::identifiers::{Ident, QualifiedName};
 use squawk_syntax::ast::{
@@ -14,7 +16,7 @@ use squawk_syntax::ast::{
     DetachPartition, DropDomain, DropIndex, DropMaterializedView, DropPolicy, DropSequence,
     DropTable, DropTrigger, DropType, DropView, Grant, Lock, NameRef, PartitionBy, PartitionType,
     Path, PathSegment, PathSegmentRef, RelationNameRef, ReleaseSavepoint, Revoke, RevokeCommand,
-    Rollback, SelectInto, Set, Stmt, TableArg, TableConstraint, Truncate,
+    Rollback, SchemaRef, SelectInto, Set, SetSchema, Stmt, TableArg, TableConstraint, Truncate,
 };
 use squawk_syntax::{SyntaxKind, ast};
 
@@ -176,6 +178,7 @@ impl AstVisitor {
                     is_full: node.is_full(),
                 });
             }
+            Stmt::Reindex(node) => return Self::extract_reindex_fact(node),
             _ => {}
         }
 
@@ -324,6 +327,53 @@ impl AstVisitor {
         }
 
         None
+    }
+
+    fn extract_reindex_fact(node: &ast::Reindex) -> Option<StatementFact> {
+        let target = node.reindex_target()?;
+        let concurrently = node.is_concurrently();
+
+        let (target_kind, target_name) = match target {
+            ast::ReindexTarget::ReindexTargetDatabase(db) => {
+                let name = db
+                    .database_ref()
+                    .and_then(|r| r.ident_token())
+                    .map(|t| QualifiedName::new(None, Self::identifier_from_token(t.text())));
+                (ReindexTargetKindFact::Database, name)
+            }
+            ast::ReindexTarget::ReindexTargetIndex(idx) => {
+                let name = idx
+                    .index_ref()
+                    .and_then(|r| Self::path_ref_to_qualified_name(&r.path_ref()?));
+                (ReindexTargetKindFact::Index, name)
+            }
+            ast::ReindexTarget::ReindexTargetSchema(schema) => {
+                let name = schema
+                    .schema_ref()
+                    .and_then(|r| r.ident_token())
+                    .map(|t| QualifiedName::new(None, Self::identifier_from_token(t.text())));
+                (ReindexTargetKindFact::Schema, name)
+            }
+            ast::ReindexTarget::ReindexTargetSystem(sys) => {
+                let name = sys
+                    .database_ref()
+                    .and_then(|r| r.ident_token())
+                    .map(|t| QualifiedName::new(None, Self::identifier_from_token(t.text())));
+                (ReindexTargetKindFact::System, name)
+            }
+            ast::ReindexTarget::ReindexTargetTable(table) => {
+                let name = table
+                    .table_name_ref()
+                    .and_then(|r| Self::path_ref_to_qualified_name(&r.path_ref()?));
+                (ReindexTargetKindFact::Table, name)
+            }
+        };
+
+        Some(StatementFact::Reindex {
+            target_kind,
+            target_name,
+            concurrently,
+        })
     }
 
     fn extract_create_schema(node: &ast::CreateSchema) -> Option<StatementFact> {
@@ -520,6 +570,7 @@ impl AstVisitor {
         if on_commit.is_some() && !matches!(persistence, PersistenceFact::Temporary) {
             return None;
         }
+
         Some(StatementFact::CreateTable {
             name: Self::path_to_qualified_name(&path)?,
             if_not_exists: node.if_not_exists().is_some(),
@@ -571,36 +622,7 @@ impl AstVisitor {
         });
         let select_outputs = node
             .select_clause()
-            .and_then(|select| select.target_list())
-            .and_then(|targets| {
-                targets
-                    .targets()
-                    .map(|target| {
-                        if target.star_token().is_some() {
-                            return Some(
-                                crate::_internal::analysis::facts::SelectOutputFact::AllColumns,
-                            );
-                        }
-                        let ast::Expr::NameRef(name) = target.expr()? else {
-                            return None;
-                        };
-                        let source_name =
-                            Self::resolve_identifier_token(name.syntax().first_token()?.text());
-                        let output_name = target
-                            .as_name()
-                            .and_then(|alias| alias.name())
-                            .and_then(|name| name.syntax().first_token())
-                            .map(|token| Self::resolve_identifier_token(token.text()))
-                            .unwrap_or_else(|| source_name.clone());
-                        Some(
-                            crate::_internal::analysis::facts::SelectOutputFact::Column {
-                                source_name,
-                                output_name,
-                            },
-                        )
-                    })
-                    .collect::<Option<Vec<_>>>()
-            });
+            .and_then(|select| Self::extract_select_outputs(&select));
         let select_projection_complete = select_source.is_some() && select_outputs.is_some();
         Some(StatementFact::CreateTable {
             name: Self::path_to_qualified_name(&name)?,
@@ -1049,24 +1071,29 @@ impl AstVisitor {
                     };
                     actions.push(AlterTableActionFact::EnableTrigger { trigger_name });
                 }
-                AlterTableAction::SetSchema(ss) => {
-                    if let Some(nr) = ss.schema_ref().and_then(|sr| sr.ident_token()) {
-                        actions.push(AlterTableActionFact::SetSchema {
-                            new_schema: Self::resolve_identifier_token(nr.text()),
+                AlterTableAction::SetSchema(ss) => match ss.schema_ref() {
+                    Some(schema_ref) => actions.push(AlterTableActionFact::SetSchema {
+                        new_schema: Self::resolve_schema_ref(&schema_ref),
+                    }),
+                    None => unsupported_action = true,
+                },
+                AlterTableAction::SetTablespace(st) => {
+                    match st.tablespace_ref().and_then(|tr| tr.ident_token()) {
+                        Some(token) => {
+                            let tablespace = Self::resolve_identifier_token(token.text());
+                            actions.push(AlterTableActionFact::SetTablespace { tablespace });
+                        }
+                        None => unsupported_action = true,
+                    }
+                }
+                AlterTableAction::OwnerTo(ot) => match ot.role_ref() {
+                    Some(role) => {
+                        actions.push(AlterTableActionFact::OwnerTo {
+                            new_owner: Self::extract_role(&role),
                         });
                     }
-                }
-                AlterTableAction::SetTablespace(st) => {
-                    if let Some(token) = st.tablespace_ref().and_then(|tr| tr.ident_token()) {
-                        let tablespace = Self::resolve_identifier_token(token.text());
-                        actions.push(AlterTableActionFact::SetTablespace { tablespace });
-                    }
-                }
-                AlterTableAction::OwnerTo(ot) => {
-                    if let Some(new_owner) = ot.role_ref().map(|role| Self::extract_role(&role)) {
-                        actions.push(AlterTableActionFact::OwnerTo { new_owner });
-                    }
-                }
+                    None => unsupported_action = true,
+                },
                 AlterTableAction::SetLogged(_) => {
                     actions.push(AlterTableActionFact::SetLogged);
                 }
@@ -1275,6 +1302,20 @@ impl AstVisitor {
             }
         }
 
+        // The parser does not always put SET SCHEMA in the action list, so
+        // fall back to the direct child when the loop did not supply one.
+        for child in node.syntax().children() {
+            if let Some(ss) = SetSchema::cast(child)
+                && !actions
+                    .iter()
+                    .any(|a| matches!(a, AlterTableActionFact::SetSchema { .. }))
+                && let Some(schema_ref) = ss.schema_ref()
+            {
+                actions.push(AlterTableActionFact::SetSchema {
+                    new_schema: Self::resolve_schema_ref(&schema_ref),
+                });
+            }
+        }
         if unsupported_action {
             return None;
         }
@@ -2108,25 +2149,108 @@ impl AstVisitor {
     }
 
     fn extract_alter_index(node: &AlterIndex) -> Option<StatementFact> {
+        // Two grammar shapes: a per-index action list (IndexRef child), and the
+        // bulk relocation form `ALL IN TABLESPACE src SET TABLESPACE dst`
+        // (AllInTablespace child; no index_ref). The bulk form has no single
+        // index to validate, so it becomes its own advisory fact.
+        if let Some(all) = node.all_in_tablespace() {
+            let source = all.tablespace_ref()?.ident_token()?;
+            let target = all.set_tablespace()?.tablespace_ref()?.ident_token()?;
+            return Some(StatementFact::AlterIndexAllInTablespace {
+                source_tablespace: Self::identifier_from_token(source.text()),
+                target_tablespace: Self::identifier_from_token(target.text()),
+            });
+        }
+
         let path = node.index_ref()?.path_ref()?;
         let name = Self::path_ref_to_qualified_name(&path)?;
+        let if_exists = node.if_exists().is_some();
         let mut actions = Vec::new();
 
-        if let Some(squawk_syntax::ast::AlterIndexAction::IndexRenameTo(rt)) = node.action()
-            && let Some(new_name_node) = rt
-                .index()
-                .and_then(|i| i.path())
-                .and_then(|p| Self::path_to_qualified_name(&p))
-        {
-            actions.push(AlterIndexActionFact::RenameTo {
-                new_name: new_name_node.name,
-            });
+        match node.action()? {
+            squawk_syntax::ast::AlterIndexAction::IndexRenameTo(rt) => {
+                let new_name = rt
+                    .index()
+                    .and_then(|i| i.path())
+                    .and_then(|p| Self::path_to_qualified_name(&p))?;
+                actions.push(AlterIndexActionFact::RenameTo {
+                    new_name: new_name.name,
+                });
+            }
+            squawk_syntax::ast::AlterIndexAction::SetTablespace(st) => {
+                let ts = st.tablespace_ref()?.ident_token()?;
+                actions.push(AlterIndexActionFact::SetTablespace {
+                    new_tablespace: Self::identifier_from_token(ts.text()),
+                });
+            }
+            squawk_syntax::ast::AlterIndexAction::AttachIndexPartition(ap) => {
+                let partition_path = ap.index_ref()?.path_ref()?;
+                let partition_name = Self::path_ref_to_qualified_name(&partition_path)?;
+                actions.push(AlterIndexActionFact::AttachPartition { partition_name });
+            }
+            squawk_syntax::ast::AlterIndexAction::DependsOnExtension(dep) => {
+                let ext = dep.extension_ref()?.ident_token()?;
+                actions.push(AlterIndexActionFact::DependsOnExtension {
+                    extension_name: Self::identifier_from_token(ext.text()),
+                });
+            }
+            squawk_syntax::ast::AlterIndexAction::NoDependsOnExtension(dep) => {
+                let ext = dep.extension_ref()?.ident_token()?;
+                actions.push(AlterIndexActionFact::NoDependsOnExtension {
+                    extension_name: Self::identifier_from_token(ext.text()),
+                });
+            }
+            squawk_syntax::ast::AlterIndexAction::AlterSetStatistics(ss) => {
+                // PostgreSQL requires a column, by name or 1-based number;
+                // the bare form is a syntax error.
+                let column = if let Some(name_ref) = ss.column_name_ref() {
+                    let name = name_ref.ident_token()?.text().to_string();
+                    IndexStatisticsColumn::Name(Self::identifier_from_token(&name).resolve())
+                } else {
+                    let number = ss.expr()?.syntax().text().to_string();
+                    IndexStatisticsColumn::Number(number.parse::<i32>().ok()?)
+                };
+                if let Some(stat_node) = ss.set_statistics() {
+                    let target = if stat_node.default_token().is_some() {
+                        crate::_internal::analysis::facts::StatisticsTarget::Default
+                    } else {
+                        let n = stat_node
+                            .expr()?
+                            .syntax()
+                            .text()
+                            .to_string()
+                            .parse::<i32>()
+                            .ok()?;
+                        crate::_internal::analysis::facts::StatisticsTarget::Value(n)
+                    };
+                    actions.push(AlterIndexActionFact::SetStatistics { column, target });
+                } else {
+                    // The SetOptions child may be absent from an unannotated
+                    // degenerate form; propagating None models nothing rather
+                    // than silently degrading a reachable SET (options) form.
+                    let so = ss.set_options()?;
+                    let options = Self::extract_attribute_list(so.attribute_list());
+                    actions.push(AlterIndexActionFact::SetOptions { options });
+                }
+            }
+            squawk_syntax::ast::AlterIndexAction::SetOptions(so) => {
+                let options = Self::extract_attribute_list(so.attribute_list());
+                actions.push(AlterIndexActionFact::SetOptions { options });
+            }
+            squawk_syntax::ast::AlterIndexAction::ResetOptions(ro) => {
+                let options = Self::extract_attribute_list(ro.attribute_list());
+                actions.push(AlterIndexActionFact::ResetOptions { options });
+            }
         }
 
         if actions.is_empty() {
             return None;
         }
-        Some(StatementFact::AlterIndex { name, actions })
+        Some(StatementFact::AlterIndex {
+            name,
+            if_exists,
+            actions,
+        })
     }
 
     fn extract_drop_index(node: &DropIndex) -> Option<StatementFact> {
@@ -2146,6 +2270,40 @@ impl AstVisitor {
         })
     }
 
+    /// Output columns of a `SELECT`, or `None` when the projection is anything
+    /// other than plain column references. A view's column types come from
+    /// analysing the query, so an expression output cannot be typed offline.
+    fn extract_select_outputs(
+        select: &ast::SelectClause,
+    ) -> Option<Vec<crate::_internal::analysis::facts::SelectOutputFact>> {
+        select
+            .target_list()?
+            .targets()
+            .map(|target| {
+                if target.star_token().is_some() {
+                    return Some(crate::_internal::analysis::facts::SelectOutputFact::AllColumns);
+                }
+                let ast::Expr::NameRef(name) = target.expr()? else {
+                    return None;
+                };
+                let source_name =
+                    Self::resolve_identifier_token(name.syntax().first_token()?.text());
+                let output_name = target
+                    .as_name()
+                    .and_then(|alias| alias.name())
+                    .and_then(|name| name.syntax().first_token())
+                    .map(|token| Self::resolve_identifier_token(token.text()))
+                    .unwrap_or_else(|| source_name.clone());
+                Some(
+                    crate::_internal::analysis::facts::SelectOutputFact::Column {
+                        source_name,
+                        output_name,
+                    },
+                )
+            })
+            .collect::<Option<Vec<_>>>()
+    }
+
     fn extract_create_view(node: &CreateView) -> Option<StatementFact> {
         // View options and WITH CHECK OPTION alter write/security semantics
         // that are not represented by the relation state or dependency graph.
@@ -2153,10 +2311,45 @@ impl AstVisitor {
             return None;
         }
         let path = node.view()?.path()?;
+        // Only a plain `SELECT` exposes a target list. Compound, parenthesized
+        // and `VALUES` queries still create the view, but its columns are then
+        // unknown, so the projection is left incomplete.
+        let (select_source, select_outputs) = match node.query() {
+            Some(ast::SelectVariant::Select(select)) => {
+                let source = select.from_clause().and_then(|from| {
+                    let mut items = from.items();
+                    let item = items.next()?;
+                    if items.next().is_some() {
+                        return None;
+                    }
+                    let ast::FromListItem::FromItem(ast::FromItem::RelationFromItem(relation)) =
+                        item
+                    else {
+                        return None;
+                    };
+                    if relation.tablesample_clause().is_some() {
+                        return None;
+                    }
+                    relation
+                        .relation_name_ref()?
+                        .path_ref()
+                        .and_then(|path| Self::path_ref_to_qualified_name(&path))
+                });
+                let outputs = select
+                    .select_clause()
+                    .and_then(|clause| Self::extract_select_outputs(&clause));
+                (source, outputs)
+            }
+            _ => (None, None),
+        };
+        let select_projection_complete = select_source.is_some() && select_outputs.is_some();
         Some(StatementFact::CreateView {
             name: Self::path_to_qualified_name(&path)?,
             or_replace: node.or_replace().is_some(),
             depends_on: Self::extract_view_dependencies(node.syntax()),
+            select_outputs: select_outputs.unwrap_or_default(),
+            select_projection_complete,
+            select_source,
         })
     }
 
@@ -2193,12 +2386,23 @@ impl AstVisitor {
                     },
                 })
             }
-            ast::AlterViewAction::AlterViewColumn(_) => {
-                // View column defaults are not represented by the relation
-                // state and the resolver has no corresponding mutation.
-                // Keep these parser-valid actions opaque rather than
-                // returning a fact that is silently discarded.
-                None
+            ast::AlterViewAction::AlterViewColumn(avc) => {
+                let col_token = avc.name()?.ident_token()?;
+                let column = Self::resolve_identifier_token(col_token.text());
+                let action = match avc.alter_view_column_action()? {
+                    ast::AlterViewColumnAction::SetDefault(sd) => {
+                        crate::_internal::analysis::facts::AlterViewAction::SetDefault {
+                            column,
+                            default: sd.expr().map(
+                                crate::_internal::analysis::expr_visitor::ExprVisitor::convert,
+                            ),
+                        }
+                    }
+                    ast::AlterViewColumnAction::DropDefault(_) => {
+                        crate::_internal::analysis::facts::AlterViewAction::DropDefault { column }
+                    }
+                };
+                Some(StatementFact::AlterView { name, action })
             }
             ast::AlterViewAction::RenameColumn(rc) => {
                 let from_token = rc.column_name_ref()?.ident_token()?;
@@ -2215,7 +2419,24 @@ impl AstVisitor {
                     },
                 })
             }
-            ast::AlterViewAction::SetOptions(_) | ast::AlterViewAction::ResetOptions(_) => None,
+            ast::AlterViewAction::SetOptions(so) => {
+                let options = Self::extract_attribute_list(so.attribute_list());
+                Some(StatementFact::AlterView {
+                    name,
+                    action: crate::_internal::analysis::facts::AlterViewAction::SetOptions {
+                        options,
+                    },
+                })
+            }
+            ast::AlterViewAction::ResetOptions(ro) => {
+                let options = Self::extract_attribute_list(ro.attribute_list());
+                Some(StatementFact::AlterView {
+                    name,
+                    action: crate::_internal::analysis::facts::AlterViewAction::ResetOptions {
+                        options,
+                    },
+                })
+            }
         }
     }
 
@@ -2238,23 +2459,109 @@ impl AstVisitor {
 
     fn extract_alter_materialized_view(node: &ast::AlterMaterializedView) -> Option<StatementFact> {
         let path = node.view_ref()?.path_ref()?;
-        let Some(squawk_syntax::ast::AlterMaterializedViewAction::ViewRenameTo(rt)) =
-            node.action().next()
-        else {
-            // SET SCHEMA, column changes, extension dependencies, and other
-            // parser-valid actions are not represented by this mutation.
-            // Do not turn them into a fact with no resolver mutation.
-            return None;
+        let name = Self::path_ref_to_qualified_name(&path)?;
+        let action_node = node.action().next()?;
+
+        let action = match action_node {
+            ast::AlterMaterializedViewAction::ViewRenameTo(rt) => {
+                let segment = rt.view()?.path()?.segment()?;
+                crate::_internal::analysis::facts::AlterMaterializedViewActionFact::RenameTo {
+                    new_name: Self::identifier_from_name(segment.text(), segment.is_quoted()),
+                }
+            }
+            ast::AlterMaterializedViewAction::SetSchema(ss) => {
+                let token = ss.schema_ref()?.ident_token()?;
+                crate::_internal::analysis::facts::AlterMaterializedViewActionFact::SetSchema {
+                    new_schema: Self::resolve_identifier_token(token.text()),
+                }
+            }
+            ast::AlterMaterializedViewAction::RenameColumn(rc) => {
+                let from_token = rc.column_name_ref()?.ident_token()?;
+                let from = Self::identifier_from_token(from_token.text());
+
+                let to_token = rc.column_name()?.ident_token()?;
+                let to = Self::identifier_from_token(to_token.text());
+
+                crate::_internal::analysis::facts::AlterMaterializedViewActionFact::RenameColumn {
+                    from,
+                    to,
+                }
+            }
+            ast::AlterMaterializedViewAction::DependsOnExtension(d) => {
+                let ext_token = d.extension_ref()?.ident_token()?;
+                crate::_internal::analysis::facts::AlterMaterializedViewActionFact::DependsOnExtension {
+                    extension_name: Self::identifier_from_token(ext_token.text()),
+                }
+            }
+            ast::AlterMaterializedViewAction::NoDependsOnExtension(nd) => {
+                let ext_token = nd.extension_ref()?.ident_token()?;
+                crate::_internal::analysis::facts::AlterMaterializedViewActionFact::NoDependsOnExtension {
+                    extension_name: Self::identifier_from_token(ext_token.text()),
+                }
+            }
+            ast::AlterMaterializedViewAction::AlterTableAction(ata) => {
+                match ata {
+                    ast::AlterTableAction::SetOptions(so) => {
+                        crate::_internal::analysis::facts::AlterMaterializedViewActionFact::SetOptions {
+                            options: Self::extract_attribute_list(so.attribute_list()),
+                        }
+                    }
+                    ast::AlterTableAction::ResetOptions(ro) => {
+                        crate::_internal::analysis::facts::AlterMaterializedViewActionFact::ResetOptions {
+                            options: Self::extract_attribute_list(ro.attribute_list()),
+                        }
+                    }
+                    ast::AlterTableAction::ClusterOn(co) => {
+                        let idx_path = co.index_ref()?.path_ref()?;
+                        crate::_internal::analysis::facts::AlterMaterializedViewActionFact::ClusterOn {
+                            index_name: Self::path_ref_to_qualified_name(&idx_path)?.name,
+                        }
+                    }
+                    ast::AlterTableAction::SetWithoutCluster(_) => {
+                        crate::_internal::analysis::facts::AlterMaterializedViewActionFact::SetWithoutCluster
+                    }
+                    ast::AlterTableAction::SetTablespace(st) => {
+                        let ts = st.tablespace_ref()?.ident_token()?;
+                        crate::_internal::analysis::facts::AlterMaterializedViewActionFact::SetTablespace {
+                            new_tablespace: Self::identifier_from_token(ts.text()),
+                        }
+                    }
+                    ast::AlterTableAction::SetAccessMethod(sam) => {
+                        let am = sam.access_method_ref()?.ident_token()?;
+                        crate::_internal::analysis::facts::AlterMaterializedViewActionFact::SetAccessMethod {
+                            new_access_method: Self::identifier_from_token(am.text()),
+                        }
+                    }
+                    ast::AlterTableAction::AlterColumn(ac) => {
+                        let col_name_ref = ac.column_name_ref()?;
+                        let col_name = Self::resolve_identifier_token(col_name_ref.ident_token()?.text());
+                        match ac.option()? {
+                            ast::AlterColumnOption::SetStorage(ss) => {
+                                crate::_internal::analysis::facts::AlterMaterializedViewActionFact::SetStorage {
+                                    column: col_name,
+                                    storage: ss.storage_mode()?.syntax().text().to_string(),
+                                }
+                            }
+                            ast::AlterColumnOption::SetCompression(sc) => {
+                                crate::_internal::analysis::facts::AlterMaterializedViewActionFact::SetCompression {
+                                    column: col_name,
+                                    compression: sc.compression_method_name()?.syntax().text().to_string(),
+                                }
+                            }
+                            _ => return None,
+                        }
+                    }
+                    ast::AlterTableAction::OwnerTo(ot) => {
+                        crate::_internal::analysis::facts::AlterMaterializedViewActionFact::OwnerTo {
+                            new_owner: Self::extract_role(&ot.role_ref()?),
+                        }
+                    }
+                    _ => return None,
+                }
+            }
         };
-        let segment = rt.view()?.path()?.segment()?;
-        let new_name = Some(Self::identifier_from_name(
-            segment.text(),
-            segment.is_quoted(),
-        ));
-        Some(StatementFact::AlterMaterializedView {
-            name: Self::path_ref_to_qualified_name(&path)?,
-            new_name,
-        })
+
+        Some(StatementFact::AlterMaterializedView { name, action })
     }
 
     fn extract_refresh(node: &ast::Refresh) -> Option<StatementFact> {
@@ -2617,9 +2924,10 @@ impl AstVisitor {
                     })
                     .collect::<Option<Vec<_>>>()?,
             },
-            // Range/base types carry subtype or function metadata that the
-            // state model does not retain.
-            ast::CreateTypeKind::RangeType(_) | ast::CreateTypeKind::BaseType(_) => return None,
+            // The model records these kinds without their subtype or I/O
+            // metadata, matching what the catalog sync reports for them.
+            ast::CreateTypeKind::RangeType(_) => TypeCreationKind::Range,
+            ast::CreateTypeKind::BaseType(_) => TypeCreationKind::Base,
         };
 
         Some(StatementFact::CreateType(CreateTypeFact { name, kind }))
@@ -4636,6 +4944,15 @@ impl AstVisitor {
             }
         }
         keys
+    }
+
+    // Schema name from a SchemaRef, which the parser builds either as a leaf
+    // node or one wrapping an identifier token.
+    fn resolve_schema_ref(schema_ref: &SchemaRef) -> String {
+        schema_ref.ident_token().map_or_else(
+            || Self::resolve_identifier_token(schema_ref.syntax().text().to_string()),
+            |token| Self::resolve_identifier_token(token.text()),
+        )
     }
 
     fn resolve_identifier_token(text: impl AsRef<str>) -> String {
