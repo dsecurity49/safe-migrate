@@ -1,5 +1,5 @@
 use crate::_internal::analysis::mutations::Mutation;
-use crate::_internal::analysis::state::MutationResult;
+
 use crate::_internal::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
 use crate::_internal::rules::{Rule, RuleContext};
 
@@ -21,12 +21,12 @@ impl Rule for OverbroadGrantRule {
         // state matrix intentionally skips it because grant chains are not
         // modeled, but that uncertainty must not suppress the syntax-level
         // warning for a statement PostgreSQL will execute.
-        let skipped_grant_option = *context.result() == MutationResult::Skipped
+        let skipped_grant_option = context.result().is_unresolved()
             && matches!(
                 context.mutation(),
                 Mutation::Grant(grant) if grant.with_grant_option
             );
-        if *context.result() == MutationResult::Skipped && !skipped_grant_option {
+        if context.result().is_unresolved() && !skipped_grant_option {
             return vec![];
         }
         let mut violations = Vec::new();

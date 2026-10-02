@@ -56,7 +56,7 @@ impl Rule for CascadingDropRule {
             }
         }
 
-        if !matches!(result, MutationResult::Conflict { .. })
+        if !matches!(result, MutationResult::Conflict(_))
             && let Mutation::DropTable(drop) = mutation
             && drop.cascade
             && let Some(closure) = cascade_closure
@@ -153,7 +153,7 @@ impl Rule for SizeAwareAddColumnRule {
         let pre_state = context.pre_state();
         let state = context.state();
         let config = context.config();
-        if *result == MutationResult::Skipped {
+        if result.is_unresolved() {
             return vec![];
         }
 
@@ -370,7 +370,7 @@ impl Rule for CreateTableAsSelectRule {
     fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
         let mutation = context.mutation();
         let result = context.result();
-        if *result == MutationResult::Skipped {
+        if result.is_unresolved() || result.is_noop() {
             return vec![];
         }
         if let Mutation::CreateTable(c) = mutation
@@ -436,7 +436,7 @@ impl Rule for ReversibilityRule {
         let pre_state = context.pre_state();
         let state = context.state();
         let config = context.config();
-        let skipped_known_drop_column = *result == MutationResult::Skipped
+        let skipped_known_drop_column = result.is_unresolved()
             && matches!(
                 mutation,
                 Mutation::AlterTable(crate::_internal::analysis::mutations::AlterTable {
@@ -769,7 +769,7 @@ impl Rule for TypeChangeRewriteRule {
         // Keep the rewrite warning conservative in that case; silently
         // dropping it would turn an uncertain ACCESS EXCLUSIVE operation into
         // a false clean result. Other skipped mutations remain non-events.
-        if *result == MutationResult::Skipped
+        if result.is_unresolved()
             && !matches!(
                 mutation,
                 Mutation::AlterTable(crate::_internal::analysis::mutations::AlterTable {

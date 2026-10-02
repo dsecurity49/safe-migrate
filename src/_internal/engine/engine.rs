@@ -381,7 +381,7 @@ impl SafeMigrateEngine {
 
                 statement_failed = matches!(
                     result,
-                    crate::_internal::analysis::state::MutationResult::Conflict { .. }
+                    crate::_internal::analysis::state::MutationResult::Conflict(_)
                 );
                 if statement_failed {
                     let transaction_aborted = state.transaction_is_aborted();

@@ -1,5 +1,5 @@
 use crate::_internal::analysis::mutations::{AlterTableActionMutation, Mutation};
-use crate::_internal::analysis::state::MutationResult;
+
 use crate::_internal::model::relation::Persistence;
 use crate::_internal::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
 use crate::_internal::rules::{BASELINE_STATS_CAPABILITIES, Rule, RuleCapability, RuleContext};
@@ -22,7 +22,7 @@ impl Rule for BlockingConstraintRule {
     }
 
     fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
-        if *context.result() == MutationResult::Skipped {
+        if context.result().is_unresolved() {
             return vec![];
         }
 

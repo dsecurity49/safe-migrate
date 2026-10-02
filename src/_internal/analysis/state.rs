@@ -39,16 +39,61 @@ pub(crate) enum Confidence {
     Tainted,
 }
 
+/// Why PostgreSQL rejects a statement against known state.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ConflictKind {
+    /// A `CONCURRENTLY` operation cannot run inside a transaction block.
+    ConcurrentInTransaction,
+    /// Any other statement PostgreSQL rejects.
+    Rejected { reason: String },
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum MutationResult {
     Applied,
-    Skipped,
+    /// PostgreSQL executed the statement but nothing in the modeled state
+    /// changed, so no dependent rule can observe a difference.
+    NoOp,
     /// PostgreSQL did not execute this statement because an earlier statement
     /// aborted the active transaction.
     NotExecuted,
-    Conflict {
-        reason: String,
-    },
+    /// The modeled outcome cannot be stated, and this is the evidence recorded
+    /// for it. The cause rides on the result so a rule never re-derives it.
+    Unresolved(EvidenceCode),
+    Conflict(ConflictKind),
+}
+
+impl MutationResult {
+    pub(crate) fn is_unresolved(&self) -> bool {
+        matches!(self, Self::Unresolved(_))
+    }
+
+    /// PostgreSQL ran the statement but the modeled state did not change, so a
+    /// rule whose finding depends on a transition cannot have observed one.
+    pub(crate) fn is_noop(&self) -> bool {
+        matches!(self, Self::NoOp)
+    }
+
+    pub(crate) fn conflict(reason: impl Into<String>) -> Self {
+        Self::Conflict(ConflictKind::Rejected {
+            reason: reason.into(),
+        })
+    }
+
+    pub(crate) fn is_concurrent_transaction_conflict(&self) -> bool {
+        matches!(self, Self::Conflict(ConflictKind::ConcurrentInTransaction))
+    }
+
+    /// The PostgreSQL-facing message for a rejected statement.
+    pub(crate) fn conflict_reason(&self) -> Option<&str> {
+        match self {
+            Self::Conflict(ConflictKind::Rejected { reason }) => Some(reason.as_str()),
+            Self::Conflict(ConflictKind::ConcurrentInTransaction) => {
+                Some("CONCURRENTLY operation cannot run inside a transaction block")
+            }
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1614,18 +1659,11 @@ impl AnalysisState {
     {
         match self.relation_lookup(id, expected) {
             ObjectLookup::Present => Ok(()),
-            ObjectLookup::WrongKind => Err(MutationResult::Conflict {
-                reason: wrong_kind_reason,
-            }),
+            ObjectLookup::WrongKind => Err(MutationResult::conflict(wrong_kind_reason)),
             ObjectLookup::AuthoritativelyAbsent | ObjectLookup::Tombstone => {
-                Err(MutationResult::Conflict {
-                    reason: missing_reason,
-                })
+                Err(MutationResult::conflict(missing_reason))
             }
-            ObjectLookup::Unknown => {
-                self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
-                Err(MutationResult::Skipped)
-            }
+            ObjectLookup::Unknown => Err(self.unresolved(EvidenceCode::UnknownObjectState)),
         }
     }
 
@@ -1654,25 +1692,16 @@ impl AnalysisState {
     ) -> Result<(), MutationResult> {
         match self.local.functions.get(id) {
             Some(FunctionOverlay::Present(function)) if function.routine_kind == expected => Ok(()),
-            Some(FunctionOverlay::Present(_)) => Err(MutationResult::Conflict {
-                reason: wrong_kind_reason,
-            }),
-            Some(FunctionOverlay::Dropped) => Err(MutationResult::Conflict {
-                reason: missing_reason,
-            }),
+            Some(FunctionOverlay::Present(_)) => Err(MutationResult::conflict(wrong_kind_reason)),
+            Some(FunctionOverlay::Dropped) => Err(MutationResult::conflict(missing_reason)),
             None if self.baseline_covers_family_object(
                 id,
                 crate::_internal::db::cache::CatalogFamily::Routines,
             ) =>
             {
-                Err(MutationResult::Conflict {
-                    reason: missing_reason,
-                })
+                Err(MutationResult::conflict(missing_reason))
             }
-            None => {
-                self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
-                Err(MutationResult::Skipped)
-            }
+            None => Err(self.unresolved(EvidenceCode::UnknownObjectState)),
         }
     }
 
@@ -1690,18 +1719,13 @@ impl AnalysisState {
         match self.schema_lookup(schema) {
             ObjectLookup::Present => Ok(()),
             ObjectLookup::Tombstone | ObjectLookup::AuthoritativelyAbsent => {
-                Err(MutationResult::Conflict {
-                    reason: if schema.is_empty() {
-                        "no schema has been selected to create in".to_string()
-                    } else {
-                        format!("schema '{}' does not exist", schema)
-                    },
-                })
+                Err(MutationResult::conflict(if schema.is_empty() {
+                    "no schema has been selected to create in".to_string()
+                } else {
+                    format!("schema '{}' does not exist", schema)
+                }))
             }
-            ObjectLookup::Unknown => {
-                self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
-                Err(MutationResult::Skipped)
-            }
+            ObjectLookup::Unknown => Err(self.unresolved(EvidenceCode::UnknownObjectState)),
             ObjectLookup::WrongKind => {
                 unreachable!("schemas do not share an overlay with other object kinds")
             }
@@ -3069,8 +3093,7 @@ impl AnalysisState {
         }
 
         let result = self.apply_inner(mutation, precomputed_cascade);
-        if matches!(result, MutationResult::Conflict { .. }) && !self.local.transactions.is_empty()
-        {
+        if matches!(result, MutationResult::Conflict(_)) && !self.local.transactions.is_empty() {
             self.local.transaction_aborted = true;
         }
         // Keep the derived dependency indexes inside their invariant boundary
@@ -3304,11 +3327,9 @@ impl AnalysisState {
         }
         self.ensure_schema_target(&new_id.schema)?;
         match self.local.functions.get(new_id) {
-            Some(crate::_internal::model::function::FunctionOverlay::Present(_)) => {
-                Err(MutationResult::Conflict {
-                    reason: format!("routine '{}' already exists", new_id),
-                })
-            }
+            Some(crate::_internal::model::function::FunctionOverlay::Present(_)) => Err(
+                MutationResult::conflict(format!("routine '{}' already exists", new_id)),
+            ),
             // A prior DROP in this migration leaves a tombstone but the
             // namespace is available again, just as it is in PostgreSQL.
             Some(crate::_internal::model::function::FunctionOverlay::Dropped) => Ok(()),
@@ -3473,6 +3494,19 @@ impl AnalysisState {
 
     pub(crate) fn taint(&mut self, code: EvidenceCode, scope: EvidenceScope) {
         self.record_evidence(EvidenceRecord::new(code, scope));
+    }
+
+    /// Record `code` and return the outcome carrying it, so the reported
+    /// evidence and the rule-visible cause cannot disagree.
+    pub(crate) fn unresolved(&mut self, code: EvidenceCode) -> MutationResult {
+        self.taint(code, EvidenceScope::Chain);
+        MutationResult::Unresolved(code)
+    }
+
+    /// `unresolved` for a cause that stays scoped to its own statement.
+    pub(crate) fn unresolved_statement(&mut self, code: EvidenceCode) -> MutationResult {
+        self.taint(code, EvidenceScope::Statement);
+        MutationResult::Unresolved(code)
     }
 
     pub(crate) fn set_evidence_location(&mut self, location: Option<EvidenceLocation>) {
@@ -3805,7 +3839,7 @@ mod evidence_tests {
             None,
         );
 
-        assert!(matches!(result, MutationResult::Conflict { .. }));
+        assert!(matches!(result, MutationResult::Conflict(_)));
         assert!(
             state
                 .evidence()
@@ -3831,7 +3865,10 @@ mod evidence_tests {
             None,
         );
 
-        assert_eq!(result, MutationResult::Skipped);
+        assert_eq!(
+            result,
+            MutationResult::Unresolved(EvidenceCode::UnknownObjectState)
+        );
         assert!(
             state
                 .evidence()
@@ -3859,7 +3896,10 @@ mod evidence_tests {
             None,
         );
 
-        assert_eq!(result, MutationResult::Skipped);
+        assert_eq!(
+            result,
+            MutationResult::Unresolved(EvidenceCode::UnknownObjectState)
+        );
         assert!(
             state
                 .evidence()
@@ -3918,7 +3958,10 @@ mod evidence_tests {
             None,
         );
 
-        assert_eq!(result, MutationResult::Skipped);
+        assert_eq!(
+            result,
+            MutationResult::Unresolved(EvidenceCode::UnknownObjectState)
+        );
         assert!(
             state
                 .evidence()
@@ -3950,7 +3993,10 @@ mod evidence_tests {
             None,
         );
 
-        assert_eq!(result, MutationResult::Skipped);
+        assert_eq!(
+            result,
+            MutationResult::Unresolved(EvidenceCode::CatalogCoverageIncomplete)
+        );
         assert!(
             state
                 .evidence()
@@ -4025,7 +4071,10 @@ mod evidence_tests {
             }),
             None,
         );
-        assert_eq!(result, MutationResult::Skipped);
+        assert_eq!(
+            result,
+            MutationResult::Unresolved(EvidenceCode::CatalogCoverageIncomplete)
+        );
         assert!(
             state
                 .evidence()
@@ -4066,7 +4115,10 @@ mod evidence_tests {
             ),
             None,
         );
-        assert_eq!(result, MutationResult::Skipped);
+        assert_eq!(
+            result,
+            MutationResult::Unresolved(EvidenceCode::CatalogCoverageIncomplete)
+        );
         assert!(matches!(
             state.local.sequences.get(&sequence_id),
             Some(SequenceOverlay::Present(_))
@@ -4107,7 +4159,10 @@ mod evidence_tests {
             ),
             None,
         );
-        assert_eq!(result, MutationResult::Skipped);
+        assert_eq!(
+            result,
+            MutationResult::Unresolved(EvidenceCode::CatalogCoverageIncomplete)
+        );
         assert!(matches!(
             state.local.sequences.get(&sequence_id),
             Some(SequenceOverlay::Present(_))
@@ -4147,7 +4202,10 @@ mod evidence_tests {
             }),
             None,
         );
-        assert_eq!(result, MutationResult::Skipped);
+        assert_eq!(
+            result,
+            MutationResult::Unresolved(EvidenceCode::CatalogCoverageIncomplete)
+        );
         assert!(state.local.relations.get(&table_id).is_some_and(|overlay| {
             matches!(overlay, RelationOverlay::Present(relation) if relation.has_column("id"))
         }));
@@ -4182,7 +4240,10 @@ mod evidence_tests {
             }),
             None,
         );
-        assert_eq!(result, MutationResult::Skipped);
+        assert_eq!(
+            result,
+            MutationResult::Unresolved(EvidenceCode::CatalogCoverageIncomplete)
+        );
         assert!(matches!(
             state.local.types.get(&type_id),
             Some(crate::_internal::model::types::TypeOverlay::Present(_))
@@ -4235,7 +4296,10 @@ mod evidence_tests {
             ),
             None,
         );
-        assert_eq!(result, MutationResult::Skipped);
+        assert_eq!(
+            result,
+            MutationResult::Unresolved(EvidenceCode::CatalogCoverageIncomplete)
+        );
         assert!(matches!(
             state.local.functions.get(&function_id),
             Some(crate::_internal::model::function::FunctionOverlay::Present(
@@ -4292,7 +4356,7 @@ mod evidence_tests {
                 ),
                 None,
             ),
-            MutationResult::Skipped
+            MutationResult::Unresolved(EvidenceCode::UnmodeledState)
         );
         assert!(
             procedure_state
@@ -4319,7 +4383,7 @@ mod evidence_tests {
                 ),
                 None,
             ),
-            MutationResult::Skipped
+            MutationResult::Unresolved(EvidenceCode::UnmodeledState)
         );
         assert!(
             aggregate_state
@@ -4345,7 +4409,7 @@ mod evidence_tests {
         });
         assert!(matches!(
             state.apply(&concurrent, None),
-            MutationResult::Conflict { .. }
+            MutationResult::Conflict(_)
         ));
 
         let mut state = AnalysisState::new(DbCache::new());
@@ -4358,7 +4422,7 @@ mod evidence_tests {
             });
         assert!(matches!(
             state.apply(&concurrent_cascade, None),
-            MutationResult::Conflict { .. }
+            MutationResult::Conflict(_)
         ));
 
         let mut state = AnalysisState::new(DbCache::new());
@@ -4384,7 +4448,7 @@ mod evidence_tests {
             });
         assert!(matches!(
             state.apply(&concurrent_create, None),
-            MutationResult::Conflict { .. }
+            MutationResult::Conflict(_)
         ));
 
         let mut refresh_state = AnalysisState::new(DbCache::new());
@@ -4400,7 +4464,7 @@ mod evidence_tests {
         );
         assert!(matches!(
             refresh_state.apply(&concurrent_refresh, None),
-            MutationResult::Conflict { .. }
+            MutationResult::Conflict(_)
         ));
 
         let partitioned_table = ObjectId::new("public", "events");
@@ -4429,7 +4493,7 @@ mod evidence_tests {
             });
         assert!(matches!(
             partition_state.apply(&concurrent_partition_index, None),
-            MutationResult::Conflict { .. }
+            MutationResult::Conflict(_)
         ));
 
         let partition_drop_table = ObjectId::new("public", "drop_events");
@@ -4472,7 +4536,7 @@ mod evidence_tests {
                 }),
                 None,
             ),
-            MutationResult::Conflict { .. }
+            MutationResult::Conflict(_)
         ));
     }
 
@@ -4501,7 +4565,7 @@ mod evidence_tests {
             ),
             None,
         );
-        assert!(matches!(result, MutationResult::Conflict { .. }));
+        assert!(matches!(result, MutationResult::Conflict(_)));
     }
 
     #[test]
@@ -4633,7 +4697,10 @@ mod evidence_tests {
             }),
             None,
         );
-        assert_eq!(result, MutationResult::Skipped);
+        assert_eq!(
+            result,
+            MutationResult::Unresolved(EvidenceCode::UnmodeledState)
+        );
         assert!(
             state
                 .evidence()

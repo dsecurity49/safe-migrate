@@ -37,9 +37,10 @@ impl AnalysisState {
     ) -> MutationResult {
         match self.publication_lookup(&p.name) {
             PublicationLookup::Present => {
-                return MutationResult::Conflict {
-                    reason: format!("publication '{}' already exists", p.name),
-                };
+                return MutationResult::conflict(format!(
+                    "publication '{}' already exists",
+                    p.name
+                ));
             }
             PublicationLookup::Unknown => {
                 self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
@@ -51,7 +52,7 @@ impl AnalysisState {
         }
         let scope = self.normalize_publication_scope(&p.scope);
         if let Err(reason) = self.validate_publication_scope(&scope) {
-            return MutationResult::Conflict { reason };
+            return MutationResult::conflict(reason);
         }
         self.taint_inheritance_sensitive_publication_scope(&scope);
         self.snapshot_publication(&p.name);
@@ -157,13 +158,13 @@ impl AnalysisState {
         match self.publication_lookup(&p.name) {
             PublicationLookup::Present => {}
             PublicationLookup::Tombstone | PublicationLookup::AuthoritativelyAbsent => {
-                return MutationResult::Conflict {
-                    reason: format!("publication '{}' does not exist", p.name),
-                };
+                return MutationResult::conflict(format!(
+                    "publication '{}' does not exist",
+                    p.name
+                ));
             }
             PublicationLookup::Unknown => {
-                self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
-                return MutationResult::Skipped;
+                return self.unresolved(EvidenceCode::UnknownObjectState);
             }
             PublicationLookup::WrongKind => {
                 unreachable!("publication names have a dedicated namespace")
@@ -178,13 +179,13 @@ impl AnalysisState {
         {
             match self.publication_lookup(to) {
                 PublicationLookup::Present => {
-                    return MutationResult::Conflict {
-                        reason: format!("publication '{}' already exists", to),
-                    };
+                    return MutationResult::conflict(format!(
+                        "publication '{}' already exists",
+                        to
+                    ));
                 }
                 PublicationLookup::Unknown => {
-                    self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
-                    return MutationResult::Skipped;
+                    return self.unresolved(EvidenceCode::UnknownObjectState);
                 }
                 PublicationLookup::Tombstone
                 | PublicationLookup::AuthoritativelyAbsent
@@ -198,9 +199,7 @@ impl AnalysisState {
             && self.local.roles_known
             && self.present_role(&owner).is_none()
         {
-            return MutationResult::Conflict {
-                reason: format!("role '{}' does not exist", owner),
-            };
+            return MutationResult::conflict(format!("role '{}' does not exist", owner));
         }
         self.snapshot_publication(&p.name);
         self.snapshot_generation_counter();
@@ -222,15 +221,16 @@ impl AnalysisState {
                     additions.clone(),
                 );
                 if let Err(reason) = self.validate_publication_scope(&additions_scope) {
-                    return MutationResult::Conflict { reason };
+                    return MutationResult::conflict(reason);
                 }
                 self.taint_inheritance_sensitive_publication_scope(&additions_scope);
                 let crate::_internal::analysis::facts::PublicationScope::Explicit(mut objects) =
                     current_scope
                 else {
-                    return MutationResult::Conflict {
-                        reason: format!("publication '{}' already includes all tables", p.name),
-                    };
+                    return MutationResult::conflict(format!(
+                        "publication '{}' already includes all tables",
+                        p.name
+                    ));
                 };
                 let mut keys: HashSet<String> = objects
                     .iter()
@@ -239,12 +239,10 @@ impl AnalysisState {
                 for addition in additions {
                     let key = self.publication_object_key(addition);
                     if !keys.insert(key) {
-                        return MutationResult::Conflict {
-                            reason: format!(
-                                "publication '{}' already contains the requested object",
-                                p.name
-                            ),
-                        };
+                        return MutationResult::conflict(format!(
+                            "publication '{}' already contains the requested object",
+                            p.name
+                        ));
                     }
                     objects.push(addition.clone());
                 }
@@ -253,7 +251,7 @@ impl AnalysisState {
             }
             AlterPublicationActionFact::SetObjects(scope) => {
                 if let Err(reason) = self.validate_publication_scope(scope) {
-                    return MutationResult::Conflict { reason };
+                    return MutationResult::conflict(reason);
                 }
                 self.taint_inheritance_sensitive_publication_scope(scope);
                 replacement_scope = Some(scope.clone());
@@ -267,9 +265,10 @@ impl AnalysisState {
                 let crate::_internal::analysis::facts::PublicationScope::Explicit(mut objects) =
                     current_scope
                 else {
-                    return MutationResult::Conflict {
-                        reason: format!("publication '{}' includes all tables", p.name),
-                    };
+                    return MutationResult::conflict(format!(
+                        "publication '{}' includes all tables",
+                        p.name
+                    ));
                 };
                 for removal in removals {
                     let key = self.publication_object_key(removal);
@@ -277,12 +276,10 @@ impl AnalysisState {
                         .iter()
                         .position(|object| self.publication_object_key(object) == key)
                     else {
-                        return MutationResult::Conflict {
-                            reason: format!(
-                                "publication '{}' does not contain the requested object",
-                                p.name
-                            ),
-                        };
+                        return MutationResult::conflict(format!(
+                            "publication '{}' does not contain the requested object",
+                            p.name
+                        ));
                     };
                     objects.remove(position);
                 }
@@ -397,9 +394,10 @@ impl AnalysisState {
                 PublicationLookup::Present => present_names.push(name.clone()),
                 PublicationLookup::Tombstone => {
                     if !p.if_exists {
-                        return MutationResult::Conflict {
-                            reason: format!("publication '{}' does not exist", name),
-                        };
+                        return MutationResult::conflict(format!(
+                            "publication '{}' does not exist",
+                            name
+                        ));
                     }
                 }
                 PublicationLookup::AuthoritativelyAbsent if p.if_exists => {}
@@ -408,13 +406,13 @@ impl AnalysisState {
                     unknown_target = true;
                 }
                 PublicationLookup::AuthoritativelyAbsent => {
-                    return MutationResult::Conflict {
-                        reason: format!("publication '{}' does not exist", name),
-                    };
+                    return MutationResult::conflict(format!(
+                        "publication '{}' does not exist",
+                        name
+                    ));
                 }
                 PublicationLookup::Unknown => {
-                    self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
-                    return MutationResult::Skipped;
+                    return self.unresolved(EvidenceCode::UnknownObjectState);
                 }
                 PublicationLookup::WrongKind => {
                     unreachable!("publication names have a dedicated namespace")
@@ -422,7 +420,7 @@ impl AnalysisState {
             }
         }
         if unknown_target {
-            return MutationResult::Skipped;
+            return self.unresolved(EvidenceCode::UnknownObjectState);
         }
         for name in &present_names {
             self.snapshot_publication(name);
@@ -437,7 +435,7 @@ impl AnalysisState {
                 && present_names.contains(&e.referenced.name))
         });
         if present_names.is_empty() {
-            MutationResult::Skipped
+            MutationResult::NoOp
         } else {
             MutationResult::Applied
         }
@@ -450,9 +448,7 @@ impl AnalysisState {
         let name = s.name.clone().unwrap_or_else(|| "unnamed_sub".into());
         match self.subscription_lookup(&name) {
             SubscriptionLookup::Present => {
-                return MutationResult::Conflict {
-                    reason: format!("subscription '{}' already exists", name),
-                };
+                return MutationResult::conflict(format!("subscription '{}' already exists", name));
             }
             SubscriptionLookup::Unknown => {
                 self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
@@ -479,7 +475,7 @@ impl AnalysisState {
                 "two_phase",
             ],
         ) {
-            return MutationResult::Conflict { reason };
+            return MutationResult::conflict(reason);
         }
         let connects_to_publisher =
             Self::subscription_boolean_option(params, "connect") != Some(false);
@@ -488,22 +484,18 @@ impl AnalysisState {
                 .iter()
                 .any(|name| Self::subscription_boolean_option(params, name) == Some(true))
         {
-            return MutationResult::Conflict {
-                reason: format!(
-                    "subscription '{}' cannot enable connection-dependent options when connect is false",
-                    name
-                ),
-            };
+            return MutationResult::conflict(format!(
+                "subscription '{}' cannot enable connection-dependent options when connect is false",
+                name
+            ));
         }
         let creates_slot = connects_to_publisher
             && Self::subscription_boolean_option(params, "create_slot") != Some(false);
         if !self.local.transactions.is_empty() && connects_to_publisher && creates_slot {
-            return MutationResult::Conflict {
-                reason: format!(
-                    "subscription '{}' cannot create a replication slot inside a transaction",
-                    name
-                ),
-            };
+            return MutationResult::conflict(format!(
+                "subscription '{}' cannot create a replication slot inside a transaction",
+                name
+            ));
         }
         self.snapshot_subscription(&name);
         self.snapshot_generation_counter();
@@ -522,12 +514,10 @@ impl AnalysisState {
             None => Some(name.clone()),
         };
         if slot_name.is_none() && (enabled || creates_slot) {
-            return MutationResult::Conflict {
-                reason: format!(
-                    "subscription '{}' with slot_name NONE must disable enabled and create_slot",
-                    name
-                ),
-            };
+            return MutationResult::conflict(format!(
+                "subscription '{}' with slot_name NONE must disable enabled and create_slot",
+                name
+            ));
         }
         let mut unique_publications = HashSet::new();
         if !s
@@ -535,12 +525,10 @@ impl AnalysisState {
             .iter()
             .all(|publication| unique_publications.insert(publication))
         {
-            return MutationResult::Conflict {
-                reason: format!(
-                    "subscription '{}' lists the same publication more than once",
-                    name
-                ),
-            };
+            return MutationResult::conflict(format!(
+                "subscription '{}' lists the same publication more than once",
+                name
+            ));
         }
 
         let owner = self
@@ -572,13 +560,13 @@ impl AnalysisState {
         match self.subscription_lookup(&s.name) {
             SubscriptionLookup::Present => {}
             SubscriptionLookup::Tombstone | SubscriptionLookup::AuthoritativelyAbsent => {
-                return MutationResult::Conflict {
-                    reason: format!("subscription '{}' does not exist", s.name),
-                };
+                return MutationResult::conflict(format!(
+                    "subscription '{}' does not exist",
+                    s.name
+                ));
             }
             SubscriptionLookup::Unknown => {
-                self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
-                return MutationResult::Skipped;
+                return self.unresolved(EvidenceCode::UnknownObjectState);
             }
             SubscriptionLookup::WrongKind => {
                 unreachable!("subscription names have a dedicated namespace")
@@ -591,13 +579,13 @@ impl AnalysisState {
         {
             match self.subscription_lookup(to) {
                 SubscriptionLookup::Present => {
-                    return MutationResult::Conflict {
-                        reason: format!("subscription '{}' already exists", to),
-                    };
+                    return MutationResult::conflict(format!(
+                        "subscription '{}' already exists",
+                        to
+                    ));
                 }
                 SubscriptionLookup::Unknown => {
-                    self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
-                    return MutationResult::Skipped;
+                    return self.unresolved(EvidenceCode::UnknownObjectState);
                 }
                 SubscriptionLookup::Tombstone
                 | SubscriptionLookup::AuthoritativelyAbsent
@@ -611,9 +599,7 @@ impl AnalysisState {
             && self.local.roles_known
             && self.present_role(&owner).is_none()
         {
-            return MutationResult::Conflict {
-                reason: format!("role '{}' does not exist", owner),
-            };
+            return MutationResult::conflict(format!("role '{}' does not exist", owner));
         }
         let existing = match self.local.subscriptions.get(&s.name) {
             Some(crate::_internal::model::replication::SubscriptionOverlay::Present(
@@ -632,17 +618,15 @@ impl AnalysisState {
                     Some(params),
                     &["refresh", "copy_data"],
                 ) {
-                    return MutationResult::Conflict { reason };
+                    return MutationResult::conflict(reason);
                 }
                 if in_transaction
                     && Self::subscription_boolean_option(Some(params), "refresh") != Some(false)
                 {
-                    return MutationResult::Conflict {
-                        reason: format!(
-                            "subscription '{}' cannot refresh publications inside a transaction",
-                            s.name
-                        ),
-                    };
+                    return MutationResult::conflict(format!(
+                        "subscription '{}' cannot refresh publications inside a transaction",
+                        s.name
+                    ));
                 }
 
                 let mut unique = HashSet::new();
@@ -652,12 +636,10 @@ impl AnalysisState {
                             .iter()
                             .all(|publication| unique.insert(publication))
                         {
-                            return MutationResult::Conflict {
-                                reason: format!(
-                                    "subscription '{}' lists the same publication more than once",
-                                    s.name
-                                ),
-                            };
+                            return MutationResult::conflict(format!(
+                                "subscription '{}' lists the same publication more than once",
+                                s.name
+                            ));
                         }
                     }
                     crate::_internal::analysis::facts::SubscriptionPublicationMode::Add => {
@@ -665,12 +647,10 @@ impl AnalysisState {
                             if !unique.insert(publication)
                                 || existing.publications.contains(publication)
                             {
-                                return MutationResult::Conflict {
-                                    reason: format!(
-                                        "subscription '{}' already includes publication '{}'",
-                                        s.name, publication
-                                    ),
-                                };
+                                return MutationResult::conflict(format!(
+                                    "subscription '{}' already includes publication '{}'",
+                                    s.name, publication
+                                ));
                             }
                         }
                     }
@@ -679,12 +659,10 @@ impl AnalysisState {
                             if !unique.insert(publication)
                                 || !existing.publications.contains(publication)
                             {
-                                return MutationResult::Conflict {
-                                    reason: format!(
-                                        "subscription '{}' does not include publication '{}'",
-                                        s.name, publication
-                                    ),
-                                };
+                                return MutationResult::conflict(format!(
+                                    "subscription '{}' does not include publication '{}'",
+                                    s.name, publication
+                                ));
                             }
                         }
                     }
@@ -693,12 +671,10 @@ impl AnalysisState {
             crate::_internal::analysis::facts::AlterSubscriptionActionFact::RefreshPublication(
                 _,
             ) if in_transaction => {
-                return MutationResult::Conflict {
-                    reason: format!(
-                        "subscription '{}' cannot refresh publications inside a transaction",
-                        s.name
-                    ),
-                };
+                return MutationResult::conflict(format!(
+                    "subscription '{}' cannot refresh publications inside a transaction",
+                    s.name
+                ));
             }
             crate::_internal::analysis::facts::AlterSubscriptionActionFact::SetOptions(options) => {
                 if let Err(reason) = Self::validate_subscription_boolean_options(
@@ -712,31 +688,27 @@ impl AnalysisState {
                         "two_phase",
                     ],
                 ) {
-                    return MutationResult::Conflict { reason };
+                    return MutationResult::conflict(reason);
                 }
                 if existing.enabled
                     && options
                         .iter()
                         .any(|option| option.name.eq_ignore_ascii_case("slot_name"))
                 {
-                    return MutationResult::Conflict {
-                        reason: format!(
-                            "subscription '{}' must be disabled before changing slot_name",
-                            s.name
-                        ),
-                    };
+                    return MutationResult::conflict(format!(
+                        "subscription '{}' must be disabled before changing slot_name",
+                        s.name
+                    ));
                 }
                 let changes_failover_or_two_phase = options.iter().any(|option| {
                     option.name.eq_ignore_ascii_case("failover")
                         || option.name.eq_ignore_ascii_case("two_phase")
                 });
                 if changes_failover_or_two_phase && existing.enabled {
-                    return MutationResult::Conflict {
-                        reason: format!(
-                            "subscription '{}' must be disabled before changing failover or two_phase",
-                            s.name
-                        ),
-                    };
+                    return MutationResult::conflict(format!(
+                        "subscription '{}' must be disabled before changing failover or two_phase",
+                        s.name
+                    ));
                 }
                 let forbidden_in_transaction = options.iter().any(|option| {
                     option.name.eq_ignore_ascii_case("failover")
@@ -744,23 +716,19 @@ impl AnalysisState {
                             && Self::postgres_boolean(&option.value) == Some(false))
                 });
                 if in_transaction && forbidden_in_transaction {
-                    return MutationResult::Conflict {
-                        reason: format!(
-                            "subscription '{}' cannot change this setting inside a transaction",
-                            s.name
-                        ),
-                    };
+                    return MutationResult::conflict(format!(
+                        "subscription '{}' cannot change this setting inside a transaction",
+                        s.name
+                    ));
                 }
             }
             crate::_internal::analysis::facts::AlterSubscriptionActionFact::SetEnabled(true)
                 if existing.slot_name.is_none() =>
             {
-                return MutationResult::Conflict {
-                    reason: format!(
-                        "subscription '{}' cannot be enabled without a slot_name",
-                        s.name
-                    ),
-                };
+                return MutationResult::conflict(format!(
+                    "subscription '{}' cannot be enabled without a slot_name",
+                    s.name
+                ));
             }
             _ => {}
         }
@@ -940,35 +908,34 @@ impl AnalysisState {
             },
             SubscriptionLookup::Tombstone => {
                 if !s.if_exists {
-                    return MutationResult::Conflict {
-                        reason: format!("subscription '{}' does not exist", s.name),
-                    };
+                    return MutationResult::conflict(format!(
+                        "subscription '{}' does not exist",
+                        s.name
+                    ));
                 }
-                return MutationResult::Skipped;
+                return MutationResult::NoOp;
             }
             SubscriptionLookup::AuthoritativelyAbsent => {
                 if !s.if_exists {
-                    return MutationResult::Conflict {
-                        reason: format!("subscription '{}' does not exist", s.name),
-                    };
+                    return MutationResult::conflict(format!(
+                        "subscription '{}' does not exist",
+                        s.name
+                    ));
                 }
-                return MutationResult::Skipped;
+                return MutationResult::NoOp;
             }
             SubscriptionLookup::Unknown => {
-                self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
-                return MutationResult::Skipped;
+                return self.unresolved(EvidenceCode::UnknownObjectState);
             }
             SubscriptionLookup::WrongKind => {
                 unreachable!("subscription names have a dedicated namespace")
             }
         };
         if has_slot && !self.local.transactions.is_empty() {
-            return MutationResult::Conflict {
-                reason: format!(
-                    "subscription '{}' has a replication slot and cannot be dropped inside a transaction",
-                    s.name
-                ),
-            };
+            return MutationResult::conflict(format!(
+                "subscription '{}' has a replication slot and cannot be dropped inside a transaction",
+                s.name
+            ));
         }
         self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
         self.snapshot_subscription(&s.name);

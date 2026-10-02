@@ -114,9 +114,10 @@ impl AnalysisState {
                             id,
                             crate::_internal::db::cache::CatalogFamily::Indexes,
                         ) {
-                            return MutationResult::Conflict {
-                                reason: format!("reindexed index '{}' does not exist", id),
-                            };
+                            return MutationResult::conflict(format!(
+                                "reindexed index '{}' does not exist",
+                                id
+                            ));
                         }
                         // No baseline coverage — we cannot prove it is absent.
                         self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
@@ -156,12 +157,12 @@ impl AnalysisState {
                 &alter.index_id,
                 crate::_internal::db::cache::CatalogFamily::Indexes,
             ) {
-                return MutationResult::Conflict {
-                    reason: format!("index '{}' does not exist", alter.index_id),
-                };
+                return MutationResult::conflict(format!(
+                    "index '{}' does not exist",
+                    alter.index_id
+                ));
             }
-            self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
-            return MutationResult::Skipped;
+            return self.unresolved(EvidenceCode::UnknownObjectState);
         }
 
         for action in &alter.actions {
@@ -194,15 +195,12 @@ impl AnalysisState {
                             partition_id,
                             crate::_internal::db::cache::CatalogFamily::Indexes,
                         ) {
-                            return MutationResult::Conflict {
-                                reason: format!(
-                                    "partition index '{}' does not exist",
-                                    partition_id
-                                ),
-                            };
+                            return MutationResult::conflict(format!(
+                                "partition index '{}' does not exist",
+                                partition_id
+                            ));
                         }
-                        self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
-                        return MutationResult::Skipped;
+                        return self.unresolved(EvidenceCode::UnknownObjectState);
                     }
                     // Record the link so dropping the parent also drops the
                     // child, which PostgreSQL does.
@@ -236,19 +234,15 @@ impl AnalysisState {
             return MutationResult::Applied;
         };
         if *value < SET_STATISTICS_MIN {
-            return MutationResult::Conflict {
-                reason: format!("statistics target {value} is too low"),
-            };
+            return MutationResult::conflict(format!("statistics target {value} is too low"));
         }
         if *value > SET_STATISTICS_MAX {
             // Accepted and stored as 10000, so it does not match what was written.
             self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Statement);
         } else if self.index_has_expression_keys(index) == Some(false) {
-            return MutationResult::Conflict {
-                reason: format!(
-                    "cannot alter statistics on non-expression column \"{column}\" of index \"{index}\""
-                ),
-            };
+            return MutationResult::conflict(format!(
+                "cannot alter statistics on non-expression column \"{column}\" of index \"{index}\""
+            ));
         }
         MutationResult::Applied
     }

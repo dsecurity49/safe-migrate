@@ -43,18 +43,17 @@ impl AnalysisState {
             self.local.relations.get_mut(&create_policy.table)
         {
             if rel.policies.contains(&create_policy.name) {
-                return MutationResult::Conflict {
-                    reason: format!(
-                        "policy '{}' already exists on relation '{}'",
-                        create_policy.name, create_policy.table
-                    ),
-                };
+                return MutationResult::conflict(format!(
+                    "policy '{}' already exists on relation '{}'",
+                    create_policy.name, create_policy.table
+                ));
             }
             rel.policies.insert(create_policy.name.clone());
         } else {
-            return MutationResult::Conflict {
-                reason: format!("relation '{}' does not exist", create_policy.table),
-            };
+            return MutationResult::conflict(format!(
+                "relation '{}' does not exist",
+                create_policy.table
+            ));
         }
         if !create_policy.semantics_complete {
             // Keep the policy identity for rule evaluation and DROP POLICY
@@ -79,21 +78,20 @@ impl AnalysisState {
         {
             if !rel.policies.contains(&drop_policy.name) {
                 return if drop_policy.if_exists {
-                    MutationResult::Skipped
+                    MutationResult::NoOp
                 } else {
-                    MutationResult::Conflict {
-                        reason: format!(
-                            "policy '{}' does not exist on relation '{}'",
-                            drop_policy.name, drop_policy.table
-                        ),
-                    }
+                    MutationResult::conflict(format!(
+                        "policy '{}' does not exist on relation '{}'",
+                        drop_policy.name, drop_policy.table
+                    ))
                 };
             }
             rel.policies.remove(&drop_policy.name);
         } else {
-            return MutationResult::Conflict {
-                reason: format!("relation '{}' does not exist", drop_policy.table),
-            };
+            return MutationResult::conflict(format!(
+                "relation '{}' does not exist",
+                drop_policy.table
+            ));
         }
         MutationResult::Applied
     }
@@ -104,12 +102,10 @@ impl AnalysisState {
     ) -> MutationResult {
         let trigger_id = Self::trigger_key(&create_trigger.table, &create_trigger.name);
         if self.trigger_lookup(&trigger_id) == TriggerLookup::Present {
-            return MutationResult::Conflict {
-                reason: format!(
-                    "trigger '{}' already exists on relation '{}'",
-                    create_trigger.name, create_trigger.table
-                ),
-            };
+            return MutationResult::conflict(format!(
+                "trigger '{}' already exists on relation '{}'",
+                create_trigger.name, create_trigger.table
+            ));
         }
         if let Err(result) = self.ensure_relation_target(
             &create_trigger.table,
@@ -153,19 +149,11 @@ impl AnalysisState {
         let Some(crate::_internal::model::function::FunctionOverlay::Present(function)) =
             self.local.functions.get(&create_trigger.function_id)
         else {
-            self.taint(
-                EvidenceCode::CatalogCoverageIncomplete,
-                EvidenceScope::Chain,
-            );
-            return MutationResult::Skipped;
+            return self.unresolved(EvidenceCode::CatalogCoverageIncomplete);
         };
         let return_type = function.return_type.trim();
         if return_type.is_empty() || return_type.eq_ignore_ascii_case("unknown") {
-            self.taint(
-                EvidenceCode::CatalogCoverageIncomplete,
-                EvidenceScope::Chain,
-            );
-            return MutationResult::Skipped;
+            return self.unresolved(EvidenceCode::CatalogCoverageIncomplete);
         }
         let return_type = return_type
             .split_once('.')
@@ -173,12 +161,10 @@ impl AnalysisState {
             .map(|(_, type_name)| type_name)
             .unwrap_or(return_type);
         if !return_type.eq_ignore_ascii_case("trigger") {
-            return MutationResult::Conflict {
-                reason: format!(
-                    "trigger function '{}' must return type trigger",
-                    create_trigger.function_id
-                ),
-            };
+            return MutationResult::conflict(format!(
+                "trigger function '{}' must return type trigger",
+                create_trigger.function_id
+            ));
         }
         self.snapshot_generation_counter();
         self.local.generation_counter += 1;
@@ -243,14 +229,12 @@ impl AnalysisState {
         let trigger_id = Self::trigger_key(&drop_trigger.table, &drop_trigger.name);
         if self.trigger_lookup(&trigger_id) != TriggerLookup::Present {
             return if drop_trigger.if_exists {
-                MutationResult::Skipped
+                MutationResult::NoOp
             } else {
-                MutationResult::Conflict {
-                    reason: format!(
-                        "trigger '{}' does not exist on relation '{}'",
-                        drop_trigger.name, drop_trigger.table
-                    ),
-                }
+                MutationResult::conflict(format!(
+                    "trigger '{}' does not exist on relation '{}'",
+                    drop_trigger.name, drop_trigger.table
+                ))
             };
         }
         self.snapshot_trigger(&trigger_id);
@@ -303,27 +287,22 @@ impl AnalysisState {
                 _ => unreachable!("trigger lookup established presence"),
             },
             TriggerLookup::Tombstone | TriggerLookup::AuthoritativelyAbsent => {
-                return MutationResult::Conflict {
-                    reason: format!(
-                        "trigger '{}' does not exist on relation '{}'",
-                        rename_trigger.name, rename_trigger.table
-                    ),
-                };
+                return MutationResult::conflict(format!(
+                    "trigger '{}' does not exist on relation '{}'",
+                    rename_trigger.name, rename_trigger.table
+                ));
             }
             TriggerLookup::Unknown => {
-                self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
-                return MutationResult::Skipped;
+                return self.unresolved(EvidenceCode::UnknownObjectState);
             }
             TriggerLookup::WrongKind => unreachable!("triggers have a dedicated namespace"),
         };
         let mut trigger = trigger;
         if old_id != new_id && self.trigger_lookup(&new_id) == TriggerLookup::Present {
-            return MutationResult::Conflict {
-                reason: format!(
-                    "trigger '{}' already exists on relation '{}'",
-                    rename_trigger.new_name, rename_trigger.table
-                ),
-            };
+            return MutationResult::conflict(format!(
+                "trigger '{}' already exists on relation '{}'",
+                rename_trigger.new_name, rename_trigger.table
+            ));
         }
         self.snapshot_trigger(&old_id);
         self.snapshot_trigger(&new_id);

@@ -1,5 +1,5 @@
 use crate::_internal::analysis::mutations::Mutation;
-use crate::_internal::analysis::state::MutationResult;
+
 use crate::_internal::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
 use crate::_internal::rules::{Rule, RuleContext};
 
@@ -17,7 +17,7 @@ impl Rule for VolatileDefaultRule {
     }
 
     fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
-        if *context.result() == MutationResult::Skipped {
+        if context.result().is_unresolved() {
             return vec![];
         }
 

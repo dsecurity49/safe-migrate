@@ -29,12 +29,10 @@ impl AnalysisState {
         }
         match self.pg_version_num {
             Some(version) if version < WIDENED_NUMERIC_SCALE_VERSION => {
-                Some(MutationResult::Conflict {
-                    reason: format!(
-                        "type '{declared}' requires PostgreSQL 15 or later, \
+                Some(MutationResult::conflict(format!(
+                    "type '{declared}' requires PostgreSQL 15 or later, \
                          but the baseline reports {version}"
-                    ),
-                })
+                )))
             }
             Some(_) => None,
             None => {
@@ -313,12 +311,10 @@ impl AnalysisState {
                 self.local.triggers.get(&clone_id),
                 Some(TriggerOverlay::Present(_))
             ) {
-                return MutationResult::Conflict {
-                    reason: format!(
-                        "trigger '{}' on partition '{}' conflicts with parent trigger",
-                        parent_trigger.name, child
-                    ),
-                };
+                return MutationResult::conflict(format!(
+                    "trigger '{}' on partition '{}' conflicts with parent trigger",
+                    parent_trigger.name, child
+                ));
             }
         }
 
@@ -785,7 +781,7 @@ impl AnalysisState {
         precomputed_cascade: Option<&CascadeResult>,
     ) -> MutationResult {
         if drop_table.ids.is_empty() {
-            return MutationResult::Skipped;
+            return MutationResult::NoOp;
         }
 
         let renames: Vec<DependencyEdge> = self
@@ -822,27 +818,20 @@ impl AnalysisState {
             match self.relation_lookup(id, |kind| *kind == RelationKind::Table) {
                 RelationLookup::Present => present_targets.push(id.clone()),
                 RelationLookup::WrongKind => {
-                    return MutationResult::Conflict {
-                        reason: format!("'{}' is not a table", id),
-                    };
+                    return MutationResult::conflict(format!("'{}' is not a table", id));
                 }
                 RelationLookup::AuthoritativelyAbsent if drop_table.if_exists => {}
                 RelationLookup::AuthoritativelyAbsent => {
-                    return MutationResult::Conflict {
-                        reason: format!("table '{}' does not exist", id),
-                    };
+                    return MutationResult::conflict(format!("table '{}' does not exist", id));
                 }
                 RelationLookup::Tombstone if drop_table.if_exists => {}
                 RelationLookup::Tombstone => {
-                    return MutationResult::Conflict {
-                        reason: format!("table '{}' does not exist", id),
-                    };
+                    return MutationResult::conflict(format!("table '{}' does not exist", id));
                 }
                 RelationLookup::Unknown => {
-                    self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
                     unknown_target = true;
                     if !drop_table.if_exists {
-                        return MutationResult::Skipped;
+                        return self.unresolved(EvidenceCode::UnknownObjectState);
                     }
                 }
             }
@@ -856,10 +845,10 @@ impl AnalysisState {
         // statement. Do not apply known siblings with an incomplete target
         // list.
         if unknown_target {
-            return MutationResult::Skipped;
+            return self.unresolved(EvidenceCode::UnknownObjectState);
         }
         if present_targets.is_empty() {
-            return MutationResult::Skipped;
+            return MutationResult::NoOp;
         }
 
         // A synchronized relation row proves that the table exists, but it
@@ -872,11 +861,7 @@ impl AnalysisState {
             .any(|id| self.baseline_relation_is_known(id))
             && !self.baseline_has_coverage(crate::_internal::db::cache::CatalogFamily::Dependencies)
         {
-            self.taint(
-                EvidenceCode::CatalogCoverageIncomplete,
-                EvidenceScope::Chain,
-            );
-            return MutationResult::Skipped;
+            return self.unresolved(EvidenceCode::CatalogCoverageIncomplete);
         }
 
         // Relation-owned dependency loaders currently expand selected
@@ -890,11 +875,7 @@ impl AnalysisState {
                 crate::_internal::db::cache::CatalogFamily::Relations,
             )
         }) {
-            self.taint(
-                EvidenceCode::CatalogCoverageIncomplete,
-                EvidenceScope::Chain,
-            );
-            return MutationResult::Skipped;
+            return self.unresolved(EvidenceCode::CatalogCoverageIncomplete);
         }
 
         let roots: HashSet<ObjectId> = present_targets.iter().map(&resolve).collect();
@@ -923,11 +904,7 @@ impl AnalysisState {
                 && !self
                     .baseline_has_coverage(crate::_internal::db::cache::CatalogFamily::Dependencies)
             {
-                self.taint(
-                    EvidenceCode::CatalogCoverageIncomplete,
-                    EvidenceScope::Chain,
-                );
-                return MutationResult::Skipped;
+                return self.unresolved(EvidenceCode::CatalogCoverageIncomplete);
             }
             if closure
                 .dropped_relations
@@ -1012,12 +989,10 @@ impl AnalysisState {
                 } else {
                     "have"
                 };
-                return MutationResult::Conflict {
-                    reason: format!(
-                        "{relation_word} '{}' still {dependent_verb} dependent objects; use CASCADE",
-                        display_names,
-                    ),
-                };
+                return MutationResult::conflict(format!(
+                    "{relation_word} '{}' still {dependent_verb} dependent objects; use CASCADE",
+                    display_names,
+                ));
             }
 
             for id in &roots {
@@ -1284,27 +1259,25 @@ impl AnalysisState {
                 .iter()
                 .any(|valid| strategy.eq_ignore_ascii_case(valid))
         {
-            return MutationResult::Conflict {
-                reason: format!("unrecognized partitioning strategy '{strategy}'"),
-            };
+            return MutationResult::conflict(format!(
+                "unrecognized partitioning strategy '{strategy}'"
+            ));
         }
         if matches!(create.persistence, PersistenceMutation::Temporary)
             && !is_session_temp_schema(&create.id.schema)
         {
-            return MutationResult::Conflict {
-                reason: "cannot create temporary relation in non-temporary schema".to_string(),
-            };
+            return MutationResult::conflict(
+                "cannot create temporary relation in non-temporary schema".to_string(),
+            );
         }
         if let Err(result) = self.ensure_schema_target(&create.id.schema) {
             return result;
         }
         if create.if_not_exists && self.relation_namespace_is_taken(&create.id) {
-            return MutationResult::Skipped;
+            return MutationResult::NoOp;
         }
         if self.relation_namespace_is_taken(&create.id) {
-            return MutationResult::Conflict {
-                reason: format!("relation '{}' already exists", create.id),
-            };
+            return MutationResult::conflict(format!("relation '{}' already exists", create.id));
         }
         if let Some(type_id) = &create.of_type {
             match self.local.types.get(type_id) {
@@ -1315,18 +1288,19 @@ impl AnalysisState {
                     },
                 )) => {}
                 Some(crate::_internal::model::types::TypeOverlay::Present(_)) => {
-                    return MutationResult::Conflict {
-                        reason: format!("type '{}' is not composite", type_id),
-                    };
+                    return MutationResult::conflict(format!(
+                        "type '{}' is not composite",
+                        type_id
+                    ));
                 }
                 Some(crate::_internal::model::types::TypeOverlay::Dropped) => {
-                    return MutationResult::Conflict {
-                        reason: format!("composite type '{}' does not exist", type_id),
-                    };
+                    return MutationResult::conflict(format!(
+                        "composite type '{}' does not exist",
+                        type_id
+                    ));
                 }
                 None => {
-                    self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
-                    return MutationResult::Skipped;
+                    return self.unresolved(EvidenceCode::UnknownObjectState);
                 }
             }
         }
@@ -1360,16 +1334,13 @@ impl AnalysisState {
                 .graph
                 .check_inheritance_cycle(parent_id, &create.id)
             {
-                return MutationResult::Conflict {
-                    reason: format!(
-                        "inheriting '{}' into '{}' would create an inheritance cycle",
-                        parent_id, create.id
-                    ),
-                };
+                return MutationResult::conflict(format!(
+                    "inheriting '{}' into '{}' would create an inheritance cycle",
+                    parent_id, create.id
+                ));
             }
             let Some(RelationOverlay::Present(parent)) = self.local.relations.get(parent_id) else {
-                self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
-                return MutationResult::Skipped;
+                return self.unresolved(EvidenceCode::UnknownObjectState);
             };
             for column in &parent.columns {
                 if !inherited_names.insert(column.name.clone()) {
@@ -1396,12 +1367,10 @@ impl AnalysisState {
                             && column.default.is_some()
                             && existing.default != column.default)
                     {
-                        return MutationResult::Conflict {
-                            reason: format!(
-                                "inherited column '{}' has incompatible parent definitions",
-                                column.name
-                            ),
-                        };
+                        return MutationResult::conflict(format!(
+                            "inherited column '{}' has incompatible parent definitions",
+                            column.name
+                        ));
                     }
                     existing.is_nullable &= column.is_nullable;
                     if existing.default.is_none() {
@@ -1416,12 +1385,10 @@ impl AnalysisState {
                 if let Some(existing) = inherited_generated_columns.get(column)
                     && existing != generated
                 {
-                    return MutationResult::Conflict {
-                        reason: format!(
-                            "inherited generated column '{}' has incompatible parent definitions",
-                            column
-                        ),
-                    };
+                    return MutationResult::conflict(format!(
+                        "inherited generated column '{}' has incompatible parent definitions",
+                        column
+                    ));
                 }
                 inherited_generated_columns.insert(column.clone(), generated.clone());
             }
@@ -1430,11 +1397,7 @@ impl AnalysisState {
                     && matches!(constraint.kind, ConstraintKind::Check)
             }) {
                 let Some(definition) = constraint.definition.as_deref() else {
-                    self.taint(
-                        EvidenceCode::CatalogCoverageIncomplete,
-                        EvidenceScope::Chain,
-                    );
-                    return MutationResult::Skipped;
+                    return self.unresolved(EvidenceCode::CatalogCoverageIncomplete);
                 };
                 let Some(columns) =
                     self.local
@@ -1454,22 +1417,16 @@ impl AnalysisState {
                             _ => None,
                         })
                 else {
-                    self.taint(
-                        EvidenceCode::CatalogCoverageIncomplete,
-                        EvidenceScope::Chain,
-                    );
-                    return MutationResult::Skipped;
+                    return self.unresolved(EvidenceCode::CatalogCoverageIncomplete);
                 };
                 if let Some((_, existing)) = inherited_check_constraints.get(&constraint.name)
                     && Self::normalized_constraint_expression(existing)
                         != Self::normalized_constraint_expression(definition)
                 {
-                    return MutationResult::Conflict {
-                        reason: format!(
-                            "inherited CHECK constraint '{}' has incompatible parent definitions",
-                            constraint.name
-                        ),
-                    };
+                    return MutationResult::conflict(format!(
+                        "inherited CHECK constraint '{}' has incompatible parent definitions",
+                        constraint.name
+                    ));
                 }
                 inherited_check_constraints
                     .insert(constraint.name.clone(), (columns, definition.to_string()));
@@ -1494,12 +1451,10 @@ impl AnalysisState {
             {
                 for field in fields {
                     if !inherited_names.insert(field.name.clone()) {
-                        return MutationResult::Conflict {
-                            reason: format!(
-                                "column '{}' is copied from more than one source",
-                                field.name
-                            ),
-                        };
+                        return MutationResult::conflict(format!(
+                            "column '{}' is copied from more than one source",
+                            field.name
+                        ));
                     }
                     inherited_columns.push(
                         crate::_internal::model::column::Column::migration_created(
@@ -1529,8 +1484,7 @@ impl AnalysisState {
                 return result;
             }
             let Some(RelationOverlay::Present(source)) = self.local.relations.get(source_id) else {
-                self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
-                return MutationResult::Skipped;
+                return self.unresolved(EvidenceCode::UnknownObjectState);
             };
             let source = source.clone();
             if like_source.properties.statistics {
@@ -1589,11 +1543,7 @@ impl AnalysisState {
                                 == Some(&(source_id.clone(), column.clone())))
                         .then(|| sequence.parameters.clone())
                     }) else {
-                        self.taint(
-                            EvidenceCode::CatalogCoverageIncomplete,
-                            EvidenceScope::Chain,
-                        );
-                        return MutationResult::Skipped;
+                        return self.unresolved(EvidenceCode::CatalogCoverageIncomplete);
                     };
                     like_identity_columns.push((column.clone(), *generation, parameters));
                 }
@@ -1630,18 +1580,10 @@ impl AnalysisState {
                             _ => None,
                         }
                     }) else {
-                        self.taint(
-                            EvidenceCode::CatalogCoverageIncomplete,
-                            EvidenceScope::Chain,
-                        );
-                        return MutationResult::Skipped;
+                        return self.unresolved(EvidenceCode::CatalogCoverageIncomplete);
                     };
                     let Some(definition) = constraint.definition.clone() else {
-                        self.taint(
-                            EvidenceCode::CatalogCoverageIncomplete,
-                            EvidenceScope::Chain,
-                        );
-                        return MutationResult::Skipped;
+                        return self.unresolved(EvidenceCode::CatalogCoverageIncomplete);
                     };
                     like_check_constraints.push((constraint.name.clone(), columns, definition));
                 }
@@ -1722,11 +1664,7 @@ impl AnalysisState {
                             }
                         })
                     else {
-                        self.taint(
-                            EvidenceCode::CatalogCoverageIncomplete,
-                            EvidenceScope::Chain,
-                        );
-                        return MutationResult::Skipped;
+                        return self.unresolved(EvidenceCode::CatalogCoverageIncomplete);
                     };
                     let is_unique = matches!(
                         constraint.kind,
@@ -1758,12 +1696,10 @@ impl AnalysisState {
             }
             for source_column in &source.columns {
                 if !inherited_names.insert(source_column.name.clone()) {
-                    return MutationResult::Conflict {
-                        reason: format!(
-                            "column '{}' is copied from more than one source relation",
-                            source_column.name
-                        ),
-                    };
+                    return MutationResult::conflict(format!(
+                        "column '{}' is copied from more than one source relation",
+                        source_column.name
+                    ));
                 }
                 let mut column = source_column.clone();
                 if !like_source.properties.defaults {
@@ -1798,18 +1734,17 @@ impl AnalysisState {
                 unreachable!("partition parent presence was checked above")
             };
             if parent.partition_type.is_none() {
-                return MutationResult::Conflict {
-                    reason: format!("partition parent '{}' is not partitioned", parent_id),
-                };
+                return MutationResult::conflict(format!(
+                    "partition parent '{}' is not partitioned",
+                    parent_id
+                ));
             }
             for column in &parent.columns {
                 if !inherited_names.insert(column.name.clone()) {
-                    return MutationResult::Conflict {
-                        reason: format!(
-                            "partition column '{}' conflicts with another table source",
-                            column.name
-                        ),
-                    };
+                    return MutationResult::conflict(format!(
+                        "partition column '{}' conflicts with another table source",
+                        column.name
+                    ));
                 }
                 inherited_columns.push(column.clone());
             }
@@ -1827,11 +1762,7 @@ impl AnalysisState {
                 .filter(|constraint| matches!(constraint.kind, ConstraintKind::Check))
             {
                 let Some(definition) = constraint.definition.clone() else {
-                    self.taint(
-                        EvidenceCode::CatalogCoverageIncomplete,
-                        EvidenceScope::Chain,
-                    );
-                    return MutationResult::Skipped;
+                    return self.unresolved(EvidenceCode::CatalogCoverageIncomplete);
                 };
                 let Some(columns) =
                     self.local
@@ -1851,11 +1782,7 @@ impl AnalysisState {
                             _ => None,
                         })
                 else {
-                    self.taint(
-                        EvidenceCode::CatalogCoverageIncomplete,
-                        EvidenceScope::Chain,
-                    );
-                    return MutationResult::Skipped;
+                    return self.unresolved(EvidenceCode::CatalogCoverageIncomplete);
                 };
                 like_check_constraints.push((constraint.name.clone(), columns, definition));
             }
@@ -1919,12 +1846,10 @@ impl AnalysisState {
                     _ => false,
                 };
                 if !compatible {
-                    return MutationResult::Conflict {
-                        reason: format!(
-                            "column '{}' conflicts with an inherited column type",
-                            column.name
-                        ),
-                    };
+                    return MutationResult::conflict(format!(
+                        "column '{}' conflicts with an inherited column type",
+                        column.name
+                    ));
                 }
             }
         }
@@ -1933,19 +1858,16 @@ impl AnalysisState {
                 continue;
             };
             let Some(references) = expr.referenced_columns() else {
-                self.taint(EvidenceCode::UnsupportedSemantics, EvidenceScope::Statement);
-                return MutationResult::Skipped;
+                return self.unresolved_statement(EvidenceCode::UnsupportedSemantics);
             };
             if let Some(reference) = references
                 .iter()
                 .find(|reference| *reference == &column.name || !column_names.contains(*reference))
             {
-                return MutationResult::Conflict {
-                    reason: format!(
-                        "generated expression for '{}.{}' references invalid column '{}'",
-                        create.id, column.name, reference
-                    ),
-                };
+                return MutationResult::conflict(format!(
+                    "generated expression for '{}.{}' references invalid column '{}'",
+                    create.id, column.name, reference
+                ));
             }
         }
         let primary_declarations = create
@@ -1959,9 +1881,9 @@ impl AnalysisState {
                 .filter(|constraint| matches!(constraint, TableConstraintFact::PrimaryKey { .. }))
                 .count();
         if primary_declarations > 1 {
-            return MutationResult::Conflict {
-                reason: "multiple primary keys for table are not allowed".to_string(),
-            };
+            return MutationResult::conflict(
+                "multiple primary keys for table are not allowed".to_string(),
+            );
         }
         for constraint in &create.table_constraints {
             let columns = match constraint {
@@ -1972,27 +1894,23 @@ impl AnalysisState {
                 }
             };
             if columns.is_empty() {
-                return MutationResult::Conflict {
-                    reason: "key constraint must name at least one column".to_string(),
-                };
+                return MutationResult::conflict(
+                    "key constraint must name at least one column".to_string(),
+                );
             }
             let mut key_columns = HashSet::new();
             for column in columns {
                 if !key_columns.insert(column) {
-                    return MutationResult::Conflict {
-                        reason: format!(
-                            "column '{}' appears more than once in a key constraint",
-                            column
-                        ),
-                    };
+                    return MutationResult::conflict(format!(
+                        "column '{}' appears more than once in a key constraint",
+                        column
+                    ));
                 }
                 if !column_names.contains(column) {
-                    return MutationResult::Conflict {
-                        reason: format!(
-                            "constraint references column '{}' which does not exist on relation '{}'",
-                            column, create.id
-                        ),
-                    };
+                    return MutationResult::conflict(format!(
+                        "constraint references column '{}' which does not exist on relation '{}'",
+                        column, create.id
+                    ));
                 }
             }
         }
@@ -2000,22 +1918,18 @@ impl AnalysisState {
         let mut effective_fk_target_columns = Vec::with_capacity(create.foreign_keys.len());
         for fk in &create.foreign_keys {
             if fk.from_columns.is_empty() {
-                return MutationResult::Conflict {
-                    reason: format!(
-                        "foreign key on relation '{}' has no source columns",
-                        create.id
-                    ),
-                };
+                return MutationResult::conflict(format!(
+                    "foreign key on relation '{}' has no source columns",
+                    create.id
+                ));
             }
             if !fk.to_columns.is_empty() && fk.from_columns.len() != fk.to_columns.len() {
-                return MutationResult::Conflict {
-                    reason: format!(
-                        "foreign key on '{}' has {} source columns but {} referenced columns",
-                        create.id,
-                        fk.from_columns.len(),
-                        fk.to_columns.len()
-                    ),
-                };
+                return MutationResult::conflict(format!(
+                    "foreign key on '{}' has {} source columns but {} referenced columns",
+                    create.id,
+                    fk.from_columns.len(),
+                    fk.to_columns.len()
+                ));
             }
             let mut source_columns = HashSet::new();
             if let Some(column) = fk
@@ -2023,12 +1937,10 @@ impl AnalysisState {
                 .iter()
                 .find(|column| !source_columns.insert(column.as_str()))
             {
-                return MutationResult::Conflict {
-                    reason: format!(
-                        "foreign key on '{}' repeats source column '{}'",
-                        create.id, column
-                    ),
-                };
+                return MutationResult::conflict(format!(
+                    "foreign key on '{}' repeats source column '{}'",
+                    create.id, column
+                ));
             }
             let mut target_columns = HashSet::new();
             if let Some(column) = fk
@@ -2036,12 +1948,10 @@ impl AnalysisState {
                 .iter()
                 .find(|column| !target_columns.insert(column.as_str()))
             {
-                return MutationResult::Conflict {
-                    reason: format!(
-                        "foreign key on '{}' repeats referenced column '{}'",
-                        create.id, column
-                    ),
-                };
+                return MutationResult::conflict(format!(
+                    "foreign key on '{}' repeats referenced column '{}'",
+                    create.id, column
+                ));
             }
             if let Some(column) = fk.from_columns.iter().find(|name| {
                 !create
@@ -2049,12 +1959,10 @@ impl AnalysisState {
                     .iter()
                     .any(|candidate| candidate.name == **name)
             }) {
-                return MutationResult::Conflict {
-                    reason: format!(
-                        "foreign key column '{}' does not exist on relation '{}'",
-                        column, create.id
-                    ),
-                };
+                return MutationResult::conflict(format!(
+                    "foreign key column '{}' does not exist on relation '{}'",
+                    column, create.id
+                ));
             }
             let target_columns: HashSet<String> = if fk.to_table == create.id {
                 create
@@ -2079,8 +1987,7 @@ impl AnalysisState {
                 }
                 let Some(RelationOverlay::Present(parent)) = self.local.relations.get(&fk.to_table)
                 else {
-                    self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
-                    return MutationResult::Skipped;
+                    return self.unresolved(EvidenceCode::UnknownObjectState);
                 };
                 parent
                     .columns
@@ -2100,12 +2007,10 @@ impl AnalysisState {
                     .iter()
                     .find(|name| !target_columns.contains(*name))
             {
-                return MutationResult::Conflict {
-                    reason: format!(
-                        "foreign key references column '{}.{}' which does not exist",
-                        fk.to_table, column
-                    ),
-                };
+                return MutationResult::conflict(format!(
+                    "foreign key references column '{}.{}' which does not exist",
+                    fk.to_table, column
+                ));
             }
             let target_keys = if fk.to_table == create.id {
                 let mut keys = Vec::new();
@@ -2158,12 +2063,10 @@ impl AnalysisState {
                     })
                     .unwrap_or_default();
                 if target_keys.is_some() && primary_keys.len() != 1 {
-                    return MutationResult::Conflict {
-                        reason: format!(
-                            "foreign key on '{}' omits referenced columns but target '{}' has no single primary key",
-                            create.id, fk.to_table
-                        ),
-                    };
+                    return MutationResult::conflict(format!(
+                        "foreign key on '{}' omits referenced columns but target '{}' has no single primary key",
+                        create.id, fk.to_table
+                    ));
                 }
                 primary_keys.first().cloned().cloned().unwrap_or_default()
             } else {
@@ -2175,12 +2078,10 @@ impl AnalysisState {
                     .iter()
                     .any(|(columns, _)| columns == &referenced_columns)
             {
-                return MutationResult::Conflict {
-                    reason: format!(
-                        "foreign key on '{}' references columns on '{}' that are not backed by a primary key or unique key",
-                        create.id, fk.to_table
-                    ),
-                };
+                return MutationResult::conflict(format!(
+                    "foreign key on '{}' references columns on '{}' that are not backed by a primary key or unique key",
+                    create.id, fk.to_table
+                ));
             } else if target_keys.is_none() {
                 self.taint(
                     EvidenceCode::CatalogCoverageIncomplete,
@@ -2263,11 +2164,7 @@ impl AnalysisState {
                         }
                     });
             if type_mismatch {
-                self.taint(
-                    EvidenceCode::CatalogCoverageIncomplete,
-                    EvidenceScope::Chain,
-                );
-                return MutationResult::Skipped;
+                return self.unresolved(EvidenceCode::CatalogCoverageIncomplete);
             }
             if type_evidence_unknown {
                 self.taint(
@@ -2322,9 +2219,10 @@ impl AnalysisState {
                 if self.relation_namespace_is_taken(&sequence_id)
                     || reserved_sequences.contains(&sequence_id)
                 {
-                    return MutationResult::Conflict {
-                        reason: format!("relation '{}' already exists", sequence_id),
-                    };
+                    return MutationResult::conflict(format!(
+                        "relation '{}' already exists",
+                        sequence_id
+                    ));
                 }
                 let default_parameters = Self::default_column_sequence_parameters(
                     column.ty.as_deref(),
@@ -2335,12 +2233,10 @@ impl AnalysisState {
                         let Some(parameters) =
                             Self::apply_identity_sequence_options(default_parameters, options)
                         else {
-                            return MutationResult::Conflict {
-                                reason: format!(
-                                    "identity sequence options for '{}.{}' are invalid",
-                                    create.id, column.name
-                                ),
-                            };
+                            return MutationResult::conflict(format!(
+                                "identity sequence options for '{}.{}' are invalid",
+                                create.id, column.name
+                            ));
                         };
                         parameters
                     }
@@ -2369,16 +2265,18 @@ impl AnalysisState {
         let mut reserved_index_ids = HashSet::new();
         for (name, _, _) in &like_check_constraints {
             if !reserved_constraint_names.insert(name.clone()) {
-                return MutationResult::Conflict {
-                    reason: format!("constraint '{}' is copied more than once", name),
-                };
+                return MutationResult::conflict(format!(
+                    "constraint '{}' is copied more than once",
+                    name
+                ));
             }
         }
         for (name, _) in &partition_foreign_keys {
             if !reserved_constraint_names.insert(name.clone()) {
-                return MutationResult::Conflict {
-                    reason: format!("constraint '{}' is inherited more than once", name),
-                };
+                return MutationResult::conflict(format!(
+                    "constraint '{}' is inherited more than once",
+                    name
+                ));
             }
         }
         let primary_key_name = create
@@ -2413,16 +2311,15 @@ impl AnalysisState {
         if let Some(name) = &primary_key_constraint_name
             && !reserved_constraint_names.insert(name.clone())
         {
-            return MutationResult::Conflict {
-                reason: format!("constraint '{}' is specified more than once", name),
-            };
+            return MutationResult::conflict(format!(
+                "constraint '{}' is specified more than once",
+                name
+            ));
         }
         if let Some(name) = &primary_key_constraint_name {
             let index_id = ObjectId::new(&create.id.schema, name);
             if self.relation_namespace_is_taken(&index_id) {
-                return MutationResult::Conflict {
-                    reason: format!("relation '{}' already exists", index_id),
-                };
+                return MutationResult::conflict(format!("relation '{}' already exists", index_id));
             }
             reserved_index_ids.insert(index_id);
         }
@@ -2462,15 +2359,14 @@ impl AnalysisState {
                 .name
             });
             if !reserved_constraint_names.insert(name.clone()) {
-                return MutationResult::Conflict {
-                    reason: format!("constraint '{}' is specified more than once", name),
-                };
+                return MutationResult::conflict(format!(
+                    "constraint '{}' is specified more than once",
+                    name
+                ));
             }
             let index_id = ObjectId::new(&create.id.schema, &name);
             if self.relation_namespace_is_taken(&index_id) {
-                return MutationResult::Conflict {
-                    reason: format!("relation '{}' already exists", index_id),
-                };
+                return MutationResult::conflict(format!("relation '{}' already exists", index_id));
             }
             reserved_index_ids.insert(index_id);
             unique_constraint_names.push((name, columns.clone()));
@@ -2488,9 +2384,10 @@ impl AnalysisState {
                 )
             });
             if !reserved_constraint_names.insert(name.clone()) {
-                return MutationResult::Conflict {
-                    reason: format!("constraint '{}' is specified more than once", name),
-                };
+                return MutationResult::conflict(format!(
+                    "constraint '{}' is specified more than once",
+                    name
+                ));
             }
             foreign_key_constraint_names.push(name);
         }
@@ -2562,16 +2459,18 @@ impl AnalysisState {
                 {
                     continue;
                 }
-                return MutationResult::Conflict {
-                    reason: format!("constraint '{}' is specified more than once", name),
-                };
+                return MutationResult::conflict(format!(
+                    "constraint '{}' is specified more than once",
+                    name
+                ));
             }
             let backing_index = if matches!(&kind, ConstraintKind::Exclusion) {
                 let index_id = ObjectId::new(&create.id.schema, &name);
                 if self.relation_namespace_is_taken(&index_id) {
-                    return MutationResult::Conflict {
-                        reason: format!("relation '{}' already exists", index_id),
-                    };
+                    return MutationResult::conflict(format!(
+                        "relation '{}' already exists",
+                        index_id
+                    ));
                 }
                 reserved_index_ids.insert(index_id.clone());
                 Some(index_id)
@@ -3325,19 +3224,13 @@ impl AnalysisState {
             for descendant in &recursive_rename_descendants {
                 let Some(RelationOverlay::Present(relation)) = self.local.relations.get(descendant)
                 else {
-                    self.taint(
-                        EvidenceCode::CatalogCoverageIncomplete,
-                        EvidenceScope::Chain,
-                    );
-                    return MutationResult::Skipped;
+                    return self.unresolved(EvidenceCode::CatalogCoverageIncomplete);
                 };
                 if relation.has_column(to) {
-                    return MutationResult::Conflict {
-                        reason: format!(
-                            "column '{}' already exists on relation '{}'",
-                            to, descendant
-                        ),
-                    };
+                    return MutationResult::conflict(format!(
+                        "column '{}' already exists on relation '{}'",
+                        to, descendant
+                    ));
                 }
                 if relation.generated_columns.values().any(|generated| {
                     generated.expression.as_deref().is_none_or(|source| {
@@ -3350,18 +3243,10 @@ impl AnalysisState {
                         .is_none()
                     })
                 }) {
-                    self.taint(
-                        EvidenceCode::CatalogCoverageIncomplete,
-                        EvidenceScope::Chain,
-                    );
-                    return MutationResult::Skipped;
+                    return self.unresolved(EvidenceCode::CatalogCoverageIncomplete);
                 }
                 let Some(provenance) = relation.column_inheritance.get(from) else {
-                    self.taint(
-                        EvidenceCode::CatalogCoverageIncomplete,
-                        EvidenceScope::Chain,
-                    );
-                    return MutationResult::Skipped;
+                    return self.unresolved(EvidenceCode::CatalogCoverageIncomplete);
                 };
                 let expected_parents = self
                     .local
@@ -3379,9 +3264,10 @@ impl AnalysisState {
                     })
                     .count() as u32;
                 if provenance.parent_count > expected_parents {
-                    return MutationResult::Conflict {
-                        reason: format!("cannot rename inherited column '{}'", from),
-                    };
+                    return MutationResult::conflict(format!(
+                        "cannot rename inherited column '{}'",
+                        from
+                    ));
                 }
             }
         }
@@ -3397,9 +3283,9 @@ impl AnalysisState {
                     == self.local.graph.resolve_rename(&alter.id)
             })
         {
-            return MutationResult::Conflict {
-                reason: "inherited columns must be renamed in child tables too".into(),
-            };
+            return MutationResult::conflict(
+                "inherited columns must be renamed in child tables too",
+            );
         }
         let concurrent_detach = matches!(
             alter.action,
@@ -3409,35 +3295,26 @@ impl AnalysisState {
             }
         );
         if concurrent_detach && self.in_transaction() {
-            return MutationResult::Conflict {
-                reason: "DETACH PARTITION CONCURRENTLY cannot run inside a transaction".into(),
-            };
+            return MutationResult::conflict(
+                "DETACH PARTITION CONCURRENTLY cannot run inside a transaction",
+            );
         }
         match self.relation_lookup(&alter.id, |kind| *kind == RelationKind::Table) {
             ObjectLookup::Present => {}
             ObjectLookup::WrongKind => {
-                return MutationResult::Conflict {
-                    reason: format!("object '{}' is not a table", alter.id),
-                };
+                return MutationResult::conflict(format!("object '{}' is not a table", alter.id));
             }
             ObjectLookup::AuthoritativelyAbsent | ObjectLookup::Tombstone => {
-                return MutationResult::Conflict {
-                    reason: format!("relation '{}' does not exist", alter.id),
-                };
+                return MutationResult::conflict(format!("relation '{}' does not exist", alter.id));
             }
             ObjectLookup::Unknown => {
-                self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
-                return MutationResult::Skipped;
+                return self.unresolved(EvidenceCode::UnknownObjectState);
             }
         }
 
         if let AlterTableActionMutation::OwnerTo { new_owner } = &alter.action {
             let Some((owner, known)) = self.role_fact_identity(new_owner) else {
-                self.taint(
-                    EvidenceCode::CatalogCoverageIncomplete,
-                    EvidenceScope::Chain,
-                );
-                return MutationResult::Skipped;
+                return self.unresolved(EvidenceCode::CatalogCoverageIncomplete);
             };
             if !known {
                 self.taint(
@@ -3446,9 +3323,7 @@ impl AnalysisState {
                 );
             }
             if known && self.local.roles_known && self.present_role(&owner).is_none() {
-                return MutationResult::Conflict {
-                    reason: format!("role '{}' does not exist", owner),
-                };
+                return MutationResult::conflict(format!("role '{}' does not exist", owner));
             }
             if known && !self.local.roles_known {
                 self.taint(
@@ -3462,9 +3337,7 @@ impl AnalysisState {
                     relation.owner = ObjectId::new("", owner.clone());
                     MutationResult::Applied
                 }
-                _ => MutationResult::Conflict {
-                    reason: format!("relation '{}' does not exist", alter.id),
-                },
+                _ => MutationResult::conflict(format!("relation '{}' does not exist", alter.id)),
             };
             if matches!(result, MutationResult::Applied) {
                 self.transfer_owned_sequence_owners(&alter.id, &ObjectId::new("", owner));
@@ -3477,24 +3350,19 @@ impl AnalysisState {
         // ignores missing names, but PostgreSQL rejects those ALTER TABLE
         // actions; silently continuing would make later state look valid.
         let Some(RelationOverlay::Present(relation)) = self.local.relations.get(&alter.id) else {
-            return MutationResult::Conflict {
-                reason: format!("relation '{}' does not exist", alter.id),
-            };
+            return MutationResult::conflict(format!("relation '{}' does not exist", alter.id));
         };
         let relation_columns_known =
             !relation.columns.is_empty() || relation.estimated_rows.is_some();
         if let AlterTableActionMutation::SetRuleMode { rule_name, mode } = &alter.action {
             let Some(rule_name) = rule_name else {
-                self.taint(EvidenceCode::UnsupportedSemantics, EvidenceScope::Statement);
-                return MutationResult::Skipped;
+                return self.unresolved_statement(EvidenceCode::UnsupportedSemantics);
             };
             if !relation.rules.contains_key(rule_name) {
-                return MutationResult::Conflict {
-                    reason: format!(
-                        "rule '{}' does not exist on relation '{}'",
-                        rule_name, alter.id
-                    ),
-                };
+                return MutationResult::conflict(format!(
+                    "rule '{}' does not exist on relation '{}'",
+                    rule_name, alter.id
+                ));
             }
             self.snapshot_relation(&alter.id);
             let Some(RelationOverlay::Present(relation)) = self.local.relations.get_mut(&alter.id)
@@ -3526,11 +3394,7 @@ impl AnalysisState {
                     | AlterTableActionMutation::ResetColumnOptions { .. }
             )
         {
-            self.taint(
-                EvidenceCode::CatalogCoverageIncomplete,
-                EvidenceScope::Chain,
-            );
-            return MutationResult::Skipped;
+            return self.unresolved(EvidenceCode::CatalogCoverageIncomplete);
         }
         match &alter.action {
             AlterTableActionMutation::AddColumn {
@@ -3540,53 +3404,45 @@ impl AnalysisState {
                 ..
             } if relation.has_column(name) => {
                 return if *if_not_exists {
-                    MutationResult::Skipped
+                    MutationResult::NoOp
                 } else {
-                    MutationResult::Conflict {
-                        reason: format!(
-                            "column '{}' already exists with type {}; this statement adds it again with type {}",
-                            name,
-                            relation
-                                .columns
-                                .iter()
-                                .find(|column| column.name == *name)
-                                .and_then(|column| column.data_type.as_deref())
-                                .unwrap_or("unknown"),
-                            ty.as_deref().unwrap_or("unknown"),
-                        ),
-                    }
+                    MutationResult::conflict(format!(
+                        "column '{}' already exists with type {}; this statement adds it again with type {}",
+                        name,
+                        relation
+                            .columns
+                            .iter()
+                            .find(|column| column.name == *name)
+                            .and_then(|column| column.data_type.as_deref())
+                            .unwrap_or("unknown"),
+                        ty.as_deref().unwrap_or("unknown"),
+                    ))
                 };
             }
             AlterTableActionMutation::DropColumn {
                 name, if_exists, ..
             } if !relation.has_column(name) => {
                 return if *if_exists {
-                    MutationResult::Skipped
+                    MutationResult::NoOp
                 } else {
-                    MutationResult::Conflict {
-                        reason: format!(
-                            "column '{}' does not exist on relation '{}'",
-                            name, alter.id
-                        ),
-                    }
+                    MutationResult::conflict(format!(
+                        "column '{}' does not exist on relation '{}'",
+                        name, alter.id
+                    ))
                 };
             }
             AlterTableActionMutation::RenameColumn { from, to } => {
                 if !relation.has_column(from) {
-                    return MutationResult::Conflict {
-                        reason: format!(
-                            "column '{}' does not exist on relation '{}'",
-                            from, alter.id
-                        ),
-                    };
+                    return MutationResult::conflict(format!(
+                        "column '{}' does not exist on relation '{}'",
+                        from, alter.id
+                    ));
                 }
                 if relation.has_column(to) {
-                    return MutationResult::Conflict {
-                        reason: format!(
-                            "column '{}' already exists on relation '{}'",
-                            to, alter.id
-                        ),
-                    };
+                    return MutationResult::conflict(format!(
+                        "column '{}' already exists on relation '{}'",
+                        to, alter.id
+                    ));
                 }
                 if relation.generated_columns.values().any(|generated| {
                     generated.expression.as_deref().is_none_or(|source| {
@@ -3599,11 +3455,7 @@ impl AnalysisState {
                         .is_none()
                     })
                 }) {
-                    self.taint(
-                        EvidenceCode::CatalogCoverageIncomplete,
-                        EvidenceScope::Chain,
-                    );
-                    return MutationResult::Skipped;
+                    return self.unresolved(EvidenceCode::CatalogCoverageIncomplete);
                 }
             }
             AlterTableActionMutation::SetNotNull { column }
@@ -3619,12 +3471,10 @@ impl AnalysisState {
             | AlterTableActionMutation::ResetColumnOptions { column, .. }
                 if !relation.has_column(column) =>
             {
-                return MutationResult::Conflict {
-                    reason: format!(
-                        "column '{}' does not exist on relation '{}'",
-                        column, alter.id
-                    ),
-                };
+                return MutationResult::conflict(format!(
+                    "column '{}' does not exist on relation '{}'",
+                    column, alter.id
+                ));
             }
             AlterTableActionMutation::SetCompression {
                 method: Some(method),
@@ -3632,46 +3482,38 @@ impl AnalysisState {
             } if !method.eq_ignore_ascii_case("pglz") => {
                 // lz4 availability is a PostgreSQL build capability, not a
                 // catalog fact carried by V8. Do not claim an exact result.
-                self.taint(EvidenceCode::UnsupportedSemantics, EvidenceScope::Statement);
-                return MutationResult::Skipped;
+                return self.unresolved_statement(EvidenceCode::UnsupportedSemantics);
             }
             AlterTableActionMutation::SetGeneratedExpression { column, expr, .. } => {
                 if !relation.generated_columns.contains_key(column) {
-                    return MutationResult::Conflict {
-                        reason: format!(
-                            "column '{}.{}' is not a generated column",
-                            alter.id, column
-                        ),
-                    };
+                    return MutationResult::conflict(format!(
+                        "column '{}.{}' is not a generated column",
+                        alter.id, column
+                    ));
                 }
                 let Some(references) = expr.referenced_columns() else {
-                    self.taint(EvidenceCode::UnsupportedSemantics, EvidenceScope::Statement);
-                    return MutationResult::Skipped;
+                    return self.unresolved_statement(EvidenceCode::UnsupportedSemantics);
                 };
                 if let Some(reference) = references
                     .iter()
                     .find(|reference| *reference == column || !relation.has_column(reference))
                 {
-                    return MutationResult::Conflict {
-                        reason: format!(
-                            "generated expression for '{}.{}' references invalid column '{}'",
-                            alter.id, column, reference
-                        ),
-                    };
+                    return MutationResult::conflict(format!(
+                        "generated expression for '{}.{}' references invalid column '{}'",
+                        alter.id, column, reference
+                    ));
                 }
             }
             AlterTableActionMutation::DropGeneratedExpression { column, if_exists }
                 if !relation.generated_columns.contains_key(column) =>
             {
                 return if *if_exists {
-                    MutationResult::Skipped
+                    MutationResult::NoOp
                 } else {
-                    MutationResult::Conflict {
-                        reason: format!(
-                            "column '{}.{}' has no generated expression",
-                            alter.id, column
-                        ),
-                    }
+                    MutationResult::conflict(format!(
+                        "column '{}.{}' has no generated expression",
+                        alter.id, column
+                    ))
                 };
             }
             _ => {}
@@ -3691,23 +3533,17 @@ impl AnalysisState {
                             &alter.id,
                             crate::_internal::db::cache::CatalogFamily::Relations,
                         ) {
-                        MutationResult::Skipped
+                        MutationResult::NoOp
                     } else if self.baseline_covers_family_object(
                         &alter.id,
                         crate::_internal::db::cache::CatalogFamily::Relations,
                     ) {
-                        MutationResult::Conflict {
-                            reason: format!(
-                                "constraint '{}' does not exist on relation '{}'",
-                                name, alter.id
-                            ),
-                        }
+                        MutationResult::conflict(format!(
+                            "constraint '{}' does not exist on relation '{}'",
+                            name, alter.id
+                        ))
                     } else {
-                        self.taint(
-                            EvidenceCode::CatalogCoverageIncomplete,
-                            EvidenceScope::Chain,
-                        );
-                        MutationResult::Skipped
+                        self.unresolved(EvidenceCode::CatalogCoverageIncomplete)
                     };
                 }
             }
@@ -3719,12 +3555,10 @@ impl AnalysisState {
                     .constraints
                     .contains_key(&(alter.id.clone(), name.clone()))
                 {
-                    return MutationResult::Conflict {
-                        reason: format!(
-                            "constraint '{}' does not exist on relation '{}'",
-                            name, alter.id
-                        ),
-                    };
+                    return MutationResult::conflict(format!(
+                        "constraint '{}' does not exist on relation '{}'",
+                        name, alter.id
+                    ));
                 }
             }
             AlterTableActionMutation::RenameConstraint { old_name, new_name } => {
@@ -3733,24 +3567,20 @@ impl AnalysisState {
                     .constraints
                     .contains_key(&(alter.id.clone(), old_name.clone()))
                 {
-                    return MutationResult::Conflict {
-                        reason: format!(
-                            "constraint '{}' does not exist on relation '{}'",
-                            old_name, alter.id
-                        ),
-                    };
+                    return MutationResult::conflict(format!(
+                        "constraint '{}' does not exist on relation '{}'",
+                        old_name, alter.id
+                    ));
                 }
                 if self
                     .local
                     .constraints
                     .contains_key(&(alter.id.clone(), new_name.clone()))
                 {
-                    return MutationResult::Conflict {
-                        reason: format!(
-                            "constraint '{}' already exists on relation '{}'",
-                            new_name, alter.id
-                        ),
-                    };
+                    return MutationResult::conflict(format!(
+                        "constraint '{}' already exists on relation '{}'",
+                        new_name, alter.id
+                    ));
                 }
                 let constraint = &self.local.constraints[&(alter.id.clone(), old_name.clone())];
                 if matches!(
@@ -3783,12 +3613,10 @@ impl AnalysisState {
                     .constraints
                     .contains_key(&(alter.id.clone(), name.clone()))
                 {
-                    return MutationResult::Conflict {
-                        reason: format!(
-                            "constraint '{}' already exists on relation '{}'",
-                            name, alter.id
-                        ),
-                    };
+                    return MutationResult::conflict(format!(
+                        "constraint '{}' already exists on relation '{}'",
+                        name, alter.id
+                    ));
                 }
             }
             AlterTableActionMutation::AddCheckConstraint {
@@ -3811,12 +3639,10 @@ impl AnalysisState {
                     .constraints
                     .contains_key(&(alter.id.clone(), name.clone()))
                 {
-                    return MutationResult::Conflict {
-                        reason: format!(
-                            "constraint '{}' already exists on relation '{}'",
-                            name, alter.id
-                        ),
-                    };
+                    return MutationResult::conflict(format!(
+                        "constraint '{}' already exists on relation '{}'",
+                        name, alter.id
+                    ));
                 }
             }
             AlterTableActionMutation::AddExcludeConstraint {
@@ -3836,12 +3662,10 @@ impl AnalysisState {
                     .constraints
                     .contains_key(&(alter.id.clone(), name.clone()))
                 {
-                    return MutationResult::Conflict {
-                        reason: format!(
-                            "constraint '{}' already exists on relation '{}'",
-                            name, alter.id
-                        ),
-                    };
+                    return MutationResult::conflict(format!(
+                        "constraint '{}' already exists on relation '{}'",
+                        name, alter.id
+                    ));
                 }
             }
             AlterTableActionMutation::AddUniqueConstraint {
@@ -3856,27 +3680,23 @@ impl AnalysisState {
             } => {
                 if using_index.is_none() {
                     if columns.is_empty() {
-                        return MutationResult::Conflict {
-                            reason: "key constraint must name at least one column".to_string(),
-                        };
+                        return MutationResult::conflict(
+                            "key constraint must name at least one column".to_string(),
+                        );
                     }
                     let mut key_columns = HashSet::new();
                     for column in columns {
                         if !key_columns.insert(column) {
-                            return MutationResult::Conflict {
-                                reason: format!(
-                                    "column '{}' appears more than once in a key constraint",
-                                    column
-                                ),
-                            };
+                            return MutationResult::conflict(format!(
+                                "column '{}' appears more than once in a key constraint",
+                                column
+                            ));
                         }
                         if relation_columns_known && !relation.has_column(column) {
-                            return MutationResult::Conflict {
-                                reason: format!(
-                                    "constraint references column '{}' which does not exist on relation '{}'",
-                                    column, alter.id
-                                ),
-                            };
+                            return MutationResult::conflict(format!(
+                                "constraint references column '{}' which does not exist on relation '{}'",
+                                column, alter.id
+                            ));
                         }
                     }
                 }
@@ -3891,9 +3711,10 @@ impl AnalysisState {
                         table == &alter.id && constraint.kind == ConstraintKind::PrimaryKey
                     })
                 {
-                    return MutationResult::Conflict {
-                        reason: format!("relation '{}' already has a primary key", alter.id),
-                    };
+                    return MutationResult::conflict(format!(
+                        "relation '{}' already has a primary key",
+                        alter.id
+                    ));
                 }
                 let name = constraint_name
                     .clone()
@@ -3919,12 +3740,10 @@ impl AnalysisState {
                     .constraints
                     .contains_key(&(alter.id.clone(), name.clone()))
                 {
-                    return MutationResult::Conflict {
-                        reason: format!(
-                            "constraint '{}' already exists on relation '{}'",
-                            name, alter.id
-                        ),
-                    };
+                    return MutationResult::conflict(format!(
+                        "constraint '{}' already exists on relation '{}'",
+                        name, alter.id
+                    ));
                 }
                 if using_index.is_none()
                     && self.relation_namespace_object_is_present(&ObjectId::new(
@@ -3932,12 +3751,10 @@ impl AnalysisState {
                         &name,
                     ))
                 {
-                    return MutationResult::Conflict {
-                        reason: format!(
-                            "constraint index '{}.{}' already exists",
-                            alter.id.schema, name
-                        ),
-                    };
+                    return MutationResult::conflict(format!(
+                        "constraint index '{}.{}' already exists",
+                        alter.id.schema, name
+                    ));
                 }
             }
             AlterTableActionMutation::AlterConstraint { name, .. } => {
@@ -3950,12 +3767,10 @@ impl AnalysisState {
                     .constraints
                     .contains_key(&(alter.id.clone(), name.clone()))
                 {
-                    return MutationResult::Conflict {
-                        reason: format!(
-                            "constraint '{}' does not exist on relation '{}'",
-                            name, alter.id
-                        ),
-                    };
+                    return MutationResult::conflict(format!(
+                        "constraint '{}' does not exist on relation '{}'",
+                        name, alter.id
+                    ));
                 }
                 self.taint(EvidenceCode::UnsupportedSemantics, EvidenceScope::Chain);
                 return MutationResult::Applied;
@@ -3976,28 +3791,25 @@ impl AnalysisState {
                     unreachable!("alter target presence established above")
                 };
                 let Some(partition_type) = &parent.partition_type else {
-                    return MutationResult::Conflict {
-                        reason: format!("partition parent '{}' is not partitioned", alter.id),
-                    };
+                    return MutationResult::conflict(format!(
+                        "partition parent '{}' is not partitioned",
+                        alter.id
+                    ));
                 };
                 if strategy
                     .as_deref()
                     .is_some_and(|strategy| !strategy.eq_ignore_ascii_case(partition_type))
                 {
-                    return MutationResult::Conflict {
-                        reason: format!(
-                            "partition strategy for '{}' does not match parent '{}' ({})",
-                            child, alter.id, partition_type
-                        ),
-                    };
+                    return MutationResult::conflict(format!(
+                        "partition strategy for '{}' does not match parent '{}' ({})",
+                        child, alter.id, partition_type
+                    ));
                 }
                 if self.local.graph.check_partition_cycle(&alter.id, child) {
-                    return MutationResult::Conflict {
-                        reason: format!(
-                            "attaching partition '{}' to '{}' would create a partition cycle",
-                            child, alter.id
-                        ),
-                    };
+                    return MutationResult::conflict(format!(
+                        "attaching partition '{}' to '{}' would create a partition cycle",
+                        child, alter.id
+                    ));
                 }
                 let existing_parent = self.local.graph.edges().iter().find_map(|edge| {
                     (matches!(
@@ -4007,12 +3819,10 @@ impl AnalysisState {
                         .then_some(edge.referenced.clone())
                 });
                 if let Some(existing_parent) = existing_parent {
-                    return MutationResult::Conflict {
-                        reason: format!(
-                            "partition '{}' is already attached to '{}'",
-                            child, existing_parent
-                        ),
-                    };
+                    return MutationResult::conflict(format!(
+                        "partition '{}' is already attached to '{}'",
+                        child, existing_parent
+                    ));
                 }
                 match self.partition_attachment_is_compatible(&alter.id, child) {
                     Ok(true) => {}
@@ -4026,7 +3836,7 @@ impl AnalysisState {
                             EvidenceScope::Chain,
                         );
                     }
-                    Err(reason) => return MutationResult::Conflict { reason },
+                    Err(reason) => return MutationResult::conflict(reason),
                 }
             }
             AlterTableActionMutation::DetachPartition { child, mode } => {
@@ -4042,12 +3852,10 @@ impl AnalysisState {
                         .filter(|edge| edge.referenced == alter.id)
                     {
                         if matches!(edge.kind, DependencyKind::PartitionDetachPending) {
-                            return MutationResult::Conflict {
-                                reason: format!(
-                                    "parent '{}' already has a partition pending detach",
-                                    alter.id
-                                ),
-                            };
+                            return MutationResult::conflict(format!(
+                                "parent '{}' already has a partition pending detach",
+                                alter.id
+                            ));
                         }
                         if matches!(edge.kind, DependencyKind::PartitionOf)
                             && let Some(RelationOverlay::Present(partition)) =
@@ -4057,12 +3865,10 @@ impl AnalysisState {
                                 .as_deref()
                                 .is_some_and(|bound| bound.trim().eq_ignore_ascii_case("DEFAULT"))
                         {
-                            return MutationResult::Conflict {
-                                reason: format!(
-                                    "cannot detach concurrently from '{}' while it has a default partition",
-                                    alter.id
-                                ),
-                            };
+                            return MutationResult::conflict(format!(
+                                "cannot detach concurrently from '{}' while it has a default partition",
+                                alter.id
+                            ));
                         }
                     }
                 }
@@ -4094,9 +3900,10 @@ impl AnalysisState {
                         }
                         _ => "is not attached to",
                     };
-                    return MutationResult::Conflict {
-                        reason: format!("partition '{}' {} parent '{}'", child, action, alter.id),
-                    };
+                    return MutationResult::conflict(format!(
+                        "partition '{}' {} parent '{}'",
+                        child, action, alter.id
+                    ));
                 }
             }
             AlterTableActionMutation::InheritTable { parent }
@@ -4116,30 +3923,24 @@ impl AnalysisState {
                 });
                 match &alter.action {
                     AlterTableActionMutation::InheritTable { .. } if has_edge => {
-                        return MutationResult::Conflict {
-                            reason: format!(
-                                "relation '{}' already inherits from '{}'",
-                                alter.id, parent
-                            ),
-                        };
+                        return MutationResult::conflict(format!(
+                            "relation '{}' already inherits from '{}'",
+                            alter.id, parent
+                        ));
                     }
                     AlterTableActionMutation::NoInheritTable { .. } if !has_edge => {
-                        return MutationResult::Conflict {
-                            reason: format!(
-                                "relation '{}' does not inherit from '{}'",
-                                alter.id, parent
-                            ),
-                        };
+                        return MutationResult::conflict(format!(
+                            "relation '{}' does not inherit from '{}'",
+                            alter.id, parent
+                        ));
                     }
                     AlterTableActionMutation::InheritTable { .. }
                         if self.local.graph.check_inheritance_cycle(parent, &alter.id) =>
                     {
-                        return MutationResult::Conflict {
-                            reason: format!(
-                                "inheriting '{}' into '{}' would create an inheritance cycle",
-                                parent, alter.id
-                            ),
-                        };
+                        return MutationResult::conflict(format!(
+                            "inheriting '{}' into '{}' would create an inheritance cycle",
+                            parent, alter.id
+                        ));
                     }
                     AlterTableActionMutation::InheritTable { .. } => {
                         let Some(RelationOverlay::Present(parent_relation)) =
@@ -4155,12 +3956,10 @@ impl AnalysisState {
                         for parent_column in &parent_relation.columns {
                             let Some(child_column) = child_relation.get_column(&parent_column.name)
                             else {
-                                return MutationResult::Conflict {
-                                    reason: format!(
-                                        "relation '{}' lacks inherited column '{}'",
-                                        alter.id, parent_column.name
-                                    ),
-                                };
+                                return MutationResult::conflict(format!(
+                                    "relation '{}' lacks inherited column '{}'",
+                                    alter.id, parent_column.name
+                                ));
                             };
                             let compatible_type = match (
                                 parent_column.type_id.as_ref(),
@@ -4179,12 +3978,10 @@ impl AnalysisState {
                                 || parent_relation.generated_columns.get(&parent_column.name)
                                     != child_relation.generated_columns.get(&parent_column.name)
                             {
-                                return MutationResult::Conflict {
-                                    reason: format!(
-                                        "column '{}.{}' is incompatible with inheritance parent '{}'",
-                                        alter.id, parent_column.name, parent
-                                    ),
-                                };
+                                return MutationResult::conflict(format!(
+                                    "column '{}.{}' is incompatible with inheritance parent '{}'",
+                                    alter.id, parent_column.name, parent
+                                ));
                             }
                         }
                         for parent_constraint in
@@ -4198,12 +3995,10 @@ impl AnalysisState {
                                 .constraints
                                 .get(&(alter.id.clone(), parent_constraint.name.clone()))
                             else {
-                                return MutationResult::Conflict {
-                                    reason: format!(
-                                        "relation '{}' lacks inherited CHECK constraint '{}'",
-                                        alter.id, parent_constraint.name
-                                    ),
-                                };
+                                return MutationResult::conflict(format!(
+                                    "relation '{}' lacks inherited CHECK constraint '{}'",
+                                    alter.id, parent_constraint.name
+                                ));
                             };
                             let definitions_match = parent_constraint
                                 .definition
@@ -4216,12 +4011,10 @@ impl AnalysisState {
                             if !matches!(child_constraint.kind, ConstraintKind::Check)
                                 || !definitions_match
                             {
-                                return MutationResult::Conflict {
-                                    reason: format!(
-                                        "CHECK constraint '{}' is incompatible with inheritance parent '{}'",
-                                        parent_constraint.name, parent
-                                    ),
-                                };
+                                return MutationResult::conflict(format!(
+                                    "CHECK constraint '{}' is incompatible with inheritance parent '{}'",
+                                    parent_constraint.name, parent
+                                ));
                             }
                         }
                     }
@@ -4235,12 +4028,10 @@ impl AnalysisState {
                         && edge.referenced == alter.id
                 });
                 if !owned {
-                    return MutationResult::Conflict {
-                        reason: format!(
-                            "index '{}' does not belong to relation '{}'",
-                            index, alter.id
-                        ),
-                    };
+                    return MutationResult::conflict(format!(
+                        "index '{}' does not belong to relation '{}'",
+                        index, alter.id
+                    ));
                 }
             }
             AlterTableActionMutation::SetReplicaIdentity {
@@ -4252,12 +4043,10 @@ impl AnalysisState {
                         && edge.referenced == alter.id
                         && matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
                 }) else {
-                    return MutationResult::Conflict {
-                        reason: format!(
-                            "replica identity index '{}' does not belong to relation '{}'",
-                            index, alter.id
-                        ),
-                    };
+                    return MutationResult::conflict(format!(
+                        "replica identity index '{}' does not belong to relation '{}'",
+                        index, alter.id
+                    ));
                 };
                 let DependencyKind::IndexOnRelation {
                     key_columns,
@@ -4276,11 +4065,7 @@ impl AnalysisState {
                     unreachable!("index edge was checked above");
                 };
                 if !*eligibility_known || !*dependency_columns_known {
-                    self.taint(
-                        EvidenceCode::CatalogCoverageIncomplete,
-                        EvidenceScope::Chain,
-                    );
-                    return MutationResult::Skipped;
+                    return self.unresolved(EvidenceCode::CatalogCoverageIncomplete);
                 }
                 let all_keys_not_null = self
                     .local
@@ -4308,12 +4093,10 @@ impl AnalysisState {
                     || !*is_live
                     || !all_keys_not_null
                 {
-                    return MutationResult::Conflict {
-                        reason: format!(
-                            "index '{}' is not eligible for replica identity on relation '{}'",
-                            index, alter.id
-                        ),
-                    };
+                    return MutationResult::conflict(format!(
+                        "index '{}' is not eligible for replica identity on relation '{}'",
+                        index, alter.id
+                    ));
                 }
             }
             AlterTableActionMutation::SetOfType {
@@ -4329,9 +4112,10 @@ impl AnalysisState {
                     })
                     .is_some()
                 {
-                    return MutationResult::Conflict {
-                        reason: format!("relation '{}' is already a typed table", alter.id),
-                    };
+                    return MutationResult::conflict(format!(
+                        "relation '{}' is already a typed table",
+                        alter.id
+                    ));
                 }
                 let Some(crate::_internal::model::types::TypeOverlay::Present(
                     crate::_internal::model::types::TypeState {
@@ -4340,14 +4124,14 @@ impl AnalysisState {
                     },
                 )) = self.local.types.get(type_id)
                 else {
-                    return MutationResult::Conflict {
-                        reason: format!("type '{}' is not an existing composite type", type_id),
-                    };
+                    return MutationResult::conflict(format!(
+                        "type '{}' is not an existing composite type",
+                        type_id
+                    ));
                 };
                 let Some(RelationOverlay::Present(relation)) = self.local.relations.get(&alter.id)
                 else {
-                    self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
-                    return MutationResult::Skipped;
+                    return self.unresolved(EvidenceCode::UnknownObjectState);
                 };
                 let matches_layout = relation.columns.len() == fields.len()
                     && relation.columns.iter().zip(fields).all(|(column, field)| {
@@ -4359,12 +4143,10 @@ impl AnalysisState {
                             })
                     });
                 if !matches_layout {
-                    return MutationResult::Conflict {
-                        reason: format!(
-                            "relation '{}' does not match composite type '{}' column layout",
-                            alter.id, type_id
-                        ),
-                    };
+                    return MutationResult::conflict(format!(
+                        "relation '{}' does not match composite type '{}' column layout",
+                        alter.id, type_id
+                    ));
                 }
             }
             AlterTableActionMutation::SetOfType { type_id: None } => {
@@ -4377,9 +4159,10 @@ impl AnalysisState {
                         RelationOverlay::Dropped => None,
                     });
                 if typed.is_none() {
-                    return MutationResult::Conflict {
-                        reason: format!("relation '{}' is not a typed table", alter.id),
-                    };
+                    return MutationResult::conflict(format!(
+                        "relation '{}' is not a typed table",
+                        alter.id
+                    ));
                 }
             }
             _ => {}
@@ -4417,13 +4200,11 @@ impl AnalysisState {
                 })
                 .collect();
             if trigger_ids.is_empty() && !all {
-                return MutationResult::Conflict {
-                    reason: format!(
-                        "trigger '{}' does not exist on relation '{}'",
-                        trigger_name.unwrap_or_default(),
-                        alter.id
-                    ),
-                };
+                return MutationResult::conflict(format!(
+                    "trigger '{}' does not exist on relation '{}'",
+                    trigger_name.unwrap_or_default(),
+                    alter.id
+                ));
             }
             for trigger_id in trigger_ids {
                 self.snapshot_trigger(&trigger_id);
@@ -4445,57 +4226,47 @@ impl AnalysisState {
         } = &alter.action
         {
             if from_columns.is_empty() {
-                return MutationResult::Conflict {
-                    reason: format!(
-                        "foreign key on relation '{}' has no source columns",
-                        alter.id
-                    ),
-                };
+                return MutationResult::conflict(format!(
+                    "foreign key on relation '{}' has no source columns",
+                    alter.id
+                ));
             }
             if !to_columns.is_empty() && from_columns.len() != to_columns.len() {
-                return MutationResult::Conflict {
-                    reason: format!(
-                        "foreign key on '{}' has {} source columns but {} referenced columns",
-                        alter.id,
-                        from_columns.len(),
-                        to_columns.len()
-                    ),
-                };
+                return MutationResult::conflict(format!(
+                    "foreign key on '{}' has {} source columns but {} referenced columns",
+                    alter.id,
+                    from_columns.len(),
+                    to_columns.len()
+                ));
             }
             let mut source_columns = HashSet::new();
             if let Some(column) = from_columns
                 .iter()
                 .find(|column| !source_columns.insert(column.as_str()))
             {
-                return MutationResult::Conflict {
-                    reason: format!(
-                        "foreign key on '{}' repeats source column '{}'",
-                        alter.id, column
-                    ),
-                };
+                return MutationResult::conflict(format!(
+                    "foreign key on '{}' repeats source column '{}'",
+                    alter.id, column
+                ));
             }
             let mut target_columns = HashSet::new();
             if let Some(column) = to_columns
                 .iter()
                 .find(|column| !target_columns.insert(column.as_str()))
             {
-                return MutationResult::Conflict {
-                    reason: format!(
-                        "foreign key on '{}' repeats referenced column '{}'",
-                        alter.id, column
-                    ),
-                };
+                return MutationResult::conflict(format!(
+                    "foreign key on '{}' repeats referenced column '{}'",
+                    alter.id, column
+                ));
             }
             if let Some(RelationOverlay::Present(child)) = self.local.relations.get(&alter.id)
                 && (!self.baseline_relation_is_known(&alter.id) || !child.columns.is_empty())
                 && let Some(column) = from_columns.iter().find(|column| !child.has_column(column))
             {
-                return MutationResult::Conflict {
-                    reason: format!(
-                        "foreign key column '{}' does not exist on relation '{}'",
-                        column, alter.id
-                    ),
-                };
+                return MutationResult::conflict(format!(
+                    "foreign key column '{}' does not exist on relation '{}'",
+                    column, alter.id
+                ));
             }
 
             if let Err(result) = self.ensure_relation_target(
@@ -4510,20 +4281,17 @@ impl AnalysisState {
                 return result;
             }
             let Some(RelationOverlay::Present(parent)) = self.local.relations.get(to_table) else {
-                self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
-                return MutationResult::Skipped;
+                return self.unresolved(EvidenceCode::UnknownObjectState);
             };
             let target_columns_known =
                 !self.baseline_relation_is_known(to_table) || !parent.columns.is_empty();
             if target_columns_known
                 && let Some(column) = to_columns.iter().find(|column| !parent.has_column(column))
             {
-                return MutationResult::Conflict {
-                    reason: format!(
-                        "foreign key references column '{}.{}' which does not exist",
-                        to_table, column
-                    ),
-                };
+                return MutationResult::conflict(format!(
+                    "foreign key references column '{}.{}' which does not exist",
+                    to_table, column
+                ));
             }
             let target_keys = self.unique_keys_for_relation(to_table);
             let mut fk_evidence_unknown = target_keys.is_none();
@@ -4537,12 +4305,10 @@ impl AnalysisState {
                     })
                     .unwrap_or_default();
                 if target_keys.is_some() && primary_keys.len() != 1 {
-                    return MutationResult::Conflict {
-                        reason: format!(
-                            "foreign key on '{}' omits referenced columns but target '{}' has no single primary key",
-                            alter.id, to_table
-                        ),
-                    };
+                    return MutationResult::conflict(format!(
+                        "foreign key on '{}' omits referenced columns but target '{}' has no single primary key",
+                        alter.id, to_table
+                    ));
                 }
                 primary_keys.first().cloned().cloned().unwrap_or_default()
             } else {
@@ -4554,12 +4320,10 @@ impl AnalysisState {
                     .iter()
                     .any(|(columns, _)| columns == &referenced_columns)
             {
-                return MutationResult::Conflict {
-                    reason: format!(
-                        "foreign key on '{}' references columns on '{}' that are not backed by a primary key or unique key",
-                        alter.id, to_table
-                    ),
-                };
+                return MutationResult::conflict(format!(
+                    "foreign key on '{}' references columns on '{}' that are not backed by a primary key or unique key",
+                    alter.id, to_table
+                ));
             }
             let Some(child) =
                 self.local
@@ -4609,11 +4373,7 @@ impl AnalysisState {
                 // PostgreSQL permits some binary-compatible type pairs, but
                 // the cache model does not carry the catalog cast graph.  A
                 // mismatch therefore cannot be classified safely here.
-                self.taint(
-                    EvidenceCode::CatalogCoverageIncomplete,
-                    EvidenceScope::Chain,
-                );
-                return MutationResult::Skipped;
+                return self.unresolved(EvidenceCode::CatalogCoverageIncomplete);
             }
             if type_evidence_unknown {
                 fk_evidence_unknown = true;
@@ -4660,9 +4420,7 @@ impl AnalysisState {
         if let Some((sequence_id, _, _, _)) = &implicit_add
             && self.relation_namespace_is_taken(sequence_id)
         {
-            return MutationResult::Conflict {
-                reason: format!("relation '{}' already exists", sequence_id),
-            };
+            return MutationResult::conflict(format!("relation '{}' already exists", sequence_id));
         }
         let owned_sequences_for_column: Vec<ObjectId> = match &alter.action {
             AlterTableActionMutation::DropColumn { name, .. }
@@ -4702,20 +4460,16 @@ impl AnalysisState {
                 })
                 .cloned()
             else {
-                return MutationResult::Conflict {
-                    reason: format!(
-                        "constraint references index '{}' which does not exist",
-                        index
-                    ),
-                };
+                return MutationResult::conflict(format!(
+                    "constraint references index '{}' which does not exist",
+                    index
+                ));
             };
             if edge.referenced != alter.id {
-                return MutationResult::Conflict {
-                    reason: format!(
-                        "constraint index '{}' belongs to relation '{}', not '{}'",
-                        index, edge.referenced, alter.id
-                    ),
-                };
+                return MutationResult::conflict(format!(
+                    "constraint index '{}' belongs to relation '{}', not '{}'",
+                    index, edge.referenced, alter.id
+                ));
             }
             if let DependencyKind::IndexOnRelation {
                 using_method,
@@ -4733,11 +4487,7 @@ impl AnalysisState {
             } = &edge.kind
             {
                 if !*eligibility_known {
-                    self.taint(
-                        EvidenceCode::CatalogCoverageIncomplete,
-                        crate::_internal::analysis::evidence::EvidenceScope::Chain,
-                    );
-                    return MutationResult::Skipped;
+                    return self.unresolved(EvidenceCode::CatalogCoverageIncomplete);
                 }
                 let is_btree = using_method
                     .as_deref()
@@ -4753,12 +4503,10 @@ impl AnalysisState {
                     || !*has_default_collations
                     || !is_btree
                 {
-                    return MutationResult::Conflict {
-                        reason: format!(
-                            "constraint index '{}' must be unique and non-partial, live/valid/ready, a btree with simple columns, and use the default definition",
-                            index
-                        ),
-                    };
+                    return MutationResult::conflict(format!(
+                        "constraint index '{}' must be unique and non-partial, live/valid/ready, a btree with simple columns, and use the default definition",
+                        index
+                    ));
                 }
             }
 
@@ -4776,9 +4524,10 @@ impl AnalysisState {
             let adopted_index = ObjectId::new(index.schema.clone(), constraint_name);
             if adopted_index != *index && self.relation_namespace_object_is_present(&adopted_index)
             {
-                return MutationResult::Conflict {
-                    reason: format!("constraint index '{}' already exists", adopted_index),
-                };
+                return MutationResult::conflict(format!(
+                    "constraint index '{}' already exists",
+                    adopted_index
+                ));
             }
         }
 
@@ -4797,11 +4546,7 @@ impl AnalysisState {
                     crate::_internal::db::cache::CatalogFamily::Relations,
                 ))
             {
-                self.taint(
-                    EvidenceCode::CatalogCoverageIncomplete,
-                    EvidenceScope::Chain,
-                );
-                return MutationResult::Skipped;
+                return self.unresolved(EvidenceCode::CatalogCoverageIncomplete);
             }
             let mut unknown_dependency = false;
             let mut known_dependency = false;
@@ -5115,19 +4860,13 @@ impl AnalysisState {
             }
 
             if unknown_dependency {
-                self.taint(
-                    EvidenceCode::CatalogCoverageIncomplete,
-                    EvidenceScope::Chain,
-                );
-                return MutationResult::Skipped;
+                return self.unresolved(EvidenceCode::CatalogCoverageIncomplete);
             }
             if known_dependency && !cascade {
-                return MutationResult::Conflict {
-                    reason: format!(
-                        "column '{}.{}' has dependent objects; use CASCADE",
-                        alter.id, name
-                    ),
-                };
+                return MutationResult::conflict(format!(
+                    "column '{}.{}' has dependent objects; use CASCADE",
+                    alter.id, name
+                ));
             }
         }
 
@@ -5169,16 +4908,14 @@ impl AnalysisState {
                 } => {
                     if let Some(existing_col) = rel.columns.iter().find(|c| c.name == *name) {
                         if *if_not_exists {
-                            return MutationResult::Skipped;
+                            return MutationResult::NoOp;
                         }
-                        return MutationResult::Conflict {
-                            reason: format!(
-                                "column '{}' already exists with type {}; this statement adds it again with type {}",
-                                name,
-                                existing_col.data_type.as_deref().unwrap_or("unknown"),
-                                ty.as_deref().unwrap_or("unknown")
-                            ),
-                        };
+                        return MutationResult::conflict(format!(
+                            "column '{}' already exists with type {}; this statement adds it again with type {}",
+                            name,
+                            existing_col.data_type.as_deref().unwrap_or("unknown"),
+                            ty.as_deref().unwrap_or("unknown")
+                        ));
                     }
                     rel.apply_column_action(&ColumnAction::Add {
                         name: name.clone(),
@@ -5276,14 +5013,12 @@ impl AnalysisState {
                     if !rel.has_column(name) {
                         if *if_exists {
                             // Column doesn't exist and IF EXISTS was specified: no-op
-                            return MutationResult::Skipped;
+                            return MutationResult::NoOp;
                         }
-                        return MutationResult::Conflict {
-                            reason: format!(
-                                "column '{}' does not exist on relation '{}'",
-                                name, alter.id
-                            ),
-                        };
+                        return MutationResult::conflict(format!(
+                            "column '{}' does not exist on relation '{}'",
+                            name, alter.id
+                        ));
                     }
                     rel.apply_column_action(&ColumnAction::Drop { name: name.clone() });
                     if !drop_column_statistics.is_empty() {
@@ -5764,9 +5499,10 @@ impl AnalysisState {
                     });
                     let backing_index = ObjectId::new(&alter.id.schema, &constraint_name);
                     if self.relation_namespace_is_taken(&backing_index) {
-                        return MutationResult::Conflict {
-                            reason: format!("relation '{}' already exists", backing_index),
-                        };
+                        return MutationResult::conflict(format!(
+                            "relation '{}' already exists",
+                            backing_index
+                        ));
                     }
                     self.snapshot_constraint(&alter.id, &constraint_name);
                     self.local.constraints.insert(
@@ -5843,12 +5579,10 @@ impl AnalysisState {
                 AlterTableActionMutation::AttachPartition { child, .. } => {
                     // Validation above rejects cyclic attachments before state mutation.
                     if self.local.graph.check_partition_cycle(&alter.id, child) {
-                        return MutationResult::Conflict {
-                            reason: format!(
-                                "attaching partition '{}' to '{}' would create a partition cycle",
-                                child, alter.id
-                            ),
-                        };
+                        return MutationResult::conflict(format!(
+                            "attaching partition '{}' to '{}' would create a partition cycle",
+                            child, alter.id
+                        ));
                     } else {
                         self.snapshot_graph();
                         self.local.graph.add_edge(DependencyEdge::new(
@@ -6286,12 +6020,10 @@ impl AnalysisState {
                     let Some(parameters) =
                         Self::apply_identity_sequence_options(default_parameters, options)
                     else {
-                        return MutationResult::Conflict {
-                            reason: format!(
-                                "identity sequence options for '{}.{}' are invalid",
-                                alter.id, column_name
-                            ),
-                        };
+                        return MutationResult::conflict(format!(
+                            "identity sequence options for '{}.{}' are invalid",
+                            alter.id, column_name
+                        ));
                     };
                     parameters
                 }
@@ -6519,12 +6251,10 @@ impl AnalysisState {
                         .constraints
                         .contains_key(&(constraint.table_id.clone(), rename.new_id.name.clone()))
                 {
-                    return MutationResult::Conflict {
-                        reason: format!(
-                            "constraint '{}' already exists on relation '{}'",
-                            rename.new_id.name, constraint.table_id
-                        ),
-                    };
+                    return MutationResult::conflict(format!(
+                        "constraint '{}' already exists on relation '{}'",
+                        rename.new_id.name, constraint.table_id
+                    ));
                 }
             }
         }
@@ -6538,38 +6268,36 @@ impl AnalysisState {
                 crate::_internal::db::cache::CatalogFamily::Indexes,
             ) =>
             {
-                return MutationResult::Conflict {
-                    reason: format!("relation '{}' does not exist", rename.old_id),
-                };
+                return MutationResult::conflict(format!(
+                    "relation '{}' does not exist",
+                    rename.old_id
+                ));
             }
             RelationLookup::Tombstone
             | RelationLookup::AuthoritativelyAbsent
             | RelationLookup::Unknown => {
-                self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
-                return MutationResult::Skipped;
+                return self.unresolved(EvidenceCode::UnknownObjectState);
             }
             RelationLookup::WrongKind => {
                 unreachable!("relation renames accept every modeled relation kind")
             }
         }
         if rename.old_id != rename.new_id && self.relation_namespace_is_taken(&rename.new_id) {
-            return MutationResult::Conflict {
-                reason: format!("relation '{}' already exists", rename.new_id),
-            };
+            return MutationResult::conflict(format!(
+                "relation '{}' already exists",
+                rename.new_id
+            ));
         }
         if rename.old_id.schema != rename.new_id.schema
             && !self.schema_is_present(&rename.new_id.schema)
         {
             if self.schema_absence_is_authoritative(&rename.new_id.schema) {
-                return MutationResult::Conflict {
-                    reason: format!("schema '{}' does not exist", rename.new_id.schema),
-                };
+                return MutationResult::conflict(format!(
+                    "schema '{}' does not exist",
+                    rename.new_id.schema
+                ));
             }
-            self.taint(
-                EvidenceCode::CatalogCoverageIncomplete,
-                EvidenceScope::Chain,
-            );
-            return MutationResult::Skipped;
+            return self.unresolved(EvidenceCode::CatalogCoverageIncomplete);
         }
 
         let schema_move = rename.old_id.schema != rename.new_id.schema;
@@ -6620,9 +6348,10 @@ impl AnalysisState {
             .chain(&associated_index_moves)
         {
             if old_id != new_id && self.relation_namespace_is_taken(new_id) {
-                return MutationResult::Conflict {
-                    reason: format!("associated object '{}' already exists", new_id),
-                };
+                return MutationResult::conflict(format!(
+                    "associated object '{}' already exists",
+                    new_id
+                ));
             }
         }
 
@@ -6928,8 +6657,7 @@ impl AnalysisState {
         new_owner: &crate::_internal::analysis::facts::RoleFact,
     ) -> MutationResult {
         let Some((owner, known)) = self.role_fact_identity(new_owner) else {
-            self.taint(EvidenceCode::UnresolvedReference, EvidenceScope::Chain);
-            return MutationResult::Skipped;
+            return self.unresolved(EvidenceCode::UnresolvedReference);
         };
         if !known {
             self.taint(
@@ -6938,9 +6666,7 @@ impl AnalysisState {
             );
         }
         if known && self.local.roles_known && self.present_role(&owner).is_none() {
-            return MutationResult::Conflict {
-                reason: format!("role '{}' does not exist", owner),
-            };
+            return MutationResult::conflict(format!("role '{}' does not exist", owner));
         }
         if known && !self.local.roles_known {
             self.taint(
@@ -6966,14 +6692,9 @@ impl AnalysisState {
                 unreachable!("all present relation kinds accept owner changes")
             }
             RelationLookup::Tombstone | RelationLookup::AuthoritativelyAbsent => {
-                MutationResult::Conflict {
-                    reason: format!("relation '{}' does not exist", id),
-                }
+                MutationResult::conflict(format!("relation '{}' does not exist", id))
             }
-            RelationLookup::Unknown => {
-                self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
-                MutationResult::Skipped
-            }
+            RelationLookup::Unknown => self.unresolved(EvidenceCode::UnknownObjectState),
         }
     }
 

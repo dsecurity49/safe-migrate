@@ -1,5 +1,5 @@
 use crate::_internal::analysis::mutations::{Mutation, ReindexTargetMutation};
-use crate::_internal::analysis::state::MutationResult;
+
 use crate::_internal::model::relation::Persistence;
 use crate::_internal::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
 use crate::_internal::rules::{
@@ -24,7 +24,7 @@ impl Rule for ConcurrentIndexRule {
     }
 
     fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
-        if *context.result() == MutationResult::Skipped {
+        if context.result().is_unresolved() {
             // An index that is present in the pre-state still incurs the
             // synchronous DROP INDEX risk even when catalog metadata is too
             // incomplete to mutate it exactly (for example, eligibility for

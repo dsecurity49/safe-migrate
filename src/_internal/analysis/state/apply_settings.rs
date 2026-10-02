@@ -10,7 +10,7 @@ use crate::_internal::analysis::mutations::{
 impl AnalysisState {
     pub(super) fn apply_search_path(&mut self, change: &SearchPathChange) -> MutationResult {
         if change.local && self.local.transactions.is_empty() {
-            return MutationResult::Skipped;
+            return MutationResult::NoOp;
         }
         self.snapshot_search_path();
         self.snapshot_confidence();
@@ -31,7 +31,7 @@ impl AnalysisState {
         change: &TimeoutSettingChange,
     ) -> MutationResult {
         if change.local && self.local.transactions.is_empty() {
-            return MutationResult::Skipped;
+            return MutationResult::NoOp;
         }
         let next = match &change.value {
             TimeoutSettingValue::Default => match change.setting {
@@ -44,9 +44,7 @@ impl AnalysisState {
                 TimeoutSetting::Statement => self.local.statement_timeout.effective,
             },
             TimeoutSettingValue::Invalid(reason) => {
-                return MutationResult::Conflict {
-                    reason: reason.clone(),
-                };
+                return MutationResult::conflict(reason.clone());
             }
         };
         self.snapshot_timeout_settings();
@@ -105,13 +103,12 @@ impl AnalysisState {
         is_session_auth: bool,
     ) -> MutationResult {
         if local && self.local.transactions.is_empty() {
-            return MutationResult::Skipped;
+            return MutationResult::NoOp;
         }
 
         let (target_name, target_known) = if let Some(role) = role {
             let Some(identity) = self.role_fact_identity(role) else {
-                self.taint(EvidenceCode::UnresolvedReference, EvidenceScope::Chain);
-                return MutationResult::Skipped;
+                return self.unresolved(EvidenceCode::UnresolvedReference);
             };
             identity
         } else if is_session_auth {
@@ -143,13 +140,11 @@ impl AnalysisState {
         };
         match authorized {
             Some(false) => {
-                return MutationResult::Conflict {
-                    reason: if self.present_role(&target_name).is_none() {
-                        format!("role '{}' does not exist", target_name)
-                    } else {
-                        format!("permission denied to set role '{}'", target_name)
-                    },
-                };
+                return MutationResult::conflict(if self.present_role(&target_name).is_none() {
+                    format!("role '{}' does not exist", target_name)
+                } else {
+                    format!("permission denied to set role '{}'", target_name)
+                });
             }
             None => {
                 self.taint(

@@ -108,7 +108,7 @@ impl Rule for BrokenComputeRule {
     }
 
     fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
-        if !matches!(context.result(), MutationResult::Conflict { .. }) {
+        if !matches!(context.result(), MutationResult::Conflict(_)) {
             return vec![];
         }
         if let Mutation::DropFunction(drop) = context.mutation()

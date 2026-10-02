@@ -5985,7 +5985,7 @@ mod state_mutation_tests {
             aggregate_drop("public", true),
         ] {
             let mut state = setup_state();
-            assert_eq!(state.apply(&drop, None), MutationResult::Skipped);
+            assert_eq!(state.apply(&drop, None), MutationResult::NoOp);
             assert_eq!(state.local.confidence, Confidence::Exact);
         }
 
@@ -5997,7 +5997,10 @@ mod state_mutation_tests {
             let mut cache = synced_cache();
             cache.metadata.schemas = Some(vec!["public".into()]);
             let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
-            assert_eq!(state.apply(&drop, None), MutationResult::Skipped);
+            assert_eq!(
+                state.apply(&drop, None),
+                MutationResult::Unresolved(EvidenceCode::UnknownObjectState)
+            );
             assert_eq!(state.local.confidence, Confidence::Tainted);
         }
 
@@ -6006,12 +6009,12 @@ mod state_mutation_tests {
         let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
         assert_eq!(
             state.apply(&function_drop("tenant", true), None),
-            MutationResult::Skipped
+            MutationResult::Unresolved(EvidenceCode::UnknownObjectState)
         );
         assert_eq!(state.local.confidence, Confidence::Tainted);
         assert_eq!(
             state.apply(&aggregate_drop("tenant", true), None),
-            MutationResult::Skipped
+            MutationResult::Unresolved(EvidenceCode::UnknownObjectState)
         );
         assert_eq!(state.local.confidence, Confidence::Tainted);
     }

@@ -230,18 +230,16 @@ impl AnalysisState {
             return result;
         }
         if create.if_not_exists && self.relation_namespace_is_taken(&create.id) {
-            return MutationResult::Skipped;
+            return MutationResult::NoOp;
         }
         if self.relation_namespace_is_taken(&create.id) {
-            return MutationResult::Conflict {
-                reason: format!("relation '{}' already exists", create.id),
-            };
+            return MutationResult::conflict(format!("relation '{}' already exists", create.id));
         }
         if let Some((table_id, column)) = &create.owned_by {
             if table_id.schema != create.id.schema {
-                return MutationResult::Conflict {
-                    reason: "sequence must be in the same schema as its owning table".to_string(),
-                };
+                return MutationResult::conflict(
+                    "sequence must be in the same schema as its owning table".to_string(),
+                );
             }
             if let Err(result) = self.ensure_relation_target(
                 table_id,
@@ -254,15 +252,16 @@ impl AnalysisState {
             match self.local.relations.get(table_id) {
                 Some(RelationOverlay::Present(table)) => {
                     if !table.has_column(column) {
-                        return MutationResult::Conflict {
-                            reason: format!("column '{}.{}' does not exist", table_id, column),
-                        };
+                        return MutationResult::conflict(format!(
+                            "column '{}.{}' does not exist",
+                            table_id, column
+                        ));
                     }
                     if self.local.current_role_known && table.owner.name != self.local.current_role
                     {
-                        return MutationResult::Conflict {
-                            reason: "sequence and table must have the same owner".to_string(),
-                        };
+                        return MutationResult::conflict(
+                            "sequence and table must have the same owner".to_string(),
+                        );
                     }
                 }
                 _ if self.baseline_covers_family_object(
@@ -270,13 +269,13 @@ impl AnalysisState {
                     crate::_internal::db::cache::CatalogFamily::Relations,
                 ) =>
                 {
-                    return MutationResult::Conflict {
-                        reason: format!("relation '{}' does not exist", table_id),
-                    };
+                    return MutationResult::conflict(format!(
+                        "relation '{}' does not exist",
+                        table_id
+                    ));
                 }
                 _ => {
-                    self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
-                    return MutationResult::Skipped;
+                    return self.unresolved(EvidenceCode::UnknownObjectState);
                 }
             }
         }
@@ -291,9 +290,7 @@ impl AnalysisState {
             },
             &create.options,
         ) else {
-            return MutationResult::Conflict {
-                reason: "invalid sequence parameters".to_string(),
-            };
+            return MutationResult::conflict("invalid sequence parameters".to_string());
         };
         self.local.sequences.insert(
             create.id.clone(),
@@ -327,12 +324,10 @@ impl AnalysisState {
         match self.sequence_lookup(&alter.id) {
             SequenceLookup::Present => {}
             SequenceLookup::AuthoritativelyAbsent if alter.if_exists => {
-                return MutationResult::Skipped;
+                return MutationResult::NoOp;
             }
             SequenceLookup::AuthoritativelyAbsent => {
-                return MutationResult::Conflict {
-                    reason: format!("sequence '{}' does not exist", alter.id),
-                };
+                return MutationResult::conflict(format!("sequence '{}' does not exist", alter.id));
             }
             SequenceLookup::Tombstone
                 if self.baseline_covers_family_object(
@@ -340,14 +335,11 @@ impl AnalysisState {
                     crate::_internal::db::cache::CatalogFamily::Sequences,
                 ) =>
             {
-                return MutationResult::Conflict {
-                    reason: format!("sequence '{}' does not exist", alter.id),
-                };
+                return MutationResult::conflict(format!("sequence '{}' does not exist", alter.id));
             }
-            SequenceLookup::Tombstone if alter.if_exists => return MutationResult::Skipped,
+            SequenceLookup::Tombstone if alter.if_exists => return MutationResult::NoOp,
             SequenceLookup::Tombstone | SequenceLookup::Unknown => {
-                self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
-                return MutationResult::Skipped;
+                return self.unresolved(EvidenceCode::UnknownObjectState);
             }
             SequenceLookup::WrongKind => unreachable!("sequence lookup has no kind predicate"),
         }
@@ -358,16 +350,15 @@ impl AnalysisState {
         match &alter.action {
             AlterSequenceActionMutation::OwnedBy(owned_by) => {
                 if current.kind == SequenceKind::Identity {
-                    return MutationResult::Conflict {
-                        reason: "cannot change ownership of an identity sequence".to_string(),
-                    };
+                    return MutationResult::conflict(
+                        "cannot change ownership of an identity sequence".to_string(),
+                    );
                 }
                 if let Some((table_id, column)) = owned_by {
                     if table_id.schema != alter.id.schema {
-                        return MutationResult::Conflict {
-                            reason: "sequence must be in the same schema as its owning table"
-                                .to_string(),
-                        };
+                        return MutationResult::conflict(
+                            "sequence must be in the same schema as its owning table".to_string(),
+                        );
                     }
                     if let Err(result) = self.ensure_relation_target(
                         table_id,
@@ -382,14 +373,15 @@ impl AnalysisState {
                         unreachable!("relation target presence checked above");
                     };
                     if !table.has_column(column) {
-                        return MutationResult::Conflict {
-                            reason: format!("column '{}.{}' does not exist", table_id, column),
-                        };
+                        return MutationResult::conflict(format!(
+                            "column '{}.{}' does not exist",
+                            table_id, column
+                        ));
                     }
                     if table.owner != current.owner {
-                        return MutationResult::Conflict {
-                            reason: "sequence and table must have the same owner".to_string(),
-                        };
+                        return MutationResult::conflict(
+                            "sequence and table must have the same owner".to_string(),
+                        );
                     }
                 }
                 self.snapshot_sequence(&alter.id);
@@ -421,18 +413,18 @@ impl AnalysisState {
             }
             AlterSequenceActionMutation::OwnerTo(owner) => {
                 if current.kind == SequenceKind::Identity {
-                    return MutationResult::Conflict {
-                        reason: "cannot alter an identity sequence independently".to_string(),
-                    };
+                    return MutationResult::conflict(
+                        "cannot alter an identity sequence independently".to_string(),
+                    );
                 }
                 let Some((owner_name, known)) = self.role_fact_identity(owner) else {
-                    self.taint(EvidenceCode::UnresolvedReference, EvidenceScope::Chain);
-                    return MutationResult::Skipped;
+                    return self.unresolved(EvidenceCode::UnresolvedReference);
                 };
                 if known && self.local.roles_known && self.present_role(&owner_name).is_none() {
-                    return MutationResult::Conflict {
-                        reason: format!("role '{}' does not exist", owner_name),
-                    };
+                    return MutationResult::conflict(format!(
+                        "role '{}' does not exist",
+                        owner_name
+                    ));
                 }
                 if known && !self.local.roles_known {
                     self.taint(
@@ -454,9 +446,9 @@ impl AnalysisState {
                         unreachable!("sequence owner presence checked above");
                     };
                     if table.owner.name != owner_name {
-                        return MutationResult::Conflict {
-                            reason: "sequence and table must have the same owner".to_string(),
-                        };
+                        return MutationResult::conflict(
+                            "sequence and table must have the same owner".to_string(),
+                        );
                     }
                 }
                 self.snapshot_sequence(&alter.id);
@@ -470,25 +462,25 @@ impl AnalysisState {
             AlterSequenceActionMutation::RenameTo(new_id)
             | AlterSequenceActionMutation::SetSchema(new_id) => {
                 if current.kind == SequenceKind::Identity {
-                    return MutationResult::Conflict {
-                        reason: "cannot alter an identity sequence independently".to_string(),
-                    };
+                    return MutationResult::conflict(
+                        "cannot alter an identity sequence independently".to_string(),
+                    );
                 }
                 if let Err(result) = self.ensure_schema_target(&new_id.schema) {
                     return result;
                 }
                 if self.relation_namespace_is_taken(new_id) {
-                    return MutationResult::Conflict {
-                        reason: format!("relation '{}' already exists", new_id),
-                    };
+                    return MutationResult::conflict(format!(
+                        "relation '{}' already exists",
+                        new_id
+                    ));
                 }
                 if let Some((table_id, _)) = &current.owned_by
                     && table_id.schema != new_id.schema
                 {
-                    return MutationResult::Conflict {
-                        reason: "sequence must be in the same schema as its owning table"
-                            .to_string(),
-                    };
+                    return MutationResult::conflict(
+                        "sequence must be in the same schema as its owning table".to_string(),
+                    );
                 }
                 self.snapshot_namespace();
                 let mut moved = current;
@@ -513,8 +505,7 @@ impl AnalysisState {
             AlterSequenceActionMutation::Other => {
                 // No typed state transition exists for this Squawk action;
                 // retaining Applied would make subsequent analysis look exact.
-                self.taint(EvidenceCode::UnsupportedSemantics, EvidenceScope::Chain);
-                MutationResult::Skipped
+                self.unresolved(EvidenceCode::UnsupportedSemantics)
             }
         }
     }
@@ -526,16 +517,13 @@ impl AnalysisState {
                 SequenceLookup::AuthoritativelyAbsent | SequenceLookup::Tombstone
                     if drop.if_exists => {}
                 SequenceLookup::AuthoritativelyAbsent | SequenceLookup::Tombstone => {
-                    return MutationResult::Conflict {
-                        reason: format!("sequence '{}' does not exist", id),
-                    };
+                    return MutationResult::conflict(format!("sequence '{}' does not exist", id));
                 }
                 SequenceLookup::Unknown => {
                     // IF EXISTS cannot prove that an out-of-scope object is
                     // absent.  Do not apply the other targets and then claim
                     // an exact state transition.
-                    self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
-                    return MutationResult::Skipped;
+                    return self.unresolved(EvidenceCode::UnknownObjectState);
                 }
                 SequenceLookup::WrongKind => {
                     unreachable!("sequence lookup has no kind predicate")
@@ -549,7 +537,7 @@ impl AnalysisState {
             .cloned()
             .collect();
         if present.is_empty() {
-            return MutationResult::Skipped;
+            return MutationResult::NoOp;
         }
         if present.iter().any(|id| {
             self.baseline_sequences.contains(id)
@@ -560,20 +548,17 @@ impl AnalysisState {
                     crate::_internal::db::cache::CatalogFamily::Sequences,
                 ))
         }) {
-            self.taint(
-                EvidenceCode::CatalogCoverageIncomplete,
-                EvidenceScope::Chain,
-            );
-            return MutationResult::Skipped;
+            return self.unresolved(EvidenceCode::CatalogCoverageIncomplete);
         }
         for id in &present {
             let Some(SequenceOverlay::Present(sequence)) = self.local.sequences.get(id) else {
                 continue;
             };
             if sequence.kind == SequenceKind::Identity {
-                return MutationResult::Conflict {
-                    reason: format!("cannot drop identity sequence '{}' independently", id),
-                };
+                return MutationResult::conflict(format!(
+                    "cannot drop identity sequence '{}' independently",
+                    id
+                ));
             }
             let has_default_dependencies = self.local.graph.edges().iter().any(|edge| {
                 edge.referenced == *id
@@ -582,9 +567,10 @@ impl AnalysisState {
             if (sequence.kind == SequenceKind::SerialLike || has_default_dependencies)
                 && !drop.cascade
             {
-                return MutationResult::Conflict {
-                    reason: format!("sequence '{}' still has dependent defaults", id),
-                };
+                return MutationResult::conflict(format!(
+                    "sequence '{}' still has dependent defaults",
+                    id
+                ));
             }
         }
         if drop.cascade {

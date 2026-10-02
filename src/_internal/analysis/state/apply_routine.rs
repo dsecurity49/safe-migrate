@@ -58,14 +58,16 @@ impl AnalysisState {
         };
         match self.routine_lookup(&function.id, |kind| kind == routine_kind) {
             RoutineLookup::Present if !function.or_replace => {
-                return MutationResult::Conflict {
-                    reason: format!("routine '{}' already exists", function.id),
-                };
+                return MutationResult::conflict(format!(
+                    "routine '{}' already exists",
+                    function.id
+                ));
             }
             RoutineLookup::WrongKind => {
-                return MutationResult::Conflict {
-                    reason: format!("routine '{}' already exists", function.id),
-                };
+                return MutationResult::conflict(format!(
+                    "routine '{}' already exists",
+                    function.id
+                ));
             }
             RoutineLookup::Unknown => {
                 self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
@@ -185,18 +187,16 @@ impl AnalysisState {
         }) {
             RoutineLookup::Present => {}
             RoutineLookup::WrongKind => {
-                return MutationResult::Conflict {
-                    reason: format!("'{}' is not a function", function.id),
-                };
+                return MutationResult::conflict(format!("'{}' is not a function", function.id));
             }
             RoutineLookup::Tombstone | RoutineLookup::AuthoritativelyAbsent => {
-                return MutationResult::Conflict {
-                    reason: format!("function '{}' does not exist", function.id),
-                };
+                return MutationResult::conflict(format!(
+                    "function '{}' does not exist",
+                    function.id
+                ));
             }
             RoutineLookup::Unknown => {
-                self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
-                return MutationResult::Skipped;
+                return self.unresolved(EvidenceCode::UnknownObjectState);
             }
         }
 
@@ -258,8 +258,7 @@ impl AnalysisState {
                 // Ownership and extension dependencies are not represented
                 // by FunctionState, so retaining Applied would overstate the
                 // precision of subsequent dependency checks.
-                self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
-                return MutationResult::Skipped;
+                return self.unresolved(EvidenceCode::UnmodeledState);
             }
         }
         MutationResult::Applied
@@ -286,36 +285,27 @@ impl AnalysisState {
                 matches!(kind, RoutineKind::Function | RoutineKind::Window)
             }) {
                 RoutineLookup::WrongKind => {
-                    return MutationResult::Conflict {
-                        reason: format!("function '{}' does not exist", id),
-                    };
+                    return MutationResult::conflict(format!("function '{}' does not exist", id));
                 }
                 RoutineLookup::Tombstone if function.if_exists => {}
                 RoutineLookup::Tombstone => {
-                    return MutationResult::Conflict {
-                        reason: format!("function '{}' does not exist", id),
-                    };
+                    return MutationResult::conflict(format!("function '{}' does not exist", id));
                 }
                 RoutineLookup::AuthoritativelyAbsent if !function.if_exists => {
-                    return MutationResult::Conflict {
-                        reason: format!("function '{}' does not exist", id),
-                    };
+                    return MutationResult::conflict(format!("function '{}' does not exist", id));
                 }
                 RoutineLookup::Unknown => {
-                    self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
-                    return MutationResult::Skipped;
+                    return self.unresolved(EvidenceCode::UnknownObjectState);
                 }
                 RoutineLookup::Present => {
                     // PostgreSQL created this routine as an internal part of a
                     // type (a range constructor) and refuses to drop it while
                     // that type exists.
                     if let Some(owner) = self.routine_internal_type_owner(&id) {
-                        return MutationResult::Conflict {
-                            reason: format!(
-                                "function '{}' cannot be dropped because type '{}' requires it",
-                                id, owner
-                            ),
-                        };
+                        return MutationResult::conflict(format!(
+                            "function '{}' cannot be dropped because type '{}' requires it",
+                            id, owner
+                        ));
                     }
                     let dependent_triggers: Vec<(ObjectId, ObjectId)> = self
                         .local
@@ -332,12 +322,10 @@ impl AnalysisState {
                         })
                         .collect();
                     if !dependent_triggers.is_empty() && !function.cascade {
-                        return MutationResult::Conflict {
-                            reason: format!(
-                                "function '{}' still has dependent triggers; use CASCADE",
-                                id
-                            ),
-                        };
+                        return MutationResult::conflict(format!(
+                            "function '{}' still has dependent triggers; use CASCADE",
+                            id
+                        ));
                     }
                     if !targets.iter().any(|(existing, _)| existing == &id) {
                         targets.push((id, dependent_triggers));
@@ -348,7 +336,7 @@ impl AnalysisState {
         }
 
         if targets.is_empty() {
-            return MutationResult::Skipped;
+            return MutationResult::NoOp;
         }
 
         if targets.iter().any(|(id, _)| {
@@ -357,11 +345,7 @@ impl AnalysisState {
                 crate::_internal::db::cache::CatalogFamily::Routines,
             )
         }) {
-            self.taint(
-                EvidenceCode::CatalogCoverageIncomplete,
-                EvidenceScope::Chain,
-            );
-            return MutationResult::Skipped;
+            return self.unresolved(EvidenceCode::CatalogCoverageIncomplete);
         }
 
         let any_applied = !targets.is_empty();
@@ -406,7 +390,7 @@ impl AnalysisState {
         if any_applied {
             MutationResult::Applied
         } else {
-            MutationResult::Skipped
+            MutationResult::NoOp
         }
     }
 
@@ -420,9 +404,10 @@ impl AnalysisState {
         match self.routine_lookup(&procedure.id, |kind| kind == RoutineKind::Procedure) {
             RoutineLookup::Present if procedure.or_replace => {}
             RoutineLookup::Present | RoutineLookup::WrongKind => {
-                return MutationResult::Conflict {
-                    reason: format!("routine '{}' already exists", procedure.id),
-                };
+                return MutationResult::conflict(format!(
+                    "routine '{}' already exists",
+                    procedure.id
+                ));
             }
             RoutineLookup::Unknown => {
                 self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
@@ -513,18 +498,16 @@ impl AnalysisState {
         match self.routine_lookup(&procedure.id, |kind| kind == RoutineKind::Procedure) {
             RoutineLookup::Present => {}
             RoutineLookup::WrongKind => {
-                return MutationResult::Conflict {
-                    reason: format!("'{}' is not a procedure", procedure.id),
-                };
+                return MutationResult::conflict(format!("'{}' is not a procedure", procedure.id));
             }
             RoutineLookup::Tombstone | RoutineLookup::AuthoritativelyAbsent => {
-                return MutationResult::Conflict {
-                    reason: format!("procedure '{}' does not exist", procedure.id),
-                };
+                return MutationResult::conflict(format!(
+                    "procedure '{}' does not exist",
+                    procedure.id
+                ));
             }
             RoutineLookup::Unknown => {
-                self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
-                return MutationResult::Skipped;
+                return self.unresolved(EvidenceCode::UnknownObjectState);
             }
         }
 
@@ -550,8 +533,7 @@ impl AnalysisState {
                 self.move_function(&procedure.id, &new_id);
             }
             _ => {
-                self.taint(EvidenceCode::UnsupportedSemantics, EvidenceScope::Chain);
-                return MutationResult::Skipped;
+                return self.unresolved(EvidenceCode::UnsupportedSemantics);
             }
         }
         MutationResult::Applied
@@ -577,24 +559,17 @@ impl AnalysisState {
                     }
                 }
                 RoutineLookup::WrongKind => {
-                    return MutationResult::Conflict {
-                        reason: format!("procedure '{}' does not exist", id),
-                    };
+                    return MutationResult::conflict(format!("procedure '{}' does not exist", id));
                 }
                 RoutineLookup::Tombstone if procedure.if_exists => {}
                 RoutineLookup::Tombstone => {
-                    return MutationResult::Conflict {
-                        reason: format!("procedure '{}' does not exist", id),
-                    };
+                    return MutationResult::conflict(format!("procedure '{}' does not exist", id));
                 }
                 RoutineLookup::AuthoritativelyAbsent if !procedure.if_exists => {
-                    return MutationResult::Conflict {
-                        reason: format!("procedure '{}' does not exist", id),
-                    };
+                    return MutationResult::conflict(format!("procedure '{}' does not exist", id));
                 }
                 RoutineLookup::Unknown => {
-                    self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
-                    return MutationResult::Skipped;
+                    return self.unresolved(EvidenceCode::UnknownObjectState);
                 }
                 RoutineLookup::AuthoritativelyAbsent => {}
             }
@@ -605,18 +580,13 @@ impl AnalysisState {
                 crate::_internal::db::cache::CatalogFamily::Routines,
             )
         }) {
-            self.taint(
-                EvidenceCode::CatalogCoverageIncomplete,
-                EvidenceScope::Chain,
-            );
-            return MutationResult::Skipped;
+            return self.unresolved(EvidenceCode::CatalogCoverageIncomplete);
         }
         if procedure.cascade && !targets.is_empty() {
             // Procedure dependents are not yet represented as typed graph
             // edges. Applying CASCADE would therefore remove only the routine
             // while leaving PostgreSQL-owned dependents in simulated state.
-            self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
-            return MutationResult::Skipped;
+            return self.unresolved(EvidenceCode::UnmodeledState);
         }
         for id in &targets {
             self.snapshot_function(id);
@@ -627,7 +597,7 @@ impl AnalysisState {
         if !targets.is_empty() {
             MutationResult::Applied
         } else {
-            MutationResult::Skipped
+            MutationResult::NoOp
         }
     }
 
@@ -641,9 +611,10 @@ impl AnalysisState {
         match self.routine_lookup(&aggregate.id, |kind| kind == RoutineKind::Aggregate) {
             RoutineLookup::Present if aggregate.or_replace => {}
             RoutineLookup::Present | RoutineLookup::WrongKind => {
-                return MutationResult::Conflict {
-                    reason: format!("routine '{}' already exists", aggregate.id),
-                };
+                return MutationResult::conflict(format!(
+                    "routine '{}' already exists",
+                    aggregate.id
+                ));
             }
             RoutineLookup::Unknown => {
                 self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
@@ -693,18 +664,16 @@ impl AnalysisState {
         match self.routine_lookup(&aggregate.id, |kind| kind == RoutineKind::Aggregate) {
             RoutineLookup::Present => {}
             RoutineLookup::WrongKind => {
-                return MutationResult::Conflict {
-                    reason: format!("'{}' is not an aggregate", aggregate.id),
-                };
+                return MutationResult::conflict(format!("'{}' is not an aggregate", aggregate.id));
             }
             RoutineLookup::Tombstone | RoutineLookup::AuthoritativelyAbsent => {
-                return MutationResult::Conflict {
-                    reason: format!("aggregate '{}' does not exist", aggregate.id),
-                };
+                return MutationResult::conflict(format!(
+                    "aggregate '{}' does not exist",
+                    aggregate.id
+                ));
             }
             RoutineLookup::Unknown => {
-                self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
-                return MutationResult::Skipped;
+                return self.unresolved(EvidenceCode::UnknownObjectState);
             }
         }
         match &aggregate.action {
@@ -729,8 +698,7 @@ impl AnalysisState {
                 self.move_function(&aggregate.id, &new_id);
             }
             AlterFunctionAction::OwnerChange(_) => {
-                self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
-                return MutationResult::Skipped;
+                return self.unresolved(EvidenceCode::UnmodeledState);
             }
             _ => unreachable!("aggregate extraction only emits rename, owner, or schema"),
         }
@@ -757,20 +725,15 @@ impl AnalysisState {
                     }
                 }
                 RoutineLookup::WrongKind => {
-                    return MutationResult::Conflict {
-                        reason: format!("aggregate '{}' does not exist", id),
-                    };
+                    return MutationResult::conflict(format!("aggregate '{}' does not exist", id));
                 }
                 RoutineLookup::Tombstone | RoutineLookup::AuthoritativelyAbsent
                     if aggregate.if_exists => {}
                 RoutineLookup::Tombstone | RoutineLookup::AuthoritativelyAbsent => {
-                    return MutationResult::Conflict {
-                        reason: format!("aggregate '{}' does not exist", id),
-                    };
+                    return MutationResult::conflict(format!("aggregate '{}' does not exist", id));
                 }
                 RoutineLookup::Unknown => {
-                    self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
-                    return MutationResult::Skipped;
+                    return self.unresolved(EvidenceCode::UnknownObjectState);
                 }
             }
         }
@@ -780,17 +743,12 @@ impl AnalysisState {
                 crate::_internal::db::cache::CatalogFamily::Routines,
             )
         }) {
-            self.taint(
-                EvidenceCode::CatalogCoverageIncomplete,
-                EvidenceScope::Chain,
-            );
-            return MutationResult::Skipped;
+            return self.unresolved(EvidenceCode::CatalogCoverageIncomplete);
         }
         if aggregate.cascade && !targets.is_empty() {
             // Aggregate implementation-function and dependent-object edges
             // are not modeled yet; CASCADE must not claim a partial closure.
-            self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
-            return MutationResult::Skipped;
+            return self.unresolved(EvidenceCode::UnmodeledState);
         }
         for id in &targets {
             self.snapshot_function(id);
@@ -801,7 +759,7 @@ impl AnalysisState {
         if !targets.is_empty() {
             MutationResult::Applied
         } else {
-            MutationResult::Skipped
+            MutationResult::NoOp
         }
     }
 

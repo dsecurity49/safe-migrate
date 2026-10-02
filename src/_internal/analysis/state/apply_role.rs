@@ -25,9 +25,7 @@ impl AnalysisState {
         let role_id = ObjectId::new("", &role.name);
         match self.role_lookup(&role_id) {
             RoleLookup::Present => {
-                return MutationResult::Conflict {
-                    reason: format!("role '{}' already exists", role.name),
-                };
+                return MutationResult::conflict(format!("role '{}' already exists", role.name));
             }
             RoleLookup::Unknown => {
                 self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
@@ -60,19 +58,16 @@ impl AnalysisState {
             &self.local.current_role,
             &self.local.session_role,
         ) else {
-            return MutationResult::Skipped;
+            return self.unresolved(EvidenceCode::UnresolvedReference);
         };
         self.snapshot_role(&role_id);
         match self.role_lookup(&role_id) {
             RoleLookup::Present => {}
             RoleLookup::Tombstone | RoleLookup::AuthoritativelyAbsent => {
-                return MutationResult::Conflict {
-                    reason: format!("role '{}' does not exist", role_id.name),
-                };
+                return MutationResult::conflict(format!("role '{}' does not exist", role_id.name));
             }
             RoleLookup::Unknown => {
-                self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
-                return MutationResult::Skipped;
+                return self.unresolved(EvidenceCode::UnknownObjectState);
             }
             RoleLookup::WrongKind => unreachable!("roles have a dedicated namespace"),
         }
@@ -103,13 +98,10 @@ impl AnalysisState {
                         continue;
                     }
                     RoleLookup::Tombstone | RoleLookup::AuthoritativelyAbsent => {
-                        return MutationResult::Conflict {
-                            reason: format!("role '{}' does not exist", name),
-                        };
+                        return MutationResult::conflict(format!("role '{}' does not exist", name));
                     }
                     RoleLookup::Unknown => {
-                        self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
-                        return MutationResult::Skipped;
+                        return self.unresolved(EvidenceCode::UnknownObjectState);
                     }
                     RoleLookup::WrongKind => unreachable!("roles have a dedicated namespace"),
                 }
@@ -120,8 +112,7 @@ impl AnalysisState {
         // completely in RoleState, so do not claim an exact drop when a
         // catalog-backed role list is available.
         if self.local.roles_known && !present_roles.is_empty() {
-            self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
-            return MutationResult::Skipped;
+            return self.unresolved(EvidenceCode::UnmodeledState);
         }
         for role_id in present_roles {
             self.snapshot_role(&role_id);
@@ -140,12 +131,10 @@ impl AnalysisState {
         }
         match (grantor, self.local.current_role_known) {
             (Some(grantor), true) if grantor.name != self.local.current_role => {
-                Err(MutationResult::Conflict {
-                    reason: format!(
-                        "object privilege GRANTED BY '{}' must name current role '{}'",
-                        grantor.name, self.local.current_role
-                    ),
-                })
+                Err(MutationResult::conflict(format!(
+                    "object privilege GRANTED BY '{}' must name current role '{}'",
+                    grantor.name, self.local.current_role
+                )))
             }
             (Some(_), false) | (None, _) => {
                 self.taint(
@@ -315,15 +304,13 @@ impl AnalysisState {
                     match authorization {
                         Some(true) => {}
                         Some(false) => {
-                            return MutationResult::Conflict {
-                                reason: format!(
-                                    "role '{}' lacks grant option on relation '{}'",
-                                    grantor
-                                        .as_ref()
-                                        .map_or_else(|| "unknown".to_string(), |r| r.name.clone()),
-                                    id
-                                ),
-                            };
+                            return MutationResult::conflict(format!(
+                                "role '{}' lacks grant option on relation '{}'",
+                                grantor
+                                    .as_ref()
+                                    .map_or_else(|| "unknown".to_string(), |r| r.name.clone()),
+                                id
+                            ));
                         }
                         None if grantor.is_some() => self.taint(
                             EvidenceCode::CatalogCoverageIncomplete,
@@ -385,10 +372,9 @@ impl AnalysisState {
                         .iter()
                         .any(|option| !matches!(option, RoleMembershipOptionFact::Admin(true)))
                 {
-                    return MutationResult::Conflict {
-                        reason: "per-membership TRUE/FALSE options require PostgreSQL 16+"
-                            .to_string(),
-                    };
+                    return MutationResult::conflict(
+                        "per-membership TRUE/FALSE options require PostgreSQL 16+".to_string(),
+                    );
                 }
                 // Role memberships attribute implicit superuser grants to
                 // the bootstrap superuser, unlike object privileges.
@@ -413,12 +399,10 @@ impl AnalysisState {
                         match can_administer {
                             Some(true) => {}
                             Some(false) => {
-                                return MutationResult::Conflict {
-                                    reason: format!(
-                                        "role '{}' lacks ADMIN OPTION for the granted membership",
-                                        grantor.name
-                                    ),
-                                };
+                                return MutationResult::conflict(format!(
+                                    "role '{}' lacks ADMIN OPTION for the granted membership",
+                                    grantor.name
+                                ));
                             }
                             None => self.taint(
                                 EvidenceCode::CatalogCoverageIncomplete,
@@ -454,17 +438,14 @@ impl AnalysisState {
                         })
                         .is_some()
                     {
-                        self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
-                        return MutationResult::Skipped;
+                        return self.unresolved(EvidenceCode::UnmodeledState);
                     }
                 }
                 if grant.role_options.is_empty() && grant.with_grant_option {
-                    self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
-                    return MutationResult::Skipped;
+                    return self.unresolved(EvidenceCode::UnmodeledState);
                 }
                 if grantees.iter().any(|member| member.name == "public") {
-                    self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
-                    return MutationResult::Skipped;
+                    return self.unresolved(EvidenceCode::UnmodeledState);
                 }
                 // PostgreSQL rejects membership cycles. Validate the whole
                 // batch against a proposed adjacency map before taking any
@@ -485,12 +466,10 @@ impl AnalysisState {
                         let mut visited = HashSet::new();
                         while let Some(role_id) = pending.pop() {
                             if role_id == *member {
-                                return MutationResult::Conflict {
-                                    reason: format!(
-                                        "role membership '{}' in '{}' would create a cycle",
-                                        member.name, parent
-                                    ),
-                                };
+                                return MutationResult::conflict(format!(
+                                    "role membership '{}' in '{}' would create a cycle",
+                                    member.name, parent
+                                ));
                             }
                             if !visited.insert(role_id.clone()) {
                                 continue;
@@ -731,15 +710,13 @@ impl AnalysisState {
                     match authorization {
                         Some(true) => {}
                         Some(false) => {
-                            return MutationResult::Conflict {
-                                reason: format!(
-                                    "role '{}' lacks grant option on relation '{}'",
-                                    grantor
-                                        .as_ref()
-                                        .map_or_else(|| "unknown".to_string(), |r| r.name.clone()),
-                                    id
-                                ),
-                            };
+                            return MutationResult::conflict(format!(
+                                "role '{}' lacks grant option on relation '{}'",
+                                grantor
+                                    .as_ref()
+                                    .map_or_else(|| "unknown".to_string(), |r| r.name.clone()),
+                                id
+                            ));
                         }
                         None if grantor.is_some() => self.taint(
                             EvidenceCode::CatalogCoverageIncomplete,
@@ -840,10 +817,9 @@ impl AnalysisState {
                             | Some(RoleMembershipOptionFact::Set(_))
                     )
                 {
-                    return MutationResult::Conflict {
-                        reason: "per-membership TRUE/FALSE options require PostgreSQL 16+"
-                            .to_string(),
-                    };
+                    return MutationResult::conflict(
+                        "per-membership TRUE/FALSE options require PostgreSQL 16+".to_string(),
+                    );
                 }
                 if revoke.cascade && !self.local.role_membership_grantors_complete {
                     self.taint(
@@ -872,12 +848,10 @@ impl AnalysisState {
                         match can_administer {
                             Some(true) => {}
                             Some(false) => {
-                                return MutationResult::Conflict {
-                                    reason: format!(
-                                        "role '{}' lacks ADMIN OPTION for the revoked membership",
-                                        grantor.name
-                                    ),
-                                };
+                                return MutationResult::conflict(format!(
+                                    "role '{}' lacks ADMIN OPTION for the revoked membership",
+                                    grantor.name
+                                ));
                             }
                             None => self.taint(
                                 EvidenceCode::CatalogCoverageIncomplete,
@@ -908,8 +882,7 @@ impl AnalysisState {
                         Some(RoleMembershipOptionFact::Set(false))
                     }
                     Some(_) => {
-                        self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
-                        return MutationResult::Skipped;
+                        return self.unresolved(EvidenceCode::UnmodeledState);
                     }
                 };
                 if matches!(revoke_option, Some(RoleMembershipOptionFact::Admin(false)))
@@ -922,8 +895,7 @@ impl AnalysisState {
                     );
                 }
                 if revokees.iter().any(|member| member.name == "public") {
-                    self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
-                    return MutationResult::Skipped;
+                    return self.unresolved(EvidenceCode::UnmodeledState);
                 }
                 let mut cascade_grantors = Vec::new();
                 let record_mode =
@@ -1123,13 +1095,13 @@ impl AnalysisState {
                     match self.role_lookup(role) {
                         RoleLookup::Present => {}
                         RoleLookup::Tombstone | RoleLookup::AuthoritativelyAbsent => {
-                            return Err(MutationResult::Conflict {
-                                reason: format!("role '{}' does not exist", role.name),
-                            });
+                            return Err(MutationResult::conflict(format!(
+                                "role '{}' does not exist",
+                                role.name
+                            )));
                         }
                         RoleLookup::Unknown => {
-                            self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
-                            return Err(MutationResult::Skipped);
+                            return Err(self.unresolved(EvidenceCode::UnknownObjectState));
                         }
                         RoleLookup::WrongKind => unreachable!("roles have a dedicated namespace"),
                     }
@@ -1143,8 +1115,7 @@ impl AnalysisState {
         let mut ids = Vec::with_capacity(facts.len());
         for fact in facts {
             let Some((name, _identity_known)) = self.role_fact_identity(fact) else {
-                self.taint(EvidenceCode::UnresolvedReference, EvidenceScope::Chain);
-                return Err(MutationResult::Skipped);
+                return Err(self.unresolved(EvidenceCode::UnresolvedReference));
             };
             // PUBLIC is a PostgreSQL pseudo-role, not a row in pg_roles.
             // Unquoted PUBLIC is resolved to "public" by the AST identifier rules.
@@ -1157,9 +1128,10 @@ impl AnalysisState {
             match self.role_lookup(&id) {
                 RoleLookup::Present => ids.push(id),
                 RoleLookup::Tombstone | RoleLookup::AuthoritativelyAbsent => {
-                    return Err(MutationResult::Conflict {
-                        reason: format!("role '{}' does not exist", name),
-                    });
+                    return Err(MutationResult::conflict(format!(
+                        "role '{}' does not exist",
+                        name
+                    )));
                 }
                 RoleLookup::Unknown => {
                     self.taint(
