@@ -163,6 +163,7 @@ impl SafeMigrateEngine {
                                 &file_order,
                                 file_index,
                                 statement_index,
+                                state.pg_version().is_asserted(),
                             );
                         ReportFinding {
                             location: Self::source_location(

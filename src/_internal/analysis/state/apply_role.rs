@@ -254,6 +254,7 @@ impl AnalysisState {
     }
 
     pub(super) fn apply_grant(&mut self, grant: &GrantMutation) -> MutationResult {
+        let pg_version = self.pg_version().conservative_num();
         if let Err(result) = self.validate_grant_targets(&grant.target) {
             return result;
         }
@@ -366,7 +367,7 @@ impl AnalysisState {
                 }
             }
             ResolvedGrantTarget::Roles(parents) => {
-                if self.pg_version_num.is_some_and(|version| version < 160_000)
+                if self.pg_version().conservative_num() < 160_000
                     && grant
                         .role_options
                         .iter()
@@ -630,12 +631,11 @@ impl AnalysisState {
                         // inheritance option: every edge exists and the role's
                         // current INHERIT attribute controls traversal. From
                         // PostgreSQL 16 onward the option belongs to the edge.
-                        let inherit_opt =
-                            if self.pg_version_num.is_some_and(|version| version < 160_000) {
-                                is_new.then_some(true)
-                            } else {
-                                explicit_inherit.or_else(|| is_new.then_some(role.inherits))
-                            };
+                        let inherit_opt = if pg_version < 160_000 {
+                            is_new.then_some(true)
+                        } else {
+                            explicit_inherit.or_else(|| is_new.then_some(role.inherits))
+                        };
                         if inherit_opt == Some(true) {
                             if !role.can_inherit_from.contains(parent) {
                                 role.can_inherit_from.push(parent.clone());
@@ -810,7 +810,7 @@ impl AnalysisState {
                 }
             }
             ResolvedGrantTarget::Roles(parents) => {
-                if self.pg_version_num.is_some_and(|version| version < 160_000)
+                if self.pg_version().conservative_num() < 160_000
                     && matches!(
                         revoke.role_option,
                         Some(RoleMembershipOptionFact::Inherit(_))

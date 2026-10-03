@@ -1,5 +1,5 @@
 use crate::_internal::analysis::evidence::{EvidenceRecord, EvidenceScope};
-use crate::_internal::analysis::state::Confidence;
+use crate::api::Certainty;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub(crate) enum OperationKind {
@@ -197,7 +197,7 @@ pub(crate) struct ReportFinding {
     pub statement_index: Option<usize>,
     /// Certainty is independent of `violation.tier`: severity describes the
     /// operation, certainty describes the evidence behind it.
-    pub certainty: Confidence,
+    pub certainty: Certainty,
 }
 
 /// Certainty of a finding produced at `statement_index` of `file_index`.
@@ -210,7 +210,8 @@ pub(crate) fn certainty_for_statement(
     file_order: &[String],
     file_index: usize,
     statement_index: Option<usize>,
-) -> Confidence {
+    asserted_inputs: bool,
+) -> Certainty {
     let here = statement_index.map(|index| (file_index, index));
     let mut unattributed_statement_evidence = false;
 
@@ -219,10 +220,10 @@ pub(crate) fn certainty_for_statement(
         match record.scope {
             EvidenceScope::Chain => match (at, here) {
                 (Some(at), Some(here)) if at >= here => {}
-                _ => return Confidence::Tainted,
+                _ => return Certainty::Tainted,
             },
             EvidenceScope::Statement => match (at, here) {
-                (Some(at), Some(here)) if at == here => return Confidence::Tainted,
+                (Some(at), Some(here)) if at == here => return Certainty::Tainted,
                 (Some(_), Some(_)) => {}
                 _ => unattributed_statement_evidence = true,
             },
@@ -230,9 +231,12 @@ pub(crate) fn certainty_for_statement(
     }
 
     if unattributed_statement_evidence {
-        return Confidence::Tainted;
+        return Certainty::Tainted;
     }
-    Confidence::Exact
+    if asserted_inputs {
+        return Certainty::Assumed;
+    }
+    Certainty::Exact
 }
 
 fn record_position(record: &EvidenceRecord, file_order: &[String]) -> Option<(usize, usize)> {

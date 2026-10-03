@@ -307,6 +307,33 @@ pub enum Confidence {
     Tainted,
 }
 
+/// How well-supported a single finding is by the evidence behind it.
+///
+/// Separate from [`Confidence`], which describes the run as a whole. Reduced
+/// certainty never reduces severity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[non_exhaustive]
+pub enum Certainty {
+    /// Proven from observed evidence.
+    Exact,
+    /// Decided under an asserted input rather than an observed one. Reported
+    /// rather than suppressed, because a false negative cannot be
+    /// self-remediated by the reader.
+    Assumed,
+    /// Partially supported: a relevant fact was unavailable or unmodeled.
+    Tainted,
+}
+
+impl std::fmt::Display for Certainty {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Certainty::Exact => write!(f, "exact"),
+            Certainty::Assumed => write!(f, "assumed"),
+            Certainty::Tainted => write!(f, "tainted"),
+        }
+    }
+}
+
 /// Stable severity assigned to a finding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[non_exhaustive]
@@ -630,7 +657,7 @@ pub struct Finding {
     pub statement_index: Option<usize>,
     /// How well-supported this finding is by the evidence behind it. Reduced
     /// certainty never reduces severity.
-    pub certainty: Confidence,
+    pub certainty: Certainty,
 }
 
 /// One named SQL migration in its intended analysis order.
@@ -781,7 +808,7 @@ impl AnalysisOutcome {
     /// Run the terminal report viewer.
     pub fn run_interactive(&self) -> Result<(), Error> {
         crate::_internal::report::interactive::run_interactive(
-            &self.violations(),
+            &self.inner.findings,
             &self.inner.confidence,
         )
         .map_err(|error| {
@@ -1342,10 +1369,11 @@ pub fn validate_config(config: &Config) -> Result<(), Error> {
             "toast_width_threshold_bytes must be greater than zero",
         ));
     }
-    let assumed_version = config.assumed_postgres_version();
-    if assumed_version != 100_000 && !(140_000..=180_999).contains(&assumed_version) {
+    if let Some(assumed_version) = config.assumed_postgres_version()
+        && !(140_000..=180_999).contains(&assumed_version)
+    {
         return Err(Error::configuration(
-            "assume_pg_version must be 100000 (the conservative no-baseline default) or a PostgreSQL 14–18 version number",
+            "assume_pg_version must be a PostgreSQL 14–18 version number",
         ));
     }
     config
@@ -1503,7 +1531,8 @@ pub fn analyze_chain(
         .collect();
     let mut state =
         InternalAnalysisState::try_with_baseline(baseline.inner.clone(), baseline.available)
-            .map_err(Error::cache)?;
+            .map_err(Error::cache)?
+            .with_asserted_pg_version(config.assumed_postgres_version());
     let engine = SafeMigrateEngine::new(config.clone());
     let inner = engine
         .analyze_chain_outcome_with_locations(&files, &mut state)
@@ -1715,7 +1744,7 @@ impl From<&InternalFinding> for Finding {
                 column: location.column,
             }),
             statement_index: finding.statement_index,
-            certainty: finding.certainty.clone().into(),
+            certainty: finding.certainty,
         }
     }
 }

@@ -9,7 +9,7 @@ mod rule_evaluation_tests {
     };
     use safe_migrate::_internal::model::relation::{Persistence, RelationKind, RelationState};
     use safe_migrate::_internal::report::violations::ViolationTier;
-    use safe_migrate::api::{Config, RuleConfig};
+    use safe_migrate::api::{Certainty, Config, RuleConfig};
 
     #[test]
     fn test_rule_idempotency() {
@@ -436,10 +436,10 @@ mod rule_evaluation_tests {
 
     #[test]
     fn test_earlier_taint_lowers_certainty_of_later_findings_only() {
-        use safe_migrate::_internal::analysis::state::Confidence;
-
         let engine = setup_engine();
         let mut cache = crate::common::synced_cache();
+        // Pin an observed version so certainty reflects only evidence taint.
+        cache.pg_version_num = Some(180_002);
         let tid = object_id("public", "t");
         cache.insert_baseline(
             tid.clone(),
@@ -492,12 +492,57 @@ mod rule_evaluation_tests {
 
         // The DO block can only invalidate state observed after it.
         assert!(
-            db.iter().all(|f| f.certainty == Confidence::Exact),
+            db.iter().all(|f| f.certainty == Certainty::Exact),
             "a finding produced before the unmodeled statement is still exact: {db:?}"
         );
         assert!(
-            drop.iter().all(|f| f.certainty == Confidence::Tainted),
+            drop.iter().all(|f| f.certainty == Certainty::Tainted),
             "a finding produced after the unmodeled statement is uncertain: {drop:?}"
+        );
+    }
+
+    #[test]
+    fn test_unobserved_version_marks_findings_assumed_not_exact() {
+        let engine = setup_engine();
+
+        let analyse = |cache: crate::_internal::db::cache::DbCache| {
+            let mut state = AnalysisState::new(cache);
+            engine
+                .analyze_chain_with_locations(
+                    &[("001.sql".to_string(), "DROP DATABASE mydb;".to_string())],
+                    &mut state,
+                )
+                .unwrap()
+        };
+
+        let mut observed = crate::common::synced_cache();
+        observed.pg_version_num = Some(180_002);
+        assert!(
+            analyse(observed)
+                .iter()
+                .all(|f| f.certainty == Certainty::Exact),
+            "an observed server version keeps a finding exact"
+        );
+
+        assert!(
+            analyse(crate::common::synced_cache())
+                .iter()
+                .all(|f| f.certainty == Certainty::Assumed),
+            "with no observed version the finding is still reported, marked assumed"
+        );
+
+        let mut cache = crate::common::synced_cache();
+        cache.pg_version_num = None;
+        let mut state = AnalysisState::new(cache).with_asserted_pg_version(Some(170_000));
+        let findings = engine
+            .analyze_chain_with_locations(
+                &[("001.sql".to_string(), "DROP DATABASE mydb;".to_string())],
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            findings.iter().all(|f| f.certainty == Certainty::Assumed),
+            "a configured version is an assertion, not an observation"
         );
     }
 

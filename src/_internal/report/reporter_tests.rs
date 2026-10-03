@@ -11,6 +11,7 @@ mod tests {
     use crate::_internal::report::violations::{
         ObjectKind, OperationKind, ReportFinding, SourceLocation, Violation, ViolationTier,
     };
+    use crate::api::Certainty;
 
     fn make_violation(rule_id: &'static str, tier: ViolationTier, reason: &str) -> Violation {
         Violation {
@@ -73,7 +74,7 @@ mod tests {
                 column: 5,
             }),
             statement_index: Some(1),
-            certainty: Confidence::Exact,
+            certainty: Certainty::Exact,
         };
 
         let markdown =
@@ -84,6 +85,23 @@ mod tests {
         assert!(markdown.contains("`migrations/001.sql:3:5`"));
         assert!(markdown.contains("**Statement:** 1"));
         assert!(markdown.contains("needs review"));
+        assert!(
+            !markdown.contains("**Certainty:**"),
+            "an exact finding needs no certainty line: {markdown}"
+        );
+
+        for certainty in [Certainty::Assumed, Certainty::Tainted] {
+            let uncertain = ReportFinding {
+                certainty,
+                ..finding.clone()
+            };
+            let markdown =
+                Reporter::markdown_report(std::slice::from_ref(&uncertain), &Confidence::Exact);
+            assert!(
+                markdown.contains(&format!("**Certainty:** {certainty}")),
+                "reduced certainty must be visible in the report: {markdown}"
+            );
+        }
     }
 
     #[test]
@@ -96,7 +114,7 @@ mod tests {
             ),
             location: None,
             statement_index: Some(1),
-            certainty: Confidence::Exact,
+            certainty: Certainty::Exact,
         };
 
         let report = Reporter::json_report_with_locations(&[finding], &Confidence::Exact);
@@ -116,7 +134,7 @@ mod tests {
             violation: make_violation("test-rule", ViolationTier::Tier2, "needs review"),
             location: None,
             statement_index: Some(1),
-            certainty: Confidence::Exact,
+            certainty: Certainty::Exact,
         };
         let outcome = AnalysisOutcome::new(
             vec![finding],
@@ -152,7 +170,7 @@ mod tests {
                 column: 5,
             }),
             statement_index: Some(1),
-            certainty: Confidence::Exact,
+            certainty: Certainty::Exact,
         };
 
         let json = Reporter::json_report_with_locations(
@@ -196,7 +214,7 @@ mod tests {
         let finding = ReportFinding {
             location: None,
             statement_index: None,
-            certainty: Confidence::Exact,
+            certainty: Certainty::Exact,
             violation: Violation {
                 source_range: None,
                 rule_id: "test-rule",
@@ -224,7 +242,7 @@ mod tests {
             violation,
             location: None,
             statement_index: None,
-            certainty: Confidence::Exact,
+            certainty: Certainty::Exact,
         };
 
         let markdown = Reporter::markdown_report(&[finding], &Confidence::Exact);
@@ -241,7 +259,7 @@ mod tests {
                 column: 1,
             }),
             statement_index: Some(1),
-            certainty: Confidence::Exact,
+            certainty: Certainty::Exact,
             violation: Violation {
                 source_range: None,
                 rule_id: "test-rule",
@@ -272,7 +290,7 @@ mod tests {
                 column: 1,
             }),
             statement_index: None,
-            certainty: Confidence::Exact,
+            certainty: Certainty::Exact,
             violation: Violation {
                 source_range: None,
                 rule_id: "test-rule",

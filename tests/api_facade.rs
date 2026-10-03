@@ -48,7 +48,7 @@ fn public_config_builders_cover_every_runtime_setting() {
     assert_eq!(config.tier2_threshold_rows(), 50);
     assert_eq!(config.default_rows(), 250);
     assert_eq!(config.toast_width_threshold_bytes(), 1024);
-    assert_eq!(config.assumed_postgres_version(), 170000);
+    assert_eq!(config.assumed_postgres_version(), Some(170000));
     assert_eq!(
         config.schema_scope(),
         Some([String::from("public")].as_slice())

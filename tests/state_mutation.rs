@@ -9054,6 +9054,8 @@ mod state_mutation_tests {
     fn grant_set_option_authorizes_set_role_and_revoke_removes_it() {
         let engine = setup_engine();
         let mut cache = synced_cache();
+        // Per-membership SET/INHERIT options exist from PostgreSQL 16 onward.
+        cache.pg_version_num = Some(180_002);
         cache.metadata.source_role = Some("member".into());
         cache.metadata.source_session_role = Some("member".into());
         for name in ["member", "parent"] {
@@ -9116,6 +9118,8 @@ mod state_mutation_tests {
     fn role_membership_admin_and_inherit_options_round_trip() {
         let engine = setup_engine();
         let mut cache = synced_cache();
+        // Per-membership SET/INHERIT options exist from PostgreSQL 16 onward.
+        cache.pg_version_num = Some(180_002);
         for name in ["member", "parent"] {
             let id = object_id("", name);
             cache.roles.insert(

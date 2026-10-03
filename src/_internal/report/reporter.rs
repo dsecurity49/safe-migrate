@@ -4,6 +4,7 @@ use crate::_internal::analysis::state::Confidence;
 use crate::_internal::report::violations::{ReportFinding, Violation, ViolationTier};
 use crate::_internal::rules::destructive::IRREVERSIBLE_MIGRATION_RULE_ID;
 use crate::_internal::rules::registry;
+use crate::api::Certainty;
 use comfy_table::Table;
 use owo_colors::{OwoColorize, Style};
 
@@ -248,6 +249,12 @@ impl Reporter {
             }
             if let Some(statement_index) = finding.statement_index {
                 output.push_str(&format!("**Statement:** {}  \n", statement_index));
+            }
+            if finding.certainty != Certainty::Exact {
+                output.push_str(&format!(
+                    "**Certainty:** {}  \n",
+                    markdown_escape(&finding.certainty.to_string())
+                ));
             }
             output.push_str(&format!(
                 "**Object:** {} {}  \n**Reason:** {}  \n**Recommendation:** {}\n",

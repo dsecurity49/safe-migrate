@@ -66,7 +66,7 @@ pub struct Config {
     pub(crate) cache_encryption: bool,
     pub(crate) allow_inline_suppressions: bool,
     pub(crate) rules: BTreeMap<String, RuleConfig>,
-    pub(crate) assume_pg_version: u32,
+    pub(crate) assume_pg_version: Option<u32>,
     pub(crate) disabled_rules: Vec<String>,
     pub(crate) schemas: Option<Vec<String>>,
 }
@@ -82,7 +82,7 @@ impl Default for Config {
             auto_sync: false,
             cache_encryption: false,
             allow_inline_suppressions: false,
-            assume_pg_version: 100000,
+            assume_pg_version: None,
             disabled_rules: Vec::new(),
             rules: BTreeMap::new(),
             schemas: None,
@@ -136,12 +136,9 @@ impl Config {
         self.toast_width_threshold_bytes
     }
 
-    /// Return the PostgreSQL version assumed when no connected baseline provides one.
-    ///
-    /// The default `100000` is a conservative compatibility fallback, not a
-    /// claim that PostgreSQL 10 is supported. A configured value must name a
-    /// supported PostgreSQL 14–18 version.
-    pub fn assumed_postgres_version(&self) -> u32 {
+    /// Return the PostgreSQL version assumed when no connected baseline provides
+    /// one, or `None` when the version is simply unknown.
+    pub fn assumed_postgres_version(&self) -> Option<u32> {
         self.assume_pg_version
     }
 
@@ -192,7 +189,7 @@ impl Config {
     /// Use a PostgreSQL 14–18 server version number only when the deployment
     /// target is known. [`Config::validate`] rejects unsupported values.
     pub fn with_assumed_postgres_version(mut self, version_num: u32) -> Self {
-        self.assume_pg_version = version_num;
+        self.assume_pg_version = Some(version_num);
         self
     }
 

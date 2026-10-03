@@ -138,7 +138,7 @@ impl AnalysisState {
                     .unwrap_or_else(|| "false".to_string()),
             },
         ];
-        if self.effective_pg_version_num(0) >= 180_000 {
+        if self.pg_version().conservative_num() >= 180_000 {
             params.push(AttributeFact {
                 name: "publish_generated_columns".to_string(),
                 value: explicit

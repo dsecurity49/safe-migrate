@@ -294,6 +294,9 @@ mod pre_state_tests {
 #[derive(Clone)]
 pub(crate) struct AnalysisState {
     pub pg_version_num: Option<u32>,
+    /// Version number asserted by configuration, used only when the cache
+    /// carries none.
+    asserted_pg_version_num: Option<u32>,
     /// Whether the initial cache was loaded from a real cache file. An empty
     /// cache can be a valid baseline for an empty database, so availability
     /// must not be inferred from the number of modeled objects.
@@ -1252,6 +1255,7 @@ impl AnalysisState {
 
         let mut state = Self {
             pg_version_num: cache.pg_version_num,
+            asserted_pg_version_num: None,
             baseline_available,
             baseline_boundary_queries_complete,
             baseline_coverage,
@@ -1396,11 +1400,20 @@ impl AnalysisState {
         )
     }
 
-    /// Returns the effective PostgreSQL version used for semantic decisions.
-    /// A synchronized cache supplies the authoritative version; callers pass
-    /// their configured fallback for cache-free analysis.
-    pub(crate) fn effective_pg_version_num(&self, fallback: u32) -> u32 {
-        self.pg_version_num.unwrap_or(fallback)
+    /// Record a configured version, used only when the cache carries none.
+    pub(crate) fn with_asserted_pg_version(mut self, version: Option<u32>) -> Self {
+        self.asserted_pg_version_num = version;
+        self
+    }
+
+    /// The version in effect and where it came from. An observed cache version
+    /// always wins over a configured one.
+    pub(crate) fn pg_version(&self) -> PgVersion {
+        match (self.pg_version_num, self.asserted_pg_version_num) {
+            (Some(version), _) => PgVersion::Observed(version),
+            (None, Some(version)) => PgVersion::Assumed(version),
+            (None, None) => PgVersion::Unresolved,
+        }
     }
 
     /// Read-only search-path view for name resolution. Keeping resolution on
@@ -2537,7 +2550,7 @@ impl AnalysisState {
                 return Some(true);
             }
             let role_state = self.present_role(&candidate.name)?;
-            match self.pg_version_num {
+            match self.pg_version().num() {
                 Some(version) if version >= 160_000 => {
                     pending.extend(role_state.can_inherit_from.iter().cloned());
                 }
@@ -2570,7 +2583,7 @@ impl AnalysisState {
             {
                 return Some(true);
             }
-            match self.pg_version_num {
+            match self.pg_version().num() {
                 Some(version) if version >= 160_000 => {
                     pending.extend(role.can_inherit_from.iter().cloned());
                 }
@@ -3740,6 +3753,39 @@ impl AnalysisState {
         self.rollback_undo_log(statement_undo);
         debug_assert!(self.local.graph.indexes_are_valid());
         Ok(())
+    }
+}
+
+/// Where the PostgreSQL version used for semantic decisions came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PgVersion {
+    Observed(u32),
+    Assumed(u32),
+    Unresolved,
+}
+
+/// Oldest release we support. Used as the fallback when nothing is known,
+/// because assuming an older server reports more risk rather than less.
+pub(crate) const OLDEST_SUPPORTED_PG_VERSION_NUM: u32 = 140_000;
+
+impl PgVersion {
+    pub(crate) fn num(self) -> Option<u32> {
+        match self {
+            Self::Observed(version) | Self::Assumed(version) => Some(version),
+            Self::Unresolved => None,
+        }
+    }
+
+    /// Whether this version came from the user rather than from the server.
+    pub(crate) fn is_asserted(self) -> bool {
+        !matches!(self, Self::Observed(_))
+    }
+
+    /// Version to branch on. With nothing known this assumes the oldest
+    /// supported release, so an unanswerable version question reports the
+    /// migration as risky instead of silently declaring it safe.
+    pub(crate) fn conservative_num(self) -> u32 {
+        self.num().unwrap_or(OLDEST_SUPPORTED_PG_VERSION_NUM)
     }
 }
 

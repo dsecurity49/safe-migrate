@@ -27,7 +27,7 @@ impl AnalysisState {
         if !ParsedDataType::parse(declared).needs_widened_numeric_scale() {
             return None;
         }
-        match self.pg_version_num {
+        match self.pg_version().num() {
             Some(version) if version < WIDENED_NUMERIC_SCALE_VERSION => {
                 Some(MutationResult::conflict(format!(
                     "type '{declared}' requires PostgreSQL 15 or later, \
@@ -1159,7 +1159,7 @@ impl AnalysisState {
         // database never lists. Column nullability is still carried by the
         // column itself; only this separate constraint representation is
         // suppressed.
-        if self.effective_pg_version_num(0) < 180_000 {
+        if self.pg_version().conservative_num() < 180_000 {
             return;
         }
         if self.not_null_constraint_for_column(table, column).is_some() {

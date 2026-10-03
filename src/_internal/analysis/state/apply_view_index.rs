@@ -57,7 +57,7 @@ impl AnalysisState {
         kind: ReloptionTarget,
         attributes: &[crate::_internal::analysis::facts::AttributeFact],
     ) -> MutationResult {
-        let version = self.pg_version_num;
+        let version = self.pg_version().num();
         for attribute in attributes {
             let verdict = match kind {
                 ReloptionTarget::View => view_reloption(&attribute.name),

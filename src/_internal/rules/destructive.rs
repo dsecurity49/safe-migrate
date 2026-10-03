@@ -158,7 +158,7 @@ impl Rule for SizeAwareAddColumnRule {
         }
 
         let mut violations = Vec::new();
-        let pg_version = state.effective_pg_version_num(config.assume_pg_version);
+        let pg_version = state.pg_version().conservative_num();
 
         if let Mutation::AlterTable(alter) = mutation
             && let AlterTableActionMutation::AddColumn {
@@ -790,7 +790,7 @@ impl Rule for TypeChangeRewriteRule {
                 has_using,
             } = &alter.action
         {
-            let pg_version = state.effective_pg_version_num(config.assume_pg_version);
+            let pg_version = state.pg_version().conservative_num();
 
             let (is_safe, rows, old_type_str) = match pre_state.relations.get(&alter.id) {
                 Some(rel) => {
