@@ -1,6 +1,6 @@
 mod phase10_bug_fixes_and_sorting_tests {
     use crate::common::*;
-    use safe_migrate::_internal::analysis::state::{AnalysisState, Confidence};
+    use safe_migrate::_internal::analysis::state::{AnalysisState, Confidence, MutationResult};
     use safe_migrate::_internal::ast::identifiers::ObjectId;
 
     use safe_migrate::_internal::model::relation::{Persistence, RelationKind, RelationState};
@@ -535,6 +535,82 @@ mod phase10_bug_fixes_and_sorting_tests {
             v.iter().any(|violation| violation.tier
                 == safe_migrate::_internal::report::violations::ViolationTier::Tier1),
             "Expected Tier1 because confidence should be restored to Exact after rollback"
+        );
+    }
+
+    #[test]
+    fn scoped_drop_reports_unresolved_when_the_target_has_out_of_scope_dependents() {
+        use safe_migrate::_internal::db::cache::{ForeignKeyCache, ScopedDependencyEdge};
+
+        let scoped = vec!["app".to_string()];
+        let build = |external_present: bool, edge_present: bool| {
+            let mut cache = crate::common::synced_cache();
+            cache.metadata.schemas = Some(scoped.clone());
+            cache.metadata.boundary_queries_complete = true;
+
+            let parent = object_id("app", "parent");
+            let child = object_id("other", "child");
+            for id in [parent.clone(), child.clone()] {
+                if id.schema == "other" && !external_present {
+                    continue;
+                }
+                cache.insert_baseline(
+                    id.clone(),
+                    RelationState::new(
+                        id.clone(),
+                        object_id("public", "postgres"),
+                        0,
+                        Some(10),
+                        RelationKind::Table,
+                        Persistence::Permanent,
+                        0,
+                    ),
+                );
+            }
+            if edge_present {
+                cache
+                    .scoped_external_relation_dependencies
+                    .push(ScopedDependencyEdge::new(parent.clone(), child.clone()));
+            }
+            cache.foreign_keys.push(ForeignKeyCache {
+                constraint_name: "child_parent_fk".to_string(),
+                from_table: child,
+                to_table: parent.clone(),
+                from_columns: vec!["parent_id".to_string()],
+                to_columns: vec!["id".to_string()],
+                pk_fk_equality_operators: Vec::new(),
+                pk_pk_equality_operators: Vec::new(),
+                fk_fk_equality_operators: Vec::new(),
+            });
+            AnalysisState::new(cache)
+        };
+
+        let drop = || {
+            safe_migrate::_internal::analysis::mutations::Mutation::DropTable(
+                safe_migrate::_internal::analysis::mutations::DropTable {
+                    ids: vec![object_id("app", "parent")],
+                    if_exists: false,
+                    cascade: false,
+                },
+            )
+        };
+
+        // The out-of-scope dependent is known only as an edge, not as modeled
+        // state, so the drop cannot be stated exactly.
+        let mut state = build(true, true);
+        let result = state.apply(&drop(), None);
+        assert!(
+            result.is_unresolved(),
+            "a recorded cross-scope dependent makes the outcome unknowable: {result:?}"
+        );
+
+        // The dependent is modeled but stays inside the scope, so the drop is
+        // fully known and PostgreSQL would reject it outright.
+        let mut state = build(true, false);
+        let result = state.apply(&drop(), None);
+        assert!(
+            matches!(result, MutationResult::Conflict(_)),
+            "an in-scope dependent makes the drop a known conflict: {result:?}"
         );
     }
 
