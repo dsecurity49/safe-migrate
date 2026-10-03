@@ -3,7 +3,7 @@ mod phase10_bug_fixes_and_sorting_tests {
     use safe_migrate::_internal::analysis::state::{AnalysisState, Confidence};
     use safe_migrate::_internal::ast::identifiers::ObjectId;
 
-    use safe_migrate::_internal::model::relation::{Persistence, RelationKind};
+    use safe_migrate::_internal::model::relation::{Persistence, RelationKind, RelationState};
     use safe_migrate::_internal::report::violations::{
         ObjectKind, OperationKind, Violation, ViolationTier,
     };
@@ -535,6 +535,62 @@ mod phase10_bug_fixes_and_sorting_tests {
             v.iter().any(|violation| violation.tier
                 == safe_migrate::_internal::report::violations::ViolationTier::Tier1),
             "Expected Tier1 because confidence should be restored to Exact after rollback"
+        );
+    }
+
+    #[test]
+    fn fk_dependency_related_fires_when_cascade_pulls_an_out_of_scope_relation() {
+        use safe_migrate::_internal::db::cache::ForeignKeyCache;
+
+        let engine = setup_engine();
+        let mut cache = crate::common::synced_cache();
+
+        let parent = object_id("public", "parent");
+        let child = object_id("other", "child");
+        for id in [parent.clone(), child.clone()] {
+            cache.insert_baseline(
+                id.clone(),
+                RelationState::new(
+                    id.clone(),
+                    object_id("public", "postgres"),
+                    0,
+                    Some(10),
+                    RelationKind::Table,
+                    Persistence::Permanent,
+                    0,
+                ),
+            );
+        }
+        // Scoped sync pulls in out-of-scope relations that a foreign key
+        // connects to the scoped set, and marks them as such.
+        cache
+            .relations
+            .get_mut(&child)
+            .expect("child baseline row")
+            .mark_fk_dependency();
+        cache.foreign_keys.push(ForeignKeyCache {
+            constraint_name: "child_parent_fk".to_string(),
+            from_table: child.clone(),
+            to_table: parent.clone(),
+            from_columns: vec!["parent_id".to_string()],
+            to_columns: vec!["id".to_string()],
+            pk_fk_equality_operators: Vec::new(),
+            pk_pk_equality_operators: Vec::new(),
+            fk_fk_equality_operators: Vec::new(),
+        });
+
+        let mut state = AnalysisState::new(cache);
+        let violations = engine
+            .analyze("DROP TABLE parent CASCADE;", &mut state)
+            .unwrap();
+
+        let cascade = violations
+            .iter()
+            .find(|violation| violation.rule_id == "destructive-cascade")
+            .expect("a cascading drop over baseline objects must be reported");
+        assert!(
+            cascade.fk_dependency_related,
+            "the closure pulled an out-of-scope FK relation, so the finding must say so: {cascade:?}"
         );
     }
 

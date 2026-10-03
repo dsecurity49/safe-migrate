@@ -206,7 +206,8 @@ impl NotEvaluated {
                 "Run `safe-migrate sync` to build a baseline.".to_string()
             }
             EvidenceCode::CatalogCoverageIncomplete => {
-                "Re-sync without `--schemas` so every catalog family is covered.".to_string()
+                "Add the referenced schema to `schemas` in safe-migrate.toml, then re-sync."
+                    .to_string()
             }
             EvidenceCode::UnsupportedStatement | EvidenceCode::UnsupportedSemantics => {
                 "This statement has no semantic model yet; no configuration resolves it."
