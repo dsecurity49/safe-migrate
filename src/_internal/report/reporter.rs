@@ -50,6 +50,28 @@ impl Verdict {
 
 /// Compute the overall verdict from a set of violations.
 pub(crate) fn compute_verdict(violations: &[Violation]) -> Verdict {
+    compute_verdict_with(violations, &[])
+}
+
+/// As [`compute_verdict`], but a verdict may not read SAFE while a
+/// blocking-capable rule did not run: SAFE must mean every check happened.
+pub(crate) fn compute_verdict_with(
+    violations: &[Violation],
+    not_evaluated: &[crate::_internal::report::violations::NotEvaluated],
+) -> Verdict {
+    let verdict = verdict_from_violations(violations);
+    let blocked_by_gap = verdict == Verdict::Safe
+        && not_evaluated
+            .iter()
+            .any(|entry| entry.tier == ViolationTier::Tier1);
+    if blocked_by_gap {
+        Verdict::Cautious
+    } else {
+        verdict
+    }
+}
+
+fn verdict_from_violations(violations: &[Violation]) -> Verdict {
     let has_tier1 = violations.iter().any(|v| v.tier == ViolationTier::Tier1);
     let has_tier2 = violations.iter().any(|v| v.tier == ViolationTier::Tier2);
     let has_irreversible_tier3 = violations
@@ -184,12 +206,16 @@ impl Reporter {
 
     /// Deterministic Markdown rendering for pull-request artifacts. It uses
     /// the same verdict, confidence, tier, and finding data as JSON output.
-    pub(crate) fn markdown_report(findings: &[ReportFinding], confidence: &Confidence) -> String {
+    pub(crate) fn markdown_report(
+        findings: &[ReportFinding],
+        confidence: &Confidence,
+        not_evaluated: &[crate::_internal::report::violations::NotEvaluated],
+    ) -> String {
         let violations: Vec<_> = findings
             .iter()
             .map(|finding| finding.violation.clone())
             .collect();
-        let verdict = compute_verdict(&violations);
+        let verdict = compute_verdict_with(&violations, not_evaluated);
         let confidence = match confidence {
             Confidence::Exact => "Exact",
             Confidence::Tainted => "Tainted",
@@ -281,9 +307,14 @@ impl Reporter {
     }
 
     /// Render findings and structured conservative-analysis evidence.
-    pub(crate) fn markdown_outcome(outcome: &AnalysisOutcome<ReportFinding>) -> String {
-        let mut output = Self::markdown_report(&outcome.findings, &outcome.confidence);
+    pub(crate) fn markdown_outcome(
+        outcome: &AnalysisOutcome<ReportFinding>,
+        not_evaluated: &[crate::_internal::report::violations::NotEvaluated],
+    ) -> String {
+        let mut output =
+            Self::markdown_report(&outcome.findings, &outcome.confidence, not_evaluated);
         append_markdown_evidence(&mut output, &outcome.evidence);
+        append_markdown_not_evaluated(&mut output, not_evaluated);
         output
     }
 
@@ -291,7 +322,11 @@ impl Reporter {
         compute_verdict(violations) == Verdict::Halt
     }
 
-    pub(crate) fn print_report(violations: &[Violation], confidence: &Confidence) -> bool {
+    pub(crate) fn print_report(
+        violations: &[Violation],
+        confidence: &Confidence,
+        not_evaluated: &[crate::_internal::report::violations::NotEvaluated],
+    ) -> bool {
         let mut tier1 = 0usize;
         let mut tier2 = 0usize;
         let mut tier3 = 0usize;
@@ -304,7 +339,7 @@ impl Reporter {
             }
         }
 
-        let verdict = compute_verdict(violations);
+        let verdict = compute_verdict_with(violations, not_evaluated);
         let conf_str = match confidence {
             Confidence::Exact => "Exact",
             Confidence::Tainted => "Tainted",
@@ -453,13 +488,16 @@ impl Reporter {
     }
 
     /// Print findings and a compact, deterministic evidence summary.
-    pub(crate) fn print_outcome(outcome: &AnalysisOutcome<ReportFinding>) -> bool {
+    pub(crate) fn print_outcome(
+        outcome: &AnalysisOutcome<ReportFinding>,
+        not_evaluated: &[crate::_internal::report::violations::NotEvaluated],
+    ) -> bool {
         let violations: Vec<_> = outcome
             .findings
             .iter()
             .map(|finding| finding.violation.clone())
             .collect();
-        let should_halt = Self::print_report(&violations, &outcome.confidence);
+        let should_halt = Self::print_report(&violations, &outcome.confidence, not_evaluated);
         if !outcome.evidence.is_empty() {
             println!("Analysis evidence:");
             for evidence in &outcome.evidence {
@@ -478,6 +516,29 @@ impl Reporter {
             println!();
         }
         should_halt
+    }
+}
+
+fn append_markdown_not_evaluated(
+    output: &mut String,
+    not_evaluated: &[crate::_internal::report::violations::NotEvaluated],
+) {
+    if not_evaluated.is_empty() {
+        return;
+    }
+    output.push_str("\n## Not evaluated\n\n");
+    output.push_str(
+        "These checks did not run because the required evidence was unavailable.\n\n\
+         | Rule | Tier | Cause | Remedy |\n| --- | --- | --- | --- |\n",
+    );
+    for entry in not_evaluated {
+        output.push_str(&format!(
+            "| `{}` | {:?} | `{}` | {} |\n",
+            entry.rule_id,
+            entry.tier,
+            entry.cause.as_str(),
+            markdown_escape(&entry.remediation)
+        ));
     }
 }
 

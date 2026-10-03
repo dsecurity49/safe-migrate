@@ -60,7 +60,7 @@ use crate::_internal::engine::engine::SafeMigrateEngine;
 use crate::_internal::model::function::RoutineKind;
 use crate::_internal::model::relation::RelationKind;
 use crate::_internal::report::reporter::{
-    Reporter as InternalReporter, Verdict as InternalVerdict, compute_verdict,
+    Reporter as InternalReporter, Verdict as InternalVerdict,
 };
 use crate::_internal::report::violations::{
     ObjectKind as InternalObjectKind, OperationKind as InternalOperationKind,
@@ -689,11 +689,43 @@ impl Migration {
 
 /// Immutable analysis result with API-owned snapshots and built-in renderers.
 #[derive(Clone)]
+/// A rule that could not state a finding for want of evidence. Nothing is
+/// wrong with the migration; these are the checks that did not run.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub struct NotEvaluated {
+    /// Rule that could not be evaluated.
+    pub rule_id: String,
+    /// Tier this rule would have produced had it been evaluable.
+    pub tier: Tier,
+    /// Why the evidence was unavailable.
+    pub cause: String,
+    /// SQL statement the rule could not judge.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sql: Option<String>,
+    /// What would make this rule evaluable.
+    pub remediation: String,
+}
+
+impl From<&crate::_internal::report::violations::NotEvaluated> for NotEvaluated {
+    fn from(value: &crate::_internal::report::violations::NotEvaluated) -> Self {
+        Self {
+            rule_id: value.rule_id.to_owned(),
+            tier: value.tier.clone().into(),
+            cause: value.cause.as_str().to_owned(),
+            sql: value.sql.clone(),
+            remediation: value.remediation.clone(),
+        }
+    }
+}
+
+/// Verdict, findings, evidence, and the checks that did not run.
 pub struct AnalysisOutcome {
     findings: Vec<Finding>,
     confidence: Confidence,
     evidence: Vec<Evidence>,
     baseline: BaselineReport,
+    /// Rules that could not state a finding for want of evidence.
+    not_evaluated: Vec<crate::_internal::report::violations::NotEvaluated>,
     inner: InternalOutcome<InternalFinding>,
 }
 
@@ -725,6 +757,12 @@ impl AnalysisOutcome {
         &self.evidence
     }
 
+    /// Rules that could not state a finding because the evidence they need was
+    /// unavailable, each with the cause and what would resolve it.
+    pub fn not_evaluated(&self) -> Vec<NotEvaluated> {
+        self.not_evaluated.iter().map(NotEvaluated::from).collect()
+    }
+
     /// Return the baseline provenance attached to every report format.
     pub fn baseline(&self) -> &BaselineReport {
         &self.baseline
@@ -737,12 +775,20 @@ impl AnalysisOutcome {
 
     /// Return the overall deployment verdict.
     pub fn verdict(&self) -> Verdict {
-        compute_verdict(&self.violations()).into()
+        crate::_internal::report::reporter::compute_verdict_with(
+            &self.violations(),
+            &self.not_evaluated,
+        )
+        .into()
     }
 
     /// Return the canonical deployment recommendation for this result.
     pub fn recommendation(&self) -> &'static str {
-        compute_verdict(&self.violations()).recommendation(&self.inner.confidence)
+        crate::_internal::report::reporter::compute_verdict_with(
+            &self.violations(),
+            &self.not_evaluated,
+        )
+        .recommendation(&self.inner.confidence)
     }
 
     /// Return finding counts by severity tier.
@@ -768,12 +814,14 @@ impl AnalysisOutcome {
         let mut report = InternalReporter::json_outcome_with_locations(&self.inner);
         report["baseline"] = serde_json::to_value(&self.baseline)
             .expect("API-owned baseline report is always serializable");
+        report["not_evaluated"] = serde_json::to_value(self.not_evaluated())
+            .expect("not-evaluated records are always serializable");
         report
     }
 
     /// Render the Markdown report used in pull-request summaries.
     pub fn markdown(&self) -> String {
-        let mut report = InternalReporter::markdown_outcome(&self.inner);
+        let mut report = InternalReporter::markdown_outcome(&self.inner, &self.not_evaluated);
         report.push_str("\n## Baseline\n\n");
         report.push_str(&format!(
             "- **Status:** `{}`\n- **Automatic sync:** `{}`\n",
@@ -802,7 +850,7 @@ impl AnalysisOutcome {
 
     /// Print the human report and return whether it contains a halt result.
     pub fn print_human(&self) -> bool {
-        InternalReporter::print_outcome(&self.inner)
+        InternalReporter::print_outcome(&self.inner, &self.not_evaluated)
     }
 
     /// Run the terminal report viewer.
@@ -1537,8 +1585,10 @@ pub fn analyze_chain(
     let inner = engine
         .analyze_chain_outcome_with_locations(&files, &mut state)
         .map_err(Error::analysis)?;
+    let not_evaluated = state.not_evaluated().to_vec();
     let mut outcome =
         AnalysisOutcome::from_internal(inner, baseline.report(config.stale_stats_days()));
+    outcome.not_evaluated = not_evaluated;
     if baseline_unavailable {
         outcome = outcome.with_evidence(EvidenceCode::BaselineUnavailable, EvidenceScope::Chain);
     } else if baseline_stale {
@@ -1698,6 +1748,7 @@ impl AnalysisOutcome {
             confidence: inner.confidence.clone().into(),
             evidence: inner.evidence.iter().map(Evidence::from).collect(),
             baseline,
+            not_evaluated: Vec::new(),
             inner,
         }
     }

@@ -429,6 +429,24 @@ impl SafeMigrateEngine {
                         continue;
                     }
 
+                    if let Some(cause) = result.unresolved_cause()
+                        && !rule.evaluates_when_unresolved()
+                    {
+                        state.record_not_evaluated(
+                            crate::_internal::report::violations::NotEvaluated {
+                                rule_id: rule.id(),
+                                tier: rule.default_tier(),
+                                cause,
+                                sql: Some(stmt_text.trim().to_string()),
+                                remediation:
+                                    crate::_internal::report::violations::NotEvaluated::remedy_for(
+                                        cause,
+                                    ),
+                            },
+                        );
+                        continue;
+                    }
+
                     let rule_context = RuleContext::new(
                         &mutation,
                         &result,

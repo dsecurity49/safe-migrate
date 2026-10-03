@@ -20,6 +20,12 @@ impl Rule for DriftDetectionRule {
         BASELINE_RELATION_CAPABILITIES
     }
 
+    fn evaluates_when_unresolved(&self) -> bool {
+        // This rule's finding *is* the missing evidence, so it must speak when
+        // the post-state is unknown.
+        true
+    }
+
     fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
         // A missing cache is not proof that production lacks an object. Keep
         // the stateful analyzer useful offline without turning every ALTER or

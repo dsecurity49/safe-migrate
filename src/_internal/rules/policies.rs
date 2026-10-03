@@ -17,9 +17,6 @@ impl Rule for RestrictivePolicyRule {
     }
 
     fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
-        if context.result().is_unresolved() {
-            return vec![];
-        }
         let mut violations = Vec::new();
 
         if let Mutation::CreatePolicy(policy) = context.mutation()

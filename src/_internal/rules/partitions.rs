@@ -22,10 +22,6 @@ impl Rule for PartitionLockRule {
     }
 
     fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
-        if context.result().is_unresolved() {
-            return vec![];
-        }
-
         let mut violations = Vec::new();
 
         if let Mutation::AlterTable(alter) = context.mutation() {
@@ -157,10 +153,6 @@ impl Rule for PartitionStrategyMismatchRule {
     }
 
     fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
-        if context.result().is_unresolved() {
-            return vec![];
-        }
-
         let mut violations = Vec::new();
 
         if let Mutation::AlterTable(alter) = context.mutation()

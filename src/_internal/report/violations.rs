@@ -184,6 +184,42 @@ pub(crate) struct SourceLocation {
     pub column: usize,
 }
 
+/// A rule that could not state a finding for want of evidence. Reported apart
+/// from findings, because nothing is wrong with the migration.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct NotEvaluated {
+    pub rule_id: &'static str,
+    pub tier: ViolationTier,
+    pub cause: crate::_internal::analysis::evidence::EvidenceCode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sql: Option<String>,
+    /// What would make this rule evaluable.
+    pub remediation: String,
+}
+
+impl NotEvaluated {
+    /// The command or setting that would supply the missing evidence.
+    pub(crate) fn remedy_for(cause: crate::_internal::analysis::evidence::EvidenceCode) -> String {
+        use crate::_internal::analysis::evidence::EvidenceCode;
+        match cause {
+            EvidenceCode::BaselineUnavailable => {
+                "Run `safe-migrate sync` to build a baseline.".to_string()
+            }
+            EvidenceCode::CatalogCoverageIncomplete => {
+                "Re-sync without `--schemas` so every catalog family is covered.".to_string()
+            }
+            EvidenceCode::UnsupportedStatement | EvidenceCode::UnsupportedSemantics => {
+                "This statement has no semantic model yet; no configuration resolves it."
+                    .to_string()
+            }
+            EvidenceCode::UnmodeledState => {
+                "This PostgreSQL state is deliberately outside the model.".to_string()
+            }
+            _ => "Set `assume_pg_version` or widen the baseline scope.".to_string(),
+        }
+    }
+}
+
 /// A violation paired with the file and line that produced it. The flattened
 /// serialization keeps the JSON violation schema additive.
 #[derive(Debug, Clone, serde::Serialize)]

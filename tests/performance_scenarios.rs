@@ -386,6 +386,7 @@ mod performance_scenarios {
         let markdown = crate::_internal::report::reporter::Reporter::markdown_report(
             &findings,
             &state.local.confidence,
+            &[],
         );
         let elapsed = started.elapsed();
 

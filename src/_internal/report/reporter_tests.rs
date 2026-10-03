@@ -33,7 +33,7 @@ mod tests {
     fn test_reporter_print_empty() {
         let violations: Vec<Violation> = vec![];
         let confidence = Confidence::Exact;
-        let has_failures = Reporter::print_report(&violations, &confidence);
+        let has_failures = Reporter::print_report(&violations, &confidence, &[]);
         assert!(!has_failures);
     }
 
@@ -50,7 +50,7 @@ mod tests {
         ];
 
         let confidence = Confidence::Tainted;
-        let has_failures = Reporter::print_report(&violations, &confidence);
+        let has_failures = Reporter::print_report(&violations, &confidence, &[]);
         assert!(has_failures);
 
         let report = Reporter::json_report(&violations, &confidence);
@@ -78,7 +78,7 @@ mod tests {
         };
 
         let markdown =
-            Reporter::markdown_report(std::slice::from_ref(&finding), &Confidence::Exact);
+            Reporter::markdown_report(std::slice::from_ref(&finding), &Confidence::Exact, &[]);
         assert!(markdown.starts_with("# safe-migrate report\n"));
         assert!(markdown.contains("**Verdict:** CAUTIOUS"));
         assert!(markdown.contains("### WARN — test-rule (`test-rule`)"));
@@ -95,8 +95,11 @@ mod tests {
                 certainty,
                 ..finding.clone()
             };
-            let markdown =
-                Reporter::markdown_report(std::slice::from_ref(&uncertain), &Confidence::Exact);
+            let markdown = Reporter::markdown_report(
+                std::slice::from_ref(&uncertain),
+                &Confidence::Exact,
+                &[],
+            );
             assert!(
                 markdown.contains(&format!("**Certainty:** {certainty}")),
                 "reduced certainty must be visible in the report: {markdown}"
@@ -154,7 +157,7 @@ mod tests {
         assert_eq!(json["evidence"][0]["code"], "unsupported_statement");
         assert_eq!(json["evidence"][0]["location"]["statement_index"], 1);
 
-        let markdown = Reporter::markdown_outcome(&outcome);
+        let markdown = Reporter::markdown_outcome(&outcome, &[]);
         assert!(markdown.contains("## Analysis evidence"));
         assert!(markdown.contains("`unsupported_statement`"));
         assert!(markdown.contains("migrations/001.sql"));
@@ -184,7 +187,7 @@ mod tests {
         assert_eq!(json, expected_json);
 
         let markdown =
-            Reporter::markdown_report(std::slice::from_ref(&finding), &Confidence::Exact);
+            Reporter::markdown_report(std::slice::from_ref(&finding), &Confidence::Exact, &[]);
         assert_eq!(
             markdown,
             include_str!("../../../tests/golden/representative-report.md")
@@ -202,7 +205,7 @@ mod tests {
                 "JSON output must be byte-stable across repeated runs"
             );
             assert_eq!(
-                Reporter::markdown_report(std::slice::from_ref(&finding), &Confidence::Exact),
+                Reporter::markdown_report(std::slice::from_ref(&finding), &Confidence::Exact, &[]),
                 markdown,
                 "Markdown output must be byte-stable across repeated runs"
             );
@@ -230,7 +233,7 @@ mod tests {
             },
         };
 
-        let markdown = Reporter::markdown_report(&[finding], &Confidence::Exact);
+        let markdown = Reporter::markdown_report(&[finding], &Confidence::Exact, &[]);
         assert!(markdown.contains("\n````sql\nSELECT '```';\n````\n"));
     }
 
@@ -245,7 +248,7 @@ mod tests {
             certainty: Certainty::Exact,
         };
 
-        let markdown = Reporter::markdown_report(&[finding], &Confidence::Exact);
+        let markdown = Reporter::markdown_report(&[finding], &Confidence::Exact, &[]);
         assert!(!markdown.contains('\x1b'));
         assert!(markdown.contains("SELECT '\\u{1b}[2J';\n\tSELECT 1;"));
     }
@@ -275,7 +278,7 @@ mod tests {
             },
         };
 
-        let markdown = Reporter::markdown_report(&[finding], &Confidence::Exact);
+        let markdown = Reporter::markdown_report(&[finding], &Confidence::Exact, &[]);
         assert!(!markdown.contains("\n## forged"));
         assert!(markdown.contains("entry ## forged \\<details\\>"));
         assert!(markdown.contains("escape \\| inline \\<markup\\>"));
@@ -306,7 +309,7 @@ mod tests {
             },
         };
 
-        let markdown = Reporter::markdown_report(&[finding], &Confidence::Exact);
+        let markdown = Reporter::markdown_report(&[finding], &Confidence::Exact, &[]);
         assert!(!markdown.contains('\x1b'));
         assert!(markdown.contains("entry\\\\u{1b}[2J"));
         assert!(markdown.contains("migrations/\\u{1b}[2J.sql"));
@@ -319,6 +322,38 @@ mod tests {
         assert_eq!(
             terminal_block("SELECT\n'\u{1b}[31m';"),
             "SELECT\n'\\u{1b}[31m';"
+        );
+    }
+
+    #[test]
+    fn verdict_may_not_read_safe_while_a_blocking_rule_was_not_evaluated() {
+        let violations = vec![make_violation("test-rule", ViolationTier::Tier3, "safe")];
+        assert_eq!(compute_verdict(&violations), Verdict::Safe);
+
+        let blocked = vec![crate::_internal::report::violations::NotEvaluated {
+            rule_id: "destructive-cascade",
+            tier: ViolationTier::Tier1,
+            cause: crate::_internal::analysis::evidence::EvidenceCode::CatalogCoverageIncomplete,
+            sql: None,
+            remediation: "Re-sync without `--schemas`.".to_string(),
+        }];
+        assert_eq!(
+            crate::_internal::report::reporter::compute_verdict_with(&violations, &blocked),
+            Verdict::Cautious,
+            "SAFE must mean every blocking check actually ran"
+        );
+
+        let low_tier = vec![crate::_internal::report::violations::NotEvaluated {
+            rule_id: "prefer-timestamptz",
+            tier: ViolationTier::Tier2,
+            cause: crate::_internal::analysis::evidence::EvidenceCode::UnmodeledState,
+            sql: None,
+            remediation: "Outside the model.".to_string(),
+        }];
+        assert_eq!(
+            crate::_internal::report::reporter::compute_verdict_with(&violations, &low_tier),
+            Verdict::Safe,
+            "a skipped non-blocking rule does not block a SAFE verdict"
         );
     }
 
@@ -458,7 +493,7 @@ mod tests {
             },
         ];
         let confidence = Confidence::Exact;
-        let has_failures = Reporter::print_report(&violations, &confidence);
+        let has_failures = Reporter::print_report(&violations, &confidence, &[]);
         assert!(!has_failures);
     }
 }

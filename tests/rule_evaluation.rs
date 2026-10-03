@@ -1100,6 +1100,32 @@ mod rule_evaluation_tests {
     }
 
     #[test]
+    fn unresolved_statement_records_unevaluated_rules_with_a_remedy() {
+        let engine = setup_engine();
+        let mut cache = crate::common::synced_cache();
+        // A target outside the synced scope cannot be seen, so post-state rules
+        // must decline rather than guess.
+        cache.metadata.schemas = Some(vec!["app".to_string()]);
+        let mut state = AnalysisState::new(cache);
+
+        engine
+            .analyze("DROP TABLE public.secret_table CASCADE;", &mut state)
+            .unwrap();
+
+        let not_evaluated = state.not_evaluated();
+        assert!(
+            !not_evaluated.is_empty(),
+            "an unresolvable target must record which rules did not run"
+        );
+        assert!(
+            not_evaluated
+                .iter()
+                .any(|entry| !entry.remediation.is_empty()),
+            "each record must say what would make the rule evaluable"
+        );
+    }
+
+    #[test]
     fn scoped_cache_reports_unknown_schema_as_coverage_not_drift() {
         let engine = setup_engine();
         let mut cache = crate::common::synced_cache();

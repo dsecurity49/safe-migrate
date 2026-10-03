@@ -16,6 +16,11 @@ impl Rule for OverbroadGrantRule {
         "Avoid GRANT ALL to public roles. Use granular privileges."
     }
 
+    fn evaluates_when_unresolved(&self) -> bool {
+        // A grant to PUBLIC is a policy question answered by the statement text.
+        true
+    }
+
     fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
         // `WITH GRANT OPTION` is itself the security-sensitive operation. The
         // state matrix intentionally skips it because grant chains are not

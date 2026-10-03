@@ -15,6 +15,11 @@ impl Rule for OpaqueDynamicSqlRule {
         "Procedural or dynamic SQL (DO blocks, EXECUTE) obscures schema mutations. Lock analysis confidence is heavily degraded."
     }
 
+    fn evaluates_when_unresolved(&self) -> bool {
+        // The mutation is opaque by construction; nothing later resolves it.
+        true
+    }
+
     fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
         // A missing baseline object is `schema-drift`'s concern, not opaque SQL.
         if matches!(

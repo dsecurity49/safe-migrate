@@ -23,6 +23,12 @@ impl Rule for ConcurrentIndexRule {
         BASELINE_STATS_DEPENDENCY_CAPABILITIES
     }
 
+    fn evaluates_when_unresolved(&self) -> bool {
+        // A DROP INDEX on a known target is synchronous regardless of catalog
+        // completeness, so the risk stands even when the post-state is unknown.
+        true
+    }
+
     fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
         if context.result().is_unresolved() {
             // An index that is present in the pre-state still incurs the

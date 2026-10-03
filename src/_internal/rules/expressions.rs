@@ -17,10 +17,6 @@ impl Rule for VolatileDefaultRule {
     }
 
     fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
-        if context.result().is_unresolved() {
-            return vec![];
-        }
-
         let mut violations = Vec::new();
 
         if let Mutation::CreateTable(c) = context.mutation() {

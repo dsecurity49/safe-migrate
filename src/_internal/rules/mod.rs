@@ -239,6 +239,14 @@ pub(crate) trait Rule {
     fn default_tier(&self) -> ViolationTier;
     fn recipe(&self) -> &'static str;
 
+    /// Whether this rule can still state findings when the post-state is
+    /// unresolved. True only where the finding provable from the statement and
+    /// pre-state alone; the engine suppresses and records every other rule, so
+    /// this stays a single decision rather than a per-rule guard.
+    fn evaluates_when_unresolved(&self) -> bool {
+        false
+    }
+
     fn required_capabilities(&self) -> &'static [RuleCapability] {
         &[]
     }

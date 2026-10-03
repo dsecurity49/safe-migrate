@@ -68,6 +68,15 @@ impl MutationResult {
         matches!(self, Self::Unresolved(_))
     }
 
+    /// The recorded cause when unresolved, so a caller never has to match on
+    /// the variant and invent a fallback for a case that cannot occur.
+    pub(crate) fn unresolved_cause(&self) -> Option<EvidenceCode> {
+        match self {
+            Self::Unresolved(cause) => Some(*cause),
+            _ => None,
+        }
+    }
+
     /// PostgreSQL ran the statement but the modeled state did not change, so a
     /// rule whose finding depends on a transition cannot have observed one.
     pub(crate) fn is_noop(&self) -> bool {
@@ -294,8 +303,9 @@ mod pre_state_tests {
 #[derive(Clone)]
 pub(crate) struct AnalysisState {
     pub pg_version_num: Option<u32>,
-    /// Version number asserted by configuration, used only when the cache
-    /// carries none.
+    /// Rules that could not state a finding because their evidence was missing.
+    not_evaluated: Vec<crate::_internal::report::violations::NotEvaluated>,
+    /// Version asserted by configuration, used only when the cache lacks one.
     asserted_pg_version_num: Option<u32>,
     /// Whether the initial cache was loaded from a real cache file. An empty
     /// cache can be a valid baseline for an empty database, so availability
@@ -1255,6 +1265,7 @@ impl AnalysisState {
 
         let mut state = Self {
             pg_version_num: cache.pg_version_num,
+            not_evaluated: Vec::new(),
             asserted_pg_version_num: None,
             baseline_available,
             baseline_boundary_queries_complete,
@@ -1398,6 +1409,24 @@ impl AnalysisState {
             self.local.relations.get(id),
             Some(RelationOverlay::Present(_))
         )
+    }
+
+    /// Record a configured version, used only when the cache carries none.
+    pub(crate) fn record_not_evaluated(
+        &mut self,
+        record: crate::_internal::report::violations::NotEvaluated,
+    ) {
+        if !self
+            .not_evaluated
+            .iter()
+            .any(|entry| entry.rule_id == record.rule_id && entry.cause == record.cause)
+        {
+            self.not_evaluated.push(record);
+        }
+    }
+
+    pub(crate) fn not_evaluated(&self) -> &[crate::_internal::report::violations::NotEvaluated] {
+        &self.not_evaluated
     }
 
     /// Record a configured version, used only when the cache carries none.
@@ -3764,8 +3793,7 @@ pub(crate) enum PgVersion {
     Unresolved,
 }
 
-/// Oldest release we support. Used as the fallback when nothing is known,
-/// because assuming an older server reports more risk rather than less.
+/// Oldest release we support. Assuming an older server reports more risk.
 pub(crate) const OLDEST_SUPPORTED_PG_VERSION_NUM: u32 = 140_000;
 
 impl PgVersion {
@@ -3781,9 +3809,8 @@ impl PgVersion {
         !matches!(self, Self::Observed(_))
     }
 
-    /// Version to branch on. With nothing known this assumes the oldest
-    /// supported release, so an unanswerable version question reports the
-    /// migration as risky instead of silently declaring it safe.
+    /// Version to branch on, defaulting to the oldest supported release so an
+    /// unanswerable version question reports risk rather than safety.
     pub(crate) fn conservative_num(self) -> u32 {
         self.num().unwrap_or(OLDEST_SUPPORTED_PG_VERSION_NUM)
     }

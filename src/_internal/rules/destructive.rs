@@ -149,13 +149,9 @@ impl Rule for SizeAwareAddColumnRule {
 
     fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
         let mutation = context.mutation();
-        let result = context.result();
         let pre_state = context.pre_state();
         let state = context.state();
         let config = context.config();
-        if result.is_unresolved() {
-            return vec![];
-        }
 
         let mut violations = Vec::new();
         let pg_version = state.pg_version().conservative_num();
@@ -370,7 +366,7 @@ impl Rule for CreateTableAsSelectRule {
     fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
         let mutation = context.mutation();
         let result = context.result();
-        if result.is_unresolved() || result.is_noop() {
+        if result.is_noop() {
             return vec![];
         }
         if let Mutation::CreateTable(c) = mutation
