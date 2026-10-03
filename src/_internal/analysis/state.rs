@@ -9,6 +9,7 @@ use crate::_internal::analysis::transaction::{NamespaceSnapshot, StateChange, Tr
 use crate::_internal::ast::identifiers::ObjectId;
 use crate::_internal::db::cache::CatalogCoverage;
 use crate::_internal::db::cache::DbCache;
+use crate::_internal::db::cache::ScopedDependencyEdge;
 use crate::_internal::model::constraint::{ConstraintKind, ConstraintState};
 use crate::_internal::model::function::FunctionOverlay;
 pub(crate) use crate::_internal::model::relation::RelationOverlay;
@@ -327,7 +328,7 @@ pub(crate) struct AnalysisState {
     pub baseline_foreign_keys: HashSet<(ObjectId, String)>,
     pub baseline_fk_dependencies: HashSet<ObjectId>,
     pub baseline_sequences: HashSet<ObjectId>,
-    pub scoped_external_relation_dependencies: HashSet<ObjectId>,
+    pub scoped_external_relation_dependencies: HashSet<ScopedDependencyEdge>,
     pub scoped_external_type_dependencies: HashSet<ObjectId>,
     pub scoped_external_routine_dependencies: HashSet<ObjectId>,
     pub scoped_external_index_dependencies: HashSet<ObjectId>,
@@ -1589,7 +1590,10 @@ impl AnalysisState {
             family,
             crate::_internal::db::cache::CatalogFamily::Relations
         ) {
-            return self.scoped_external_relation_dependencies.contains(id);
+            return self
+                .scoped_external_relation_dependencies
+                .iter()
+                .any(|edge| edge.scoped == *id);
         }
         if matches!(family, crate::_internal::db::cache::CatalogFamily::Types) {
             return self.scoped_external_type_dependencies.contains(id);
@@ -3016,11 +3020,22 @@ impl AnalysisState {
                 })
                 .collect();
         };
+        // Both endpoints of a cross-scope edge carry a schema.
+        let remap_edges = |set: &mut HashSet<ScopedDependencyEdge>| {
+            *set = std::mem::take(set)
+                .into_iter()
+                .map(|mut edge| {
+                    Self::remap_schema_id(&mut edge.scoped, old_name, new_name);
+                    Self::remap_schema_id(&mut edge.external, old_name, new_name);
+                    edge
+                })
+                .collect();
+        };
         remap_set(&mut self.baseline_relations);
         remap_set(&mut self.baseline_indexes);
         remap_set(&mut self.baseline_fk_dependencies);
         remap_set(&mut self.baseline_sequences);
-        remap_set(&mut self.scoped_external_relation_dependencies);
+        remap_edges(&mut self.scoped_external_relation_dependencies);
         remap_set(&mut self.scoped_external_type_dependencies);
         remap_set(&mut self.scoped_external_routine_dependencies);
         self.baseline_foreign_keys = std::mem::take(&mut self.baseline_foreign_keys)

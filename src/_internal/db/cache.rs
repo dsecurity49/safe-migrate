@@ -168,6 +168,37 @@ impl Default for CatalogCoverage {
     }
 }
 
+/// A cross-scope dependency, keeping both endpoints.
+///
+/// Direction matters: `scoped` is the object inside the synced schemas and
+/// `external` depends on it from outside. Storing only the external endpoint
+/// cannot answer "does this object have dependents out of scope?".
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub(crate) struct ScopedDependencyEdge {
+    pub scoped: ObjectId,
+    pub external: ObjectId,
+}
+
+impl ScopedDependencyEdge {
+    pub(crate) fn new(scoped: ObjectId, external: ObjectId) -> Self {
+        Self { scoped, external }
+    }
+}
+
+impl Ord for ScopedDependencyEdge {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.scoped
+            .cmp_identity(&other.scoped)
+            .then_with(|| self.external.cmp_identity(&other.external))
+    }
+}
+
+impl PartialOrd for ScopedDependencyEdge {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ForeignKeyCache {
     pub constraint_name: String,
@@ -396,7 +427,7 @@ pub(crate) struct DbCache {
     /// schema scope. Scoped destructive transitions stay conservative for
     /// these identities; an absent entry means no such dependent was observed
     /// in the catalog families the synchronizer resolves.
-    pub scoped_external_relation_dependencies: Vec<ObjectId>,
+    pub scoped_external_relation_dependencies: Vec<ScopedDependencyEdge>,
     pub scoped_external_type_dependencies: Vec<ObjectId>,
     pub scoped_external_routine_dependencies: Vec<ObjectId>,
     pub scoped_external_index_dependencies: Vec<ObjectId>,
@@ -651,24 +682,31 @@ impl DbCache {
             }
         }
         let mut scoped_external_relations = HashSet::new();
-        for id in &self.scoped_external_relation_dependencies {
-            validate_id("scoped external relation dependency identity", id, true)?;
-            if !scoped_external_relations.insert(id) {
+        for edge in &self.scoped_external_relation_dependencies {
+            validate_id("scoped dependency endpoint", &edge.scoped, true)?;
+            validate_id("scoped dependency endpoint", &edge.external, true)?;
+            if !scoped_external_relations.insert(edge.clone()) {
                 return Err(format!(
-                    "scoped external relation dependency '{}' appears more than once",
-                    id
+                    "scoped external relation dependency '{}' -> '{}' appears more than once",
+                    edge.scoped, edge.external
                 ));
             }
             if !matches!(self.coverage.schema_scope, SchemaCoverage::Explicit(_)) {
                 return Err(format!(
-                    "scoped external relation dependency '{}' requires an explicit schema scope",
-                    id
+                    "scoped external relation dependency '{}' -> '{}' requires an explicit schema scope",
+                    edge.scoped, edge.external
                 ));
             }
-            if !self.coverage.schema_scope.covers(&id.schema) {
+            if !self.coverage.schema_scope.covers(&edge.scoped.schema) {
                 return Err(format!(
                     "scoped external relation dependency '{}' is outside the cache schema scope",
-                    id
+                    edge.scoped
+                ));
+            }
+            if self.coverage.schema_scope.covers(&edge.external.schema) {
+                return Err(format!(
+                    "scoped external relation dependency '{}' must not be in the cache schema scope",
+                    edge.external
                 ));
             }
         }
@@ -2352,13 +2390,33 @@ mod tests {
         let mut cache = synced_cache();
         let schemas = vec!["public".to_string()];
         cache.coverage = fully_covering(Some(&schemas));
-        cache.metadata.schemas = Some(schemas);
+        cache.metadata.schemas = Some(schemas.clone());
+        // The scoped endpoint is the one that must lie inside the scope.
         cache
             .scoped_external_relation_dependencies
-            .push(ObjectId::new("omitted", "table"));
+            .push(ScopedDependencyEdge::new(
+                ObjectId::new("omitted", "scoped"),
+                ObjectId::new("public", "table"),
+            ));
 
         let error = cache.validate_semantics().unwrap_err();
         assert!(error.contains("outside the cache schema scope"), "{error}");
+
+        // An external endpoint inside the scope is the contradictory case.
+        let mut cache = synced_cache();
+        cache.coverage = fully_covering(Some(&schemas));
+        cache.metadata.schemas = Some(schemas);
+        cache
+            .scoped_external_relation_dependencies
+            .push(ScopedDependencyEdge::new(
+                ObjectId::new("public", "scoped"),
+                ObjectId::new("public", "table"),
+            ));
+        let error = cache.validate_semantics().unwrap_err();
+        assert!(
+            error.contains("must not be in the cache schema scope"),
+            "{error}"
+        );
     }
 
     #[test]

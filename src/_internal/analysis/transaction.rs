@@ -24,7 +24,8 @@ pub(crate) struct NamespaceSnapshot {
     pub baseline_foreign_keys: HashSet<(ObjectId, String)>,
     pub baseline_fk_dependencies: HashSet<ObjectId>,
     pub baseline_sequences: HashSet<ObjectId>,
-    pub scoped_external_relation_dependencies: HashSet<ObjectId>,
+    pub scoped_external_relation_dependencies:
+        HashSet<crate::_internal::db::cache::ScopedDependencyEdge>,
     pub scoped_external_type_dependencies: HashSet<ObjectId>,
     pub scoped_external_routine_dependencies: HashSet<ObjectId>,
     pub baseline_schemas: Option<HashSet<String>>,

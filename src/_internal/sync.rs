@@ -2,7 +2,8 @@ use crate::_internal::ast::identifiers::ObjectId;
 use crate::_internal::db::cache::{
     CACHE_V9_MAGIC, CatalogCoverageBuilder, CatalogFamily, ConstraintDependencyCache,
     ConstraintKeyCache, DbCache, DbCacheVersioned, DefaultSequenceDependencyCache, ForeignKeyCache,
-    GeneratedColumnDependencyCache, IndexCache, InheritanceCache, ViewDependencyCache,
+    GeneratedColumnDependencyCache, IndexCache, InheritanceCache, ScopedDependencyEdge,
+    ViewDependencyCache,
 };
 use crate::_internal::db::cache_file::{
     MAX_CACHE_DECODE_BYTES, MAX_CACHE_FILE_BYTES, protect_cache_bytes,
@@ -786,7 +787,7 @@ fn load_scoped_external_index_dependencies(
 fn load_scoped_external_relation_dependencies(
     client: &mut impl GenericClient,
     schema_values: &Option<Vec<String>>,
-) -> Result<Vec<ObjectId>> {
+) -> Result<Vec<ScopedDependencyEdge>> {
     let Some(schemas) = schema_values else {
         return Ok(Vec::new());
     };
@@ -794,7 +795,8 @@ fn load_scoped_external_relation_dependencies(
         return Ok(Vec::new());
     }
     let query = r#"
-        SELECT DISTINCT ref_n.nspname AS ref_schema, ref_c.relname AS ref_name
+SELECT DISTINCT ref_n.nspname AS ref_schema, ref_c.relname AS ref_name,
+                dep_n.nspname AS dep_schema, dep_c.relname AS dep_name
         FROM pg_depend d
         JOIN pg_class ref_c ON d.refclassid = 'pg_class'::regclass
                            AND d.refobjid = ref_c.oid
@@ -807,7 +809,8 @@ fn load_scoped_external_relation_dependencies(
           AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
           AND dep_n.nspname <> 'information_schema'
         UNION
-        SELECT DISTINCT ref_n.nspname, ref_c.relname
+        SELECT DISTINCT ref_n.nspname, ref_c.relname,
+                dep_n.nspname, dep_c.relname
         FROM pg_depend d
         JOIN pg_class ref_c ON d.refclassid = 'pg_class'::regclass
                            AND d.refobjid = ref_c.oid
@@ -821,7 +824,8 @@ fn load_scoped_external_relation_dependencies(
           AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
           AND dep_n.nspname <> 'information_schema'
         UNION
-        SELECT DISTINCT ref_n.nspname, ref_c.relname
+        SELECT DISTINCT ref_n.nspname, ref_c.relname,
+                dep_n.nspname, dep_c.relname
         FROM pg_depend d
         JOIN pg_class ref_c ON d.refclassid = 'pg_class'::regclass
                            AND d.refobjid = ref_c.oid
@@ -835,7 +839,8 @@ fn load_scoped_external_relation_dependencies(
           AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
           AND dep_n.nspname <> 'information_schema'
         UNION
-        SELECT DISTINCT ref_n.nspname, ref_c.relname
+        SELECT DISTINCT ref_n.nspname, ref_c.relname,
+                dep_n.nspname, dep_c.relname
         FROM pg_depend d
         JOIN pg_class ref_c ON d.refclassid = 'pg_class'::regclass
                            AND d.refobjid = ref_c.oid
@@ -849,10 +854,12 @@ fn load_scoped_external_relation_dependencies(
           AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
           AND dep_n.nspname <> 'information_schema'
         UNION
-        SELECT DISTINCT ref_n.nspname, ref_c.relname
+        SELECT DISTINCT ref_n.nspname, ref_c.relname,
+                dep_n.nspname, dep_c.relname
         FROM pg_depend d
         JOIN pg_class ref_c ON d.refclassid = 'pg_class'::regclass
                            AND d.refobjid = ref_c.oid
+        JOIN pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace
         JOIN pg_trigger dep_tg ON d.classid = 'pg_trigger'::regclass
                               AND d.objid = dep_tg.oid
         JOIN pg_class dep_c ON dep_c.oid = dep_tg.tgrelid
@@ -863,7 +870,8 @@ fn load_scoped_external_relation_dependencies(
           AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
           AND dep_n.nspname <> 'information_schema'
         UNION
-        SELECT DISTINCT ref_n.nspname, ref_c.relname
+        SELECT DISTINCT ref_n.nspname, ref_c.relname,
+                dep_n.nspname, dep_p.relname
         FROM pg_depend d
         JOIN pg_class ref_c ON d.refclassid = 'pg_class'::regclass
                            AND d.refobjid = ref_c.oid
@@ -876,7 +884,8 @@ fn load_scoped_external_relation_dependencies(
           AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
           AND dep_n.nspname <> 'information_schema'
         UNION
-        SELECT DISTINCT ref_n.nspname, ref_c.relname
+        SELECT DISTINCT ref_n.nspname, ref_c.relname,
+                dep_n.nspname, dep_c.relname
         FROM pg_depend d
         JOIN pg_class ref_c ON d.refclassid = 'pg_class'::regclass
                            AND d.refobjid = ref_c.oid
@@ -895,9 +904,15 @@ fn load_scoped_external_relation_dependencies(
         .context("Failed to load scoped relation dependency boundaries")?
         .into_iter()
         .map(|row| {
-            Ok(ObjectId::new(
-                row.try_get::<_, String>("ref_schema")?,
-                row.try_get::<_, String>("ref_name")?,
+            Ok(ScopedDependencyEdge::new(
+                ObjectId::new(
+                    row.try_get::<_, String>("ref_schema")?,
+                    row.try_get::<_, String>("ref_name")?,
+                ),
+                ObjectId::new(
+                    row.try_get::<_, String>("dep_schema")?,
+                    row.try_get::<_, String>("dep_name")?,
+                ),
             ))
         })
         .collect()

@@ -89,6 +89,15 @@ impl PartialEq for ObjectId {
 
 impl Eq for ObjectId {}
 
+impl ObjectId {
+    /// Total order over identity, for use inside ordered collections.
+    pub(crate) fn cmp_identity(&self, other: &Self) -> std::cmp::Ordering {
+        self.schema
+            .cmp(&other.schema)
+            .then_with(|| self.name.cmp(&other.name))
+    }
+}
+
 impl std::hash::Hash for ObjectId {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.schema.hash(state);
