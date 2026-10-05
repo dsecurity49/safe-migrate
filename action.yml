@@ -12,7 +12,7 @@ inputs:
     required: false
     default: ""
   cache:
-    description: Explicit trusted Cache V9 path; disables managed GitHub cache restore and save.
+    description: Explicit trusted Cache V10 path; disables managed GitHub cache restore and save.
     required: false
     default: ""
   config:
@@ -135,13 +135,13 @@ runs:
           cache_dir="${baseline_root}/${INPUT_BASELINE}"
           rm -rf -- "$cache_dir"
           mkdir -p -- "$cache_dir"
-          cache_path="${cache_dir}/baseline-v9.cache"
-          cache_transport_path="~/.cache/safe-migrate-action/baselines/${INPUT_BASELINE}/baseline-v9.cache"
+          cache_path="${cache_dir}/baseline-v10.cache"
+          cache_transport_path="~/.cache/safe-migrate-action/baselines/${INPUT_BASELINE}/baseline-v10.cache"
         else
           cache_root="${RUNNER_TEMP}/safe-migrate-action"
           mkdir -p "$cache_root"
           cache_dir="$(mktemp -d "${cache_root}/invocation.XXXXXX")"
-          cache_path="${cache_dir}/baseline-v9.cache"
+          cache_path="${cache_dir}/baseline-v10.cache"
         fi
 
         printf '%s\n' "cache-path=${cache_path}" >> "$GITHUB_OUTPUT"
@@ -158,7 +158,7 @@ runs:
           else
             cache_mode=plaintext
           fi
-          cache_prefix="safe-migrate-v9-${RUNNER_OS}-${cache_mode}-${INPUT_BASELINE}-"
+          cache_prefix="safe-migrate-v10-${RUNNER_OS}-${cache_mode}-${INPUT_BASELINE}-"
           printf '%s\n' "cache-prefix=${cache_prefix}" >> "$GITHUB_OUTPUT"
           printf '%s\n' \
             "cache-primary-key=${cache_prefix}${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
@@ -531,16 +531,18 @@ runs:
             .replace(/[\u0000-\u001f\u007f-\u009f]/g, character =>
               `\\u${character.charCodeAt(0).toString(16).padStart(4, '0')}`)
             .replace(/::/g, '::\u200B');
+          const rules = report.rules || {};
           for (const finding of report.violations || []) {
             if (finding.tier !== 'Tier1' && finding.tier !== 'Tier2') continue;
+            const ruleTitle = rules[finding.rule_id];
             const location = finding.location || {};
             const properties = {
-              title: sanitize(`safe-migrate: ${finding.rule_title || finding.rule_id || 'finding'}${finding.rule_title && finding.rule_id ? ` (${finding.rule_id})` : ''}`),
+              title: sanitize(`safe-migrate: ${ruleTitle || finding.rule_id || 'finding'}${ruleTitle && finding.rule_id ? ` (${finding.rule_id})` : ''}`),
               file: location.file,
               startLine: location.line,
               startColumn: location.column,
             };
-            const message = sanitize(`${finding.rule_summary ? `${finding.rule_summary} ` : ''}${finding.reason || 'Migration finding'}${finding.recipe ? ` — ${finding.recipe}` : ''}`);
+            const message = sanitize(`${finding.reason || 'Migration finding'}${finding.recipe ? ` — ${finding.recipe}` : ''}`);
             if (finding.tier === 'Tier1') core.error(message, properties);
             else core.warning(message, properties);
           }

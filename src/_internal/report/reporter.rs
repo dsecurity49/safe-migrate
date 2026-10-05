@@ -7,6 +7,7 @@ use crate::_internal::rules::registry;
 use crate::api::Certainty;
 use comfy_table::Table;
 use owo_colors::{OwoColorize, Style};
+use std::io::IsTerminal;
 
 /// Four-way verdict classification based on violation tiers.
 #[derive(Debug, PartialEq, Eq)]
@@ -86,11 +87,19 @@ fn verdict_from_violations(violations: &[Violation]) -> Verdict {
     }
 }
 
-fn no_color() -> bool {
-    std::env::var_os("NO_COLOR").is_some()
+/// Whether the human report may emit ANSI styling.
+///
+/// Honours the `NO_COLOR` convention and never styles output that is not going
+/// to a terminal, so redirected or piped reports stay free of escape codes.
+pub(crate) fn color_enabled(no_color_env: bool, stdout_is_terminal: bool) -> bool {
+    !no_color_env && stdout_is_terminal
 }
-pub(crate) fn tier_label_colored(tier: &ViolationTier) -> String {
-    tier_label_with_color(tier, !no_color())
+
+fn no_color() -> bool {
+    !color_enabled(
+        std::env::var_os("NO_COLOR").is_some(),
+        std::io::stdout().is_terminal(),
+    )
 }
 
 pub(super) fn tier_label_with_color(tier: &ViolationTier, color: bool) -> String {
@@ -117,10 +126,27 @@ fn terminal_width() -> usize {
         .max(60)
 }
 
+/// Rule titles for exactly the rules a report cites. Kept out of each finding
+/// because it is identical for every occurrence of a rule.
+fn rules_catalogue<'a>(rule_ids: impl Iterator<Item = &'a str>) -> serde_json::Value {
+    let mut catalogue = serde_json::Map::new();
+    for rule_id in rule_ids {
+        if catalogue.contains_key(rule_id) {
+            continue;
+        }
+        if let Some(descriptor) = registry::find_primary_rule(rule_id) {
+            catalogue.insert(rule_id.to_string(), serde_json::json!(descriptor.title));
+        }
+    }
+    serde_json::Value::Object(catalogue)
+}
+
 pub(crate) struct Reporter;
 
 impl Reporter {
-    pub(crate) const JSON_SCHEMA_VERSION: u32 = 2;
+    // v3 adds the top-level `not_evaluated` object, whose entries carry an
+    // optional `missing_schemas` list.
+    pub(crate) const JSON_SCHEMA_VERSION: u32 = 3;
 
     pub(crate) fn json_report(
         violations: &[Violation],
@@ -153,6 +179,7 @@ impl Reporter {
                 "tier3": tier3,
             },
             "evidence": [],
+            "rules": rules_catalogue(violations.iter().map(|violation| violation.rule_id)),
             "violations": violations,
         })
     }
@@ -183,24 +210,17 @@ impl Reporter {
             findings
                 .iter()
                 .map(|finding| {
-                    let mut value = serde_json::to_value(finding).unwrap_or_else(|error| {
+                    serde_json::to_value(finding).unwrap_or_else(|error| {
                         serde_json::json!({
                             "rule_id": finding.violation.rule_id,
                             "message": "Failed to serialize report finding",
                             "serialization_error": error.to_string(),
                         })
-                    });
-                    if let Some(descriptor) = registry::find_primary_rule(finding.violation.rule_id)
-                        && let Some(object) = value.as_object_mut()
-                    {
-                        object.insert("rule_title".into(), descriptor.title.into());
-                        object.insert("rule_summary".into(), descriptor.summary.into());
-                        object.insert("impact".into(), descriptor.impact.into());
-                    }
-                    value
+                    })
                 })
                 .collect(),
         );
+        report["rules"] = rules_catalogue(findings.iter().map(|finding| finding.violation.rule_id));
         report
     }
 
@@ -258,13 +278,6 @@ impl Reporter {
                     .unwrap_or(violation.rule_id),
                 markdown_code(violation.rule_id)
             ));
-            if let Some(descriptor) = registry::find_primary_rule(violation.rule_id) {
-                output.push_str(&format!(
-                    "**Impact:** {}  \n**Rule summary:** {}  \n",
-                    markdown_escape(descriptor.impact),
-                    markdown_escape(descriptor.summary)
-                ));
-            }
             if let Some(location) = &finding.location {
                 output.push_str(&format!(
                     "**Location:** `{}:{}:{}`  \n",
@@ -303,7 +316,34 @@ impl Reporter {
                 output.push_str(&markdown_sql_block(sql.trim()));
             }
         }
+        output.push_str(&Self::markdown_rules_catalogue(
+            findings.iter().map(|finding| finding.violation.rule_id),
+        ));
         output
+    }
+
+    /// Rule titles for the cited rules, listed once rather than under every
+    /// occurrence of the rule.
+    fn markdown_rules_catalogue<'a>(rule_ids: impl Iterator<Item = &'a str>) -> String {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut output = String::new();
+        for rule_id in rule_ids {
+            if !seen.insert(rule_id) {
+                continue;
+            }
+            let Some(descriptor) = registry::find_primary_rule(rule_id) else {
+                continue;
+            };
+            output.push_str(&format!(
+                "- `{}` — {}\n",
+                markdown_code(rule_id),
+                markdown_escape(descriptor.title)
+            ));
+        }
+        if output.is_empty() {
+            return output;
+        }
+        format!("\n## Rules\n\n{output}")
     }
 
     /// Render findings and structured conservative-analysis evidence.
@@ -347,20 +387,23 @@ impl Reporter {
 
         let width = terminal_width();
 
+        // Three borderless columns so the fields spread evenly instead of
+        // bunching left; UTF8_BORDERS_ONLY keeps the edges clean.
         let mut header_table = Table::new();
         header_table.load_preset(comfy_table::presets::UTF8_BORDERS_ONLY);
         header_table.set_content_arrangement(comfy_table::ContentArrangement::DynamicFullWidth);
         header_table.set_width(width as u16);
-        header_table.set_header(vec!["safe-migrate lint"]);
-        header_table.add_row(vec![format!(
-            "Verdict: {}   Confidence: {}",
-            verdict.label(),
-            conf_str
-        )]);
-        header_table.add_row(vec![format!(
-            "HALT: {}   WARN: {}   SAFE: {}",
-            tier1, tier2, tier3
-        )]);
+        header_table.set_header(vec!["safe-migrate lint", "", ""]);
+        header_table.add_row(vec![
+            format!("Verdict: {}", verdict.label()),
+            format!("Confidence: {}", conf_str),
+            String::new(),
+        ]);
+        header_table.add_row(vec![
+            format!("HALT: {}", tier1),
+            format!("WARN: {}", tier2),
+            format!("SAFE: {}", tier3),
+        ]);
         println!("{}", header_table);
 
         if violations.is_empty() {
@@ -392,19 +435,19 @@ impl Reporter {
             }
         }
 
+        // Resolve styling once; asking the terminal per finding would repeat the
+        // syscall for every row.
+        let color = !no_color();
+
         for (gi, (primary_idx, secondary_idxs)) in groups.iter().enumerate() {
             let v = &violations[*primary_idx];
-            let tier_str = tier_label_colored(&v.tier);
+            let tier_str = tier_label_with_color(&v.tier, color);
 
             let descriptor = registry::find_primary_rule(v.rule_id);
             let rule_label = descriptor
                 .map(|descriptor| format!("{} ({})", descriptor.title, v.rule_id))
                 .unwrap_or_else(|| v.rule_id.to_string());
             println!(" [{}] {}", tier_str, rule_label);
-            if let Some(descriptor) = descriptor {
-                println!("   impact : {}", descriptor.impact);
-                println!("   summary: {}", descriptor.summary);
-            }
 
             let display_name = match &v.object_kind {
                 crate::_internal::report::violations::ObjectKind::Database
@@ -455,7 +498,7 @@ impl Reporter {
                 let sv = &violations[sec_idx];
                 println!(
                     "   also   : [{}] {}",
-                    tier_label_colored(&sv.tier),
+                    tier_label_with_color(&sv.tier, color),
                     sv.rule_id
                 );
             }
@@ -537,7 +580,7 @@ fn append_markdown_not_evaluated(
             entry.rule_id,
             entry.tier,
             entry.cause.as_str(),
-            markdown_escape(&entry.remediation)
+            markdown_escape(&entry.recipe)
         ));
     }
 }

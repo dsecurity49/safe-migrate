@@ -410,7 +410,6 @@ impl SafeMigrateEngine {
                         statement_violations.push(crate::_internal::report::violations::Violation {
                             source_range: None,
                             rule_id: "inline-suppression-disabled",
-                            operation_kind: crate::_internal::report::violations::OperationKind::Other("config".to_string()),
                             object_kind: crate::_internal::report::violations::ObjectKind::Unknown,
                             object_name: "".to_string(),
                             tier: crate::_internal::report::violations::ViolationTier::Tier1,
@@ -418,7 +417,7 @@ impl SafeMigrateEngine {
                             recipe: "Remove the inline directive. To bypass a rule, explicitly disable it in safe-migrate.toml.",
                             dedup_key: Some(format!("inline-suppression-disabled:{}", rule.id())),
                             sql: None,
-                            fk_dependency_related: false,
+
                         });
                         // Skip evaluating the rule since it was requested to be ignored,
                         // but the build will fail anyway due to the Tier1 config violation.
@@ -438,10 +437,12 @@ impl SafeMigrateEngine {
                                 tier: rule.default_tier(),
                                 cause,
                                 sql: Some(stmt_text.trim().to_string()),
-                                remediation:
-                                    crate::_internal::report::violations::NotEvaluated::remedy_for(
+                                recipe:
+                                    crate::_internal::report::violations::NotEvaluated::recipe_for(
                                         cause,
+                                        &state.external_referenced_schemas(),
                                     ),
+                                missing_schemas: state.external_referenced_schemas(),
                             },
                         );
                         continue;

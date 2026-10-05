@@ -1,6 +1,6 @@
 use crate::_internal::analysis::mutations::Mutation;
 
-use crate::_internal::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
+use crate::_internal::report::violations::{ObjectKind, Violation, ViolationTier};
 use crate::_internal::rules::{Rule, RuleContext};
 
 pub(crate) struct OverbroadGrantRule;
@@ -70,7 +70,7 @@ impl Rule for OverbroadGrantRule {
                 violations.push(Violation {
                     source_range: None,
                     rule_id: self.id(),
-                    operation_kind: OperationKind::Grant,
+
                     object_kind: obj_kind.clone(),
                     object_name: obj_name.clone(),
                     tier: ViolationTier::Tier1,
@@ -78,7 +78,6 @@ impl Rule for OverbroadGrantRule {
                     recipe: "GRANT to PUBLIC is almost never intended as it applies to every role.",
                     dedup_key: None,
                     sql: None,
-                    fk_dependency_related: false,
                 });
             }
 
@@ -113,7 +112,7 @@ impl Rule for OverbroadGrantRule {
                     violations.push(Violation {
                         source_range: None,
                         rule_id: self.id(),
-                        operation_kind: OperationKind::Grant,
+
                         object_kind: obj_kind.clone(),
                         object_name: obj_name.clone(),
                         tier: ViolationTier::Tier2,
@@ -121,7 +120,6 @@ impl Rule for OverbroadGrantRule {
                         recipe: "GRANT ALL PRIVILEGES to a role that is not the owner is risky.",
                         dedup_key: None,
                         sql: None,
-                        fk_dependency_related: false,
                     });
                 }
             }
@@ -129,7 +127,7 @@ impl Rule for OverbroadGrantRule {
             if grant.with_grant_option {
                 violations.push(Violation { source_range: None,
                     rule_id: self.id(),
-                    operation_kind: OperationKind::Grant,
+
                     object_kind: obj_kind,
                     object_name: obj_name,
                     tier: ViolationTier::Tier2,
@@ -137,7 +135,7 @@ impl Rule for OverbroadGrantRule {
                     recipe: "WITH GRANT OPTION allows the grantee to re-grant privileges, widening the blast radius.",
                     dedup_key: None,
                             sql: None,
-                            fk_dependency_related: false,
+
                 });
             }
         }

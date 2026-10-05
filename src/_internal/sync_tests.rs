@@ -325,7 +325,7 @@ mod tests {
         );
 
         // The current cache format uses bincode.
-        let versioned = crate::_internal::db::cache::DbCacheVersioned::V9(Box::new(cache));
+        let versioned = crate::_internal::db::cache::DbCacheVersioned::V10(Box::new(cache));
         let config = bincode::config::standard().with_variable_int_encoding();
         let encoded = bincode::serde::encode_to_vec(&versioned, config).unwrap();
 
@@ -333,7 +333,7 @@ mod tests {
             bincode::serde::decode_from_slice(&encoded, config)
                 .unwrap()
                 .0;
-        let crate::_internal::db::cache::DbCacheVersioned::V9(deserialized) = decoded else {
+        let crate::_internal::db::cache::DbCacheVersioned::V10(deserialized) = decoded else {
             panic!("Expected the current cache format");
         };
         assert_eq!(deserialized.pg_version_num, Some(160000));
@@ -427,14 +427,14 @@ mod tests {
         });
         cache.insert_baseline(id.clone(), rel);
 
-        let versioned = crate::_internal::db::cache::DbCacheVersioned::V9(Box::new(cache));
+        let versioned = crate::_internal::db::cache::DbCacheVersioned::V10(Box::new(cache));
         let config = bincode::config::standard().with_variable_int_encoding();
         let encoded = bincode::serde::encode_to_vec(&versioned, config).unwrap();
         let decoded: crate::_internal::db::cache::DbCacheVersioned =
             bincode::serde::decode_from_slice(&encoded, config)
                 .unwrap()
                 .0;
-        let crate::_internal::db::cache::DbCacheVersioned::V9(deserialized) = decoded else {
+        let crate::_internal::db::cache::DbCacheVersioned::V10(deserialized) = decoded else {
             panic!("Expected the current cache format");
         };
         let rel = deserialized.relations.get(&id).unwrap();

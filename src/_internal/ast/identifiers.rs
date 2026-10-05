@@ -113,6 +113,23 @@ impl ObjectId {
             inferred_schema: false,
         }
     }
+
+    /// A column of this relation, as `schema.relation.column`.
+    ///
+    /// The inferred-schema annotation belongs to the relation and stays at the
+    /// end, so it never lands inside the qualified name.
+    ///
+    /// TODO: `Violation::object_name` is still a `String`, so callers assemble
+    /// identities by interpolation. Replace it with a structured object
+    /// reference (relation plus optional column) and let the renderers format
+    /// it, which removes this whole class of mis-rendered identifier.
+    pub(crate) fn column_name(&self, column: &str) -> String {
+        if self.inferred_schema {
+            format!("{}.{}.{} (inferred)", self.schema, self.name, column)
+        } else {
+            format!("{}.{}.{}", self.schema, self.name, column)
+        }
+    }
 }
 
 impl std::fmt::Display for ObjectId {

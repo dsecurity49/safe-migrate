@@ -864,11 +864,8 @@ impl AnalysisState {
             return self.unresolved(EvidenceCode::CatalogCoverageIncomplete);
         }
 
-        // Relation-owned dependency loaders currently expand selected
-        // foreign-key boundaries, but do not establish that every possible
-        // cross-schema default, generated expression, policy, or extension
-        // dependency was loaded. Keep a scoped baseline DROP TABLE
-        // conservative until that object-class coverage is explicit.
+        // The FK loader only expands foreign-key boundaries, so a scoped baseline
+        // cannot prove every cross-schema dependent was loaded.
         if present_targets.iter().any(|id| {
             self.baseline_scoped_family_object(
                 id,

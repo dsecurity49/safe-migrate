@@ -18,7 +18,7 @@ use crate::_internal::model::schema::SchemaOverlay;
 use crate::_internal::model::sequence::SequenceOverlay;
 use crate::_internal::model::trigger::TriggerOverlay;
 use crate::_internal::model::types::{TypeKind, TypeOverlay, TypeState};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::hash::Hash;
 
 mod apply_misc;
@@ -328,10 +328,7 @@ pub(crate) struct AnalysisState {
     pub baseline_foreign_keys: HashSet<(ObjectId, String)>,
     pub baseline_fk_dependencies: HashSet<ObjectId>,
     pub baseline_sequences: HashSet<ObjectId>,
-    pub scoped_external_relation_dependencies: HashSet<ScopedDependencyEdge>,
-    pub scoped_external_type_dependencies: HashSet<ObjectId>,
-    pub scoped_external_routine_dependencies: HashSet<ObjectId>,
-    pub scoped_external_index_dependencies: HashSet<ObjectId>,
+    pub scoped_external_dependencies: HashSet<ScopedDependencyEdge>,
     pub local: LocalState,
 }
 
@@ -952,26 +949,8 @@ impl AnalysisState {
             .map(|(id, sequence)| (id.clone(), SequenceOverlay::Present(sequence.clone())))
             .collect();
         let baseline_sequences = cache.sequences.keys().cloned().collect();
-        let scoped_external_relation_dependencies = cache
-            .scoped_external_relation_dependencies
-            .iter()
-            .cloned()
-            .collect();
-        let scoped_external_type_dependencies = cache
-            .scoped_external_type_dependencies
-            .iter()
-            .cloned()
-            .collect();
-        let scoped_external_routine_dependencies = cache
-            .scoped_external_routine_dependencies
-            .iter()
-            .cloned()
-            .collect();
-        let scoped_external_index_dependencies = cache
-            .scoped_external_index_dependencies
-            .iter()
-            .cloned()
-            .collect();
+        let scoped_external_dependencies =
+            cache.scoped_external_dependencies.iter().cloned().collect();
         for sequence in cache.sequences.values() {
             if let Some((table, column)) = &sequence.owned_by {
                 graph.add_edge(DependencyEdge::new(
@@ -1277,10 +1256,7 @@ impl AnalysisState {
             baseline_foreign_keys,
             baseline_fk_dependencies,
             baseline_sequences,
-            scoped_external_relation_dependencies,
-            scoped_external_type_dependencies,
-            scoped_external_routine_dependencies,
-            scoped_external_index_dependencies,
+            scoped_external_dependencies,
             local: LocalState {
                 schemas,
                 relations,
@@ -1565,6 +1541,18 @@ impl AnalysisState {
         self.baseline_coverage.has(family)
     }
 
+    /// Schemas outside the synchronized scope that a loaded object depends on.
+    /// Adding one of these to `schemas` is what makes the boundary answerable.
+    pub(crate) fn external_referenced_schemas(&self) -> Vec<String> {
+        let mut names: BTreeSet<String> = BTreeSet::new();
+        for edge in &self.scoped_external_dependencies {
+            if let Some(external) = &edge.external {
+                names.insert(external.schema.clone());
+            }
+        }
+        names.into_iter().collect()
+    }
+
     /// A schema-scoped baseline cannot prove that cross-schema dependents were
     /// absent unless the relevant catalog loader explicitly includes them.
     /// Destructive transitions for families whose dependency queries are not
@@ -1589,20 +1577,14 @@ impl AnalysisState {
         if matches!(
             family,
             crate::_internal::db::cache::CatalogFamily::Relations
+                | crate::_internal::db::cache::CatalogFamily::Types
+                | crate::_internal::db::cache::CatalogFamily::Routines
+                | crate::_internal::db::cache::CatalogFamily::Indexes
         ) {
             return self
-                .scoped_external_relation_dependencies
+                .scoped_external_dependencies
                 .iter()
-                .any(|edge| edge.scoped == *id);
-        }
-        if matches!(family, crate::_internal::db::cache::CatalogFamily::Types) {
-            return self.scoped_external_type_dependencies.contains(id);
-        }
-        if matches!(family, crate::_internal::db::cache::CatalogFamily::Routines) {
-            return self.scoped_external_routine_dependencies.contains(id);
-        }
-        if matches!(family, crate::_internal::db::cache::CatalogFamily::Indexes) {
-            return self.scoped_external_index_dependencies.contains(id);
+                .any(|edge| edge.exposes(family, id));
         }
         true
     }
@@ -3026,7 +3008,9 @@ impl AnalysisState {
                 .into_iter()
                 .map(|mut edge| {
                     Self::remap_schema_id(&mut edge.scoped, old_name, new_name);
-                    Self::remap_schema_id(&mut edge.external, old_name, new_name);
+                    if let Some(external) = edge.external.as_mut() {
+                        Self::remap_schema_id(external, old_name, new_name);
+                    }
                     edge
                 })
                 .collect();
@@ -3035,9 +3019,7 @@ impl AnalysisState {
         remap_set(&mut self.baseline_indexes);
         remap_set(&mut self.baseline_fk_dependencies);
         remap_set(&mut self.baseline_sequences);
-        remap_edges(&mut self.scoped_external_relation_dependencies);
-        remap_set(&mut self.scoped_external_type_dependencies);
-        remap_set(&mut self.scoped_external_routine_dependencies);
+        remap_edges(&mut self.scoped_external_dependencies);
         self.baseline_foreign_keys = std::mem::take(&mut self.baseline_foreign_keys)
             .into_iter()
             .map(|(mut table, name)| {
@@ -3314,15 +3296,7 @@ impl AnalysisState {
                     baseline_foreign_keys: self.baseline_foreign_keys.clone(),
                     baseline_fk_dependencies: self.baseline_fk_dependencies.clone(),
                     baseline_sequences: self.baseline_sequences.clone(),
-                    scoped_external_relation_dependencies: self
-                        .scoped_external_relation_dependencies
-                        .clone(),
-                    scoped_external_type_dependencies: self
-                        .scoped_external_type_dependencies
-                        .clone(),
-                    scoped_external_routine_dependencies: self
-                        .scoped_external_routine_dependencies
-                        .clone(),
+                    scoped_external_dependencies: self.scoped_external_dependencies.clone(),
                     baseline_schemas: self.baseline_schemas.clone(),
                     search_path: self.local.search_path.clone(),
                     search_path_template: self.local.search_path_template.clone(),
@@ -3625,12 +3599,7 @@ impl AnalysisState {
                     self.baseline_foreign_keys = snapshot.baseline_foreign_keys;
                     self.baseline_fk_dependencies = snapshot.baseline_fk_dependencies;
                     self.baseline_sequences = snapshot.baseline_sequences;
-                    self.scoped_external_relation_dependencies =
-                        snapshot.scoped_external_relation_dependencies;
-                    self.scoped_external_type_dependencies =
-                        snapshot.scoped_external_type_dependencies;
-                    self.scoped_external_routine_dependencies =
-                        snapshot.scoped_external_routine_dependencies;
+                    self.scoped_external_dependencies = snapshot.scoped_external_dependencies;
                     self.baseline_schemas = snapshot.baseline_schemas;
                     self.local.search_path = snapshot.search_path;
                     self.local.search_path_template = snapshot.search_path_template;

@@ -85,7 +85,7 @@ hour. Adjust it to match your schema-change rate and runner availability.
 | Merge queue | Never available | Restore only | Offline |
 
 A refresh reads the PostgreSQL catalogs in one read-only, repeatable-read
-transaction. A PR check decrypts and validates Cache V9, parses the proposed
+transaction. A PR check decrypts and validates Cache V10, parses the proposed
 SQL, and simulates its state changes.
 
 Neither path applies the migration.
@@ -154,7 +154,7 @@ The baseline contains:
 It does not contain `DATABASE_URL`, role password hashes, or subscription
 connection strings.
 
-Cache V9 uses authenticated XChaCha20-Poly1305 encryption. Without the key, a
+Cache V10 uses authenticated XChaCha20-Poly1305 encryption. Without the key, a
 modified cache, forged PR cache, or cache encrypted under another key fails
 authentication. The decrypted payload is size-bounded, version-checked, and
 semantically validated before use.

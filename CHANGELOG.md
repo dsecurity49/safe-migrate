@@ -5,6 +5,26 @@ commits and pull requests. Published binaries, checksums, and generated release
 notes are available on the
 [GitHub Releases page](https://github.com/dsecurity49/safe-migrate/releases).
 
+## v0.11.0 — Unreleased
+
+- Report schema version 3. Violations no longer carry `operation_kind`,
+  `dedup_key`, `fk_dependency_related`, `rule_title`, `rule_summary`, or
+  `impact`; rule titles are cited once through a new top-level `rules` object
+  keyed by rule id. Consumers must branch on `schema_version`.
+- `certainty` is reported only when it is not `exact`.
+- Remediation is labelled `recipe` in every output. `rules --json` moved to its
+  own version 3, which is what tells consumers `remediation` became `recipe`.
+- Cache format V10; run `safe-migrate sync`. V1–V9 are rejected.
+- A scoped baseline now records cross-schema dependents for types, routines and
+  indexes as well as relations, so a scoped `sync` no longer overlooks
+  dependents outside the schemas it loaded.
+- A check skipped for want of evidence names the out-of-scope schemas the
+  boundary query observed instead of advising a bare resync.
+- Tier labels are colored only when standard output is a terminal, so
+  redirected and piped reports contain no escape sequences.
+- Column identities are rendered as `schema.relation.column`, with an inferred
+  schema annotated at the end.
+
 ## v0.10.0 — 2026-10-02
 
 - Range types are read from the baseline and their constructor is owned by the

@@ -120,16 +120,18 @@ fn public_finding_serialization_matches_the_report_contract() {
         .iter()
         .find(|finding| finding.rule_id == "missing-idempotency")
         .expect("CREATE TABLE without a guard should be reported");
-    assert_eq!(finding.operation_kind, api::OperationKind::CreateTable);
     assert_eq!(finding.object_kind, api::ObjectKind::Table);
     let value = serde_json::to_value(finding).unwrap();
 
-    assert_eq!(value["fk_dependency_related"], false);
-    assert!(value.get("foreign_key_dependency_related").is_none());
-    assert_eq!(value["rule_title"], "Missing idempotency");
-    assert!(value.get("rule_summary").is_some());
-    assert!(value.get("impact").is_some());
-    assert!(value.get("dedup_key").is_some());
+    assert!(value.get("fk_dependency_related").is_none());
+    assert!(value.get("rule_title").is_none());
+    assert!(value.get("rule_summary").is_none());
+    assert!(value.get("impact").is_none());
+    assert!(value.get("dedup_key").is_none());
+    assert!(value.get("operation_kind").is_none());
+    // Certainty is reported only when it is not the exact default.
+    assert!(!finding.certainty.is_exact());
+    assert!(value.get("certainty").is_some());
     let report_finding = outcome.json()["violations"]
         .as_array()
         .unwrap()
@@ -138,6 +140,10 @@ fn public_finding_serialization_matches_the_report_contract() {
         .unwrap()
         .clone();
     assert_eq!(value, report_finding);
+    assert_eq!(
+        outcome.json()["rules"]["missing-idempotency"],
+        "Missing idempotency"
+    );
 }
 
 #[test]

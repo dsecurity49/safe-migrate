@@ -173,23 +173,55 @@ impl Default for CatalogCoverage {
 /// Direction matters: `scoped` is the object inside the synced schemas and
 /// `external` depends on it from outside. Storing only the external endpoint
 /// cannot answer "does this object have dependents out of scope?".
+///
+/// `family` is the catalog family of `scoped`. Identity is `(schema, name)`,
+/// which a table and a type in one schema may share, so the family keeps
+/// cross-scope exposure attributable to the object that actually has it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) struct ScopedDependencyEdge {
+    pub family: CatalogFamily,
     pub scoped: ObjectId,
-    pub external: ObjectId,
+    /// The out-of-scope dependent, absent when its catalog class could not be
+    /// resolved. That is exposure we can neither model nor name, and it still
+    /// forces the scoped endpoint to stay unevaluated.
+    pub external: Option<ObjectId>,
 }
 
 impl ScopedDependencyEdge {
-    pub(crate) fn new(scoped: ObjectId, external: ObjectId) -> Self {
-        Self { scoped, external }
+    pub(crate) fn new(family: CatalogFamily, scoped: ObjectId, external: ObjectId) -> Self {
+        Self {
+            family,
+            scoped,
+            external: Some(external),
+        }
+    }
+
+    pub(crate) fn unresolved_external(family: CatalogFamily, scoped: ObjectId) -> Self {
+        Self {
+            family,
+            scoped,
+            external: None,
+        }
+    }
+
+    /// True when this edge makes `scoped` unevaluatable: a modeled external
+    /// dependent, or an external dependent we could not resolve at all.
+    pub(crate) fn exposes(&self, family: CatalogFamily, id: &ObjectId) -> bool {
+        self.family == family && self.scoped == *id
     }
 }
 
 impl Ord for ScopedDependencyEdge {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.scoped
-            .cmp_identity(&other.scoped)
-            .then_with(|| self.external.cmp_identity(&other.external))
+        self.family
+            .cmp(&other.family)
+            .then_with(|| self.scoped.cmp_identity(&other.scoped))
+            .then_with(|| match (&self.external, &other.external) {
+                (None, None) => std::cmp::Ordering::Equal,
+                (None, Some(_)) => std::cmp::Ordering::Less,
+                (Some(_), None) => std::cmp::Ordering::Greater,
+                (Some(a), Some(b)) => a.cmp_identity(b),
+            })
     }
 }
 
@@ -423,14 +455,11 @@ pub(crate) struct DbCache {
     pub schemas: HashMap<String, SchemaState>,
     pub sequences: HashMap<ObjectId, SequenceState>,
     pub dependencies: Vec<ViewDependencyCache>,
-    /// Synchronized relations with a known dependent outside an explicit
-    /// schema scope. Scoped destructive transitions stay conservative for
-    /// these identities; an absent entry means no such dependent was observed
-    /// in the catalog families the synchronizer resolves.
-    pub scoped_external_relation_dependencies: Vec<ScopedDependencyEdge>,
-    pub scoped_external_type_dependencies: Vec<ObjectId>,
-    pub scoped_external_routine_dependencies: Vec<ObjectId>,
-    pub scoped_external_index_dependencies: Vec<ObjectId>,
+    /// Every observed cross-scope dependency edge, tagged with the catalog
+    /// family of the in-scope endpoint. Scoped destructive transitions stay
+    /// conservative for these identities; an absent entry means no external
+    /// dependent was observed when the boundary query ran.
+    pub scoped_external_dependencies: Vec<ScopedDependencyEdge>,
     pub inheritances: Vec<InheritanceCache>,
     pub publications: HashMap<String, PublicationState>,
     pub subscriptions: HashMap<String, SubscriptionState>,
@@ -442,17 +471,17 @@ pub(crate) struct DbCache {
 // this: bincode carries no field names, so bytes are laid out exactly as the
 // current definitions describe. The header encodes the same number, and the
 // magic must stay one digit wide or the fixed-size prefix read breaks.
-pub(crate) const CACHE_FORMAT_VERSION: u32 = 9;
+pub(crate) const CACHE_FORMAT_VERSION: u32 = 10;
 
-/// Current durable cache header. V9 records every independently-nameable type,
-/// including ranges and multiranges, so `Types` coverage is honest.
-pub(crate) const CACHE_V9_MAGIC: &[u8] = b"SMCACHE09";
+/// Current durable cache header. V10 records cross-scope dependency edges with
+/// both endpoints and a catalog family, so the boundary check is answerable.
+pub(crate) const CACHE_MAGIC: &[u8] = b"SMCACHE10";
 
-// The header width is fixed, so a two-digit version would break the prefix
-// comparison in `api.rs` and read as corruption rather than an old format.
+// The prefix read in `api.rs` consumes a fixed number of bytes, so the magic
+// must stay the same width as the version grows. Two version digits fit.
 const _: () = assert!(
-    CACHE_FORMAT_VERSION < 10,
-    "a two-digit cache version changes the header width; redesign the prefix read first"
+    CACHE_MAGIC.len() == 9,
+    "the cache magic must stay 9 bytes; a wider version needs a new prefix read"
 );
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -469,6 +498,7 @@ pub(crate) enum DbCacheVersioned {
     V7(Box<DbCache>),
     V8(Box<DbCache>),
     V9(Box<DbCache>),
+    V10(Box<DbCache>),
 }
 
 impl DbCacheVersioned {
@@ -483,6 +513,7 @@ impl DbCacheVersioned {
             DbCacheVersioned::V7(_) => 7,
             DbCacheVersioned::V8(_) => 8,
             DbCacheVersioned::V9(_) => 9,
+            DbCacheVersioned::V10(_) => 10,
         }
     }
 
@@ -495,11 +526,12 @@ impl DbCacheVersioned {
             | DbCacheVersioned::V5(_)
             | DbCacheVersioned::V6(_)
             | DbCacheVersioned::V7(_)
-            | DbCacheVersioned::V8(_) => Err(
+            | DbCacheVersioned::V8(_)
+            | DbCacheVersioned::V9(_) => Err(
                 "This cache format is unsupported. Run `safe-migrate sync` to rebuild it."
                     .to_string(),
             ),
-            DbCacheVersioned::V9(c) => {
+            DbCacheVersioned::V10(c) => {
                 c.validate_semantics()?;
                 Ok(*c)
             }
@@ -538,10 +570,7 @@ impl DbCache {
             schemas: HashMap::new(),
             sequences: HashMap::new(),
             dependencies: Vec::new(),
-            scoped_external_relation_dependencies: Vec::new(),
-            scoped_external_type_dependencies: Vec::new(),
-            scoped_external_routine_dependencies: Vec::new(),
-            scoped_external_index_dependencies: Vec::new(),
+            scoped_external_dependencies: Vec::new(),
             inheritances: Vec::new(),
             publications: HashMap::new(),
             subscriptions: HashMap::new(),
@@ -681,67 +710,36 @@ impl DbCache {
                 ));
             }
         }
-        let mut scoped_external_relations = HashSet::new();
-        for edge in &self.scoped_external_relation_dependencies {
+        let mut seen_edges = HashSet::new();
+        for edge in &self.scoped_external_dependencies {
             validate_id("scoped dependency endpoint", &edge.scoped, true)?;
-            validate_id("scoped dependency endpoint", &edge.external, true)?;
-            if !scoped_external_relations.insert(edge.clone()) {
+            if !seen_edges.insert(edge.clone()) {
                 return Err(format!(
-                    "scoped external relation dependency '{}' -> '{}' appears more than once",
-                    edge.scoped, edge.external
+                    "scoped external dependency '{}' appears more than once",
+                    edge.scoped
                 ));
             }
             if !matches!(self.coverage.schema_scope, SchemaCoverage::Explicit(_)) {
                 return Err(format!(
-                    "scoped external relation dependency '{}' -> '{}' requires an explicit schema scope",
-                    edge.scoped, edge.external
+                    "scoped external dependency '{}' requires an explicit schema scope",
+                    edge.scoped
                 ));
             }
             if !self.coverage.schema_scope.covers(&edge.scoped.schema) {
                 return Err(format!(
-                    "scoped external relation dependency '{}' is outside the cache schema scope",
+                    "scoped external dependency '{}' is outside the cache schema scope",
                     edge.scoped
                 ));
             }
-            if self.coverage.schema_scope.covers(&edge.external.schema) {
+            let Some(external) = &edge.external else {
+                continue;
+            };
+            validate_id("scoped dependency endpoint", external, true)?;
+            if self.coverage.schema_scope.covers(&external.schema) {
                 return Err(format!(
-                    "scoped external relation dependency '{}' must not be in the cache schema scope",
-                    edge.external
+                    "scoped external dependency '{}' -> '{}' must not be in the cache schema scope",
+                    edge.scoped, external
                 ));
-            }
-        }
-        for (label, ids) in [
-            (
-                "scoped external type dependency",
-                &self.scoped_external_type_dependencies,
-            ),
-            (
-                "scoped external routine dependency",
-                &self.scoped_external_routine_dependencies,
-            ),
-            (
-                "scoped external index dependency",
-                &self.scoped_external_index_dependencies,
-            ),
-        ] {
-            let mut seen = HashSet::new();
-            for id in ids {
-                validate_id(label, id, true)?;
-                if !seen.insert(id) {
-                    return Err(format!("{label} '{}' appears more than once", id));
-                }
-                if !matches!(self.coverage.schema_scope, SchemaCoverage::Explicit(_)) {
-                    return Err(format!(
-                        "{label} '{}' requires an explicit schema scope",
-                        id
-                    ));
-                }
-                if !self.coverage.schema_scope.covers(&id.schema) {
-                    return Err(format!(
-                        "{label} '{}' is outside the cache schema scope",
-                        id
-                    ));
-                }
             }
         }
         let coverage_scope = self
@@ -2308,10 +2306,16 @@ mod tests {
     }
 
     #[test]
-    fn current_cache_format_is_v9() {
-        assert_eq!(CACHE_FORMAT_VERSION, 9);
-        assert_eq!(DbCacheVersioned::V9(Box::default()).format_version(), 9);
-        assert_eq!(CACHE_V9_MAGIC, b"SMCACHE09");
+    fn current_cache_format_is_v10() {
+        assert_eq!(CACHE_FORMAT_VERSION, 10);
+        assert_eq!(DbCacheVersioned::V10(Box::default()).format_version(), 10);
+        assert_eq!(CACHE_MAGIC, b"SMCACHE10");
+    }
+
+    #[test]
+    fn legacy_cache_versions_are_rejected_before_validation() {
+        assert!(DbCacheVersioned::V9(Box::default()).into_cache().is_err());
+        assert!(DbCacheVersioned::V1.into_cache().is_err());
     }
 
     #[test]
@@ -2393,8 +2397,9 @@ mod tests {
         cache.metadata.schemas = Some(schemas.clone());
         // The scoped endpoint is the one that must lie inside the scope.
         cache
-            .scoped_external_relation_dependencies
+            .scoped_external_dependencies
             .push(ScopedDependencyEdge::new(
+                CatalogFamily::Relations,
                 ObjectId::new("omitted", "scoped"),
                 ObjectId::new("public", "table"),
             ));
@@ -2407,8 +2412,9 @@ mod tests {
         cache.coverage = fully_covering(Some(&schemas));
         cache.metadata.schemas = Some(schemas);
         cache
-            .scoped_external_relation_dependencies
+            .scoped_external_dependencies
             .push(ScopedDependencyEdge::new(
+                CatalogFamily::Relations,
                 ObjectId::new("public", "scoped"),
                 ObjectId::new("public", "table"),
             ));
@@ -2417,6 +2423,52 @@ mod tests {
             error.contains("must not be in the cache schema scope"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn current_cache_accepts_unresolvable_external_endpoint() {
+        let mut cache = synced_cache();
+        let schemas = vec!["public".to_string()];
+        cache.coverage = fully_covering(Some(&schemas));
+        cache.metadata.schemas = Some(schemas);
+        cache
+            .scoped_external_dependencies
+            .push(ScopedDependencyEdge::unresolved_external(
+                CatalogFamily::Relations,
+                ObjectId::new("public", "scoped"),
+            ));
+
+        // An unresolvable dependent is exposure we can neither model nor name,
+        // so it is recorded rather than rejected.
+        assert!(cache.validate_semantics().is_ok());
+    }
+
+    #[test]
+    fn scoped_external_edges_keep_family_distinct() {
+        let mut cache = synced_cache();
+        let schemas = vec!["public".to_string()];
+        cache.coverage = fully_covering(Some(&schemas));
+        cache.metadata.schemas = Some(schemas);
+        let scoped = ObjectId::new("public", "widget");
+        let external = ObjectId::new("other", "widget");
+        cache
+            .scoped_external_dependencies
+            .push(ScopedDependencyEdge::new(
+                CatalogFamily::Indexes,
+                scoped.clone(),
+                external.clone(),
+            ));
+        cache
+            .scoped_external_dependencies
+            .push(ScopedDependencyEdge::new(
+                CatalogFamily::Relations,
+                scoped,
+                external,
+            ));
+
+        // A table and an index may share an identity, so the family stays part
+        // of the key and the duplicate check does not fire.
+        assert!(cache.validate_semantics().is_ok());
     }
 
     #[test]
@@ -2431,7 +2483,7 @@ mod tests {
             },
         );
 
-        let error = DbCacheVersioned::V9(Box::new(cache))
+        let error = DbCacheVersioned::V10(Box::new(cache))
             .into_cache()
             .unwrap_err();
         assert!(error.contains("schema cache key 'app'"));
@@ -2442,7 +2494,7 @@ mod tests {
         let mut cache = synced_cache();
         cache.metadata.schemas = Some(vec!["app".to_string()]);
 
-        let error = DbCacheVersioned::V9(Box::new(cache))
+        let error = DbCacheVersioned::V10(Box::new(cache))
             .into_cache()
             .unwrap_err();
         assert!(error.contains("schema coverage disagrees"));
@@ -2969,7 +3021,7 @@ mod tests {
             },
         );
 
-        let error = DbCacheVersioned::V9(Box::new(cache))
+        let error = DbCacheVersioned::V10(Box::new(cache))
             .into_cache()
             .unwrap_err();
         assert!(error.contains("empty or duplicate table column"));
@@ -3005,7 +3057,7 @@ mod tests {
             },
         );
 
-        let error = DbCacheVersioned::V9(Box::new(cache))
+        let error = DbCacheVersioned::V10(Box::new(cache))
             .into_cache()
             .unwrap_err();
         assert!(error.contains("owner 'missing_owner' is absent"));
@@ -3299,7 +3351,7 @@ mod tests {
             has_default_collations: true,
         });
 
-        let error = DbCacheVersioned::V9(Box::new(cache))
+        let error = DbCacheVersioned::V10(Box::new(cache))
             .into_cache()
             .unwrap_err();
         assert!(error.contains("references missing relation 'public.items'"));
@@ -3330,7 +3382,7 @@ mod tests {
             has_default_collations: true,
         });
 
-        let error = DbCacheVersioned::V9(Box::new(cache))
+        let error = DbCacheVersioned::V10(Box::new(cache))
             .into_cache()
             .unwrap_err();
         assert!(error.contains("must be in the same schema as indexed relation"));
@@ -3363,7 +3415,7 @@ mod tests {
             has_default_collations: true,
         });
 
-        let error = DbCacheVersioned::V9(Box::new(cache))
+        let error = DbCacheVersioned::V10(Box::new(cache))
             .into_cache()
             .unwrap_err();
         assert!(error.contains("collides with another relation-namespace object"));
@@ -3388,7 +3440,7 @@ mod tests {
             },
         );
 
-        let error = DbCacheVersioned::V9(Box::new(cache))
+        let error = DbCacheVersioned::V10(Box::new(cache))
             .into_cache()
             .unwrap_err();
         assert!(error.contains("collides with another relation-namespace object"));
@@ -3408,7 +3460,7 @@ mod tests {
             enabled_mode: TriggerEnableMode::Origin,
         });
 
-        let error = DbCacheVersioned::V9(Box::new(cache))
+        let error = DbCacheVersioned::V10(Box::new(cache))
             .into_cache()
             .unwrap_err();
         assert!(error.contains("must be in the same schema as trigger table"));
@@ -3440,7 +3492,7 @@ mod tests {
         });
 
         assert!(
-            DbCacheVersioned::V9(Box::new(cache))
+            DbCacheVersioned::V10(Box::new(cache))
                 .into_cache()
                 .unwrap_err()
                 .contains("missing complete dependency-column evidence")
@@ -3463,13 +3515,13 @@ mod tests {
             detach_pending: false,
         });
         assert!(
-            DbCacheVersioned::V9(Box::new(cache.clone()))
+            DbCacheVersioned::V10(Box::new(cache.clone()))
                 .into_cache()
                 .is_ok()
         );
 
         cache.inheritances[0].detach_pending = true;
-        let error = DbCacheVersioned::V9(Box::new(cache))
+        let error = DbCacheVersioned::V10(Box::new(cache))
             .into_cache()
             .unwrap_err();
         assert!(error.contains("pending detach requires"));
@@ -3494,7 +3546,7 @@ mod tests {
             is_partition: true,
             detach_pending: true,
         });
-        assert!(DbCacheVersioned::V9(Box::new(cache)).into_cache().is_ok());
+        assert!(DbCacheVersioned::V10(Box::new(cache)).into_cache().is_ok());
     }
 
     #[test]

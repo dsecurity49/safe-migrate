@@ -2,7 +2,7 @@ use crate::_internal::analysis::facts::LockModeFact;
 use crate::_internal::analysis::mutations::{
     AlterTypeActionMutation, Mutation, ReindexTargetMutation,
 };
-use crate::_internal::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
+use crate::_internal::report::violations::{ObjectKind, Violation, ViolationTier};
 use crate::_internal::rules::{Rule, RuleCapability, RuleContext, TRANSACTION_CAPABILITIES};
 
 pub(crate) struct ConcurrentInsideTransactionRule;
@@ -30,7 +30,7 @@ impl Rule for ConcurrentInsideTransactionRule {
                 Mutation::CreateIndex(c) if c.concurrently => {
                     violations.push(Violation { source_range: None,
                         rule_id: self.id(),
-                        operation_kind: OperationKind::CreateIndex,
+
                         object_kind: ObjectKind::Index,
                         object_name: c.id.to_string(),
                         tier: self.default_tier(),
@@ -38,7 +38,7 @@ impl Rule for ConcurrentInsideTransactionRule {
                         recipe: "Move CONCURRENTLY index creation outside of explicit transaction blocks.",
                         dedup_key: Some(format!("{}_{}", self.id(), c.id)),
                                     sql: None,
-                                    fk_dependency_related: false,
+
                     });
                 }
                 Mutation::DropIndex(d) if d.concurrently => {
@@ -46,7 +46,7 @@ impl Rule for ConcurrentInsideTransactionRule {
                         violations.push(Violation {
                             source_range: None,
                             rule_id: self.id(),
-                            operation_kind: OperationKind::DropIndex,
+
                             object_kind: ObjectKind::Index,
                             object_name: id.to_string(),
                             tier: self.default_tier(),
@@ -57,7 +57,7 @@ impl Rule for ConcurrentInsideTransactionRule {
                             recipe: self.recipe(),
                             dedup_key: None,
                             sql: None,
-                            fk_dependency_related: false,
+
                         });
                     }
                 }
@@ -65,7 +65,7 @@ impl Rule for ConcurrentInsideTransactionRule {
                     violations.push(Violation {
                         source_range: None,
                         rule_id: self.id(),
-                        operation_kind: OperationKind::RefreshMaterializedView,
+
                         object_kind: ObjectKind::MaterializedView,
                         object_name: refresh.id.to_string(),
                         tier: self.default_tier(),
@@ -76,7 +76,7 @@ impl Rule for ConcurrentInsideTransactionRule {
                         recipe: self.recipe(),
                         dedup_key: Some(format!("{}_{}", self.id(), refresh.id)),
                         sql: None,
-                        fk_dependency_related: false,
+
                     });
                 }
                 Mutation::Reindex { target, concurrently: true }
@@ -91,7 +91,7 @@ impl Rule for ConcurrentInsideTransactionRule {
                     violations.push(Violation {
                         source_range: None,
                         rule_id: self.id(),
-                        operation_kind: OperationKind::Reindex,
+
                         object_kind: match target {
                             Some(
                                 ReindexTargetMutation::Database(_) | ReindexTargetMutation::System(_),
@@ -108,7 +108,7 @@ impl Rule for ConcurrentInsideTransactionRule {
                         recipe: self.recipe(),
                         dedup_key: Some(format!("{}_{}", self.id(), target_name)),
                         sql: None,
-                        fk_dependency_related: false,
+
                     });
                 }
                 _ => {}
@@ -144,7 +144,7 @@ impl Rule for AlterTypeAddValueRule {
             return vec![Violation {
                 source_range: None,
                 rule_id: self.id(),
-                operation_kind: OperationKind::AlterType,
+
                 object_kind: ObjectKind::Type,
                 object_name: alter.id.to_string(),
                 tier: self.default_tier(),
@@ -155,7 +155,6 @@ impl Rule for AlterTypeAddValueRule {
                 recipe: self.recipe(),
                 dedup_key: None,
                 sql: None,
-                fk_dependency_related: false,
             }];
         }
         vec![]
@@ -199,7 +198,7 @@ impl Rule for LockTableRule {
             .map(|target| Violation {
                 source_range: None,
                 rule_id: self.id(),
-                operation_kind: OperationKind::LockTable,
+
                 object_kind: ObjectKind::Table,
                 object_name: target.id.to_string(),
                 tier: tier.clone(),
@@ -212,7 +211,6 @@ impl Rule for LockTableRule {
                 recipe: self.recipe(),
                 dedup_key: None,
                 sql: None,
-                fk_dependency_related: false,
             })
             .collect()
     }
@@ -246,7 +244,7 @@ impl Rule for VacuumFullRule {
             return vec![Violation {
                 source_range: None,
                 rule_id: self.id(),
-                operation_kind: OperationKind::VacuumFull,
+
                 object_kind: ObjectKind::Table,
                 object_name,
                 tier: self.default_tier(),
@@ -254,7 +252,6 @@ impl Rule for VacuumFullRule {
                 recipe: self.recipe(),
                 dedup_key: None,
                 sql: None,
-                fk_dependency_related: false,
             }];
         }
         vec![]

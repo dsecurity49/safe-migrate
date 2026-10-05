@@ -1,7 +1,7 @@
 use crate::_internal::analysis::mutations::{AlterTableActionMutation, Mutation};
 
 use crate::_internal::model::relation::Persistence;
-use crate::_internal::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
+use crate::_internal::report::violations::{ObjectKind, Violation, ViolationTier};
 use crate::_internal::rules::{BASELINE_STATS_CAPABILITIES, Rule, RuleCapability, RuleContext};
 
 pub(crate) struct BlockingConstraintRule;
@@ -141,7 +141,7 @@ impl Rule for BlockingConstraintRule {
                 let key = format!("{}_stale_{}", self.id(), alter.id);
                 violations.push(Violation { source_range: None,
                     rule_id: self.id(),
-                    operation_kind: OperationKind::AddConstraint,
+
                     object_kind: ObjectKind::Table,
                     object_name: alter.id.to_string(),
                     tier: ViolationTier::Tier2,
@@ -149,7 +149,7 @@ impl Rule for BlockingConstraintRule {
                     recipe: "Run ANALYZE to ensure accurate row estimates before structural changes.",
                     dedup_key: Some(key),
                             sql: None,
-                            fk_dependency_related: false,
+
                 });
             }
 
@@ -176,7 +176,7 @@ impl Rule for BlockingConstraintRule {
                     violations.push(Violation {
                         source_range: None,
                         rule_id: self.id(),
-                        operation_kind: OperationKind::AddConstraint,
+
                         object_kind: ObjectKind::Table,
                         object_name: alter.id.to_string(),
                         tier,
@@ -184,7 +184,6 @@ impl Rule for BlockingConstraintRule {
                         recipe: self.recipe(),
                         dedup_key: None,
                         sql: None,
-                        fk_dependency_related: false,
                     });
                 }
                 AlterTableActionMutation::AddForeignKey {
@@ -209,7 +208,7 @@ impl Rule for BlockingConstraintRule {
                     violations.push(Violation {
                         source_range: None,
                         rule_id: self.id(),
-                        operation_kind: OperationKind::AddConstraint,
+
                         object_kind: ObjectKind::Table,
                         object_name: alter.id.to_string(),
                         tier,
@@ -217,7 +216,6 @@ impl Rule for BlockingConstraintRule {
                         recipe: self.recipe(),
                         dedup_key: None,
                         sql: None,
-                        fk_dependency_related: false,
                     });
                 }
                 AlterTableActionMutation::SetNotNull { column } => {
@@ -236,15 +234,14 @@ impl Rule for BlockingConstraintRule {
                         violations.push(Violation {
                             source_range: None,
                             rule_id: self.id(),
-                            operation_kind: OperationKind::AddConstraint,
+
                             object_kind: ObjectKind::Table,
-                            object_name: format!("{}.{}", alter.id, column),
+                            object_name: alter.id.column_name(column),
                             tier,
                             reason: format!("Synchronous SET NOT NULL on {}.{}", alter.id, column),
                             recipe: "Add CHECK constraint NOT VALID, then VALIDATE separately.",
                             dedup_key: None,
                             sql: None,
-                            fk_dependency_related: false,
                         });
                     }
                 }
@@ -264,7 +261,7 @@ impl Rule for BlockingConstraintRule {
 
                     violations.push(Violation { source_range: None,
                         rule_id: "blocking-index-constraint",
-                        operation_kind: OperationKind::AddConstraint,
+
                         object_kind: ObjectKind::Table,
                         object_name: alter.id.to_string(),
                         tier,
@@ -272,7 +269,7 @@ impl Rule for BlockingConstraintRule {
                         recipe: "Build a UNIQUE index CONCURRENTLY first, then add the constraint USING INDEX.",
                         dedup_key: None,
                                     sql: None,
-                                    fk_dependency_related: false,
+
                     });
                 }
                 AlterTableActionMutation::AddExcludeConstraint { .. } => {
@@ -286,7 +283,7 @@ impl Rule for BlockingConstraintRule {
 
                     violations.push(Violation { source_range: None,
                         rule_id: "blocking-index-constraint",
-                        operation_kind: OperationKind::AddConstraint,
+
                         object_kind: ObjectKind::Table,
                         object_name: alter.id.to_string(),
                         tier,
@@ -294,7 +291,7 @@ impl Rule for BlockingConstraintRule {
                         recipe: "EXCLUDE constraints cannot be added USING INDEX; add them directly and expect the table to be locked while the supporting index is built.",
                         dedup_key: None,
                                     sql: None,
-                                    fk_dependency_related: false,
+
                     });
                 }
                 AlterTableActionMutation::SetStorage { column, .. } => {
@@ -308,15 +305,15 @@ impl Rule for BlockingConstraintRule {
 
                     violations.push(Violation { source_range: None,
                         rule_id: "table-rewrite-storage",
-                        operation_kind: OperationKind::AlterColumnType,
+
                         object_kind: ObjectKind::Table,
-                        object_name: format!("{}.{}", alter.id, column),
+                        object_name: alter.id.column_name(column),
                         tier,
                         reason,
                         recipe: "Changing column storage requires an ACCESS EXCLUSIVE lock. Execute during a planned maintenance window.",
                         dedup_key: None,
                                     sql: None,
-                                    fk_dependency_related: false,
+
                     });
                 }
                 AlterTableActionMutation::SetAccessMethod { .. } => {
@@ -330,7 +327,7 @@ impl Rule for BlockingConstraintRule {
 
                     violations.push(Violation { source_range: None,
                         rule_id: "table-rewrite-access-method",
-                        operation_kind: OperationKind::AlterColumnType,
+
                         object_kind: ObjectKind::Table,
                         object_name: alter.id.to_string(),
                         tier,
@@ -338,7 +335,7 @@ impl Rule for BlockingConstraintRule {
                         recipe: "Changing table access method requires an ACCESS EXCLUSIVE lock. Execute during a planned maintenance window.",
                         dedup_key: None,
                                     sql: None,
-                                    fk_dependency_related: false,
+
                     });
                 }
                 _ => {}

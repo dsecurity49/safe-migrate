@@ -1,5 +1,5 @@
 use crate::_internal::analysis::mutations::{Mutation, OpaqueMutation};
-use crate::_internal::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
+use crate::_internal::report::violations::{ObjectKind, Violation, ViolationTier};
 use crate::_internal::rules::{Rule, RuleContext};
 
 pub(crate) struct OpaqueDynamicSqlRule;
@@ -51,7 +51,7 @@ impl Rule for OpaqueDynamicSqlRule {
         vec![Violation {
             source_range: None,
             rule_id: self.id(),
-            operation_kind: OperationKind::OpaqueSql,
+
             object_kind: ObjectKind::Opaque,
             object_name: "opaque statement".to_string(),
             tier: self.default_tier(),
@@ -59,7 +59,6 @@ impl Rule for OpaqueDynamicSqlRule {
             recipe,
             dedup_key: None,
             sql: None,
-            fk_dependency_related: false,
         }]
     }
 }

@@ -7,7 +7,7 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit},
 };
 use safe_migrate::_internal::ast::identifiers::ObjectId;
-use safe_migrate::_internal::db::cache::{CACHE_V9_MAGIC, DbCacheVersioned};
+use safe_migrate::_internal::db::cache::{CACHE_MAGIC, DbCacheVersioned};
 use safe_migrate::_internal::model::relation::{Persistence, RelationKind, RelationState};
 use safe_migrate::_internal::model::schema::SchemaState;
 
@@ -44,9 +44,9 @@ fn write_cache_with_timestamp(path: &std::path::Path, created_at_unix_secs: u64)
     let mut compressed = Vec::new();
     let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3).unwrap();
     let config = bincode::config::standard().with_variable_int_encoding();
-    encoder.write_all(CACHE_V9_MAGIC).unwrap();
+    encoder.write_all(CACHE_MAGIC).unwrap();
     bincode::serde::encode_into_std_write(
-        DbCacheVersioned::V9(Box::new(cache)),
+        DbCacheVersioned::V10(Box::new(cache)),
         &mut encoder,
         config,
     )
@@ -235,11 +235,15 @@ fn rules_command_lists_registry_descriptors_in_json() {
     let output = cmd.arg("rules").arg("--json").output().unwrap();
     assert!(output.status.success());
     let report = parse_json_stdout(&output);
-    assert_eq!(report["schema_version"], 2);
+    // The catalogue is versioned independently of the lint report, and its
+    // version 3 is what tells consumers `remediation` became `recipe`.
+    assert_eq!(report["schema_version"], 3);
     let rules = report["rules"].as_array().expect("rules array");
     assert_eq!(rules.len(), 30);
     assert_eq!(rules[0]["id"], "irreversible-migration");
     assert_eq!(rules[0]["title"], "Irreversible migration");
+    assert!(rules[0].get("recipe").is_some());
+    assert!(rules[0].get("remediation").is_none());
     assert!(
         rules[0]["supported_configuration_fields"]
             .as_array()
@@ -452,10 +456,10 @@ fn test_cli_rejects_semantically_contradictory_v7_cache() {
     );
     let config = bincode::config::standard().with_variable_int_encoding();
     let encoded =
-        bincode::serde::encode_to_vec(DbCacheVersioned::V9(Box::new(invalid)), config).unwrap();
+        bincode::serde::encode_to_vec(DbCacheVersioned::V10(Box::new(invalid)), config).unwrap();
     let mut compressed = Vec::new();
     let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3).unwrap();
-    encoder.write_all(CACHE_V9_MAGIC).unwrap();
+    encoder.write_all(CACHE_MAGIC).unwrap();
     encoder.write_all(&encoded).unwrap();
     encoder.finish().unwrap();
     let cache = tempfile::NamedTempFile::new().unwrap();
@@ -489,10 +493,10 @@ fn test_cli_rejects_authenticated_semantically_contradictory_v7_cache() {
     );
     let config = bincode::config::standard().with_variable_int_encoding();
     let encoded =
-        bincode::serde::encode_to_vec(DbCacheVersioned::V9(Box::new(invalid)), config).unwrap();
+        bincode::serde::encode_to_vec(DbCacheVersioned::V10(Box::new(invalid)), config).unwrap();
     let mut compressed = Vec::new();
     let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3).unwrap();
-    encoder.write_all(CACHE_V9_MAGIC).unwrap();
+    encoder.write_all(CACHE_MAGIC).unwrap();
     encoder.write_all(&encoded).unwrap();
     encoder.finish().unwrap();
 
@@ -533,7 +537,7 @@ fn test_cli_rejects_authenticated_semantically_contradictory_v7_cache() {
 fn test_cli_rejects_malformed_cache_payload() {
     let config = bincode::config::standard().with_variable_int_encoding();
     let encoded =
-        bincode::serde::encode_to_vec(DbCacheVersioned::V9(Box::default()), config).unwrap();
+        bincode::serde::encode_to_vec(DbCacheVersioned::V10(Box::default()), config).unwrap();
     // Preserve the current enum discriminant, then corrupt the payload.
     let mut malicious = encoded[..4].to_vec();
     malicious.push(252);
@@ -541,7 +545,7 @@ fn test_cli_rejects_malformed_cache_payload() {
 
     let mut compressed = Vec::new();
     let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3).unwrap();
-    encoder.write_all(CACHE_V9_MAGIC).unwrap();
+    encoder.write_all(CACHE_MAGIC).unwrap();
     encoder.write_all(&malicious).unwrap();
     encoder.finish().unwrap();
 
@@ -566,11 +570,11 @@ fn test_cli_rejects_malformed_cache_payload() {
 fn test_cli_rejects_trailing_data_after_streamed_cache_decode() {
     let config = bincode::config::standard().with_variable_int_encoding();
     let encoded =
-        bincode::serde::encode_to_vec(DbCacheVersioned::V9(Box::default()), config).unwrap();
+        bincode::serde::encode_to_vec(DbCacheVersioned::V10(Box::default()), config).unwrap();
 
     let mut compressed = Vec::new();
     let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3).unwrap();
-    encoder.write_all(CACHE_V9_MAGIC).unwrap();
+    encoder.write_all(CACHE_MAGIC).unwrap();
     encoder.write_all(&encoded).unwrap();
     encoder.write_all(b"trailing-data").unwrap();
     encoder.finish().unwrap();
@@ -699,7 +703,7 @@ fn test_cache_inspect_outputs_a_redacted_json_summary() {
     let report = parse_json_stdout(assert.get_output());
 
     assert_eq!(report["path"], cache_path.display().to_string());
-    assert_eq!(report["format_version"], 9);
+    assert_eq!(report["format_version"], 10);
     assert_eq!(report["encrypted"], false);
     assert_eq!(report["coverage"]["schema_scope"], "all_non_system");
     assert!(report["coverage"]["families"].is_array());
@@ -774,7 +778,7 @@ fn test_cli_json_is_machine_clean_and_marks_missing_baseline_tainted() {
     let output = assert.get_output();
     let report = parse_json_stdout(output);
 
-    assert_eq!(report["schema_version"], 2);
+    assert_eq!(report["schema_version"], 3);
     assert_eq!(report["confidence"], "Tainted");
     assert_eq!(report["baseline"]["status"], "unavailable");
     assert!(report["baseline"]["observed_settings"]["lock_timeout_ms"].is_null());
@@ -1058,8 +1062,12 @@ fn test_cli_json_halt_is_json_and_uses_blocking_exit_status() {
     assert_eq!(finding["location"]["line"], 1);
     assert_eq!(finding["location"]["column"], 1);
     assert_eq!(finding["statement_index"], 1);
-    assert_eq!(finding["rule_title"], "Drop database");
-    assert_eq!(finding["impact"], "data loss");
+    assert_eq!(report["rules"]["drop-database"], "Drop database");
+    assert!(report["rules"]["drop-database"].get("impact").is_none());
+    assert!(finding.get("rule_title").is_none());
+    assert!(finding.get("impact").is_none());
+    assert!(finding.get("dedup_key").is_none());
+    assert!(finding.get("operation_kind").is_none());
     let rule_ids = report["violations"]
         .as_array()
         .unwrap()
@@ -1118,9 +1126,10 @@ fn test_cli_markdown_report_is_machine_clean_and_includes_location() {
 
     assert!(markdown.starts_with("# safe-migrate report\n"));
     assert!(markdown.contains("### HALT — Drop database (`drop-database`)"));
-    assert!(markdown.contains("**Impact:** data loss"));
     assert!(markdown.contains("**Statement:** 1"));
     assert!(markdown.contains(&format!("`{}:1:1`", sql_file.path().display())));
+    assert!(markdown.contains("## Rules"));
+    assert!(markdown.contains("- `drop-database` — Drop database"));
     assert!(markdown.contains("## Baseline"));
     assert!(!markdown.contains("Analyzing migration"));
     assert!(String::from_utf8_lossy(&output.stderr).contains("Analyzing migration"));
@@ -1229,7 +1238,7 @@ fn test_cli_chain_json_is_machine_clean() {
     let output = assert.get_output();
     let report = parse_json_stdout(output);
 
-    assert_eq!(report["schema_version"], 2);
+    assert_eq!(report["schema_version"], 3);
     assert_eq!(report["confidence"], "Tainted");
     assert!(!String::from_utf8_lossy(&output.stdout).contains("Analyzing migration"));
 }

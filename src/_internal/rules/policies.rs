@@ -1,6 +1,6 @@
 use crate::_internal::analysis::mutations::Mutation;
 
-use crate::_internal::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
+use crate::_internal::report::violations::{ObjectKind, Violation, ViolationTier};
 use crate::_internal::rules::{Rule, RuleContext};
 
 pub(crate) struct RestrictivePolicyRule;
@@ -25,7 +25,7 @@ impl Rule for RestrictivePolicyRule {
             violations.push(Violation {
                 source_range: None,
                 rule_id: self.id(),
-                operation_kind: OperationKind::CreatePolicy,
+
                 object_kind: ObjectKind::Policy,
                 object_name: format!("{} on {}", policy.name, policy.table),
                 tier: self.default_tier(),
@@ -36,7 +36,6 @@ impl Rule for RestrictivePolicyRule {
                 recipe: self.recipe(),
                 dedup_key: None,
                 sql: None,
-                fk_dependency_related: false,
             });
         }
 

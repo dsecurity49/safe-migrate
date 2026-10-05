@@ -50,7 +50,7 @@ use crate::_internal::analysis::state::{
     AnalysisState as InternalAnalysisState, Confidence as InternalConfidence,
 };
 use crate::_internal::db::cache::{
-    CACHE_FORMAT_VERSION, CACHE_V9_MAGIC, DbCache as InternalDbCache, DbCacheVersioned,
+    CACHE_FORMAT_VERSION, CACHE_MAGIC, DbCache as InternalDbCache, DbCacheVersioned,
 };
 use crate::_internal::db::cache_file::{
     MAX_CACHE_DECODE_BYTES, decode_hex_key, is_encrypted_cache_bytes, read_cache_bytes,
@@ -63,9 +63,8 @@ use crate::_internal::report::reporter::{
     Reporter as InternalReporter, Verdict as InternalVerdict,
 };
 use crate::_internal::report::violations::{
-    ObjectKind as InternalObjectKind, OperationKind as InternalOperationKind,
-    ReportFinding as InternalFinding, Violation as InternalViolation,
-    ViolationTier as InternalTier,
+    ObjectKind as InternalObjectKind, ReportFinding as InternalFinding,
+    Violation as InternalViolation, ViolationTier as InternalTier,
 };
 use crate::_internal::rules::registry::{
     self, RuleConfigurationField as InternalRuleConfigurationField,
@@ -331,6 +330,13 @@ impl std::fmt::Display for Certainty {
             Certainty::Assumed => write!(f, "assumed"),
             Certainty::Tainted => write!(f, "tainted"),
         }
+    }
+}
+
+impl Certainty {
+    /// Whether the evidence is certain.
+    pub fn is_exact(&self) -> bool {
+        matches!(self, Self::Exact)
     }
 }
 
@@ -616,13 +622,14 @@ pub struct SourceLocation {
 }
 
 /// A source-aware, machine-readable migration finding.
+///
+/// Per-occurrence fields only. Rule metadata (title, summary) is not repeated
+/// here; look the `rule_id` up in the report's `rules` catalogue.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[non_exhaustive]
 pub struct Finding {
     /// Stable primary rule identifier.
     pub rule_id: String,
-    /// Stable operation category.
-    pub operation_kind: OperationKind,
     /// Stable database-object category.
     pub object_kind: ObjectKind,
     /// Qualified object name when known.
@@ -633,22 +640,9 @@ pub struct Finding {
     pub reason: String,
     /// Recommended remediation.
     pub recipe: String,
-    /// Optional key used to deduplicate equivalent findings.
-    pub dedup_key: Option<String>,
     /// SQL statement associated with the finding, when available.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub sql: Option<String>,
-    /// Whether a foreign-key dependency contributed to the finding.
-    #[serde(rename = "fk_dependency_related")]
-    pub foreign_key_dependency_related: bool,
-    /// Current human-readable rule title, when the rule is registered.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rule_title: Option<String>,
-    /// Current short rule description, when the rule is registered.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rule_summary: Option<String>,
-    /// Risk category associated with the rule, when registered.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub impact: Option<String>,
     /// Source line and column, when available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub location: Option<SourceLocation>,
@@ -656,7 +650,8 @@ pub struct Finding {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub statement_index: Option<usize>,
     /// How well-supported this finding is by the evidence behind it. Reduced
-    /// certainty never reduces severity.
+    /// certainty never reduces severity. Reported only when it is not exact.
+    #[serde(skip_serializing_if = "Certainty::is_exact")]
     pub certainty: Certainty,
 }
 
@@ -703,7 +698,10 @@ pub struct NotEvaluated {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sql: Option<String>,
     /// What would make this rule evaluable.
-    pub remediation: String,
+    pub recipe: String,
+    /// Out-of-scope schemas the boundary query observed for this rule.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub missing_schemas: Vec<String>,
 }
 
 impl From<&crate::_internal::report::violations::NotEvaluated> for NotEvaluated {
@@ -713,7 +711,8 @@ impl From<&crate::_internal::report::violations::NotEvaluated> for NotEvaluated 
             tier: value.tier.clone().into(),
             cause: value.cause.as_str().to_owned(),
             sql: value.sql.clone(),
-            remediation: value.remediation.clone(),
+            recipe: value.recipe.clone(),
+            missing_schemas: value.missing_schemas.clone(),
         }
     }
 }
@@ -1365,7 +1364,7 @@ pub struct Rule {
     /// Default severity before confidence adjustment.
     pub default_tier: Tier,
     /// Recommended remediation.
-    pub remediation: String,
+    pub recipe: String,
     /// Configuration fields accepted by this rule.
     pub supported_configuration_fields: Vec<RuleConfigurationField>,
     /// Whether the rule is enabled by the supplied configuration.
@@ -1445,7 +1444,7 @@ pub fn rules(config: &Config) -> Result<Vec<Rule>, Error> {
             summary: descriptor.summary.to_owned(),
             impact: descriptor.impact.to_owned(),
             default_tier: descriptor.default_tier().into(),
-            remediation: descriptor.recipe().to_owned(),
+            recipe: descriptor.recipe().to_owned(),
             supported_configuration_fields: descriptor
                 .supported_configuration_fields
                 .iter()
@@ -1635,10 +1634,10 @@ fn decode_cache_payload(
         )
     })?;
     let mut decoder = decoder.take(MAX_CACHE_DECODE_BYTES as u64 + 1);
-    let mut header = Vec::with_capacity(CACHE_V9_MAGIC.len());
+    let mut header = Vec::with_capacity(CACHE_MAGIC.len());
     decoder
         .by_ref()
-        .take(CACHE_V9_MAGIC.len() as u64)
+        .take(CACHE_MAGIC.len() as u64)
         .read_to_end(&mut header)
         .map_err(|error| {
             Error::with_source(
@@ -1647,13 +1646,13 @@ fn decode_cache_payload(
                 error,
             )
         })?;
-    if header.len() < CACHE_V9_MAGIC.len() && CACHE_V9_MAGIC.starts_with(&header) {
+    if header.len() < CACHE_MAGIC.len() && CACHE_MAGIC.starts_with(&header) {
         return Err(Error::cache(format!(
             "{} is truncated or corrupted",
             path.display()
         )));
     }
-    if header != CACHE_V9_MAGIC {
+    if header != CACHE_MAGIC {
         return Err(Error::cache(format!(
             "{} uses an unsupported cache format; run `safe-migrate sync`",
             path.display()
@@ -1774,21 +1773,14 @@ fn markdown_inline_code(value: &str) -> String {
 impl From<&InternalFinding> for Finding {
     fn from(finding: &InternalFinding) -> Self {
         let violation = &finding.violation;
-        let descriptor = registry::find_primary_rule(violation.rule_id);
         Self {
             rule_id: violation.rule_id.to_owned(),
-            operation_kind: (&violation.operation_kind).into(),
             object_kind: (&violation.object_kind).into(),
             object_name: violation.object_name.clone(),
             tier: violation.tier.clone().into(),
             reason: violation.reason.clone(),
             recipe: violation.recipe.to_owned(),
-            dedup_key: violation.dedup_key.clone(),
             sql: violation.sql.clone(),
-            foreign_key_dependency_related: violation.fk_dependency_related,
-            rule_title: descriptor.map(|descriptor| descriptor.title.to_owned()),
-            rule_summary: descriptor.map(|descriptor| descriptor.summary.to_owned()),
-            impact: descriptor.map(|descriptor| descriptor.impact.to_owned()),
             location: finding.location.as_ref().map(|location| SourceLocation {
                 file: location.file.clone(),
                 line: location.line,
@@ -1836,58 +1828,6 @@ impl From<InternalRuleConfigurationField> for RuleConfigurationField {
             InternalRuleConfigurationField::Disabled => Self::Disabled,
             InternalRuleConfigurationField::Tier1ThresholdRows => Self::Tier1ThresholdRows,
             InternalRuleConfigurationField::Tier2ThresholdRows => Self::Tier2ThresholdRows,
-        }
-    }
-}
-
-impl From<&InternalOperationKind> for OperationKind {
-    fn from(value: &InternalOperationKind) -> Self {
-        match value {
-            InternalOperationKind::DropColumn => Self::DropColumn,
-            InternalOperationKind::DropTable => Self::DropTable,
-            InternalOperationKind::DropIndex => Self::DropIndex,
-            InternalOperationKind::DropView => Self::DropView,
-            InternalOperationKind::DropMaterializedView => Self::DropMaterializedView,
-            InternalOperationKind::DropFunction => Self::DropFunction,
-            InternalOperationKind::DropProcedure => Self::DropProcedure,
-            InternalOperationKind::DropSchema => Self::DropSchema,
-            InternalOperationKind::DropDatabase => Self::DropDatabase,
-            InternalOperationKind::DropSequence => Self::DropSequence,
-            InternalOperationKind::DropDomain => Self::DropDomain,
-            InternalOperationKind::DropType => Self::DropType,
-            InternalOperationKind::DropPublication => Self::DropPublication,
-            InternalOperationKind::DropTrigger => Self::DropTrigger,
-            InternalOperationKind::DropPolicy => Self::DropPolicy,
-            InternalOperationKind::AddColumn => Self::AddColumn,
-            InternalOperationKind::AlterColumnType => Self::AlterColumnType,
-            InternalOperationKind::AddConstraint => Self::AddConstraint,
-            InternalOperationKind::CreateIndex => Self::CreateIndex,
-            InternalOperationKind::CreateTable => Self::CreateTable,
-            InternalOperationKind::CreateView => Self::CreateView,
-            InternalOperationKind::CreateFunction => Self::CreateFunction,
-            InternalOperationKind::AlterFunction => Self::AlterFunction,
-            InternalOperationKind::AlterProcedure => Self::AlterProcedure,
-            InternalOperationKind::RefreshMaterializedView => Self::RefreshMaterializedView,
-            InternalOperationKind::Reindex => Self::Reindex,
-            InternalOperationKind::AttachPartition => Self::AttachPartition,
-            InternalOperationKind::DetachPartition => Self::DetachPartition,
-            InternalOperationKind::VacuumFull => Self::VacuumFull,
-            InternalOperationKind::LockTable => Self::LockTable,
-            InternalOperationKind::TruncateTable => Self::TruncateTable,
-            InternalOperationKind::Grant => Self::Grant,
-            InternalOperationKind::AlterType => Self::AlterType,
-            InternalOperationKind::CreatePolicy => Self::CreatePolicy,
-            InternalOperationKind::DisableTrigger => Self::DisableTrigger,
-            InternalOperationKind::EnableTrigger => Self::EnableTrigger,
-            InternalOperationKind::Rename => Self::Rename,
-            InternalOperationKind::OpaqueSql => Self::OpaqueSql,
-            InternalOperationKind::CreateSchema => Self::CreateSchema,
-            InternalOperationKind::SetDefault => Self::SetDefault,
-            InternalOperationKind::CreateSequence => Self::CreateSequence,
-            InternalOperationKind::Conflict => Self::Conflict,
-            InternalOperationKind::Irreversible => Self::Irreversible,
-            InternalOperationKind::UnresolvedReference => Self::UnresolvedReference,
-            InternalOperationKind::Other(name) => Self::Other(name.clone()),
         }
     }
 }

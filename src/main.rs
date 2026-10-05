@@ -8,6 +8,11 @@ use std::path::{Path, PathBuf};
 
 const EXIT_BLOCKING_FINDINGS: i32 = 2;
 
+/// Schema version of the `rules --json` catalogue, which is versioned
+/// independently of the lint report. Version 3 renamed `remediation` to
+/// `recipe`; consumers must branch on it before reading a descriptor.
+const RULES_JSON_SCHEMA_VERSION: u32 = 3;
+
 fn terminal_inline(value: &str) -> String {
     let mut output = String::with_capacity(value.len());
     for character in value.chars() {
@@ -272,7 +277,7 @@ fn rule_descriptor_json(rule: &Rule) -> serde_json::Value {
         "summary": rule.summary,
         "impact": rule.impact,
         "default_tier": format!("{:?}", rule.default_tier),
-        "remediation": rule.remediation,
+        "recipe": rule.recipe,
         "supported_configuration_fields": rule.supported_configuration_fields,
         "effective": effective,
     })
@@ -314,7 +319,7 @@ fn run_rules(rule_id: Option<&str>, json: bool, config_path: Option<&Path>) -> R
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
-                "schema_version": 2,
+                "schema_version": RULES_JSON_SCHEMA_VERSION,
                 "rules": rules.iter().map(rule_descriptor_json).collect::<Vec<_>>(),
             }))?
         );
@@ -331,7 +336,7 @@ fn run_rules(rule_id: Option<&str>, json: bool, config_path: Option<&Path>) -> R
         println!("  Summary: {}", rule.summary);
         println!("  Impact: {}", rule.impact);
         println!("  Default tier: {:?}", rule.default_tier);
-        println!("  Remediation: {}", rule.remediation);
+        println!("  Recipe: {}", rule.recipe);
         println!(
             "  Configuration: {}",
             rule.supported_configuration_fields

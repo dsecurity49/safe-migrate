@@ -1,5 +1,5 @@
 use crate::_internal::analysis::state::MutationResult;
-use crate::_internal::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
+use crate::_internal::report::violations::{ObjectKind, Violation, ViolationTier};
 use crate::_internal::rules::{Rule, RuleContext};
 
 pub(crate) struct ConflictRule;
@@ -33,7 +33,7 @@ impl Rule for ConflictRule {
             Some(reason) => vec![Violation {
                 source_range: None,
                 rule_id: Self::ID,
-                operation_kind: OperationKind::Conflict,
+
                 object_kind: ObjectKind::Unknown,
                 object_name: "migration state".to_string(),
                 tier: Self::DEFAULT_TIER,
@@ -41,7 +41,6 @@ impl Rule for ConflictRule {
                 recipe: Self::RECIPE,
                 dedup_key: None,
                 sql: None,
-                fk_dependency_related: false,
             }],
             None => Vec::new(),
         }

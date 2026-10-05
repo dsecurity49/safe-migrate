@@ -1,6 +1,6 @@
 # CLI and Report Contract
 
-This document defines safe-migrate v0.10.0's CLI, report, cache, and GitHub
+This document defines safe-migrate v0.11.0's CLI, report, cache, and GitHub
 Action behavior.
 
 If you are learning safe-migrate, start with the [README](../README.md). This
@@ -53,21 +53,34 @@ are mutually exclusive; conflicts exit `1`. Both lint commands support JSON.
 
 ## JSON report
 
-The report schema is version 2:
+The report schema is version 3:
 
 ```json
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "confidence": "Exact",
   "verdict": "HALT",
   "evidence": [],
+  "not_evaluated": [],
   "violations": []
 }
 ```
 
-Each violation includes `rule_id`, `operation_kind`, `object_kind`,
-`object_name`, `tier`, `reason`, `recipe`, `dedup_key`, `sql`, and
-`fk_dependency_related`. `rule_id` is the stable identifier.
+Each violation carries only per-occurrence data: `rule_id`, `object_kind`,
+`object_name`, `tier`, `reason`, `recipe`, and — when known — `sql`, `location`,
+and `statement_index`. `certainty` appears only when it is not `Exact`.
+`rule_id` is the stable identifier; rule metadata is not repeated per finding. A
+cascade that pulls an out-of-scope foreign-key dependent says so in `reason`;
+there is no separate flag for it.
+
+Rule titles live once in the top-level `rules` object, keyed by `rule_id`:
+
+```json
+"rules": {
+  "destructive-cascade": "Drop table with cascade",
+  "irreversible-migration": "Irreversible migration"
+}
+```
 
 Additional top-level objects are:
 
@@ -75,6 +88,7 @@ Additional top-level objects are:
 | --- | --- |
 | `summary` | `total`, `tier1`, `tier2`, and `tier3` counts. |
 | `evidence` | Ordered, deduplicated reasons for conservative analysis. Each has a stable snake-case `code`, `statement` or `chain` scope, summary, and optional file/index. It contains no SQL or credentials. |
+| `not_evaluated` | Checks that did not run for want of evidence. Each entry carries `rule_id`, `tier`, `cause`, optional `sql`, a `recipe` string, and a `missing_schemas` list naming any out-of-scope schemas the boundary query observed. |
 | `baseline` | Cache status, provenance, observed settings, and automatic-sync result. |
 
 The `baseline` shape is:
@@ -98,21 +112,28 @@ The `baseline` shape is:
 are `null` when no cache is available. Missing creation provenance makes an
 otherwise readable baseline stale.
 
-Violations may also include a one-based `statement_index`, known-rule metadata
-(`rule_title`, `rule_summary`, and `impact`), and this location object:
+Violations may also include a one-based `statement_index` and this location
+object:
 
 ```json
 "location": { "file": "migrations/001_add_status.sql", "line": 12, "column": 1 }
 ```
 
-`rules --json` has its own version 2 schema. Descriptors expose identity,
-guidance, tier, supported settings, and effective values. Every primary rule
-supports `disabled`; other settings are accepted only when advertised.
+`rules --json` has its own version 3 schema, versioned independently of the lint
+report. Descriptors expose identity, guidance, tier, supported settings, and
+effective values. Every primary rule supports `disabled`; other settings are
+accepted only when advertised.
 Unknown rule IDs and unsupported fields are operational errors.
 
 Consumers must branch on `schema_version`. Additive fields are compatible;
 removal, renaming, type changes, and changed enum meanings require a changelog
 entry. Violation ordering is deterministic for identical inputs and version.
+
+Schema 3 is a breaking change from schema 2: `not_evaluated` is new, and
+`operation_kind`, `dedup_key`, `fk_dependency_related`, `rule_title`,
+`rule_summary`, and `impact` are gone from violations. Rule titles moved to
+`rules`. `rules --json` moved to its own version 3 at the same time, renaming
+`remediation` to `recipe`.
 
 ## Verdict and exit status
 
@@ -151,7 +172,7 @@ PostgreSQL conflicts such as dropping a missing column produce a Tier 1
 `chain-conflict`, leave state unchanged, and do not taint confidence by
 themselves. This applies to both `lint` and `lint-chain`.
 
-Cache V9 supplies typed evidence for:
+Cache V10 supplies typed evidence for:
 
 - catalog coverage, schema scope, roles, privileges, and session settings;
 - constraint keys and expressions, generated-column sources, and PostgreSQL's
@@ -189,7 +210,7 @@ They require positive effective values for statements identified by Squawk's
 pinned `possibly_slow_stmt` classifier. `lock_timeout` must also be shorter than
 a positive `statement_timeout`.
 
-Values begin from Cache V9, or unknown without a cache. Ordered `SET`, local
+Values begin from Cache V10, or unknown without a cache. Ordered `SET`, local
 settings, resets, commits, and rollbacks follow PostgreSQL session/local
 behavior. `SET LOCAL` outside a transaction has no modeled effect. Each rule
 reports at most once per input file.
@@ -206,15 +227,15 @@ These conditions exit `1` instead of producing a clean report:
 - internal serialization or analysis failure.
 
 Sync replaces a cache only after its new payload is complete. An automatic
-refresh failure is recorded in JSON and may reuse a readable V9 cache; otherwise
+refresh failure is recorded in JSON and may reuse a readable V10 cache; otherwise
 analysis continues without a baseline and is `Tainted`.
 
 Encrypted mode requires `cache_encryption = true` and a valid
 `SAFE_MIGRATE_CACHE_KEY`. Cache modes cannot be mixed; switching requires a new
-`sync`. V9 carries an explicit header, coverage and scope-completion markers,
+`sync`. V10 carries an explicit header, coverage and scope-completion markers,
 role/session provenance, schemas, settings, dependencies, and redacted catalog
 metadata. It never contains password hashes or subscription connection strings.
-V1–V8 and unheadered caches are rejected with resync guidance.
+V1–V9 and unheadered caches are rejected with resync guidance.
 
 ### GitHub Action
 
@@ -235,3 +256,5 @@ report.
 
 Before v1.0 the CLI may evolve. User-visible changes still require regression
 tests, a changelog and contract update, and a migration note for automation.
+Schema 2 consumers must not assume `recipe`; they must branch on
+`schema_version` before reading any violation field.

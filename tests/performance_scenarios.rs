@@ -234,7 +234,7 @@ mod performance_scenarios {
         let cache = large_baseline();
         let started = Instant::now();
         let config = bincode::config::standard().with_variable_int_encoding();
-        let payload = bincode::serde::encode_to_vec(DbCacheVersioned::V9(Box::new(cache)), config)
+        let payload = bincode::serde::encode_to_vec(DbCacheVersioned::V10(Box::new(cache)), config)
             .expect("cache should encode");
         let compressed = zstd::stream::encode_all(Cursor::new(payload), 3)
             .expect("cache payload should compress");

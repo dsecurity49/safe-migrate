@@ -4,9 +4,7 @@ mod phase10_bug_fixes_and_sorting_tests {
     use safe_migrate::_internal::ast::identifiers::ObjectId;
 
     use safe_migrate::_internal::model::relation::{Persistence, RelationKind, RelationState};
-    use safe_migrate::_internal::report::violations::{
-        ObjectKind, OperationKind, Violation, ViolationTier,
-    };
+    use safe_migrate::_internal::report::violations::{ObjectKind, Violation, ViolationTier};
 
     fn baseline_index(
         index_id: ObjectId,
@@ -304,7 +302,6 @@ mod phase10_bug_fixes_and_sorting_tests {
         let v_tier3 = Violation {
             source_range: Some(rowan::TextRange::new(0.into(), 10.into())),
             rule_id: "rule_a",
-            operation_kind: OperationKind::DropTable,
             object_kind: ObjectKind::Table,
             object_name: "a".to_string(),
             tier: ViolationTier::Tier3,
@@ -312,12 +309,10 @@ mod phase10_bug_fixes_and_sorting_tests {
             recipe: "recipe",
             dedup_key: None,
             sql: None,
-            fk_dependency_related: false,
         };
         let v_tier1 = Violation {
             source_range: Some(rowan::TextRange::new(0.into(), 10.into())),
             rule_id: "rule_b",
-            operation_kind: OperationKind::DropTable,
             object_kind: ObjectKind::Table,
             object_name: "b".to_string(),
             tier: ViolationTier::Tier1,
@@ -325,12 +320,10 @@ mod phase10_bug_fixes_and_sorting_tests {
             recipe: "recipe",
             dedup_key: None,
             sql: None,
-            fk_dependency_related: false,
         };
         let v_range_later = Violation {
             source_range: Some(rowan::TextRange::new(20.into(), 30.into())),
             rule_id: "rule_c",
-            operation_kind: OperationKind::DropTable,
             object_kind: ObjectKind::Table,
             object_name: "c".to_string(),
             tier: ViolationTier::Tier1,
@@ -338,12 +331,10 @@ mod phase10_bug_fixes_and_sorting_tests {
             recipe: "recipe",
             dedup_key: None,
             sql: None,
-            fk_dependency_related: false,
         };
         let v_name_later = Violation {
             source_range: Some(rowan::TextRange::new(0.into(), 10.into())),
             rule_id: "rule_b",
-            operation_kind: OperationKind::DropTable,
             object_kind: ObjectKind::Table,
             object_name: "z".to_string(),
             tier: ViolationTier::Tier1,
@@ -351,7 +342,6 @@ mod phase10_bug_fixes_and_sorting_tests {
             recipe: "recipe",
             dedup_key: None,
             sql: None,
-            fk_dependency_related: false,
         };
 
         let mut violations = vec![
@@ -540,7 +530,9 @@ mod phase10_bug_fixes_and_sorting_tests {
 
     #[test]
     fn scoped_drop_reports_unresolved_when_the_target_has_out_of_scope_dependents() {
-        use safe_migrate::_internal::db::cache::{ForeignKeyCache, ScopedDependencyEdge};
+        use safe_migrate::_internal::db::cache::{
+            CatalogFamily, ForeignKeyCache, ScopedDependencyEdge,
+        };
 
         let scoped = vec!["app".to_string()];
         let build = |external_present: bool, edge_present: bool| {
@@ -569,8 +561,12 @@ mod phase10_bug_fixes_and_sorting_tests {
             }
             if edge_present {
                 cache
-                    .scoped_external_relation_dependencies
-                    .push(ScopedDependencyEdge::new(parent.clone(), child.clone()));
+                    .scoped_external_dependencies
+                    .push(ScopedDependencyEdge::new(
+                        CatalogFamily::Relations,
+                        parent.clone(),
+                        child.clone(),
+                    ));
             }
             cache.foreign_keys.push(ForeignKeyCache {
                 constraint_name: "child_parent_fk".to_string(),
@@ -615,7 +611,52 @@ mod phase10_bug_fixes_and_sorting_tests {
     }
 
     #[test]
-    fn fk_dependency_related_fires_when_cascade_pulls_an_out_of_scope_relation() {
+    fn unresolved_scope_remedy_names_the_missing_schemas() {
+        use safe_migrate::_internal::analysis::evidence::EvidenceCode;
+        use safe_migrate::_internal::db::cache::{CatalogFamily, ScopedDependencyEdge};
+        use safe_migrate::_internal::report::violations::NotEvaluated;
+
+        let mut cache = crate::common::synced_cache();
+        cache.metadata.schemas = Some(vec!["app".to_string()]);
+        cache.metadata.boundary_queries_complete = true;
+        let scoped = object_id("app", "parent");
+        for name in ["Billing", "audit_log", "reporting"] {
+            cache
+                .scoped_external_dependencies
+                .push(ScopedDependencyEdge::new(
+                    CatalogFamily::Relations,
+                    scoped.clone(),
+                    object_id(name, "child"),
+                ));
+        }
+        // An unresolved external endpoint has no schema to name.
+        cache
+            .scoped_external_dependencies
+            .push(ScopedDependencyEdge::unresolved_external(
+                CatalogFamily::Relations,
+                scoped.clone(),
+            ));
+        let state = AnalysisState::new(cache);
+
+        let missing = state.external_referenced_schemas();
+        assert_eq!(missing, vec!["Billing", "audit_log", "reporting"]);
+
+        let recipe = NotEvaluated::recipe_for(EvidenceCode::CatalogCoverageIncomplete, &missing);
+        // Quoted because it needs quoting, and named rather than described.
+        assert!(recipe.contains("\"Billing\""), "{recipe}");
+        assert!(recipe.contains("audit_log"), "{recipe}");
+        assert!(recipe.contains("audit_log and reporting"), "{recipe}");
+
+        // With nothing to name, the recipe falls back to describing the fix.
+        let generic_recipe = NotEvaluated::recipe_for(EvidenceCode::CatalogCoverageIncomplete, &[]);
+        assert!(
+            generic_recipe.contains("the referenced schema"),
+            "{generic_recipe}"
+        );
+    }
+
+    #[test]
+    fn cascade_drop_names_the_out_of_scope_fk_dependency() {
         use safe_migrate::_internal::db::cache::ForeignKeyCache;
 
         let engine = setup_engine();
@@ -665,8 +706,10 @@ mod phase10_bug_fixes_and_sorting_tests {
             .find(|violation| violation.rule_id == "destructive-cascade")
             .expect("a cascading drop over baseline objects must be reported");
         assert!(
-            cascade.fk_dependency_related,
-            "the closure pulled an out-of-scope FK relation, so the finding must say so: {cascade:?}"
+            cascade
+                .reason
+                .contains("FK-pulled tables from other schemas"),
+            "the closure pulled an out-of-scope FK relation, so the reason must say so: {cascade:?}"
         );
     }
 

@@ -1,7 +1,7 @@
 use crate::_internal::analysis::mutations::{AlterTableActionMutation, Mutation};
 
 use crate::_internal::model::relation::Persistence;
-use crate::_internal::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
+use crate::_internal::report::violations::{ObjectKind, Violation, ViolationTier};
 use crate::_internal::rules::{BASELINE_STATS_CAPABILITIES, Rule, RuleCapability, RuleContext};
 
 pub(crate) struct PartitionLockRule;
@@ -51,20 +51,10 @@ impl Rule for PartitionLockRule {
                         return violations;
                     }
 
-                    let op_kind = if matches!(
-                        alter.action,
-                        AlterTableActionMutation::AttachPartition { .. }
-                    ) {
-                        OperationKind::AttachPartition
-                    } else {
-                        OperationKind::DetachPartition
-                    };
-
                     if is_stale {
                         let key = format!("{}_stale_{}", self.id(), alter.id);
                         violations.push(Violation { source_range: None,
                             rule_id: self.id(),
-                            operation_kind: op_kind.clone(),
                             object_kind: ObjectKind::Table,
                             object_name: alter.id.to_string(),
                             tier: ViolationTier::Tier2,
@@ -72,7 +62,7 @@ impl Rule for PartitionLockRule {
                             recipe: "Run ANALYZE to ensure accurate row estimates before structural changes.",
                             dedup_key: Some(key),
                                             sql: None,
-                                            fk_dependency_related: false,
+
                         });
                     }
 
@@ -116,7 +106,6 @@ impl Rule for PartitionLockRule {
                         violations.push(Violation {
                             source_range: None,
                             rule_id: self.id(),
-                            operation_kind: op_kind,
                             object_kind: ObjectKind::Table,
                             object_name: alter.id.to_string(),
                             tier,
@@ -124,7 +113,6 @@ impl Rule for PartitionLockRule {
                             recipe: self.recipe(),
                             dedup_key: None,
                             sql: None,
-                            fk_dependency_related: false,
                         });
                     }
                 }
@@ -192,7 +180,7 @@ impl Rule for PartitionStrategyMismatchRule {
                     violations.push(Violation {
                         source_range: None,
                         rule_id: self.id(),
-                        operation_kind: OperationKind::AttachPartition,
+
                         object_kind: ObjectKind::Table,
                         object_name: format!("{} -> {}", child, alter.id),
                         tier: self.default_tier(),
@@ -203,7 +191,6 @@ impl Rule for PartitionStrategyMismatchRule {
                         recipe: self.recipe(),
                         dedup_key: None,
                         sql: None,
-                        fk_dependency_related: false,
                     });
                 }
             }

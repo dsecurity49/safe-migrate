@@ -1,7 +1,7 @@
 use crate::_internal::analysis::mutations::Mutation;
 
 use crate::_internal::model::relation::Persistence;
-use crate::_internal::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
+use crate::_internal::report::violations::{ObjectKind, Violation, ViolationTier};
 use crate::_internal::rules::{BASELINE_STATS_CAPABILITIES, Rule, RuleCapability, RuleContext};
 
 pub(crate) struct MaterializedViewRefreshRule;
@@ -48,7 +48,6 @@ impl Rule for MaterializedViewRefreshRule {
                     let key = format!("{}_stale_{}", self.id(), refresh.id);
                     violations.push(Violation { source_range: None,
                         rule_id: self.id(),
-                        operation_kind: OperationKind::RefreshMaterializedView,
                         object_kind: ObjectKind::MaterializedView,
                         object_name: refresh.id.to_string(),
                         tier: ViolationTier::Tier2,
@@ -56,7 +55,7 @@ impl Rule for MaterializedViewRefreshRule {
                         recipe: "Run ANALYZE to ensure accurate row estimates.",
                         dedup_key: Some(key),
                                     sql: None,
-                                    fk_dependency_related: false,
+
                     });
                 }
 
@@ -81,7 +80,6 @@ impl Rule for MaterializedViewRefreshRule {
                     violations.push(Violation {
                         source_range: None,
                         rule_id: self.id(),
-                        operation_kind: OperationKind::RefreshMaterializedView,
                         object_kind: ObjectKind::MaterializedView,
                         object_name: refresh.id.to_string(),
                         tier,
@@ -89,7 +87,6 @@ impl Rule for MaterializedViewRefreshRule {
                         recipe: self.recipe(),
                         dedup_key: None,
                         sql: None,
-                        fk_dependency_related: false,
                     });
                 }
             } else {
@@ -99,7 +96,6 @@ impl Rule for MaterializedViewRefreshRule {
                 if !has_unique_index {
                     violations.push(Violation { source_range: None,
                         rule_id: self.id(),
-                        operation_kind: OperationKind::RefreshMaterializedView,
                         object_kind: ObjectKind::MaterializedView,
                         object_name: refresh.id.to_string(),
                         tier: ViolationTier::Tier1,
@@ -107,7 +103,7 @@ impl Rule for MaterializedViewRefreshRule {
                         recipe: "Create a unique index on the materialized view before attempting a concurrent refresh.",
                         dedup_key: None,
                                     sql: None,
-                                    fk_dependency_related: false,
+
                     });
                 }
             }

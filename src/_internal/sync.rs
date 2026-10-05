@@ -1,6 +1,6 @@
 use crate::_internal::ast::identifiers::ObjectId;
 use crate::_internal::db::cache::{
-    CACHE_V9_MAGIC, CatalogCoverageBuilder, CatalogFamily, ConstraintDependencyCache,
+    CACHE_MAGIC, CatalogCoverageBuilder, CatalogFamily, ConstraintDependencyCache,
     ConstraintKeyCache, DbCache, DbCacheVersioned, DefaultSequenceDependencyCache, ForeignKeyCache,
     GeneratedColumnDependencyCache, IndexCache, InheritanceCache, ScopedDependencyEdge,
     ViewDependencyCache,
@@ -375,7 +375,7 @@ fn write_cache_with_protection_and_limits(
         .context("Failed to init zstd compression")?;
     let mut encoder = SizeLimitedWriter::new(encoder, max_decode_bytes);
 
-    if let Err(error) = encoder.write_all(CACHE_V9_MAGIC) {
+    if let Err(error) = encoder.write_all(CACHE_MAGIC) {
         if encoder.limit_exceeded() {
             anyhow::bail!(
                 "Cache payload exceeds the {} MiB decoded-size limit",
@@ -385,7 +385,7 @@ fn write_cache_with_protection_and_limits(
         return Err(error).context("Failed to write cache payload header");
     }
 
-    let versioned = DbCacheVersioned::V9(Box::new(cache));
+    let versioned = DbCacheVersioned::V10(Box::new(cache));
     let bincode_config = bincode::config::standard().with_variable_int_encoding();
 
     let encode_result =
@@ -653,138 +653,13 @@ fn load_view_dependencies(
         .collect()
 }
 
-/// Return synchronized relations whose known catalog dependents cross an
-/// explicit schema boundary. The query covers the catalog classes that can
-/// expose a dependent relation (relations/indexes, constraints, rewrites,
-/// defaults, and triggers); unscoped synchronization needs no boundary list.
-fn load_scoped_external_index_dependencies(
-    client: &mut impl GenericClient,
-    schema_values: &Option<Vec<String>>,
-) -> Result<Vec<ObjectId>> {
-    let Some(schemas) = schema_values else {
-        return Ok(Vec::new());
-    };
-    if schemas.is_empty() {
-        return Ok(Vec::new());
-    }
-    let query = r#"
-        SELECT DISTINCT ref_n.nspname AS ref_schema, ref_c.relname AS ref_name
-        FROM pg_depend d
-        JOIN pg_class ref_c ON d.refclassid = 'pg_class'::regclass
-                           AND d.refobjid = ref_c.oid
-        JOIN pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace
-        JOIN pg_class dep_c ON d.classid = 'pg_class'::regclass
-                           AND d.objid = dep_c.oid
-        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
-        WHERE ref_c.relkind IN ('i', 'I')
-          AND ref_n.nspname = ANY($1)
-          AND NOT (dep_n.nspname = ANY($1))
-          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
-          AND dep_n.nspname <> 'information_schema'
-        UNION
-        SELECT DISTINCT ref_n.nspname, ref_c.relname
-        FROM pg_depend d
-        JOIN pg_class ref_c ON d.refclassid = 'pg_class'::regclass
-                           AND d.refobjid = ref_c.oid
-        JOIN pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace
-        JOIN pg_constraint dep_con ON d.classid = 'pg_constraint'::regclass
-                                  AND d.objid = dep_con.oid
-        JOIN pg_class dep_c ON dep_c.oid = dep_con.conrelid
-        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
-        WHERE ref_c.relkind IN ('i', 'I')
-          AND ref_n.nspname = ANY($1)
-          AND NOT (dep_n.nspname = ANY($1))
-          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
-          AND dep_n.nspname <> 'information_schema'
-        UNION
-        SELECT DISTINCT ref_n.nspname, ref_c.relname
-        FROM pg_depend d
-        JOIN pg_class ref_c ON d.refclassid = 'pg_class'::regclass
-                           AND d.refobjid = ref_c.oid
-        JOIN pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace
-        JOIN pg_rewrite dep_rw ON d.classid = 'pg_rewrite'::regclass
-                              AND d.objid = dep_rw.oid
-        JOIN pg_class dep_c ON dep_c.oid = dep_rw.ev_class
-        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
-        WHERE ref_c.relkind IN ('i', 'I')
-          AND ref_n.nspname = ANY($1)
-          AND NOT (dep_n.nspname = ANY($1))
-          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
-          AND dep_n.nspname <> 'information_schema'
-        UNION
-        SELECT DISTINCT ref_n.nspname, ref_c.relname
-        FROM pg_depend d
-        JOIN pg_class ref_c ON d.refclassid = 'pg_class'::regclass
-                           AND d.refobjid = ref_c.oid
-        JOIN pg_attrdef dep_ad ON d.classid = 'pg_attrdef'::regclass
-                              AND d.objid = dep_ad.oid
-        JOIN pg_class dep_c ON dep_c.oid = dep_ad.adrelid
-        JOIN pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace
-        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
-        WHERE ref_c.relkind IN ('i', 'I')
-          AND ref_n.nspname = ANY($1)
-          AND NOT (dep_n.nspname = ANY($1))
-          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
-          AND dep_n.nspname <> 'information_schema'
-        UNION
-        SELECT DISTINCT ref_n.nspname, ref_c.relname
-        FROM pg_depend d
-        JOIN pg_class ref_c ON d.refclassid = 'pg_class'::regclass
-                           AND d.refobjid = ref_c.oid
-        JOIN pg_trigger dep_tg ON d.classid = 'pg_trigger'::regclass
-                              AND d.objid = dep_tg.oid
-        JOIN pg_class dep_c ON dep_c.oid = dep_tg.tgrelid
-        JOIN pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace
-        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
-        WHERE ref_c.relkind IN ('i', 'I')
-          AND ref_n.nspname = ANY($1)
-          AND NOT (dep_n.nspname = ANY($1))
-          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
-          AND dep_n.nspname <> 'information_schema'
-        UNION
-        SELECT DISTINCT ref_n.nspname, ref_c.relname
-        FROM pg_depend d
-        JOIN pg_class ref_c ON d.refclassid = 'pg_class'::regclass
-                           AND d.refobjid = ref_c.oid
-        JOIN pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace
-        JOIN pg_proc dep_p ON d.classid = 'pg_proc'::regclass
-                          AND d.objid = dep_p.oid
-        JOIN pg_namespace dep_n ON dep_n.oid = dep_p.pronamespace
-        WHERE ref_c.relkind IN ('i', 'I')
-          AND ref_n.nspname = ANY($1)
-          AND NOT (dep_n.nspname = ANY($1))
-          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
-          AND dep_n.nspname <> 'information_schema'
-        UNION
-        SELECT DISTINCT ref_n.nspname, ref_c.relname
-        FROM pg_depend d
-        JOIN pg_class ref_c ON d.refclassid = 'pg_class'::regclass
-                           AND d.refobjid = ref_c.oid
-        JOIN pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace
-        JOIN pg_policy dep_pol ON d.classid = 'pg_policy'::regclass
-                              AND d.objid = dep_pol.oid
-        JOIN pg_class dep_c ON dep_c.oid = dep_pol.polrelid
-        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
-        WHERE ref_c.relkind IN ('i', 'I')
-          AND ref_n.nspname = ANY($1)
-          AND NOT (dep_n.nspname = ANY($1))
-          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
-          AND dep_n.nspname <> 'information_schema'
-    "#;
-    client
-        .query(query, &[schemas])
-        .context("Failed to load scoped index dependency boundaries")?
-        .into_iter()
-        .map(|row| {
-            Ok(ObjectId::new(
-                row.try_get::<_, String>("ref_schema")?,
-                row.try_get::<_, String>("ref_name")?,
-            ))
-        })
-        .collect()
-}
-
-fn load_scoped_external_relation_dependencies(
+/// Every dependency crossing an explicit schema scope, with both endpoints.
+///
+/// One query resolves both sides of each `pg_depend` row: the in-scope object
+/// being depended on, and the out-of-scope object that depends on it. Class to
+/// catalog resolution lives in one lateral per side, so a dependent class
+/// cannot be handled inconsistently between families.
+fn load_scoped_external_dependencies(
     client: &mut impl GenericClient,
     schema_values: &Option<Vec<String>>,
 ) -> Result<Vec<ScopedDependencyEdge>> {
@@ -795,400 +670,98 @@ fn load_scoped_external_relation_dependencies(
         return Ok(Vec::new());
     }
     let query = r#"
-SELECT DISTINCT ref_n.nspname AS ref_schema, ref_c.relname AS ref_name,
-                dep_n.nspname AS dep_schema, dep_c.relname AS dep_name
+        SELECT DISTINCT
+            ref_side.family AS ref_family,
+            ref_side.relkind AS ref_relkind,
+            ref_side.schema AS ref_schema,
+            ref_side.name AS ref_name,
+            dep_side.schema AS dep_schema,
+            dep_side.name AS dep_name
         FROM pg_depend d
-        JOIN pg_class ref_c ON d.refclassid = 'pg_class'::regclass
-                           AND d.refobjid = ref_c.oid
-        JOIN pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace
-        JOIN pg_class dep_c ON d.classid = 'pg_class'::regclass
-                           AND d.objid = dep_c.oid
-        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
-        WHERE ref_n.nspname = ANY($1)
-          AND NOT (dep_n.nspname = ANY($1))
-          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
-          AND dep_n.nspname <> 'information_schema'
-        UNION
-        SELECT DISTINCT ref_n.nspname, ref_c.relname,
-                dep_n.nspname, dep_c.relname
-        FROM pg_depend d
-        JOIN pg_class ref_c ON d.refclassid = 'pg_class'::regclass
-                           AND d.refobjid = ref_c.oid
-        JOIN pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace
-        JOIN pg_constraint dep_con ON d.classid = 'pg_constraint'::regclass
-                                  AND d.objid = dep_con.oid
-        JOIN pg_class dep_c ON dep_c.oid = dep_con.conrelid
-        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
-        WHERE ref_n.nspname = ANY($1)
-          AND NOT (dep_n.nspname = ANY($1))
-          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
-          AND dep_n.nspname <> 'information_schema'
-        UNION
-        SELECT DISTINCT ref_n.nspname, ref_c.relname,
-                dep_n.nspname, dep_c.relname
-        FROM pg_depend d
-        JOIN pg_class ref_c ON d.refclassid = 'pg_class'::regclass
-                           AND d.refobjid = ref_c.oid
-        JOIN pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace
-        JOIN pg_rewrite dep_rw ON d.classid = 'pg_rewrite'::regclass
-                              AND d.objid = dep_rw.oid
-        JOIN pg_class dep_c ON dep_c.oid = dep_rw.ev_class
-        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
-        WHERE ref_n.nspname = ANY($1)
-          AND NOT (dep_n.nspname = ANY($1))
-          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
-          AND dep_n.nspname <> 'information_schema'
-        UNION
-        SELECT DISTINCT ref_n.nspname, ref_c.relname,
-                dep_n.nspname, dep_c.relname
-        FROM pg_depend d
-        JOIN pg_class ref_c ON d.refclassid = 'pg_class'::regclass
-                           AND d.refobjid = ref_c.oid
-        JOIN pg_attrdef dep_ad ON d.classid = 'pg_attrdef'::regclass
-                              AND d.objid = dep_ad.oid
-        JOIN pg_class dep_c ON dep_c.oid = dep_ad.adrelid
-        JOIN pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace
-        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
-        WHERE ref_n.nspname = ANY($1)
-          AND NOT (dep_n.nspname = ANY($1))
-          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
-          AND dep_n.nspname <> 'information_schema'
-        UNION
-        SELECT DISTINCT ref_n.nspname, ref_c.relname,
-                dep_n.nspname, dep_c.relname
-        FROM pg_depend d
-        JOIN pg_class ref_c ON d.refclassid = 'pg_class'::regclass
-                           AND d.refobjid = ref_c.oid
-        JOIN pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace
-        JOIN pg_trigger dep_tg ON d.classid = 'pg_trigger'::regclass
-                              AND d.objid = dep_tg.oid
-        JOIN pg_class dep_c ON dep_c.oid = dep_tg.tgrelid
-        JOIN pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace
-        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
-        WHERE ref_n.nspname = ANY($1)
-          AND NOT (dep_n.nspname = ANY($1))
-          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
-          AND dep_n.nspname <> 'information_schema'
-        UNION
-        SELECT DISTINCT ref_n.nspname, ref_c.relname,
-                dep_n.nspname, dep_p.relname
-        FROM pg_depend d
-        JOIN pg_class ref_c ON d.refclassid = 'pg_class'::regclass
-                           AND d.refobjid = ref_c.oid
-        JOIN pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace
-        JOIN pg_proc dep_p ON d.classid = 'pg_proc'::regclass
-                          AND d.objid = dep_p.oid
-        JOIN pg_namespace dep_n ON dep_n.oid = dep_p.pronamespace
-        WHERE ref_n.nspname = ANY($1)
-          AND NOT (dep_n.nspname = ANY($1))
-          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
-          AND dep_n.nspname <> 'information_schema'
-        UNION
-        SELECT DISTINCT ref_n.nspname, ref_c.relname,
-                dep_n.nspname, dep_c.relname
-        FROM pg_depend d
-        JOIN pg_class ref_c ON d.refclassid = 'pg_class'::regclass
-                           AND d.refobjid = ref_c.oid
-        JOIN pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace
-        JOIN pg_policy dep_pol ON d.classid = 'pg_policy'::regclass
-                              AND d.objid = dep_pol.oid
-        JOIN pg_class dep_c ON dep_c.oid = dep_pol.polrelid
-        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
-        WHERE ref_n.nspname = ANY($1)
-          AND NOT (dep_n.nspname = ANY($1))
-          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
-          AND dep_n.nspname <> 'information_schema'
+        CROSS JOIN LATERAL (
+            SELECT 'r' AS family, c.relkind::text AS relkind,
+                   n.nspname AS schema, c.relname AS name
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE d.refclassid = 'pg_class'::regclass AND c.oid = d.refobjid
+            UNION ALL
+            SELECT 't', NULL, n.nspname, t.typname
+            FROM pg_type t
+            JOIN pg_namespace n ON n.oid = t.typnamespace
+            WHERE d.refclassid = 'pg_type'::regclass AND t.oid = d.refobjid
+            UNION ALL
+            SELECT 'p', NULL, n.nspname, p.proname
+            FROM pg_proc p
+            JOIN pg_namespace n ON n.oid = p.pronamespace
+            WHERE d.refclassid = 'pg_proc'::regclass AND p.oid = d.refobjid
+        ) ref_side
+        LEFT JOIN LATERAL (
+            SELECT n.nspname AS schema, c.relname AS name
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE c.oid = COALESCE(
+                CASE d.classid WHEN 'pg_class'::regclass THEN d.objid END,
+                CASE d.classid
+                    WHEN 'pg_constraint'::regclass
+                        THEN (SELECT conrelid FROM pg_constraint WHERE oid = d.objid)
+                    WHEN 'pg_rewrite'::regclass
+                        THEN (SELECT ev_class FROM pg_rewrite WHERE oid = d.objid)
+                    WHEN 'pg_attrdef'::regclass
+                        THEN (SELECT adrelid FROM pg_attrdef WHERE oid = d.objid)
+                    WHEN 'pg_trigger'::regclass
+                        THEN (SELECT tgrelid FROM pg_trigger WHERE oid = d.objid)
+                    WHEN 'pg_policy'::regclass
+                        THEN (SELECT polrelid FROM pg_policy WHERE oid = d.objid)
+                END
+            )
+            UNION ALL
+            SELECT n.nspname, p.proname
+            FROM pg_proc p
+            JOIN pg_namespace n ON n.oid = p.pronamespace
+            WHERE d.classid = 'pg_proc'::regclass AND p.oid = d.objid
+        ) dep_side ON TRUE
+        WHERE ref_side.schema = ANY($1)
+          AND (
+            dep_side.schema IS NULL
+            OR NOT (dep_side.schema = ANY($1))
+          )
+          AND (
+            dep_side.schema IS NULL
+            OR (
+              dep_side.schema NOT LIKE 'pg\_%' ESCAPE '\'
+              AND dep_side.schema <> 'information_schema'
+            )
+          )
     "#;
     client
         .query(query, &[schemas])
-        .context("Failed to load scoped relation dependency boundaries")?
+        .context("Failed to load scoped external dependency boundaries")?
         .into_iter()
         .map(|row| {
-            Ok(ScopedDependencyEdge::new(
-                ObjectId::new(
-                    row.try_get::<_, String>("ref_schema")?,
-                    row.try_get::<_, String>("ref_name")?,
-                ),
-                ObjectId::new(
-                    row.try_get::<_, String>("dep_schema")?,
-                    row.try_get::<_, String>("dep_name")?,
-                ),
-            ))
-        })
-        .collect()
-}
-
-fn load_scoped_external_type_dependencies(
-    client: &mut impl GenericClient,
-    schema_values: &Option<Vec<String>>,
-) -> Result<Vec<ObjectId>> {
-    let Some(schemas) = schema_values else {
-        return Ok(Vec::new());
-    };
-    let query = r#"
-        SELECT DISTINCT ref_n.nspname AS ref_schema, ref_t.typname AS ref_name
-        FROM pg_depend d
-        JOIN pg_type ref_t ON d.refclassid = 'pg_type'::regclass
-                          AND d.refobjid = ref_t.oid
-        JOIN pg_namespace ref_n ON ref_n.oid = ref_t.typnamespace
-        JOIN pg_class dep_c ON d.classid = 'pg_class'::regclass
-                           AND d.objid = dep_c.oid
-        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
-        WHERE ref_n.nspname = ANY($1)
-          AND NOT (dep_n.nspname = ANY($1))
-          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
-          AND dep_n.nspname <> 'information_schema'
-        UNION
-        SELECT DISTINCT ref_n.nspname, ref_t.typname
-        FROM pg_depend d
-        JOIN pg_type ref_t ON d.refclassid = 'pg_type'::regclass
-                          AND d.refobjid = ref_t.oid
-        JOIN pg_namespace ref_n ON ref_n.oid = ref_t.typnamespace
-        JOIN pg_rewrite dep_rw ON d.classid = 'pg_rewrite'::regclass
-                              AND d.objid = dep_rw.oid
-        JOIN pg_class dep_c ON dep_c.oid = dep_rw.ev_class
-        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
-        WHERE ref_n.nspname = ANY($1)
-          AND NOT (dep_n.nspname = ANY($1))
-          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
-          AND dep_n.nspname <> 'information_schema'
-        UNION
-        SELECT DISTINCT ref_n.nspname, ref_t.typname
-        FROM pg_depend d
-        JOIN pg_type ref_t ON d.refclassid = 'pg_type'::regclass
-                          AND d.refobjid = ref_t.oid
-        JOIN pg_proc dep_p ON d.classid = 'pg_proc'::regclass
-                          AND d.objid = dep_p.oid
-        JOIN pg_namespace dep_n ON dep_n.oid = dep_p.pronamespace
-        JOIN pg_namespace ref_n ON ref_n.oid = ref_t.typnamespace
-        WHERE ref_n.nspname = ANY($1)
-          AND NOT (dep_n.nspname = ANY($1))
-          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
-          AND dep_n.nspname <> 'information_schema'
-        UNION
-        SELECT DISTINCT ref_n.nspname, ref_t.typname
-        FROM pg_depend d
-        JOIN pg_type ref_t ON d.refclassid = 'pg_type'::regclass
-                          AND d.refobjid = ref_t.oid
-        JOIN pg_namespace ref_n ON ref_n.oid = ref_t.typnamespace
-        JOIN pg_constraint dep_con ON d.classid = 'pg_constraint'::regclass
-                                  AND d.objid = dep_con.oid
-        JOIN pg_class dep_c ON dep_c.oid = dep_con.conrelid
-        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
-        WHERE ref_n.nspname = ANY($1)
-          AND NOT (dep_n.nspname = ANY($1))
-          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
-          AND dep_n.nspname <> 'information_schema'
-        UNION
-        SELECT DISTINCT ref_n.nspname, ref_t.typname
-        FROM pg_depend d
-        JOIN pg_type ref_t ON d.refclassid = 'pg_type'::regclass
-                          AND d.refobjid = ref_t.oid
-        JOIN pg_namespace ref_n ON ref_n.oid = ref_t.typnamespace
-        JOIN pg_attrdef dep_ad ON d.classid = 'pg_attrdef'::regclass
-                              AND d.objid = dep_ad.oid
-        JOIN pg_class dep_c ON dep_c.oid = dep_ad.adrelid
-        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
-        WHERE ref_n.nspname = ANY($1)
-          AND NOT (dep_n.nspname = ANY($1))
-          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
-          AND dep_n.nspname <> 'information_schema'
-        UNION
-        SELECT DISTINCT ref_n.nspname, ref_t.typname
-        FROM pg_depend d
-        JOIN pg_type ref_t ON d.refclassid = 'pg_type'::regclass
-                          AND d.refobjid = ref_t.oid
-        JOIN pg_namespace ref_n ON ref_n.oid = ref_t.typnamespace
-        JOIN pg_trigger dep_tg ON d.classid = 'pg_trigger'::regclass
-                              AND d.objid = dep_tg.oid
-        JOIN pg_class dep_c ON dep_c.oid = dep_tg.tgrelid
-        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
-        WHERE ref_n.nspname = ANY($1)
-          AND NOT (dep_n.nspname = ANY($1))
-          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
-          AND dep_n.nspname <> 'information_schema'
-        UNION
-        SELECT DISTINCT ref_n.nspname, ref_t.typname
-        FROM pg_depend d
-        JOIN pg_type ref_t ON d.refclassid = 'pg_type'::regclass
-                          AND d.refobjid = ref_t.oid
-        JOIN pg_namespace ref_n ON ref_n.oid = ref_t.typnamespace
-        JOIN pg_policy dep_pol ON d.classid = 'pg_policy'::regclass
-                              AND d.objid = dep_pol.oid
-        JOIN pg_class dep_c ON dep_c.oid = dep_pol.polrelid
-        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
-        WHERE ref_n.nspname = ANY($1)
-          AND NOT (dep_n.nspname = ANY($1))
-          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
-          AND dep_n.nspname <> 'information_schema'
-    "#;
-    client
-        .query(query, &[schemas])
-        .context("Failed to load scoped type dependency boundaries")?
-        .into_iter()
-        .map(|row| {
-            Ok(ObjectId::new(
+            let relkind: Option<String> = row.try_get("ref_relkind")?;
+            let family = match (
+                row.try_get::<_, String>("ref_family")?.as_str(),
+                relkind.as_deref(),
+            ) {
+                ("r", Some("i" | "I")) => CatalogFamily::Indexes,
+                ("r", _) => CatalogFamily::Relations,
+                ("t", _) => CatalogFamily::Types,
+                ("p", _) => CatalogFamily::Routines,
+                (other, _) => return Err(anyhow::anyhow!("unknown dependency family {other}")),
+            };
+            let scoped = ObjectId::new(
                 row.try_get::<_, String>("ref_schema")?,
                 row.try_get::<_, String>("ref_name")?,
-            ))
-        })
-        .collect()
-}
-
-fn load_scoped_external_routine_dependencies(
-    client: &mut impl GenericClient,
-    schema_values: &Option<Vec<String>>,
-) -> Result<Vec<ObjectId>> {
-    let Some(schemas) = schema_values else {
-        return Ok(Vec::new());
-    };
-    let query = r#"
-        SELECT DISTINCT
-            ref_n.nspname AS ref_schema,
-            ref_p.proname AS ref_name,
-            ARRAY(
-                SELECT pg_catalog.format_type(t, NULL)
-                FROM unnest(ref_p.proargtypes::oid[]) WITH ORDINALITY AS args(t, n)
-                ORDER BY n
-            )::text[] AS arg_types
-        FROM pg_depend d
-        JOIN pg_proc ref_p ON d.refclassid = 'pg_proc'::regclass
-                          AND d.refobjid = ref_p.oid
-        JOIN pg_namespace ref_n ON ref_n.oid = ref_p.pronamespace
-        JOIN pg_class dep_c ON d.classid = 'pg_class'::regclass
-                           AND d.objid = dep_c.oid
-        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
-        WHERE ref_n.nspname = ANY($1)
-          AND NOT (dep_n.nspname = ANY($1))
-          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
-          AND dep_n.nspname <> 'information_schema'
-        UNION
-        SELECT DISTINCT
-            ref_n.nspname,
-            ref_p.proname,
-            ARRAY(
-                SELECT pg_catalog.format_type(t, NULL)
-                FROM unnest(ref_p.proargtypes::oid[]) WITH ORDINALITY AS args(t, n)
-                ORDER BY n
-            )::text[]
-        FROM pg_depend d
-        JOIN pg_proc ref_p ON d.refclassid = 'pg_proc'::regclass
-                          AND d.refobjid = ref_p.oid
-        JOIN pg_namespace ref_n ON ref_n.oid = ref_p.pronamespace
-        JOIN pg_rewrite dep_rw ON d.classid = 'pg_rewrite'::regclass
-                              AND d.objid = dep_rw.oid
-        JOIN pg_class dep_c ON dep_c.oid = dep_rw.ev_class
-        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
-        WHERE ref_n.nspname = ANY($1)
-          AND NOT (dep_n.nspname = ANY($1))
-          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
-          AND dep_n.nspname <> 'information_schema'
-        UNION
-        SELECT DISTINCT
-            ref_n.nspname,
-            ref_p.proname,
-            ARRAY(
-                SELECT pg_catalog.format_type(t, NULL)
-                FROM unnest(ref_p.proargtypes::oid[]) WITH ORDINALITY AS args(t, n)
-                ORDER BY n
-            )::text[]
-        FROM pg_depend d
-        JOIN pg_proc ref_p ON d.refclassid = 'pg_proc'::regclass
-                          AND d.refobjid = ref_p.oid
-        JOIN pg_namespace ref_n ON ref_n.oid = ref_p.pronamespace
-        JOIN pg_constraint dep_con ON d.classid = 'pg_constraint'::regclass
-                                  AND d.objid = dep_con.oid
-        JOIN pg_class dep_c ON dep_c.oid = dep_con.conrelid
-        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
-        WHERE ref_n.nspname = ANY($1)
-          AND NOT (dep_n.nspname = ANY($1))
-          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
-          AND dep_n.nspname <> 'information_schema'
-        UNION
-        SELECT DISTINCT
-            ref_n.nspname,
-            ref_p.proname,
-            ARRAY(
-                SELECT pg_catalog.format_type(t, NULL)
-                FROM unnest(ref_p.proargtypes::oid[]) WITH ORDINALITY AS args(t, n)
-                ORDER BY n
-            )::text[]
-        FROM pg_depend d
-        JOIN pg_proc ref_p ON d.refclassid = 'pg_proc'::regclass
-                          AND d.refobjid = ref_p.oid
-        JOIN pg_namespace ref_n ON ref_n.oid = ref_p.pronamespace
-        JOIN pg_attrdef dep_ad ON d.classid = 'pg_attrdef'::regclass
-                              AND d.objid = dep_ad.oid
-        JOIN pg_class dep_c ON dep_c.oid = dep_ad.adrelid
-        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
-        WHERE ref_n.nspname = ANY($1)
-          AND NOT (dep_n.nspname = ANY($1))
-          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
-          AND dep_n.nspname <> 'information_schema'
-        UNION
-        SELECT DISTINCT
-            ref_n.nspname,
-            ref_p.proname,
-            ARRAY(
-                SELECT pg_catalog.format_type(t, NULL)
-                FROM unnest(ref_p.proargtypes::oid[]) WITH ORDINALITY AS args(t, n)
-                ORDER BY n
-            )::text[]
-        FROM pg_depend d
-        JOIN pg_proc ref_p ON d.refclassid = 'pg_proc'::regclass
-                          AND d.refobjid = ref_p.oid
-        JOIN pg_namespace ref_n ON ref_n.oid = ref_p.pronamespace
-        JOIN pg_trigger dep_tg ON d.classid = 'pg_trigger'::regclass
-                              AND d.objid = dep_tg.oid
-        JOIN pg_class dep_c ON dep_c.oid = dep_tg.tgrelid
-        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
-        WHERE ref_n.nspname = ANY($1)
-          AND NOT (dep_n.nspname = ANY($1))
-          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
-          AND dep_n.nspname <> 'information_schema'
-        UNION
-        SELECT DISTINCT
-            ref_n.nspname,
-            ref_p.proname,
-            ARRAY(
-                SELECT pg_catalog.format_type(t, NULL)
-                FROM unnest(ref_p.proargtypes::oid[]) WITH ORDINALITY AS args(t, n)
-                ORDER BY n
-            )::text[]
-        FROM pg_depend d
-        JOIN pg_proc ref_p ON d.refclassid = 'pg_proc'::regclass
-                          AND d.refobjid = ref_p.oid
-        JOIN pg_namespace ref_n ON ref_n.oid = ref_p.pronamespace
-        JOIN pg_policy dep_pol ON d.classid = 'pg_policy'::regclass
-                              AND d.objid = dep_pol.oid
-        JOIN pg_class dep_c ON dep_c.oid = dep_pol.polrelid
-        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
-        WHERE ref_n.nspname = ANY($1)
-          AND NOT (dep_n.nspname = ANY($1))
-          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
-          AND dep_n.nspname <> 'information_schema'
-    "#;
-    client
-        .query(query, &[schemas])
-        .context("Failed to load scoped routine dependency boundaries")?
-        .into_iter()
-        .map(|row| {
-            let args: Vec<String> = row.try_get("arg_types")?;
-            let args = args
-                .iter()
-                .map(|arg| {
-                    crate::_internal::analysis::resolver::Resolver::normalize_function_arg_type(arg)
-                        .render()
-                })
-                .collect::<Vec<_>>();
-            Ok(ObjectId::new(
-                row.try_get::<_, String>("ref_schema")?,
-                format!(
-                    "{}({})",
-                    row.try_get::<_, String>("ref_name")?,
-                    args.join(",")
-                ),
-            ))
+            );
+            let external_schema: Option<String> = row.try_get("dep_schema")?;
+            match external_schema {
+                Some(schema) => Ok(ScopedDependencyEdge::new(
+                    family,
+                    scoped,
+                    ObjectId::new(schema, row.try_get::<_, String>("dep_name")?),
+                )),
+                None => Ok(ScopedDependencyEdge::unresolved_external(family, scoped)),
+            }
         })
         .collect()
 }
@@ -3680,14 +3253,7 @@ fn populate_cache_from_client(
     // after synchronization, so avoid loading them into Cache V8.
     cache.dependencies = load_view_dependencies(client, &schema_values)?;
     coverage.record(CatalogFamily::Dependencies);
-    cache.scoped_external_relation_dependencies =
-        load_scoped_external_relation_dependencies(client, &schema_values)?;
-    cache.scoped_external_type_dependencies =
-        load_scoped_external_type_dependencies(client, &schema_values)?;
-    cache.scoped_external_routine_dependencies =
-        load_scoped_external_routine_dependencies(client, &schema_values)?;
-    cache.scoped_external_index_dependencies =
-        load_scoped_external_index_dependencies(client, &schema_values)?;
+    cache.scoped_external_dependencies = load_scoped_external_dependencies(client, &schema_values)?;
     // All scope-boundary queries above completed inside the same repeatable
     // read transaction. Mark this only after every query succeeds; a cache
     // that was assembled programmatically or by a partial loader remains
@@ -3864,7 +3430,7 @@ mod atomic_write_tests {
         let mut payload = Vec::new();
         decoder.read_to_end(&mut payload).unwrap();
         let payload = payload
-            .strip_prefix(CACHE_V9_MAGIC)
+            .strip_prefix(CACHE_MAGIC)
             .expect("writer must prefix cache payloads");
         let config = bincode::config::standard().with_variable_int_encoding();
         let versioned: DbCacheVersioned = bincode::serde::decode_from_slice(payload, config)
@@ -3960,7 +3526,7 @@ mod atomic_write_tests {
             writable_cache(),
             Ok,
             MAX_CACHE_FILE_BYTES,
-            CACHE_V9_MAGIC.len(),
+            CACHE_MAGIC.len(),
         )
         .unwrap_err();
 

@@ -1118,9 +1118,7 @@ mod rule_evaluation_tests {
             "an unresolvable target must record which rules did not run"
         );
         assert!(
-            not_evaluated
-                .iter()
-                .any(|entry| !entry.remediation.is_empty()),
+            not_evaluated.iter().any(|entry| !entry.recipe.is_empty()),
             "each record must say what would make the rule evaluable"
         );
     }

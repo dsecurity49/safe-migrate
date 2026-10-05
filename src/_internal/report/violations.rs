@@ -2,107 +2,6 @@ use crate::_internal::analysis::evidence::{EvidenceRecord, EvidenceScope};
 use crate::api::Certainty;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub(crate) enum OperationKind {
-    DropColumn,
-    DropTable,
-    DropIndex,
-    DropView,
-    DropMaterializedView,
-    DropFunction,
-    DropProcedure,
-    DropSchema,
-    DropDatabase,
-    DropSequence,
-    DropDomain,
-    DropType,
-    DropPublication,
-    DropTrigger,
-    DropPolicy,
-    AddColumn,
-    AlterColumnType,
-    AddConstraint,
-    CreateIndex,
-    CreateTable,
-    CreateView,
-    CreateFunction,
-    AlterFunction,
-    AlterProcedure,
-    RefreshMaterializedView,
-    AttachPartition,
-    DetachPartition,
-    VacuumFull,
-    Reindex,
-    LockTable,
-    TruncateTable,
-    Grant,
-    AlterType,
-    CreatePolicy,
-    DisableTrigger,
-    EnableTrigger,
-    Rename,
-    OpaqueSql,
-    CreateSchema,
-    SetDefault,
-    CreateSequence,
-    Conflict,
-    Irreversible,
-    UnresolvedReference,
-    Other(String),
-}
-
-impl std::fmt::Display for OperationKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            OperationKind::DropColumn => write!(f, "drop_column"),
-            OperationKind::DropTable => write!(f, "drop_table"),
-            OperationKind::DropIndex => write!(f, "drop_index"),
-            OperationKind::DropView => write!(f, "drop_view"),
-            OperationKind::DropMaterializedView => write!(f, "drop_materialized_view"),
-            OperationKind::DropFunction => write!(f, "drop_function"),
-            OperationKind::DropProcedure => write!(f, "drop_procedure"),
-            OperationKind::DropSchema => write!(f, "drop_schema"),
-            OperationKind::DropDatabase => write!(f, "drop_database"),
-            OperationKind::DropSequence => write!(f, "drop_sequence"),
-            OperationKind::DropDomain => write!(f, "drop_domain"),
-            OperationKind::DropType => write!(f, "drop_type"),
-            OperationKind::DropPublication => write!(f, "drop_publication"),
-            OperationKind::DropTrigger => write!(f, "drop_trigger"),
-            OperationKind::DropPolicy => write!(f, "drop_policy"),
-            OperationKind::AddColumn => write!(f, "add_column"),
-            OperationKind::AlterColumnType => write!(f, "alter_column_type"),
-            OperationKind::AddConstraint => write!(f, "add_constraint"),
-            OperationKind::CreateIndex => write!(f, "create_index"),
-            OperationKind::CreateTable => write!(f, "create_table"),
-            OperationKind::CreateView => write!(f, "create_view"),
-            OperationKind::CreateFunction => write!(f, "create_function"),
-            OperationKind::AlterFunction => write!(f, "alter_function"),
-            OperationKind::AlterProcedure => write!(f, "alter_procedure"),
-            OperationKind::RefreshMaterializedView => write!(f, "refresh_materialized_view"),
-            OperationKind::AttachPartition => write!(f, "attach_partition"),
-            OperationKind::DetachPartition => write!(f, "detach_partition"),
-            OperationKind::VacuumFull => write!(f, "vacuum_full"),
-            OperationKind::Reindex => write!(f, "reindex"),
-            OperationKind::LockTable => write!(f, "lock_table"),
-            OperationKind::TruncateTable => write!(f, "truncate_table"),
-            OperationKind::Grant => write!(f, "grant"),
-            OperationKind::AlterType => write!(f, "alter_type"),
-            OperationKind::CreatePolicy => write!(f, "create_policy"),
-            OperationKind::DisableTrigger => write!(f, "disable_trigger"),
-            OperationKind::EnableTrigger => write!(f, "enable_trigger"),
-            OperationKind::Rename => write!(f, "rename"),
-            OperationKind::OpaqueSql => write!(f, "opaque_sql"),
-            OperationKind::CreateSchema => write!(f, "create_schema"),
-            OperationKind::SetDefault => write!(f, "set_default"),
-            OperationKind::CreateSequence => write!(f, "create_sequence"),
-            OperationKind::Conflict => write!(f, "conflict"),
-            OperationKind::Irreversible => write!(f, "irreversible"),
-            OperationKind::UnresolvedReference => write!(f, "unresolved_reference"),
-            OperationKind::Other(s) => write!(f, "{}", s),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub(crate) enum ObjectKind {
     Table,
     Index,
@@ -158,21 +57,25 @@ pub(crate) enum ViolationTier {
     Tier3, // SAFE — informational / low risk, sorts last
 }
 
+fn certainty_is_exact(&c: &Certainty) -> bool {
+    c.is_exact()
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct Violation {
     #[serde(skip)]
     pub source_range: Option<rowan::TextRange>,
     pub rule_id: &'static str,
-    pub operation_kind: OperationKind,
     pub object_kind: ObjectKind,
     pub object_name: String,
     pub tier: ViolationTier,
     pub reason: String,
     pub recipe: &'static str,
+    /// Internal warning-grouping hint. Never part of the report contract.
+    #[serde(skip)]
     pub dedup_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub sql: Option<String>,
-    #[serde(default)]
-    pub fk_dependency_related: bool,
 }
 
 /// Stable source location attached at reporting time. Rules remain independent
@@ -194,16 +97,29 @@ pub(crate) struct NotEvaluated {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sql: Option<String>,
     /// What would make this rule evaluable.
-    pub remediation: String,
+    pub recipe: String,
+    /// Out-of-scope schemas the boundary query actually observed, so the
+    /// remedy can name them instead of asking the reader to find them.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub missing_schemas: Vec<String>,
 }
 
 impl NotEvaluated {
     /// The command or setting that would supply the missing evidence.
-    pub(crate) fn remedy_for(cause: crate::_internal::analysis::evidence::EvidenceCode) -> String {
+    pub(crate) fn recipe_for(
+        cause: crate::_internal::analysis::evidence::EvidenceCode,
+        missing_schemas: &[String],
+    ) -> String {
         use crate::_internal::analysis::evidence::EvidenceCode;
         match cause {
             EvidenceCode::BaselineUnavailable => {
                 "Run `safe-migrate sync` to build a baseline.".to_string()
+            }
+            EvidenceCode::CatalogCoverageIncomplete if !missing_schemas.is_empty() => {
+                format!(
+                    "Add {} to `schemas` in safe-migrate.toml, then re-sync.",
+                    quote_schema_list(missing_schemas)
+                )
             }
             EvidenceCode::CatalogCoverageIncomplete => {
                 "Add the referenced schema to `schemas` in safe-migrate.toml, then re-sync."
@@ -216,8 +132,43 @@ impl NotEvaluated {
             EvidenceCode::UnmodeledState => {
                 "This PostgreSQL state is deliberately outside the model.".to_string()
             }
-            _ => "Set `assume_pg_version` or widen the baseline scope.".to_string(),
+            EvidenceCode::BaselineStale => {
+                "Run `safe-migrate sync` to refresh the stale baseline.".to_string()
+            }
+            EvidenceCode::UnresolvedReference => {
+                "Widen the baseline scope to include the referenced object, then re-sync."
+                    .to_string()
+            }
+            EvidenceCode::UnknownObjectState | EvidenceCode::TransactionStateUnknown => {
+                "Re-run `safe-migrate sync` with a wider schema scope so the object state is known, then re-run the analysis."
+                    .to_string()
+            }
         }
+    }
+}
+
+/// Render schema names as a readable list, quoting any that need it.
+fn quote_schema_list(schemas: &[String]) -> String {
+    let rendered: Vec<String> = schemas
+        .iter()
+        .map(|schema| {
+            let needs_quotes = schema.is_empty()
+                || !schema
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                || schema.chars().next().is_some_and(|c| c.is_ascii_digit());
+            if needs_quotes {
+                format!("\"{}\"", schema.replace('"', "\"\""))
+            } else {
+                schema.clone()
+            }
+        })
+        .collect();
+    match rendered.as_slice() {
+        [] => String::new(),
+        [only] => only.clone(),
+        [first, second] => format!("{first} and {second}"),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
     }
 }
 
@@ -234,6 +185,7 @@ pub(crate) struct ReportFinding {
     pub statement_index: Option<usize>,
     /// Certainty is independent of `violation.tier`: severity describes the
     /// operation, certainty describes the evidence behind it.
+    #[serde(skip_serializing_if = "certainty_is_exact")]
     pub certainty: Certainty,
 }
 

@@ -1,6 +1,6 @@
 use crate::_internal::analysis::mutations::Mutation;
 use crate::_internal::analysis::state::MutationResult;
-use crate::_internal::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
+use crate::_internal::report::violations::{ObjectKind, Violation, ViolationTier};
 use crate::_internal::rules::{
     FUNCTION_CAPABILITIES, FUNCTION_DEPENDENCY_CAPABILITIES, Rule, RuleCapability, RuleContext,
 };
@@ -25,20 +25,18 @@ impl Rule for FunctionVolatilityRule {
     fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
         let mut violations = Vec::new();
 
-        let (target_id, new_opts, is_create) = match context.mutation() {
+        let (target_id, new_opts) = match context.mutation() {
             Mutation::AlterFunction(alter) => {
                 if let crate::_internal::analysis::facts::AlterFunctionAction::OptionsChange(
                     new_opts,
                 ) = &alter.action
                 {
-                    (&alter.id, new_opts, false)
+                    (&alter.id, new_opts)
                 } else {
                     return violations;
                 }
             }
-            Mutation::CreateFunction(create) if create.or_replace => {
-                (&create.id, &create.options, true)
-            }
+            Mutation::CreateFunction(create) if create.or_replace => (&create.id, &create.options),
             _ => return violations,
         };
 
@@ -66,11 +64,6 @@ impl Rule for FunctionVolatilityRule {
                 violations.push(Violation {
                     source_range: None,
                     rule_id: self.id(),
-                    operation_kind: if is_create {
-                        OperationKind::CreateFunction
-                    } else {
-                        OperationKind::AlterFunction
-                    },
                     object_kind: ObjectKind::Function,
                     object_name: target_id.to_string(),
                     tier: self.default_tier(),
@@ -81,7 +74,6 @@ impl Rule for FunctionVolatilityRule {
                     recipe: self.recipe(),
                     dedup_key: None,
                     sql: None,
-                    fk_dependency_related: false,
                 });
             }
         }
@@ -135,7 +127,7 @@ impl Rule for BrokenComputeRule {
                     return vec![Violation {
                         source_range: None,
                         rule_id: self.id(),
-                        operation_kind: OperationKind::DropFunction,
+
                         object_kind: ObjectKind::Function,
                         object_name: function_id.to_string(),
                         tier: self.default_tier(),
@@ -146,7 +138,6 @@ impl Rule for BrokenComputeRule {
                         recipe: self.recipe(),
                         dedup_key: None,
                         sql: None,
-                        fk_dependency_related: false,
                     }];
                 }
             }

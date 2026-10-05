@@ -103,8 +103,12 @@ pub(crate) fn run_interactive(findings: &[ReportFinding], confidence: &Confidenc
                 Print(format!("[{:?}] ", v.tier)),
                 ResetColor,
                 Print(format!(
-                    "{} (rule: {})\r\n",
-                    terminal_inline(&v.operation_kind.to_string()),
+                    "{} ({})\r\n",
+                    terminal_inline(
+                        crate::_internal::rules::registry::find_primary_rule(v.rule_id)
+                            .map(|descriptor| descriptor.title)
+                            .unwrap_or(v.rule_id)
+                    ),
                     terminal_inline(v.rule_id)
                 ))
             )?;
