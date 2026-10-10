@@ -90,10 +90,12 @@ impl Resolver {
         let view_column = |output_name: String, declared: Option<&str>| ViewColumn {
             name: output_name,
             data_type: declared.map(|declared| {
-                TypeIdentity::from_syntax(&ParsedDataType::parse(declared)).render()
+                TypeIdentity::from_syntax(&ParsedDataType::parse(declared, state.builtin_types()))
+                    .render()
             }),
-            type_modifier: declared
-                .and_then(|declared| ParsedDataType::parse(declared).atttypmod_offset()),
+            type_modifier: declared.and_then(|declared| {
+                ParsedDataType::parse(declared, state.builtin_types()).atttypmod_offset()
+            }),
         };
 
         let mut columns = Vec::new();

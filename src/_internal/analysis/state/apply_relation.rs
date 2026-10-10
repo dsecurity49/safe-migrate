@@ -7,10 +7,9 @@ use crate::_internal::analysis::mutations::{
 };
 use crate::_internal::analysis::namespace::is_session_temp_schema;
 use crate::_internal::ast::identifiers::ObjectId;
+use crate::_internal::model::builtin_type::BuiltinTypeCatalogue;
 use crate::_internal::model::constraint::{ConstraintKind, ConstraintState};
-use crate::_internal::model::data_type::{
-    DataTypeFamily, ParsedDataType, WIDENED_NUMERIC_SCALE_VERSION,
-};
+use crate::_internal::model::data_type::{ParsedDataType, WIDENED_NUMERIC_SCALE_VERSION};
 use crate::_internal::model::relation::{ColumnAction, RelationKind, RelationState};
 use crate::_internal::model::sequence::{
     SequenceKind, SequenceOverlay, SequenceParameters, SequencePersistence, SequenceState,
@@ -24,7 +23,7 @@ impl AnalysisState {
     /// Reject a column type the target server version would refuse. Without a
     /// baseline the version is unknown, so this taints instead.
     pub(super) fn check_declared_type(&mut self, declared: &str) -> Option<MutationResult> {
-        if !ParsedDataType::parse(declared).needs_widened_numeric_scale() {
+        if !ParsedDataType::parse(declared, self.builtin_types()).needs_widened_numeric_scale() {
             return None;
         }
         match self.pg_version().num() {
@@ -4886,6 +4885,15 @@ impl AnalysisState {
         {
             return conflict;
         }
+        // Resolved before the mutable borrow below, which the catalogue lookup
+        // cannot coexist with.
+        let declared_type_modifier = match &alter.action {
+            AlterTableActionMutation::SetType { ty, .. } => {
+                ParsedDataType::parse(ty, self.builtin_types()).atttypmod_offset()
+            }
+            _ => None,
+        };
+
         let rel_overlay = self.local.relations.get_mut(&alter.id);
         #[allow(clippy::collapsible_if)]
         if let Some(RelationOverlay::Present(rel)) = rel_overlay {
@@ -5058,7 +5066,7 @@ impl AnalysisState {
                         // Keep type_modifier in sync with the new DDL-declared type so
                         // partition-column compatibility checks (which compare type_modifier
                         // between parent and child columns) remain correct after a type change.
-                        col.type_modifier = ParsedDataType::parse(ty).atttypmod_offset();
+                        col.type_modifier = declared_type_modifier;
                     }
                 }
                 AlterTableActionMutation::SetDefault { column, default } => {
@@ -6967,7 +6975,7 @@ impl AnalysisState {
             for element in elements {
                 values.push(decode_sql_literal(element)?);
             }
-            let mapped = elements_for_array(&values, &array_type)?;
+            let mapped = elements_for_array(&values, &array_type, self.builtin_types())?;
             let array_text = serialize_array_literal(&mapped);
             let suffix = &rest[close + 1..];
             return Some(format!(
@@ -7019,11 +7027,11 @@ impl AnalysisState {
                 .find(|c| &c.name == key_name)
                 .and_then(|c| c.data_type.as_deref())?;
 
-            let parsed = ParsedDataType::parse(col_type);
-            if parsed.family == DataTypeFamily::Unknown {
+            let parsed = ParsedDataType::parse(col_type, self.builtin_types());
+            if !parsed.is_builtin() {
                 return None;
             }
-            let comp_left = if parsed.family.requires_text_cast_for_comparison() {
+            let comp_left = if parsed.requires_text_cast_for_comparison() {
                 format!("({key})::text")
             } else {
                 key.clone()
@@ -7066,10 +7074,18 @@ impl AnalysisState {
                 for (i, datum) in lower_datums.iter().take(k_lower).enumerate() {
                     let mut and_clauses = Vec::new();
                     for (j, prev) in lower_datums.iter().take(i).enumerate() {
-                        let literal = deparse_partition_literal(column_types[j], &prev.text)?;
+                        let literal = deparse_partition_literal(
+                            column_types[j],
+                            &prev.text,
+                            self.builtin_types(),
+                        )?;
                         and_clauses.push(format!("({} = {})", comparison_lefts[j], literal));
                     }
-                    let literal = deparse_partition_literal(column_types[i], &datum.text)?;
+                    let literal = deparse_partition_literal(
+                        column_types[i],
+                        &datum.text,
+                        self.builtin_types(),
+                    )?;
                     if i == k_lower - 1 {
                         and_clauses.push(format!("({} >= {})", comparison_lefts[i], literal));
                     } else {
@@ -7107,10 +7123,18 @@ impl AnalysisState {
                 for (i, datum) in upper_datums.iter().take(k_upper).enumerate() {
                     let mut and_clauses = Vec::new();
                     for (j, prev) in upper_datums.iter().take(i).enumerate() {
-                        let literal = deparse_partition_literal(column_types[j], &prev.text)?;
+                        let literal = deparse_partition_literal(
+                            column_types[j],
+                            &prev.text,
+                            self.builtin_types(),
+                        )?;
                         and_clauses.push(format!("({} = {})", comparison_lefts[j], literal));
                     }
-                    let literal = deparse_partition_literal(column_types[i], &datum.text)?;
+                    let literal = deparse_partition_literal(
+                        column_types[i],
+                        &datum.text,
+                        self.builtin_types(),
+                    )?;
                     if i == k_upper - 1 && is_maxvalue {
                         and_clauses.push(format!("({} <= {})", comparison_lefts[i], literal));
                     } else {
@@ -7158,8 +7182,10 @@ impl AnalysisState {
 
             let value_check = match non_null_datums.as_slice() {
                 [single] => {
-                    let literal = deparse_partition_literal(column_type, &single.text)?;
-                    if column_type == "boolean" {
+                    let parsed = ParsedDataType::parse(column_type, self.builtin_types());
+                    let literal =
+                        deparse_partition_literal(column_type, &single.text, self.builtin_types())?;
+                    if parsed.is_named("bool") {
                         if literal == "true" {
                             key.clone()
                         } else if literal == "false" {
@@ -7177,17 +7203,15 @@ impl AnalysisState {
                     for datum in non_null_datums {
                         values.push(decode_sql_literal(&datum.text)?);
                     }
-                    let type_parsed = ParsedDataType::parse(column_type);
-                    let type_family = if type_parsed.family == DataTypeFamily::Unknown {
+                    let type_parsed = ParsedDataType::parse(column_type, self.builtin_types());
+                    if !type_parsed.is_builtin() {
                         return None;
-                    } else {
-                        type_parsed.family
-                    };
+                    }
                     let canonical_type = type_parsed.to_string();
-                    let mapped = elements_for_array(&values, column_type)?;
+                    let mapped = elements_for_array(&values, column_type, self.builtin_types())?;
                     if matches!(
-                        type_family,
-                        DataTypeFamily::Integer | DataTypeFamily::SmallInt | DataTypeFamily::BigInt
+                        type_parsed.builtin().map(|b| b.typname.as_str()),
+                        Some("int4" | "int2" | "int8")
                     ) {
                         format!("({comparison_left} = ANY (ARRAY[{}]))", mapped.join(", "))
                     } else {
@@ -7423,14 +7447,17 @@ fn array_element_type(elements: &[&str], fallback: &str) -> Option<String> {
 
 /// Render partition-list values in the array-constant element syntax for the
 /// key column type (`t`/`f` for booleans, otherwise the element text as-is).
-fn elements_for_array(values: &[String], column_type: &str) -> Option<Vec<String>> {
-    let parsed = ParsedDataType::parse(column_type);
-    if parsed.family == DataTypeFamily::Unknown {
+fn elements_for_array(
+    values: &[String],
+    column_type: &str,
+    catalogue: &BuiltinTypeCatalogue,
+) -> Option<Vec<String>> {
+    let parsed = ParsedDataType::parse(column_type, catalogue);
+    if !parsed.is_builtin() {
         return None;
     }
-    let family = parsed.family;
-    match family {
-        DataTypeFamily::Boolean => values
+    if parsed.is_named("bool") {
+        values
             .iter()
             .map(|value| {
                 if value.eq_ignore_ascii_case("true") {
@@ -7441,36 +7468,40 @@ fn elements_for_array(values: &[String], column_type: &str) -> Option<Vec<String
                     None
                 }
             })
-            .collect(),
-        DataTypeFamily::Numeric => {
-            let scale = ParsedDataType::parse(column_type).numeric_scale();
-            Some(
-                values
-                    .iter()
-                    .map(|value| {
-                        if is_plain_integer(value)
-                            && let Some(scale) = scale
-                        {
-                            let zeros = "0".repeat(scale.zero_padding());
-                            return format!("{value}.{zeros}");
-                        }
-                        value.clone()
-                    })
-                    .collect(),
-            )
-        }
-        DataTypeFamily::Integer
-        | DataTypeFamily::SmallInt
-        | DataTypeFamily::BigInt
-        | DataTypeFamily::Text
-        | DataTypeFamily::Name
-        | DataTypeFamily::CiText
-        | DataTypeFamily::CharacterVarying
-        | DataTypeFamily::Character
-        | DataTypeFamily::BpChar
-        | DataTypeFamily::Date
-        | DataTypeFamily::Timestamp => Some(values.to_vec()),
-        _ => None,
+            .collect()
+    } else if parsed.is_named("numeric") {
+        let scale = parsed.numeric_scale();
+        Some(
+            values
+                .iter()
+                .map(|value| {
+                    if is_plain_integer(value)
+                        && let Some(scale) = scale
+                    {
+                        let zeros = "0".repeat(scale.zero_padding());
+                        return format!("{value}.{zeros}");
+                    }
+                    value.clone()
+                })
+                .collect(),
+        )
+    } else if matches!(
+        parsed.builtin().map(|b| b.typname.as_str()),
+        Some(
+            "int2"
+                | "int4"
+                | "int8"
+                | "text"
+                | "name"
+                | "varchar"
+                | "bpchar"
+                | "date"
+                | "timestamp"
+        )
+    ) {
+        Some(values.to_vec())
+    } else {
+        None
     }
 }
 
@@ -7561,116 +7592,100 @@ fn predicate_column_name(predicate: &str) -> Option<String> {
 /// non-negative and quoted otherwise, smallint/bigint/real/double always
 /// quoted, numeric quoted unless it looks like a float literal, and
 /// text-like/uuid/ISO-date values quoted with a `::type` cast.
-fn deparse_partition_literal(data_type: &str, raw: &str) -> Option<String> {
+fn deparse_partition_literal(
+    data_type: &str,
+    raw: &str,
+    catalogue: &BuiltinTypeCatalogue,
+) -> Option<String> {
     let decoded = decode_sql_literal(raw)?;
-    let parsed = ParsedDataType::parse(data_type);
-    if parsed.family == DataTypeFamily::Unknown {
+    let parsed = ParsedDataType::parse(data_type, catalogue);
+    if !parsed.is_builtin() {
         return None;
     }
-    let family = parsed.family;
-    match family {
-        DataTypeFamily::Boolean => {
-            if decoded.eq_ignore_ascii_case("true") {
-                Some("true".to_string())
-            } else if decoded.eq_ignore_ascii_case("false") {
-                Some("false".to_string())
+    let typname = parsed
+        .builtin()
+        .map(|b| b.typname.as_str())
+        .unwrap_or_default();
+    if typname == "bool" {
+        if decoded.eq_ignore_ascii_case("true") {
+            Some("true".to_string())
+        } else if decoded.eq_ignore_ascii_case("false") {
+            Some("false".to_string())
+        } else {
+            None
+        }
+    } else if typname == "int4" {
+        let value: i64 = decoded.parse().ok()?;
+        if (i32::MIN as i64..=i32::MAX as i64).contains(&value) {
+            Some(if value >= 0 {
+                value.to_string()
             } else {
-                None
-            }
+                format!("'{value}'::integer")
+            })
+        } else {
+            None
         }
-        DataTypeFamily::Integer => {
-            let value: i64 = decoded.parse().ok()?;
-            if (i32::MIN as i64..=i32::MAX as i64).contains(&value) {
-                if value >= 0 {
-                    Some(value.to_string())
-                } else {
-                    Some(format!("'{}'::integer", value))
-                }
+    } else if typname == "int2" {
+        let value: i16 = decoded.parse().ok()?;
+        Some(format!("'{value}'::smallint"))
+    } else if typname == "int8" {
+        let value: i64 = decoded.parse().ok()?;
+        Some(format!("'{value}'::bigint"))
+    } else if typname == "numeric" {
+        // When the column type carries a typmod (e.g. numeric(10,2)), PostgreSQL's
+        // get_const_expr casts and applies the column scale: an integer input `5`
+        // is rendered as `5.00::numeric(10,2)` when scale=2.  Bare `numeric` with
+        // a float-like constant is printed without a cast.
+        if parsed.has_typmod() {
+            let scale = parsed.numeric_scale().map_or(0, |s| s.zero_padding());
+            let scaled = if is_plain_integer(&decoded) && scale > 0 {
+                format!("{decoded}.{}", "0".repeat(scale))
             } else {
-                None
-            }
+                decoded
+            };
+            Some(format!("{scaled}::{data_type}"))
+        } else if numeric_float_like(&decoded) {
+            Some(decoded)
+        } else {
+            Some(format!("'{decoded}'::numeric"))
         }
-        DataTypeFamily::SmallInt => {
-            let value: i16 = decoded.parse().ok()?;
-            Some(format!("'{}'::smallint", value))
-        }
-        DataTypeFamily::BigInt => {
-            let value: i64 = decoded.parse().ok()?;
-            Some(format!("'{}'::bigint", value))
-        }
-        DataTypeFamily::Numeric => {
-            // When the column type carries a typmod (e.g. numeric(10,2)), PostgreSQL's
-            // get_const_expr casts and applies the column scale: an integer input `5`
-            // is rendered as `5.00::numeric(10,2)` when scale=2.  Bare `numeric` with
-            // a float-like constant is printed without a cast.
-            let parsed_dt = ParsedDataType::parse(data_type);
-            let has_typmod = parsed_dt.has_typmod();
-            if has_typmod {
-                let scale = parsed_dt.numeric_scale().map_or(0, |s| s.zero_padding());
-                let scaled = if is_plain_integer(&decoded) && scale > 0 {
-                    let zeros = "0".repeat(scale);
-                    format!("{decoded}.{zeros}")
-                } else {
-                    decoded
-                };
-                Some(format!("{scaled}::{data_type}"))
-            } else if numeric_float_like(&decoded) {
-                Some(decoded)
-            } else {
-                Some(format!("'{}'::numeric", decoded))
-            }
-        }
-        DataTypeFamily::Real | DataTypeFamily::DoublePrecision => {
-            if numeric_float_like(&decoded) {
-                Some(format!("'{}'::{}", decoded, data_type))
-            } else {
-                None
-            }
-        }
-        DataTypeFamily::Date => {
-            if decoded.len() == 10
-                && decoded.as_bytes()[4] == b'-'
-                && decoded.as_bytes()[7] == b'-'
-                && decoded
-                    .chars()
-                    .enumerate()
-                    .all(|(index, ch)| (index == 4 || index == 7) || ch.is_ascii_digit())
-            {
-                Some(format!("'{}'::date", decoded))
-            } else {
-                None
-            }
-        }
-        DataTypeFamily::Uuid => {
-            if decoded.len() == 36
-                && decoded.as_bytes()[8] == b'-'
-                && decoded.as_bytes()[13] == b'-'
-                && decoded.as_bytes()[18] == b'-'
-                && decoded.as_bytes()[23] == b'-'
-                && decoded
-                    .chars()
-                    .all(|ch| ch.is_ascii_hexdigit() || ch == '-')
-            {
-                Some(format!("'{}'::uuid", decoded))
-            } else {
-                None
-            }
-        }
-        DataTypeFamily::Text
-        | DataTypeFamily::Name
-        | DataTypeFamily::CiText
-        | DataTypeFamily::CharacterVarying
-        | DataTypeFamily::Character
-        | DataTypeFamily::BpChar
-        | DataTypeFamily::Timestamp => Some(format!(
-            "'{}'::{}",
-            decoded.replace('\'', "''"),
-            ParsedDataType::parse(data_type)
-        )),
-        _ => None,
+    } else if typname == "float4" || typname == "float8" {
+        numeric_float_like(&decoded).then(|| format!("'{decoded}'::{data_type}"))
+    } else if typname == "date" {
+        is_iso_date(&decoded).then(|| format!("'{decoded}'::date"))
+    } else if typname == "uuid" {
+        is_uuid(&decoded).then(|| format!("'{decoded}'::uuid"))
+    } else if matches!(
+        typname,
+        "text" | "name" | "varchar" | "bpchar" | "timestamp"
+    ) {
+        // `timestamptz` is deliberately absent: how it renders depends on the
+        // session TimeZone setting, so a concrete bound would be fabricated.
+        Some(format!("'{}'::{}", decoded.replace('\'', "''"), parsed))
+    } else {
+        None
     }
 }
 
+/// `YYYY-MM-DD` with digits everywhere else.
+fn is_iso_date(value: &str) -> bool {
+    value.len() == 10
+        && value.as_bytes()[4] == b'-'
+        && value.as_bytes()[7] == b'-'
+        && value
+            .chars()
+            .enumerate()
+            .all(|(index, ch)| (index == 4 || index == 7) || ch.is_ascii_digit())
+}
+
+/// Canonical 8-4-4-4-12 hexadecimal form.
+fn is_uuid(value: &str) -> bool {
+    value.len() == 36
+        && [8, 13, 18, 23]
+            .iter()
+            .all(|index| value.as_bytes()[*index] == b'-')
+        && value.chars().all(|ch| ch.is_ascii_hexdigit() || ch == '-')
+}
 /// `get_const_expr` prints a NUMERIC constant bare when it looks like a float
 /// literal (starts with a digit and contains `.`, `e`, or `E`).
 fn numeric_float_like(value: &str) -> bool {

@@ -334,4 +334,99 @@ mod resolver_namespace_tests {
             "both spellings must name the same type"
         );
     }
+
+    /// T10: seven overloads differing only by built-in type collapsed into one
+    /// signature, because every unrecognised name rendered as nothing.
+    #[test]
+    fn built_in_overloads_keep_distinct_signatures() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        for declaration in [
+            "CREATE FUNCTION f(a bytea) RETURNS int LANGUAGE sql AS 'SELECT 1';",
+            "CREATE FUNCTION f(a jsonb) RETURNS int LANGUAGE sql AS 'SELECT 1';",
+            "CREATE FUNCTION f(a inet) RETURNS int LANGUAGE sql AS 'SELECT 1';",
+            "CREATE FUNCTION f(a text) RETURNS int LANGUAGE sql AS 'SELECT 1';",
+            "CREATE FUNCTION f(a varchar) RETURNS int LANGUAGE sql AS 'SELECT 1';",
+            "CREATE FUNCTION f(a uuid) RETURNS int LANGUAGE sql AS 'SELECT 1';",
+            "CREATE FUNCTION f(a xml) RETURNS int LANGUAGE sql AS 'SELECT 1';",
+        ] {
+            let findings = engine.analyze(declaration, &mut state).unwrap();
+            assert!(
+                !findings
+                    .iter()
+                    .any(|finding| finding.rule_id == "chain-conflict"),
+                "declaring a built-in overload must not conflict: {declaration} -> {findings:?}"
+            );
+        }
+
+        let mut identities = state
+            .local
+            .functions
+            .keys()
+            .map(|id| id.name.clone())
+            .collect::<Vec<_>>();
+        identities.sort();
+        assert_eq!(
+            identities,
+            [
+                "f(bytea)",
+                "f(character varying)",
+                "f(inet)",
+                "f(jsonb)",
+                "f(text)",
+                "f(uuid)",
+                "f(xml)",
+            ],
+            "each built-in argument type must give its own signature"
+        );
+    }
+
+    /// T10: the two identity paths must agree, so a canonical spelling written in
+    /// DDL and the same type read back from the catalog are one identity.
+    #[test]
+    fn written_and_catalog_spellings_share_one_identity() {
+        use safe_migrate::_internal::model::data_type::{ParsedDataType, TypeIdentity};
+
+        let state = setup_state();
+        for (written, canonical) in [
+            ("int", "integer"),
+            ("int4", "integer"),
+            ("integer", "integer"),
+            ("timestamptz", "timestamp with time zone"),
+            ("timestamp with time zone", "timestamp with time zone"),
+            ("bool", "boolean"),
+            ("boolean", "boolean"),
+            ("float", "double precision"),
+            ("float8", "double precision"),
+            ("varbit", "bit varying"),
+            ("varchar", "character varying"),
+        ] {
+            let identity =
+                TypeIdentity::from_syntax(&ParsedDataType::parse(written, state.builtin_types()));
+            assert_eq!(
+                identity.render(),
+                canonical,
+                "{written} must render as {canonical}"
+            );
+            assert!(
+                !identity.is_unknown(),
+                "{written} is a built-in and must not read as unresolved"
+            );
+        }
+    }
+
+    /// T63: `citext` is an extension type, never a pg_catalog built-in. Treating
+    /// it as native made a same-spelling user type unreachable.
+    #[test]
+    fn citext_is_not_a_builtin_family() {
+        let state = setup_state();
+        assert!(
+            !state
+                .builtin_types()
+                .resolve("citext")
+                .is_some_and(|entry| entry.typname == "citext"),
+            "citext only exists in pg_catalog when its extension is installed"
+        );
+    }
 }

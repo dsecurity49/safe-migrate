@@ -14,6 +14,12 @@ notes are available on the
 - `certainty` is reported only when it is not `exact`.
 - Remediation is labelled `recipe` in every output. `rules --json` moved to its
   own version 3, which is what tells consumers `remediation` became `recipe`.
+- Built-in types are read from `pg_catalog.pg_type` instead of a hand-written
+  table, so `bytea`, `jsonb`, `inet`, `xml`, `uuid` and the range types now
+  carry their own routine signatures and type identities rather than collapsing
+  into one. Type widths come from the catalog too.
+- `citext` is no longer assumed to be built in; it resolves only when the
+  extension is installed, so a user type of the same name is no longer shadowed.
 - Cache format V10; run `safe-migrate sync`. V1–V9 are rejected.
 - A scoped baseline now records cross-schema dependents for types, routines and
   indexes as well as relations, so a scoped `sync` no longer overlooks

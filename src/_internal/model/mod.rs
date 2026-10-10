@@ -1,3 +1,5 @@
+pub(crate) mod builtin_type;
+pub(crate) mod builtin_type_fallback;
 pub(crate) mod column;
 pub(crate) mod constraint;
 pub(crate) mod data_type;

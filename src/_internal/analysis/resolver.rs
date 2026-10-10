@@ -3,6 +3,7 @@ use crate::_internal::analysis::mutations::{Mutation, OpaqueMutation};
 use crate::_internal::analysis::namespace::temp_object_id;
 use crate::_internal::analysis::state::AnalysisState;
 use crate::_internal::ast::identifiers::{ObjectId, QualifiedName};
+use crate::_internal::model::builtin_type::BuiltinTypeCatalogue;
 use crate::_internal::model::data_type::{ParsedDataType, TypeIdentity};
 use crate::_internal::report::violations::ObjectKind;
 
@@ -187,17 +188,20 @@ impl Resolver {
         if let Some(id) = state.resolve_type_reference(raw) {
             return id.to_string();
         }
-        let identity = Self::normalize_function_arg_type(raw);
+        let identity = Self::normalize_function_arg_type(raw, state.builtin_types());
         // An unresolved custom type renders to nothing, so two distinct ones
         // would collapse into one signature. Keep its written name instead.
         if identity.is_unknown() {
-            return ParsedDataType::parse(raw).to_string();
+            return ParsedDataType::parse(raw, state.builtin_types()).to_string();
         }
         identity.render()
     }
 
-    pub(crate) fn normalize_function_arg_type(raw: &str) -> TypeIdentity {
-        TypeIdentity::from_syntax(&ParsedDataType::parse(raw))
+    pub(crate) fn normalize_function_arg_type(
+        raw: &str,
+        catalogue: &BuiltinTypeCatalogue,
+    ) -> TypeIdentity {
+        TypeIdentity::from_syntax(&ParsedDataType::parse(raw, catalogue))
     }
 
     pub(crate) fn resolve(fact: &StatementFact, state: &AnalysisState) -> Vec<Mutation> {

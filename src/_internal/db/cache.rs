@@ -1,4 +1,5 @@
 use crate::_internal::ast::identifiers::ObjectId;
+use crate::_internal::model::builtin_type::BuiltinTypeCatalogue;
 use crate::_internal::model::constraint::{ConstraintKind, ConstraintState};
 use crate::_internal::model::function::FunctionState;
 use crate::_internal::model::relation::{RelationKind, RelationState};
@@ -453,6 +454,12 @@ pub(crate) struct DbCache {
     #[serde(default)]
     pub bootstrap_superuser: Option<String>,
     pub schemas: HashMap<String, SchemaState>,
+    /// Built-in types of the synchronized cluster, derived from `pg_type`.
+    ///
+    /// `None` when no baseline was synchronized, which is distinct from an
+    /// empty catalogue: the former means "unknown", the latter cannot occur
+    /// against a real server.
+    pub builtin_types: Option<BuiltinTypeCatalogue>,
     pub sequences: HashMap<ObjectId, SequenceState>,
     pub dependencies: Vec<ViewDependencyCache>,
     /// Every observed cross-scope dependency edge, tagged with the catalog
@@ -474,7 +481,8 @@ pub(crate) struct DbCache {
 pub(crate) const CACHE_FORMAT_VERSION: u32 = 10;
 
 /// Current durable cache header. V10 records cross-scope dependency edges with
-/// both endpoints and a catalog family, so the boundary check is answerable.
+/// both endpoints and a catalog family, and the built-in type catalogue derived
+/// from `pg_type`, so a written type name resolves without a server.
 pub(crate) const CACHE_MAGIC: &[u8] = b"SMCACHE10";
 
 // The prefix read in `api.rs` consumes a fixed number of bytes, so the magic
@@ -568,6 +576,7 @@ impl DbCache {
             role_membership_grantors_complete: false,
             bootstrap_superuser: None,
             schemas: HashMap::new(),
+            builtin_types: None,
             sequences: HashMap::new(),
             dependencies: Vec::new(),
             scoped_external_dependencies: Vec::new(),

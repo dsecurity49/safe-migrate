@@ -10,6 +10,7 @@ use crate::_internal::ast::identifiers::ObjectId;
 use crate::_internal::db::cache::CatalogCoverage;
 use crate::_internal::db::cache::DbCache;
 use crate::_internal::db::cache::ScopedDependencyEdge;
+use crate::_internal::model::builtin_type::BuiltinTypeCatalogue;
 use crate::_internal::model::constraint::{ConstraintKind, ConstraintState};
 use crate::_internal::model::function::FunctionOverlay;
 pub(crate) use crate::_internal::model::relation::RelationOverlay;
@@ -166,6 +167,9 @@ pub(crate) struct LocalState {
     pub constraints: HashMap<(ObjectId, String), ConstraintState>,
     pub graph: DependencyGraph,
     pub search_path: Vec<String>,
+    /// Built-in types of the synchronized cluster, used to resolve written
+    /// type names. Empty only when no baseline supplied one.
+    pub builtin_types: BuiltinTypeCatalogue,
     /// Performance hint: a temporary object has been created in this session.
     /// `temp_namespace_exists` derives the real answer, so this only has to be
     /// a superset to stay correct across rollback and `ON COMMIT DROP`.
@@ -1286,6 +1290,10 @@ impl AnalysisState {
                 constraints,
                 graph,
                 search_path: default_search_path.clone(),
+                builtin_types: cache
+                    .builtin_types
+                    .clone()
+                    .unwrap_or_else(BuiltinTypeCatalogue::fallback),
                 saw_temp_object: false,
                 default_search_path,
                 search_path_template: default_search_path_template.clone(),
@@ -1430,6 +1438,12 @@ impl AnalysisState {
     /// this accessor prevents callers from coupling themselves to `LocalState`.
     pub(crate) fn search_path(&self) -> &[String] {
         &self.local.search_path
+    }
+
+    /// Built-in types of the synchronized cluster, used to resolve written type
+    /// names to catalog identities.
+    pub(crate) fn builtin_types(&self) -> &BuiltinTypeCatalogue {
+        &self.local.builtin_types
     }
 
     /// Whether this session has a temporary schema, which is searched before

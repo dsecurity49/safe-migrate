@@ -9,6 +9,7 @@ use crate::_internal::db::cache_file::{
     MAX_CACHE_DECODE_BYTES, MAX_CACHE_FILE_BYTES, protect_cache_bytes,
     protect_cache_bytes_with_key, validate_cache_encryption_configuration,
 };
+use crate::_internal::model::builtin_type::BuiltinTypeCatalogue;
 use crate::_internal::model::relation::{Persistence, RelationKind, RelationState};
 use anyhow::{Context, Result};
 use postgres::config::Host;
@@ -2497,6 +2498,7 @@ fn load_routines(
     client: &mut impl GenericClient,
     schema_values: &Option<Vec<String>>,
     schema_filter: &str,
+    builtin_types: &BuiltinTypeCatalogue,
 ) -> Result<std::collections::HashMap<ObjectId, crate::_internal::model::function::FunctionState>> {
     let query = format!(
         "
@@ -2553,6 +2555,7 @@ fn load_routines(
                 .map(|arg_type| {
                     crate::_internal::analysis::resolver::Resolver::normalize_function_arg_type(
                         arg_type,
+                        builtin_types,
                     )
                     .render()
                 })
@@ -2596,6 +2599,76 @@ fn load_routines(
             ))
         })
         .collect()
+}
+
+/// Load the built-in types the analyzer can name in a migration.
+///
+/// Only what a migration can actually declare is kept. Arrays are excluded
+/// because `typarray` plus `[]` already describes them, composites because a
+/// table's row type belongs to the relation cache, and pseudo-types because
+/// `format_type` already returns their `typname`, so they need no mapping.
+///
+/// Arrays are identified by `typcategory`, not `typelem`: `name`, `box`,
+/// `line`, `lseg` and `point` all carry a non-zero `typelem` recording their
+/// array linkage while being ordinary declarable types themselves.
+///
+/// Must run after the connection pins `search_path` to `pg_catalog`, otherwise
+/// `format_type` schema-qualifies every name.
+fn load_builtin_types(
+    client: &mut impl GenericClient,
+) -> Result<crate::_internal::model::builtin_type::BuiltinTypeCatalogue> {
+    let rows = client
+        .query(
+            "
+            SELECT
+                t.oid,
+                t.typname,
+                pg_catalog.format_type(t.oid, NULL) AS canonical,
+                t.typcategory::text AS category,
+                t.typlen,
+                t.typarray,
+                t.typmodout <> 0 AS accepts_typmod
+            FROM pg_catalog.pg_type t
+            JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
+            WHERE n.nspname = 'pg_catalog'
+              AND t.typtype IN ('b', 'r', 'm')
+              AND t.typcategory <> 'A';
+            ",
+            &[],
+        )
+        .context("Failed to load built-in types")?;
+
+    let types = rows
+        .into_iter()
+        .map(|row| {
+            use crate::_internal::model::builtin_type::{BuiltinType, TypeCategory};
+            // `typlen` is negative for variable-length types, so only a
+            // positive value states a fixed width.
+            let typlen: i16 = row.try_get("typlen").context("built-in type length")?;
+            let category: String = row.try_get("category").context("built-in type category")?;
+            Ok(BuiltinType {
+                oid: Some(row.try_get("oid").context("built-in type oid")?),
+                typname: row.try_get("typname").context("built-in type name")?,
+                canonical: row
+                    .try_get("canonical")
+                    .context("built-in type canonical name")?,
+                category: TypeCategory::from_catalog(&category),
+                fixed_bits: (typlen > 0).then(|| i32::from(typlen) * 8),
+                array_oid: match row
+                    .try_get::<_, u32>("typarray")
+                    .context("built-in type array oid")?
+                {
+                    0 => None,
+                    oid => Some(oid),
+                },
+                accepts_typmod: row
+                    .try_get("accepts_typmod")
+                    .context("built-in type typmod flag")?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(crate::_internal::model::builtin_type::BuiltinTypeCatalogue::new(types))
 }
 
 fn load_types(
@@ -3162,6 +3235,12 @@ fn populate_cache_from_client(
     // Schemas are an authoritative catalog only for the requested sync scope.
     // FK-only external schemas pulled in below deliberately do not enter it.
     cache.schemas = load_schemas(client, &schema_values, schema_filter)?;
+
+    // Built-ins are cluster-wide, so they are read once and never scoped, and
+    // they are read first because every loader that renders a type name needs
+    // them to agree with what a migration would resolve.
+    cache.builtin_types = Some(load_builtin_types(client)?);
+    let builtin_types = cache.builtin_types.as_ref().expect("just loaded");
     coverage.record(CatalogFamily::Schemas);
     // A scoped request can name schemas that do not exist yet. PostgreSQL's
     // effective search path skips those entries, so do not let them become
@@ -3237,7 +3316,7 @@ fn populate_cache_from_client(
     cache.indexes = load_indexes(client, &schema_values, schema_filter_nt)?;
     coverage.record(CatalogFamily::Indexes);
 
-    cache.functions = load_routines(client, &schema_values, schema_filter)?;
+    cache.functions = load_routines(client, &schema_values, schema_filter, builtin_types)?;
     coverage.record(CatalogFamily::Routines);
 
     cache.publications = load_publications(client, cache.pg_version_num.unwrap_or_default())?;

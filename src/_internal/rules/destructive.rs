@@ -1,5 +1,6 @@
 use crate::_internal::analysis::mutations::{AlterTableActionMutation, Mutation};
 use crate::_internal::analysis::state::MutationResult;
+use crate::_internal::model::builtin_type::BuiltinTypeCatalogue;
 use crate::_internal::model::data_type::ParsedDataType;
 use crate::_internal::report::violations::{ObjectKind, Violation, ViolationTier};
 use crate::_internal::rules::{
@@ -459,7 +460,7 @@ impl Rule for ReversibilityRule {
         {
             // Only flag as "conditionally reversible" if there's actual data loss risk
             // (e.g., narrowing, not widening). Table rewrites are handled by TypeChangeRewriteRule.
-            if is_type_change_lossy(old_ty, ty) {
+            if is_type_change_lossy(old_ty, ty, state.builtin_types()) {
                 let rows = rel.estimated_rows.unwrap_or(config.default_rows);
                 let tier = if rows >= config.rule_tier1_threshold(self.id()) {
                     ViolationTier::Tier1
@@ -575,9 +576,9 @@ impl Rule for ReversibilityRule {
 /// Checks if a type change represents actual data loss (narrowing), not just a rewrite.
 /// This is used by ReversibilityRule to distinguish between "safe widening" (e.g., INT->BIGINT)
 /// and genuinely lossy changes (e.g., BIGINT->INT, VARCHAR(255)->VARCHAR(50), TEXT->VARCHAR(n)).
-fn is_type_change_lossy(old_type: &str, new_type: &str) -> bool {
-    let old_parsed = ParsedDataType::parse(old_type);
-    let new_parsed = ParsedDataType::parse(new_type);
+fn is_type_change_lossy(old_type: &str, new_type: &str, catalogue: &BuiltinTypeCatalogue) -> bool {
+    let old_parsed = ParsedDataType::parse(old_type, catalogue);
+    let new_parsed = ParsedDataType::parse(new_type, catalogue);
     old_parsed.is_lossy_narrowing_to(&new_parsed)
 }
 
@@ -661,19 +662,22 @@ impl Rule for GeneralCascadeRule {
 pub(crate) struct TypeChangeRewriteRule;
 
 impl TypeChangeRewriteRule {
-    fn is_type_change_safe(old_type: &str, new_type: &str, pg_version: u32) -> bool {
+    fn is_type_change_safe(
+        old_type: &str,
+        new_type: &str,
+        pg_version: u32,
+        catalogue: &BuiltinTypeCatalogue,
+    ) -> bool {
         if old_type.eq_ignore_ascii_case(new_type) {
             return true;
         }
 
-        let old_dt = ParsedDataType::parse(old_type);
-        let new_dt = ParsedDataType::parse(new_type);
-
-        use crate::_internal::model::data_type::DataTypeFamily;
+        let old_dt = ParsedDataType::parse(old_type, catalogue);
+        let new_dt = ParsedDataType::parse(new_type, catalogue);
 
         // Varchar widening is a metadata-only change.
-        if old_dt.family.is_text_like() && new_dt.family.is_text_like() {
-            if new_dt.family == DataTypeFamily::Text || !new_dt.has_typmod() {
+        if old_dt.is_text_like() && new_dt.is_text_like() {
+            if new_dt.is_named("text") || !new_dt.has_typmod() {
                 return true; // Widening to unbounded text/varchar.
             }
             if let (Some(old_limit), Some(new_limit)) =
@@ -685,7 +689,7 @@ impl TypeChangeRewriteRule {
         }
 
         // Numeric widening is a metadata-only change in PG >= 12.
-        if pg_version >= 120_000 && old_dt.family.is_numeric() && new_dt.family.is_numeric() {
+        if pg_version >= 120_000 && old_dt.is_exact_numeric() && new_dt.is_exact_numeric() {
             if !new_dt.has_typmod() {
                 return true; // Widening to unconstrained numeric.
             }
@@ -759,7 +763,9 @@ impl Rule for TypeChangeRewriteRule {
                     // A USING expression always forces a full table rewrite.
                     let safe = !has_using
                         && old_ty
-                            .map(|o| Self::is_type_change_safe(o, ty, pg_version))
+                            .map(|o| {
+                                Self::is_type_change_safe(o, ty, pg_version, state.builtin_types())
+                            })
                             .unwrap_or(false);
                     (
                         safe,
@@ -779,7 +785,7 @@ impl Rule for TypeChangeRewriteRule {
                     ViolationTier::Tier2
                 };
 
-                if is_type_change_lossy(&old_type_str, ty) {
+                if is_type_change_lossy(&old_type_str, ty, state.builtin_types()) {
                     violations.push(Violation { source_range: None,
                         rule_id: self.id(),
 
