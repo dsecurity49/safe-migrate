@@ -3,6 +3,7 @@ mod resolver_namespace_tests {
     use crate::common::{object_id, setup_engine, setup_state};
     use safe_migrate::_internal::model::function::FunctionOverlay;
     use safe_migrate::_internal::model::relation::RelationOverlay;
+    use safe_migrate::_internal::model::schema::SchemaState;
 
     fn assert_no_conflict(findings: &[safe_migrate::_internal::report::violations::Violation]) {
         assert!(
@@ -240,6 +241,97 @@ mod resolver_namespace_tests {
                 .relations
                 .keys()
                 .any(|id| id.name.ends_with('x') || id.name.ends_with('y'))
+        );
+    }
+
+    /// A scoped sync hides schemas outside `--schemas`, but `search_path` still
+    /// names them, and an out-of-scope entry may *precede* an in-scope one.
+    /// PostgreSQL would search `public` first; dropping it silently retargets
+    /// the reference to `app` and reports drift on a table that may well live in
+    /// `public`. The lookup must stay unknown instead.
+    #[test]
+    fn unqualified_reference_through_out_of_scope_search_path_entry_is_unknown() {
+        let engine = setup_engine();
+        let mut cache = crate::common::synced_cache();
+        cache.metadata.schemas = Some(vec!["app".to_string()]);
+        // What sync actually observed: `public` first, then the scoped `app`.
+        cache.metadata.source_search_path = Some(vec!["public".to_string(), "app".to_string()]);
+        cache.search_path = vec!["app".to_string()];
+        cache.schemas.insert(
+            "app".to_string(),
+            SchemaState {
+                name: "app".to_string(),
+                owner: object_id("", "postgres"),
+                generation: 0,
+            },
+        );
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
+
+        let findings = engine
+            .analyze(
+                "ALTER TABLE external_table ADD COLUMN note text;",
+                &mut state,
+            )
+            .unwrap();
+
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.rule_id == "chain-conflict"),
+            "an unresolvable reference must not be reported as a chain conflict: \
+             {findings:?}"
+        );
+        let coverage = findings
+            .iter()
+            .find(|finding| finding.rule_id == "schema-drift")
+            .expect("an omitted schema must be reported as unknown coverage");
+        assert_eq!(
+            coverage.tier,
+            safe_migrate::_internal::report::violations::ViolationTier::Tier2,
+            "an unverifiable reference is a coverage gap, not a Tier1 drift claim"
+        );
+        assert!(coverage.reason.contains("does not cover schema \"public\""));
+        assert!(
+            !coverage.reason.contains("does not exist"),
+            "coverage must never be reported as proven absence: {}",
+            coverage.reason
+        );
+        assert!(
+            !coverage.object_name.starts_with("app."),
+            "the reference must keep the schema PostgreSQL searched first: {}",
+            coverage.object_name
+        );
+        assert!(
+            state.evidence().iter().any(|record| {
+                record.code
+                    == safe_migrate::_internal::analysis::evidence::EvidenceCode::UnknownObjectState
+            }),
+            "a search_path entry outside the synced scope must taint the lookup: {:?}",
+            state.evidence()
+        );
+    }
+
+    /// PostgreSQL searches the session temporary schema before every explicit
+    /// path entry, for relations and types alike. A type reference must agree
+    /// with the relation resolver, or `f(x tt)` and `f(x pg_temp.tt)` become two
+    /// signatures for one type.
+    #[test]
+    fn unqualified_type_reference_searches_the_session_temporary_schema() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze("CREATE TEMP TABLE tt(a integer);", &mut state)
+            .unwrap();
+
+        assert_eq!(
+            state.resolve_type_reference("tt"),
+            Some(object_id("pg_temp", "tt")),
+            "an unqualified type must resolve through pg_temp"
+        );
+        assert_eq!(
+            state.resolve_type_reference("pg_temp.tt"),
+            Some(object_id("pg_temp", "tt")),
+            "both spellings must name the same type"
         );
     }
 }

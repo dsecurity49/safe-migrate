@@ -208,7 +208,11 @@ fn schema_rename_remaps_namespace_and_rolls_back_atomically() {
             .contains(&object_id("schema_new", "t"))
     );
     assert_eq!(state.local.search_path_template, ["schema_old", "public"]);
-    assert_eq!(state.local.search_path, ["public"]);
+    // The template stays the session's own setting, so `SET search_path TO
+    // DEFAULT` restores it unchanged. The effective path additionally carries
+    // every scoped schema, which is what `cache_search_path` would have merged
+    // in at sync time.
+    assert_eq!(state.local.search_path, ["public", "schema_new"]);
     assert!(matches!(
         state.local.publications.get("app_publication"),
         Some(safe_migrate::_internal::model::replication::PublicationOverlay::Present(publication))

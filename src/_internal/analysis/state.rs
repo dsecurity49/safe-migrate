@@ -884,15 +884,19 @@ impl AnalysisState {
         let source_statement_timeout =
             baseline_available.then_some(cache.metadata.source_statement_timeout_ms);
         let default_search_path = cache.search_path.clone();
-        let default_search_path_template = if cache.metadata.schemas.is_none() {
-            cache
-                .metadata
-                .source_search_path
-                .clone()
-                .unwrap_or_else(|| default_search_path.clone())
-        } else {
-            default_search_path.clone()
-        };
+        // The template must be the path PostgreSQL actually searched. Under a
+        // `--schemas` scope the cache's resolved path has already had every
+        // out-of-scope entry dropped, so resolving against it would retarget an
+        // unqualified name to a schema PostgreSQL never reached first. The raw
+        // setting keeps those entries visible, where they become unknown rather
+        // than absent. The scope is deliberately not appended here: the template
+        // is what `SET search_path TO DEFAULT` restores, and that must be the
+        // session's own setting.
+        let default_search_path_template = cache
+            .metadata
+            .source_search_path
+            .clone()
+            .unwrap_or_else(|| default_search_path.clone());
         let current_role_known = cache.metadata.source_role.is_some();
         let current_role = cache
             .metadata
@@ -1933,17 +1937,16 @@ impl AnalysisState {
     }
 
     pub(crate) fn resolve_type_reference(&self, raw: &str) -> Option<ObjectId> {
-        Self::resolve_type_reference_from_catalog(
-            raw,
-            &self.local.types,
-            &self.local.search_path,
-            |id| {
-                matches!(
-                    self.local.relations.get(id),
-                    Some(RelationOverlay::Present(_))
-                )
-            },
-        )
+        // PostgreSQL searches the session temporary schema before every explicit
+        // path entry for types as well as relations, so this must agree with
+        // `resolve_type_lookup_name` or one type has two identities.
+        let search_path = self.relation_search_path();
+        Self::resolve_type_reference_from_catalog(raw, &self.local.types, &search_path, |id| {
+            matches!(
+                self.local.relations.get(id),
+                Some(RelationOverlay::Present(_))
+            )
+        })
     }
 
     fn type_reference_name(id: &ObjectId, qualified: bool) -> String {
@@ -2812,7 +2815,23 @@ impl AnalysisState {
     }
 
     fn refresh_role_sensitive_search_path(&mut self) {
-        let template = self.local.search_path_template.clone();
+        // PostgreSQL searches `pg_catalog` implicitly when the path omits it,
+        // but sync excludes every system schema from the model (`sync.rs`
+        // filters `pg_%` and `pg_catalog`), so searching it can never match.
+        // Adding it would only risk naming `pg_catalog` as a creation target.
+        let mut template = self.local.search_path_template.clone();
+        // A scoped sync must keep every requested schema reachable even when the
+        // session path does not name it. This belongs to the effective path
+        // rather than the template, which stands for the session's own setting.
+        if let Some(scope) = self.baseline_schemas.as_ref() {
+            let mut requested: Vec<&String> = scope.iter().collect();
+            requested.sort();
+            for schema in requested {
+                if !template.contains(schema) {
+                    template.push(schema.clone());
+                }
+            }
+        }
         let mut effective = Vec::new();
         let mut role_identity_unknown = false;
         let mut schema_state_unknown = false;
