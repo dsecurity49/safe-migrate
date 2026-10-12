@@ -284,4 +284,33 @@ mod invariant_sequences {
             "repeated analysis must produce identical reports"
         );
     }
+
+    // T43: every path that touches index topology must leave it consistent.
+    #[test]
+    fn index_partition_topology_stays_consistent_across_every_path() {
+        let mut state = setup_state();
+        for sql in [
+            "CREATE TABLE p (a integer, b text) PARTITION BY RANGE (a);",
+            "CREATE INDEX p_b ON p (b);",
+            // T42: creating the partition attaches its index.
+            "CREATE TABLE c PARTITION OF p FOR VALUES FROM (0) TO (10);",
+            // T41: attaching a partition reuses the child index and attaches it.
+            "CREATE TABLE d (a integer, b text);",
+            "CREATE INDEX d_b ON d (b);",
+            "ALTER TABLE p ATTACH PARTITION d FOR VALUES FROM (10) TO (20);",
+            // T38: re-attaching an already attached relationship is a no-op.
+            "ALTER INDEX p_b ATTACH PARTITION d_b;",
+            // T40: detaching releases the attachment, leaving no stale edge.
+            "ALTER TABLE p DETACH PARTITION d;",
+            // Dropping the parent index takes the attached child with it.
+            "DROP INDEX p_b;",
+        ] {
+            let _ = setup_engine().analyze(sql, &mut state).expect("statement");
+            assert_state_invariants(&state);
+        }
+        assert!(!state.local.graph.edges().iter().any(|edge| matches!(
+            edge.kind,
+            safe_migrate::_internal::analysis::graph::DependencyKind::IndexPartitionOf
+        )));
+    }
 }

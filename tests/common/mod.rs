@@ -56,7 +56,32 @@ pub(crate) fn synced_cache() -> DbCache {
     let mut cache = DbCache::new();
     cache.coverage =
         CatalogCoverage::for_families(SchemaCoverage::from_sync_scope(None), CatalogFamily::ALL);
+    cache.opclasses = Some(default_opclasses());
     cache
+}
+
+/// The default operator classes `sync` would load, reduced to the entries a
+/// test can rely on. Mirrors PostgreSQL's own defaults for btree and hash.
+fn default_opclasses() -> crate::_internal::model::opclass::OpclassCatalogue {
+    use crate::_internal::model::opclass::{OpclassCatalogue, OpclassEntry};
+    let mut catalogue = Vec::new();
+    for (intype, name) in [
+        ("int4", "int4_ops"),
+        ("text", "text_ops"),
+        ("varchar", "varchar_ops"),
+        ("bool", "bool_ops"),
+        ("date", "date_ops"),
+        ("timestamptz", "timestamptz_ops"),
+    ] {
+        catalogue.push(OpclassEntry {
+            name: name.to_string(),
+            namespace: "pg_catalog".to_string(),
+            intype: intype.to_string(),
+            method: "btree".to_string(),
+            is_default: true,
+        });
+    }
+    OpclassCatalogue::from_entries(catalogue)
 }
 
 /// The synthetic empty cache `Baseline::unavailable()` produces, whose coverage

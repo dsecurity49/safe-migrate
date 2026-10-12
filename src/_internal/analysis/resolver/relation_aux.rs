@@ -1,4 +1,5 @@
 use super::Resolver;
+use crate::_internal::analysis::expr_ir::ExprIr;
 use crate::_internal::analysis::facts::{
     AlterIndexActionFact, AlterMaterializedViewActionFact, AlterViewAction, PolicyCommand,
     ReindexTargetKindFact, SelectOutputFact, StatisticsTarget,
@@ -12,6 +13,7 @@ use crate::_internal::analysis::mutations::{
 use crate::_internal::analysis::state::AnalysisState;
 use crate::_internal::ast::identifiers::{ObjectId, QualifiedName};
 use crate::_internal::model::data_type::{ParsedDataType, TypeIdentity};
+use crate::_internal::model::index::IndexOrder;
 
 impl Resolver {
     pub(super) fn resolve_reindex(
@@ -246,8 +248,11 @@ impl Resolver {
         has_predicate: bool,
         unique: bool,
         key_columns: &[String],
+        key_expressions: &[Option<ExprIr>],
+        key_orders: &[IndexOrder],
+        key_opclasses: &[Option<String>],
+        key_collations: &[Option<String>],
         included_columns: &[String],
-        has_expression_keys: bool,
         has_default_sort_order: bool,
         has_default_opclasses: bool,
         has_default_collations: bool,
@@ -270,8 +275,11 @@ impl Resolver {
             has_predicate,
             unique,
             key_columns: key_columns.to_vec(),
+            key_expressions: key_expressions.to_vec(),
+            key_orders: key_orders.to_vec(),
+            key_opclasses: key_opclasses.to_vec(),
+            key_collations: key_collations.to_vec(),
             included_columns: included_columns.to_vec(),
-            has_expression_keys,
             has_default_sort_order,
             has_default_opclasses,
             has_default_collations,

@@ -9,6 +9,7 @@ use crate::_internal::analysis::mutations::{
 };
 use crate::_internal::ast::identifiers::ObjectId;
 use crate::_internal::model::column::Column;
+use crate::_internal::model::index::{IndexDefinition, index_keys};
 use crate::_internal::model::relation::{Persistence, RelationKind, RelationState};
 use crate::_internal::model::reloption::{
     ReloptionOutcome, classify, materialized_view_reloption, view_reloption,
@@ -191,16 +192,20 @@ impl AnalysisState {
         kind_name: &str,
     ) -> MutationResult {
         let roots = present.iter().cloned().collect::<HashSet<_>>();
+        // View dependency rows are scope-aware, but expression and extension
+        // dependent objects outside the selected schemas are not yet a
+        // complete catalog contract. That widens what CASCADE may remove; it
+        // does not cancel the drop, which PostgreSQL performs either way.
         if present.iter().any(|id| {
             self.baseline_scoped_family_object(
                 id,
                 crate::_internal::db::cache::CatalogFamily::Relations,
             )
         }) {
-            // View dependency rows are scope-aware, but expression and
-            // extension-dependent objects outside the selected schemas are
-            // not yet represented as a complete catalog contract.
-            return self.unresolved(EvidenceCode::CatalogCoverageIncomplete);
+            self.taint(
+                EvidenceCode::CatalogCoverageIncomplete,
+                EvidenceScope::Chain,
+            );
         }
         if !cascade && self.has_external_view_dependents(&roots) {
             return MutationResult::conflict(format!(
@@ -527,37 +532,34 @@ impl AnalysisState {
             create.id.clone(),
             create.table.clone(),
             DependencyKind::IndexOnRelation {
-                using_method: create
-                    .using_method
-                    .clone()
-                    .or_else(|| Some("btree".to_string())),
-                key_columns: create.key_columns.clone(),
-                included_columns: create.included_columns.clone(),
+                definition: IndexDefinition {
+                    method: create
+                        .using_method
+                        .clone()
+                        .or_else(|| Some("btree".to_string())),
+                    keys: self.resolved_statement_index_keys(create),
+                    included: index_keys(create.included_columns.clone()),
+                    expression_keys: create
+                        .key_expressions
+                        .iter()
+                        .filter(|key| key.is_some())
+                        .count(),
+                    unique: create.unique,
+                    predicate: create.has_predicate,
+                    valid: true,
+                    ready: true,
+                    live: true,
+                },
                 dependency_columns: create
                     .key_columns
                     .iter()
                     .chain(&create.included_columns)
                     .cloned()
                     .collect(),
-                dependency_columns_known: !create.has_expression_keys && !create.has_predicate,
-                has_expression_keys: create.has_expression_keys,
-                has_predicate: create.has_predicate,
+                dependency_columns_known: create.key_expressions.iter().all(Option::is_none)
+                    && !create.has_predicate,
                 is_concurrent: create.concurrently,
-                is_unique: create.unique,
-                // PostgreSQL-created indexes are immediate unless a
-                // constraint later adopts them with deferred semantics.
                 is_immediate: true,
-                is_valid: true,
-                is_ready: true,
-                is_live: true,
-                has_default_sort_order: create.has_default_sort_order,
-                has_default_opclasses: create.has_default_opclasses,
-                has_default_collations: create.has_default_collations,
-                // Eligibility facts are known even when dependency-column
-                // proof is incomplete: expression and partial indexes are
-                // deterministically ineligible for USING INDEX. Keep that
-                // distinction separate from dependency_columns_known, which
-                // governs exact column-drop cleanup.
                 eligibility_known: true,
             },
         ));
@@ -761,21 +763,22 @@ impl AnalysisState {
                 return self.unresolved(EvidenceCode::CatalogCoverageIncomplete);
             }
         }
+        // An attached child index cannot be dropped on its own. PostgreSQL
+        // refuses unconditionally here: CASCADE does not help and IF EXISTS
+        // does not downgrade it.
+        for target in &targets {
+            if let Some(parent) = self.index_parent_of(target) {
+                return MutationResult::conflict(format!(
+                    "cannot drop index '{}' because index '{}' requires it",
+                    target.name, parent.name
+                ));
+            }
+        }
         // An attached partition index goes with its parent.
-        let attached_children = self
-            .local
-            .graph
-            .edges()
+        let attached_children: Vec<ObjectId> = targets
             .iter()
-            .filter(|edge| {
-                matches!(edge.kind, DependencyKind::IndexPartitionOf)
-                    && targets.iter().any(|target| {
-                        self.local.graph.resolve_rename(target)
-                            == self.local.graph.resolve_rename(&edge.referenced)
-                    })
-            })
-            .map(|edge| edge.dependent.clone())
-            .collect::<Vec<_>>();
+            .flat_map(|target| self.index_partitions_of(target))
+            .collect();
         let mut removed = targets.clone();
         removed.extend(attached_children.iter().cloned());
         let table_indexes = self

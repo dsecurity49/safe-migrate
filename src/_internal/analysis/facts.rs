@@ -1,5 +1,6 @@
 use crate::_internal::analysis::expr_ir::ExprIr;
 use crate::_internal::ast::identifiers::{Ident, QualifiedName};
+use crate::_internal::model::index::IndexOrder;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum PersistenceFact {
@@ -222,8 +223,16 @@ pub(crate) enum StatementFact {
         has_predicate: bool,
         unique: bool,
         key_columns: Vec<String>,
+        /// Aligned with key positions; `Some` is the parsed expression for an
+        /// expression key and `None` for a plain column.
+        key_expressions: Vec<Option<ExprIr>>,
+        /// Aligned with key positions.
+        key_orders: Vec<IndexOrder>,
+        /// Aligned with key positions; `None` means the type's default.
+        key_opclasses: Vec<Option<String>>,
+        /// Aligned with key positions; `None` means not collatable.
+        key_collations: Vec<Option<String>>,
         included_columns: Vec<String>,
-        has_expression_keys: bool,
         has_default_sort_order: bool,
         has_default_opclasses: bool,
         has_default_collations: bool,

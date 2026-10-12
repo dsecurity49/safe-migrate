@@ -4,6 +4,8 @@ pub(crate) mod column;
 pub(crate) mod constraint;
 pub(crate) mod data_type;
 pub(crate) mod function;
+pub(crate) mod index;
+pub(crate) mod opclass;
 pub(crate) mod relation;
 pub(crate) mod reloption;
 pub(crate) mod replication;

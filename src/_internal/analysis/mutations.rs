@@ -4,6 +4,7 @@ use crate::_internal::analysis::facts::{
     TimeoutSettingValue,
 };
 use crate::_internal::ast::identifiers::ObjectId;
+use crate::_internal::model::index::IndexOrder;
 use crate::_internal::model::types::TypeKind;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -473,8 +474,12 @@ pub(crate) struct CreateIndex {
     pub has_predicate: bool,
     pub unique: bool,
     pub key_columns: Vec<String>,
+    /// Aligned with key positions; `Some` carries the parsed expression.
+    pub key_expressions: Vec<Option<ExprIr>>,
+    pub key_orders: Vec<IndexOrder>,
+    pub key_opclasses: Vec<Option<String>>,
+    pub key_collations: Vec<Option<String>>,
     pub included_columns: Vec<String>,
-    pub has_expression_keys: bool,
     pub has_default_sort_order: bool,
     pub has_default_opclasses: bool,
     pub has_default_collations: bool,

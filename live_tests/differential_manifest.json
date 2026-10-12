@@ -81,7 +81,8 @@
     "relations",
     "indexes",
     "foreign_keys",
-    "partitions"
+    "partitions",
+    "index_partitions"
    ],
    "required_relations": [
     "public.test_table",
@@ -632,7 +633,8 @@
    ],
    "scope": [
     "relations",
-    "partitions"
+    "partitions",
+    "index_partitions"
    ],
    "required_relations": [
     "public.parent",
@@ -1528,7 +1530,8 @@
    ],
    "scope": [
     "relations",
-    "partitions"
+    "partitions",
+    "index_partitions"
    ],
    "fixture_scopes": {
     "safe_005_add_column.sql": [
@@ -2031,13 +2034,15 @@
      "indexes",
      "constraints",
      "triggers",
-     "partitions"
+     "partitions",
+     "index_partitions"
     ],
     "safe_032_inheritance_lifecycle.sql": [
      "relations",
      "columns",
      "constraints",
-     "partitions"
+     "partitions",
+     "index_partitions"
     ],
     "safe_033_typed_table_lifecycle.sql": [
      "relations",
@@ -2076,12 +2081,14 @@
     "safe_041_partition_bounds.sql": [
      "relations",
      "columns",
-     "partitions"
+     "partitions",
+     "index_partitions"
     ],
     "safe_042_concurrent_hash_detach.sql": [
      "relations",
      "columns",
      "partitions",
+     "index_partitions",
      "indexes",
      "constraints",
      "triggers"
@@ -2135,20 +2142,23 @@
      "relations",
      "columns",
      "constraints",
-     "partitions"
+     "partitions",
+     "index_partitions"
     ],
     "safe_048_concurrent_list_detach_retains_check.sql": [
      "relations",
      "columns",
      "constraints",
-     "partitions"
+     "partitions",
+     "index_partitions"
     ],
     "safe_049_recursive_column_rename.sql": [
      "relations",
      "columns",
      "indexes",
      "constraints",
-     "partitions"
+     "partitions",
+     "index_partitions"
     ],
     "safe_050_autocommit_on_commit_drop.sql": [
      "relations",
@@ -2163,13 +2173,15 @@
      "relations",
      "columns",
      "constraints",
-     "partitions"
+     "partitions",
+     "index_partitions"
     ],
     "safe_053_cancelled_detach_finalize.sql": [
      "relations",
      "columns",
      "constraints",
-     "partitions"
+     "partitions",
+     "index_partitions"
     ]
    },
    "required_relations": [

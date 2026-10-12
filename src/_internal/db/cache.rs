@@ -10,6 +10,8 @@ use crate::_internal::model::sequence::{SequenceKind, SequenceState};
 use crate::_internal::model::trigger::TriggerEnableMode;
 use crate::_internal::model::types::{TypeKind, TypeState};
 use serde::{Deserialize, Serialize};
+
+use crate::_internal::model::index::IndexDefinition;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// Catalog families whose completeness is independently meaningful to the
@@ -317,12 +319,8 @@ pub(crate) struct DefaultSequenceDependencyCache {
 pub(crate) struct IndexCache {
     pub index_id: ObjectId,
     pub table_id: ObjectId,
-    pub using_method: String,
-    /// Ordered simple key columns. An expression key is omitted, so this is
-    /// complete only when `has_expression_keys` is false.
-    pub key_columns: Vec<String>,
-    /// Columns stored with `INCLUDE`; they remain dependencies of the index.
-    pub included_columns: Vec<String>,
+    /// The index's shape, exactly as the catalog states it.
+    pub definition: IndexDefinition,
     /// Every table column named by PostgreSQL's `pg_depend` rows for this
     /// index, including expression keys and predicates. This is unordered
     /// dependency evidence, not an index definition.
@@ -330,17 +328,8 @@ pub(crate) struct IndexCache {
     /// Whether `dependency_columns` came from complete catalog evidence.
     /// Locally parsed expression/predicate indexes cannot claim this yet.
     pub dependency_columns_known: bool,
-    pub has_expression_keys: bool,
-    pub has_predicate: bool,
-    pub is_unique: bool,
     /// `pg_index.indimmediate`; deferred unique indexes cannot be a replica identity.
     pub is_immediate: bool,
-    pub is_valid: bool,
-    pub is_ready: bool,
-    pub is_live: bool,
-    pub has_default_sort_order: bool,
-    pub has_default_opclasses: bool,
-    pub has_default_collations: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -386,6 +375,19 @@ pub(crate) struct InheritanceCache {
     /// partitioning from traditional `INHERITS`, which shares `pg_inherits`.
     pub is_partition: bool,
     pub detach_pending: bool,
+}
+
+/// An index that is a partition of a partitioned index.
+///
+/// PostgreSQL stores this in the same `pg_inherits` rows as table partitions,
+/// with the parent's `relkind` `I` and the child's `i`. The row is what makes
+/// `DROP INDEX` on the child fail while the parent exists.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct IndexAttachmentCache {
+    /// The attached (partition) index.
+    pub child: ObjectId,
+    /// The partitioned (parent) index.
+    pub parent: ObjectId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -460,6 +462,7 @@ pub(crate) struct DbCache {
     /// empty catalogue: the former means "unknown", the latter cannot occur
     /// against a real server.
     pub builtin_types: Option<BuiltinTypeCatalogue>,
+    pub opclasses: Option<crate::_internal::model::opclass::OpclassCatalogue>,
     pub sequences: HashMap<ObjectId, SequenceState>,
     pub dependencies: Vec<ViewDependencyCache>,
     /// Every observed cross-scope dependency edge, tagged with the catalog
@@ -468,6 +471,7 @@ pub(crate) struct DbCache {
     /// dependent was observed when the boundary query ran.
     pub scoped_external_dependencies: Vec<ScopedDependencyEdge>,
     pub inheritances: Vec<InheritanceCache>,
+    pub index_attachments: Vec<IndexAttachmentCache>,
     pub publications: HashMap<String, PublicationState>,
     pub subscriptions: HashMap<String, SubscriptionState>,
 }
@@ -577,10 +581,12 @@ impl DbCache {
             bootstrap_superuser: None,
             schemas: HashMap::new(),
             builtin_types: None,
+            opclasses: None,
             sequences: HashMap::new(),
             dependencies: Vec::new(),
             scoped_external_dependencies: Vec::new(),
             inheritances: Vec::new(),
+            index_attachments: Vec::new(),
             publications: HashMap::new(),
             subscriptions: HashMap::new(),
         }
@@ -1533,7 +1539,7 @@ impl DbCache {
                         constraint.table_id, constraint.name, backing_index
                     ));
                 };
-                if !index.is_valid || !index.is_ready || !index.is_live {
+                if !index.definition.is_usable() {
                     return Err(format!(
                         "constraint '{}.{}' references an unusable backing index '{}'",
                         constraint.table_id, constraint.name, backing_index
@@ -1542,7 +1548,7 @@ impl DbCache {
                 if matches!(
                     constraint.kind,
                     ConstraintKind::PrimaryKey | ConstraintKind::Unique
-                ) && !index.is_unique
+                ) && !index.definition.unique
                 {
                     return Err(format!(
                         "constraint '{}.{}' references non-unique backing index '{}'",
@@ -1637,7 +1643,7 @@ impl DbCache {
                     index.index_id
                 ));
             }
-            if index.using_method.is_empty() {
+            if index.definition.method.as_deref().is_none_or(str::is_empty) {
                 return Err(format!(
                     "index '{}' has an empty access method",
                     index.index_id
@@ -1661,7 +1667,9 @@ impl DbCache {
             if !index_ids.insert(index.index_id.clone()) {
                 return Err(format!("index '{}' appears more than once", index.index_id));
             }
-            if !index.has_expression_keys && index.key_columns.is_empty() {
+            // `keys` counts expression keys too, so this cannot be satisfied by an
+            // index that merely recorded expression positions as absent columns.
+            if index.definition.keys.is_empty() {
                 return Err(format!(
                     "index '{}' has no key column identities",
                     index.index_id
@@ -1674,9 +1682,10 @@ impl DbCache {
                 ));
             }
             for column in index
-                .key_columns
+                .definition
+                .key_column_names()
                 .iter()
-                .chain(&index.included_columns)
+                .chain(&index.definition.included_column_names())
                 .chain(&index.dependency_columns)
             {
                 if !relation.has_column(column) {
@@ -1737,18 +1746,16 @@ impl DbCache {
                     relation.id, index_name
                 ));
             };
-            let all_keys_not_null = index.key_columns.iter().all(|column| {
+            let all_keys_not_null = index.definition.key_column_names().iter().all(|column| {
                 relation
                     .get_column(column)
                     .is_some_and(|column| !column.is_nullable)
             });
-            if !index.is_unique
-                || index.has_predicate
-                || index.has_expression_keys
-                || !index.is_valid
+            if !index.definition.is_usable()
+                || !index.definition.unique
+                || index.definition.predicate
+                || index.definition.has_expression_keys()
                 || !index.is_immediate
-                || !index.is_ready
-                || !index.is_live
                 || !all_keys_not_null
             {
                 return Err(format!(
@@ -2241,6 +2248,7 @@ impl DbCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::_internal::model::index::index_keys;
 
     /// Coverage for a hand-built cache that retrieved the whole catalog.
     fn fully_covering(schemas: Option<&[String]>) -> CatalogCoverage {
@@ -2667,21 +2675,20 @@ mod tests {
         cache.indexes.push(IndexCache {
             index_id: index_id.clone(),
             table_id: table_id.clone(),
-            using_method: "gist".to_string(),
-            key_columns: vec!["id".to_string()],
-            included_columns: Vec::new(),
+            definition: IndexDefinition {
+                method: Some("gist".into()),
+                keys: index_keys(vec!["id".to_string()]),
+                included: index_keys(Vec::new()),
+                expression_keys: 0,
+                unique: false,
+                predicate: false,
+                valid: true,
+                ready: true,
+                live: true,
+            },
             dependency_columns: vec!["id".to_string()],
             dependency_columns_known: true,
-            has_expression_keys: false,
-            has_predicate: false,
-            is_unique: false,
             is_immediate: true,
-            is_valid: true,
-            is_ready: true,
-            is_live: true,
-            has_default_sort_order: true,
-            has_default_opclasses: true,
-            has_default_collations: true,
         });
         cache.constraints.push(ConstraintState {
             table_id,
@@ -3343,21 +3350,20 @@ mod tests {
         cache.indexes.push(IndexCache {
             index_id: ObjectId::new("public", "items_idx"),
             table_id: ObjectId::new("public", "items"),
-            using_method: "btree".into(),
-            key_columns: vec!["id".into()],
-            included_columns: Vec::new(),
+            definition: IndexDefinition {
+                method: Some("btree".into()),
+                keys: index_keys(vec!["id".into()]),
+                included: index_keys(Vec::new()),
+                expression_keys: 0,
+                unique: false,
+                predicate: false,
+                valid: true,
+                ready: true,
+                live: true,
+            },
             dependency_columns: vec!["id".into()],
             dependency_columns_known: true,
-            has_expression_keys: false,
-            has_predicate: false,
-            is_unique: false,
             is_immediate: true,
-            is_valid: true,
-            is_ready: true,
-            is_live: true,
-            has_default_sort_order: true,
-            has_default_opclasses: true,
-            has_default_collations: true,
         });
 
         let error = DbCacheVersioned::V10(Box::new(cache))
@@ -3374,21 +3380,20 @@ mod tests {
         cache.indexes.push(IndexCache {
             index_id: ObjectId::new("other", "items_idx"),
             table_id,
-            using_method: "btree".into(),
-            key_columns: vec!["id".into()],
-            included_columns: Vec::new(),
+            definition: IndexDefinition {
+                method: Some("btree".into()),
+                keys: index_keys(vec!["id".into()]),
+                included: index_keys(Vec::new()),
+                expression_keys: 0,
+                unique: false,
+                predicate: false,
+                valid: true,
+                ready: true,
+                live: true,
+            },
             dependency_columns: vec!["id".into()],
             dependency_columns_known: true,
-            has_expression_keys: false,
-            has_predicate: false,
-            is_unique: false,
             is_immediate: true,
-            is_valid: true,
-            is_ready: true,
-            is_live: true,
-            has_default_sort_order: true,
-            has_default_opclasses: true,
-            has_default_collations: true,
         });
 
         let error = DbCacheVersioned::V10(Box::new(cache))
@@ -3407,21 +3412,20 @@ mod tests {
         cache.indexes.push(IndexCache {
             index_id,
             table_id: ObjectId::new("public", "items"),
-            using_method: "btree".into(),
-            key_columns: vec!["id".into()],
-            included_columns: Vec::new(),
+            definition: IndexDefinition {
+                method: Some("btree".into()),
+                keys: index_keys(vec!["id".into()]),
+                included: index_keys(Vec::new()),
+                expression_keys: 0,
+                unique: false,
+                predicate: false,
+                valid: true,
+                ready: true,
+                live: true,
+            },
             dependency_columns: vec!["id".into()],
             dependency_columns_known: true,
-            has_expression_keys: false,
-            has_predicate: false,
-            is_unique: false,
             is_immediate: true,
-            is_valid: true,
-            is_ready: true,
-            is_live: true,
-            has_default_sort_order: true,
-            has_default_opclasses: true,
-            has_default_collations: true,
         });
 
         let error = DbCacheVersioned::V10(Box::new(cache))
@@ -3483,21 +3487,20 @@ mod tests {
         cache.indexes.push(IndexCache {
             index_id: ObjectId::new("public", "items_idx"),
             table_id,
-            using_method: "btree".into(),
-            key_columns: vec!["id".into()],
-            included_columns: Vec::new(),
+            definition: IndexDefinition {
+                method: Some("btree".into()),
+                keys: index_keys(vec!["id".into()]),
+                included: index_keys(Vec::new()),
+                expression_keys: 0,
+                unique: false,
+                predicate: false,
+                valid: true,
+                ready: true,
+                live: true,
+            },
             dependency_columns: vec!["id".into()],
             dependency_columns_known: false,
-            has_expression_keys: false,
-            has_predicate: false,
-            is_unique: false,
             is_immediate: true,
-            is_valid: true,
-            is_ready: true,
-            is_live: true,
-            has_default_sort_order: true,
-            has_default_opclasses: true,
-            has_default_collations: true,
         });
 
         assert!(

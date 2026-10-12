@@ -1,5 +1,5 @@
 use super::{AnalysisState, MutationResult, ObjectLookup, RelationOverlay};
-use crate::_internal::analysis::evidence::EvidenceCode;
+use crate::_internal::analysis::evidence::{EvidenceCode, EvidenceScope};
 use crate::_internal::analysis::graph::{DependencyEdge, DependencyKind};
 use crate::_internal::analysis::mutations::{
     AlterDomainMutation, AlterTypeActionMutation, AlterTypeMutation, CreateDomainMutation,
@@ -345,13 +345,18 @@ impl AnalysisState {
         if present.is_empty() {
             return MutationResult::NoOp;
         }
+        // A scoped baseline cannot enumerate every dependent, which widens what
+        // CASCADE removes. PostgreSQL still drops the domain.
         if present.iter().any(|id| {
             self.baseline_scoped_family_object(
                 id,
                 crate::_internal::db::cache::CatalogFamily::Types,
             )
         }) {
-            return self.unresolved(EvidenceCode::CatalogCoverageIncomplete);
+            self.taint(
+                EvidenceCode::CatalogCoverageIncomplete,
+                EvidenceScope::Chain,
+            );
         }
         if let Some(dependent) = present.iter().find(|id| self.has_type_dependents(id)) {
             if !drop.cascade {
@@ -392,13 +397,18 @@ impl AnalysisState {
         if present.is_empty() {
             return MutationResult::NoOp;
         }
+        // A scoped baseline cannot enumerate every dependent, which widens what
+        // CASCADE removes. PostgreSQL still drops the type.
         if present.iter().any(|id| {
             self.baseline_scoped_family_object(
                 id,
                 crate::_internal::db::cache::CatalogFamily::Types,
             )
         }) {
-            return self.unresolved(EvidenceCode::CatalogCoverageIncomplete);
+            self.taint(
+                EvidenceCode::CatalogCoverageIncomplete,
+                EvidenceScope::Chain,
+            );
         }
         if let Some(dependent) = present.iter().find(|id| self.has_type_dependents(id)) {
             if !drop.cascade {

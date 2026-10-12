@@ -247,15 +247,40 @@ pub(crate) fn assert_state_invariants(state: &AnalysisState) {
                 "constraint dependency edge must have a matching constraint"
             ),
             DependencyKind::IndexPartitionOf => {
-                let present = |id: &crate::_internal::ast::identifiers::ObjectId| {
-                    local.graph.edges().iter().any(|other| {
-                        matches!(other.kind, DependencyKind::IndexOnRelation { .. })
-                            && other.dependent == *id
-                    })
+                let index_table = |id: &crate::_internal::ast::identifiers::ObjectId| {
+                    local
+                        .graph
+                        .edges()
+                        .iter()
+                        .find(|other| {
+                            matches!(other.kind, DependencyKind::IndexOnRelation { .. })
+                                && other.dependent == *id
+                        })
+                        .map(|other| other.referenced.clone())
                 };
+                let present =
+                    |id: &crate::_internal::ast::identifiers::ObjectId| index_table(id).is_some();
                 assert!(
                     present(&edge.dependent) && present(&edge.referenced),
                     "index-partition edge must join two present indexes"
+                );
+                // Checking only that both endpoints exist cannot see a stale
+                // edge, because a detached partition takes both indexes with
+                // it. The attachment is only true while the child's table is
+                // still a partition of the parent's table.
+                let parent_table = index_table(&edge.referenced).expect("parent index");
+                let child_table = index_table(&edge.dependent).expect("child index");
+                let partitions = local.graph.partitions_of(&parent_table);
+                assert!(
+                    partitions.iter().any(|partition| {
+                        local.graph.resolve_rename(partition)
+                            == local.graph.resolve_rename(&child_table)
+                    }),
+                    "index-partition edge '{} -> '{}' is stale: '{}' is no longer a partition of '{}'",
+                    edge.dependent,
+                    edge.referenced,
+                    child_table,
+                    parent_table
                 );
             }
             DependencyKind::IndexOnRelation { .. }
@@ -269,6 +294,38 @@ pub(crate) fn assert_state_invariants(state: &AnalysisState) {
                 constraint_name: None,
                 ..
             } => {}
+        }
+    }
+
+    // A valid partitioned index has an index in every partition: PostgreSQL
+    // keeps it invalid until each partition acquires one, so an invalid parent
+    // is the legitimate partially-attached state and is not asserted here.
+    for edge in local.graph.edges() {
+        let DependencyKind::IndexOnRelation { definition, .. } = &edge.kind else {
+            continue;
+        };
+        if !definition.is_usable() {
+            continue;
+        }
+        let partitions = local.graph.partitions_of(&edge.referenced);
+        for partition in partitions {
+            assert!(
+                local.graph.edges().iter().any(|other| {
+                    matches!(other.kind, DependencyKind::IndexPartitionOf)
+                        && local.graph.resolve_rename(&other.referenced)
+                            == local.graph.resolve_rename(&edge.dependent)
+                        && local
+                            .graph
+                            .index_table_of(&other.dependent)
+                            .is_some_and(|table| {
+                                local.graph.resolve_rename(table)
+                                    == local.graph.resolve_rename(partition)
+                            })
+                }),
+                "valid index '{}' has no attached index for partition '{}'",
+                edge.dependent,
+                partition
+            );
         }
     }
 

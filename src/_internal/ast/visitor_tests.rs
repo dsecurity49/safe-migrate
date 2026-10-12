@@ -3139,6 +3139,32 @@ mod tests {
     }
 
     #[test]
+    fn expression_indexes_keep_their_parsed_identity() {
+        let parsed =
+            SourceFile::parse("CREATE UNIQUE INDEX normalized_name ON source ((lower(name)));");
+        let statement = parsed.tree().stmts().next().expect("statement");
+        let Some(StatementFact::CreateIndex {
+            unique,
+            concurrently,
+            has_predicate,
+            key_columns,
+            key_expressions,
+            ..
+        }) = AstVisitor::extract(&statement)
+        else {
+            panic!("expected create index fact");
+        };
+        assert!(unique);
+        assert!(!concurrently);
+        assert!(!has_predicate);
+        // An expression key names no column, so the columns list is empty while
+        // the key itself is still present and carries its parsed identity.
+        assert!(key_columns.is_empty());
+        assert_eq!(key_expressions.len(), 1);
+        assert!(key_expressions[0].is_some());
+    }
+
+    #[test]
     fn expression_indexes_preserve_index_rule_metadata() {
         let parsed =
             SourceFile::parse("CREATE UNIQUE INDEX normalized_name ON source ((lower(name)));");
@@ -3149,7 +3175,6 @@ mod tests {
                 unique: true,
                 concurrently: false,
                 has_predicate: false,
-                has_expression_keys: true,
                 ..
             })
         ));
@@ -3162,7 +3187,7 @@ mod tests {
         let statement = parsed.tree().stmts().next().expect("statement");
         let Some(StatementFact::CreateIndex {
             key_columns,
-            has_expression_keys,
+            key_expressions,
             included_columns,
             has_default_sort_order,
             has_default_opclasses,
@@ -3173,7 +3198,8 @@ mod tests {
             panic!("expected create index fact");
         };
         assert_eq!(key_columns, ["name"]);
-        assert!(!has_expression_keys);
+        // Key positions stay aligned: one plain column, no expressions.
+        assert_eq!(key_expressions, [None]);
         assert_eq!(included_columns, ["id"]);
         assert!(has_default_sort_order);
         assert!(has_default_opclasses);

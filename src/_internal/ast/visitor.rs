@@ -8,6 +8,7 @@ use crate::_internal::analysis::facts::{
     TypeCreationKind,
 };
 use crate::_internal::ast::identifiers::{Ident, QualifiedName};
+use crate::_internal::model::index::IndexOrder;
 use squawk_syntax::ast::{
     AlterColumnOption, AlterConstraint, AlterDomain, AlterIndex, AlterSequence, AlterTable,
     AlterTableAction, AlterTrigger, AlterType, AstNode, AttachPartition, Column, ColumnConstraint,
@@ -2068,6 +2069,40 @@ impl AstVisitor {
             .collect()
     }
 
+    /// PostgreSQL stores both bits absolutely, so `ASC NULLS LAST` and
+    /// `DESC NULLS FIRST` are one order; saying nothing means `ASC NULLS LAST`.
+    fn index_key_order(
+        sort_order: Option<ast::SortOrder>,
+        nulls_order: Option<ast::NullsOrder>,
+    ) -> IndexOrder {
+        let descending = matches!(sort_order, Some(ast::SortOrder::SortDesc(_)));
+        // PostgreSQL defaults to NULLS LAST for ASC and NULLS FIRST for DESC,
+        // so a bare `DESC` is the default order, not a non-default one.
+        let nulls_first = match nulls_order {
+            Some(ast::NullsOrder::NullsFirst(_)) => true,
+            Some(ast::NullsOrder::NullsLast(_)) => false,
+            None => descending,
+        };
+        match (descending, nulls_first) {
+            (false, false) | (true, true) => IndexOrder::Default,
+            (true, false) => IndexOrder::DescNullsLast,
+            (false, true) => IndexOrder::AscNullsFirst,
+        }
+    }
+
+    /// The trailing name of a dotted reference, which is all that identifies an
+    /// operator class or collation inside one index definition.
+    fn index_item_ref_name<T: AstNode>(
+        reference: Option<T>,
+        child: impl Fn(&T) -> Option<PathSegmentRef>,
+    ) -> Option<String> {
+        let reference = reference?;
+        let segment = child(&reference)?;
+        Some(Self::resolve_identifier_token(
+            segment.ident_token()?.text(),
+        ))
+    }
+
     fn extract_create_index(node: &CreateIndex) -> Option<StatementFact> {
         let relation = node.table_relation_name()?.table_name_ref()?.path_ref()?;
         let relation = Self::path_ref_to_qualified_name(&relation)?;
@@ -2105,7 +2140,10 @@ impl AstVisitor {
             })
             .collect();
         let mut key_columns = Vec::new();
-        let mut has_expression_keys = false;
+        let mut key_expressions: Vec<Option<ExprIr>> = Vec::new();
+        let mut key_orders: Vec<IndexOrder> = Vec::new();
+        let mut key_opclasses: Vec<Option<String>> = Vec::new();
+        let mut key_collations: Vec<Option<String>> = Vec::new();
         let mut has_default_sort_order = true;
         let mut has_default_opclasses = true;
         let mut has_default_collations = true;
@@ -2126,9 +2164,21 @@ impl AstVisitor {
             match item.expr() {
                 Some(ast::Expr::NameRef(name)) => {
                     key_columns.push(Self::resolve_identifier_token(name.text()));
+                    key_expressions.push(None);
                 }
-                _ => has_expression_keys = true,
+                Some(expr) => key_expressions.push(Some(
+                    crate::_internal::analysis::expr_visitor::ExprVisitor::convert(expr),
+                )),
+                None => key_expressions.push(None),
             }
+            key_orders.push(Self::index_key_order(item.sort_order(), item.nulls_order()));
+            key_opclasses.push(Self::index_item_ref_name(item.op_class_ref(), |r| {
+                r.path_ref().and_then(|path| path.segment())
+            }));
+            key_collations.push(Self::index_item_ref_name(
+                item.collate().and_then(|collate| collate.collation_ref()),
+                |r| r.path_ref().and_then(|path| path.segment()),
+            ));
         }
 
         Some(StatementFact::CreateIndex {
@@ -2140,8 +2190,11 @@ impl AstVisitor {
             has_predicate,
             unique,
             key_columns,
+            key_expressions,
+            key_orders,
+            key_opclasses,
+            key_collations,
             included_columns,
-            has_expression_keys,
             has_default_sort_order,
             has_default_opclasses,
             has_default_collations,

@@ -21,6 +21,20 @@ notes are available on the
 - `citext` is no longer assumed to be built in; it resolves only when the
   extension is installed, so a user type of the same name is no longer shadowed.
 - Cache format V10; run `safe-migrate sync`. V1–V9 are rejected.
+- `DROP TABLE`, `DROP VIEW`, `DROP MATERIALIZED VIEW`, `DROP DOMAIN`,
+  `DROP TYPE` and `ALTER TABLE ... DROP COLUMN` now drop their target under a
+  scoped or incomplete baseline instead of being skipped, and report that the
+  rest of the migration is no longer exact.
+- A constraint cloned onto a partition is named as PostgreSQL names it, and an
+  explicitly written default operator class, collation or sort direction counts
+  as the same as omitting it.
+- `ALTER INDEX ... ATTACH PARTITION` is validated instead of accepted whenever
+  both indexes exist. Mismatched definitions and children of unrelated tables
+  are now reported.
+- `DROP INDEX` on an index attached to a parent index is reported, and is not
+  bypassed by `CASCADE` or `IF EXISTS`.
+- Creating, attaching or detaching a partition maintains its index attachments,
+  and two indexes on different expressions are no longer interchangeable.
 - A scoped baseline now records cross-schema dependents for types, routines and
   indexes as well as relations, so a scoped `sync` no longer overlooks
   dependents outside the schemas it loaded.

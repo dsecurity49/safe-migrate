@@ -2,14 +2,15 @@ use crate::_internal::ast::identifiers::ObjectId;
 use crate::_internal::db::cache::{
     CACHE_MAGIC, CatalogCoverageBuilder, CatalogFamily, ConstraintDependencyCache,
     ConstraintKeyCache, DbCache, DbCacheVersioned, DefaultSequenceDependencyCache, ForeignKeyCache,
-    GeneratedColumnDependencyCache, IndexCache, InheritanceCache, ScopedDependencyEdge,
-    ViewDependencyCache,
+    GeneratedColumnDependencyCache, IndexAttachmentCache, IndexCache, InheritanceCache,
+    ScopedDependencyEdge, ViewDependencyCache,
 };
 use crate::_internal::db::cache_file::{
     MAX_CACHE_DECODE_BYTES, MAX_CACHE_FILE_BYTES, protect_cache_bytes,
     protect_cache_bytes_with_key, validate_cache_encryption_configuration,
 };
 use crate::_internal::model::builtin_type::BuiltinTypeCatalogue;
+use crate::_internal::model::index::{IndexDefinition, IndexKey, IndexKeyKind, IndexOrder};
 use crate::_internal::model::relation::{Persistence, RelationKind, RelationState};
 use anyhow::{Context, Result};
 use postgres::config::Host;
@@ -2266,6 +2267,55 @@ fn load_foreign_keys(
         .collect()
 }
 
+fn load_index_attachments(
+    client: &mut impl GenericClient,
+    schema_values: &Option<Vec<String>>,
+) -> Result<Vec<IndexAttachmentCache>> {
+    let query = r#"
+        SELECT
+            child_ns.nspname AS child_schema,
+            child.relname AS child_name,
+            parent_ns.nspname AS parent_schema,
+            parent.relname AS parent_name
+        FROM pg_inherits inh
+        JOIN pg_class child ON child.oid = inh.inhrelid
+        JOIN pg_namespace child_ns ON child_ns.oid = child.relnamespace
+        JOIN pg_class parent ON parent.oid = inh.inhparent
+        JOIN pg_namespace parent_ns ON parent_ns.oid = parent.relnamespace
+        WHERE child.relkind = 'i'
+          AND parent.relkind = 'I'
+          AND child_ns.nspname NOT IN ('pg_catalog', 'information_schema')
+          AND parent_ns.nspname NOT IN ('pg_catalog', 'information_schema')
+          AND (
+              $1::text[] IS NULL
+              OR child_ns.nspname = ANY($1)
+              OR parent_ns.nspname = ANY($1)
+          )
+        ORDER BY child_ns.nspname, child.relname
+    "#;
+    let rows = client
+        .query(query, &[schema_values])
+        .context("Failed to load index attachments from pg_inherits")?;
+    rows.iter()
+        .map(|row| {
+            Ok(IndexAttachmentCache {
+                child: ObjectId::new(
+                    row.try_get::<_, String>("child_schema")
+                        .context("attached index schema")?,
+                    row.try_get::<_, String>("child_name")
+                        .context("attached index name")?,
+                ),
+                parent: ObjectId::new(
+                    row.try_get::<_, String>("parent_schema")
+                        .context("parent index schema")?,
+                    row.try_get::<_, String>("parent_name")
+                        .context("parent index name")?,
+                ),
+            })
+        })
+        .collect()
+}
+
 fn load_inheritances(
     client: &mut impl GenericClient,
     schema_values: &Option<Vec<String>>,
@@ -2364,6 +2414,40 @@ fn load_indexes(
             ) AS included_columns,
             ARRAY(
                 SELECT a.attname
+                FROM generate_series(1, x.indnkeyatts) AS k(ord)
+                LEFT JOIN pg_attribute a
+                  ON a.attrelid = x.indrelid
+                 AND a.attnum = x.indkey[k.ord - 1]
+                 AND NOT a.attisdropped
+                ORDER BY k.ord
+            ) AS key_attnames,
+            ARRAY(
+                SELECT CASE
+                    WHEN opc.opcdefault AND opc.opcmethod = i.relam THEN ''
+                    ELSE COALESCE(opc.opcname, '')
+                END
+                FROM generate_series(1, x.indnkeyatts) AS k(ord)
+                LEFT JOIN pg_opclass opc ON opc.oid = x.indclass[k.ord - 1]
+                ORDER BY k.ord
+            ) AS key_opclasses,
+            ARRAY(
+                SELECT CASE
+                    WHEN coll.oid IS NULL
+                      OR coll.oid = a.attcollation
+                      OR coll.oid = 100  -- the default collation, inherited
+                    THEN ''
+                    ELSE coll.collname
+                END
+                FROM generate_series(1, x.indnkeyatts) AS k(ord)
+                LEFT JOIN pg_collation coll ON coll.oid = x.indcollation[k.ord - 1]
+                LEFT JOIN pg_attribute a
+                  ON a.attrelid = x.indrelid
+                 AND a.attnum = x.indkey[k.ord - 1]
+                 AND a.attnum <> 0
+                ORDER BY k.ord
+            ) AS key_collations,
+            ARRAY(
+                SELECT a.attname
                 FROM pg_depend d
                 JOIN pg_attribute a
                   ON a.attrelid = d.refobjid
@@ -2382,11 +2466,16 @@ fn load_indexes(
                 WHERE key_part.ordinality <= x.indnkeyatts
                   AND key_part.attnum = 0
             ) AS has_expression_keys,
-            NOT EXISTS (
-                SELECT 1
-                FROM unnest(x.indoption::smallint[]) AS option_part(flags)
-                WHERE option_part.flags <> 0
-            ) AS has_default_sort_order,
+            COALESCE(
+                (
+                    SELECT array_agg(o.flags ORDER BY o.ord)
+                    FROM unnest(x.indoption::smallint[])
+                        WITH ORDINALITY AS o(flags, ord)
+                    WHERE o.ord <= x.indnkeyatts
+                ),
+                ARRAY[]::smallint[]
+            ) AS indoption_bits,
+            pg_catalog.pg_indexam_has_property(am.oid, 'can_order') AS am_can_order,
             NOT EXISTS (
                 SELECT 1
                 FROM unnest(x.indclass::oid[]) WITH ORDINALITY AS opclass_part(opclass_oid, ordinality)
@@ -2409,10 +2498,10 @@ fn load_indexes(
             ) AS has_default_collations
         FROM pg_index x
         JOIN pg_class i ON i.oid = x.indexrelid
+        JOIN pg_am am ON am.oid = i.relam
         JOIN pg_namespace n_i ON n_i.oid = i.relnamespace
         JOIN pg_class t ON t.oid = x.indrelid
         JOIN pg_namespace n_t ON n_t.oid = t.relnamespace
-        JOIN pg_am am ON am.oid = i.relam
         WHERE n_i.nspname !~ '^pg_'
           AND n_i.nspname <> 'information_schema'
           AND n_t.nspname !~ '^pg_'
@@ -2436,12 +2525,31 @@ fn load_indexes(
         let included_columns: Vec<String> = row
             .try_get("included_columns")
             .context("index included columns")?;
-        let has_expression_keys: bool = row
-            .try_get("has_expression_keys")
-            .context("index expression key flag")?;
-        let has_predicate: bool = row
-            .try_get("has_predicate")
-            .context("index predicate flag")?;
+        let key_attnames: Vec<Option<String>> =
+            row.try_get("key_attnames").context("index key attnames")?;
+        let key_opclasses: Vec<String> = row
+            .try_get("key_opclasses")
+            .context("index key opclasses")?;
+        let key_collations: Vec<String> = row
+            .try_get("key_collations")
+            .context("index key collations")?;
+        let indoption_bits: Vec<i16> = row.try_get("indoption_bits").context("index sort bits")?;
+        let am_can_order: bool = row.try_get("am_can_order").context("index access method")?;
+        let definition = build_index_definition(
+            row.try_get("using_method").context("index access method")?,
+            &key_attnames,
+            &key_opclasses,
+            &key_collations,
+            &indoption_bits,
+            am_can_order,
+            &included_columns,
+            row.try_get("is_unique").context("index uniqueness")?,
+            row.try_get("has_predicate")
+                .context("index predicate flag")?,
+            row.try_get("is_valid").context("index validity flag")?,
+            row.try_get("is_ready").context("index readiness flag")?,
+            row.try_get("is_live").context("index liveness flag")?,
+        );
         let mut dependency_columns: Vec<String> = row
             .try_get("dependency_columns")
             .context("index dependency columns")?;
@@ -2466,29 +2574,12 @@ fn load_indexes(
                 row.try_get::<_, String>("table_name")
                     .context("indexed table name")?,
             ),
-            using_method: row.try_get("using_method").context("index access method")?,
-            key_columns,
-            included_columns,
+            definition,
             dependency_columns,
             dependency_columns_known: true,
-            has_expression_keys,
-            has_predicate,
-            is_unique: row.try_get("is_unique").context("index uniqueness flag")?,
             is_immediate: row
                 .try_get("is_immediate")
                 .context("index immediacy flag")?,
-            is_valid: row.try_get("is_valid").context("index validity flag")?,
-            is_ready: row.try_get("is_ready").context("index readiness flag")?,
-            is_live: row.try_get("is_live").context("index liveness flag")?,
-            has_default_sort_order: row
-                .try_get("has_default_sort_order")
-                .context("index sort ordering")?,
-            has_default_opclasses: row
-                .try_get("has_default_opclasses")
-                .context("index operator classes")?,
-            has_default_collations: row
-                .try_get("has_default_collations")
-                .context("index collations")?,
         });
     }
     Ok(indexes)
@@ -2614,6 +2705,130 @@ fn load_routines(
 ///
 /// Must run after the connection pins `search_path` to `pg_catalog`, otherwise
 /// `format_type` schema-qualifies every name.
+/// Whether every key of an index uses the default sort order.
+///
+/// The bits are normalized through [`IndexOrder`] rather than tested for zero,
+/// because `DESC NULLS FIRST` is stored as `3` and is the same order as `0`.
+/// They are also ignored entirely when the access method cannot order, since
+/// `indoption` bits are access-method specific.
+/// Build a key's description from the parallel catalog arrays.
+///
+/// A NULL attname is an expression: `indkey` records it as 0 and PostgreSQL
+/// stores no identity for it, so the key is recorded as an expression and
+/// never compared by content.
+fn index_key(
+    attname: Option<&String>,
+    opclass: &str,
+    collation: &str,
+    bits: Option<i16>,
+    can_order: bool,
+) -> IndexKey {
+    IndexKey {
+        kind: match attname {
+            Some(name) => IndexKeyKind::Column(name.clone()),
+            None => IndexKeyKind::Expression(None),
+        },
+        opclass: (!opclass.is_empty()).then(|| opclass.to_string()),
+        collation: (!collation.is_empty()).then(|| collation.to_string()),
+        order: IndexOrder::from_indoption(bits.unwrap_or(0) as u16, can_order),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_index_definition(
+    method: String,
+    key_attnames: &[Option<String>],
+    key_opclasses: &[String],
+    key_collations: &[String],
+    indoption_bits: &[i16],
+    can_order: bool,
+    included_attnames: &[String],
+    unique: bool,
+    predicate: bool,
+    valid: bool,
+    ready: bool,
+    live: bool,
+) -> IndexDefinition {
+    let keys = key_attnames
+        .iter()
+        .enumerate()
+        .map(|(ord, attname)| {
+            index_key(
+                attname.as_ref(),
+                key_opclasses
+                    .get(ord)
+                    .map(String::as_str)
+                    .unwrap_or_default(),
+                key_collations
+                    .get(ord)
+                    .map(String::as_str)
+                    .unwrap_or_default(),
+                indoption_bits.get(ord).copied(),
+                can_order,
+            )
+        })
+        .collect::<Vec<_>>();
+    let expression_keys = keys
+        .iter()
+        .filter(|key| matches!(key.kind, IndexKeyKind::Expression(_)))
+        .count();
+    IndexDefinition {
+        method: Some(method),
+        keys,
+        included: included_attnames
+            .iter()
+            .map(|name| IndexKey::column(name.clone()))
+            .collect(),
+        expression_keys,
+        unique,
+        predicate,
+        valid,
+        ready,
+        live,
+    }
+}
+
+fn load_opclasses(
+    client: &mut impl GenericClient,
+) -> Result<crate::_internal::model::opclass::OpclassCatalogue> {
+    let rows = client
+        .query(
+            "
+            SELECT
+                n.nspname AS namespace,
+                o.opcname AS name,
+                t.typname AS intype,
+                am.amname AS method,
+                o.opcdefault AS is_default
+            FROM pg_catalog.pg_opclass o
+            JOIN pg_catalog.pg_namespace n ON n.oid = o.opcnamespace
+            JOIN pg_catalog.pg_type t ON t.oid = o.opcintype
+            JOIN pg_catalog.pg_am am ON am.oid = o.opcmethod
+            ",
+            &[],
+        )
+        .context("Failed to load operator classes")?;
+    Ok(
+        crate::_internal::model::opclass::OpclassCatalogue::from_entries(
+            rows.into_iter()
+                .map(|row| {
+                    Ok(crate::_internal::model::opclass::OpclassEntry {
+                        name: row.try_get("name").context("operator class name")?,
+                        namespace: row.try_get("namespace").context("operator class schema")?,
+                        intype: row.try_get("intype").context("operator class input type")?,
+                        method: row
+                            .try_get("method")
+                            .context("operator class access method")?,
+                        is_default: row
+                            .try_get("is_default")
+                            .context("operator class default flag")?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+        ),
+    )
+}
+
 fn load_builtin_types(
     client: &mut impl GenericClient,
 ) -> Result<crate::_internal::model::builtin_type::BuiltinTypeCatalogue> {
@@ -3240,6 +3455,7 @@ fn populate_cache_from_client(
     // they are read first because every loader that renders a type name needs
     // them to agree with what a migration would resolve.
     cache.builtin_types = Some(load_builtin_types(client)?);
+    cache.opclasses = Some(load_opclasses(client)?);
     let builtin_types = cache.builtin_types.as_ref().expect("just loaded");
     coverage.record(CatalogFamily::Schemas);
     // A scoped request can name schemas that do not exist yet. PostgreSQL's
@@ -3311,6 +3527,7 @@ fn populate_cache_from_client(
         load_foreign_keys(client, schemas, &schema_values, schema_filter_n1_or_n2)?;
 
     cache.inheritances = load_inheritances(client, &schema_values)?;
+    cache.index_attachments = load_index_attachments(client, &schema_values)?;
     coverage.record(CatalogFamily::Inheritance);
 
     cache.indexes = load_indexes(client, &schema_values, schema_filter_nt)?;

@@ -1,4 +1,5 @@
 use crate::_internal::ast::identifiers::ObjectId;
+use crate::_internal::model::index::IndexDefinition;
 use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
 
@@ -22,22 +23,11 @@ pub(crate) enum DependencyKind {
         referenced_column: Option<String>,
     },
     IndexOnRelation {
-        using_method: Option<String>,
-        key_columns: Vec<String>,
-        included_columns: Vec<String>,
+        definition: IndexDefinition,
         dependency_columns: Vec<String>,
         dependency_columns_known: bool,
-        has_expression_keys: bool,
-        has_predicate: bool,
         is_concurrent: bool,
-        is_unique: bool,
         is_immediate: bool,
-        is_valid: bool,
-        is_ready: bool,
-        is_live: bool,
-        has_default_sort_order: bool,
-        has_default_opclasses: bool,
-        has_default_collations: bool,
         eligibility_known: bool,
     },
     /// A primary-key/unique constraint whose ordered key columns are known.
@@ -384,7 +374,17 @@ impl DependencyGraph {
             .collect()
     }
 
-    #[cfg(test)]
+    /// The table an index is defined on, if the graph records one.
+    pub(crate) fn index_table_of(&self, index: &ObjectId) -> Option<&ObjectId> {
+        self.edges
+            .iter()
+            .find(|edge| {
+                edge.dependent == *index
+                    && matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
+            })
+            .map(|edge| &edge.referenced)
+    }
+
     pub(crate) fn partitions_of(&self, id: &ObjectId) -> Vec<&ObjectId> {
         if self.edges.len() >= Self::CASCADE_INDEX_MIN_EDGES {
             return self
@@ -754,19 +754,23 @@ impl DependencyGraph {
                     continue;
                 }
                 let DependencyKind::IndexOnRelation {
-                    key_columns,
-                    included_columns,
+                    definition,
                     dependency_columns,
                     ..
                 } = &mut edge.kind
                 else {
                     continue;
                 };
-                for column in key_columns
+                let index_keys = definition
+                    .keys
                     .iter_mut()
-                    .chain(included_columns)
-                    .chain(dependency_columns)
-                {
+                    .chain(&mut definition.included)
+                    .filter_map(|key| match &mut key.kind {
+                        crate::_internal::model::index::IndexKeyKind::Column(name) => Some(name),
+                        crate::_internal::model::index::IndexKeyKind::Expression(_) => None,
+                    })
+                    .collect::<Vec<&mut String>>();
+                for column in index_keys.into_iter().chain(dependency_columns.iter_mut()) {
                     if column == old_name {
                         *column = new_name.to_string();
                     }
@@ -838,6 +842,7 @@ impl DependencyGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::_internal::model::index::index_keys;
 
     fn id(name: &str) -> ObjectId {
         ObjectId::new("public", name)
@@ -1070,22 +1075,21 @@ mod tests {
             "index",
             "target",
             DependencyKind::IndexOnRelation {
-                using_method: Some("btree".into()),
-                key_columns: vec!["id".into()],
-                included_columns: Vec::new(),
+                definition: IndexDefinition {
+                    method: Some("btree".into()),
+                    keys: index_keys(vec!["id".into()]),
+                    included: index_keys(Vec::new()),
+                    expression_keys: 0,
+                    unique: false,
+                    predicate: false,
+                    valid: true,
+                    ready: true,
+                    live: true,
+                },
                 dependency_columns: Vec::new(),
                 dependency_columns_known: true,
-                has_expression_keys: false,
-                has_predicate: false,
                 is_concurrent: false,
-                is_unique: false,
                 is_immediate: true,
-                is_valid: true,
-                is_ready: true,
-                is_live: true,
-                has_default_sort_order: true,
-                has_default_opclasses: true,
-                has_default_collations: true,
                 eligibility_known: true,
             },
         ));

@@ -2,6 +2,7 @@ mod phase10_bug_fixes_and_sorting_tests {
     use crate::common::*;
     use safe_migrate::_internal::analysis::state::{AnalysisState, Confidence, MutationResult};
     use safe_migrate::_internal::ast::identifiers::ObjectId;
+    use safe_migrate::_internal::model::index::{IndexDefinition, index_keys};
 
     use safe_migrate::_internal::model::relation::{Persistence, RelationKind, RelationState};
     use safe_migrate::_internal::report::violations::{ObjectKind, Violation, ViolationTier};
@@ -13,21 +14,20 @@ mod phase10_bug_fixes_and_sorting_tests {
         safe_migrate::_internal::db::cache::IndexCache {
             index_id,
             table_id,
-            using_method: "btree".into(),
-            key_columns: vec!["id".into()],
-            included_columns: Vec::new(),
+            definition: IndexDefinition {
+                method: Some("btree".into()),
+                keys: index_keys(vec!["id".into()]),
+                included: index_keys(Vec::new()),
+                expression_keys: 0,
+                unique: false,
+                predicate: false,
+                valid: true,
+                ready: true,
+                live: true,
+            },
             dependency_columns: vec!["id".into()],
             dependency_columns_known: true,
-            has_expression_keys: false,
-            has_predicate: false,
-            is_unique: false,
             is_immediate: true,
-            is_valid: true,
-            is_ready: true,
-            is_live: true,
-            has_default_sort_order: true,
-            has_default_opclasses: true,
-            has_default_collations: true,
         }
     }
 
@@ -529,7 +529,7 @@ mod phase10_bug_fixes_and_sorting_tests {
     }
 
     #[test]
-    fn scoped_drop_reports_unresolved_when_the_target_has_out_of_scope_dependents() {
+    fn scoped_drop_separates_a_blocking_dependent_from_an_unproven_cascade() {
         use safe_migrate::_internal::db::cache::{
             CatalogFamily, ForeignKeyCache, ScopedDependencyEdge,
         };
@@ -581,29 +581,47 @@ mod phase10_bug_fixes_and_sorting_tests {
             AnalysisState::new(cache)
         };
 
-        let drop = || {
+        let drop = |cascade: bool| {
             safe_migrate::_internal::analysis::mutations::Mutation::DropTable(
                 safe_migrate::_internal::analysis::mutations::DropTable {
                     ids: vec![object_id("app", "parent")],
                     if_exists: false,
-                    cascade: false,
+                    cascade,
                 },
             )
         };
 
-        // The out-of-scope dependent is known only as an edge, not as modeled
-        // state, so the drop cannot be stated exactly.
+        // Without CASCADE a recorded dependent is exactly what PostgreSQL
+        // refuses on, whether or not it is in scope.
         let mut state = build(true, true);
-        let result = state.apply(&drop(), None);
+        let result = state.apply(&drop(false), None);
         assert!(
-            result.is_unresolved(),
-            "a recorded cross-scope dependent makes the outcome unknowable: {result:?}"
+            matches!(result, MutationResult::Conflict(_)),
+            "an unproven dependent blocks a non-cascading drop: {result:?}"
+        );
+
+        // With CASCADE the target still drops. The dependent is known only as
+        // an edge, so the cascade's reach is open, but that must widen the
+        // result rather than cancel it.
+        let mut state = build(true, true);
+        let result = state.apply(&drop(true), None);
+        assert!(
+            matches!(result, MutationResult::Applied),
+            "CASCADE still drops the target: {result:?}"
+        );
+        assert!(!state.relation_is_present(&object_id("app", "parent")));
+        assert!(
+            state
+                .evidence()
+                .iter()
+                .any(|record| record.code == safe_migrate::_internal::analysis::evidence::EvidenceCode::CatalogCoverageIncomplete),
+            "an unproven cascade must taint the chain"
         );
 
         // The dependent is modeled but stays inside the scope, so the drop is
         // fully known and PostgreSQL would reject it outright.
         let mut state = build(true, false);
-        let result = state.apply(&drop(), None);
+        let result = state.apply(&drop(false), None);
         assert!(
             matches!(result, MutationResult::Conflict(_)),
             "an in-scope dependent makes the drop a known conflict: {result:?}"

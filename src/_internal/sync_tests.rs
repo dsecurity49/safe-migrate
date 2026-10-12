@@ -3,6 +3,7 @@ use crate::_internal::db::cache::DbCache;
 use crate::_internal::model::builtin_type::BuiltinTypeCatalogue;
 use crate::_internal::model::data_type::ParsedDataType;
 use crate::_internal::model::relation::{Persistence, RelationKind, RelationState};
+use safe_migrate::_internal::model::index::{IndexDefinition, index_keys};
 
 #[cfg(test)]
 mod tests {
@@ -251,21 +252,20 @@ mod tests {
         cache.indexes.push(crate::_internal::db::cache::IndexCache {
             index_id: ObjectId::new("public", "idx_test"),
             table_id: ObjectId::new("public", "test_table"),
-            using_method: "btree".into(),
-            key_columns: vec!["id".into()],
-            included_columns: Vec::new(),
+            definition: IndexDefinition {
+                method: Some("btree".into()),
+                keys: index_keys(vec!["id".into()]),
+                included: index_keys(Vec::new()),
+                expression_keys: 0,
+                unique: false,
+                predicate: false,
+                valid: true,
+                ready: true,
+                live: true,
+            },
             dependency_columns: vec!["id".into()],
             dependency_columns_known: true,
-            has_expression_keys: false,
-            has_predicate: false,
-            is_unique: false,
             is_immediate: true,
-            is_valid: true,
-            is_ready: true,
-            is_live: true,
-            has_default_sort_order: true,
-            has_default_opclasses: true,
-            has_default_collations: true,
         });
         let type_id = ObjectId::new("app", "status");
         cache.types.insert(

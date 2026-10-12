@@ -10,6 +10,7 @@ use crate::_internal::ast::identifiers::ObjectId;
 use crate::_internal::model::builtin_type::BuiltinTypeCatalogue;
 use crate::_internal::model::constraint::{ConstraintKind, ConstraintState};
 use crate::_internal::model::data_type::{ParsedDataType, WIDENED_NUMERIC_SCALE_VERSION};
+use crate::_internal::model::index::{IndexComparability, IndexDefinition, index_keys};
 use crate::_internal::model::relation::{ColumnAction, RelationKind, RelationState};
 use crate::_internal::model::sequence::{
     SequenceKind, SequenceOverlay, SequenceParameters, SequencePersistence, SequenceState,
@@ -400,63 +401,40 @@ impl AnalysisState {
         }
     }
 
+    /// Whether a child index is acceptable as a partition of the parent's.
+    ///
+    /// An index carrying an expression key is never accepted: the catalog gives no
+    /// reliable way to prove two expression trees equal, so claiming the parent is
+    /// covered would be a claim we cannot support.
     fn partition_indexes_equivalent(left: &DependencyKind, right: &DependencyKind) -> bool {
         match (left, right) {
             (
                 DependencyKind::IndexOnRelation {
-                    using_method: left_method,
-                    key_columns: left_keys,
-                    included_columns: left_included,
+                    definition: left_definition,
                     dependency_columns: left_dependencies,
                     dependency_columns_known: left_dependencies_known,
-                    has_expression_keys: left_expressions,
-                    has_predicate: left_predicate,
-                    is_unique: left_unique,
-                    is_valid: left_valid,
-                    is_ready: left_ready,
-                    is_live: left_live,
-                    has_default_sort_order: left_sort,
-                    has_default_opclasses: left_opclasses,
-                    has_default_collations: left_collations,
+                    is_concurrent: left_concurrent,
+                    is_immediate: left_immediate,
                     eligibility_known: left_eligibility,
-                    ..
                 },
                 DependencyKind::IndexOnRelation {
-                    using_method: right_method,
-                    key_columns: right_keys,
-                    included_columns: right_included,
+                    definition: right_definition,
                     dependency_columns: right_dependencies,
                     dependency_columns_known: right_dependencies_known,
-                    has_expression_keys: right_expressions,
-                    has_predicate: right_predicate,
-                    is_unique: right_unique,
-                    is_valid: right_valid,
-                    is_ready: right_ready,
-                    is_live: right_live,
-                    has_default_sort_order: right_sort,
-                    has_default_opclasses: right_opclasses,
-                    has_default_collations: right_collations,
+                    is_concurrent: right_concurrent,
+                    is_immediate: right_immediate,
                     eligibility_known: right_eligibility,
-                    ..
                 },
             ) => {
-                *left_valid
-                    && *right_valid
-                    && *left_ready
-                    && *right_ready
-                    && *left_live
-                    && *right_live
-                    && left_method == right_method
-                    && left_keys == right_keys
-                    && left_included == right_included
+                left_definition.is_usable()
+                    && right_definition.is_usable()
+                    && left_definition.comparability(right_definition)
+                        == IndexComparability::Comparable
+                    && left_definition == right_definition
                     && left_dependencies == right_dependencies
                     && left_dependencies_known == right_dependencies_known
-                    && left_expressions == right_expressions
-                    && left_predicate == right_predicate
-                    && left_unique == right_unique
-                    && left_sort == right_sort
-                    && left_opclasses == right_opclasses
-                    && left_collations == right_collations
+                    && left_concurrent == right_concurrent
+                    && left_immediate == right_immediate
                     && left_eligibility == right_eligibility
             }
             _ => false,
@@ -503,8 +481,9 @@ impl AnalysisState {
                 .map(|edge| edge.dependent.clone())
                 .unwrap_or_else(|| {
                     let columns = match &parent_index.kind {
-                        DependencyKind::IndexOnRelation { key_columns, .. } => {
-                            (!key_columns.is_empty()).then(|| key_columns.join("_"))
+                        DependencyKind::IndexOnRelation { definition, .. } => {
+                            let names = definition.key_column_names();
+                            (!names.is_empty()).then(|| names.join("_"))
                         }
                         _ => None,
                     };
@@ -524,6 +503,12 @@ impl AnalysisState {
                     id
                 });
 
+            // PostgreSQL attaches the partition's index to the parent's as part
+            // of the same operation, so the child cannot be dropped alone.
+            if self.index_parent_of(&child_index).is_none() {
+                self.record_index_partition(&parent_index.dependent, &child_index);
+            }
+
             let Some(parent_constraint) = parent_constraints.iter().find(|constraint| {
                 constraint.backing_index.as_ref() == Some(&parent_index.dependent)
                     && matches!(
@@ -540,6 +525,9 @@ impl AnalysisState {
             {
                 continue;
             }
+            // A unique or primary key constraint cloned onto a partition is renamed
+            // `<partition>_<column>_key`; a check constraint keeps the
+            // parent's name. Verified against a live server.
             let columns = self
                 .local
                 .graph
@@ -558,12 +546,28 @@ impl AnalysisState {
                     }
                     _ => None,
                 });
-            self.snapshot_constraint(child, &parent_constraint.name);
+            // A constraint cloned onto a partition is renamed: a primary key becomes
+            // `<partition>_pkey`, a unique constraint `<partition>_<column>_key`,
+            // and a check constraint keeps the parent's name. Verified against
+            // a live server for range, list and hash partitions.
+            let cloned_name = match parent_constraint.kind {
+                ConstraintKind::PrimaryKey => format!("{}_pkey", child.name),
+                ConstraintKind::Unique => {
+                    let column = columns
+                        .as_ref()
+                        .and_then(|columns| columns.first())
+                        .cloned()
+                        .unwrap_or_else(|| child.name.clone());
+                    format!("{}_{}_key", child.name, column)
+                }
+                _ => parent_constraint.name.clone(),
+            };
+            self.snapshot_constraint(child, &cloned_name);
             self.local.constraints.insert(
-                (child.clone(), parent_constraint.name.clone()),
+                (child.clone(), cloned_name.clone()),
                 ConstraintState {
                     table_id: child.clone(),
-                    name: parent_constraint.name.clone(),
+                    name: cloned_name.clone(),
                     kind: parent_constraint.kind,
                     validated: true,
                     definition: None,
@@ -576,7 +580,7 @@ impl AnalysisState {
                     child.clone(),
                     child.clone(),
                     DependencyKind::ConstraintOnRelation {
-                        constraint_name: parent_constraint.name.clone(),
+                        constraint_name: cloned_name,
                         columns,
                         is_primary: parent_constraint.kind == ConstraintKind::PrimaryKey,
                     },
@@ -628,22 +632,21 @@ impl AnalysisState {
 
     fn constraint_index_dependency(columns: Vec<String>, is_unique: bool) -> DependencyKind {
         DependencyKind::IndexOnRelation {
-            using_method: Some("btree".to_string()),
-            key_columns: columns.clone(),
-            included_columns: Vec::new(),
+            definition: IndexDefinition {
+                method: Some("btree".to_string()),
+                keys: index_keys(columns.clone()),
+                included: index_keys(Vec::new()),
+                expression_keys: usize::from(false),
+                unique: is_unique,
+                predicate: false,
+                valid: true,
+                ready: true,
+                live: true,
+            },
             dependency_columns: columns,
             dependency_columns_known: true,
-            has_expression_keys: false,
-            has_predicate: false,
             is_concurrent: false,
-            is_unique,
             is_immediate: true,
-            is_valid: true,
-            is_ready: true,
-            is_live: true,
-            has_default_sort_order: true,
-            has_default_opclasses: true,
-            has_default_collations: true,
             eligibility_known: true,
         }
     }
@@ -850,29 +853,24 @@ impl AnalysisState {
             return MutationResult::NoOp;
         }
 
-        // A synchronized relation row proves that the table exists, but it
-        // cannot prove a DROP result when the dependency catalog family was
-        // omitted.  Treat both RESTRICT and CASCADE conservatively rather
-        // than letting a partial graph look complete merely because it has
-        // some cached edges.
-        if present_targets
+        // Neither a baseline without dependency coverage nor a scoped one can
+        // enumerate every dependent. The named targets still drop and the known
+        // closure still follows; only the remainder is unknown, so record that
+        // instead of refusing a drop PostgreSQL performs.
+        let mut incomplete_closure = present_targets
             .iter()
             .any(|id| self.baseline_relation_is_known(id))
-            && !self.baseline_has_coverage(crate::_internal::db::cache::CatalogFamily::Dependencies)
-        {
-            return self.unresolved(EvidenceCode::CatalogCoverageIncomplete);
-        }
+            && !self
+                .baseline_has_coverage(crate::_internal::db::cache::CatalogFamily::Dependencies);
 
-        // The FK loader only expands foreign-key boundaries, so a scoped baseline
-        // cannot prove every cross-schema dependent was loaded.
-        if present_targets.iter().any(|id| {
+        // The FK loader only expands foreign-key boundaries, so a scoped
+        // baseline cannot prove every cross-schema dependent was loaded.
+        incomplete_closure |= present_targets.iter().any(|id| {
             self.baseline_scoped_family_object(
                 id,
                 crate::_internal::db::cache::CatalogFamily::Relations,
             )
-        }) {
-            return self.unresolved(EvidenceCode::CatalogCoverageIncomplete);
-        }
+        });
 
         let roots: HashSet<ObjectId> = present_targets.iter().map(&resolve).collect();
         let mut dropped_relations = roots.clone();
@@ -1136,6 +1134,16 @@ impl AnalysisState {
             !matches!(edge.kind, DependencyKind::PublicationIncludes { .. })
                 || !dropped_relations.contains(&resolve(&edge.dependent))
         });
+
+        if incomplete_closure {
+            // Everything the known closure reached is gone. A dependent loaded
+            // out of scope may have gone too, so nothing after this statement
+            // can be called exact.
+            self.taint(
+                EvidenceCode::CatalogCoverageIncomplete,
+                EvidenceScope::Chain,
+            );
+        }
 
         MutationResult::Applied
     }
@@ -1668,22 +1676,21 @@ impl AnalysisState {
                     );
                     like_indexes.push((
                         DependencyKind::IndexOnRelation {
-                            using_method: is_key.then(|| "btree".to_string()),
-                            key_columns: columns.clone(),
-                            included_columns: Vec::new(),
+                            definition: IndexDefinition {
+                                method: is_key.then(|| "btree".to_string()),
+                                keys: index_keys(columns.clone()),
+                                included: index_keys(Vec::new()),
+                                expression_keys: usize::from(!is_key),
+                                unique: is_unique,
+                                predicate: false,
+                                valid: true,
+                                ready: true,
+                                live: true,
+                            },
                             dependency_columns: columns.clone(),
                             dependency_columns_known: true,
-                            has_expression_keys: !is_key,
-                            has_predicate: false,
                             is_concurrent: false,
-                            is_unique,
                             is_immediate: true,
-                            is_valid: true,
-                            is_ready: true,
-                            is_live: true,
-                            has_default_sort_order: is_key,
-                            has_default_opclasses: is_key,
-                            has_default_collations: is_key,
                             eligibility_known: true,
                         },
                         Some((constraint.kind, columns)),
@@ -2492,8 +2499,8 @@ impl AnalysisState {
                 Some(_) => unreachable!("LIKE INDEXES clones only index-backed constraints"),
                 None => {
                     let columns = match &index_kind {
-                        DependencyKind::IndexOnRelation { key_columns, .. } => {
-                            key_columns.join("_")
+                        DependencyKind::IndexOnRelation { definition, .. } => {
+                            definition.key_column_names().join("_")
                         }
                         _ => unreachable!("LIKE index plan must contain an index edge"),
                     };
@@ -3023,22 +3030,21 @@ impl AnalysisState {
                     index_id,
                     create.id.clone(),
                     DependencyKind::IndexOnRelation {
-                        using_method: None,
-                        key_columns: columns.clone(),
-                        included_columns: Vec::new(),
+                        definition: IndexDefinition {
+                            method: None,
+                            keys: index_keys(columns.clone()),
+                            included: index_keys(Vec::new()),
+                            expression_keys: usize::from(true),
+                            unique: false,
+                            predicate: false,
+                            valid: true,
+                            ready: true,
+                            live: true,
+                        },
                         dependency_columns: columns.clone(),
                         dependency_columns_known: columns_complete,
-                        has_expression_keys: true,
-                        has_predicate: false,
                         is_concurrent: false,
-                        is_unique: false,
                         is_immediate: true,
-                        is_valid: true,
-                        is_ready: true,
-                        is_live: true,
-                        has_default_sort_order: false,
-                        has_default_opclasses: false,
-                        has_default_collations: false,
                         eligibility_known: false,
                     },
                 ));
@@ -3124,6 +3130,9 @@ impl AnalysisState {
             if !matches!(result, MutationResult::Applied) {
                 return result;
             }
+            // PostgreSQL creates and attaches the partition's indexes as part
+            // of creating the partition, not as a separate step.
+            self.ensure_partition_indexes_and_constraints(parent, &create.id);
         }
         MutationResult::Applied
     }
@@ -3156,26 +3165,7 @@ impl AnalysisState {
         else {
             return;
         };
-        let DependencyKind::IndexOnRelation {
-            using_method,
-            key_columns,
-            included_columns,
-            dependency_columns,
-            dependency_columns_known,
-            has_expression_keys,
-            has_predicate,
-            is_concurrent,
-            is_unique,
-            is_immediate,
-            is_valid,
-            is_ready,
-            is_live,
-            has_default_sort_order,
-            has_default_opclasses,
-            has_default_collations,
-            eligibility_known,
-        } = edge.kind
-        else {
+        let DependencyKind::IndexOnRelation { .. } = edge.kind else {
             return;
         };
         self.snapshot_graph_full();
@@ -3183,29 +3173,9 @@ impl AnalysisState {
             !(matches!(existing.kind, DependencyKind::IndexOnRelation { .. })
                 && existing.dependent == *index)
         });
-        self.local.graph.add_edge(DependencyEdge::new(
-            adopted,
-            table.clone(),
-            DependencyKind::IndexOnRelation {
-                using_method,
-                key_columns,
-                included_columns,
-                dependency_columns,
-                dependency_columns_known,
-                has_expression_keys,
-                has_predicate,
-                is_concurrent,
-                is_unique,
-                is_immediate,
-                is_valid,
-                is_ready,
-                is_live,
-                has_default_sort_order,
-                has_default_opclasses,
-                has_default_collations,
-                eligibility_known,
-            },
-        ));
+        self.local
+            .graph
+            .add_edge(DependencyEdge::new(adopted, table.clone(), edge.kind));
     }
 
     pub(super) fn apply_alter_table(&mut self, alter: &AlterTable) -> MutationResult {
@@ -3901,6 +3871,9 @@ impl AnalysisState {
                         child, action, alter.id
                     ));
                 }
+                // Detaching a partition detaches its indexes too, so a later
+                // DROP INDEX on either side must be allowed.
+                self.detach_index_partitions_of_table(child);
             }
             AlterTableActionMutation::InheritTable { parent }
             | AlterTableActionMutation::NoInheritTable { parent } => {
@@ -4045,15 +4018,9 @@ impl AnalysisState {
                     ));
                 };
                 let DependencyKind::IndexOnRelation {
-                    key_columns,
+                    definition,
                     dependency_columns_known,
-                    has_expression_keys,
-                    has_predicate,
-                    is_unique,
                     is_immediate,
-                    is_valid,
-                    is_ready,
-                    is_live,
                     eligibility_known,
                     ..
                 } = &edge.kind
@@ -4069,7 +4036,7 @@ impl AnalysisState {
                     .get(&alter.id)
                     .and_then(|overlay| match overlay {
                         RelationOverlay::Present(relation) => {
-                            Some(key_columns.iter().all(|column| {
+                            Some(definition.key_column_names().iter().all(|column| {
                                 relation
                                     .columns
                                     .iter()
@@ -4080,13 +4047,11 @@ impl AnalysisState {
                         RelationOverlay::Dropped => None,
                     })
                     .unwrap_or(false);
-                if !*is_unique
-                    || *has_predicate
-                    || *has_expression_keys
-                    || !*is_valid
+                if !definition.is_usable()
+                    || !definition.unique
+                    || definition.predicate
+                    || definition.has_expression_keys()
                     || !*is_immediate
-                    || !*is_ready
-                    || !*is_live
                     || !all_keys_not_null
                 {
                     return MutationResult::conflict(format!(
@@ -4468,16 +4433,7 @@ impl AnalysisState {
                 ));
             }
             if let DependencyKind::IndexOnRelation {
-                using_method,
-                has_expression_keys,
-                has_predicate,
-                is_unique,
-                is_valid,
-                is_ready,
-                is_live,
-                has_default_sort_order,
-                has_default_opclasses,
-                has_default_collations,
+                definition,
                 eligibility_known,
                 ..
             } = &edge.kind
@@ -4485,18 +4441,20 @@ impl AnalysisState {
                 if !*eligibility_known {
                     return self.unresolved(EvidenceCode::CatalogCoverageIncomplete);
                 }
-                let is_btree = using_method
+                let is_btree = definition
+                    .method
                     .as_deref()
                     .is_some_and(|method| method.eq_ignore_ascii_case("btree"));
-                if !*is_unique
-                    || *has_predicate
-                    || *has_expression_keys
-                    || !*is_valid
-                    || !*is_ready
-                    || !*is_live
-                    || !*has_default_sort_order
-                    || !*has_default_opclasses
-                    || !*has_default_collations
+                // A non-plain key means an explicit opclass, collation or sort
+                // order, which a constraint index may not carry.
+                if !definition.is_usable()
+                    || !definition.unique
+                    || definition.predicate
+                    || definition.has_expression_keys()
+                    || !definition
+                        .keys
+                        .iter()
+                        .all(crate::_internal::model::index::IndexKey::is_plain)
                     || !is_btree
                 {
                     return MutationResult::conflict(format!(
@@ -4534,15 +4492,21 @@ impl AnalysisState {
         let mut cascade_view_roots: HashSet<ObjectId> = HashSet::new();
         if let AlterTableActionMutation::DropColumn { name, cascade, .. } = &alter.action {
             let resolved_table = self.local.graph.resolve_rename(&alter.id).clone();
-            if self.baseline_relation_is_known(&resolved_table)
+            // The same rule as DROP TABLE: an unproven dependency set widens what the
+            // drop may take with it, it does not cancel the drop. PostgreSQL
+            // removes the column either way.
+            let unproven_dependents = self.baseline_relation_is_known(&resolved_table)
                 && (!self.baseline_has_coverage(
                     crate::_internal::db::cache::CatalogFamily::Dependencies,
                 ) || self.baseline_scoped_family_object(
                     &resolved_table,
                     crate::_internal::db::cache::CatalogFamily::Relations,
-                ))
-            {
-                return self.unresolved(EvidenceCode::CatalogCoverageIncomplete);
+                ));
+            if unproven_dependents {
+                self.taint(
+                    EvidenceCode::CatalogCoverageIncomplete,
+                    EvidenceScope::Chain,
+                );
             }
             let mut unknown_dependency = false;
             let mut known_dependency = false;
@@ -4631,12 +4595,9 @@ impl AnalysisState {
                         }
                     }
                     DependencyKind::IndexOnRelation {
-                        key_columns,
-                        included_columns,
+                        definition,
                         dependency_columns,
                         dependency_columns_known,
-                        has_expression_keys,
-                        has_predicate,
                         ..
                     } if referenced == &resolved_table => {
                         // PostgreSQL automatically removes an index when a
@@ -4649,12 +4610,13 @@ impl AnalysisState {
                             unknown_dependency = true;
                         } else if dependency_columns.iter().any(|column| column == name) {
                             drop_column_indexes.insert(dependent.clone());
-                        } else if !*has_expression_keys && !*has_predicate {
+                        } else if !definition.has_expression_keys() && !definition.predicate {
                             debug_assert!(
-                                key_columns
-                                    .iter()
-                                    .chain(included_columns)
-                                    .all(|column| dependency_columns.contains(column))
+                                definition
+                                    .key_column_names()
+                                    .into_iter()
+                                    .chain(definition.included_column_names())
+                                    .all(|column| dependency_columns.contains(&column))
                             );
                         }
                     }
@@ -4855,14 +4817,21 @@ impl AnalysisState {
                 }
             }
 
-            if unknown_dependency {
-                return self.unresolved(EvidenceCode::CatalogCoverageIncomplete);
-            }
             if known_dependency && !cascade {
                 return MutationResult::conflict(format!(
                     "column '{}.{}' has dependent objects; use CASCADE",
                     alter.id, name
                 ));
+            }
+            if unknown_dependency {
+                // PostgreSQL drops the column; only the fate of dependents the
+                // pre-scan could not classify is open. Record that and fall
+                // through, because abandoning the mutation would claim the
+                // column survives when it cannot.
+                self.taint(
+                    EvidenceCode::CatalogCoverageIncomplete,
+                    EvidenceScope::Chain,
+                );
             }
         }
 
@@ -5532,22 +5501,21 @@ impl AnalysisState {
                             backing_index,
                             alter.id.clone(),
                             DependencyKind::IndexOnRelation {
-                                using_method: None,
-                                key_columns: columns.clone(),
-                                included_columns: Vec::new(),
+                                definition: IndexDefinition {
+                                    method: None,
+                                    keys: index_keys(columns.clone()),
+                                    included: index_keys(Vec::new()),
+                                    expression_keys: usize::from(true),
+                                    unique: false,
+                                    predicate: false,
+                                    valid: true,
+                                    ready: true,
+                                    live: true,
+                                },
                                 dependency_columns: columns.clone(),
                                 dependency_columns_known: true,
-                                has_expression_keys: true,
-                                has_predicate: false,
                                 is_concurrent: false,
-                                is_unique: false,
                                 is_immediate: true,
-                                is_valid: true,
-                                is_ready: true,
-                                is_live: true,
-                                has_default_sort_order: false,
-                                has_default_opclasses: false,
-                                has_default_collations: false,
                                 eligibility_known: false,
                             },
                         ));
@@ -6210,7 +6178,8 @@ impl AnalysisState {
                     }
                 }
                 DependencyKind::IndexOnRelation {
-                    is_unique: true, ..
+                    definition: IndexDefinition { unique: true, .. },
+                    ..
                 } => unknown = true,
                 _ => {}
             }

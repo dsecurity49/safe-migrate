@@ -8,7 +8,7 @@ mod state_mutation_tests {
     use safe_migrate::_internal::analysis::mutations::{
         DropAggregateMutation, DropFunctionMutation, DropProcedureMutation, Mutation,
     };
-    use safe_migrate::_internal::analysis::state::{Confidence, MutationResult};
+    use safe_migrate::_internal::analysis::state::{AnalysisState, Confidence, MutationResult};
     use safe_migrate::_internal::ast::identifiers::{Ident, ObjectId, QualifiedName};
     use safe_migrate::_internal::db::cache::{
         CatalogFamily, ConstraintDependencyCache, GeneratedColumnDependencyCache,
@@ -19,6 +19,7 @@ mod state_mutation_tests {
     use safe_migrate::_internal::model::function::{
         FunctionOverlay, FunctionState, RoutineKind, SecurityMode, Volatility,
     };
+    use safe_migrate::_internal::model::index::{IndexDefinition, index_keys};
     use safe_migrate::_internal::model::relation::{
         ColumnAction, Persistence, Privilege, RelationKind, RelationOverlay, RelationState,
     };
@@ -26,6 +27,7 @@ mod state_mutation_tests {
     use safe_migrate::_internal::model::schema::SchemaState;
     use safe_migrate::_internal::model::sequence::{SequenceKind, SequenceOverlay, SequenceState};
     use safe_migrate::_internal::model::types::{TypeKind, TypeOverlay, TypeState};
+    use safe_migrate::_internal::report::violations::Violation;
 
     #[test]
     fn partition_key_rename_updates_keys_for_synthesis() {
@@ -329,7 +331,7 @@ mod state_mutation_tests {
                         && matches!(
                             edge.kind,
                             DependencyKind::IndexOnRelation {
-                                is_unique: true,
+                                definition: IndexDefinition { unique: true, .. },
                                 ..
                             }
                         ))
@@ -573,7 +575,10 @@ mod state_mutation_tests {
         assert!(matches!(
             edge.kind,
             DependencyKind::IndexOnRelation {
-                has_expression_keys: true,
+                definition: IndexDefinition {
+                    expression_keys: 1,
+                    ..
+                },
                 dependency_columns_known: false,
                 eligibility_known: true,
                 ..
@@ -1029,21 +1034,20 @@ mod state_mutation_tests {
             .push(safe_migrate::_internal::db::cache::IndexCache {
                 index_id: index_id.clone(),
                 table_id: table_id.clone(),
-                using_method: "btree".to_string(),
-                key_columns: Vec::new(),
-                included_columns: Vec::new(),
+                definition: IndexDefinition {
+                    method: Some("btree".into()),
+                    keys: index_keys(Vec::new()),
+                    included: index_keys(Vec::new()),
+                    expression_keys: 1,
+                    unique: false,
+                    predicate: false,
+                    valid: true,
+                    ready: true,
+                    live: true,
+                },
                 dependency_columns: vec!["note".to_string()],
                 dependency_columns_known: true,
-                has_expression_keys: true,
-                has_predicate: false,
-                is_unique: false,
                 is_immediate: true,
-                is_valid: true,
-                is_ready: true,
-                is_live: true,
-                has_default_sort_order: true,
-                has_default_opclasses: true,
-                has_default_collations: true,
             });
 
         let engine = setup_engine();
@@ -1144,7 +1148,7 @@ mod state_mutation_tests {
     }
 
     #[test]
-    fn scoped_drop_with_incomplete_dependency_coverage_stays_unchanged() {
+    fn scoped_drop_with_incomplete_dependency_coverage_applies_and_taints() {
         let in_scope_table = object_id("app", "base");
         let omitted_view = object_id("tenant", "v");
         let mut cache = synced_cache();
@@ -1179,8 +1183,10 @@ mod state_mutation_tests {
                 .any(|violation| violation.rule_id == "chain-conflict"),
             "coverage uncertainty should skip without inventing a conflict: {violations:?}"
         );
+        // PostgreSQL drops the table even when the baseline could not enumerate
+        // every dependent; only the chain's exactness is lost.
         assert_eq!(state.local.confidence, Confidence::Tainted);
-        assert!(state.relation_is_present(&in_scope_table));
+        assert!(!state.relation_is_present(&in_scope_table));
     }
 
     #[test]
@@ -1941,7 +1947,7 @@ mod state_mutation_tests {
                     .is_some_and(|definition| definition.contains("renamed")))
         );
         assert!(state.local.graph.edges().iter().any(|edge| edge.dependent == object_id("public", "child_id_idx")
-            && matches!(&edge.kind, DependencyKind::IndexOnRelation { key_columns, .. } if key_columns == &["renamed".to_string()])));
+            && matches!(&edge.kind, DependencyKind::IndexOnRelation { definition, .. } if definition.key_column_names() == ["renamed"])));
         engine.analyze("ROLLBACK;", &mut state).unwrap();
         for name in ["parent", "child"] {
             let RelationOverlay::Present(relation) =
@@ -7644,21 +7650,20 @@ mod state_mutation_tests {
             .push(safe_migrate::_internal::db::cache::IndexCache {
                 index_id: derived_index.clone(),
                 table_id: table.clone(),
-                using_method: "btree".to_string(),
-                key_columns: vec!["derived".to_string()],
-                included_columns: Vec::new(),
+                definition: IndexDefinition {
+                    method: Some("btree".into()),
+                    keys: index_keys(vec!["derived".to_string()]),
+                    included: index_keys(Vec::new()),
+                    expression_keys: 0,
+                    unique: false,
+                    predicate: false,
+                    valid: true,
+                    ready: true,
+                    live: true,
+                },
                 dependency_columns: vec!["derived".to_string()],
                 dependency_columns_known: true,
-                has_expression_keys: false,
-                has_predicate: false,
-                is_unique: false,
                 is_immediate: true,
-                is_valid: true,
-                is_ready: true,
-                is_live: true,
-                has_default_sort_order: true,
-                has_default_opclasses: true,
-                has_default_collations: true,
             });
         let mut state = crate::_internal::analysis::state::AnalysisState::new(cache.clone());
 
@@ -9630,5 +9635,436 @@ mod state_mutation_tests {
                 .any(|finding| finding.rule_id == "chain-conflict"),
             "an unrelated index must survive its neighbour's drop: {findings:?}"
         );
+    }
+
+    // The expected outcomes below were confirmed against a live PostgreSQL
+    // 18.6 server before being encoded here.
+    fn attach_fixture(sql: &str) -> (AnalysisState, Vec<Violation>) {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let violations = engine.analyze(sql, &mut state).unwrap();
+        (state, violations)
+    }
+
+    #[test]
+    fn attaching_a_mismatched_index_partition_is_refused() {
+        let (state, violations) = attach_fixture(
+            "CREATE TABLE p (a integer, b text, d text) PARTITION BY RANGE (a);
+             CREATE TABLE c (a integer, b text, d text);
+             ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);
+             CREATE INDEX c_b ON c (b);
+             CREATE INDEX p_d ON p (d);
+             ALTER INDEX p_d ATTACH PARTITION c_b;",
+        );
+        // PostgreSQL: "cannot attach index ... the index definitions do not match"
+        assert!(
+            !state
+                .local
+                .graph
+                .edges()
+                .iter()
+                .any(|edge| matches!(edge.kind, DependencyKind::IndexPartitionOf))
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.reason.contains("index definitions do not match")),
+            "expected a definition mismatch, got {violations:?}"
+        );
+    }
+
+    #[test]
+    fn attaching_an_index_from_a_non_partition_is_refused() {
+        let (state, violations) = attach_fixture(
+            "CREATE TABLE p (a integer) PARTITION BY RANGE (a);
+             CREATE TABLE c (a integer);
+             CREATE TABLE elsewhere (a integer);
+             ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);
+             CREATE INDEX elsewhere_a ON elsewhere (a);
+             CREATE INDEX p_a ON p (a);
+             ALTER INDEX p_a ATTACH PARTITION elsewhere_a;",
+        );
+        assert!(
+            !state
+                .local
+                .graph
+                .edges()
+                .iter()
+                .any(|edge| matches!(edge.kind, DependencyKind::IndexPartitionOf))
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.reason.contains("not an index on any partition")),
+            "expected a non-partition refusal, got {violations:?}"
+        );
+    }
+
+    #[test]
+    fn attaching_a_matching_index_partition_is_accepted() {
+        let (state, violations) = attach_fixture(
+            "CREATE TABLE p (a integer, b text) PARTITION BY RANGE (a);
+             CREATE TABLE c (a integer, b text);
+             ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);
+             CREATE INDEX c_b ON c (b);
+             CREATE INDEX p_b ON p (b);
+             ALTER INDEX p_b ATTACH PARTITION c_b;",
+        );
+        assert!(
+            state.local.graph.edges().iter().any(|edge| matches!(
+                edge.kind,
+                DependencyKind::IndexPartitionOf
+            ) && edge.dependent
+                == object_id("public", "c_b")
+                && edge.referenced == object_id("public", "p_b")),
+            "expected the attachment to be recorded, got {violations:?}"
+        );
+    }
+
+    #[test]
+    fn attaching_an_index_with_a_different_opclass_is_refused() {
+        let (state, violations) = attach_fixture(
+            "CREATE TABLE p (a integer, b text) PARTITION BY RANGE (a);
+             CREATE TABLE c (a integer, b text);
+             ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);
+             CREATE INDEX c_ops ON c (b varchar_pattern_ops);
+             CREATE INDEX p_ops ON p (b varchar_pattern_ops);
+             ALTER INDEX p_ops ATTACH PARTITION c_ops;
+             CREATE INDEX c_plain ON c (b);
+             CREATE INDEX p_plain ON p (b);",
+        );
+        // Sanity: the matching pair attaches.
+        assert!(
+            state.local.graph.edges().iter().any(|edge| matches!(
+                edge.kind,
+                DependencyKind::IndexPartitionOf
+            ) && edge.dependent
+                == object_id("public", "c_ops")
+                && edge.referenced == object_id("public", "p_ops")),
+            "matching opclasses must attach, got {violations:?}"
+        );
+        // A default opclass against an explicit one must not.
+        let (state, violations) = attach_fixture(
+            "CREATE TABLE p (a integer, b text) PARTITION BY RANGE (a);
+             CREATE TABLE c (a integer, b text);
+             ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);
+             CREATE INDEX c_ops ON c (b varchar_pattern_ops);
+             CREATE INDEX p_plain ON p (b);
+             ALTER INDEX p_plain ATTACH PARTITION c_ops;",
+        );
+        assert!(
+            !state
+                .local
+                .graph
+                .edges()
+                .iter()
+                .any(|edge| matches!(edge.kind, DependencyKind::IndexPartitionOf)),
+            "a differing opclass must not attach, got {violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_written_default_opclass_matches_an_omitted_one() {
+        // Verified live: PostgreSQL records opclass OID 3126 for both
+        // `CREATE INDEX ... (note)` and `CREATE INDEX ... (note text_ops)`,
+        // and attaches one to the other. The simulator must agree, or it
+        // rejects an attachment PostgreSQL accepts.
+        let (state, violations) = attach_fixture(
+            "CREATE TABLE p (a integer, note text) PARTITION BY RANGE (a);
+             CREATE TABLE c (a integer, note text);
+             ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);
+             CREATE INDEX c_note ON c (note text_ops);
+             CREATE INDEX p_note ON p (note);
+             ALTER INDEX p_note ATTACH PARTITION c_note;",
+        );
+        assert!(
+            state.local.graph.edges().iter().any(|edge| matches!(
+                edge.kind,
+                DependencyKind::IndexPartitionOf
+            ) && edge.dependent
+                == object_id("public", "c_note")
+                && edge.referenced == object_id("public", "p_note")),
+            "an explicit default opclass must attach like an omitted one, got {violations:?}"
+        );
+    }
+
+    #[test]
+    fn an_attached_child_index_cannot_be_dropped_on_its_own() {
+        let (state, violations) = attach_fixture(
+            "CREATE TABLE p (a integer) PARTITION BY RANGE (a);
+             CREATE TABLE c (a integer);
+             ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);
+             CREATE INDEX c_a ON c (a);
+             CREATE INDEX p_a ON p (a);
+             ALTER INDEX p_a ATTACH PARTITION c_a;
+             DROP INDEX c_a;",
+        );
+        // PostgreSQL refuses this as 2BP01 even with CASCADE.
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.reason.contains("requires it")),
+            "expected a dependent-index refusal, got {violations:?}"
+        );
+        assert!(state.local.graph.edges().iter().any(|edge| matches!(
+            edge.kind,
+            DependencyKind::IndexOnRelation { .. }
+        ) && edge.dependent
+            == object_id("public", "c_a")));
+    }
+
+    #[test]
+    fn creating_a_partition_attaches_its_indexes_to_the_parent() {
+        // PostgreSQL creates and attaches the partition's index as part of
+        // CREATE TABLE ... PARTITION OF, so the child cannot be dropped alone.
+        let (state, violations) = attach_fixture(
+            "CREATE TABLE p (a integer, b text) PARTITION BY RANGE (a);
+             CREATE INDEX p_b ON p (b);
+             CREATE TABLE c PARTITION OF p FOR VALUES FROM (0) TO (10);",
+        );
+        assert!(
+            state.local.graph.edges().iter().any(|edge| matches!(
+                edge.kind,
+                DependencyKind::IndexPartitionOf
+            ) && edge.referenced
+                == object_id("public", "p_b")),
+            "the partition's index must be attached to the parent's, got {violations:?}"
+        );
+    }
+
+    #[test]
+    fn attaching_a_partition_attaches_reused_child_indexes_to_the_parent() {
+        // The pre-existing child index is reused rather than recreated, and is
+        // still attached, so DROP INDEX on it must be refused. PostgreSQL
+        // creates no parent index when the parent has none, so the parent index
+        // has to exist here for an attachment to happen at all.
+        let (state, violations) = attach_fixture(
+            "CREATE TABLE p (a integer, b text) PARTITION BY RANGE (a);
+             CREATE TABLE c (a integer, b text);
+             CREATE INDEX c_b ON c (b);
+             CREATE INDEX p_b ON p (b);
+             ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);",
+        );
+        assert!(
+            state.local.graph.edges().iter().any(|edge| matches!(
+                edge.kind,
+                DependencyKind::IndexPartitionOf
+            ) && edge.dependent
+                == object_id("public", "c_b")
+                && edge.referenced == object_id("public", "p_b")),
+            "a reused partition index must be attached to the parent's, got {violations:?}"
+        );
+    }
+
+    #[test]
+    fn attaching_a_partition_creates_the_missing_child_index_and_attaches_it() {
+        // Verified live: PostgreSQL creates the partition's index when it is
+        // missing and attaches it to the parent's, so it cannot be dropped
+        // alone afterwards.
+        let (state, violations) = attach_fixture(
+            "CREATE TABLE p (a integer, b text) PARTITION BY RANGE (a);
+             CREATE INDEX p_b ON p (b);
+             CREATE TABLE c (a integer, b text);
+             ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);",
+        );
+        let attachment = state
+            .local
+            .graph
+            .edges()
+            .iter()
+            .find(|edge| matches!(edge.kind, DependencyKind::IndexPartitionOf));
+        let child = attachment.map(|edge| edge.dependent.clone());
+        assert!(
+            attachment.is_some() && child.as_ref() == Some(&object_id("public", "c_b_idx")),
+            "expected a generated child index attached to p_b, got {child:?} in {violations:?}"
+        );
+        assert!(state.local.graph.edges().iter().any(|edge| matches!(
+            edge.kind,
+            DependencyKind::IndexOnRelation { .. }
+        ) && edge.dependent
+            == object_id("public", "c_b_idx")
+            && edge.referenced == object_id("public", "c")));
+    }
+
+    #[test]
+    fn attaching_a_partition_without_a_parent_index_creates_no_attachment() {
+        // Verified live: PostgreSQL does not invent a parent index here, so the
+        // child index stays independent and remains droppable.
+        let (state, _violations) = attach_fixture(
+            "CREATE TABLE p (a integer, b text) PARTITION BY RANGE (a);
+             CREATE TABLE c (a integer, b text);
+             CREATE INDEX c_b ON c (b);
+             ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);",
+        );
+        assert!(
+            !state
+                .local
+                .graph
+                .edges()
+                .iter()
+                .any(|edge| matches!(edge.kind, DependencyKind::IndexPartitionOf)),
+            "no parent index means no attachment"
+        );
+    }
+
+    #[test]
+    fn a_concurrent_detach_also_releases_index_attachments() {
+        // PostgreSQL detaches the indexes on the first phase, before FINALIZE,
+        // so a later DROP INDEX must already be allowed.
+        let (state, _violations) = attach_fixture(
+            "CREATE TABLE p (a integer) PARTITION BY RANGE (a);
+             CREATE TABLE c (a integer);
+             ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);
+             CREATE INDEX c_a ON c (a);
+             CREATE INDEX p_a ON p (a);
+             ALTER TABLE p DETACH PARTITION c CONCURRENTLY;",
+        );
+        assert!(
+            !state
+                .local
+                .graph
+                .edges()
+                .iter()
+                .any(|edge| matches!(edge.kind, DependencyKind::IndexPartitionOf)),
+            "DETACH PARTITION CONCURRENTLY must release index attachments"
+        );
+    }
+
+    #[test]
+    fn detaching_a_partition_releases_its_index_attachments() {
+        let (state, _violations) = attach_fixture(
+            "CREATE TABLE p (a integer) PARTITION BY RANGE (a);
+             CREATE TABLE c (a integer);
+             ALTER TABLE p ATTACH PARTITION c FOR VALUES FROM (0) TO (10);
+             CREATE INDEX c_a ON c (a);
+             CREATE INDEX p_a ON p (a);
+             ALTER INDEX p_a ATTACH PARTITION c_a;
+             ALTER TABLE p DETACH PARTITION c;",
+        );
+        // PostgreSQL detaches the indexes with the partition, so leaving the
+        // edge behind would make a later DROP INDEX fail spuriously.
+        assert!(
+            !state
+                .local
+                .graph
+                .edges()
+                .iter()
+                .any(|edge| matches!(edge.kind, DependencyKind::IndexPartitionOf)),
+            "detach must not leave a stale index attachment"
+        );
+    }
+    #[test]
+    fn dropping_a_column_removes_it() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TABLE t (id integer, doomed text, keep text);",
+                &mut state,
+            )
+            .unwrap();
+        assert!(state
+            .relation_is_present(&object_id("public", "t")));
+        engine
+            .analyze("ALTER TABLE t DROP COLUMN doomed;", &mut state)
+            .unwrap();
+        let columns = state
+            .local
+            .relations
+            .get(&object_id("public", "t"))
+            .and_then(|o| match o {
+                RelationOverlay::Present(r) => Some(
+                    r.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>(),
+                ),
+                _ => None,
+            })
+            .unwrap_or_default();
+        assert_eq!(columns, ["id", "keep"], "dropped column must be gone");
+    }
+
+    // The differential harness applies a fixture to a baseline hydrated from the
+    // catalog, not to a table the same run created, so both paths must drop.
+    #[test]
+    fn dropping_a_column_from_a_baseline_relation_removes_it() {
+        let mut cache = crate::common::cache_with_table("public", "t", None);
+        let tid = object_id("public", "t");
+        if let Some(rel) = cache.relations.get_mut(&tid) {
+            rel.columns = vec![
+                Column {
+                    name: "id".to_string(),
+                    data_type: Some("integer".to_string()),
+                    type_id: None,
+                    is_nullable: false,
+                    default: None,
+                    avg_width: None,
+                    default_expr_text: None,
+                    type_modifier: None,
+                    storage: None,
+                    compression: None,
+                    statistics_target: None,
+                    options: Default::default(),
+                    generated: None,
+                },
+                Column {
+                    name: "doomed".to_string(),
+                    data_type: Some("text".to_string()),
+                    type_id: None,
+                    is_nullable: true,
+                    default: None,
+                    avg_width: None,
+                    default_expr_text: None,
+                    type_modifier: None,
+                    storage: None,
+                    compression: None,
+                    statistics_target: None,
+                    options: Default::default(),
+                    generated: None,
+                },
+            ];
+        }
+        let mut state = AnalysisState::with_baseline(cache, true);
+        setup_engine()
+            .analyze("ALTER TABLE t DROP COLUMN doomed;", &mut state)
+            .unwrap();
+        let columns = state
+            .local
+            .relations
+            .get(&tid)
+            .and_then(|overlay| match overlay {
+                RelationOverlay::Present(rel) => {
+                    Some(rel.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>())
+                }
+                _ => None,
+            })
+            .unwrap_or_default();
+        assert_eq!(columns, ["id"], "baseline column must be gone");
+    }
+
+    // PostgreSQL 18 materialises NOT NULL columns as `pg_constraint` rows, so a
+    // table carrying one exercises a path the unit fixtures otherwise skip.
+    #[test]
+    fn dropping_a_column_works_alongside_a_pg18_not_null_constraint() {
+        let tid = object_id("public", "t");
+        let mut state = setup_state();
+        state.pg_version_num = Some(180_006);
+        setup_engine()
+            .analyze(
+                "CREATE TABLE t (id integer NOT NULL, doomed text);
+                 ALTER TABLE t DROP COLUMN doomed;",
+                &mut state,
+            )
+            .unwrap();
+        let columns = state
+            .local
+            .relations
+            .get(&tid)
+            .and_then(|overlay| match overlay {
+                RelationOverlay::Present(rel) => {
+                    Some(rel.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>())
+                }
+                _ => None,
+            })
+            .unwrap_or_default();
+        assert_eq!(columns, ["id"], "dropped column must be gone");
     }
 }

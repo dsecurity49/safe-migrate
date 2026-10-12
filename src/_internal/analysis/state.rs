@@ -34,6 +34,7 @@ mod apply_settings;
 mod apply_transaction;
 mod apply_type;
 mod apply_view_index;
+mod index_topology;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub(crate) enum Confidence {
@@ -170,6 +171,7 @@ pub(crate) struct LocalState {
     /// Built-in types of the synchronized cluster, used to resolve written
     /// type names. Empty only when no baseline supplied one.
     pub builtin_types: BuiltinTypeCatalogue,
+    pub opclasses: crate::_internal::model::opclass::OpclassCatalogue,
     /// Performance hint: a temporary object has been created in this session.
     /// `temp_namespace_exists` derives the real answer, so this only has to be
     /// a superset to stay correct across rollback and `ON COMMIT DROP`.
@@ -237,6 +239,7 @@ struct HydratedRelationTypes {
 #[cfg(test)]
 mod pre_state_tests {
     use super::*;
+    use crate::_internal::model::index::{IndexDefinition, index_keys};
 
     #[test]
     fn incremental_capture_matches_a_fresh_public_pre_state() {
@@ -269,22 +272,21 @@ mod pre_state_tests {
             index_id,
             table_id.clone(),
             DependencyKind::IndexOnRelation {
-                using_method: Some("btree".into()),
-                key_columns: vec!["id".into()],
-                included_columns: Vec::new(),
+                definition: IndexDefinition {
+                    method: Some("btree".into()),
+                    keys: index_keys(vec!["id".into()]),
+                    included: index_keys(Vec::new()),
+                    expression_keys: 0,
+                    unique: false,
+                    predicate: false,
+                    valid: true,
+                    ready: true,
+                    live: true,
+                },
                 dependency_columns: vec!["id".into()],
                 dependency_columns_known: true,
-                has_expression_keys: false,
-                has_predicate: false,
                 is_concurrent: false,
-                is_unique: false,
                 is_immediate: true,
-                is_valid: true,
-                is_ready: true,
-                is_live: true,
-                has_default_sort_order: true,
-                has_default_opclasses: true,
-                has_default_collations: true,
                 eligibility_known: true,
             },
         ));
@@ -1006,27 +1008,11 @@ impl AnalysisState {
                 idx.index_id,
                 idx.table_id,
                 DependencyKind::IndexOnRelation {
-                    using_method: Some(idx.using_method),
-                    key_columns: idx.key_columns,
-                    included_columns: idx.included_columns,
+                    definition: idx.definition,
                     dependency_columns: idx.dependency_columns,
                     dependency_columns_known: idx.dependency_columns_known,
-                    has_expression_keys: idx.has_expression_keys,
-                    has_predicate: idx.has_predicate,
                     is_concurrent: false,
-                    is_unique: idx.is_unique,
                     is_immediate: idx.is_immediate,
-                    is_valid: idx.is_valid,
-                    is_ready: idx.is_ready,
-                    is_live: idx.is_live,
-                    has_default_sort_order: idx.has_default_sort_order,
-                    has_default_opclasses: idx.has_default_opclasses,
-                    has_default_collations: idx.has_default_collations,
-                    // Eligibility facts are distinct from dependency-column
-                    // proof. A catalog row can deterministically prove an
-                    // index is ineligible (for example, partial or
-                    // expression-based) while dependency columns remain a
-                    // separate completeness concern.
                     eligibility_known: true,
                 },
             ));
@@ -1089,6 +1075,14 @@ impl AnalysisState {
                 } else {
                     DependencyKind::InheritanceOf
                 },
+            ));
+        }
+
+        for attachment in cache.index_attachments {
+            graph.add_edge(DependencyEdge::new(
+                attachment.child.clone(),
+                attachment.parent.clone(),
+                DependencyKind::IndexPartitionOf,
             ));
         }
 
@@ -1294,6 +1288,7 @@ impl AnalysisState {
                     .builtin_types
                     .clone()
                     .unwrap_or_else(BuiltinTypeCatalogue::fallback),
+                opclasses: cache.opclasses.clone().unwrap_or_default(),
                 saw_temp_object: false,
                 default_search_path,
                 search_path_template: default_search_path_template.clone(),
@@ -1626,24 +1621,17 @@ impl AnalysisState {
     pub(crate) fn has_usable_unique_index(&self, relation_id: &ObjectId) -> bool {
         self.local.graph.edges().iter().any(|edge| {
             if let crate::_internal::analysis::graph::DependencyKind::IndexOnRelation {
-                is_unique,
-                has_expression_keys,
-                has_predicate,
-                is_valid,
-                is_ready,
-                is_live,
+                definition,
                 eligibility_known,
                 ..
             } = &edge.kind
             {
                 edge.referenced == *relation_id
                     && *eligibility_known
-                    && *is_unique
-                    && !*has_expression_keys
-                    && !*has_predicate
-                    && *is_valid
-                    && *is_ready
-                    && *is_live
+                    && definition.is_usable()
+                    && definition.unique
+                    && !definition.has_expression_keys()
+                    && !definition.predicate
             } else {
                 false
             }
@@ -3838,6 +3826,7 @@ mod evidence_tests {
     use super::*;
     use crate::_internal::analysis::evidence::{EvidenceCode, EvidenceRecord, EvidenceScope};
     use crate::_internal::db::cache::{CatalogFamily, SchemaCoverage};
+    use crate::_internal::model::index::IndexOrder;
 
     /// Coverage for a hand-built baseline that retrieved `families`.
     fn covering(schemas: Option<&[String]>, families: &[CatalogFamily]) -> CatalogCoverage {
@@ -4061,7 +4050,7 @@ mod evidence_tests {
     }
 
     #[test]
-    fn baseline_drop_requires_dependency_catalog_coverage() {
+    fn baseline_drop_applies_and_taints_without_dependency_catalog_coverage() {
         let table_id = ObjectId::new("public", "known_table");
         let mut cache = synced_cache();
         cache.insert_baseline(
@@ -4076,17 +4065,18 @@ mod evidence_tests {
 
         let result = state.apply(
             &Mutation::DropTable(crate::_internal::analysis::mutations::DropTable {
-                ids: vec![table_id],
+                ids: vec![table_id.clone()],
                 if_exists: false,
                 cascade: false,
             }),
             None,
         );
 
-        assert_eq!(
-            result,
-            MutationResult::Unresolved(EvidenceCode::CatalogCoverageIncomplete)
-        );
+        // PostgreSQL drops the table regardless of what the baseline loaded.
+        // Only the reach of the cascade is open, so the drop applies and the
+        // chain stops being exact.
+        assert_eq!(result, MutationResult::Applied);
+        assert!(!state.relation_is_present(&table_id));
         assert!(
             state
                 .evidence()
@@ -4266,7 +4256,7 @@ mod evidence_tests {
     }
 
     #[test]
-    fn baseline_drop_column_requires_dependency_coverage() {
+    fn baseline_drop_column_applies_and_taints_without_dependency_coverage() {
         let table_id = ObjectId::new("public", "known_table");
         let mut cache = synced_cache();
         cache.insert_baseline(
@@ -4292,13 +4282,13 @@ mod evidence_tests {
             }),
             None,
         );
-        assert_eq!(
-            result,
-            MutationResult::Unresolved(EvidenceCode::CatalogCoverageIncomplete)
-        );
+        // PostgreSQL drops the column whatever the baseline could not load; only the
+        // exactness of the surrounding state is lost.
+        assert_eq!(result, MutationResult::Applied);
         assert!(state.local.relations.get(&table_id).is_some_and(|overlay| {
-            matches!(overlay, RelationOverlay::Present(relation) if relation.has_column("id"))
+            matches!(overlay, RelationOverlay::Present(relation) if !relation.has_column("id"))
         }));
+        assert_eq!(state.local.confidence, Confidence::Tainted);
         assert!(
             state
                 .evidence()
@@ -4308,7 +4298,7 @@ mod evidence_tests {
     }
 
     #[test]
-    fn scoped_baseline_type_drop_requires_cross_schema_dependency_proof() {
+    fn scoped_baseline_type_drop_applies_and_taints() {
         let type_id = ObjectId::new("public", "known_type");
         let mut cache = synced_cache();
         cache.metadata.schemas = Some(vec!["public".to_string()]);
@@ -4330,14 +4320,14 @@ mod evidence_tests {
             }),
             None,
         );
-        assert_eq!(
-            result,
-            MutationResult::Unresolved(EvidenceCode::CatalogCoverageIncomplete)
-        );
+        // PostgreSQL drops the type regardless of the proof; only the chain's
+        // exactness is lost.
+        assert_eq!(result, MutationResult::Applied);
         assert!(matches!(
             state.local.types.get(&type_id),
-            Some(crate::_internal::model::types::TypeOverlay::Present(_))
+            Some(crate::_internal::model::types::TypeOverlay::Dropped)
         ));
+        assert_eq!(state.local.confidence, Confidence::Tainted);
         assert!(
             state
                 .evidence()
@@ -4530,8 +4520,11 @@ mod evidence_tests {
                 has_predicate: false,
                 unique: false,
                 key_columns: vec!["id".to_string()],
+                key_expressions: vec![None],
+                key_orders: vec![IndexOrder::Default],
+                key_opclasses: vec![None],
+                key_collations: vec![None],
                 included_columns: Vec::new(),
-                has_expression_keys: false,
                 has_default_sort_order: true,
                 has_default_opclasses: true,
                 has_default_collations: true,
@@ -4575,8 +4568,11 @@ mod evidence_tests {
                 has_predicate: false,
                 unique: false,
                 key_columns: vec!["id".to_string()],
+                key_expressions: vec![None],
+                key_orders: vec![IndexOrder::Default],
+                key_opclasses: vec![None],
+                key_collations: vec![None],
                 included_columns: Vec::new(),
-                has_expression_keys: false,
                 has_default_sort_order: true,
                 has_default_opclasses: true,
                 has_default_collations: true,
@@ -4606,8 +4602,11 @@ mod evidence_tests {
                     has_predicate: false,
                     unique: false,
                     key_columns: vec!["id".to_string()],
+                    key_expressions: vec![None],
+                    key_orders: vec![IndexOrder::Default],
+                    key_opclasses: vec![None],
+                    key_collations: vec![None],
                     included_columns: Vec::new(),
-                    has_expression_keys: false,
                     has_default_sort_order: true,
                     has_default_opclasses: true,
                     has_default_collations: true,

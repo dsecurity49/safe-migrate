@@ -1,7 +1,8 @@
+use super::index_topology::AttachRefusal;
 use super::{AnalysisState, MutationResult};
 use crate::_internal::analysis::evidence::{EvidenceCode, EvidenceScope};
 use crate::_internal::analysis::facts::{IndexStatisticsColumn, StatisticsTarget};
-use crate::_internal::analysis::graph::{DependencyEdge, DependencyKind};
+use crate::_internal::analysis::graph::DependencyKind;
 use crate::_internal::analysis::mutations::{
     AlterDatabaseMutation, AlterIndexActionMutation, AlterIndexAllInTablespaceMutation,
     AlterIndexMutation, CreateDatabaseMutation, DropDatabaseMutation, LockTableMutation,
@@ -202,14 +203,35 @@ impl AnalysisState {
                         }
                         return self.unresolved(EvidenceCode::UnknownObjectState);
                     }
-                    // Record the link so dropping the parent also drops the
-                    // child, which PostgreSQL does.
-                    self.snapshot_graph();
-                    self.local.graph.add_edge(DependencyEdge::new(
-                        partition_id.clone(),
-                        alter.index_id.clone(),
-                        DependencyKind::IndexPartitionOf,
-                    ));
+                    let parent_name = alter.index_id.name.as_str();
+                    let child_name = partition_id.name.as_str();
+                    match self.index_attach_refusal(&alter.index_id, partition_id) {
+                        None => self.record_index_partition(&alter.index_id, partition_id),
+                        Some(AttachRefusal::AttachedElsewhere) => {
+                            return MutationResult::conflict(format!(
+                                "cannot attach index \"{child_name}\" as partition of index \"{parent_name}\""
+                            ));
+                        }
+                        Some(AttachRefusal::NotAPartition) => {
+                            let parent_table = self
+                                .index_table_of(&alter.index_id)
+                                .map(|table| table.to_string())
+                                .unwrap_or_else(|| alter.index_id.to_string());
+                            return MutationResult::conflict(format!(
+                                "index \"{child_name}\" is not an index on any partition of table \"{parent_table}\""
+                            ));
+                        }
+                        Some(AttachRefusal::ConstraintMismatch) => {
+                            return MutationResult::conflict(format!(
+                                "parent index \"{parent_name}\" has a constraint but partition index \"{child_name}\" does not"
+                            ));
+                        }
+                        Some(AttachRefusal::DefinitionsDiffer) => {
+                            return MutationResult::conflict(format!(
+                                "cannot attach index \"{child_name}\" as partition of index \"{parent_name}\": the index definitions do not match"
+                            ));
+                        }
+                    }
                 }
                 // Extension dependencies are managed by PostgreSQL's extension
                 // machinery, which lives outside the schema catalog model.
@@ -259,10 +281,9 @@ impl AnalysisState {
                     && edge.dependent == *index
             })
             .map(|edge| match &edge.kind {
-                DependencyKind::IndexOnRelation {
-                    has_expression_keys,
-                    ..
-                } => *has_expression_keys,
+                DependencyKind::IndexOnRelation { definition, .. } => {
+                    definition.has_expression_keys()
+                }
                 _ => unreachable!("index lookup matched an IndexOnRelation edge"),
             })
     }

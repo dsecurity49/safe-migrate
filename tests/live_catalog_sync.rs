@@ -449,23 +449,24 @@ fn live_sync_preserves_routine_and_replication_catalogs_without_connection_secre
         .iter()
         .find(|index| index.index_id == ObjectId::new(SCHEMA, "entries_note_key"))
         .expect("synchronized simple unique index");
-    assert_eq!(simple_unique.using_method, "btree");
-    assert_eq!(simple_unique.key_columns, ["note"]);
-    assert!(simple_unique.included_columns.is_empty());
-    assert!(!simple_unique.has_expression_keys);
-    assert!(!simple_unique.has_predicate);
-    assert!(simple_unique.is_unique);
-    assert!(simple_unique.is_valid && simple_unique.is_ready && simple_unique.is_live);
-    assert!(simple_unique.has_default_sort_order);
-    assert!(simple_unique.has_default_opclasses);
-    assert!(simple_unique.has_default_collations);
+    let definition = &simple_unique.definition;
+    assert_eq!(definition.method.as_deref(), Some("btree"));
+    assert_eq!(definition.key_column_names(), ["note"]);
+    assert!(definition.included_column_names().is_empty());
+    assert!(!definition.has_expression_keys());
+    assert!(!definition.predicate);
+    assert!(definition.unique);
+    assert!(definition.is_usable());
+    // A plain single-column index names no explicit opclass, collation or
+    // order, so every key must come back completely default.
+    assert!(definition.keys.iter().all(|key| key.is_plain()));
     let partial = cache
         .indexes
         .iter()
         .find(|index| index.index_id == ObjectId::new(SCHEMA, "entries_note_partial_key"))
         .expect("synchronized partial index");
-    assert!(partial.has_predicate);
-    assert_eq!(partial.key_columns, ["id"]);
+    assert!(partial.definition.predicate);
+    assert_eq!(partial.definition.key_column_names(), ["id"]);
     assert_eq!(partial.dependency_columns, ["id", "note"]);
     assert!(partial.dependency_columns_known);
     let expression = cache
@@ -473,12 +474,19 @@ fn live_sync_preserves_routine_and_replication_catalogs_without_connection_secre
         .iter()
         .find(|index| index.index_id == ObjectId::new(SCHEMA, "entries_note_expression_idx"))
         .expect("synchronized expression index");
-    assert!(expression.has_expression_keys);
+    // An expression key names no column, yet the key is still present and
+    // counted. The old model recorded no key column here, which is what let two
+    // different expression indexes compare equal.
+    assert!(expression.definition.has_expression_keys());
+    assert!(
+        expression.definition.keys.len() > expression.definition.key_column_names().len(),
+        "expression keys must still occupy key positions"
+    );
     assert_eq!(expression.dependency_columns, ["note"]);
     assert!(expression.dependency_columns_known);
     assert!(cache.indexes.iter().any(|index| {
         index.index_id == ObjectId::new(SCHEMA, "entries_id_include_idx")
-            && index.included_columns == ["note"]
+            && index.definition.included_column_names() == ["note"]
     }));
     let extended_statistics = cache
         .relations

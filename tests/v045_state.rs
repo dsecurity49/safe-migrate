@@ -3,6 +3,7 @@ use crate::common::{object_id, setup_engine, synced_cache};
 use safe_migrate::_internal::analysis::facts::{PublicationObjectFact, PublicationScope};
 use safe_migrate::_internal::analysis::graph::DependencyKind;
 use safe_migrate::_internal::db::cache::{DbCache, IndexCache};
+use safe_migrate::_internal::model::index::{IndexDefinition, index_keys};
 use safe_migrate::_internal::model::relation::{Persistence, RelationKind, RelationState};
 use safe_migrate::_internal::model::role::RoleState;
 use safe_migrate::_internal::model::schema::{SchemaOverlay, SchemaState};
@@ -320,21 +321,20 @@ fn table_set_schema_moves_the_relation_and_preserves_baseline_origin() {
     cache.indexes.push(IndexCache {
         index_id: index_id.clone(),
         table_id: old_id.clone(),
-        using_method: "btree".into(),
-        key_columns: vec!["id".into()],
-        included_columns: Vec::new(),
+        definition: IndexDefinition {
+            method: Some("btree".into()),
+            keys: index_keys(vec!["id".into()]),
+            included: index_keys(Vec::new()),
+            expression_keys: 0,
+            unique: false,
+            predicate: false,
+            valid: true,
+            ready: true,
+            live: true,
+        },
         dependency_columns: vec!["id".into()],
         dependency_columns_known: true,
-        has_expression_keys: false,
-        has_predicate: false,
-        is_unique: false,
         is_immediate: true,
-        is_valid: true,
-        is_ready: true,
-        is_live: true,
-        has_default_sort_order: true,
-        has_default_opclasses: true,
-        has_default_collations: true,
     });
     let mut state = AnalysisState::new(cache);
 
