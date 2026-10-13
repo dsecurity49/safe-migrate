@@ -43,6 +43,9 @@ notes are available on the
   exist. `DROP TABLE` still refuses one, as the server does.
 - Subscription options are checked against the server version, and an option
   PostgreSQL does not recognise is rejected.
+- An array argument names the element's array type, so `DROP FUNCTION` and
+  `ALTER FUNCTION` on one resolve to the function PostgreSQL would. Previously
+  `name[]` was treated as `name` and `name[][]` matched nothing at all.
 - A check skipped for want of evidence names the out-of-scope schemas the
   boundary query observed instead of advising a bare resync.
 - Tier labels are colored only when standard output is a terminal, so

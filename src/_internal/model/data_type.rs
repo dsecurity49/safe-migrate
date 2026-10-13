@@ -531,7 +531,9 @@ impl TypeIdentity {
     pub(crate) fn from_syntax(syntax: &ParsedDataType) -> Self {
         Self {
             canonical: syntax.canonical_name().to_string(),
-            array_dimensions: syntax.array_dimensions,
+            // PostgreSQL has one array type per element however many `[]` a
+            // declaration carried, so the identity cannot keep the count.
+            array_dimensions: usize::from(syntax.array_dimensions > 0),
             resolved: syntax.is_builtin(),
         }
     }

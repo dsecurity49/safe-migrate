@@ -13,6 +13,16 @@ use std::collections::HashSet;
 type TypeLookup = ObjectLookup;
 
 impl AnalysisState {
+    /// What a reference to `old_id` becomes when the type is renamed: the new
+    /// name, or its array form when the reference was written `name[]`.
+    fn renamed_type_id(current: &ObjectId, rename: &Rename) -> Option<ObjectId> {
+        if current == &rename.old_id {
+            return Some(rename.new_id.clone());
+        }
+        (current == &Self::array_type_id(&rename.old_id))
+            .then(|| Self::array_type_id(&rename.new_id))
+    }
+
     pub(super) fn apply_create_type(&mut self, create: &CreateTypeMutation) -> MutationResult {
         if let Err(result) = self.ensure_schema_target(&create.id.schema) {
             return result;
@@ -78,7 +88,13 @@ impl AnalysisState {
                 .iter()
                 .enumerate()
                 .map(|(index, raw)| {
-                    if function.arg_type_ids.get(index) == Some(&Some(rename.old_id.clone())) {
+                    if function
+                        .arg_type_ids
+                        .get(index)
+                        .and_then(|id| id.as_ref())
+                        .and_then(|id| Self::renamed_type_id(id, rename))
+                        .is_some()
+                    {
                         Self::remapped_type_display(
                             raw,
                             &rename.new_id,
@@ -89,14 +105,17 @@ impl AnalysisState {
                     }
                 })
                 .collect::<Vec<_>>();
-            let new_return_type = if function.return_type_id == Some(rename.old_id.clone()) {
-                Self::remapped_type_display(
+            let new_return_type = match function
+                .return_type_id
+                .as_ref()
+                .and_then(|id| Self::renamed_type_id(id, rename))
+            {
+                Some(_) => Self::remapped_type_display(
                     &function.return_type,
                     &rename.new_id,
                     rename.old_id.schema != rename.new_id.schema,
-                )
-            } else {
-                function.return_type.clone()
+                ),
+                None => function.return_type.clone(),
             };
             let base_name = function_id
                 .name
@@ -147,13 +166,17 @@ impl AnalysisState {
         for overlay in self.local.relations.values_mut() {
             if let RelationOverlay::Present(relation) = overlay {
                 for column in &mut relation.columns {
-                    if column.type_id == Some(rename.old_id.clone()) {
+                    let remapped = column
+                        .type_id
+                        .as_ref()
+                        .and_then(|id| Self::renamed_type_id(id, rename));
+                    if let Some(new_type_id) = remapped {
                         column.data_type = Some(Self::remapped_type_display(
                             column.data_type.as_deref().unwrap_or_default(),
                             &rename.new_id,
                             rename.old_id.schema != rename.new_id.schema,
                         ));
-                        column.type_id = Some(rename.new_id.clone());
+                        column.type_id = Some(new_type_id);
                     }
                 }
             }
@@ -167,14 +190,21 @@ impl AnalysisState {
                     },
                 ..
             }) = overlay
-                && *base_type_id == Some(rename.old_id.clone())
+                && base_type_id
+                    .as_ref()
+                    .and_then(|id| Self::renamed_type_id(id, rename))
+                    .is_some()
             {
+                let new_base_id = base_type_id
+                    .as_ref()
+                    .and_then(|id| Self::renamed_type_id(id, rename))
+                    .expect("presence checked above");
                 *base_type = Self::remapped_type_display(
                     base_type,
                     &rename.new_id,
                     rename.old_id.schema != rename.new_id.schema,
                 );
-                *base_type_id = Some(rename.new_id.clone());
+                *base_type_id = Some(new_base_id);
             }
         }
         for (old_id, new_id, arg_types, return_type) in remapped_functions {
@@ -184,13 +214,20 @@ impl AnalysisState {
                 function.id = new_id.clone();
                 function.arg_types = arg_types;
                 for type_id in &mut function.arg_type_ids {
-                    if *type_id == Some(rename.old_id.clone()) {
-                        *type_id = Some(rename.new_id.clone());
+                    if let Some(remapped) = type_id
+                        .as_ref()
+                        .and_then(|id| Self::renamed_type_id(id, rename))
+                    {
+                        *type_id = Some(remapped);
                     }
                 }
                 function.return_type = return_type;
-                if function.return_type_id == Some(rename.old_id.clone()) {
-                    function.return_type_id = Some(rename.new_id.clone());
+                if let Some(remapped) = function
+                    .return_type_id
+                    .as_ref()
+                    .and_then(|id| Self::renamed_type_id(id, rename))
+                {
+                    function.return_type_id = Some(remapped);
                 }
                 self.local
                     .functions

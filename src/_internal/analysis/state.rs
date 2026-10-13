@@ -1893,27 +1893,37 @@ impl AnalysisState {
         search_path: &[String],
         row_type_exists: impl Fn(&ObjectId) -> bool,
     ) -> Option<ObjectId> {
-        let (schema, name) = Self::parse_type_reference(raw)?;
+        let (schema, name, is_array) = Self::parse_type_reference(raw)?;
+        // PostgreSQL names an array type after its element and renders it with
+        // one `[]`, which is the spelling `format_type` gives the catalog.
+        let array_name = is_array.then(|| format!("{name}[]"));
+        let as_array = move |element: ObjectId| match &array_name {
+            Some(array_name) => ObjectId::new(&element.schema, array_name.clone()),
+            None => element,
+        };
         if let Some(schema) = schema {
             let candidate = ObjectId::new(schema, name);
             return (matches!(types.get(&candidate), Some(TypeOverlay::Present(_)))
                 || row_type_exists(&candidate))
-            .then_some(candidate);
+            .then(|| as_array(candidate));
         }
         search_path.iter().find_map(|schema| {
             let candidate = ObjectId::new(schema, &name);
             (matches!(types.get(&candidate), Some(TypeOverlay::Present(_)))
                 || row_type_exists(&candidate))
-            .then_some(candidate)
+            .then(|| as_array(candidate))
         })
     }
 
     /// Parse a SQL type name exactly enough to resolve modeled named types.
     /// Quoted identifiers retain their case, unquoted identifiers fold to
-    /// lowercase, and any number of array suffixes are ignored for lookup.
-    fn parse_type_reference(raw: &str) -> Option<(Option<String>, String)> {
+    /// lowercase. Array suffixes name the element's own array type, and any
+    /// number of them collapse onto that one type.
+    fn parse_type_reference(raw: &str) -> Option<(Option<String>, String, bool)> {
         let mut token = raw.trim();
+        let mut is_array = false;
         while let Some(without_array) = token.strip_suffix("[]") {
+            is_array = true;
             token = without_array.trim_end();
         }
 
@@ -1946,8 +1956,8 @@ impl AnalysisState {
         }
         parts.push(Self::resolve_type_identifier(&current, part_is_quoted)?);
         match parts.as_slice() {
-            [name] => Some((None, name.clone())),
-            [schema, name] => Some((Some(schema.clone()), name.clone())),
+            [name] => Some((None, name.clone(), is_array)),
+            [schema, name] => Some((Some(schema.clone()), name.clone(), is_array)),
             _ => None,
         }
     }
@@ -2003,12 +2013,18 @@ impl AnalysisState {
         }
     }
 
+    /// The identity a declaration `name[]` resolves to. PostgreSQL has one array
+    /// type per element, so however many `[]` were written, they name this.
+    pub(crate) fn array_type_id(element: &ObjectId) -> ObjectId {
+        ObjectId::new(&element.schema, format!("{}[]", element.name))
+    }
+
     fn remapped_type_display(raw: &str, new_id: &ObjectId, schema_changed: bool) -> String {
         let suffix = raw.find('[').map(|index| &raw[index..]).unwrap_or("");
         // Keep the qualification the reference was written with; a moved type
         // gains one, or the reference would no longer resolve.
         let was_qualified =
-            Self::parse_type_reference(raw).is_some_and(|(schema, _)| schema.is_some());
+            Self::parse_type_reference(raw).is_some_and(|(schema, _, _)| schema.is_some());
         format!(
             "{}{}",
             Self::type_reference_name(new_id, was_qualified || schema_changed),

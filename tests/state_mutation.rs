@@ -4456,6 +4456,78 @@ mod state_mutation_tests {
         ));
     }
 
+    /// PostgreSQL has one array type per element, so `name[]` and `name[][]` are
+    /// one argument type, and an array argument is not its element.
+    #[test]
+    fn an_array_argument_names_the_element_array_type() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let violations = engine
+            .analyze(
+                "CREATE TYPE mood AS ENUM ('sad');
+                 CREATE FUNCTION arr_arg(value mood[]) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;
+                 CREATE FUNCTION dim_arg(value integer[][]) RETURNS int LANGUAGE sql AS $$ SELECT 2 $$;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict")
+        );
+
+        for drop in [
+            "DROP FUNCTION arr_arg(mood[]);",
+            "DROP FUNCTION arr_arg(mood[][]);",
+            "DROP FUNCTION dim_arg(integer[]);",
+            "DROP FUNCTION dim_arg(integer[][]);",
+        ] {
+            let mut state = setup_state();
+            let violations = engine
+                .analyze(
+                    &format!(
+                        "CREATE TYPE mood AS ENUM ('sad');
+                         CREATE FUNCTION arr_arg(value mood[]) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;
+                         CREATE FUNCTION dim_arg(value integer[][]) RETURNS int LANGUAGE sql AS $$ SELECT 2 $$;
+                         {drop}"
+                    ),
+                    &mut state,
+                )
+                .unwrap();
+            assert!(
+                !violations
+                    .iter()
+                    .any(|violation| violation.rule_id == "chain-conflict"),
+                "{drop}"
+            );
+        }
+
+        // The element and its array remain distinct functions.
+        for drop in [
+            "DROP FUNCTION arr_arg(mood);",
+            "DROP FUNCTION dim_arg(integer);",
+        ] {
+            let mut state = setup_state();
+            let violations = engine
+                .analyze(
+                    &format!(
+                        "CREATE TYPE mood AS ENUM ('sad');
+                         CREATE FUNCTION arr_arg(value mood[]) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;
+                         CREATE FUNCTION dim_arg(value integer[][]) RETURNS int LANGUAGE sql AS $$ SELECT 2 $$;
+                         {drop}"
+                    ),
+                    &mut state,
+                )
+                .unwrap();
+            assert!(
+                violations
+                    .iter()
+                    .any(|violation| violation.rule_id == "chain-conflict"),
+                "{drop}"
+            );
+        }
+    }
+
     #[test]
     fn rename_type_remaps_modeled_dependent_references() {
         let engine = setup_engine();
@@ -10254,7 +10326,8 @@ mod state_mutation_tests {
             );
         }
         let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
-        if let Some(RelationOverlay::Present(parent_state)) = state.local.relations.get_mut(&parent) {
+        if let Some(RelationOverlay::Present(parent_state)) = state.local.relations.get_mut(&parent)
+        {
             parent_state.partition_type = Some("RANGE".to_string());
             parent_state.partition_by = Some("id".to_string());
         }
