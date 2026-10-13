@@ -460,22 +460,8 @@ impl AnalysisState {
         }
 
         let params = s.params.as_deref();
-        if let Err(reason) = Self::validate_subscription_boolean_options(
-            params,
-            &[
-                "connect",
-                "create_slot",
-                "enabled",
-                "copy_data",
-                "binary",
-                "disable_on_error",
-                "password_required",
-                "run_as_owner",
-                "failover",
-                "two_phase",
-            ],
-        ) {
-            return MutationResult::conflict(reason);
+        if let Err(result) = self.validate_subscription_options(params) {
+            return result;
         }
         let connects_to_publisher =
             Self::subscription_boolean_option(params, "connect") != Some(false);
@@ -601,6 +587,9 @@ impl AnalysisState {
         {
             return MutationResult::conflict(format!("role '{}' does not exist", owner));
         }
+        if let Err(result) = self.validate_subscription_options(s.action.params()) {
+            return result;
+        }
         let existing = match self.local.subscriptions.get(&s.name) {
             Some(crate::_internal::model::replication::SubscriptionOverlay::Present(
                 subscription,
@@ -614,12 +603,6 @@ impl AnalysisState {
                 publications,
                 params,
             } => {
-                if let Err(reason) = Self::validate_subscription_boolean_options(
-                    Some(params),
-                    &["refresh", "copy_data"],
-                ) {
-                    return MutationResult::conflict(reason);
-                }
                 if in_transaction
                     && Self::subscription_boolean_option(Some(params), "refresh") != Some(false)
                 {
@@ -677,19 +660,6 @@ impl AnalysisState {
                 ));
             }
             crate::_internal::analysis::facts::AlterSubscriptionActionFact::SetOptions(options) => {
-                if let Err(reason) = Self::validate_subscription_boolean_options(
-                    Some(options),
-                    &[
-                        "binary",
-                        "disable_on_error",
-                        "password_required",
-                        "run_as_owner",
-                        "failover",
-                        "two_phase",
-                    ],
-                ) {
-                    return MutationResult::conflict(reason);
-                }
                 if existing.enabled
                     && options
                         .iter()

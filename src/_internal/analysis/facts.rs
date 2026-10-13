@@ -844,6 +844,20 @@ pub(crate) enum AlterSubscriptionActionFact {
     },
 }
 
+impl AlterSubscriptionActionFact {
+    /// The subscription options this action carries, whichever form it takes.
+    /// Every one of them is gated on name and server version alike.
+    pub(crate) fn params(&self) -> Option<&[AttributeFact]> {
+        match self {
+            Self::Publications { params, .. }
+            | Self::RefreshPublication(params)
+            | Self::SetOptions(params)
+            | Self::Skip(params) => Some(params),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct DropSubscriptionFact {
     pub name: String,

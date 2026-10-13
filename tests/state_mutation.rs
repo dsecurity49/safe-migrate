@@ -6,7 +6,8 @@ mod state_mutation_tests {
         DependencyEdge, DependencyGraph, DependencyKind,
     };
     use safe_migrate::_internal::analysis::mutations::{
-        DropAggregateMutation, DropFunctionMutation, DropProcedureMutation, Mutation,
+        AlterTable, AlterTableActionMutation, DropAggregateMutation, DropFunctionMutation,
+        DropProcedureMutation, DropTable, Mutation,
     };
     use safe_migrate::_internal::analysis::state::{AnalysisState, Confidence, MutationResult};
     use safe_migrate::_internal::ast::identifiers::{Ident, ObjectId, QualifiedName};
@@ -6157,6 +6158,7 @@ mod state_mutation_tests {
     fn cached_publication_and_subscription_actions_update_exact_state() {
         let engine = setup_engine();
         let mut cache = cache_with_table("public", "first", None);
+        cache.pg_version_num = Some(180_006);
         let second = object_id("public", "second");
         cache.insert_baseline(
             second.clone(),
@@ -6509,6 +6511,88 @@ mod state_mutation_tests {
     }
 
     #[test]
+    fn subscription_options_are_gated_on_the_server_version() {
+        let engine = setup_engine();
+        // The release that introduced each gated parameter, checked against a
+        // server one major version below it.
+        for (since, parameter) in [
+            (140_000, "binary = true"),
+            (140_000, "streaming = parallel"),
+            (150_000, "two_phase = true"),
+            (150_000, "disable_on_error = true"),
+            (160_000, "password_required = true"),
+            (160_000, "run_as_owner = true"),
+            (160_000, "origin = 'any'"),
+            (170_000, "failover = true"),
+        ] {
+            let sql = format!(
+                "CREATE SUBSCRIPTION s CONNECTION 'host=publisher.invalid' \
+                 PUBLICATION p WITH ({parameter});"
+            );
+
+            let mut state = setup_state();
+            state.pg_version_num = Some(since - 10_000);
+            let violations = engine.analyze(&sql, &mut state).unwrap();
+            assert!(
+                violations
+                    .iter()
+                    .any(|violation| violation.rule_id == "chain-conflict"),
+                "{parameter} must be rejected below {since}"
+            );
+
+            let mut state = setup_state();
+            state.pg_version_num = Some(since);
+            let violations = engine.analyze(&sql, &mut state).unwrap();
+            assert!(
+                !violations
+                    .iter()
+                    .any(|violation| violation.rule_id == "chain-conflict"),
+                "{parameter} must be accepted from {since}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_server_version_taints_rather_than_conflicting() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        state.pg_version_num = None;
+        let violations = engine
+            .analyze(
+                "CREATE SUBSCRIPTION s CONNECTION 'host=publisher.invalid' \
+                 PUBLICATION p WITH (failover = true);",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict"),
+            "an unanswerable version question cannot prove a conflict"
+        );
+        assert_eq!(state.local.confidence, Confidence::Tainted);
+    }
+
+    #[test]
+    fn an_unknown_subscription_parameter_is_rejected() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        state.pg_version_num = Some(180_006);
+        let violations = engine
+            .analyze(
+                "CREATE SUBSCRIPTION s CONNECTION 'host=publisher.invalid' \
+                 PUBLICATION p WITH (not_a_parameter = true);",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict")
+        );
+    }
+
+    #[test]
     fn subscription_options_enforce_postgresql_slot_and_publication_invariants() {
         let engine = setup_engine();
 
@@ -6535,6 +6619,8 @@ mod state_mutation_tests {
         }
 
         let mut boolean_state = setup_state();
+        // `binary` is PostgreSQL 14, so this baseline must know its server.
+        boolean_state.pg_version_num = Some(180_006);
         let violations = engine
             .analyze(
                 "CREATE SUBSCRIPTION boolean_options
@@ -9963,8 +10049,7 @@ mod state_mutation_tests {
                 &mut state,
             )
             .unwrap();
-        assert!(state
-            .relation_is_present(&object_id("public", "t")));
+        assert!(state.relation_is_present(&object_id("public", "t")));
         engine
             .analyze("ALTER TABLE t DROP COLUMN doomed;", &mut state)
             .unwrap();
@@ -9973,9 +10058,9 @@ mod state_mutation_tests {
             .relations
             .get(&object_id("public", "t"))
             .and_then(|o| match o {
-                RelationOverlay::Present(r) => Some(
-                    r.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>(),
-                ),
+                RelationOverlay::Present(r) => {
+                    Some(r.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>())
+                }
                 _ => None,
             })
             .unwrap_or_default();
@@ -10031,9 +10116,12 @@ mod state_mutation_tests {
             .relations
             .get(&tid)
             .and_then(|overlay| match overlay {
-                RelationOverlay::Present(rel) => {
-                    Some(rel.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>())
-                }
+                RelationOverlay::Present(rel) => Some(
+                    rel.columns
+                        .iter()
+                        .map(|c| c.name.clone())
+                        .collect::<Vec<_>>(),
+                ),
                 _ => None,
             })
             .unwrap_or_default();
@@ -10059,12 +10147,129 @@ mod state_mutation_tests {
             .relations
             .get(&tid)
             .and_then(|overlay| match overlay {
-                RelationOverlay::Present(rel) => {
-                    Some(rel.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>())
-                }
+                RelationOverlay::Present(rel) => Some(
+                    rel.columns
+                        .iter()
+                        .map(|c| c.name.clone())
+                        .collect::<Vec<_>>(),
+                ),
                 _ => None,
             })
             .unwrap_or_default();
         assert_eq!(columns, ["id"], "dropped column must be gone");
+    }
+
+    // PostgreSQL accepts ALTER TABLE, GRANT and TRUNCATE on a foreign table,
+    // and rejects DROP TABLE, LOCK and a foreign-key reference. Each is
+    // verified against a live server; the baseline must know the kind.
+    #[test]
+    fn foreign_table_accepts_the_statements_postgres_accepts() {
+        let id = object_id("public", "remote_t");
+        let mut cache = synced_cache();
+        cache.insert_baseline(
+            id.clone(),
+            RelationState::new(
+                id.clone(),
+                object_id("public", "owner"),
+                0,
+                None,
+                RelationKind::ForeignTable,
+                Persistence::Permanent,
+                0,
+            ),
+        );
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
+
+        let alter = Mutation::AlterTable(AlterTable {
+            id: id.clone(),
+            only: false,
+            action: AlterTableActionMutation::AddColumn {
+                name: "extra".to_string(),
+                ty: Some("integer".to_string()),
+                if_not_exists: false,
+                not_null: false,
+                default: None,
+                depends_on: None,
+                generation: crate::_internal::analysis::facts::ColumnGeneration::Ordinary,
+                identity_sequence: None,
+                generated_expr: None,
+                generated_expr_sql: None,
+            },
+        });
+        assert!(
+            matches!(state.apply(&alter, None), MutationResult::Applied),
+            "ALTER TABLE is accepted on a foreign table"
+        );
+    }
+
+    #[test]
+    fn drop_table_still_rejects_a_foreign_table() {
+        let id = object_id("public", "remote_t");
+        let mut cache = synced_cache();
+        cache.insert_baseline(
+            id.clone(),
+            RelationState::new(
+                id.clone(),
+                object_id("public", "owner"),
+                0,
+                None,
+                RelationKind::ForeignTable,
+                Persistence::Permanent,
+                0,
+            ),
+        );
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
+
+        let drop = Mutation::DropTable(DropTable {
+            ids: vec![id],
+            if_exists: false,
+            cascade: false,
+        });
+        assert!(
+            matches!(state.apply(&drop, None), MutationResult::Conflict { .. }),
+            "the server answers DROP TABLE with 'is not a table'"
+        );
+    }
+
+    #[test]
+    fn a_foreign_table_can_hold_a_partition() {
+        let parent = object_id("public", "parent");
+        let child = object_id("public", "child");
+        let mut cache = synced_cache();
+        for (id, kind) in [
+            (parent.clone(), RelationKind::Table),
+            (child.clone(), RelationKind::ForeignTable),
+        ] {
+            cache.insert_baseline(
+                id.clone(),
+                RelationState::new(
+                    id.clone(),
+                    object_id("public", "owner"),
+                    0,
+                    None,
+                    kind,
+                    Persistence::Permanent,
+                    0,
+                ),
+            );
+        }
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
+        if let Some(RelationOverlay::Present(parent_state)) = state.local.relations.get_mut(&parent) {
+            parent_state.partition_type = Some("RANGE".to_string());
+            parent_state.partition_by = Some("id".to_string());
+        }
+        let attach = Mutation::AlterTable(AlterTable {
+            id: parent,
+            only: false,
+            action: AlterTableActionMutation::AttachPartition {
+                child,
+                strategy: None,
+                bound: None,
+            },
+        });
+        assert!(
+            !matches!(state.apply(&attach, None), MutationResult::Conflict { .. }),
+            "ATTACH PARTITION accepts a foreign table"
+        );
     }
 }

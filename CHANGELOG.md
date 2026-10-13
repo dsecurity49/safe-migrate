@@ -38,6 +38,11 @@ notes are available on the
 - A scoped baseline now records cross-schema dependents for types, routines and
   indexes as well as relations, so a scoped `sync` no longer overlooks
   dependents outside the schemas it loaded.
+- Foreign tables are read from a baseline, so `ALTER TABLE`, `GRANT`,
+  `TRUNCATE` and partition operations on one no longer report that it does not
+  exist. `DROP TABLE` still refuses one, as the server does.
+- Subscription options are checked against the server version, and an option
+  PostgreSQL does not recognise is rejected.
 - A check skipped for want of evidence names the out-of-scope schemas the
   boundary query observed instead of advising a bare resync.
 - Tier labels are colored only when standard output is a terminal, so

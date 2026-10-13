@@ -15,6 +15,7 @@ use crate::_internal::model::constraint::{ConstraintKind, ConstraintState};
 use crate::_internal::model::function::FunctionOverlay;
 pub(crate) use crate::_internal::model::relation::RelationOverlay;
 use crate::_internal::model::relation::{Persistence, Privilege, RelationKind};
+use crate::_internal::model::replication::SUBSCRIPTION_PARAMS;
 use crate::_internal::model::schema::SchemaOverlay;
 use crate::_internal::model::sequence::SequenceOverlay;
 use crate::_internal::model::trigger::TriggerOverlay;
@@ -644,23 +645,46 @@ impl AnalysisState {
         Self::subscription_option(params, name).and_then(Self::postgres_boolean)
     }
 
-    fn validate_subscription_boolean_options(
+    /// Checks every subscription parameter against the server that will run it:
+    /// the name must be one PostgreSQL knows, the version must have introduced
+    /// it, and a boolean option must carry a boolean value.
+    fn validate_subscription_options(
+        &mut self,
         params: Option<&[crate::_internal::analysis::facts::AttributeFact]>,
-        names: &[&str],
-    ) -> Result<(), String> {
+    ) -> Result<(), MutationResult> {
         let Some(params) = params else {
             return Ok(());
         };
+        let version = self.pg_version();
         for option in params {
-            if names
+            let Some(param) = SUBSCRIPTION_PARAMS
                 .iter()
-                .any(|name| option.name.eq_ignore_ascii_case(name))
-                && Self::postgres_boolean(&option.value).is_none()
-            {
-                return Err(format!(
+                .find(|param| option.name.eq_ignore_ascii_case(param.name))
+            else {
+                return Err(MutationResult::conflict(format!(
+                    "unrecognized parameter \"{}\"",
+                    option.name
+                )));
+            };
+            if param.boolean && Self::postgres_boolean(&option.value).is_none() {
+                return Err(MutationResult::conflict(format!(
                     "subscription option '{}' requires a PostgreSQL boolean value",
                     option.name
-                ));
+                )));
+            }
+            let (Some(since), Some(version_num)) = (param.since, version.num()) else {
+                // Either every supported release has it, or the server is unknown.
+                if version.num().is_none() && param.since.is_some() {
+                    self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Statement);
+                }
+                continue;
+            };
+            if version_num < since {
+                return Err(MutationResult::conflict(format!(
+                    "subscription option '{}' requires PostgreSQL {}",
+                    option.name,
+                    pg_version_label(since)
+                )));
             }
         }
         Ok(())
@@ -3819,6 +3843,12 @@ impl PgVersion {
     pub(crate) fn conservative_num(self) -> u32 {
         self.num().unwrap_or(OLDEST_SUPPORTED_PG_VERSION_NUM)
     }
+}
+
+/// Renders a `server_version_num` as the major release, e.g. `160_002` to
+/// `"16"`, so a diagnostic can name the release that introduced a feature.
+pub(crate) fn pg_version_label(version_num: u32) -> String {
+    (version_num / 10_000).to_string()
 }
 
 #[cfg(test)]
