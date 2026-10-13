@@ -1,7 +1,7 @@
 use crate::_internal::analysis::mutations::{AlterTableActionMutation, Mutation};
 use crate::_internal::analysis::state::MutationResult;
 use crate::_internal::model::builtin_type::BuiltinTypeCatalogue;
-use crate::_internal::model::data_type::ParsedDataType;
+use crate::_internal::model::data_type::{ParsedDataType, TypeIdentity};
 use crate::_internal::report::violations::{ObjectKind, Violation, ViolationTier};
 use crate::_internal::rules::{
     BASELINE_RELATION_CAPABILITIES, BASELINE_STATS_CAPABILITIES, Rule, RuleCapability, RuleContext,
@@ -668,17 +668,28 @@ impl TypeChangeRewriteRule {
         pg_version: u32,
         catalogue: &BuiltinTypeCatalogue,
     ) -> bool {
-        if old_type.eq_ignore_ascii_case(new_type) {
-            return true;
-        }
-
         let old_dt = ParsedDataType::parse(old_type, catalogue);
         let new_dt = ParsedDataType::parse(new_type, catalogue);
 
-        // Varchar widening is a metadata-only change.
-        if old_dt.is_text_like() && new_dt.is_text_like() {
+        // Two spellings of one catalog type carrying one modifier are one type. An
+        // array renders with a single `[]` whatever the declaration carried.
+        if TypeIdentity::from_syntax(&old_dt).render()
+            == TypeIdentity::from_syntax(&new_dt).render()
+            && old_dt.raw_typmods() == new_dt.raw_typmods()
+        {
+            return true;
+        }
+
+        // A fixed-length `character` is blank-padded and `varchar` is not, so
+        // converting between them re-encodes every value. Only a widening
+        // inside one family is metadata-only.
+        let fixed_char = |parsed: &ParsedDataType| parsed.is_named("bpchar");
+        if old_dt.is_text_like()
+            && new_dt.is_text_like()
+            && fixed_char(&old_dt) == fixed_char(&new_dt)
+        {
             if new_dt.is_named("text") || !new_dt.has_typmod() {
-                return true; // Widening to unbounded text/varchar.
+                return true;
             }
             if let (Some(old_limit), Some(new_limit)) =
                 (old_dt.character_limit(), new_dt.character_limit())
@@ -688,17 +699,18 @@ impl TypeChangeRewriteRule {
             }
         }
 
-        // Numeric widening is a metadata-only change in PG >= 12.
+        // A numeric keeps its digits when precision rises and the scale is
+        // unchanged, or when the constraint is dropped entirely. Changing the
+        // scale re-encodes every value.
         if pg_version >= 120_000 && old_dt.is_exact_numeric() && new_dt.is_exact_numeric() {
-            if !new_dt.has_typmod() {
-                return true; // Widening to unconstrained numeric.
-            }
-            if let (Some((old_p, old_s)), Some((new_p, new_s))) =
-                (old_dt.numeric_params(), new_dt.numeric_params())
-                && new_p >= old_p
-                && new_s >= old_s
-            {
-                return true;
+            match (old_dt.numeric_params(), new_dt.numeric_params()) {
+                (_, None) => return true,
+                (Some((old_p, old_s)), Some((new_p, new_s)))
+                    if new_p >= old_p && new_s == old_s =>
+                {
+                    return true;
+                }
+                _ => {}
             }
         }
 

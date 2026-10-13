@@ -21,25 +21,52 @@ use std::collections::HashSet;
 type RelationLookup = ObjectLookup;
 
 impl AnalysisState {
-    /// Reject a column type the target server version would refuse. Without a
-    /// baseline the version is unknown, so this taints instead.
+    /// Reject a declared type the server would refuse: a length or precision
+    /// outside the server's range, a type no server can resolve, or a feature
+    /// that postdates it. An unknown version or baseline taints instead.
     pub(super) fn check_declared_type(&mut self, declared: &str) -> Option<MutationResult> {
-        if !ParsedDataType::parse(declared, self.builtin_types()).needs_widened_numeric_scale() {
+        let parsed = ParsedDataType::parse(declared, self.builtin_types());
+        if !parsed.is_valid_declaration() {
+            return Some(MutationResult::conflict(format!(
+                "type '{declared}' is not a valid type declaration"
+            )));
+        }
+        if !self.declared_type_resolves(declared) {
+            let Some((schema, name, _)) = Self::parse_type_reference(declared) else {
+                self.taint(EvidenceCode::UnresolvedReference, EvidenceScope::Statement);
+                return None;
+            };
+            let id = ObjectId::new(schema.as_deref().unwrap_or_default(), &name);
+            if schema
+                .as_deref()
+                .is_none_or(|schema| self.schema_absence_is_authoritative(schema))
+                && self.baseline_covers_family_object(
+                    &id,
+                    crate::_internal::db::cache::CatalogFamily::Types,
+                )
+            {
+                return Some(MutationResult::conflict(format!(
+                    "type '{declared}' does not exist"
+                )));
+            }
+            self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Statement);
             return None;
         }
-        match self.pg_version().num() {
-            Some(version) if version < WIDENED_NUMERIC_SCALE_VERSION => {
-                Some(MutationResult::conflict(format!(
-                    "type '{declared}' requires PostgreSQL 15 or later, \
-                         but the baseline reports {version}"
-                )))
-            }
-            Some(_) => None,
-            None => {
-                self.taint(EvidenceCode::UnsupportedSemantics, EvidenceScope::Statement);
-                None
+        if parsed.needs_widened_numeric_scale() {
+            match self.pg_version().num() {
+                Some(version) if version < WIDENED_NUMERIC_SCALE_VERSION => {
+                    return Some(MutationResult::conflict(format!(
+                        "type '{declared}' requires PostgreSQL 15 or later, \
+                             but the baseline reports {version}"
+                    )));
+                }
+                Some(_) => {}
+                None => {
+                    self.taint(EvidenceCode::UnsupportedSemantics, EvidenceScope::Statement);
+                }
             }
         }
+        None
     }
 
     fn inherited_descendants(&self, root: &ObjectId) -> Vec<ObjectId> {

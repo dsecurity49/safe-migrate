@@ -12,6 +12,7 @@ use crate::_internal::db::cache::DbCache;
 use crate::_internal::db::cache::ScopedDependencyEdge;
 use crate::_internal::model::builtin_type::BuiltinTypeCatalogue;
 use crate::_internal::model::constraint::{ConstraintKind, ConstraintState};
+use crate::_internal::model::data_type::ParsedDataType;
 use crate::_internal::model::function::FunctionOverlay;
 pub(crate) use crate::_internal::model::relation::RelationOverlay;
 use crate::_internal::model::relation::{Persistence, Privilege, RelationKind};
@@ -1970,6 +1971,13 @@ impl AnalysisState {
                 identifier.to_lowercase()
             }
         })
+    }
+
+    /// Whether the server can resolve a declared type: a built-in, a type the
+    /// migration created, or one the baseline holds.
+    pub(crate) fn declared_type_resolves(&self, declared: &str) -> bool {
+        ParsedDataType::parse(declared, self.builtin_types()).is_builtin()
+            || self.resolve_type_reference(declared).is_some()
     }
 
     pub(crate) fn resolve_type_reference(&self, raw: &str) -> Option<ObjectId> {

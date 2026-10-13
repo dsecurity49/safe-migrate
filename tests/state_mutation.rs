@@ -4583,6 +4583,121 @@ mod state_mutation_tests {
         assert_eq!(function.return_type, "emotion");
     }
 
+    /// A declaration the server refuses: a modifier outside its range, or a
+    /// type nothing resolves to.
+    #[test]
+    fn a_type_declaration_the_server_refuses_is_a_conflict() {
+        let engine = setup_engine();
+        for sql in [
+            "CREATE TABLE bad (c varchar(10485761));",
+            "CREATE TABLE bad (c numeric(0));",
+            "CREATE TABLE bad (c numeric(1001));",
+            "CREATE TABLE bad (c no_such_type);",
+            "CREATE DOMAIN bad AS no_such_type;",
+            "CREATE TYPE bad AS (a no_such_type);",
+        ] {
+            let mut state = setup_state();
+            let violations = engine.analyze(sql, &mut state).unwrap();
+            assert!(
+                violations
+                    .iter()
+                    .any(|violation| violation.rule_id == "chain-conflict"),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rejected_declaration_does_not_block_the_valid_ones() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let violations = engine
+            .analyze(
+                "CREATE TABLE ok_a (c text, d text[], e serial, f bigserial);
+                 CREATE DOMAIN ok_dom AS text;
+                 CREATE TYPE ok_enum AS ENUM ('a', 'b');
+                 CREATE TYPE ok_comp AS (a int, b text);
+                 CREATE TYPE ok_range AS RANGE (subtype = float8);",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict"),
+            "valid declarations must still apply"
+        );
+    }
+
+    #[test]
+    fn a_duplicate_enum_label_is_a_conflict() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let violations = engine
+            .analyze("CREATE TYPE dup AS ENUM ('a', 'a');", &mut state)
+            .unwrap();
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict")
+        );
+    }
+
+    /// PostgreSQL rewrites unless the catalog type and its modifier are
+    /// unchanged, so only these changes are metadata-only. Measured against a
+    /// live server by watching `relfilenode` change.
+    #[test]
+    fn type_change_rewrite_matches_postgres_rewrite_behaviour() {
+        let engine = setup_engine();
+        for (column, declared, rewrites) in [
+            ("numeric(5,2)", "numeric(6,2)", false),
+            ("numeric(5,2)", "numeric(7,2)", false),
+            ("numeric(5,2)", "numeric", false),
+            ("numeric(5,2)", "numeric(5,3)", true),
+            ("numeric(5,2)", "numeric(4,2)", true),
+            ("numeric(5,2)", "numeric(5,1)", true),
+            ("varchar(50)", "varchar(100)", false),
+            ("varchar(50)", "text", false),
+            ("varchar(50)", "varchar(10)", true),
+            ("int", "integer", false),
+            ("int", "bigint", true),
+            ("character(5)", "character(10)", false),
+            ("character(5)", "varchar(5)", true),
+            ("character(5)", "text", true),
+        ] {
+            let sql = format!(
+                "CREATE TABLE probe (c {column});\
+                 ALTER TABLE probe ALTER COLUMN c TYPE {declared};"
+            );
+            let mut state = setup_state();
+            let violations = engine.analyze(&sql, &mut state).unwrap();
+            let reported = violations
+                .iter()
+                .any(|violation| violation.rule_id == "type-change-rewrite");
+            assert_eq!(reported, rewrites, "{column} -> {declared}");
+        }
+    }
+
+    #[test]
+    fn a_canonical_alias_is_not_a_rewrite() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let violations = engine
+            .analyze(
+                "CREATE TABLE alias_probe (a int, b integer, c int4);
+                 ALTER TABLE alias_probe ALTER COLUMN a TYPE integer;
+                 ALTER TABLE alias_probe ALTER COLUMN b TYPE int4;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.rule_id == "type-change-rewrite"),
+            "two spellings of one type are one type"
+        );
+    }
+
     #[test]
     fn rename_type_remaps_only_the_resolved_schema_and_preserves_quoted_identity() {
         let engine = setup_engine();

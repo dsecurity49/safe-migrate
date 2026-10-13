@@ -13,6 +13,36 @@ use std::collections::HashSet;
 type TypeLookup = ObjectLookup;
 
 impl AnalysisState {
+    /// Reject a type the server would refuse to create: a duplicate enum
+    /// label, or a component type that names nothing resolvable.
+    fn check_created_type(&mut self, kind: &TypeKind) -> Result<(), MutationResult> {
+        let declared: Vec<&str> = match kind {
+            TypeKind::Enum { variants } => {
+                let mut seen = HashSet::new();
+                for label in variants {
+                    if !seen.insert(label) {
+                        return Err(MutationResult::conflict(format!(
+                            "enum label \"{label}\" already exists"
+                        )));
+                    }
+                }
+                Vec::new()
+            }
+            TypeKind::Composite { fields } => fields
+                .iter()
+                .map(|field| field.data_type.as_str())
+                .collect(),
+            TypeKind::Domain { base_type, .. } => vec![base_type.as_str()],
+            TypeKind::Range | TypeKind::Multirange | TypeKind::Base => Vec::new(),
+        };
+        for declared_type in declared {
+            if let Some(result) = self.check_declared_type(declared_type) {
+                return Err(result);
+            }
+        }
+        Ok(())
+    }
+
     /// What a reference to `old_id` becomes when the type is renamed: the new
     /// name, or its array form when the reference was written `name[]`.
     fn renamed_type_id(current: &ObjectId, rename: &Rename) -> Option<ObjectId> {
@@ -29,6 +59,9 @@ impl AnalysisState {
         }
         if self.relation_namespace_is_taken(&create.id) {
             return MutationResult::conflict(format!("type '{}' already exists", create.id));
+        }
+        if let Err(result) = self.check_created_type(&create.kind) {
+            return result;
         }
         self.snapshot_type(&create.id);
         self.snapshot_generation_counter();
@@ -330,6 +363,9 @@ impl AnalysisState {
         }
         if self.relation_namespace_is_taken(&create.id) {
             return MutationResult::conflict(format!("type '{}' already exists", create.id));
+        }
+        if let Some(result) = self.check_declared_type(&create.base_type) {
+            return result;
         }
         self.snapshot_type(&create.id);
         self.snapshot_generation_counter();

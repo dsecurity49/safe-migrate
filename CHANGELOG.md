@@ -46,6 +46,12 @@ notes are available on the
 - An array argument names the element's array type, so `DROP FUNCTION` and
   `ALTER FUNCTION` on one resolve to the function PostgreSQL would. Previously
   `name[]` was treated as `name` and `name[][]` matched nothing at all.
+- A type declaration the server would refuse is reported: a length or
+  precision outside its range, a type nothing resolves to, an enum label
+  declared twice, and a composite or domain naming a missing type.
+- The type-change rewrite warning now matches what PostgreSQL actually does.
+  Changing a numeric's scale, or converting between `character` and `varchar`,
+  rewrites the table and is reported; two spellings of one type are not.
 - A check skipped for want of evidence names the out-of-scope schemas the
   boundary query observed instead of advising a bare resync.
 - Tier labels are colored only when standard output is a terminal, so

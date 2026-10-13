@@ -243,6 +243,21 @@ impl ParsedDataType {
         let text = Self::strip_pg_catalog_qualifier(&text).to_string();
         let original_base = Self::strip_pg_catalog_qualifier(&original_base).to_string();
 
+        // `serial` is grammar, not a type: the server expands it to an integer
+        // type and a sequence before the column exists.
+        let text = match text.as_str() {
+            "serial" | "serial4" => "integer".to_string(),
+            "bigserial" | "serial8" => "bigint".to_string(),
+            "smallserial" | "serial2" => "smallint".to_string(),
+            _ => text,
+        };
+        let original_base = match original_base.as_str() {
+            "serial" | "serial4" => "integer".to_string(),
+            "bigserial" | "serial8" => "bigint".to_string(),
+            "smallserial" | "serial2" => "smallint".to_string(),
+            _ => original_base,
+        };
+
         let builtin = catalogue.resolve(&text).map(ResolvedBuiltinType::from);
         let typmod = Self::classify_typmod(builtin.as_ref(), &text, typmods.as_deref());
         Self {
@@ -419,6 +434,12 @@ impl ParsedDataType {
         self.raw_typmods.is_some()
     }
 
+    /// Whether the server would accept this declaration. A length, precision
+    /// or scale outside the server's range is refused outright.
+    pub(crate) fn is_valid_declaration(&self) -> bool {
+        self.typmod != TypeTypmod::OutOfRange
+    }
+
     /// Character limit, or None when no limit is established: an unbounded
     /// column, another family, or a declaration the server rejects.
     pub(crate) fn character_limit(&self) -> Option<i32> {
@@ -484,6 +505,17 @@ impl ParsedDataType {
         // Any change in array dimensionality is structurally incompatible.
         if self.array_dimensions != new_type.array_dimensions {
             return true;
+        }
+
+        // A numeric keeps a value only when the target holds every digit the
+        // source can hold: a smaller precision overflows, a smaller scale
+        // rounds. A larger scale only pads.
+        if self.is_exact_numeric() && new_type.is_exact_numeric() {
+            return match (self.numeric_params(), new_type.numeric_params()) {
+                (_, None) => false,
+                (None, Some(_)) => true,
+                (Some((old_p, old_s)), Some((new_p, new_s))) => new_p < old_p || new_s < old_s,
+            };
         }
 
         // A narrower fixed-width representation cannot hold every value of a
