@@ -817,6 +817,8 @@ impl AnalysisState {
         let mut present_targets = Vec::new();
         let mut unknown_target = false;
         for id in &drop_table.ids {
+            // The server rejects `DROP TABLE` on a foreign table and points at
+            // `DROP FOREIGN TABLE`, so the kind check stays table-only.
             match self.relation_lookup(id, |kind| *kind == RelationKind::Table) {
                 RelationLookup::Present => present_targets.push(id.clone()),
                 RelationLookup::WrongKind => {
@@ -1327,7 +1329,7 @@ impl AnalysisState {
         for parent_id in &create.inherits {
             if let Err(result) = self.ensure_relation_target(
                 parent_id,
-                |kind| *kind == RelationKind::Table,
+                |kind| kind.is_table_like(),
                 format!("inheritance parent relation '{}' does not exist", parent_id),
                 format!("inheritance parent '{}' is not a table", parent_id),
             ) {
@@ -3265,7 +3267,8 @@ impl AnalysisState {
                 "DETACH PARTITION CONCURRENTLY cannot run inside a transaction",
             );
         }
-        match self.relation_lookup(&alter.id, |kind| *kind == RelationKind::Table) {
+        // `ALTER TABLE` accepts a foreign table for everything except RLS.
+        match self.relation_lookup(&alter.id, |kind| kind.is_table_like()) {
             ObjectLookup::Present => {}
             ObjectLookup::WrongKind => {
                 return MutationResult::conflict(format!("object '{}' is not a table", alter.id));
@@ -3746,7 +3749,7 @@ impl AnalysisState {
             } => {
                 if let Err(result) = self.ensure_relation_target(
                     child,
-                    |kind| *kind == RelationKind::Table,
+                    |kind| kind.is_table_like(),
                     format!("partition child relation '{}' does not exist", child),
                     format!("partition child '{}' is not a table", child),
                 ) {
@@ -3840,7 +3843,7 @@ impl AnalysisState {
                 }
                 if let Err(result) = self.ensure_relation_target(
                     child,
-                    |kind| *kind == RelationKind::Table,
+                    |kind| kind.is_table_like(),
                     format!("partition child relation '{}' does not exist", child),
                     format!("partition child '{}' is not a table", child),
                 ) {
@@ -3879,7 +3882,7 @@ impl AnalysisState {
             | AlterTableActionMutation::NoInheritTable { parent } => {
                 if let Err(result) = self.ensure_relation_target(
                     parent,
-                    |kind| *kind == RelationKind::Table,
+                    |kind| kind.is_table_like(),
                     format!("inheritance parent relation '{}' does not exist", parent),
                     format!("inheritance parent '{}' is not a table", parent),
                 ) {

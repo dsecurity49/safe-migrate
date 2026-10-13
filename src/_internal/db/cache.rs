@@ -1782,7 +1782,10 @@ impl DbCache {
                     trigger.trigger_id, trigger.table_id
                 ));
             };
-            if !matches!(relation.kind, RelationKind::Table | RelationKind::View) {
+            if !matches!(
+                relation.kind,
+                RelationKind::Table | RelationKind::View | RelationKind::ForeignTable
+            ) {
                 return Err(format!(
                     "trigger '{}' targets a relation kind that cannot have triggers",
                     trigger.trigger_id
@@ -1988,7 +1991,7 @@ impl DbCache {
             };
             for id in [&inheritance.child, &inheritance.parent] {
                 if let Some(relation) = self.relations.get(id) {
-                    if !matches!(relation.kind, RelationKind::Table) {
+                    if !relation.kind.is_table_like() {
                         return Err(format!(
                             "inheritance '{} -> {}' must reference tables",
                             inheritance.child, inheritance.parent

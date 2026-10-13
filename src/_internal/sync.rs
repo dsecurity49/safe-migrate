@@ -226,6 +226,7 @@ fn relation_kind_from_pg(code: u8) -> Result<RelationKind> {
         b'r' | b'p' => Ok(RelationKind::Table),
         b'v' => Ok(RelationKind::View),
         b'm' => Ok(RelationKind::MaterializedView),
+        b'f' => Ok(RelationKind::ForeignTable),
         other => anyhow::bail!("unsupported pg_class.relkind byte {other}"),
     }
 }
@@ -1205,7 +1206,7 @@ fn load_relations_and_columns(
         LEFT JOIN pg_class replica_index ON replica_index.oid = replica_i.indexrelid
         LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid
         LEFT JOIN pg_partitioned_table p ON p.partrelid = c.oid
-        WHERE c.relkind IN ('r', 'p', 'v', 'm')
+        WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f')
           AND n.nspname NOT IN ('pg_catalog', 'information_schema')
           {schema_filter_with_fk};
     "
@@ -1349,7 +1350,7 @@ fn load_relations_and_columns(
         LEFT JOIN pg_stats s ON s.schemaname = n.nspname AND s.tablename = c.relname AND s.attname = a.attname
         LEFT JOIN pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum
         WHERE a.attnum > 0 AND NOT a.attisdropped
-          AND c.relkind IN ('r', 'p', 'v', 'm')
+          AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
           AND n.nspname NOT IN ('pg_catalog', 'information_schema')
           {schema_filter_with_fk}
         -- Composite-type fields are ordered by pg_attribute.attnum.  Keep the
@@ -1590,7 +1591,7 @@ fn load_relation_decorations(
         JOIN pg_namespace n ON n.oid = c.relnamespace
         LEFT JOIN pg_trigger t ON t.tgrelid = c.oid
         LEFT JOIN pg_policy p ON p.polrelid = c.oid
-        WHERE c.relkind IN ('r', 'p', 'v', 'm') AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+        WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') AND n.nspname NOT IN ('pg_catalog', 'information_schema')
         {schema_filter_with_fk}
         GROUP BY n.nspname, c.relname, c.oid;
     "
@@ -1648,7 +1649,7 @@ fn load_relation_decorations(
         FROM pg_class c
         JOIN pg_namespace n ON n.oid = c.relnamespace
         CROSS JOIN LATERAL pg_catalog.aclexplode(c.relacl) acl
-        WHERE c.relkind IN ('r', 'p', 'v', 'm')
+        WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f')
           AND n.nspname NOT IN ('pg_catalog', 'information_schema')
           AND acl.grantee <> c.relowner
           {schema_filter_with_fk};
@@ -1750,7 +1751,7 @@ fn load_triggers(
         LEFT JOIN pg_class inferred_pc ON inferred_pc.oid = inferred_pt.table_oid
         LEFT JOIN pg_namespace inferred_pn ON inferred_pn.oid = inferred_pc.relnamespace
         WHERE (t.tgisinternal = false OR (t.tgparentid <> 0 AND pt.tgisinternal = false))
-          AND c.relkind IN ('r', 'p', 'v', 'm')
+          AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
           AND n.nspname NOT IN ('pg_catalog', 'information_schema')
           {schema_filter_with_fk};
     "
@@ -1832,7 +1833,7 @@ fn load_constraints(
         LEFT JOIN pg_class backing ON backing.oid = con.conindid
         LEFT JOIN pg_namespace backing_n ON backing_n.oid = backing.relnamespace
         WHERE con.contype IN ('c', 'f', 'p', 'u', 'x', 'n')
-          AND c.relkind IN ('r', 'p', 'v', 'm')
+          AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
           AND n.nspname NOT IN ('pg_catalog', 'information_schema')
           {schema_filter_with_fk};
         "
@@ -1919,7 +1920,7 @@ fn load_constraint_keys(
         JOIN pg_class c ON c.oid = con.conrelid
         JOIN pg_namespace n ON n.oid = c.relnamespace
         WHERE con.contype IN ('p', 'u', 'n')
-          AND c.relkind IN ('r', 'p')
+          AND c.relkind IN ('r', 'p', 'f')
           AND n.nspname NOT IN ('pg_catalog', 'information_schema')
           {schema_filter_with_fk};
     "
@@ -1988,7 +1989,7 @@ fn load_constraint_dependencies(
         JOIN pg_class c ON c.oid = con.conrelid
         JOIN pg_namespace n ON n.oid = c.relnamespace
         WHERE con.contype IN ('c', 'x')
-          AND c.relkind IN ('r', 'p')
+          AND c.relkind IN ('r', 'p', 'f')
           AND n.nspname NOT IN ('pg_catalog', 'information_schema')
           {schema_filter_with_fk};
         "
@@ -2048,7 +2049,7 @@ fn load_generated_column_dependencies(
         WHERE a.attnum > 0
           AND NOT a.attisdropped
           AND a.attgenerated = 's'
-          AND c.relkind IN ('r', 'p')
+          AND c.relkind IN ('r', 'p', 'f')
           AND n.nspname NOT IN ('pg_catalog', 'information_schema')
           {schema_filter_with_fk}
         ORDER BY n.nspname, c.relname, a.attname, source_a.attname;
@@ -2105,7 +2106,7 @@ fn load_default_sequence_dependencies(
         WHERE a.attnum > 0
           AND NOT a.attisdropped
           AND a.attgenerated = ''
-          AND c.relkind IN ('r', 'p')
+          AND c.relkind IN ('r', 'p', 'f')
           AND n.nspname NOT IN ('pg_catalog', 'information_schema')
           {schema_filter_with_fk}
         ORDER BY n.nspname, c.relname, a.attname, seqn.nspname, seq.relname;
@@ -2334,8 +2335,8 @@ fn load_inheritances(
         JOIN pg_namespace child_ns ON child_ns.oid = child.relnamespace
         JOIN pg_class parent ON parent.oid = inh.inhparent
         JOIN pg_namespace parent_ns ON parent_ns.oid = parent.relnamespace
-        WHERE child.relkind IN ('r', 'p')
-          AND parent.relkind IN ('r', 'p')
+        WHERE child.relkind IN ('r', 'p', 'f')
+          AND parent.relkind IN ('r', 'p', 'f')
           AND child_ns.nspname NOT IN ('pg_catalog', 'information_schema')
           AND parent_ns.nspname NOT IN ('pg_catalog', 'information_schema')
           AND (

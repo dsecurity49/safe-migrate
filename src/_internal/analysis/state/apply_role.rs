@@ -1073,11 +1073,14 @@ impl AnalysisState {
                     self.ensure_relation_target(
                         id,
                         |kind| {
+                            // A foreign table accepts GRANT; only its server
+                            // options are restricted.
                             matches!(
                                 kind,
                                 crate::_internal::model::relation::RelationKind::Table
                                     | crate::_internal::model::relation::RelationKind::View
                                     | crate::_internal::model::relation::RelationKind::MaterializedView
+                                    | crate::_internal::model::relation::RelationKind::ForeignTable
                             )
                         },
                         format!("grant target relation '{}' does not exist", id),

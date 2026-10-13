@@ -1170,6 +1170,8 @@ pub struct BaselineContents {
     pub views: usize,
     /// Number of materialized views.
     pub materialized_views: usize,
+    /// Number of foreign tables.
+    pub foreign_tables: usize,
     /// Number of relation columns.
     pub columns: usize,
     /// Number of indexes.
@@ -1264,6 +1266,7 @@ impl BaselineInspection {
         let mut tables = 0;
         let mut views = 0;
         let mut materialized_views = 0;
+        let mut foreign_tables = 0;
         let mut columns = 0;
         for relation in cache.relations.values() {
             columns += relation.columns.len();
@@ -1271,6 +1274,7 @@ impl BaselineInspection {
                 RelationKind::Table => tables += 1,
                 RelationKind::View => views += 1,
                 RelationKind::MaterializedView => materialized_views += 1,
+                RelationKind::ForeignTable => foreign_tables += 1,
             }
         }
         let mut functions = 0;
@@ -1328,6 +1332,7 @@ impl BaselineInspection {
                 tables,
                 views,
                 materialized_views,
+                foreign_tables,
                 columns,
                 indexes: cache.indexes.len(),
                 foreign_keys: cache.foreign_keys.len(),

@@ -38,7 +38,7 @@ impl AnalysisState {
         for target in &truncate.targets {
             if let Err(result) = self.ensure_relation_target(
                 &target.id,
-                |kind| *kind == RelationKind::Table,
+                |kind| kind.is_table_like(),
                 format!("truncated relation '{}' does not exist", target.id),
                 format!("truncated relation '{}' is not a table", target.id),
             ) {

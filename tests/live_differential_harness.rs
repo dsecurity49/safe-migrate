@@ -245,6 +245,7 @@ enum NormalizedRelationKind {
     Table,
     View,
     MaterializedView,
+    ForeignTable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -3647,6 +3648,8 @@ fn normalize_relation_kind(kind: RelationKind) -> NormalizedRelationKind {
         RelationKind::Table => NormalizedRelationKind::Table,
         RelationKind::View => NormalizedRelationKind::View,
         RelationKind::MaterializedView => NormalizedRelationKind::MaterializedView,
+        // Remote rows; no local storage or access method.
+        RelationKind::ForeignTable => NormalizedRelationKind::ForeignTable,
     }
 }
 
@@ -3655,7 +3658,7 @@ fn normalize_access_method(kind: &RelationKind, method: Option<&str>) -> Option<
         RelationKind::Table | RelationKind::MaterializedView => {
             Some(method.unwrap_or("heap").to_ascii_lowercase())
         }
-        RelationKind::View => None,
+        RelationKind::View | RelationKind::ForeignTable => None,
     }
 }
 
