@@ -10418,6 +10418,93 @@ mod state_mutation_tests {
         );
     }
 
+    /// PostgreSQL attaches to a parent index that is invalid precisely because
+    /// partitions are missing, and marks it valid once the last one arrives.
+    #[test]
+    fn attaching_to_an_incomplete_partitioned_index_is_allowed() {
+        let engine = setup_engine();
+        for extra in ["", "ALTER INDEX pt_idx ATTACH PARTITION p1_idx;"] {
+            let mut state = setup_state();
+            let violations = engine
+                .analyze(
+                    &format!(
+                        "CREATE TABLE pt (a int) PARTITION BY RANGE (a);
+                         CREATE TABLE p1 PARTITION OF pt FOR VALUES FROM (0) TO (10);
+                         CREATE TABLE p2 PARTITION OF pt FOR VALUES FROM (10) TO (20);
+                         CREATE INDEX pt_idx ON ONLY pt (a);
+                         CREATE INDEX p1_idx ON ONLY p1 (a);
+                         CREATE INDEX p2_idx ON ONLY p2 (a);
+                         ALTER INDEX pt_idx ATTACH PARTITION p1_idx;
+                         {extra}"
+                    ),
+                    &mut state,
+                )
+                .unwrap();
+            assert!(
+                !violations
+                    .iter()
+                    .any(|violation| violation.rule_id == "chain-conflict"),
+                "attaching an incomplete parent must succeed"
+            );
+        }
+    }
+
+    /// REINDEX rebuilds a broken index, so the index is usable afterwards.
+    #[test]
+    fn reindex_makes_a_broken_index_usable() {
+        let engine = setup_engine();
+        let mut cache = synced_cache();
+        let broken = object_id("public", "broken_idx");
+        let table = object_id("public", "t");
+        let definition = safe_migrate::_internal::model::index::IndexDefinition {
+            method: Some("btree".to_string()),
+            keys: index_keys(vec!["a".to_string()]),
+            included: Vec::new(),
+            expression_keys: 0,
+            unique: true,
+            predicate: false,
+            valid: false,
+            ready: false,
+            live: true,
+        };
+        cache.insert_baseline(
+            table.clone(),
+            RelationState::new(
+                table.clone(),
+                object_id("public", "owner"),
+                0,
+                Some(1000),
+                RelationKind::Table,
+                Persistence::Permanent,
+                0,
+            ),
+        );
+        cache
+            .indexes
+            .push(safe_migrate::_internal::db::cache::IndexCache {
+                index_id: broken.clone(),
+                table_id: table.clone(),
+                definition,
+                dependency_columns: vec!["a".to_string()],
+                dependency_columns_known: true,
+                is_immediate: true,
+            });
+        let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
+        let violations = engine
+            .analyze(
+                "REINDEX INDEX broken_idx;
+                 ALTER TABLE t ADD CONSTRAINT t_u UNIQUE USING INDEX broken_idx;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict"),
+            "a rebuilt index is usable"
+        );
+    }
+
     #[test]
     fn a_foreign_table_can_hold_a_partition() {
         let parent = object_id("public", "parent");

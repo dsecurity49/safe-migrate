@@ -151,8 +151,9 @@ impl Reporter {
     pub(crate) fn json_report(
         violations: &[Violation],
         confidence: &Confidence,
+        not_evaluated: &[crate::_internal::report::violations::NotEvaluated],
     ) -> serde_json::Value {
-        let verdict = compute_verdict(violations);
+        let verdict = compute_verdict_with(violations, not_evaluated);
         let tier1 = violations
             .iter()
             .filter(|violation| violation.tier == ViolationTier::Tier1)
@@ -188,8 +189,10 @@ impl Reporter {
     /// evidence alongside the existing finding contract.
     pub(crate) fn json_outcome_with_locations(
         outcome: &AnalysisOutcome<ReportFinding>,
+        not_evaluated: &[crate::_internal::report::violations::NotEvaluated],
     ) -> serde_json::Value {
-        let mut report = Self::json_report_with_locations(&outcome.findings, &outcome.confidence);
+        let mut report =
+            Self::json_report_with_locations(&outcome.findings, &outcome.confidence, not_evaluated);
         report["evidence"] = serde_json::to_value(&outcome.evidence)
             .expect("analysis evidence is always serializable");
         report
@@ -200,12 +203,13 @@ impl Reporter {
     pub(crate) fn json_report_with_locations(
         findings: &[ReportFinding],
         confidence: &Confidence,
+        not_evaluated: &[crate::_internal::report::violations::NotEvaluated],
     ) -> serde_json::Value {
         let violations: Vec<_> = findings
             .iter()
             .map(|finding| finding.violation.clone())
             .collect();
-        let mut report = Self::json_report(&violations, confidence);
+        let mut report = Self::json_report(&violations, confidence, not_evaluated);
         report["violations"] = serde_json::Value::Array(
             findings
                 .iter()

@@ -17,6 +17,9 @@ pub(crate) struct OpclassEntry {
     pub namespace: String,
     /// The data type the class indexes, by `typname`.
     pub intype: String,
+    /// SQL spellings that name the same type as `intype`, so a column written
+    /// `integer` matches the catalogue's `int4`.
+    pub aliases: Vec<String>,
     /// The access method it belongs to, by `amname`.
     pub method: String,
     /// Whether this is the access method's default class for `intype`.
@@ -33,26 +36,34 @@ impl OpclassCatalogue {
     pub(crate) fn from_entries(entries: Vec<OpclassEntry>) -> Self {
         let mut catalogue = Self::default();
         for entry in entries {
-            catalogue
-                .entries
-                .insert(Self::key(&entry.namespace, &entry.name), entry);
+            catalogue.entries.insert(
+                Self::key(&entry.namespace, &entry.name, &entry.method),
+                entry,
+            );
         }
         catalogue
     }
 
-    fn key(namespace: &str, name: &str) -> String {
-        format!("{namespace}.{name}")
+    fn key(namespace: &str, name: &str, method: &str) -> String {
+        // One class name exists per access method, so the method is part of the
+        // identity: `int4_ops` is both the btree and the hash class.
+        format!("{namespace}.{name}.{method}")
     }
 
     /// Resolve a written class name, honouring `search_path` order.
     ///
     /// Returns `None` when the name is unknown: an unresolvable class is not
     /// evidence of a non-default class.
-    pub(crate) fn resolve(&self, name: &str, search_path: &[String]) -> Option<&OpclassEntry> {
+    pub(crate) fn resolve(
+        &self,
+        name: &str,
+        method: &str,
+        search_path: &[String],
+    ) -> Option<&OpclassEntry> {
         search_path
             .iter()
-            .find_map(|schema| self.entries.get(&Self::key(schema, name)))
-            .or_else(|| self.entries.get(&Self::key("pg_catalog", name)))
+            .find_map(|schema| self.entries.get(&Self::key(schema, name, method)))
+            .or_else(|| self.entries.get(&Self::key("pg_catalog", name, method)))
     }
 
     /// Whether a written class means "the default for this type and method".
@@ -67,14 +78,25 @@ impl OpclassCatalogue {
         method: &str,
         search_path: &[String],
     ) -> Option<bool> {
-        let entry = self.resolve(name, search_path)?;
-        if entry.intype == intype && entry.method == method {
+        let entry = self.resolve(name, method, search_path)?;
+        if entry.serves(intype, method) {
             Some(entry.is_default)
         } else {
             // A class for another type or method is written explicitly, and an
             // explicit class that is not the default stays recorded.
             Some(false)
         }
+    }
+}
+
+impl OpclassEntry {
+    /// Whether this class serves the given input type and access method.
+    ///
+    /// The catalogue records `pg_type.typname` (`int4`), while a column carries
+    /// the SQL spelling (`integer`), so both spellings name the same type.
+    fn serves(&self, intype: &str, method: &str) -> bool {
+        self.method == method
+            && (self.intype == intype || self.aliases.iter().any(|alias| alias == intype))
     }
 }
 
@@ -88,6 +110,7 @@ mod tests {
                 name: "text_ops".to_string(),
                 namespace: "pg_catalog".to_string(),
                 intype: "text".to_string(),
+                aliases: Vec::new(),
                 method: "btree".to_string(),
                 is_default: true,
             },
@@ -95,6 +118,7 @@ mod tests {
                 name: "varchar_pattern_ops".to_string(),
                 namespace: "pg_catalog".to_string(),
                 intype: "text".to_string(),
+                aliases: Vec::new(),
                 method: "btree".to_string(),
                 is_default: false,
             },

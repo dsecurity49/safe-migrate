@@ -60,6 +60,16 @@ pub(crate) fn synced_cache() -> DbCache {
     cache
 }
 
+/// The SQL spelling a column carries, for the catalog `typname` above.
+fn aliases_for(intype: &str) -> Vec<String> {
+    match intype {
+        "int4" => vec!["integer".to_string()],
+        "varchar" => vec!["character varying".to_string()],
+        "bool" => vec!["boolean".to_string()],
+        _ => Vec::new(),
+    }
+}
+
 /// The default operator classes `sync` would load, reduced to the entries a
 /// test can rely on. Mirrors PostgreSQL's own defaults for btree and hash.
 fn default_opclasses() -> crate::_internal::model::opclass::OpclassCatalogue {
@@ -77,6 +87,7 @@ fn default_opclasses() -> crate::_internal::model::opclass::OpclassCatalogue {
             name: name.to_string(),
             namespace: "pg_catalog".to_string(),
             intype: intype.to_string(),
+            aliases: aliases_for(intype),
             method: "btree".to_string(),
             is_default: true,
         });

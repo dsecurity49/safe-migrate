@@ -9,7 +9,16 @@
 use super::AnalysisState;
 use crate::_internal::analysis::graph::{DependencyEdge, DependencyKind};
 use crate::_internal::ast::identifiers::ObjectId;
+use crate::_internal::model::constraint::ConstraintKind;
 use crate::_internal::model::index::IndexComparability;
+
+/// The outcome of comparing two index shapes.
+#[derive(PartialEq, Eq)]
+enum IndexComparison {
+    Match,
+    Mismatch,
+    Undecidable,
+}
 
 /// Why an attachment was refused.
 pub(crate) enum AttachRefusal {
@@ -19,7 +28,9 @@ pub(crate) enum AttachRefusal {
     AttachedElsewhere,
     /// The two definitions do not match.
     DefinitionsDiffer,
-    /// The parent has a constraint the child lacks.
+    /// An opaque expression leaves equivalence undecidable, not unequal.
+    EquivalenceUnknown,
+    /// The two indexes are not backed by the same kind of constraint.
     ConstraintMismatch,
 }
 
@@ -128,21 +139,27 @@ impl AnalysisState {
     /// and equal sort order, with columns paired by name through the
     /// partition's attribute map. Sort order is compared normalized, so
     /// `ASC NULLS LAST` matches `DESC NULLS FIRST` — verified live.
-    pub(super) fn index_definitions_match(&self, parent: &ObjectId, child: &ObjectId) -> bool {
+    /// Lifecycle state plays no part: PostgreSQL attaches to a parent that is
+    /// invalid precisely because partitions are still missing.
+    fn compare_index_definitions(&self, parent: &ObjectId, child: &ObjectId) -> IndexComparison {
         let (Some(parent_definition), Some(child_definition)) = (
             self.index_definition_of(parent),
             self.index_definition_of(child),
         ) else {
-            return false;
+            return IndexComparison::Mismatch;
         };
-        if parent_definition.comparability(child_definition) != IndexComparability::Comparable {
-            return false;
+        match parent_definition.comparability(child_definition) {
+            IndexComparability::DifferentFamily => IndexComparison::Mismatch,
+            // Undecidable is not unequal; a conflict would claim more than is known.
+            IndexComparability::Unknown => IndexComparison::Undecidable,
+            IndexComparability::Comparable => {
+                if parent_definition.has_same_shape(child_definition) {
+                    IndexComparison::Match
+                } else {
+                    IndexComparison::Mismatch
+                }
+            }
         }
-        // A partitioned parent is invalid until every partition is attached, so
-        // an unusable definition never counts as a match.
-        parent_definition.is_usable()
-            && child_definition.is_usable()
-            && parent_definition == child_definition
     }
 
     /// Why an attachment cannot proceed, in PostgreSQL's check order.
@@ -177,8 +194,10 @@ impl AnalysisState {
         if !is_partition {
             return Some(AttachRefusal::NotAPartition);
         }
-        if !self.index_definitions_match(parent, child) {
-            return Some(AttachRefusal::DefinitionsDiffer);
+        match self.compare_index_definitions(parent, child) {
+            IndexComparison::Mismatch => return Some(AttachRefusal::DefinitionsDiffer),
+            IndexComparison::Undecidable => return Some(AttachRefusal::EquivalenceUnknown),
+            IndexComparison::Match => {}
         }
         if self.constraint_backing(parent) != self.constraint_backing(child) {
             return Some(AttachRefusal::ConstraintMismatch);
@@ -186,12 +205,12 @@ impl AnalysisState {
         None
     }
 
-    /// The constraint name backing an index, if any.
+    /// The kind of constraint backing an index, if any.
     ///
-    /// PostgreSQL refuses to attach when the parent index backs a constraint
-    /// and the child does not, and attaches the constraint alongside the
-    /// indexes when both have it.
-    fn constraint_backing(&self, index: &ObjectId) -> Option<String> {
+    /// PostgreSQL attaches a constraint alongside the indexes when both sides
+    /// have one of the same kind. Cloned partition constraints are renamed, so
+    /// the name cannot decide it.
+    fn constraint_backing(&self, index: &ObjectId) -> Option<ConstraintKind> {
         self.local
             .constraints
             .values()
@@ -199,15 +218,39 @@ impl AnalysisState {
                 constraint.backing_index.as_ref() == Some(index)
                     && matches!(
                         constraint.kind,
-                        crate::_internal::model::constraint::ConstraintKind::PrimaryKey
-                            | crate::_internal::model::constraint::ConstraintKind::Unique
-                            | crate::_internal::model::constraint::ConstraintKind::Exclusion
+                        ConstraintKind::PrimaryKey
+                            | ConstraintKind::Unique
+                            | ConstraintKind::Exclusion
                     )
             })
-            .map(|constraint| constraint.name.clone())
+            .map(|constraint| constraint.kind)
+    }
+
+    /// A partitioned parent carries no rows: it is valid exactly when its
+    /// partitions are covered. A leaf index has none to cover.
+    pub(super) fn index_is_fully_attached(&self, index: &ObjectId) -> bool {
+        let Some(table) = self.index_table_of(index) else {
+            return false;
+        };
+        let partitions = self.local.graph.partitions_of(table);
+        if partitions.is_empty() {
+            return true;
+        }
+        let attached = self.index_partitions_of(index);
+        partitions.iter().all(|partition| {
+            attached.iter().any(|child| {
+                self.index_table_of(child).is_some_and(|owner| {
+                    self.local.graph.resolve_rename(owner)
+                        == self.local.graph.resolve_rename(partition)
+                })
+            })
+        })
     }
 
     /// Record `child` as a partition of `parent`.
+    ///
+    /// Attaching the last partition is what makes a parent valid, which is why
+    /// re-attaching an already-attached child is not merely a no-op.
     pub(super) fn record_index_partition(&mut self, parent: &ObjectId, child: &ObjectId) {
         self.snapshot_graph();
         self.local.graph.add_edge(DependencyEdge::new(
@@ -215,6 +258,28 @@ impl AnalysisState {
             parent.clone(),
             DependencyKind::IndexPartitionOf,
         ));
+        self.mark_index_valid(parent);
+    }
+
+    /// Record that an index has finished being built and is usable.
+    ///
+    /// REINDEX rebuilds a broken index; a partitioned parent reaches the same
+    /// state once every partition is attached.
+    pub(super) fn mark_index_valid(&mut self, index: &ObjectId) {
+        let Some(definition) = self.index_definition_of(index).cloned() else {
+            return;
+        };
+        // A leaf index is rebuilt by REINDEX; a partitioned parent only once
+        // every partition is attached.
+        if definition.is_usable() || !self.index_is_fully_attached(index) {
+            return;
+        }
+        self.snapshot_graph_full();
+        self.local.graph.update_index_definition(index, |stored| {
+            stored.valid = true;
+            stored.ready = true;
+            stored.live = true;
+        });
     }
 
     /// Drop every attachment whose child index lives on `table`.

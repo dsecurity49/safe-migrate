@@ -382,6 +382,7 @@ mod performance_scenarios {
         let json = crate::_internal::report::reporter::Reporter::json_report_with_locations(
             &findings,
             &state.local.confidence,
+            state.not_evaluated(),
         );
         let markdown = crate::_internal::report::reporter::Reporter::markdown_report(
             &findings,

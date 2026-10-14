@@ -385,6 +385,22 @@ impl DependencyGraph {
             .map(|edge| &edge.referenced)
     }
 
+    /// Rewrite a recorded index definition in place.
+    pub(crate) fn update_index_definition(
+        &mut self,
+        index: &ObjectId,
+        apply: impl FnOnce(&mut crate::_internal::model::index::IndexDefinition),
+    ) {
+        for edge in &mut self.edges {
+            if edge.dependent == *index
+                && let DependencyKind::IndexOnRelation { definition, .. } = &mut edge.kind
+            {
+                apply(definition);
+                return;
+            }
+        }
+    }
+
     pub(crate) fn partitions_of(&self, id: &ObjectId) -> Vec<&ObjectId> {
         if self.edges.len() >= Self::CASCADE_INDEX_MIN_EDGES {
             return self

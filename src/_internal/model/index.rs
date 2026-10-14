@@ -266,6 +266,18 @@ impl IndexDefinition {
         }
         IndexComparability::Comparable
     }
+
+    /// Whether two indexes have the same shape: keys, included columns,
+    /// uniqueness and predicate. Lifecycle state is excluded — an incomplete
+    /// parent is still attachable.
+    pub(crate) fn has_same_shape(&self, other: &Self) -> bool {
+        self.method == other.method
+            && self.keys == other.keys
+            && self.included == other.included
+            && self.expression_keys == other.expression_keys
+            && self.unique == other.unique
+            && self.predicate == other.predicate
+    }
 }
 
 /// Access methods grouped by what their indexes can be compared for.

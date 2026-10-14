@@ -251,6 +251,7 @@ mod invariant_sequences {
                         &crate::_internal::report::reporter::Reporter::json_report(
                             &findings,
                             &state.local.confidence,
+                            state.not_evaluated(),
                         ),
                     )
                     .expect("report should serialize"),

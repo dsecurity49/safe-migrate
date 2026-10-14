@@ -2799,6 +2799,11 @@ fn load_opclasses(
                 n.nspname AS namespace,
                 o.opcname AS name,
                 t.typname AS intype,
+                ARRAY(
+                    SELECT pg_catalog.format_type(t.oid, NULL)
+                    UNION ALL
+                    SELECT t.typname
+                ) AS aliases,
                 am.amname AS method,
                 o.opcdefault AS is_default
             FROM pg_catalog.pg_opclass o
@@ -2817,6 +2822,9 @@ fn load_opclasses(
                         name: row.try_get("name").context("operator class name")?,
                         namespace: row.try_get("namespace").context("operator class schema")?,
                         intype: row.try_get("intype").context("operator class input type")?,
+                        aliases: row
+                            .try_get("aliases")
+                            .context("operator class input type aliases")?,
                         method: row
                             .try_get("method")
                             .context("operator class access method")?,

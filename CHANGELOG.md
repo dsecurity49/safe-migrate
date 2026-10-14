@@ -52,6 +52,18 @@ notes are available on the
 - The type-change rewrite warning now matches what PostgreSQL actually does.
   Changing a numeric's scale, or converting between `character` and `varchar`,
   rewrites the table and is reported; two spellings of one type are not.
+- `ALTER INDEX ... ATTACH PARTITION` accepts a parent index that is still
+  invalid because partitions are missing, which is how `CREATE INDEX ON ONLY`
+  is completed. An index whose equivalence cannot be decided no longer reports
+  a conflict.
+- `REINDEX` marks a broken index usable, so rebuilding one and then constraining
+  from it no longer fails.
+- A cloned partition constraint no longer has to share its parent's name to
+  attach.
+- An explicitly written default operator class is recognized whether the column
+  is spelled `integer` or `int4`.
+- The JSON report's verdict now matches the library's: a Tier 1 check that did
+  not run no longer serializes as `safe`.
 - A check skipped for want of evidence names the out-of-scope schemas the
   boundary query observed instead of advising a bare resync.
 - Tier labels are colored only when standard output is a terminal, so

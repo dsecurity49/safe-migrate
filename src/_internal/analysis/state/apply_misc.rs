@@ -122,6 +122,10 @@ impl AnalysisState {
                         }
                         // No baseline coverage — we cannot prove it is absent.
                         self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
+                    } else {
+                        // REINDEX rebuilds a broken index; a partitioned parent
+                        // only becomes valid once its partitions are attached.
+                        self.mark_index_valid(id);
                     }
                 }
             }
@@ -230,6 +234,9 @@ impl AnalysisState {
                             return MutationResult::conflict(format!(
                                 "cannot attach index \"{child_name}\" as partition of index \"{parent_name}\": the index definitions do not match"
                             ));
+                        }
+                        Some(AttachRefusal::EquivalenceUnknown) => {
+                            return self.unresolved(EvidenceCode::UnmodeledState);
                         }
                     }
                 }

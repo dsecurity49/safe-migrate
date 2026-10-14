@@ -810,7 +810,8 @@ impl AnalysisOutcome {
 
     /// Render the stable JSON report consumed by automation.
     pub fn json(&self) -> serde_json::Value {
-        let mut report = InternalReporter::json_outcome_with_locations(&self.inner);
+        let mut report =
+            InternalReporter::json_outcome_with_locations(&self.inner, &self.not_evaluated);
         report["baseline"] = serde_json::to_value(&self.baseline)
             .expect("API-owned baseline report is always serializable");
         report["not_evaluated"] = serde_json::to_value(self.not_evaluated())

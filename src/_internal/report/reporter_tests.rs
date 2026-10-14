@@ -53,7 +53,7 @@ mod tests {
         let has_failures = Reporter::print_report(&violations, &confidence, &[]);
         assert!(has_failures);
 
-        let report = Reporter::json_report(&violations, &confidence);
+        let report = Reporter::json_report(&violations, &confidence, &[]);
         assert_eq!(report["schema_version"], Reporter::JSON_SCHEMA_VERSION);
         assert_eq!(report["confidence"], "Tainted");
         assert_eq!(report["verdict"], "HALT");
@@ -120,7 +120,7 @@ mod tests {
             certainty: Certainty::Exact,
         };
 
-        let report = Reporter::json_report_with_locations(&[finding], &Confidence::Exact);
+        let report = Reporter::json_report_with_locations(&[finding], &Confidence::Exact, &[]);
         assert_eq!(report["schema_version"], Reporter::JSON_SCHEMA_VERSION);
         assert_eq!(report["violations"][0]["statement_index"], 1);
         // The rule title is catalogued once instead of repeated per occurrence.
@@ -153,7 +153,7 @@ mod tests {
             ],
         );
 
-        let json = Reporter::json_outcome_with_locations(&outcome);
+        let json = Reporter::json_outcome_with_locations(&outcome, &[]);
         assert_eq!(json["schema_version"], Reporter::JSON_SCHEMA_VERSION);
         assert_eq!(json["evidence"][0]["code"], "unsupported_statement");
         assert_eq!(json["evidence"][0]["location"]["statement_index"], 1);
@@ -180,6 +180,7 @@ mod tests {
         let json = Reporter::json_report_with_locations(
             std::slice::from_ref(&finding),
             &Confidence::Exact,
+            &[],
         );
         let expected_json: serde_json::Value = serde_json::from_str(include_str!(
             "../../../tests/golden/representative-report.json"
@@ -200,6 +201,7 @@ mod tests {
                 serde_json::to_string_pretty(&Reporter::json_report_with_locations(
                     std::slice::from_ref(&finding),
                     &Confidence::Exact,
+                    &[],
                 ))
                 .expect("serialize repeated report"),
                 canonical_json,
