@@ -25,6 +25,14 @@ notes are available on the
 - Every action of a comma-separated `ALTER MATERIALIZED VIEW` is now applied,
   so an unsupported action no longer disappears behind a modeled one in front
   of it.
+- `CREATE OR REPLACE VIEW` is validated the way the server validates it: a
+  leading column may not be renamed, have its type changed, or disappear, and a
+  new column may only be appended. Appending columns no longer leaves the view
+  with its old column list, so altering a column the replacement added is no
+  longer reported as missing.
+- `CREATE MATERIALIZED VIEW` records its columns, access method, tablespace and
+  storage parameters. A view selecting `*` from a materialized view now sees the
+  columns it actually has, and an explicit column list renames them.
 - Built-in types are read from `pg_catalog.pg_type` instead of a hand-written
   table, so `bytea`, `jsonb`, `inet`, `xml`, `uuid` and the range types now
   carry their own routine signatures and type identities rather than collapsing

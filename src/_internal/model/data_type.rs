@@ -100,13 +100,15 @@ fn typmod_kind(typname: &str) -> TypmodKind {
 // PostgreSQL's accepted ranges for built-in type modifiers, verified against
 // PostgreSQL 18.2 and stable across 14-18. A declaration outside them is SQL
 // the database rejects.
-mod pg_typmod {
+pub(crate) mod pg_typmod {
     // "length for type varchar must be at least 1" / "cannot exceed 10485760"
     pub(crate) const CHAR_LENGTH: std::ops::RangeInclusive<i32> = 1..=10_485_760;
     // A bounded character column stores its length in atttypmod as length + VARHDRSZ.
     pub(crate) const VARHDRSZ: i32 = 4;
     pub(crate) const NUMERIC_PRECISION: std::ops::RangeInclusive<i32> = 1..=1_000;
     pub(crate) const NUMERIC_SCALE: std::ops::RangeInclusive<i32> = -1_000..=1_000;
+    /// PostgreSQL packs a numeric precision and scale into one integer.
+    pub(crate) const NUMERIC_SHIFT: i32 = 16;
 }
 
 /// A character length PostgreSQL has accepted. Holding the bound here is what
@@ -449,11 +451,22 @@ impl ParsedDataType {
         }
     }
 
-    /// atttypmod as PostgreSQL stores it for a bounded character column.
-    pub(crate) fn atttypmod_offset(&self) -> Option<i32> {
+    /// The `atttypmod` PostgreSQL stores for this declaration, or `None` when
+    /// the type carries no modifier or the declared one was rejected.
+    ///
+    /// This is the whole encoding, not just the character-length part, so a
+    /// column derived from DDL compares equal to the same column synchronized
+    /// from `pg_attribute.atttypmod`.
+    pub(crate) fn atttypmod(&self) -> Option<i32> {
         match self.typmod {
             TypeTypmod::CharacterLength(length) => Some(length.atttypmod()),
-            _ => None,
+            // `numeric(p)` is stored as `numeric(p, 0)`.
+            TypeTypmod::Numeric { precision, scale } => Some(
+                ((precision.get() << pg_typmod::NUMERIC_SHIFT)
+                    | scale.map_or(0, NumericScale::get))
+                .checked_add(pg_typmod::VARHDRSZ)?,
+            ),
+            TypeTypmod::NotApplicable | TypeTypmod::Unbounded | TypeTypmod::OutOfRange => None,
         }
     }
 
@@ -781,10 +794,32 @@ mod tests {
     }
 
     #[test]
+    fn atttypmod_covers_numeric_as_well_as_character_lengths() {
+        // Verified against PostgreSQL 18.6 `pg_attribute.atttypmod`:
+        // numeric(5,2) is 327686, numeric(7) is 458756, varchar(10) is 14,
+        // text is -1.
+        for (declaration, expected) in [
+            ("numeric(5,2)", Some(327_686)),
+            ("numeric(7)", Some(458_756)),
+            ("numeric(1000,1000)", Some(((1000_i32 << 16) | 1000) + 4)),
+            ("varchar(10)", Some(14)),
+            ("numeric", None),
+            ("text", None),
+            ("integer", None),
+        ] {
+            assert_eq!(
+                ParsedDataType::parse(declaration, catalogue()).atttypmod(),
+                expected,
+                "{declaration}"
+            );
+        }
+    }
+
+    #[test]
     fn character_limit_and_atttypmod() {
         let v50 = ParsedDataType::parse("varchar(50)", catalogue());
         assert_eq!(v50.character_limit(), Some(50));
-        assert_eq!(v50.atttypmod_offset(), Some(54));
+        assert_eq!(v50.atttypmod(), Some(54));
         assert_eq!(
             ParsedDataType::parse("text", catalogue()).character_limit(),
             None
@@ -793,11 +828,11 @@ mod tests {
         // PostgreSQL records these exact atttypmod values; see the 18.2 probe in
         // temp/ and docs. char(7) is 11, bare char is 5.
         assert_eq!(
-            ParsedDataType::parse("char(7)", catalogue()).atttypmod_offset(),
+            ParsedDataType::parse("char(7)", catalogue()).atttypmod(),
             Some(11)
         );
         assert_eq!(
-            ParsedDataType::parse("char", catalogue()).atttypmod_offset(),
+            ParsedDataType::parse("char", catalogue()).atttypmod(),
             Some(5)
         );
         assert_eq!(
@@ -831,7 +866,7 @@ mod tests {
             TypeTypmod::OutOfRange
         );
         assert_eq!(
-            ParsedDataType::parse("varchar(10485760)", catalogue()).atttypmod_offset(),
+            ParsedDataType::parse("varchar(10485760)", catalogue()).atttypmod(),
             Some(10485764)
         );
     }
@@ -850,7 +885,7 @@ mod tests {
             let parsed = ParsedDataType::parse(decl, catalogue());
             assert_eq!(parsed.typmod, TypeTypmod::OutOfRange, "{decl}");
             assert_eq!(parsed.character_limit(), None, "{decl}");
-            assert_eq!(parsed.atttypmod_offset(), None, "{decl}");
+            assert_eq!(parsed.atttypmod(), None, "{decl}");
         }
     }
 

@@ -208,6 +208,14 @@ pub(crate) enum StatementFact {
         depends_on: Vec<QualifiedName>,
         if_not_exists: bool,
         with_no_data: bool,
+        /// An explicit `mv (a, b)` column list, which renames the outputs.
+        column_list: Vec<String>,
+        access_method: Option<String>,
+        tablespace: Option<String>,
+        options: Vec<AttributeFact>,
+        select_outputs: Vec<SelectOutputFact>,
+        select_projection_complete: bool,
+        select_source: Option<QualifiedName>,
     },
     AlterMaterializedView {
         name: QualifiedName,

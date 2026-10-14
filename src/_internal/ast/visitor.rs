@@ -2364,10 +2364,32 @@ impl AstVisitor {
             return None;
         }
         let path = node.view()?.path()?;
-        // Only a plain `SELECT` exposes a target list. Compound, parenthesized
-        // and `VALUES` queries still create the view, but its columns are then
-        // unknown, so the projection is left incomplete.
-        let (select_source, select_outputs) = match node.query() {
+        let (select_source, select_outputs) = Self::extract_single_source_projection(node.query());
+        let projection_was_complete = select_outputs.is_some();
+        let select_outputs = select_outputs.unwrap_or_default();
+        Some(StatementFact::CreateView {
+            name: Self::path_to_qualified_name(&path)?,
+            or_replace: node.or_replace().is_some(),
+            depends_on: Self::extract_view_dependencies(node.syntax()),
+            select_projection_complete: select_source.is_some() && projection_was_complete,
+            select_outputs,
+            select_source,
+        })
+    }
+
+    /// The source relation and target list of a query that selects from a
+    /// single plain relation.
+    ///
+    /// Only a plain `SELECT` exposes a target list. Compound, parenthesized
+    /// and `VALUES` queries still create the relation, but its columns are
+    /// then unknown, so the projection is left incomplete.
+    fn extract_single_source_projection(
+        query: Option<ast::SelectVariant>,
+    ) -> (
+        Option<QualifiedName>,
+        Option<Vec<crate::_internal::analysis::facts::SelectOutputFact>>,
+    ) {
+        match query {
             Some(ast::SelectVariant::Select(select)) => {
                 let source = select.from_clause().and_then(|from| {
                     let mut items = from.items();
@@ -2394,16 +2416,7 @@ impl AstVisitor {
                 (source, outputs)
             }
             _ => (None, None),
-        };
-        let select_projection_complete = select_source.is_some() && select_outputs.is_some();
-        Some(StatementFact::CreateView {
-            name: Self::path_to_qualified_name(&path)?,
-            or_replace: node.or_replace().is_some(),
-            depends_on: Self::extract_view_dependencies(node.syntax()),
-            select_outputs: select_outputs.unwrap_or_default(),
-            select_projection_complete,
-            select_source,
-        })
+        }
     }
 
     fn extract_alter_view(node: &ast::AlterView) -> Option<StatementFact> {
@@ -2478,6 +2491,9 @@ impl AstVisitor {
 
     fn extract_create_materialized_view(node: &CreateMaterializedView) -> Option<StatementFact> {
         let path = node.view()?.path()?;
+        let (select_source, select_outputs) = Self::extract_single_source_projection(node.query());
+        let projection_was_complete = select_outputs.is_some();
+        let select_outputs = select_outputs.unwrap_or_default();
         Some(StatementFact::CreateMaterializedView {
             name: Self::path_to_qualified_name(&path)?,
             depends_on: Self::extract_view_dependencies(node.syntax()),
@@ -2485,6 +2501,34 @@ impl AstVisitor {
             with_no_data: node
                 .data_option()
                 .is_some_and(|option| matches!(option, ast::DataOption::WithNoData(_))),
+            column_list: node
+                .column_list()
+                .map(|list| {
+                    list.column_names()
+                        .filter_map(|name| {
+                            Some(Self::resolve_identifier_token(name.ident_token()?.text()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            access_method: node
+                .using_method()
+                .and_then(|method| method.access_method_ref())
+                .and_then(|reference| reference.ident_token())
+                .map(|token| Self::resolve_identifier_token(token.text())),
+            tablespace: node
+                .tablespace_clause()
+                .and_then(|clause| clause.tablespace_ref())
+                .and_then(|reference| reference.ident_token())
+                .map(|token| Self::resolve_identifier_token(token.text())),
+            options: node
+                .with_params()
+                .and_then(|params| params.attribute_list())
+                .map(|attribute_list| Self::extract_attribute_list(Some(attribute_list)))
+                .unwrap_or_default(),
+            select_projection_complete: select_source.is_some() && projection_was_complete,
+            select_outputs,
+            select_source,
         })
     }
 

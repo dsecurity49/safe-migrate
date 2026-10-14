@@ -4888,7 +4888,7 @@ impl AnalysisState {
         // cannot coexist with.
         let declared_type_modifier = match &alter.action {
             AlterTableActionMutation::SetType { ty, .. } => {
-                ParsedDataType::parse(ty, self.builtin_types()).atttypmod_offset()
+                ParsedDataType::parse(ty, self.builtin_types()).atttypmod()
             }
             _ => None,
         };

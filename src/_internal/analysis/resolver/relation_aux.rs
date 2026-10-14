@@ -13,7 +13,7 @@ use crate::_internal::analysis::mutations::{
 };
 use crate::_internal::analysis::state::AnalysisState;
 use crate::_internal::ast::identifiers::{ObjectId, QualifiedName};
-use crate::_internal::model::data_type::{ParsedDataType, TypeIdentity};
+use crate::_internal::model::data_type::ParsedDataType;
 use crate::_internal::model::index::IndexOrder;
 use crate::_internal::model::relation::RelationKind;
 
@@ -93,12 +93,12 @@ impl Resolver {
         };
         let view_column = |output_name: String, declared: Option<&str>| ViewColumn {
             name: output_name,
-            data_type: declared.map(|declared| {
-                TypeIdentity::from_syntax(&ParsedDataType::parse(declared, state.builtin_types()))
-                    .render()
-            }),
+            // `format_type` spelling, typmod included, so a view built from
+            // DDL carries the same string the catalog reports.
+            data_type: declared
+                .map(|declared| ParsedDataType::parse(declared, state.builtin_types()).to_string()),
             type_modifier: declared.and_then(|declared| {
-                ParsedDataType::parse(declared, state.builtin_types()).atttypmod_offset()
+                ParsedDataType::parse(declared, state.builtin_types()).atttypmod()
             }),
         };
 
@@ -173,13 +173,35 @@ impl Resolver {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn resolve_create_materialized_view(
         name: &QualifiedName,
         depends_on: &[QualifiedName],
         if_not_exists: bool,
         with_no_data: bool,
+        column_list: &[String],
+        access_method: &Option<String>,
+        tablespace: &Option<String>,
+        options: &[crate::_internal::analysis::facts::AttributeFact],
+        select_outputs: &[SelectOutputFact],
+        projection_complete: bool,
+        select_source: Option<&QualifiedName>,
         state: &AnalysisState,
     ) -> Mutation {
+        let source = select_source.map(|source| Self::resolve_relation_lookup_name(source, state));
+        let mut columns = Self::resolve_view_columns(select_outputs, source.as_ref(), state);
+        // An explicit column list renames the outputs in order.
+        if !column_list.is_empty() {
+            if column_list.len() == columns.len() {
+                for (column, name) in columns.iter_mut().zip(column_list) {
+                    column.name = name.clone();
+                }
+            } else {
+                // PostgreSQL refuses a list that does not match the projection,
+                // and the mismatch is not modelled, so claim nothing.
+                columns.clear();
+            }
+        }
         Mutation::CreateMaterializedView(CreateMaterializedView {
             id: Self::resolve_creation_name(name, state),
             depends_on: depends_on
@@ -188,6 +210,11 @@ impl Resolver {
                 .collect(),
             if_not_exists,
             with_no_data,
+            columns,
+            projection_complete,
+            access_method: access_method.clone(),
+            tablespace: tablespace.clone(),
+            options: options.to_vec(),
         })
     }
 

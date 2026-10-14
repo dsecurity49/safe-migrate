@@ -342,7 +342,11 @@ mod state_machine_guards_tests {
         let mut state = setup_state();
 
         engine
-            .analyze("CREATE MATERIALIZED VIEW mv AS SELECT 1 AS id;", &mut state)
+            .analyze(
+                "CREATE TABLE t (id int);
+                 CREATE MATERIALIZED VIEW mv AS SELECT id FROM t;",
+                &mut state,
+            )
             .expect("matview setup should analyze");
 
         for sql in [
@@ -364,7 +368,11 @@ mod state_machine_guards_tests {
         let mut state = setup_state();
 
         engine
-            .analyze("CREATE MATERIALIZED VIEW mv AS SELECT 1 AS id;", &mut state)
+            .analyze(
+                "CREATE TABLE t (id int);
+                 CREATE MATERIALIZED VIEW mv AS SELECT id FROM t;",
+                &mut state,
+            )
             .expect("matview setup should analyze");
 
         // This unsupported action produces OpaqueMutation::UnsupportedStatement and taints

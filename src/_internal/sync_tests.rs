@@ -420,7 +420,7 @@ mod tests {
             avg_width: Some(10),
             default_expr_text: Some("now()".into()),
             type_modifier: ParsedDataType::parse("varchar(255)", &BuiltinTypeCatalogue::fallback())
-                .atttypmod_offset(),
+                .atttypmod(),
             storage: None,
             compression: None,
             statistics_target: None,

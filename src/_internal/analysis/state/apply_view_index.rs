@@ -6,7 +6,7 @@ use crate::_internal::analysis::graph::{DependencyEdge, DependencyKind};
 use crate::_internal::analysis::mutations::{
     AlterViewFamily, CreateIndex, CreateMaterializedView, CreateView, DropIndex,
     DropMaterializedViewMutation, DropViewMutation, RefreshMaterializedViewMutation,
-    ReloptionTarget,
+    ReloptionTarget, ViewColumn,
 };
 use crate::_internal::ast::identifiers::ObjectId;
 use crate::_internal::model::column::Column;
@@ -356,26 +356,13 @@ impl AnalysisState {
             // A view whose output list could not be derived still exists, but
             // its columns are unknown, so any column-level claim is unsound.
             self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Statement);
-        } else if !create.or_replace || !existing_view {
-            relation.columns = create
-                .columns
-                .iter()
-                .map(|column| Column {
-                    name: column.name.clone(),
-                    data_type: column.data_type.clone(),
-                    type_id: None,
-                    is_nullable: true,
-                    default: None,
-                    avg_width: None,
-                    default_expr_text: None,
-                    type_modifier: column.type_modifier,
-                    storage: None,
-                    compression: None,
-                    statistics_target: None,
-                    options: Default::default(),
-                    generated: None,
-                })
-                .collect();
+        } else if create.or_replace && existing_view {
+            if let Err(result) = self.check_replaced_view_columns(&create.id, &create.columns) {
+                return result;
+            }
+            relation.columns = view_state_columns(&create.columns);
+        } else {
+            relation.columns = view_state_columns(&create.columns);
         }
         self.local
             .relations
@@ -430,6 +417,20 @@ impl AnalysisState {
             self.local.transactions.len(),
         );
         relation.is_populated = Some(!create.with_no_data);
+        relation.access_method = create.access_method.clone();
+        relation.tablespace = create.tablespace.clone();
+        for option in &create.options {
+            relation
+                .table_options
+                .insert(option.name.clone(), option.value.clone());
+        }
+        if !create.projection_complete {
+            // A view whose output list could not be derived still exists, but
+            // its columns are unknown, so any column-level claim is unsound.
+            self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Statement);
+        } else {
+            relation.columns = view_state_columns(&create.columns);
+        }
         self.local
             .relations
             .insert(create.id.clone(), RelationOverlay::Present(relation));
@@ -504,6 +505,54 @@ impl AnalysisState {
     /// `ALTER VIEW` / `ALTER MATERIALIZED VIEW` with every action of the
     /// statement. `IF EXISTS` guards the relation lookup, and an action the
     /// model does not represent makes the statement opaque.
+    /// PostgreSQL only lets `CREATE OR REPLACE VIEW` append columns: every
+    /// position it already had keeps its name and its exact type, typmod
+    /// included.
+    fn check_replaced_view_columns(
+        &mut self,
+        id: &ObjectId,
+        columns: &[ViewColumn],
+    ) -> Result<(), MutationResult> {
+        let Some(RelationOverlay::Present(existing)) = self.local.relations.get(id) else {
+            return Err(self.unresolved(EvidenceCode::CatalogCoverageIncomplete));
+        };
+        // A view always has at least one column, so an empty list means the
+        // previous definition was never resolved.
+        let previous = existing.columns.clone();
+        if previous.is_empty() {
+            return Err(self.unresolved(EvidenceCode::CatalogCoverageIncomplete));
+        }
+        if columns.len() < previous.len() {
+            return Err(MutationResult::conflict(
+                "cannot drop columns from view".to_string(),
+            ));
+        }
+        for (old, new) in previous.iter().zip(columns) {
+            if old.name != new.name {
+                return Err(MutationResult::conflict(format!(
+                    "cannot change name of view column \"{}\" to \"{}\"",
+                    old.name, new.name
+                )));
+            }
+            // The type string is `format_type`, so it already carries the
+            // typmod exactly as PostgreSQL compares the pair of attributes.
+            if old.data_type == new.data_type {
+                continue;
+            }
+            // An unstated type on either side cannot prove a change happened.
+            if old.data_type.is_none() || new.data_type.is_none() {
+                return Err(self.unresolved(EvidenceCode::CatalogCoverageIncomplete));
+            }
+            return Err(MutationResult::conflict(format!(
+                "cannot change data type of view column \"{}\" from {} to {}",
+                old.name,
+                old.data_type.as_deref().unwrap_or_default(),
+                new.data_type.as_deref().unwrap_or_default(),
+            )));
+        }
+        Ok(())
+    }
+
     pub(super) fn apply_alter_view_family(&mut self, alter: &AlterViewFamily) -> MutationResult {
         match self.relation_lookup(&alter.id, |kind| *kind == alter.kind) {
             RelationLookup::WrongKind => {
@@ -863,4 +912,26 @@ impl AnalysisState {
         });
         MutationResult::Applied
     }
+}
+
+/// A view's projected columns as relation columns.
+fn view_state_columns(columns: &[ViewColumn]) -> Vec<Column> {
+    columns
+        .iter()
+        .map(|column| Column {
+            name: column.name.clone(),
+            data_type: column.data_type.clone(),
+            type_id: None,
+            is_nullable: true,
+            default: None,
+            avg_width: None,
+            default_expr_text: None,
+            type_modifier: column.type_modifier,
+            storage: None,
+            compression: None,
+            statistics_target: None,
+            options: Default::default(),
+            generated: None,
+        })
+        .collect()
 }

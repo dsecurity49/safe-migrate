@@ -286,6 +286,11 @@ pub(crate) struct CreateMaterializedView {
     pub depends_on: Vec<ObjectId>,
     pub if_not_exists: bool,
     pub with_no_data: bool,
+    pub columns: Vec<ViewColumn>,
+    pub projection_complete: bool,
+    pub access_method: Option<String>,
+    pub tablespace: Option<String>,
+    pub options: Vec<crate::_internal::analysis::facts::AttributeFact>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

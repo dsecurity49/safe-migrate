@@ -4731,6 +4731,102 @@ mod state_mutation_tests {
     }
 
     #[test]
+    fn create_or_replace_view_only_appends_columns() {
+        let conflicts = |sql: &str| {
+            let engine = setup_engine();
+            let mut state = setup_state();
+            engine
+                .analyze(sql, &mut state)
+                .unwrap()
+                .iter()
+                .filter(|violation| violation.rule_id == "chain-conflict")
+                .map(|violation| violation.reason.clone())
+                .collect::<Vec<_>>()
+        };
+
+        assert!(
+            conflicts(
+                "CREATE TABLE t (a int, b int);
+                 CREATE VIEW v AS SELECT a FROM t;
+                 CREATE OR REPLACE VIEW v AS SELECT b AS renamed FROM t;"
+            )
+            .iter()
+            .any(|reason| reason.contains("cannot change name of view column \"a\" to \"renamed\"")),
+            "a leading column may not be renamed"
+        );
+        assert!(
+            conflicts(
+                "CREATE TABLE t (a int, b int);
+                 CREATE VIEW v AS SELECT a, b FROM t;
+                 CREATE OR REPLACE VIEW v AS SELECT a FROM t;"
+            )
+            .iter()
+            .any(|reason| reason.contains("cannot drop columns from view")),
+            "columns may not be dropped"
+        );
+        assert!(
+            conflicts(
+                "CREATE TABLE t (a int, c text);
+                 CREATE VIEW v AS SELECT a FROM t;
+                 CREATE OR REPLACE VIEW v AS SELECT c AS a FROM t;"
+            )
+            .iter()
+            .any(|reason| reason
+                .contains("cannot change data type of view column \"a\" from integer to text")),
+            "a leading column may not change type"
+        );
+        assert!(
+            conflicts(
+                "CREATE TABLE t (a varchar(10), c varchar(20));
+                 CREATE VIEW v AS SELECT a FROM t;
+                 CREATE OR REPLACE VIEW v AS SELECT c AS a FROM t;"
+            )
+            .iter()
+            .any(|reason| reason.contains("from character varying(10) to character varying(20)")),
+            "a typmod change is a type change"
+        );
+        assert!(
+            conflicts(
+                "CREATE TABLE t (a int, b int);
+                 CREATE VIEW v AS SELECT a FROM t;
+                 CREATE OR REPLACE VIEW v AS SELECT a, b FROM t;
+                 CREATE OR REPLACE VIEW v AS SELECT a, b, 1 AS c FROM t;"
+            )
+            .is_empty(),
+            "appending columns is allowed"
+        );
+    }
+
+    #[test]
+    fn a_materialized_view_carries_its_columns_and_storage() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+
+        // A view expanding `*` over a materialized view must see its columns,
+        // and an explicit column list renames them.
+        let violations = engine
+            .analyze(
+                "CREATE TABLE t (id int, nm text);
+                 CREATE MATERIALIZED VIEW mv (xx, yy) USING heap AS SELECT id, nm FROM t;
+                 CREATE VIEW v AS SELECT * FROM mv;
+                 ALTER VIEW v ALTER COLUMN yy SET DEFAULT 1;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !violations
+                .iter()
+                .any(|violation| violation.rule_id == "chain-conflict"),
+            "a materialized view must expose the renamed columns: {violations:?}"
+        );
+        assert_eq!(
+            state.local.confidence,
+            safe_migrate::_internal::analysis::state::Confidence::Exact,
+            "modeled storage and column state must not taint"
+        );
+    }
+
+    #[test]
     fn a_rejected_declaration_does_not_block_the_valid_ones() {
         let engine = setup_engine();
         let mut state = setup_state();

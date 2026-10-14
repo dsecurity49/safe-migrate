@@ -315,12 +315,26 @@ impl Resolver {
                 depends_on,
                 if_not_exists,
                 with_no_data,
+                column_list,
+                access_method,
+                tablespace,
+                options,
+                select_outputs,
+                select_projection_complete,
+                select_source,
             } => {
                 mutations.push(Self::resolve_create_materialized_view(
                     name,
                     depends_on,
                     *if_not_exists,
                     *with_no_data,
+                    column_list,
+                    access_method,
+                    tablespace,
+                    options,
+                    select_outputs,
+                    *select_projection_complete,
+                    select_source.as_ref(),
                     state,
                 ));
             }
