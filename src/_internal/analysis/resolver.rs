@@ -303,21 +303,45 @@ impl Resolver {
                     state,
                 ));
             }
-            StatementFact::AlterView { name, action } => {
-                mutations.push(Self::resolve_alter_view(name, action, state));
+            StatementFact::AlterView {
+                name,
+                action,
+                if_exists,
+            } => {
+                mutations.push(Self::resolve_alter_view(name, action, *if_exists, state));
             }
-            StatementFact::CreateMaterializedView { name, depends_on } => {
+            StatementFact::CreateMaterializedView {
+                name,
+                depends_on,
+                if_not_exists,
+                with_no_data,
+            } => {
                 mutations.push(Self::resolve_create_materialized_view(
-                    name, depends_on, state,
+                    name,
+                    depends_on,
+                    *if_not_exists,
+                    *with_no_data,
+                    state,
                 ));
             }
-            StatementFact::AlterMaterializedView { name, action } => {
-                mutations.push(Self::resolve_alter_materialized_view(name, action, state));
+            StatementFact::AlterMaterializedView {
+                name,
+                actions,
+                if_exists,
+            } => {
+                mutations.push(Self::resolve_alter_materialized_view(
+                    name, actions, *if_exists, state,
+                ));
             }
-            StatementFact::RefreshMaterializedView { name, concurrently } => {
+            StatementFact::RefreshMaterializedView {
+                name,
+                concurrently,
+                with_no_data,
+            } => {
                 mutations.push(Self::resolve_refresh_materialized_view(
                     name,
                     *concurrently,
+                    *with_no_data,
                     state,
                 ));
             }

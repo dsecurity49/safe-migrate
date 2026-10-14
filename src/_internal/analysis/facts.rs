@@ -201,18 +201,23 @@ pub(crate) enum StatementFact {
     AlterView {
         name: QualifiedName,
         action: AlterViewAction,
+        if_exists: bool,
     },
     CreateMaterializedView {
         name: QualifiedName,
         depends_on: Vec<QualifiedName>,
+        if_not_exists: bool,
+        with_no_data: bool,
     },
     AlterMaterializedView {
         name: QualifiedName,
-        action: AlterMaterializedViewActionFact,
+        actions: Vec<AlterMaterializedViewActionFact>,
+        if_exists: bool,
     },
     RefreshMaterializedView {
         name: QualifiedName,
         concurrently: bool,
+        with_no_data: bool,
     },
     CreateIndex {
         name: QualifiedName,

@@ -4,8 +4,9 @@ use super::{
 use crate::_internal::analysis::evidence::{EvidenceCode, EvidenceScope};
 use crate::_internal::analysis::graph::{DependencyEdge, DependencyKind};
 use crate::_internal::analysis::mutations::{
-    CreateIndex, CreateMaterializedView, CreateView, DropIndex, DropMaterializedViewMutation,
-    DropViewMutation, RefreshMaterializedViewMutation, ReloptionTarget,
+    AlterViewFamily, CreateIndex, CreateMaterializedView, CreateView, DropIndex,
+    DropMaterializedViewMutation, DropViewMutation, RefreshMaterializedViewMutation,
+    ReloptionTarget,
 };
 use crate::_internal::ast::identifiers::ObjectId;
 use crate::_internal::model::column::Column;
@@ -406,6 +407,9 @@ impl AnalysisState {
         if let Err(result) = self.ensure_schema_target(&create.id.schema) {
             return result;
         }
+        if create.if_not_exists && self.relation_namespace_is_taken(&create.id) {
+            return MutationResult::NoOp;
+        }
         if self.relation_namespace_is_taken(&create.id) {
             return MutationResult::conflict(format!("relation '{}' already exists", create.id));
         }
@@ -425,7 +429,7 @@ impl AnalysisState {
             Persistence::Permanent,
             self.local.transactions.len(),
         );
-        relation.is_populated = Some(true);
+        relation.is_populated = Some(!create.with_no_data);
         self.local
             .relations
             .insert(create.id.clone(), RelationOverlay::Present(relation));
@@ -457,7 +461,7 @@ impl AnalysisState {
                         Some(RelationOverlay::Present(relation)) => match relation.is_populated {
                             Some(false) => {
                                 return MutationResult::conflict(format!(
-                                    "materialized view '{}' must be populated before a concurrent refresh",
+                                    "CONCURRENTLY cannot be used when the materialized view '{}' is not populated",
                                     refresh.id
                                 ));
                             }
@@ -470,10 +474,17 @@ impl AnalysisState {
                         _ => unreachable!("materialized-view lookup established presence"),
                     }
                 }
+                // PostgreSQL rejects the option pair before it looks for the
+                // unique index a concurrent refresh requires.
+                if refresh.concurrently && refresh.with_no_data {
+                    return MutationResult::conflict(
+                        "CONCURRENTLY and WITH NO DATA options cannot be used together".to_string(),
+                    );
+                }
                 if let Some(RelationOverlay::Present(relation)) =
                     self.local.relations.get_mut(&refresh.id)
                 {
-                    relation.is_populated = Some(true);
+                    relation.is_populated = Some(!refresh.with_no_data);
                 }
                 MutationResult::Applied
             }
@@ -488,6 +499,41 @@ impl AnalysisState {
             }
             RelationLookup::Unknown => self.unresolved(EvidenceCode::UnknownObjectState),
         }
+    }
+
+    /// `ALTER VIEW` / `ALTER MATERIALIZED VIEW` with every action of the
+    /// statement. `IF EXISTS` guards the relation lookup, and an action the
+    /// model does not represent makes the statement opaque.
+    pub(super) fn apply_alter_view_family(&mut self, alter: &AlterViewFamily) -> MutationResult {
+        match self.relation_lookup(&alter.id, |kind| *kind == alter.kind) {
+            RelationLookup::WrongKind => {
+                return MutationResult::conflict(format!(
+                    "'{}' is not a {}",
+                    alter.id,
+                    match alter.kind {
+                        RelationKind::View => "view",
+                        _ => "materialized view",
+                    }
+                ));
+            }
+            RelationLookup::AuthoritativelyAbsent | RelationLookup::Tombstone => {
+                if alter.if_exists {
+                    return MutationResult::NoOp;
+                }
+                return MutationResult::conflict(format!("relation '{}' does not exist", alter.id));
+            }
+            RelationLookup::Unknown => return self.unresolved(EvidenceCode::UnknownObjectState),
+            RelationLookup::Present => {}
+        }
+        // PostgreSQL applies every action of the statement, so an unmodeled
+        // action still contributes its transparency signal.
+        for action in &alter.actions {
+            match self.apply(action, None) {
+                MutationResult::Applied | MutationResult::NoOp => {}
+                result => return result,
+            }
+        }
+        MutationResult::Applied
     }
 
     pub(super) fn apply_create_index(&mut self, create: &CreateIndex) -> MutationResult {

@@ -3228,6 +3228,7 @@ impl AnalysisState {
             Mutation::RefreshMaterializedView(refresh) => {
                 self.apply_refresh_materialized_view(refresh)
             }
+            Mutation::AlterViewFamily(alter) => self.apply_alter_view_family(alter),
             Mutation::CreateIndex(create) => self.apply_create_index(create),
             Mutation::CreatePolicy(create_policy) => self.apply_create_policy(create_policy),
             Mutation::DropPolicy(drop_policy) => self.apply_drop_policy(drop_policy),
@@ -4597,6 +4598,7 @@ mod evidence_tests {
             crate::_internal::analysis::mutations::RefreshMaterializedViewMutation {
                 id: ObjectId::new("public", "mv"),
                 concurrently: true,
+                with_no_data: false,
             },
         );
         assert!(matches!(
@@ -4704,6 +4706,7 @@ mod evidence_tests {
                 crate::_internal::analysis::mutations::RefreshMaterializedViewMutation {
                     id: view_id,
                     concurrently: true,
+                    with_no_data: false,
                 },
             ),
             None,

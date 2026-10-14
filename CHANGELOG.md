@@ -14,6 +14,17 @@ notes are available on the
 - `certainty` is reported only when it is not `exact`.
 - Remediation is labelled `recipe` in every output. `rules --json` moved to its
   own version 3, which is what tells consumers `remediation` became `recipe`.
+- `CREATE MATERIALIZED VIEW IF NOT EXISTS`, and `ALTER [MATERIALIZED] VIEW IF
+  EXISTS`, now skip the way PostgreSQL skips them instead of reporting a
+  conflict. The guard still does not hide a relation of the wrong kind.
+- `CREATE MATERIALIZED VIEW ... WITH NO DATA` and `REFRESH MATERIALIZED VIEW
+  ... WITH NO DATA` are modeled instead of being treated as unsupported: a
+  materialized view created or left unpopulated can no longer be refreshed
+  concurrently, and `CONCURRENTLY` with `WITH NO DATA` is reported the way
+  PostgreSQL reports it.
+- Every action of a comma-separated `ALTER MATERIALIZED VIEW` is now applied,
+  so an unsupported action no longer disappears behind a modeled one in front
+  of it.
 - Built-in types are read from `pg_catalog.pg_type` instead of a hand-written
   table, so `bytea`, `jsonb`, `inet`, `xml`, `uuid` and the range types now
   carry their own routine signatures and type identities rather than collapsing

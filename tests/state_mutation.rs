@@ -4609,6 +4609,128 @@ mod state_mutation_tests {
     }
 
     #[test]
+    fn if_exists_guards_only_the_relation_lookup() {
+        let conflicts = |sql: &str| {
+            let engine = setup_engine();
+            let mut state = setup_state();
+            engine
+                .analyze(sql, &mut state)
+                .unwrap()
+                .iter()
+                .filter(|violation| violation.rule_id == "chain-conflict")
+                .map(|violation| violation.reason.clone())
+                .collect::<Vec<_>>()
+        };
+
+        // PostgreSQL notices and skips; neither statement is an error.
+        assert!(
+            conflicts("ALTER VIEW IF EXISTS missing RENAME TO other;").is_empty(),
+            "ALTER VIEW IF EXISTS must skip a missing view"
+        );
+        assert!(
+            conflicts("ALTER MATERIALIZED VIEW IF EXISTS missing RENAME TO other;").is_empty(),
+            "ALTER MATERIALIZED VIEW IF EXISTS must skip a missing view"
+        );
+
+        // The guard does not cover a relation of the wrong kind.
+        assert!(
+            conflicts("CREATE TABLE t (a int); ALTER VIEW IF EXISTS t RENAME TO other;")
+                .iter()
+                .any(|message| message.contains("is not a view")),
+            "IF EXISTS must not suppress the wrong-kind error"
+        );
+
+        // Without the guard the same statement conflicts.
+        assert!(
+            conflicts("ALTER VIEW missing RENAME TO other;")
+                .iter()
+                .any(|message| message.contains("does not exist")),
+            "an unguarded ALTER of a missing view must conflict"
+        );
+    }
+
+    #[test]
+    fn create_materialized_view_if_not_exists_skips_an_existing_relation() {
+        let conflicts = |sql: &str| {
+            let engine = setup_engine();
+            let mut state = setup_state();
+            engine
+                .analyze(sql, &mut state)
+                .unwrap()
+                .iter()
+                .filter(|violation| violation.rule_id == "chain-conflict")
+                .count()
+        };
+        assert_eq!(
+            conflicts(
+                "CREATE MATERIALIZED VIEW mv AS SELECT 1 AS a;
+                 CREATE MATERIALIZED VIEW IF NOT EXISTS mv AS SELECT 2 AS a;"
+            ),
+            0,
+            "IF NOT EXISTS must skip the existing relation"
+        );
+        assert_eq!(
+            conflicts(
+                "CREATE MATERIALIZED VIEW mv AS SELECT 1 AS a;
+                 CREATE MATERIALIZED VIEW mv AS SELECT 2 AS a;"
+            ),
+            1,
+            "an unguarded duplicate materialized view must conflict"
+        );
+    }
+
+    #[test]
+    fn refresh_without_data_leaves_the_view_unpopulated() {
+        let conflicts = |sql: &str| {
+            let engine = setup_engine();
+            let mut state = setup_state();
+            engine
+                .analyze(sql, &mut state)
+                .unwrap()
+                .iter()
+                .filter(|violation| violation.rule_id == "chain-conflict")
+                .map(|violation| violation.reason.clone())
+                .collect::<Vec<_>>()
+        };
+
+        // `WITH NO DATA` is a modeled state change, not an opaque statement.
+        let unpopulated = conflicts(
+            "CREATE MATERIALIZED VIEW mv AS SELECT 1 AS a WITH NO DATA;
+             REFRESH MATERIALIZED VIEW CONCURRENTLY mv;",
+        );
+        assert!(
+            unpopulated
+                .iter()
+                .any(|message| message.contains("is not populated")),
+            "a concurrent refresh of an unpopulated view must conflict: {unpopulated:?}"
+        );
+
+        // PostgreSQL rejects the option pair before looking for a unique index.
+        let pair = conflicts(
+            "CREATE MATERIALIZED VIEW mv AS SELECT 1 AS a;
+             REFRESH MATERIALIZED VIEW CONCURRENTLY mv WITH NO DATA;",
+        );
+        assert!(
+            pair.iter()
+                .any(|message| message.contains("cannot be used together")),
+            "CONCURRENTLY with WITH NO DATA must conflict: {pair:?}"
+        );
+
+        // A plain refresh repopulates, so the populated-state conflict goes away.
+        let repopulated = conflicts(
+            "CREATE MATERIALIZED VIEW mv AS SELECT 1 AS a WITH NO DATA;
+             REFRESH MATERIALIZED VIEW mv;
+             REFRESH MATERIALIZED VIEW CONCURRENTLY mv;",
+        );
+        assert!(
+            !repopulated
+                .iter()
+                .any(|message| message.contains("is not populated")),
+            "a populated view must not report the populated-state conflict: {repopulated:?}"
+        );
+    }
+
+    #[test]
     fn a_rejected_declaration_does_not_block_the_valid_ones() {
         let engine = setup_engine();
         let mut state = setup_state();

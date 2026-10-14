@@ -2408,41 +2408,39 @@ impl AstVisitor {
 
     fn extract_alter_view(node: &ast::AlterView) -> Option<StatementFact> {
         let path = node.view_ref()?.path_ref()?;
-        let name = Self::path_ref_to_qualified_name(&path)?;
+        let action_node = node.action()?;
+        Some(StatementFact::AlterView {
+            name: Self::path_ref_to_qualified_name(&path)?,
+            action: Self::extract_alter_view_action(action_node)?,
+            if_exists: node.if_exists().is_some(),
+        })
+    }
 
-        let action = node.action()?;
-        match action {
+    fn extract_alter_view_action(
+        action_node: ast::AlterViewAction,
+    ) -> Option<crate::_internal::analysis::facts::AlterViewAction> {
+        Some(match action_node {
             ast::AlterViewAction::ViewRenameTo(rt) => {
                 let new_name_node = rt.view()?.path()?;
-                Some(StatementFact::AlterView {
-                    name,
-                    action: crate::_internal::analysis::facts::AlterViewAction::RenameTo {
-                        new_name: Self::path_to_qualified_name(&new_name_node)?.name,
-                    },
-                })
+                crate::_internal::analysis::facts::AlterViewAction::RenameTo {
+                    new_name: Self::path_to_qualified_name(&new_name_node)?.name,
+                }
             }
             ast::AlterViewAction::OwnerTo(ot) => {
-                let new_owner = Self::extract_role(&ot.role_ref()?);
-                Some(StatementFact::AlterView {
-                    name,
-                    action: crate::_internal::analysis::facts::AlterViewAction::OwnerTo {
-                        new_owner,
-                    },
-                })
+                crate::_internal::analysis::facts::AlterViewAction::OwnerTo {
+                    new_owner: Self::extract_role(&ot.role_ref()?),
+                }
             }
             ast::AlterViewAction::SetSchema(ss) => {
                 let token = ss.schema_ref()?.ident_token()?;
-                Some(StatementFact::AlterView {
-                    name,
-                    action: crate::_internal::analysis::facts::AlterViewAction::SetSchema {
-                        new_schema: Self::resolve_identifier_token(token.text()),
-                    },
-                })
+                crate::_internal::analysis::facts::AlterViewAction::SetSchema {
+                    new_schema: Self::resolve_identifier_token(token.text()),
+                }
             }
             ast::AlterViewAction::AlterViewColumn(avc) => {
                 let col_token = avc.name()?.ident_token()?;
                 let column = Self::resolve_identifier_token(col_token.text());
-                let action = match avc.alter_view_column_action()? {
+                match avc.alter_view_column_action()? {
                     ast::AlterViewColumnAction::SetDefault(sd) => {
                         crate::_internal::analysis::facts::AlterViewAction::SetDefault {
                             column,
@@ -2454,8 +2452,7 @@ impl AstVisitor {
                     ast::AlterViewColumnAction::DropDefault(_) => {
                         crate::_internal::analysis::facts::AlterViewAction::DropDefault { column }
                     }
-                };
-                Some(StatementFact::AlterView { name, action })
+                }
             }
             ast::AlterViewAction::RenameColumn(rc) => {
                 let from_token = rc.column_name_ref()?.ident_token()?;
@@ -2464,58 +2461,52 @@ impl AstVisitor {
                 let to_token = rc.column_name()?.ident_token()?;
                 let to = Self::identifier_from_token(to_token.text());
 
-                Some(StatementFact::AlterView {
-                    name,
-                    action: crate::_internal::analysis::facts::AlterViewAction::RenameColumn {
-                        from,
-                        to,
-                    },
-                })
+                crate::_internal::analysis::facts::AlterViewAction::RenameColumn { from, to }
             }
             ast::AlterViewAction::SetOptions(so) => {
-                let options = Self::extract_attribute_list(so.attribute_list());
-                Some(StatementFact::AlterView {
-                    name,
-                    action: crate::_internal::analysis::facts::AlterViewAction::SetOptions {
-                        options,
-                    },
-                })
+                crate::_internal::analysis::facts::AlterViewAction::SetOptions {
+                    options: Self::extract_attribute_list(so.attribute_list()),
+                }
             }
             ast::AlterViewAction::ResetOptions(ro) => {
-                let options = Self::extract_attribute_list(ro.attribute_list());
-                Some(StatementFact::AlterView {
-                    name,
-                    action: crate::_internal::analysis::facts::AlterViewAction::ResetOptions {
-                        options,
-                    },
-                })
+                crate::_internal::analysis::facts::AlterViewAction::ResetOptions {
+                    options: Self::extract_attribute_list(ro.attribute_list()),
+                }
             }
-        }
+        })
     }
 
     fn extract_create_materialized_view(node: &CreateMaterializedView) -> Option<StatementFact> {
-        // A materialized view created WITH NO DATA cannot be refreshed
-        // concurrently until it has been populated; populated state is not
-        // modeled, so preserve the opaque path for this explicit form.
-        if node
-            .data_option()
-            .is_some_and(|option| matches!(option, ast::DataOption::WithNoData(_)))
-        {
-            return None;
-        }
         let path = node.view()?.path()?;
         Some(StatementFact::CreateMaterializedView {
             name: Self::path_to_qualified_name(&path)?,
             depends_on: Self::extract_view_dependencies(node.syntax()),
+            if_not_exists: node.if_not_exists().is_some(),
+            with_no_data: node
+                .data_option()
+                .is_some_and(|option| matches!(option, ast::DataOption::WithNoData(_))),
         })
     }
 
     fn extract_alter_materialized_view(node: &ast::AlterMaterializedView) -> Option<StatementFact> {
         let path = node.view_ref()?.path_ref()?;
-        let name = Self::path_ref_to_qualified_name(&path)?;
-        let action_node = node.action().next()?;
+        // An action the model does not represent makes the whole statement
+        // opaque, rather than silently applying the remaining actions.
+        let actions: Option<Vec<_>> = node
+            .action()
+            .map(Self::extract_alter_materialized_view_action)
+            .collect();
+        Some(StatementFact::AlterMaterializedView {
+            name: Self::path_ref_to_qualified_name(&path)?,
+            actions: actions?,
+            if_exists: node.if_exists().is_some(),
+        })
+    }
 
-        let action = match action_node {
+    fn extract_alter_materialized_view_action(
+        action_node: ast::AlterMaterializedViewAction,
+    ) -> Option<crate::_internal::analysis::facts::AlterMaterializedViewActionFact> {
+        Some(match action_node {
             ast::AlterMaterializedViewAction::ViewRenameTo(rt) => {
                 let segment = rt.view()?.path()?.segment()?;
                 crate::_internal::analysis::facts::AlterMaterializedViewActionFact::RenameTo {
@@ -2612,9 +2603,7 @@ impl AstVisitor {
                     _ => return None,
                 }
             }
-        };
-
-        Some(StatementFact::AlterMaterializedView { name, action })
+        })
     }
 
     fn extract_refresh(node: &ast::Refresh) -> Option<StatementFact> {
@@ -2622,6 +2611,9 @@ impl AstVisitor {
         Some(StatementFact::RefreshMaterializedView {
             name: Self::path_ref_to_qualified_name(&path)?,
             concurrently: node.concurrently_token().is_some(),
+            with_no_data: node
+                .data_option()
+                .is_some_and(|option| matches!(option, ast::DataOption::WithNoData(_))),
         })
     }
 

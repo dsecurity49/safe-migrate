@@ -5,15 +5,17 @@ use crate::_internal::analysis::facts::{
     ReindexTargetKindFact, SelectOutputFact, StatisticsTarget,
 };
 use crate::_internal::analysis::mutations::{
-    AlterIndexActionMutation, AlterIndexMutation, CreateIndex, CreateMaterializedView,
-    CreatePolicyMutation, CreateTriggerMutation, CreateView, DropPolicyMutation,
-    DropTriggerMutation, Mutation, OpaqueMutation, RefreshMaterializedViewMutation,
-    ReindexTargetMutation, ReloptionTarget, Rename, RenameTriggerMutation, ViewColumn,
+    AlterIndexActionMutation, AlterIndexMutation, AlterViewFamily, CreateIndex,
+    CreateMaterializedView, CreatePolicyMutation, CreateTriggerMutation, CreateView,
+    DropPolicyMutation, DropTriggerMutation, Mutation, OpaqueMutation,
+    RefreshMaterializedViewMutation, ReindexTargetMutation, ReloptionTarget, Rename,
+    RenameTriggerMutation, ViewColumn,
 };
 use crate::_internal::analysis::state::AnalysisState;
 use crate::_internal::ast::identifiers::{ObjectId, QualifiedName};
 use crate::_internal::model::data_type::{ParsedDataType, TypeIdentity};
 use crate::_internal::model::index::IndexOrder;
+use crate::_internal::model::relation::RelationKind;
 
 impl Resolver {
     pub(super) fn resolve_reindex(
@@ -120,9 +122,10 @@ impl Resolver {
     pub(super) fn resolve_alter_view(
         name: &QualifiedName,
         action: &AlterViewAction,
+        if_exists: bool,
         state: &AnalysisState,
     ) -> Mutation {
-        match action {
+        let action = match action {
             AlterViewAction::RenameTo { new_name } => {
                 let id = Self::resolve_relation_lookup_name(name, state);
                 let mut new_id = ObjectId::new(id.schema.clone(), new_name.resolve());
@@ -161,12 +164,20 @@ impl Resolver {
                 kind: ReloptionTarget::View,
                 names: options.iter().map(|option| option.name.clone()).collect(),
             },
-        }
+        };
+        Mutation::AlterViewFamily(AlterViewFamily {
+            id: Self::resolve_relation_lookup_name(name, state),
+            kind: RelationKind::View,
+            if_exists,
+            actions: vec![action],
+        })
     }
 
     pub(super) fn resolve_create_materialized_view(
         name: &QualifiedName,
         depends_on: &[QualifiedName],
+        if_not_exists: bool,
+        with_no_data: bool,
         state: &AnalysisState,
     ) -> Mutation {
         Mutation::CreateMaterializedView(CreateMaterializedView {
@@ -175,10 +186,30 @@ impl Resolver {
                 .iter()
                 .map(|dependency| Self::resolve_relation_lookup_name(dependency, state))
                 .collect(),
+            if_not_exists,
+            with_no_data,
         })
     }
 
     pub(super) fn resolve_alter_materialized_view(
+        name: &QualifiedName,
+        actions: &[AlterMaterializedViewActionFact],
+        if_exists: bool,
+        state: &AnalysisState,
+    ) -> Mutation {
+        let actions = actions
+            .iter()
+            .map(|action| Self::resolve_alter_materialized_view_action(name, action, state))
+            .collect();
+        Mutation::AlterViewFamily(AlterViewFamily {
+            id: Self::resolve_relation_lookup_name(name, state),
+            kind: RelationKind::MaterializedView,
+            if_exists,
+            actions,
+        })
+    }
+
+    fn resolve_alter_materialized_view_action(
         name: &QualifiedName,
         action: &AlterMaterializedViewActionFact,
         state: &AnalysisState,
@@ -230,11 +261,13 @@ impl Resolver {
     pub(super) fn resolve_refresh_materialized_view(
         name: &QualifiedName,
         concurrently: bool,
+        with_no_data: bool,
         state: &AnalysisState,
     ) -> Mutation {
         Mutation::RefreshMaterializedView(RefreshMaterializedViewMutation {
             id: Self::resolve_relation_lookup_name(name, state),
             concurrently,
+            with_no_data,
         })
     }
 

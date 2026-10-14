@@ -3064,14 +3064,30 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_create_materialized_view_population_is_not_silent() {
-        let parsed = SourceFile::parse(
-            "CREATE MATERIALIZED VIEW snapshot AS SELECT id FROM source WITH NO DATA;",
+    fn create_materialized_view_carries_its_population_and_guard() {
+        let population = |sql: &str| {
+            let parsed = SourceFile::parse(sql);
+            let statement = parsed.tree().stmts().next().expect("statement");
+            match AstVisitor::extract(&statement).expect("materialized view fact") {
+                StatementFact::CreateMaterializedView {
+                    with_no_data,
+                    if_not_exists,
+                    ..
+                } => (with_no_data, if_not_exists),
+                other => panic!("expected CreateMaterializedView, got {other:?}"),
+            }
+        };
+        assert_eq!(
+            population("CREATE MATERIALIZED VIEW snapshot AS SELECT id FROM source;"),
+            (false, false)
         );
-        let statement = parsed.tree().stmts().next().expect("statement");
-        assert!(
-            AstVisitor::extract(&statement).is_none(),
-            "unpopulated materialized views must use the opaque engine path"
+        assert_eq!(
+            population("CREATE MATERIALIZED VIEW snapshot AS SELECT id FROM source WITH NO DATA;"),
+            (true, false)
+        );
+        assert_eq!(
+            population("CREATE MATERIALIZED VIEW IF NOT EXISTS snapshot AS SELECT id FROM source;"),
+            (false, true)
         );
     }
 
@@ -3231,7 +3247,9 @@ mod tests {
             let parsed = SourceFile::parse(sql);
             let stmt = parsed.tree().stmts().next().expect("statement");
             match AstVisitor::extract(&stmt).unwrap_or_else(|| panic!("no fact for: {sql}")) {
-                StatementFact::AlterMaterializedView { action, .. } => action,
+                StatementFact::AlterMaterializedView { actions, .. } => {
+                    actions.into_iter().next().expect("at least one action")
+                }
                 other => panic!("expected AlterMaterializedView fact, got {other:?} for: {sql}"),
             }
         };

@@ -5,6 +5,7 @@ use crate::_internal::analysis::facts::{
 };
 use crate::_internal::ast::identifiers::ObjectId;
 use crate::_internal::model::index::IndexOrder;
+use crate::_internal::model::relation::RelationKind;
 use crate::_internal::model::types::TypeKind;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -67,6 +68,7 @@ pub(crate) enum Mutation {
     CreateView(CreateView),
     CreateMaterializedView(CreateMaterializedView),
     RefreshMaterializedView(RefreshMaterializedViewMutation),
+    AlterViewFamily(AlterViewFamily),
     CreateIndex(CreateIndex),
     CreatePolicy(CreatePolicyMutation),
     DropPolicy(DropPolicyMutation),
@@ -282,12 +284,28 @@ pub(crate) struct DropMaterializedViewMutation {
 pub(crate) struct CreateMaterializedView {
     pub id: ObjectId,
     pub depends_on: Vec<ObjectId>,
+    pub if_not_exists: bool,
+    pub with_no_data: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct RefreshMaterializedViewMutation {
     pub id: ObjectId,
     pub concurrently: bool,
+    pub with_no_data: bool,
+}
+
+/// A view or materialized view `ALTER`, with every action of the statement.
+///
+/// PostgreSQL applies the actions as one statement, and `IF EXISTS` guards the
+/// lookup of the relation rather than each action, so the guard and the whole
+/// action list travel together instead of through each action mutation.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct AlterViewFamily {
+    pub id: ObjectId,
+    pub kind: RelationKind,
+    pub if_exists: bool,
+    pub actions: Vec<Mutation>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
