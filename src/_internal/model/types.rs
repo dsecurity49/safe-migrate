@@ -20,11 +20,19 @@ pub(crate) enum TypeKind {
         #[serde(skip)]
         base_type_id: Option<ObjectId>,
     },
-    Base,
+    /// A user-defined base type. `element` is `pg_type.typelem`, set when the
+    /// type stores fixed-length elements; it is what `ALTER TYPE ... ADD
+    /// ATTRIBUTE` and the shell-type protocol are written against.
+    Base {
+        element: Option<String>,
+    },
     Composite {
         fields: Vec<CompositeFieldState>,
     },
-    Range,
+    /// A range type. Its subtype (`pg_range.rngsubtype`) is what defines it.
+    Range {
+        subtype: Option<String>,
+    },
     /// PostgreSQL's automatically created companion of a [`TypeKind::Range`]
     /// (`typtype = 'm'`). Renameable independently, so it needs its own row.
     Multirange,

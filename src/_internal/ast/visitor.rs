@@ -2977,13 +2977,34 @@ impl AstVisitor {
                     })
                     .collect::<Option<Vec<_>>>()?,
             },
-            // The model records these kinds without their subtype or I/O
-            // metadata, matching what the catalog sync reports for them.
-            ast::CreateTypeKind::RangeType(_) => TypeCreationKind::Range,
-            ast::CreateTypeKind::BaseType(_) => TypeCreationKind::Base,
+            // A range type is defined by its subtype and a base type by its
+            // element; both arrive as attributes on the same list.
+            ast::CreateTypeKind::RangeType(range) => TypeCreationKind::Range {
+                subtype: Self::type_attribute(
+                    Self::extract_attribute_list(range.attribute_list()),
+                    "subtype",
+                ),
+            },
+            ast::CreateTypeKind::BaseType(base) => TypeCreationKind::Base {
+                element: Self::type_attribute(
+                    Self::extract_attribute_list(base.attribute_list()),
+                    "typelem",
+                ),
+            },
         };
 
         Some(StatementFact::CreateType(CreateTypeFact { name, kind }))
+    }
+
+    /// The named type an attribute list declares, if it names one.
+    fn type_attribute(
+        attributes: Vec<crate::_internal::analysis::facts::AttributeFact>,
+        name: &str,
+    ) -> Option<String> {
+        attributes
+            .into_iter()
+            .find(|attribute| attribute.name.eq_ignore_ascii_case(name))
+            .map(|attribute| attribute.value)
     }
 
     fn extract_alter_type(node: &AlterType) -> Option<StatementFact> {

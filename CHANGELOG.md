@@ -48,7 +48,7 @@ notes are available on the
   `name[]` was treated as `name` and `name[][]` matched nothing at all.
 - A type declaration the server would refuse is reported: a length or
   precision outside its range, a type nothing resolves to, an enum label
-  declared twice, and a composite or domain naming a missing type.
+  declared twice, and a composite, domain or range naming a missing type.
 - The type-change rewrite warning now matches what PostgreSQL actually does.
   Changing a numeric's scale, or converting between `character` and `varchar`,
   rewrites the table and is reported; two spellings of one type are not.

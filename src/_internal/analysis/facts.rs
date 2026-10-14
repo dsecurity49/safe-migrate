@@ -84,9 +84,9 @@ pub(crate) enum ResetSettingTarget {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum TypeCreationKind {
     Enum { variants: Vec<String> },
-    Range,
+    Range { subtype: Option<String> },
     Composite { fields: Vec<CompositeFieldFact> },
-    Base,
+    Base { element: Option<String> },
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]

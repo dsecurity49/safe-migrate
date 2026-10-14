@@ -16,7 +16,9 @@ impl Resolver {
             TypeCreationKind::Enum { variants } => TypeKind::Enum {
                 variants: variants.clone(),
             },
-            TypeCreationKind::Range => TypeKind::Range,
+            TypeCreationKind::Range { subtype } => TypeKind::Range {
+                subtype: subtype.clone(),
+            },
             TypeCreationKind::Composite { fields } => TypeKind::Composite {
                 fields: fields
                     .iter()
@@ -28,7 +30,9 @@ impl Resolver {
                     )
                     .collect(),
             },
-            TypeCreationKind::Base => TypeKind::Base,
+            TypeCreationKind::Base { element } => TypeKind::Base {
+                element: element.clone(),
+            },
         };
         Mutation::CreateType(CreateTypeMutation {
             id: Self::resolve_creation_name(&fact.name, state),

@@ -33,7 +33,9 @@ impl AnalysisState {
                 .map(|field| field.data_type.as_str())
                 .collect(),
             TypeKind::Domain { base_type, .. } => vec![base_type.as_str()],
-            TypeKind::Range | TypeKind::Multirange | TypeKind::Base => Vec::new(),
+            TypeKind::Range { subtype } => subtype.as_deref().into_iter().collect(),
+            TypeKind::Base { element } => element.as_deref().into_iter().collect(),
+            TypeKind::Multirange => Vec::new(),
         };
         for declared_type in declared {
             if let Some(result) = self.check_declared_type(declared_type) {

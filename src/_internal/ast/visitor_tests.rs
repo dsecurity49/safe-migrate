@@ -3097,11 +3097,13 @@ mod tests {
         for (sql, expected) in [
             (
                 "CREATE TYPE floatrange AS RANGE (subtype = float8);",
-                TypeCreationKind::Range,
+                TypeCreationKind::Range {
+                    subtype: Some("float8".to_string()),
+                },
             ),
             (
                 "CREATE TYPE my_input (INPUT = int4in, OUTPUT = int4out);",
-                TypeCreationKind::Base,
+                TypeCreationKind::Base { element: None },
             ),
         ] {
             let parsed = SourceFile::parse(sql);

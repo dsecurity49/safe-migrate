@@ -2925,6 +2925,11 @@ fn load_types(
                     FILTER (WHERE a.attname IS NOT NULL),
                 ARRAY[]::text[]
             ) AS composite_field_names,
+            range.rngsubtype::regtype::text AS range_subtype,
+            CASE WHEN t.typelem <> 0
+                 THEN t.typelem::regtype::text
+                 ELSE NULL
+            END AS element_type,
             COALESCE(
                 array_agg(
                     CASE WHEN field_type_ns.nspname <> 'pg_catalog'
@@ -2941,6 +2946,7 @@ fn load_types(
         FROM pg_type t
         JOIN pg_namespace n ON n.oid = t.typnamespace
         LEFT JOIN pg_enum e ON e.enumtypid = t.oid
+        LEFT JOIN pg_range range ON range.rngtypid = t.oid
         LEFT JOIN pg_class composite_rel ON composite_rel.oid = t.typrelid
         LEFT JOIN pg_attribute a
           ON a.attrelid = t.typrelid
@@ -2952,7 +2958,8 @@ fn load_types(
           AND ({type_predicate})
           AND (t.typtype <> 'c' OR composite_rel.relkind = 'c')
           {schema_filter}
-        GROUP BY n.nspname, t.typname, t.typtype, t.typbasetype, t.typtypmod;
+        GROUP BY n.nspname, t.typname, t.typtype, t.typbasetype, t.typtypmod,
+                 t.typelem, range.rngsubtype;
         "
     );
     client
@@ -2972,9 +2979,13 @@ fn load_types(
                         .context("PostgreSQL omitted the base type for a domain")?,
                     base_type_id: None,
                 },
-                "r" => crate::_internal::model::types::TypeKind::Range,
+                "r" => crate::_internal::model::types::TypeKind::Range {
+                    subtype: row.try_get("range_subtype").context("range subtype")?,
+                },
                 "m" => crate::_internal::model::types::TypeKind::Multirange,
-                "b" => crate::_internal::model::types::TypeKind::Base,
+                "b" => crate::_internal::model::types::TypeKind::Base {
+                    element: row.try_get("element_type").context("element type")?,
+                },
                 "c" => {
                     let names: Vec<String> = row
                         .try_get("composite_field_names")

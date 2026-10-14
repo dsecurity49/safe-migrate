@@ -4595,6 +4595,7 @@ mod state_mutation_tests {
             "CREATE TABLE bad (c no_such_type);",
             "CREATE DOMAIN bad AS no_such_type;",
             "CREATE TYPE bad AS (a no_such_type);",
+            "CREATE TYPE bad AS RANGE (subtype = no_such_type);",
         ] {
             let mut state = setup_state();
             let violations = engine.analyze(sql, &mut state).unwrap();
@@ -4617,7 +4618,8 @@ mod state_mutation_tests {
                  CREATE DOMAIN ok_dom AS text;
                  CREATE TYPE ok_enum AS ENUM ('a', 'b');
                  CREATE TYPE ok_comp AS (a int, b text);
-                 CREATE TYPE ok_range AS RANGE (subtype = float8);",
+                 CREATE TYPE ok_range AS RANGE (subtype = int4);
+                 CREATE TYPE ok_range2 AS RANGE (subtype = text);",
                 &mut state,
             )
             .unwrap();

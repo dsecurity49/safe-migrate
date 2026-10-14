@@ -4362,7 +4362,7 @@ mod evidence_tests {
             crate::_internal::model::types::TypeState {
                 id: type_id.clone(),
                 generation: 0,
-                kind: crate::_internal::model::types::TypeKind::Base,
+                kind: crate::_internal::model::types::TypeKind::Base { element: None },
             },
         );
         let mut state = AnalysisState::new(cache);

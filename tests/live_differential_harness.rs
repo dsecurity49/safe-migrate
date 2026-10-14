@@ -3843,11 +3843,11 @@ fn normalize_column_storage(
                     data_type = normalize_data_type_with_identity(base_type, base_type_id.as_ref());
                     continue;
                 }
-                TypeKind::Composite { .. } | TypeKind::Range | TypeKind::Multirange => {
+                TypeKind::Composite { .. } | TypeKind::Range { .. } | TypeKind::Multirange => {
                     return Some("EXTENDED".into());
                 }
                 TypeKind::Enum { .. } => return Some("PLAIN".into()),
-                TypeKind::Base => return None,
+                TypeKind::Base { .. } => return None,
             },
             _ if matches!(
                 state.local.relations.get(&id),
@@ -3984,9 +3984,9 @@ fn normalize_type_kind(kind: &TypeKind) -> NormalizedType {
         TypeKind::Domain { base_type, .. } => NormalizedType::Domain {
             base_type: normalize_data_type(base_type),
         },
-        TypeKind::Base => NormalizedType::Base,
+        TypeKind::Base { .. } => NormalizedType::Base,
         TypeKind::Composite { .. } => NormalizedType::Composite,
-        TypeKind::Range => NormalizedType::Range,
+        TypeKind::Range { .. } => NormalizedType::Range,
         TypeKind::Multirange => NormalizedType::Multirange,
     }
 }
