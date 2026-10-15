@@ -375,6 +375,7 @@ impl AnalysisState {
                         edge.kind,
                         DependencyKind::ViewDependency { .. }
                             | DependencyKind::ViewUsesRoutine { .. }
+                            | DependencyKind::ViewUsesType { .. }
                     ))
             });
         }
@@ -401,6 +402,7 @@ impl AnalysisState {
                 },
             ));
         }
+        self.add_view_type_dependencies(&create.id, &create.cast_types);
         MutationResult::Applied
     }
 
@@ -475,6 +477,7 @@ impl AnalysisState {
                 },
             ));
         }
+        self.add_view_type_dependencies(&create.id, &create.cast_types);
         MutationResult::Applied
     }
 
@@ -535,6 +538,17 @@ impl AnalysisState {
     /// `ALTER VIEW` / `ALTER MATERIALIZED VIEW` with every action of the
     /// statement. `IF EXISTS` guards the relation lookup, and an action the
     /// model does not represent makes the statement opaque.
+    /// Record a view's dependency on each type its body casts to.
+    fn add_view_type_dependencies(&mut self, view: &ObjectId, cast_types: &[ObjectId]) {
+        for ty in cast_types {
+            self.local.graph.add_edge(DependencyEdge::new(
+                view.clone(),
+                ty.clone(),
+                DependencyKind::ViewUsesType { ty: ty.clone() },
+            ));
+        }
+    }
+
     /// PostgreSQL only lets `CREATE OR REPLACE VIEW` append columns: every
     /// position it already had keeps its name and its exact type, typmod
     /// included.

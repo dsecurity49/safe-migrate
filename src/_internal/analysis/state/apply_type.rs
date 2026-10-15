@@ -518,6 +518,11 @@ impl AnalysisState {
                 kind: TypeKind::Domain { base_type_id: Some(base), .. },
                 ..
             }) if base == id)
+        }) || self.local.graph.views_for_type(id).iter().any(|edge| {
+            matches!(
+                self.local.relations.get(&edge.dependent),
+                Some(RelationOverlay::Present(_))
+            )
         })
     }
 }

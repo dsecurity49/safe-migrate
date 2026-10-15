@@ -245,6 +245,22 @@ pub(crate) fn assert_state_invariants(state: &AnalysisState) {
                         .map_or(name.schema.clone(), |resolved| resolved.schema.clone())
                 );
             }
+            DependencyKind::ViewUsesType { ty } => {
+                let dependent_is_modeled_view = matches!(
+                    local.relations.get(&edge.dependent),
+                    Some(RelationOverlay::Present(relation))
+                        if matches!(relation.kind, safe_migrate::_internal::model::relation::RelationKind::View | safe_migrate::_internal::model::relation::RelationKind::MaterializedView)
+                );
+                let dependent_schema_is_omitted = state
+                    .baseline_schemas
+                    .as_ref()
+                    .is_some_and(|schemas| !schemas.contains(&edge.dependent.schema));
+                assert!(
+                    dependent_is_modeled_view || dependent_schema_is_omitted,
+                    "type dependency must have a modeled view or an explicitly omitted dependent schema"
+                );
+                assert_eq!(edge.referenced, *ty, "type edge endpoint must be the type");
+            }
             DependencyKind::SequenceOwnedBy { column } => assert!(matches!(
                 local.sequences.get(&edge.dependent),
                 Some(SequenceOverlay::Present(sequence))

@@ -31,6 +31,10 @@ notes are available on the
   view. A call that cannot be tied to a signature is reported as unresolved
   rather than as a conflict, and an exact signature does not block a different
   overload.
+- Dropping a type a view body casts to is reported, as `CASCADE` clears it.
+  A view that only selects a column of a type is not a dependent, matching the
+  server: PostgreSQL records the dependency from the cast, not the output
+  column.
 - `CREATE OR REPLACE VIEW` is validated the way the server validates it: a
   leading column may not be renamed, have its type changed, or disappear, and a
   new column may only be appended. Appending columns no longer leaves the view

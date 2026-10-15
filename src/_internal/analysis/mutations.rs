@@ -289,6 +289,7 @@ pub(crate) struct CreateMaterializedView {
     pub columns: Vec<ViewColumn>,
     pub projection_complete: bool,
     pub routines: Vec<ViewRoutine>,
+    pub cast_types: Vec<ObjectId>,
     pub access_method: Option<String>,
     pub tablespace: Option<String>,
     pub options: Vec<crate::_internal::analysis::facts::AttributeFact>,
@@ -482,6 +483,7 @@ pub(crate) struct CreateView {
     pub or_replace: bool,
     pub depends_on: Vec<ObjectId>,
     pub routines: Vec<ViewRoutine>,
+    pub cast_types: Vec<ObjectId>,
     /// Projected columns, empty when the projection could not be derived.
     pub columns: Vec<ViewColumn>,
     pub projection_complete: bool,

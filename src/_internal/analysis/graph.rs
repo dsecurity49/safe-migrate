@@ -31,6 +31,13 @@ pub(crate) enum DependencyKind {
         routine: Option<ObjectId>,
         name: ObjectId,
     },
+    /// A type a view body casts to, which a drop of that type must clear.
+    ///
+    /// PostgreSQL records this from the cast alone: a view that selects a
+    /// column of a type creates no such dependency.
+    ViewUsesType {
+        ty: ObjectId,
+    },
     IndexOnRelation {
         definition: IndexDefinition,
         dependency_columns: Vec<String>,
@@ -556,6 +563,7 @@ impl DependencyGraph {
                 DependencyKind::ForeignKey { .. }
                 | DependencyKind::ViewDependency { .. }
                 | DependencyKind::ViewUsesRoutine { .. }
+                | DependencyKind::ViewUsesType { .. }
                 | DependencyKind::InheritanceOf
                 | DependencyKind::PartitionOf
                 | DependencyKind::PartitionDetachPending
@@ -876,6 +884,16 @@ impl DependencyGraph {
             Some((name, _)) => (routine.schema.as_str(), name),
             None => (routine.schema.as_str(), routine.name.as_str()),
         }
+    }
+
+    /// Views whose body casts to a type.
+    pub(crate) fn views_for_type(&self, ty: &ObjectId) -> Vec<&DependencyEdge> {
+        self.edges
+            .iter()
+            .filter(|edge| {
+                matches!(&edge.kind, DependencyKind::ViewUsesType { ty: referenced } if referenced == ty)
+            })
+            .collect()
     }
 
     pub(crate) fn triggers_for_function(&self, function_id: &ObjectId) -> Vec<&DependencyEdge> {

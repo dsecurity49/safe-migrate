@@ -58,6 +58,7 @@ impl Resolver {
         projection_complete: bool,
         select_source: Option<&QualifiedName>,
         routines: &[crate::_internal::analysis::facts::RoutineReferenceFact],
+        cast_types: &[crate::_internal::analysis::facts::CastTypeReferenceFact],
         state: &AnalysisState,
     ) -> Mutation {
         let source = select_source.map(|source| Self::resolve_relation_lookup_name(source, state));
@@ -72,6 +73,7 @@ impl Resolver {
             columns,
             projection_complete,
             routines: Self::resolve_view_routines(routines, source.as_ref(), state),
+            cast_types: Self::resolve_cast_types(cast_types, state),
         })
     }
 
@@ -178,6 +180,21 @@ impl Resolver {
             .collect()
     }
 
+    /// The types a view body casts to, as identities the drop path can match.
+    fn resolve_cast_types(
+        cast_types: &[crate::_internal::analysis::facts::CastTypeReferenceFact],
+        state: &AnalysisState,
+    ) -> Vec<ObjectId> {
+        let mut resolved: Vec<ObjectId> = Vec::new();
+        for reference in cast_types {
+            let id = Self::resolve_type_lookup_name(&reference.name, state);
+            if !resolved.contains(&id) {
+                resolved.push(id);
+            }
+        }
+        resolved
+    }
+
     pub(super) fn resolve_alter_view(
         name: &QualifiedName,
         action: &AlterViewAction,
@@ -246,6 +263,7 @@ impl Resolver {
         projection_complete: bool,
         select_source: Option<&QualifiedName>,
         view_routines: &[crate::_internal::analysis::facts::RoutineReferenceFact],
+        cast_types: &[crate::_internal::analysis::facts::CastTypeReferenceFact],
         state: &AnalysisState,
     ) -> Mutation {
         let source = select_source.map(|source| Self::resolve_relation_lookup_name(source, state));
@@ -273,6 +291,7 @@ impl Resolver {
             columns,
             projection_complete,
             routines: Self::resolve_view_routines(view_routines, source.as_ref(), state),
+            cast_types: Self::resolve_cast_types(cast_types, state),
             access_method: access_method.clone(),
             tablespace: tablespace.clone(),
             options: options.to_vec(),

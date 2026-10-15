@@ -106,6 +106,15 @@ pub(crate) struct RoutineReferenceFact {
     pub argument_types: Option<Vec<String>>,
 }
 
+/// The types a view body casts to.
+///
+/// A view that merely selects a column of a type does not depend on that type:
+/// PostgreSQL records the dependency from the cast, not the output column.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct CastTypeReferenceFact {
+    pub name: QualifiedName,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum AlterViewAction {
     RenameTo {
@@ -209,6 +218,7 @@ pub(crate) enum StatementFact {
         select_projection_complete: bool,
         select_source: Option<QualifiedName>,
         routines: Vec<RoutineReferenceFact>,
+        cast_types: Vec<CastTypeReferenceFact>,
     },
     AlterView {
         name: QualifiedName,
@@ -229,6 +239,7 @@ pub(crate) enum StatementFact {
         select_projection_complete: bool,
         select_source: Option<QualifiedName>,
         routines: Vec<RoutineReferenceFact>,
+        cast_types: Vec<CastTypeReferenceFact>,
     },
     AlterMaterializedView {
         name: QualifiedName,

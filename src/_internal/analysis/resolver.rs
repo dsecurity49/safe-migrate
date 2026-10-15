@@ -293,6 +293,7 @@ impl Resolver {
                 select_projection_complete,
                 select_source,
                 routines,
+                cast_types,
             } => {
                 mutations.push(Self::resolve_create_view(
                     name,
@@ -302,6 +303,7 @@ impl Resolver {
                     *select_projection_complete,
                     select_source.as_ref(),
                     routines,
+                    cast_types,
                     state,
                 ));
             }
@@ -325,6 +327,7 @@ impl Resolver {
                 select_projection_complete,
                 select_source,
                 routines,
+                cast_types,
             } => {
                 mutations.push(Self::resolve_create_materialized_view(
                     name,
@@ -339,6 +342,7 @@ impl Resolver {
                     *select_projection_complete,
                     select_source.as_ref(),
                     routines,
+                    cast_types,
                     state,
                 ));
             }

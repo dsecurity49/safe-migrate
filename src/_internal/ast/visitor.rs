@@ -2375,7 +2375,17 @@ impl AstVisitor {
             select_outputs,
             select_source,
             routines: Self::extract_view_routines(node.syntax()),
+            cast_types: Self::extract_view_cast_types(node.syntax()),
         })
+    }
+
+    /// The qualified name a cast target writes.
+    fn qualified_name_from_type(
+        cast_type: &ast::Type,
+    ) -> Option<crate::_internal::analysis::facts::CastTypeReferenceFact> {
+        let text = cast_type.syntax().text().to_string();
+        let name = Self::routine_name_from_text(text.split('(').next().unwrap_or(&text))?;
+        Some(crate::_internal::analysis::facts::CastTypeReferenceFact { name })
     }
 
     /// The routines a view calls, wherever they appear in the query.
@@ -2383,6 +2393,25 @@ impl AstVisitor {
     /// The whole query is scanned rather than the target list alone, because
     /// PostgreSQL records the dependency from anywhere in the definition —
     /// `WHERE`, `HAVING`, `JOIN ... ON` and the grouping clauses all hold one.
+    /// The types a view body casts to, which a drop of that type must clear.
+    fn extract_view_cast_types(
+        syntax: &squawk_syntax::SyntaxNode,
+    ) -> Vec<crate::_internal::analysis::facts::CastTypeReferenceFact> {
+        let mut references: Vec<crate::_internal::analysis::facts::CastTypeReferenceFact> =
+            Vec::new();
+        for cast in syntax.descendants().filter_map(ast::CastExpr::cast) {
+            let Some(cast_type) = cast.ty() else { continue };
+            let Some(reference) = Self::qualified_name_from_type(&cast_type) else {
+                continue;
+            };
+            if !references.contains(&reference) {
+                references.push(reference);
+            }
+        }
+        references
+    }
+
+    /// The routine and cast references a view query makes.
     fn extract_view_routines(
         syntax: &squawk_syntax::SyntaxNode,
     ) -> Vec<crate::_internal::analysis::facts::RoutineReferenceFact> {
@@ -2598,6 +2627,7 @@ impl AstVisitor {
             select_outputs,
             select_source,
             routines: Self::extract_view_routines(node.syntax()),
+            cast_types: Self::extract_view_cast_types(node.syntax()),
         })
     }
 

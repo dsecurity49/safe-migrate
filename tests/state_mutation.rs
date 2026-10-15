@@ -4731,6 +4731,47 @@ mod state_mutation_tests {
     }
 
     #[test]
+    fn a_view_depends_on_the_types_its_body_casts_to() {
+        let conflicts = |sql: &str| {
+            let engine = setup_engine();
+            let mut state = setup_state();
+            engine
+                .analyze(sql, &mut state)
+                .unwrap()
+                .iter()
+                .filter(|violation| violation.rule_id == "chain-conflict")
+                .count()
+        };
+        assert_eq!(
+            conflicts(
+                "CREATE TYPE ct AS (z int);
+                 CREATE VIEW v AS SELECT 1::ct AS r;
+                 DROP TYPE ct;"
+            ),
+            1,
+            "a cast to a user type must block dropping it"
+        );
+        assert_eq!(
+            conflicts(
+                "CREATE TYPE ct AS (z int);
+                 CREATE VIEW v AS SELECT 1::ct AS r;
+                 DROP TYPE ct CASCADE;"
+            ),
+            0,
+            "CASCADE must clear the dependent view"
+        );
+        assert_eq!(
+            conflicts(
+                "CREATE TYPE ct AS (z int);
+                 CREATE VIEW v AS SELECT 1 AS r;
+                 DROP TYPE ct;"
+            ),
+            0,
+            "a view that never names the type must not block it"
+        );
+    }
+
+    #[test]
     fn a_view_depends_on_every_routine_its_query_calls() {
         let conflicts = |sql: &str| {
             let engine = setup_engine();
