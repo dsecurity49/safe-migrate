@@ -95,6 +95,17 @@ pub(crate) struct CompositeFieldFact {
     pub data_type: String,
 }
 
+/// A routine a view calls.
+///
+/// `argument_types` is populated only when every argument is a plain column
+/// reference of the view's source, which is the one case where the signature
+/// can be stated exactly.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct RoutineReferenceFact {
+    pub name: QualifiedName,
+    pub argument_types: Option<Vec<String>>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum AlterViewAction {
     RenameTo {
@@ -197,6 +208,7 @@ pub(crate) enum StatementFact {
         select_outputs: Vec<SelectOutputFact>,
         select_projection_complete: bool,
         select_source: Option<QualifiedName>,
+        routines: Vec<RoutineReferenceFact>,
     },
     AlterView {
         name: QualifiedName,
@@ -216,6 +228,7 @@ pub(crate) enum StatementFact {
         select_outputs: Vec<SelectOutputFact>,
         select_projection_complete: bool,
         select_source: Option<QualifiedName>,
+        routines: Vec<RoutineReferenceFact>,
     },
     AlterMaterializedView {
         name: QualifiedName,

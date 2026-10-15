@@ -17,6 +17,9 @@ use crate::_internal::model::trigger::TriggerOverlay;
 
 type RoutineLookup = ObjectLookup;
 
+/// A routine a drop would take, with the triggers and views that depend on it.
+type DropTarget = (ObjectId, Vec<(ObjectId, ObjectId)>, Vec<ObjectId>);
+
 impl AnalysisState {
     fn routine_lookup(
         &self,
@@ -264,6 +267,28 @@ impl AnalysisState {
         MutationResult::Applied
     }
 
+    /// Whether a view depends on `routine` only through a reference that never
+    /// resolved to a signature.
+    ///
+    /// Such a reference names the routine without saying which overload the view
+    /// calls, so the drop can be neither proved safe nor proved refused. Reporting
+    /// a conflict there would report a drop the server accepts.
+    fn view_routine_reference_is_ambiguous(&self, routine: &ObjectId) -> bool {
+        self.local
+            .graph
+            .views_for_function(routine)
+            .iter()
+            .any(|edge| {
+                matches!(
+                    edge.kind,
+                    crate::_internal::analysis::graph::DependencyKind::ViewUsesRoutine {
+                        routine: None,
+                        ..
+                    }
+                )
+            })
+    }
+
     pub(super) fn apply_drop_function(
         &mut self,
         function: &DropFunctionMutation,
@@ -272,7 +297,7 @@ impl AnalysisState {
         // DROP.  Preflight the complete set first so an unknown or invalid
         // later signature cannot leave an earlier function dropped in the
         // simulator when the statement itself would fail.
-        let mut targets: Vec<(ObjectId, Vec<(ObjectId, ObjectId)>)> = Vec::new();
+        let mut targets: Vec<DropTarget> = Vec::new();
         for signature in &function.signatures {
             let signature_name = format!(
                 "{}({})",
@@ -327,8 +352,32 @@ impl AnalysisState {
                             id
                         ));
                     }
-                    if !targets.iter().any(|(existing, _)| existing == &id) {
-                        targets.push((id, dependent_triggers));
+                    // PostgreSQL refuses the drop because a view depends on the
+                    // routine, reporting `view ... depends on function`.
+                    let dependent_views: Vec<ObjectId> = self
+                        .local
+                        .graph
+                        .views_for_function(&id)
+                        .into_iter()
+                        .map(|edge| edge.dependent.clone())
+                        .collect();
+                    if !dependent_views.is_empty() && !function.cascade {
+                        // A reference that never resolved to a signature names
+                        // the routine only. It decides the question when the
+                        // name has no other overload; otherwise which overload
+                        // the view calls is unknown, and claiming a conflict
+                        // would report a drop the server accepts.
+                        let ambiguous = self.view_routine_reference_is_ambiguous(&id);
+                        if ambiguous {
+                            return self.unresolved(EvidenceCode::CatalogCoverageIncomplete);
+                        }
+                        return MutationResult::conflict(format!(
+                            "function '{}' is required by view '{}'; use CASCADE",
+                            id, dependent_views[0]
+                        ));
+                    }
+                    if !targets.iter().any(|(existing, _, _)| existing == &id) {
+                        targets.push((id, dependent_triggers, dependent_views));
                     }
                 }
                 RoutineLookup::AuthoritativelyAbsent => {}
@@ -339,7 +388,7 @@ impl AnalysisState {
             return MutationResult::NoOp;
         }
 
-        if targets.iter().any(|(id, _)| {
+        if targets.iter().any(|(id, _, _)| {
             self.baseline_scoped_family_object(
                 id,
                 crate::_internal::db::cache::CatalogFamily::Routines,
@@ -349,13 +398,25 @@ impl AnalysisState {
         }
 
         let any_applied = !targets.is_empty();
-        for (id, dependent_triggers) in &targets {
+        for (id, dependent_triggers, dependent_views) in &targets {
             self.snapshot_function(id);
             self.local
                 .functions
                 .insert(id.clone(), FunctionOverlay::Dropped);
 
             if function.cascade {
+                for view_id in dependent_views {
+                    self.snapshot_relation(view_id);
+                    self.local
+                        .relations
+                        .insert(view_id.clone(), RelationOverlay::Dropped);
+                }
+                if !dependent_views.is_empty() {
+                    self.snapshot_graph_full();
+                    self.local
+                        .graph
+                        .retain_edges(|edge| !dependent_views.contains(&edge.dependent));
+                }
                 for (trigger_id, table_id) in dependent_triggers.iter() {
                     let trigger_name =
                         self.local

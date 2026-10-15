@@ -2374,7 +2374,75 @@ impl AstVisitor {
             select_projection_complete: select_source.is_some() && projection_was_complete,
             select_outputs,
             select_source,
+            routines: Self::extract_view_routines(node.syntax()),
         })
+    }
+
+    /// The routines a view calls, wherever they appear in the query.
+    ///
+    /// The whole query is scanned rather than the target list alone, because
+    /// PostgreSQL records the dependency from anywhere in the definition —
+    /// `WHERE`, `HAVING`, `JOIN ... ON` and the grouping clauses all hold one.
+    fn extract_view_routines(
+        syntax: &squawk_syntax::SyntaxNode,
+    ) -> Vec<crate::_internal::analysis::facts::RoutineReferenceFact> {
+        let mut references: Vec<crate::_internal::analysis::facts::RoutineReferenceFact> =
+            Vec::new();
+        for call in syntax.descendants().filter_map(ast::CallExpr::cast) {
+            let Some(expr) = call.expr() else {
+                continue;
+            };
+            let Some(qualified) = Self::routine_name_from_text(&expr.syntax().text().to_string())
+            else {
+                continue;
+            };
+            // Argument types are stated only for plain column references,
+            // which are the arguments whose type the source relation fixes.
+            // A qualified column reference is not one of them.
+            let argument_types = call.arg_list().and_then(|args| {
+                args.args()
+                    .map(|argument| match argument.expr() {
+                        Some(ast::Expr::NameRef(column)) => Some(Self::resolve_identifier_token(
+                            column.syntax().first_token()?.text(),
+                        )),
+                        _ => None,
+                    })
+                    .collect::<Option<Vec<String>>>()
+            });
+            let reference = crate::_internal::analysis::facts::RoutineReferenceFact {
+                name: qualified,
+                argument_types,
+            };
+            if !references.contains(&reference) {
+                references.push(reference);
+            }
+        }
+        references
+    }
+
+    /// The qualified name a function call names, written as `name` or
+    /// `schema.name`.
+    fn routine_name_from_text(text: &str) -> Option<QualifiedName> {
+        let (schema, name) = match text.split_once('.') {
+            Some((schema, name)) => (Some(schema), name),
+            None => (None, text),
+        };
+        let part = |raw: &str| {
+            let is_quoted = raw.len() > 1 && raw.starts_with('"') && raw.ends_with('"');
+            Ident::new(
+                if is_quoted {
+                    &raw[1..raw.len() - 1]
+                } else {
+                    raw
+                }
+                .to_string(),
+                is_quoted,
+            )
+        };
+        Some(QualifiedName::new(
+            schema.map(part),
+            part(name.trim_end_matches('(').trim()),
+        ))
     }
 
     /// The source relation and target list of a query that selects from a
@@ -2529,6 +2597,7 @@ impl AstVisitor {
             select_projection_complete: select_source.is_some() && projection_was_complete,
             select_outputs,
             select_source,
+            routines: Self::extract_view_routines(node.syntax()),
         })
     }
 

@@ -370,8 +370,12 @@ impl AnalysisState {
         self.snapshot_graph_full();
         if existing_view {
             self.local.graph.retain_edges(|edge| {
-                !(matches!(edge.kind, DependencyKind::ViewDependency { .. })
-                    && edge.dependent == create.id)
+                !(edge.dependent == create.id
+                    && matches!(
+                        edge.kind,
+                        DependencyKind::ViewDependency { .. }
+                            | DependencyKind::ViewUsesRoutine { .. }
+                    ))
             });
         }
         for dependency in &create.depends_on {
@@ -381,6 +385,19 @@ impl AnalysisState {
                 DependencyKind::ViewDependency {
                     view_generation: generation,
                     referenced_column: None,
+                },
+            ));
+        }
+        for routine in &create.routines {
+            self.local.graph.add_edge(DependencyEdge::new(
+                create.id.clone(),
+                routine
+                    .signature
+                    .clone()
+                    .unwrap_or_else(|| routine.name.clone()),
+                DependencyKind::ViewUsesRoutine {
+                    routine: routine.signature.clone(),
+                    name: routine.name.clone(),
                 },
             ));
         }
@@ -442,6 +459,19 @@ impl AnalysisState {
                 DependencyKind::ViewDependency {
                     view_generation: generation,
                     referenced_column: None,
+                },
+            ));
+        }
+        for routine in &create.routines {
+            self.local.graph.add_edge(DependencyEdge::new(
+                create.id.clone(),
+                routine
+                    .signature
+                    .clone()
+                    .unwrap_or_else(|| routine.name.clone()),
+                DependencyKind::ViewUsesRoutine {
+                    routine: routine.signature.clone(),
+                    name: routine.name.clone(),
                 },
             ));
         }

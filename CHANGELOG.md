@@ -25,6 +25,12 @@ notes are available on the
 - Every action of a comma-separated `ALTER MATERIALIZED VIEW` is now applied,
   so an unsupported action no longer disappears behind a modeled one in front
   of it.
+- A view now depends on every routine its query calls, wherever the call sits —
+  target list, `WHERE`, `HAVING` or a join condition — so dropping such a
+  routine is reported instead of succeeding. `CASCADE` drops the dependent
+  view. A call that cannot be tied to a signature is reported as unresolved
+  rather than as a conflict, and an exact signature does not block a different
+  overload.
 - `CREATE OR REPLACE VIEW` is validated the way the server validates it: a
   leading column may not be renamed, have its type changed, or disappear, and a
   new column may only be appended. Appending columns no longer leaves the view

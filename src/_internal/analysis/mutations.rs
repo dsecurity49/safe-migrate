@@ -288,6 +288,7 @@ pub(crate) struct CreateMaterializedView {
     pub with_no_data: bool,
     pub columns: Vec<ViewColumn>,
     pub projection_complete: bool,
+    pub routines: Vec<ViewRoutine>,
     pub access_method: Option<String>,
     pub tablespace: Option<String>,
     pub options: Vec<crate::_internal::analysis::facts::AttributeFact>,
@@ -298,6 +299,14 @@ pub(crate) struct RefreshMaterializedViewMutation {
     pub id: ObjectId,
     pub concurrently: bool,
     pub with_no_data: bool,
+}
+
+/// A routine a view calls. `signature` is the exact routine identity when the
+/// call resolved to one; `name` always carries the qualified routine name.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ViewRoutine {
+    pub name: ObjectId,
+    pub signature: Option<ObjectId>,
 }
 
 /// A view or materialized view `ALTER`, with every action of the statement.
@@ -472,6 +481,7 @@ pub(crate) struct CreateView {
     pub id: ObjectId,
     pub or_replace: bool,
     pub depends_on: Vec<ObjectId>,
+    pub routines: Vec<ViewRoutine>,
     /// Projected columns, empty when the projection could not be derived.
     pub columns: Vec<ViewColumn>,
     pub projection_complete: bool,

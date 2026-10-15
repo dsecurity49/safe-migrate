@@ -217,6 +217,34 @@ pub(crate) fn assert_state_invariants(state: &AnalysisState) {
                     Some(RelationOverlay::Dropped)
                 ));
             }
+            DependencyKind::ViewUsesRoutine { routine, name } => {
+                let dependent_is_modeled_view = matches!(
+                    local.relations.get(&edge.dependent),
+                    Some(RelationOverlay::Present(relation))
+                        if matches!(relation.kind, safe_migrate::_internal::model::relation::RelationKind::View | safe_migrate::_internal::model::relation::RelationKind::MaterializedView)
+                );
+                let dependent_schema_is_omitted = state
+                    .baseline_schemas
+                    .as_ref()
+                    .is_some_and(|schemas| !schemas.contains(&edge.dependent.schema));
+                assert!(
+                    dependent_is_modeled_view || dependent_schema_is_omitted,
+                    "routine dependency must have a modeled view or an explicitly omitted dependent schema"
+                );
+                // A resolved reference carries the exact routine identity, so
+                // the endpoint is that routine rather than the bare name.
+                assert_eq!(
+                    edge.referenced,
+                    routine.clone().unwrap_or_else(|| name.clone()),
+                    "routine edge endpoint must be the signature, or the name when unresolved"
+                );
+                assert_eq!(
+                    name.schema,
+                    routine
+                        .as_ref()
+                        .map_or(name.schema.clone(), |resolved| resolved.schema.clone())
+                );
+            }
             DependencyKind::SequenceOwnedBy { column } => assert!(matches!(
                 local.sequences.get(&edge.dependent),
                 Some(SequenceOverlay::Present(sequence))

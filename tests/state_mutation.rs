@@ -4731,6 +4731,84 @@ mod state_mutation_tests {
     }
 
     #[test]
+    fn a_view_depends_on_every_routine_its_query_calls() {
+        let conflicts = |sql: &str| {
+            let engine = setup_engine();
+            let mut state = setup_state();
+            engine
+                .analyze(sql, &mut state)
+                .unwrap()
+                .iter()
+                .filter(|violation| violation.rule_id == "chain-conflict")
+                .map(|violation| violation.reason.clone())
+                .collect::<Vec<_>>()
+        };
+        let blocked = |sql: &str| {
+            conflicts(sql)
+                .iter()
+                .any(|reason| reason.contains("is required by view"))
+        };
+
+        // The call is in the target list.
+        assert!(
+            blocked(
+                "CREATE TABLE t (a int);
+                 CREATE FUNCTION f(int) RETURNS int AS 'SELECT $1' LANGUAGE sql IMMUTABLE;
+                 CREATE VIEW v AS SELECT f(a) AS fa FROM t;
+                 DROP FUNCTION f(integer);"
+            ),
+            "a view's target list is a routine dependency"
+        );
+        // The call is in the WHERE clause, which the old scan never reached.
+        assert!(
+            blocked(
+                "CREATE TABLE t (a int);
+                 CREATE FUNCTION f(int) RETURNS int AS 'SELECT $1' LANGUAGE sql IMMUTABLE;
+                 CREATE VIEW v AS SELECT a FROM t WHERE f(a) > 0;
+                 DROP FUNCTION f(integer);"
+            ),
+            "a view's WHERE clause is a routine dependency"
+        );
+        // CASCADE clears the dependent view.
+        assert!(
+            !blocked(
+                "CREATE TABLE t (a int);
+                 CREATE FUNCTION f(int) RETURNS int AS 'SELECT $1' LANGUAGE sql IMMUTABLE;
+                 CREATE VIEW v AS SELECT a FROM t WHERE f(a) > 0;
+                 DROP FUNCTION f(integer) CASCADE;
+                 DROP VIEW v;"
+            ),
+            "CASCADE must drop the dependent view"
+        );
+        // An exact reference must not block a different overload.
+        assert!(
+            !blocked(
+                "CREATE TABLE t (a int);
+                 CREATE FUNCTION f(int) RETURNS int AS 'SELECT $1' LANGUAGE sql IMMUTABLE;
+                 CREATE FUNCTION f(text) RETURNS text AS 'SELECT $1' LANGUAGE sql IMMUTABLE;
+                 CREATE VIEW v AS SELECT f(a) AS fa FROM t;
+                 DROP FUNCTION f(text);"
+            ),
+            "an exact signature must not block another overload"
+        );
+        // A call whose arguments do not resolve names no overload, so the
+        // drop is reported unresolved rather than as a conflict.
+        let undecided = conflicts(
+            "CREATE TABLE t (a int);
+             CREATE FUNCTION f(int) RETURNS int AS 'SELECT $1' LANGUAGE sql IMMUTABLE;
+             CREATE FUNCTION f(text) RETURNS text AS 'SELECT $1' LANGUAGE sql IMMUTABLE;
+             CREATE VIEW v AS SELECT f(a + 1) AS fa FROM t;
+             DROP FUNCTION f(text);",
+        );
+        assert!(
+            !undecided
+                .iter()
+                .any(|reason| reason.contains("is required by view")),
+            "an unresolved reference must not report a conflict: {undecided:?}"
+        );
+    }
+
+    #[test]
     fn create_or_replace_view_only_appends_columns() {
         let conflicts = |sql: &str| {
             let engine = setup_engine();

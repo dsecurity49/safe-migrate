@@ -9,7 +9,7 @@ use crate::_internal::analysis::mutations::{
     CreateMaterializedView, CreatePolicyMutation, CreateTriggerMutation, CreateView,
     DropPolicyMutation, DropTriggerMutation, Mutation, OpaqueMutation,
     RefreshMaterializedViewMutation, ReindexTargetMutation, ReloptionTarget, Rename,
-    RenameTriggerMutation, ViewColumn,
+    RenameTriggerMutation, ViewColumn, ViewRoutine,
 };
 use crate::_internal::analysis::state::AnalysisState;
 use crate::_internal::ast::identifiers::{ObjectId, QualifiedName};
@@ -49,6 +49,7 @@ impl Resolver {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn resolve_create_view(
         name: &QualifiedName,
         or_replace: bool,
@@ -56,6 +57,7 @@ impl Resolver {
         select_outputs: &[SelectOutputFact],
         projection_complete: bool,
         select_source: Option<&QualifiedName>,
+        routines: &[crate::_internal::analysis::facts::RoutineReferenceFact],
         state: &AnalysisState,
     ) -> Mutation {
         let source = select_source.map(|source| Self::resolve_relation_lookup_name(source, state));
@@ -69,6 +71,7 @@ impl Resolver {
                 .collect(),
             columns,
             projection_complete,
+            routines: Self::resolve_view_routines(routines, source.as_ref(), state),
         })
     }
 
@@ -117,6 +120,62 @@ impl Resolver {
             }
         }
         columns
+    }
+
+    /// The routines a view calls, as identities the drop path can match.
+    ///
+    /// A call whose arguments are all plain column references of the source
+    /// resolves to the exact routine identity. Any other call keeps only the
+    /// qualified name, which still blocks a drop of that name: the call may be
+    /// this overload, and claiming otherwise would be a missed conflict.
+    fn resolve_view_routines(
+        routines: &[crate::_internal::analysis::facts::RoutineReferenceFact],
+        source: Option<&ObjectId>,
+        state: &AnalysisState,
+    ) -> Vec<ViewRoutine> {
+        let source_columns = source
+            .and_then(|id| state.relation_column_types(id))
+            .unwrap_or_default();
+        routines
+            .iter()
+            .map(|reference| {
+                let name = Self::resolve_relation_lookup_name(&reference.name, state);
+                let signature = reference.argument_types.as_ref().and_then(|arguments| {
+                    arguments
+                        .iter()
+                        .map(|argument| {
+                            source_columns
+                                .iter()
+                                .find(|(column, _)| column == argument)
+                                .and_then(|(_, data_type)| data_type.clone())
+                        })
+                        .collect::<Option<Vec<String>>>()
+                });
+                ViewRoutine {
+                    name: ObjectId::new(name.schema.clone(), name.name.clone()),
+                    signature: signature.map(|arguments| {
+                        ObjectId::new(
+                            name.schema.clone(),
+                            format!(
+                                "{}({})",
+                                name.name,
+                                arguments
+                                    .iter()
+                                    .map(|argument| {
+                                        Resolver::normalize_function_arg_type(
+                                            argument,
+                                            state.builtin_types(),
+                                        )
+                                        .render()
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join(",")
+                            ),
+                        )
+                    }),
+                }
+            })
+            .collect()
     }
 
     pub(super) fn resolve_alter_view(
@@ -186,6 +245,7 @@ impl Resolver {
         select_outputs: &[SelectOutputFact],
         projection_complete: bool,
         select_source: Option<&QualifiedName>,
+        view_routines: &[crate::_internal::analysis::facts::RoutineReferenceFact],
         state: &AnalysisState,
     ) -> Mutation {
         let source = select_source.map(|source| Self::resolve_relation_lookup_name(source, state));
@@ -212,6 +272,7 @@ impl Resolver {
             with_no_data,
             columns,
             projection_complete,
+            routines: Self::resolve_view_routines(view_routines, source.as_ref(), state),
             access_method: access_method.clone(),
             tablespace: tablespace.clone(),
             options: options.to_vec(),
