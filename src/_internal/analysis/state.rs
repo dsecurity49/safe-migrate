@@ -1085,6 +1085,54 @@ impl AnalysisState {
             }
         }
 
+        for dependency in cache.view_object_dependencies {
+            let dependent = dependency.dependent;
+            let dependent_schema_is_omitted = baseline_schemas
+                .as_ref()
+                .is_some_and(|schemas| !schemas.contains(&dependent.schema));
+            let is_view = relations.get(&dependent).is_some_and(|relation| {
+                matches!(
+                    relation,
+                    RelationOverlay::Present(state)
+                        if matches!(
+                            state.kind,
+                            crate::_internal::model::relation::RelationKind::View
+                                | crate::_internal::model::relation::RelationKind::MaterializedView
+                    )
+                )
+            });
+            if !(is_view || dependent_schema_is_omitted) {
+                continue;
+            }
+            match dependency.target {
+                crate::_internal::db::cache::ViewDependencyTarget::Routine { routine } => {
+                    let name = ObjectId::new(
+                        routine.schema.clone(),
+                        routine
+                            .name
+                            .split_once('(')
+                            .map_or(routine.name.as_str(), |(name, _)| name)
+                            .to_string(),
+                    );
+                    graph.add_edge(DependencyEdge::new(
+                        dependent,
+                        routine.clone(),
+                        DependencyKind::ViewUsesRoutine {
+                            routine: Some(routine),
+                            name,
+                        },
+                    ));
+                }
+                crate::_internal::db::cache::ViewDependencyTarget::Type { ty } => {
+                    graph.add_edge(DependencyEdge::new(
+                        dependent,
+                        ty.clone(),
+                        DependencyKind::ViewUsesType { ty },
+                    ));
+                }
+            }
+        }
+
         for inheritance in cache.inheritances {
             // A committed first phase of DETACH CONCURRENTLY remains visible
             // as an inheritance row with inhdetachpending until FINALIZE.

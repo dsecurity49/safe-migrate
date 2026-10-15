@@ -360,6 +360,24 @@ pub(crate) struct ViewDependencyCache {
     pub referenced_column: Option<String>,
 }
 
+/// The non-relation object a view depends on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum ViewDependencyTarget {
+    Routine { routine: ObjectId },
+    Type { ty: ObjectId },
+}
+
+/// A `pg_depend` row from a view to a routine or a type.
+///
+/// PostgreSQL records these from the rewrite rules of the view, so a synced
+/// view carries the same obligations as one built from the statements in this
+/// migration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ViewObjectDependencyCache {
+    pub dependent: ObjectId,
+    pub target: ViewDependencyTarget,
+}
+
 /// One direct table or index inheritance relationship from `pg_inherits`.
 ///
 /// The row is retained separately from generic dependencies because PostgreSQL
@@ -465,6 +483,9 @@ pub(crate) struct DbCache {
     pub opclasses: Option<crate::_internal::model::opclass::OpclassCatalogue>,
     pub sequences: HashMap<ObjectId, SequenceState>,
     pub dependencies: Vec<ViewDependencyCache>,
+    /// Dependencies from a view to a routine or type, which the relation
+    /// dependency rows cannot express.
+    pub view_object_dependencies: Vec<ViewObjectDependencyCache>,
     /// Every observed cross-scope dependency edge, tagged with the catalog
     /// family of the in-scope endpoint. Scoped destructive transitions stay
     /// conservative for these identities; an absent entry means no external
@@ -484,9 +505,10 @@ pub(crate) struct DbCache {
 // magic must stay one digit wide or the fixed-size prefix read breaks.
 pub(crate) const CACHE_FORMAT_VERSION: u32 = 10;
 
-/// Current durable cache header. V10 records cross-scope dependency edges with
-/// both endpoints and a catalog family, and the built-in type catalogue derived
-/// from `pg_type`, so a written type name resolves without a server.
+/// Current durable cache header. V10 records the dependencies from a view to
+/// the routines and types its body uses, which the relation dependency rows
+/// cannot express, alongside the cross-scope edges and built-in type catalogue
+/// it already carried.
 pub(crate) const CACHE_MAGIC: &[u8] = b"SMCACHE10";
 
 // The prefix read in `api.rs` consumes a fixed number of bytes, so the magic
@@ -584,6 +606,7 @@ impl DbCache {
             opclasses: None,
             sequences: HashMap::new(),
             dependencies: Vec::new(),
+            view_object_dependencies: Vec::new(),
             scoped_external_dependencies: Vec::new(),
             inheritances: Vec::new(),
             index_attachments: Vec::new(),
@@ -3100,6 +3123,38 @@ mod tests {
 
         let error = cache.validate_semantics().unwrap_err();
         assert!(error.contains("appears more than once"));
+    }
+
+    #[test]
+    fn a_synced_cache_carries_view_dependencies_on_routines_and_types() {
+        let view = ObjectId::new("public", "vsync");
+        let mut cache = synced_cache();
+        let mut view_state = table(view.clone(), &["a"]);
+        view_state.kind = RelationKind::View;
+        cache.insert_baseline(view.clone(), view_state);
+        let routine = ObjectId::new("public", "fsync(integer)");
+        let ty = ObjectId::new("public", "tsync_t");
+        cache.view_object_dependencies = vec![
+            ViewObjectDependencyCache {
+                dependent: view.clone(),
+                target: ViewDependencyTarget::Routine {
+                    routine: routine.clone(),
+                },
+            },
+            ViewObjectDependencyCache {
+                dependent: view.clone(),
+                target: ViewDependencyTarget::Type { ty: ty.clone() },
+            },
+        ];
+        cache
+            .validate_semantics()
+            .expect("valid view object dependencies");
+
+        let state = crate::_internal::analysis::state::AnalysisState::new(cache);
+        let edges = state.local.graph.views_for_function(&routine);
+        assert_eq!(edges.len(), 1, "a synced view must block its routine");
+        let edges = state.local.graph.views_for_type(&ty);
+        assert_eq!(edges.len(), 1, "a synced view must block its type");
     }
 
     #[test]

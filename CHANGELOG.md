@@ -35,6 +35,9 @@ notes are available on the
   A view that only selects a column of a type is not a dependent, matching the
   server: PostgreSQL records the dependency from the cast, not the output
   column.
+- A view synchronized from the catalog now carries its dependencies on routines
+  and types, the way a view created in this migration already did. Run
+  `safe-migrate sync` to pick them up.
 - `CREATE OR REPLACE VIEW` is validated the way the server validates it: a
   leading column may not be renamed, have its type changed, or disappear, and a
   new column may only be appended. Appending columns no longer leaves the view

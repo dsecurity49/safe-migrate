@@ -3,7 +3,7 @@ use crate::_internal::db::cache::{
     CACHE_MAGIC, CatalogCoverageBuilder, CatalogFamily, ConstraintDependencyCache,
     ConstraintKeyCache, DbCache, DbCacheVersioned, DefaultSequenceDependencyCache, ForeignKeyCache,
     GeneratedColumnDependencyCache, IndexAttachmentCache, IndexCache, InheritanceCache,
-    ScopedDependencyEdge, ViewDependencyCache,
+    ScopedDependencyEdge, ViewDependencyCache, ViewDependencyTarget,
 };
 use crate::_internal::db::cache_file::{
     MAX_CACHE_DECODE_BYTES, MAX_CACHE_FILE_BYTES, protect_cache_bytes,
@@ -590,6 +590,127 @@ pub(crate) fn populate_cache_in_current_transaction(
     schemas: Option<&[String]>,
 ) -> Result<DbCache> {
     populate_cache_from_client(client, schemas)
+}
+
+/// A view's dependencies on the routines and types its body uses.
+///
+/// `pg_depend` records these from the view's rewrite rules, so a view loaded
+/// from the catalog carries the same obligations as one built from statements.
+/// The routine signature is formed exactly as `load_routines` forms it, so a
+/// drop matches whichever path produced the view.
+fn load_view_object_dependencies(
+    client: &mut impl GenericClient,
+    schema_values: &Option<Vec<String>>,
+    builtin_types: &BuiltinTypeCatalogue,
+) -> Result<Vec<crate::_internal::db::cache::ViewObjectDependencyCache>> {
+    let query = r#"
+        SELECT vn.nspname AS obj_schema,
+               vc.relname AS obj_name,
+               'pg_proc'::text AS ref_kind,
+               pn.nspname AS ref_schema,
+               p.proname AS ref_name,
+               ARRAY(
+                   SELECT pg_catalog.format_type(t, NULL)
+                   FROM unnest(p.proargtypes::oid[]) WITH ORDINALITY AS u(t, n)
+                   ORDER BY n
+               )::text[] AS ref_args
+        FROM pg_rewrite rw
+        JOIN pg_class vc ON vc.oid = rw.ev_class
+        JOIN pg_namespace vn ON vn.oid = vc.relnamespace
+        JOIN pg_depend d ON d.objid = rw.oid
+        JOIN pg_proc p ON p.oid = d.refobjid
+        JOIN pg_namespace pn ON pn.oid = p.pronamespace
+            WHERE vc.relkind IN ('v', 'm')
+              AND d.classid = 'pg_rewrite'::regclass
+              AND d.refclassid = 'pg_proc'::regclass
+              AND d.deptype = 'n'
+              AND vn.nspname NOT LIKE 'pg\_%' ESCAPE '\'
+              AND vn.nspname <> 'information_schema'
+              AND pn.nspname NOT LIKE 'pg\_%' ESCAPE '\'
+              AND pn.nspname <> 'information_schema'
+              AND (
+              $1::text[] IS NULL
+              OR vn.nspname = ANY($1)
+              OR pn.nspname = ANY($1)
+          )
+        UNION ALL
+        SELECT vn.nspname AS obj_schema,
+               vc.relname AS obj_name,
+               'pg_type'::text AS ref_kind,
+               tn.nspname AS ref_schema,
+               t.typname AS ref_name,
+               NULL::text[] AS ref_args
+        FROM pg_rewrite rw
+        JOIN pg_class vc ON vc.oid = rw.ev_class
+        JOIN pg_namespace vn ON vn.oid = vc.relnamespace
+        JOIN pg_depend d ON d.objid = rw.oid
+        JOIN pg_type t ON t.oid = d.refobjid
+        JOIN pg_namespace tn ON tn.oid = t.typnamespace
+            WHERE vc.relkind IN ('v', 'm')
+              AND d.classid = 'pg_rewrite'::regclass
+              AND d.refclassid = 'pg_type'::regclass
+              AND d.deptype = 'n'
+              AND vn.nspname NOT LIKE 'pg\_%' ESCAPE '\'
+              AND vn.nspname <> 'information_schema'
+              AND tn.nspname NOT LIKE 'pg\_%' ESCAPE '\'
+              AND tn.nspname <> 'information_schema'
+              AND (
+              $1::text[] IS NULL
+              OR vn.nspname = ANY($1)
+              OR tn.nspname = ANY($1)
+          )
+    "#;
+
+    let rows = client
+        .query(query, &[schema_values])
+        .context("Failed to load view object dependencies from pg_rewrite/pg_depend")?;
+
+    let mut dependencies: Vec<crate::_internal::db::cache::ViewObjectDependencyCache> = Vec::new();
+    for row in rows {
+        let dependent = ObjectId::new(
+            row.try_get::<_, String>("obj_schema")
+                .context("view schema")?,
+            row.try_get::<_, String>("obj_name").context("view name")?,
+        );
+        let schema = row
+            .try_get::<_, String>("ref_schema")
+            .context("referenced schema")?;
+        let name = row
+            .try_get::<_, String>("ref_name")
+            .context("referenced name")?;
+        let kind: String = row.try_get("ref_kind").context("referenced kind")?;
+        let raw_args: Vec<String> = row
+            .try_get::<_, Option<Vec<String>>>("ref_args")
+            .context("referenced argument types")?
+            .unwrap_or_default();
+        let target = match kind.as_str() {
+            "pg_proc" => {
+                let signature = raw_args
+                    .iter()
+                    .map(|argument| {
+                        crate::_internal::analysis::resolver::Resolver::normalize_function_arg_type(
+                            argument,
+                            builtin_types,
+                        )
+                        .render()
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                ViewDependencyTarget::Routine {
+                    routine: ObjectId::new(schema, format!("{name}({signature})")),
+                }
+            }
+            _ => ViewDependencyTarget::Type {
+                ty: ObjectId::new(schema, name),
+            },
+        };
+        let dependency =
+            crate::_internal::db::cache::ViewObjectDependencyCache { dependent, target };
+        if !dependencies.contains(&dependency) {
+            dependencies.push(dependency);
+        }
+    }
+    Ok(dependencies)
 }
 
 fn load_view_dependencies(
@@ -3568,6 +3689,14 @@ fn populate_cache_from_client(
     // pg_depend rows use PostgreSQL dependency codes (n/a/i) and were ignored
     // after synchronization, so avoid loading them into Cache V8.
     cache.dependencies = load_view_dependencies(client, &schema_values)?;
+    cache.view_object_dependencies = load_view_object_dependencies(
+        client,
+        &schema_values,
+        &cache
+            .builtin_types
+            .clone()
+            .unwrap_or_else(BuiltinTypeCatalogue::fallback),
+    )?;
     coverage.record(CatalogFamily::Dependencies);
     cache.scoped_external_dependencies = load_scoped_external_dependencies(client, &schema_values)?;
     // All scope-boundary queries above completed inside the same repeatable
