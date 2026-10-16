@@ -503,4 +503,30 @@ mod tests {
         let has_failures = Reporter::print_report(&violations, &confidence, &[]);
         assert!(!has_failures);
     }
+
+    #[test]
+    fn every_reported_rule_id_carries_a_title() {
+        // A finding whose id has no descriptor reaches a consumer as a bare
+        // slug, because `rules` is where titles are cited once.
+        for rule in crate::_internal::rules::registry::ALL_SECONDARY_RULES {
+            assert!(
+                crate::_internal::rules::registry::rule_title(rule.id).is_some(),
+                "secondary rule '{}' has no title",
+                rule.id
+            );
+            assert_ne!(rule.title, rule.id, "a title must not be the id");
+        }
+
+        let findings = vec![ReportFinding {
+            violation: make_violation("require-concurrent-drop-index", ViolationTier::Tier2, "x"),
+            location: None,
+            certainty: Certainty::Exact,
+            statement_index: None,
+        }];
+        let report = Reporter::json_report_with_locations(&findings, &Confidence::Exact, &[]);
+        assert_eq!(
+            report["rules"]["require-concurrent-drop-index"],
+            "Require concurrent drop index"
+        );
+    }
 }

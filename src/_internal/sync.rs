@@ -388,7 +388,7 @@ fn write_cache_with_protection_and_limits(
         return Err(error).context("Failed to write cache payload header");
     }
 
-    let versioned = DbCacheVersioned::V10(Box::new(cache));
+    let versioned = DbCacheVersioned::current(cache);
     let bincode_config = bincode::config::standard().with_variable_int_encoding();
 
     let encode_result =
@@ -786,12 +786,18 @@ fn load_view_dependencies(
 fn load_scoped_external_dependencies(
     client: &mut impl GenericClient,
     schema_values: &Option<Vec<String>>,
-) -> Result<Vec<ScopedDependencyEdge>> {
+) -> Result<ScopedExternalDependencies> {
     let Some(schemas) = schema_values else {
-        return Ok(Vec::new());
+        return Ok(ScopedExternalDependencies {
+            edges: Vec::new(),
+            external_schemas: Vec::new(),
+        });
     };
     if schemas.is_empty() {
-        return Ok(Vec::new());
+        return Ok(ScopedExternalDependencies {
+            edges: Vec::new(),
+            external_schemas: Vec::new(),
+        });
     }
     let query = r#"
         SELECT DISTINCT
@@ -818,6 +824,11 @@ fn load_scoped_external_dependencies(
             FROM pg_proc p
             JOIN pg_namespace n ON n.oid = p.pronamespace
             WHERE d.refclassid = 'pg_proc'::regclass AND p.oid = d.refobjid
+            UNION ALL
+            SELECT 'o', NULL, n.nspname, o.oprname
+            FROM pg_operator o
+            JOIN pg_namespace n ON n.oid = o.oprnamespace
+            WHERE d.refclassid = 'pg_operator'::regclass AND o.oid = d.refobjid
         ) ref_side
         LEFT JOIN LATERAL (
             SELECT n.nspname AS schema, c.relname AS name
@@ -857,37 +868,57 @@ fn load_scoped_external_dependencies(
             )
           )
     "#;
-    client
+    let mut edges = Vec::new();
+    let mut external_schemas: std::collections::BTreeSet<String> = Default::default();
+    for row in client
         .query(query, &[schemas])
         .context("Failed to load scoped external dependency boundaries")?
-        .into_iter()
-        .map(|row| {
-            let relkind: Option<String> = row.try_get("ref_relkind")?;
-            let family = match (
-                row.try_get::<_, String>("ref_family")?.as_str(),
-                relkind.as_deref(),
-            ) {
-                ("r", Some("i" | "I")) => CatalogFamily::Indexes,
-                ("r", _) => CatalogFamily::Relations,
-                ("t", _) => CatalogFamily::Types,
-                ("p", _) => CatalogFamily::Routines,
-                (other, _) => return Err(anyhow::anyhow!("unknown dependency family {other}")),
-            };
-            let scoped = ObjectId::new(
-                row.try_get::<_, String>("ref_schema")?,
-                row.try_get::<_, String>("ref_name")?,
-            );
-            let external_schema: Option<String> = row.try_get("dep_schema")?;
-            match external_schema {
-                Some(schema) => Ok(ScopedDependencyEdge::new(
-                    family,
-                    scoped,
-                    ObjectId::new(schema, row.try_get::<_, String>("dep_name")?),
-                )),
-                None => Ok(ScopedDependencyEdge::unresolved_external(family, scoped)),
+    {
+        let relkind: Option<String> = row.try_get("ref_relkind")?;
+        let family = match (
+            row.try_get::<_, String>("ref_family")?.as_str(),
+            relkind.as_deref(),
+        ) {
+            ("r", Some("i" | "I")) => CatalogFamily::Indexes,
+            ("r", _) => CatalogFamily::Relations,
+            ("t", _) => CatalogFamily::Types,
+            ("p", _) => CatalogFamily::Routines,
+            // An operator is a real cross-scope reference, but nothing in the
+            // model is an operator, so it has no family to belong to. It still
+            // names a schema the consumer should know about.
+            ("o", _) => {
+                if let Some(schema) = row.try_get::<_, Option<String>>("dep_schema")? {
+                    external_schemas.insert(schema);
+                }
+                continue;
             }
-        })
-        .collect()
+            (other, _) => return Err(anyhow::anyhow!("unknown dependency family {other}")),
+        };
+        let scoped = ObjectId::new(
+            row.try_get::<_, String>("ref_schema")?,
+            row.try_get::<_, String>("ref_name")?,
+        );
+        let external_schema: Option<String> = row.try_get("dep_schema")?;
+        edges.push(match external_schema {
+            Some(schema) => ScopedDependencyEdge::new(
+                family,
+                scoped,
+                ObjectId::new(schema, row.try_get::<_, String>("dep_name")?),
+            ),
+            None => ScopedDependencyEdge::unresolved_external(family, scoped),
+        });
+    }
+    Ok(ScopedExternalDependencies {
+        edges,
+        external_schemas: external_schemas.into_iter().collect(),
+    })
+}
+
+/// What the scope-boundary query observed: family-attributed edges plus the
+/// schemas that reference the scope through a class the model does not hold.
+struct ScopedExternalDependencies {
+    edges: Vec<ScopedDependencyEdge>,
+    external_schemas: Vec<String>,
 }
 
 fn load_roles(
@@ -2723,6 +2754,19 @@ fn load_routines(
                 FROM unnest(p.proargtypes::oid[]) WITH ORDINALITY AS u(t, n)
                 ORDER BY n
             )::text[] AS arg_types,
+            ARRAY(
+                SELECT pg_catalog.format_type(t, NULL)
+                FROM unnest(
+                    COALESCE(p.proallargtypes, p.proargtypes)::oid[]
+                ) WITH ORDINALITY AS u(t, n)
+                ORDER BY n
+            )::text[] AS all_arg_types,
+            -- PostgreSQL spells an unnamed parameter as an empty name and
+            -- leaves `proargmodes` NULL when every parameter is an input.
+            COALESCE(p.proargnames::text[], ARRAY[]::text[]) AS param_names,
+            COALESCE(p.proargmodes::text[], ARRAY[]::text[]) AS param_modes,
+            p.pronargdefaults::int4 AS default_count,
+            p.proretset AS returns_set,
             pg_catalog.pg_get_function_result(p.oid) AS return_type,
             p.provolatile::text AS volatility,
             p.prokind::text AS routine_kind,
@@ -2780,6 +2824,49 @@ fn load_routines(
             let security_definer: bool = row
                 .try_get("security_definer")
                 .context("routine security mode")?;
+            let all_arg_types = row
+                .try_get::<_, Option<Vec<String>>>("all_arg_types")
+                .context("routine argument types")?
+                .unwrap_or_else(|| raw_arg_types.clone());
+            let param_names = row
+                .try_get::<_, Vec<String>>("param_names")
+                .context("routine parameter names")?;
+            let param_modes = row
+                .try_get::<_, Vec<String>>("param_modes")
+                .context("routine parameter modes")?;
+            let parameters = all_arg_types
+                .iter()
+                .enumerate()
+                .map(|(position, ty)| {
+                    let mode = match param_modes.get(position) {
+                        // An absent `proargmodes` array means every parameter is
+                        // an input, which is how PostgreSQL reads it.
+                        None => crate::_internal::model::function::ParameterMode::In,
+                        Some(code) => crate::_internal::model::function::ParameterMode::from_pg(code)
+                            .ok_or_else(|| anyhow::anyhow!("unknown routine parameter mode {code}"))?,
+                    };
+                    Ok(crate::_internal::model::function::RoutineParameter {
+                        name: param_names
+                            .get(position)
+                            .filter(|name| !name.is_empty())
+                            .cloned(),
+                        mode,
+                        ty: crate::_internal::analysis::resolver::Resolver::normalize_function_arg_type(
+                            ty, builtin_types,
+                        )
+                        .render(),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            debug_assert_eq!(
+                parameters
+                    .iter()
+                    .filter(|parameter| parameter.mode.is_input())
+                    .map(|parameter| parameter.ty.clone())
+                    .collect::<Vec<_>>(),
+                arg_types,
+                "the input signature must be the parameter list restricted to inputs"
+            );
             Ok((
                 id.clone(),
                 crate::_internal::model::function::FunctionState {
@@ -2787,11 +2874,28 @@ fn load_routines(
                     routine_kind,
                     arg_types,
                     arg_type_ids: Vec::new(),
-                    return_type: row
-                        .try_get::<_, Option<String>>("return_type")
-                        .context("routine return type")?
-                        .unwrap_or_default(),
+                    // `pg_get_function_result` renders a set-returning routine
+                    // as `SETOF t`; `proretset` carries the flag, so the type
+                    // is stored alone and the two compare independently.
+                    return_type: {
+                        let rendered = row
+                            .try_get::<_, Option<String>>("return_type")
+                            .context("routine return type")?
+                            .unwrap_or_default();
+                        match rendered.strip_prefix("SETOF ") {
+                            Some(base) => base.to_string(),
+                            None => rendered,
+                        }
+                    },
                     return_type_id: None,
+                    returns_set: row
+                        .try_get("returns_set")
+                        .context("routine SETOF flag")?,
+                    parameters,
+                    default_count: row
+                        .try_get::<_, i32>("default_count")
+                        .context("routine parameter default count")?
+                        .max(0) as u32,
                     volatility,
                     language: row.try_get("language").context("routine language")?,
                     security: if security_definer {
@@ -3698,7 +3802,9 @@ fn populate_cache_from_client(
             .unwrap_or_else(BuiltinTypeCatalogue::fallback),
     )?;
     coverage.record(CatalogFamily::Dependencies);
-    cache.scoped_external_dependencies = load_scoped_external_dependencies(client, &schema_values)?;
+    let scoped_external = load_scoped_external_dependencies(client, &schema_values)?;
+    cache.scoped_external_dependencies = scoped_external.edges;
+    cache.external_referencing_schemas = scoped_external.external_schemas;
     // All scope-boundary queries above completed inside the same repeatable
     // read transaction. Mark this only after every query succeeds; a cache
     // that was assembled programmatically or by a partial loader remains

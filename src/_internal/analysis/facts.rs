@@ -686,7 +686,13 @@ pub(crate) enum ParamModeFact {
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum RetTypeFact {
     Table(Vec<ColumnFact>),
-    Scalar(String),
+    /// A single type. `setof` is kept apart from the type name because
+    /// PostgreSQL stores it in `pg_proc.proretset` and refuses a replacement
+    /// that changes it.
+    Scalar {
+        ty: String,
+        setof: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]

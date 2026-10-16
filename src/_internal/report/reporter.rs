@@ -134,8 +134,8 @@ fn rules_catalogue<'a>(rule_ids: impl Iterator<Item = &'a str>) -> serde_json::V
         if catalogue.contains_key(rule_id) {
             continue;
         }
-        if let Some(descriptor) = registry::find_primary_rule(rule_id) {
-            catalogue.insert(rule_id.to_string(), serde_json::json!(descriptor.title));
+        if let Some(title) = registry::rule_title(rule_id) {
+            catalogue.insert(rule_id.to_string(), serde_json::json!(title));
         }
     }
     serde_json::Value::Object(catalogue)
@@ -224,7 +224,14 @@ impl Reporter {
                 })
                 .collect(),
         );
-        report["rules"] = rules_catalogue(findings.iter().map(|finding| finding.violation.rule_id));
+        // A check that did not run still needs its title, or a consumer cannot
+        // label the entry it is told about.
+        report["rules"] = rules_catalogue(
+            findings
+                .iter()
+                .map(|finding| finding.violation.rule_id)
+                .chain(not_evaluated.iter().map(|entry| entry.rule_id)),
+        );
         report
     }
 
@@ -277,9 +284,7 @@ impl Reporter {
             output.push_str(&format!(
                 "\n### {} — {} (`{}`)\n\n",
                 markdown_tier_label(&violation.tier),
-                registry::find_primary_rule(violation.rule_id)
-                    .map(|descriptor| descriptor.title)
-                    .unwrap_or(violation.rule_id),
+                registry::rule_title(violation.rule_id).unwrap_or(violation.rule_id),
                 markdown_code(violation.rule_id)
             ));
             if let Some(location) = &finding.location {
@@ -335,13 +340,13 @@ impl Reporter {
             if !seen.insert(rule_id) {
                 continue;
             }
-            let Some(descriptor) = registry::find_primary_rule(rule_id) else {
+            let Some(title) = registry::rule_title(rule_id) else {
                 continue;
             };
             output.push_str(&format!(
                 "- `{}` — {}\n",
                 markdown_code(rule_id),
-                markdown_escape(descriptor.title)
+                markdown_escape(title)
             ));
         }
         if output.is_empty() {

@@ -33,12 +33,33 @@ notes are available on the
   relation, reporting an unknown column where PostgreSQL does. `IF NOT EXISTS`
   now skips a name held by any relation, as PostgreSQL's guard covers the whole
   name rather than only an index.
-- `CREATE OR REPLACE FUNCTION` and `ALTER PROCEDURE` no longer lose facts the
-  parser retained. A replacement may not change the routine's return type, and
-  replacing a routine with a different kind reports PostgreSQL's distinct
-  "cannot change routine kind". `ALTER PROCEDURE` applies the option list it
-  carries instead of degrading to an unmodeled statement, and `CREATE
-  AGGREGATE` records the definition the parser kept.
+- `CREATE OR REPLACE` of a routine is checked against every identity rule
+  PostgreSQL applies, in its order: return type and `SETOF`, the `RETURNS record`
+  row descriptor, an already-named input parameter, and the default count. A
+  procedure gaining or losing output parameters is named as such. Comparing the
+  *type* of a retained default needs a parse tree only the server can type, so
+  that case taints rather than claiming a check it cannot make. `ALTER
+  PROCEDURE` applies the option list it carries instead of degrading to an
+  unmodeled statement. Replacing a routine with a different kind reports
+  PostgreSQL's distinct "cannot change routine kind". `CREATE AGGREGATE` now
+  keeps its definition and refuses a state type no catalog holds; its support
+  functions are not yet resolved, because a safe check needs PostgreSQL's
+  aggregate kind and type-coercion rules and a narrower one would reject
+  definitions the server accepts.
+- A synchronized baseline records `proretset`, parameter names and modes, and
+  `pronargdefaults`, so the replacement checks above also apply to a routine
+  that already exists.
+- A report's `rules` object now titles every `rule_id` it names, including a
+  check listed in `not_evaluated` and the auxiliary ids a primary rule reports.
+  Those findings previously reached a consumer with no title.
+- `REINDEX DATABASE <name>` and `REINDEX SYSTEM <name>` are refused unless the
+  name is the database the migration runs against. The new `target_database`
+  setting states it; without it the name is reported as unknown rather than
+  assumed safe. A baseline's `source_database` is where it was synchronized
+  *from* and is never used for this.
+- A schema outside the synchronized scope that depends on an in-scope object
+  through a catalog class the model does not hold, such as an operator, is
+  reported when the scope is suggested to be widened.
 - `certainty` is reported only when it is not `exact`.
 - `ALTER SEQUENCE` now applies every option the statement carries. Options used
   to be read one at a time, so the result depended on clause order and a

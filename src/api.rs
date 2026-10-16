@@ -1429,6 +1429,13 @@ pub fn validate_config(config: &Config) -> Result<(), Error> {
             "assume_pg_version must be a PostgreSQL 14–18 version number",
         ));
     }
+    if let Some(target_database) = config.target_database()
+        && target_database.trim().is_empty()
+    {
+        return Err(Error::configuration(
+            "target_database must name a database when it is set",
+        ));
+    }
     config
         .validate_rule_ids(registry::primary_rule_ids())
         .and_then(|_| config.sync_schemas(None).map(|_| ()))?;

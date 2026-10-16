@@ -45,12 +45,8 @@ fn write_cache_with_timestamp(path: &std::path::Path, created_at_unix_secs: u64)
     let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3).unwrap();
     let config = bincode::config::standard().with_variable_int_encoding();
     encoder.write_all(CACHE_MAGIC).unwrap();
-    bincode::serde::encode_into_std_write(
-        DbCacheVersioned::V10(Box::new(cache)),
-        &mut encoder,
-        config,
-    )
-    .unwrap();
+    bincode::serde::encode_into_std_write(DbCacheVersioned::current(cache), &mut encoder, config)
+        .unwrap();
     encoder.finish().unwrap();
     fs::write(path, compressed).unwrap();
 }
@@ -444,7 +440,7 @@ fn test_cli_lint_invalid_cache() {
 }
 
 #[test]
-fn test_cli_rejects_semantically_contradictory_v7_cache() {
+fn test_cli_rejects_semantically_contradictory_cache() {
     let mut invalid = crate::common::synced_cache();
     invalid.schemas.insert(
         "app".to_string(),
@@ -456,7 +452,7 @@ fn test_cli_rejects_semantically_contradictory_v7_cache() {
     );
     let config = bincode::config::standard().with_variable_int_encoding();
     let encoded =
-        bincode::serde::encode_to_vec(DbCacheVersioned::V10(Box::new(invalid)), config).unwrap();
+        bincode::serde::encode_to_vec(DbCacheVersioned::current(invalid), config).unwrap();
     let mut compressed = Vec::new();
     let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3).unwrap();
     encoder.write_all(CACHE_MAGIC).unwrap();
@@ -481,7 +477,7 @@ fn test_cli_rejects_semantically_contradictory_v7_cache() {
 }
 
 #[test]
-fn test_cli_rejects_authenticated_semantically_contradictory_v7_cache() {
+fn test_cli_rejects_authenticated_semantically_contradictory_cache() {
     let mut invalid = crate::common::synced_cache();
     invalid.schemas.insert(
         "app".to_string(),
@@ -493,7 +489,7 @@ fn test_cli_rejects_authenticated_semantically_contradictory_v7_cache() {
     );
     let config = bincode::config::standard().with_variable_int_encoding();
     let encoded =
-        bincode::serde::encode_to_vec(DbCacheVersioned::V10(Box::new(invalid)), config).unwrap();
+        bincode::serde::encode_to_vec(DbCacheVersioned::current(invalid), config).unwrap();
     let mut compressed = Vec::new();
     let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3).unwrap();
     encoder.write_all(CACHE_MAGIC).unwrap();

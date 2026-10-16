@@ -22,68 +22,17 @@ type DropTarget = (ObjectId, Vec<(ObjectId, ObjectId)>, Vec<ObjectId>);
 
 /// The identity constraints `CREATE OR REPLACE` places on an existing routine.
 ///
-/// PostgreSQL keeps the routine's identity and lets only the body change, so a
-/// replacement that alters the return type, the OUT row descriptor, or a named
-/// input parameter is rejected. Changing an IN argument type is not one of
-/// these: it makes a distinct overload.
-fn check_routine_replacement(
-    existing: &FunctionState,
-    function: &CreateFunctionMutation,
-    rendered_return_type: &str,
-    previous_input_names: &[Option<String>],
-    previous_out_names: &[Option<String>],
-) -> Result<(), MutationResult> {
-    let hint = format!("Use DROP {} first.", function.id);
-    if rendered_return_type != existing.return_type {
-        return Err(MutationResult::conflict(format!(
-            "cannot change return type of existing function; {hint}"
-        )));
+/// PostgreSQL keeps the routine's identity and lets only the body change. The
+/// checks below mirror `ProcedureCreate` in order: the return type and the
+/// `SETOF` flag, the `RECORD` row descriptor the OUT parameters imply, the
+/// names of already-named input parameters, and the parameter defaults.
+/// The drop command PostgreSQL names in the hint of a replacement error.
+fn drop_command_for(kind: RoutineKind) -> &'static str {
+    match kind {
+        RoutineKind::Procedure => "DROP PROCEDURE",
+        RoutineKind::Aggregate => "DROP AGGREGATE",
+        RoutineKind::Function | RoutineKind::Window => "DROP FUNCTION",
     }
-
-    // When the return type is RECORD the OUT parameters are the row
-    // descriptor, so their names and types are part of the identity. A single
-    // OUT parameter's name may change; two or more are locked, because a
-    // caller that selected the row type by name would otherwise break.
-    let outs: Vec<&crate::_internal::analysis::facts::ParamFact> = function
-        .params
-        .iter()
-        .filter(|parameter| matches!(parameter.mode, ParamModeFact::Out))
-        .collect();
-    if existing.return_type == "record" && outs.len() > 1 {
-        let previous = previous_out_names;
-        for (position, parameter) in outs.iter().enumerate() {
-            let Some(Some(old_name)) = previous.get(position) else {
-                continue;
-            };
-            if parameter.name.as_deref() != Some(old_name.as_str()) {
-                return Err(MutationResult::conflict(format!(
-                    "cannot change return type of existing function; \
-                     row type defined by OUT parameters is different; {hint}"
-                )));
-            }
-        }
-    }
-
-    // A parameter that already carries a name is locked; PostgreSQL allows a
-    // formerly unnamed input parameter to be given one.
-    let previous = previous_input_names;
-    let named: Vec<&Option<String>> = function
-        .params
-        .iter()
-        .filter(|parameter| matches!(parameter.mode, ParamModeFact::In))
-        .map(|parameter| &parameter.name)
-        .collect();
-    for (position, new_name) in named.iter().enumerate() {
-        let Some(old_name) = previous.get(position).and_then(|name| name.as_ref()) else {
-            continue;
-        };
-        if new_name.as_deref() != Some(old_name.as_str()) {
-            return Err(MutationResult::conflict(format!(
-                "cannot change name of input parameter \"{old_name}\"; {hint}"
-            )));
-        }
-    }
-    Ok(())
 }
 
 impl AnalysisState {
@@ -110,12 +59,10 @@ impl AnalysisState {
     }
 
     /// The routine's return type as `FunctionState` spells it.
-    fn render_routine_return_type(&self, function: &CreateFunctionMutation) -> String {
-        function
-            .return_type
-            .as_ref()
+    fn render_routine_return_type(return_type: Option<&RetTypeFact>) -> String {
+        return_type
             .map(|return_type| match return_type {
-                RetTypeFact::Scalar(ty) => ty.clone(),
+                RetTypeFact::Scalar { ty, .. } => ty.clone(),
                 RetTypeFact::Table(columns) => columns
                     .iter()
                     .map(|column| {
@@ -131,20 +78,192 @@ impl AnalysisState {
             .unwrap_or_default()
     }
 
-    /// The names an existing routine's input parameters carry, in order.
-    ///
-    /// `FunctionState` stores `arg_types` but not the names, and the cache
-    /// representation is fixed, so a replacement cannot be checked against a
-    /// name the state does not carry. PostgreSQL records parameter names in
-    /// `pg_proc.proargnames`; until that is modeled, no name can be locked and
-    /// this reports none.
-    fn named_input_parameters(&self, _id: &ObjectId) -> Vec<Option<String>> {
-        Vec::new()
+    /// Whether a declaration returns a set, which PostgreSQL records in
+    /// `pg_proc.proretset`.
+    fn routine_declares_setof(return_type: Option<&RetTypeFact>) -> bool {
+        matches!(return_type, Some(RetTypeFact::Scalar { setof: true, .. }))
     }
 
-    /// The names an existing routine's OUT parameters carry, in order.
-    fn named_out_parameters(&self, _id: &ObjectId) -> Vec<Option<String>> {
-        Vec::new()
+    /// The declared parameters as `pg_proc` records them: `OUT` parameters and
+    /// `RETURNS TABLE` columns included, in declaration order.
+    fn routine_parameters(
+        params: &[crate::_internal::analysis::facts::ParamFact],
+        return_type: Option<&RetTypeFact>,
+    ) -> Vec<crate::_internal::model::function::RoutineParameter> {
+        use crate::_internal::model::function::{ParameterMode, RoutineParameter};
+        let mut parameters: Vec<RoutineParameter> = params
+            .iter()
+            .map(|parameter| RoutineParameter {
+                name: parameter.name.clone(),
+                mode: match parameter.mode {
+                    ParamModeFact::In => ParameterMode::In,
+                    ParamModeFact::Out => ParameterMode::Out,
+                    ParamModeFact::InOut => ParameterMode::InOut,
+                    ParamModeFact::Variadic => ParameterMode::Variadic,
+                },
+                ty: parameter.ty.clone(),
+            })
+            .collect();
+        // `RETURNS TABLE(a int)` declares output columns the same way, and
+        // PostgreSQL records them with the table-column mode after the
+        // declared parameters.
+        if let Some(RetTypeFact::Table(columns)) = return_type {
+            parameters.extend(columns.iter().map(|column| RoutineParameter {
+                name: Some(column.name.clone()),
+                mode: ParameterMode::Table,
+                ty: column.ty.clone().unwrap_or_else(|| "unknown".to_string()),
+            }));
+        }
+        parameters
+    }
+
+    /// The parameters that carry a default, counted as `pronargdefaults` is.
+    fn routine_default_count(
+        params: &[crate::_internal::analysis::facts::ParamFact],
+        return_type: Option<&RetTypeFact>,
+    ) -> u32 {
+        let declared = params
+            .iter()
+            .filter(|parameter| {
+                parameter.default.is_some() && !matches!(parameter.mode, ParamModeFact::Out)
+            })
+            .count();
+        let table = match return_type {
+            Some(RetTypeFact::Table(columns)) => columns
+                .iter()
+                .filter(|column| column.default.is_some())
+                .count(),
+            _ => 0,
+        };
+        (declared + table) as u32
+    }
+
+    /// An existing routine's parameters, or `None` when nothing is known.
+    fn existing_routine(&self, id: &ObjectId) -> Option<FunctionState> {
+        self.local
+            .functions
+            .get(id)
+            .and_then(|overlay| match overlay {
+                FunctionOverlay::Present(function) => Some(function.clone()),
+                FunctionOverlay::Dropped => None,
+            })
+    }
+
+    /// The identity constraints `CREATE OR REPLACE` places on an existing
+    /// routine. The order and the wording of each rejection follow PostgreSQL.
+    fn check_routine_replacement(
+        &mut self,
+        existing: &FunctionState,
+        id: &ObjectId,
+        params: &[crate::_internal::analysis::facts::ParamFact],
+        return_type: Option<&RetTypeFact>,
+    ) -> Result<(), MutationResult> {
+        let hint = format!(
+            "Use {} {} first.",
+            drop_command_for(existing.routine_kind),
+            id
+        );
+        let declaration = Self::routine_parameters(params, return_type);
+        let declares_outputs = declaration
+            .iter()
+            .any(|parameter| parameter.mode.is_output());
+
+        // The return type and the `SETOF` flag are separate catalog columns,
+        // and either may not change. A procedure has no user-visible return
+        // type: PostgreSQL stores `void` unless it declares output parameters.
+        let (rendered_return_type, returns_set) = if existing.routine_kind == RoutineKind::Procedure
+        {
+            (
+                if declares_outputs { "record" } else { "void" }.to_string(),
+                false,
+            )
+        } else {
+            (
+                Self::render_routine_return_type(return_type),
+                Self::routine_declares_setof(return_type),
+            )
+        };
+        // A migration may spell a type the way the user wrote it while the
+        // catalog reports `format_type`'s spelling, so both sides are reduced
+        // through the built-in catalogue before they are compared.
+        let canonical = |raw: &str| {
+            crate::_internal::analysis::resolver::Resolver::normalize_function_arg_type(
+                raw,
+                self.builtin_types(),
+            )
+            .render()
+        };
+        if canonical(&rendered_return_type) != canonical(&existing.return_type)
+            || returns_set != existing.returns_set
+        {
+            let message = if existing.routine_kind == RoutineKind::Procedure {
+                // PostgreSQL reports the change as one of output parameters.
+                "cannot change whether a procedure has output parameters".to_string()
+            } else {
+                "cannot change return type of existing function".to_string()
+            };
+            return Err(MutationResult::conflict(format!("{message}; {hint}")));
+        }
+
+        // A `RETURNS record` routine's row descriptor is its OUT parameters,
+        // so the descriptor itself is part of what cannot change.
+        if existing.return_type == "record" {
+            let outputs = |parameters: &[crate::_internal::model::function::RoutineParameter]| {
+                parameters
+                    .iter()
+                    .filter(|parameter| parameter.mode.is_output())
+                    .map(|parameter| (parameter.name.clone(), parameter.ty.clone()))
+                    .collect::<Vec<_>>()
+            };
+            if outputs(&existing.parameters) != outputs(&declaration) {
+                return Err(MutationResult::conflict(format!(
+                    "cannot change return type of existing function; \
+                     row type defined by OUT parameters is different; {hint}"
+                )));
+            }
+        }
+
+        // A parameter that already carries a name keeps it; PostgreSQL allows a
+        // formerly unnamed input to be given one.
+        let inputs = |parameters: &[crate::_internal::model::function::RoutineParameter]| {
+            parameters
+                .iter()
+                .filter(|parameter| parameter.mode.is_input())
+                .map(|parameter| parameter.name.clone())
+                .collect::<Vec<_>>()
+        };
+        let previous_inputs = inputs(&existing.parameters);
+        let new_inputs = inputs(&declaration);
+        for (position, old_name) in previous_inputs.iter().enumerate() {
+            let Some(old_name) = old_name else {
+                continue;
+            };
+            match new_inputs.get(position) {
+                Some(Some(new_name)) if new_name == old_name => {}
+                _ => {
+                    return Err(MutationResult::conflict(format!(
+                        "cannot change name of input parameter \"{old_name}\"; {hint}"
+                    )));
+                }
+            }
+        }
+
+        // Defaults may be added but never removed, because a call that relied on
+        // one would stop resolving.
+        let new_defaults = Self::routine_default_count(params, return_type);
+        if new_defaults < existing.default_count {
+            return Err(MutationResult::conflict(format!(
+                "cannot remove parameter defaults from existing function; {hint}"
+            )));
+        }
+        // PostgreSQL then compares the type of each retained default. Default
+        // expressions are stored as parse trees only the server can type, so
+        // with both sides carrying defaults that comparison is undecidable here
+        // rather than assumed to hold.
+        if existing.default_count > 0 && new_defaults > 0 {
+            self.taint(EvidenceCode::UnsupportedSemantics, EvidenceScope::Chain);
+        }
+        Ok(())
     }
 
     pub(super) fn apply_create_function(
@@ -191,23 +310,15 @@ impl AnalysisState {
             _ => {}
         }
         if function.or_replace
-            && let Some(existing) =
-                self.local
-                    .functions
-                    .get(&function.id)
-                    .and_then(|overlay| match overlay {
-                        FunctionOverlay::Present(existing) => Some(existing.clone()),
-                        FunctionOverlay::Dropped => None,
-                    })
+            && let Some(existing) = self.existing_routine(&function.id)
+            && let Err(result) = self.check_routine_replacement(
+                &existing,
+                &function.id,
+                &function.params,
+                function.return_type.as_ref(),
+            )
         {
-            let rendered = self.render_routine_return_type(function);
-            let names = self.named_input_parameters(&function.id);
-            let outs = self.named_out_parameters(&function.id);
-            if let Err(result) =
-                check_routine_replacement(&existing, function, &rendered, &names, &outs)
-            {
-                return result;
-            }
+            return result;
         }
         self.snapshot_function(&function.id);
         self.snapshot_generation_counter();
@@ -263,48 +374,36 @@ impl AnalysisState {
                     FunctionOverlay::Present(existing) => existing.internal_type_owner.clone(),
                     FunctionOverlay::Dropped => None,
                 });
+        let parameters = Self::routine_parameters(&function.params, function.return_type.as_ref());
         self.local.functions.insert(
             function.id.clone(),
             FunctionOverlay::Present(FunctionState {
                 id: function.id.clone(),
                 internal_type_owner,
                 routine_kind,
-                arg_types: function
-                    .params
+                arg_types: parameters
                     .iter()
-                    .filter(|parameter| !matches!(&parameter.mode, ParamModeFact::Out))
+                    .filter(|parameter| parameter.mode.is_input())
                     .map(|parameter| parameter.ty.clone())
                     .collect(),
-                arg_type_ids: function
-                    .params
+                arg_type_ids: parameters
                     .iter()
-                    .filter(|parameter| !matches!(&parameter.mode, ParamModeFact::Out))
+                    .filter(|parameter| parameter.mode.is_input())
                     .map(|parameter| self.resolve_type_reference(&parameter.ty))
                     .collect(),
-                return_type: function
-                    .return_type
-                    .as_ref()
-                    .map(|return_type| match return_type {
-                        RetTypeFact::Scalar(ty) => ty.clone(),
-                        RetTypeFact::Table(columns) => columns
-                            .iter()
-                            .map(|column| {
-                                format!(
-                                    "{} {}",
-                                    column.name,
-                                    column.ty.as_deref().unwrap_or("unknown")
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                            .join(", "),
-                    })
-                    .unwrap_or_default(),
+                return_type: Self::render_routine_return_type(function.return_type.as_ref()),
                 return_type_id: function.return_type.as_ref().and_then(|return_type| {
                     match return_type {
-                        RetTypeFact::Scalar(ty) => self.resolve_type_reference(ty),
+                        RetTypeFact::Scalar { ty, .. } => self.resolve_type_reference(ty),
                         RetTypeFact::Table(_) => None,
                     }
                 }),
+                returns_set: Self::routine_declares_setof(function.return_type.as_ref()),
+                parameters,
+                default_count: Self::routine_default_count(
+                    &function.params,
+                    function.return_type.as_ref(),
+                ),
                 volatility,
                 language,
                 security,
@@ -606,6 +705,13 @@ impl AnalysisState {
             }
             RoutineLookup::Tombstone | RoutineLookup::AuthoritativelyAbsent => {}
         }
+        if procedure.or_replace
+            && let Some(existing) = self.existing_routine(&procedure.id)
+            && let Err(result) =
+                self.check_routine_replacement(&existing, &procedure.id, &procedure.params, None)
+        {
+            return result;
+        }
         self.snapshot_function(&procedure.id);
         self.snapshot_generation_counter();
         self.local.generation_counter += 1;
@@ -653,6 +759,10 @@ impl AnalysisState {
             self.taint(EvidenceCode::UnsupportedSemantics, EvidenceScope::Chain);
         }
 
+        let procedure_parameters = Self::routine_parameters(&procedure.params, None);
+        let procedure_declares_outputs = procedure_parameters
+            .iter()
+            .any(|parameter| parameter.mode.is_output());
         self.local.functions.insert(
             procedure.id.clone(),
             FunctionOverlay::Present(FunctionState {
@@ -661,20 +771,28 @@ impl AnalysisState {
                 // procedure or aggregate, so neither can be type-owned.
                 internal_type_owner: None,
                 routine_kind: RoutineKind::Procedure,
-                arg_types: procedure
-                    .params
+                arg_types: procedure_parameters
                     .iter()
-                    .filter(|parameter| !matches!(&parameter.mode, ParamModeFact::Out))
+                    .filter(|parameter| parameter.mode.is_input())
                     .map(|parameter| parameter.ty.clone())
                     .collect(),
-                arg_type_ids: procedure
-                    .params
+                arg_type_ids: procedure_parameters
                     .iter()
-                    .filter(|parameter| !matches!(&parameter.mode, ParamModeFact::Out))
+                    .filter(|parameter| parameter.mode.is_input())
                     .map(|parameter| self.resolve_type_reference(&parameter.ty))
                     .collect(),
-                return_type: "void".to_string(),
+                // `prorettype` is `void` unless the procedure declares output
+                // parameters, which PostgreSQL records as `record`.
+                return_type: if procedure_declares_outputs {
+                    "record"
+                } else {
+                    "void"
+                }
+                .to_string(),
                 return_type_id: None,
+                returns_set: false,
+                parameters: procedure_parameters,
+                default_count: Self::routine_default_count(&procedure.params, None),
                 volatility,
                 language,
                 security,
@@ -826,6 +944,77 @@ impl AnalysisState {
         }
     }
 
+    /// Whether a modeled routine answers to a bare name, ignoring its
+    /// signature. A routine signature is `<name>(<types>)`, so the bare name
+    /// is what precedes the first parenthesis.
+    fn routine_named(&self, name: &str) -> bool {
+        self.local
+            .functions
+            .keys()
+            .any(|id| id.name.split('(').next().is_some_and(|bare| bare == name))
+    }
+
+    /// Refuse a `CREATE AGGREGATE` attribute whose name resolves to nothing in
+    /// the modeled catalog.
+    ///
+    /// PostgreSQL resolves every support function and the state type before it
+    /// records the aggregate, so an attribute that names an object nobody has
+    /// is refused there too. Matching on the name alone is sound in one
+    /// direction only, which is why a name that *is* present is left to the
+    /// evidence rather than treated as proof.
+    fn check_aggregate_attribute(
+        &mut self,
+        attribute: &crate::_internal::analysis::facts::AggregateOptionFact,
+    ) -> Option<MutationResult> {
+        let routine_option = matches!(
+            attribute.name.as_str(),
+            "sfunc"
+                | "finalfunc"
+                | "combinefunc"
+                | "serialfunc"
+                | "deserialfunc"
+                | "mfunc"
+                | "minvfunc"
+                | "mfinalfunc"
+        );
+        let type_option = matches!(attribute.name.as_str(), "stype" | "mfinalfunc_modify");
+        if !routine_option && !type_option {
+            return None;
+        }
+        let name = attribute.value.trim();
+        // A qualified name is resolved against schemas this build may not hold.
+        if name.contains('.') {
+            self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
+            return None;
+        }
+        let resolved = if type_option {
+            self.resolve_type_reference(name).is_some()
+                || self.builtin_types().resolve(name).is_some()
+        } else {
+            self.routine_named(name)
+        };
+        if resolved {
+            return None;
+        }
+        // Absence is only provable for a name the baseline was able to answer
+        // for. A routine can live in `pg_catalog`, which synchronization never
+        // reads, so an unresolved routine name is never proof. A type is
+        // different: the built-in catalogue is complete, so an unscoped
+        // baseline plus no built-in match is a real absence.
+        let provable = type_option
+            && self.baseline_schemas.is_none()
+            && self
+                .baseline_coverage
+                .has(crate::_internal::db::cache::CatalogFamily::Types);
+        if provable {
+            return Some(MutationResult::conflict(format!(
+                "type \"{name}\" does not exist"
+            )));
+        }
+        self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
+        None
+    }
+
     pub(super) fn apply_create_aggregate(
         &mut self,
         aggregate: &CreateAggregateMutation,
@@ -852,14 +1041,23 @@ impl AnalysisState {
             }
             RoutineLookup::Tombstone | RoutineLookup::AuthoritativelyAbsent => {}
         }
-        // The identity is kept for conservative lookup. The definition itself is
-        // recorded on the fact but not applied to the modeled state, so the
-        // aggregate's transition functions, state type, and initial condition
-        // remain unmodeled and nothing downstream may claim exactness.
+        // The definition is retained, and the parts PostgreSQL resolves by
+        // name are checked here: a support function or a state type that no
+        // modeled object carries is refused, exactly as `lookup_agg_function`
+        // and the type lookup refuse it. Anything beyond a name — the
+        // signature a transition function has to match, the state type it has
+        // to return, and the aggregate's own operator set — cannot be decided
+        // from a name alone and is left to the evidence below.
+        for attribute in &aggregate.definition {
+            if let Some(result) = self.check_aggregate_attribute(attribute) {
+                return result;
+            }
+        }
         if !aggregate.definition.is_empty() {
             self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
         }
         self.snapshot_function(&aggregate.id);
+        let aggregate_parameters = Self::routine_parameters(&aggregate.params, None);
         self.local.functions.insert(
             aggregate.id.clone(),
             FunctionOverlay::Present(FunctionState {
@@ -868,20 +1066,23 @@ impl AnalysisState {
                 // procedure or aggregate, so neither can be type-owned.
                 internal_type_owner: None,
                 routine_kind: RoutineKind::Aggregate,
-                arg_types: aggregate
-                    .params
+                arg_types: aggregate_parameters
                     .iter()
-                    .filter(|parameter| !matches!(parameter.mode, ParamModeFact::Out))
+                    .filter(|parameter| parameter.mode.is_input())
                     .map(|parameter| parameter.ty.clone())
                     .collect(),
-                arg_type_ids: aggregate
-                    .params
+                arg_type_ids: aggregate_parameters
                     .iter()
-                    .filter(|parameter| !matches!(parameter.mode, ParamModeFact::Out))
+                    .filter(|parameter| parameter.mode.is_input())
                     .map(|parameter| self.resolve_type_reference(&parameter.ty))
                     .collect(),
+                // `pg_proc.prorettype` of an aggregate is its state type, which
+                // the definition records rather than the parameter list.
                 return_type: String::new(),
                 return_type_id: None,
+                returns_set: false,
+                parameters: aggregate_parameters,
+                default_count: Self::routine_default_count(&aggregate.params, None),
                 volatility: Volatility::Volatile,
                 language: "internal".to_string(),
                 security: SecurityMode::Invoker,

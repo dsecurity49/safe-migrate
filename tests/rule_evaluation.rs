@@ -1,12 +1,11 @@
 mod rule_evaluation_tests {
     use crate::common::*;
+    use safe_migrate::_internal::analysis::evidence::EvidenceCode;
     use safe_migrate::_internal::analysis::state::{AnalysisState, Confidence, RelationOverlay};
     use safe_migrate::_internal::ast::identifiers::ObjectId;
     use safe_migrate::_internal::engine::engine::SafeMigrateEngine;
     use safe_migrate::_internal::model::column::Column;
-    use safe_migrate::_internal::model::function::{
-        FunctionOverlay, FunctionState, RoutineKind, SecurityMode, Volatility,
-    };
+    use safe_migrate::_internal::model::function::{FunctionOverlay, FunctionState, RoutineKind};
     use safe_migrate::_internal::model::relation::{Persistence, RelationKind, RelationState};
     use safe_migrate::_internal::report::violations::ViolationTier;
     use safe_migrate::api::{Certainty, Config, RuleConfig};
@@ -906,16 +905,9 @@ mod rule_evaluation_tests {
         state.local.functions.insert(
             function_id.clone(),
             FunctionOverlay::Present(FunctionState {
-                id: function_id,
-                routine_kind: RoutineKind::Function,
-                arg_types: Vec::new(),
-                arg_type_ids: Vec::new(),
                 return_type: "trigger".into(),
-                return_type_id: None,
-                volatility: Volatility::Volatile,
                 language: "plpgsql".into(),
-                security: SecurityMode::Invoker,
-                internal_type_owner: None,
+                ..FunctionState::with_inputs(function_id, RoutineKind::Function, Vec::new())
             }),
         );
 
@@ -1202,16 +1194,12 @@ mod rule_evaluation_tests {
             cache.functions.insert(
                 routine_id.clone(),
                 FunctionState {
-                    id: routine_id.clone(),
-                    internal_type_owner: None,
-                    routine_kind,
-                    arg_types: vec!["integer".into()],
-                    arg_type_ids: Vec::new(),
                     return_type: "void".into(),
-                    return_type_id: None,
-                    volatility: Volatility::Volatile,
-                    language: "sql".into(),
-                    security: SecurityMode::Invoker,
+                    ..FunctionState::with_inputs(
+                        routine_id.clone(),
+                        routine_kind,
+                        vec!["integer".into()],
+                    )
                 },
             );
             let mut state = AnalysisState::new(cache);
@@ -1779,6 +1767,60 @@ mod rule_evaluation_tests {
                  BEGIN; REINDEX TABLE p; COMMIT;"
             ),
             "Migration chain conflict: REINDEX TABLE cannot run inside a transaction block"
+        );
+    }
+
+    #[test]
+    fn a_named_reindex_target_must_be_the_migration_target() {
+        let engine_for = |database: &str| {
+            SafeMigrateEngine::new(Config::default().with_target_database(database))
+        };
+        let reason = |engine: &SafeMigrateEngine, sql: &str| {
+            let mut state = setup_state();
+            engine
+                .analyze(sql, &mut state)
+                .expect("the statement should analyze")
+                .into_iter()
+                .find(|violation| violation.rule_id == "chain-conflict")
+                .map(|violation| violation.reason)
+                .unwrap_or_default()
+        };
+        let app = engine_for("app");
+
+        // `ReindexMultipleTables` resolves both forms against `MyDatabaseId`,
+        // so a name that is not the current database is refused for either.
+        for form in ["DATABASE", "SYSTEM"] {
+            assert!(
+                reason(&app, &format!("REINDEX {form} other;"))
+                    .contains("can only reindex the currently open database"),
+                "REINDEX {form} must reject a database that is not the target"
+            );
+            assert_eq!(
+                reason(&app, &format!("REINDEX {form} app;")),
+                "",
+                "REINDEX {form} naming the target is legal"
+            );
+        }
+        // An omitted name is the current database by the grammar.
+        assert_eq!(reason(&app, "REINDEX DATABASE;"), "");
+        assert_eq!(reason(&app, "REINDEX SYSTEM;"), "");
+    }
+
+    #[test]
+    fn an_unchecked_reindex_target_name_is_reported_as_unknown() {
+        // Without a configured target the name cannot be checked, and saying
+        // nothing would claim an exactness the analysis does not have.
+        let engine = SafeMigrateEngine::new(Config::default());
+        let mut state = setup_state();
+        engine
+            .analyze("REINDEX DATABASE other;", &mut state)
+            .expect("the statement should analyze");
+        assert!(
+            state
+                .evidence()
+                .iter()
+                .any(|record| record.code == EvidenceCode::UnknownObjectState),
+            "an unresolvable target name must not pass silently"
         );
     }
 

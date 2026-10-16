@@ -43,9 +43,42 @@ const CLASSIFIED: &[(&str, Handling)] = &[
     ("Values", Handling::AllActionsApplied),
 ];
 
+/// The `squawk-syntax` version this build is locked to. The census describes
+/// the grammar that is actually compiled, not whatever else is in the
+/// registry, so the lockfile — not path ordering — is the source of truth.
+const PINNED_SQUAWK_VERSION: &str = "2.65.0";
+
+fn locked_squawk_version() -> String {
+    let lockfile = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.lock");
+    let contents = std::fs::read_to_string(&lockfile)
+        .unwrap_or_else(|error| panic!("cannot read {}: {error}", lockfile.display()));
+    for entry in contents.split("[[package]]") {
+        let is_squawk = entry
+            .lines()
+            .any(|line| line.trim() == r#"name = "squawk-syntax""#);
+        if !is_squawk {
+            continue;
+        }
+        let version = entry.lines().find_map(|line| {
+            line.trim()
+                .strip_prefix("version = \"")?
+                .strip_suffix('"')
+                .map(str::to_owned)
+        });
+        return version.unwrap_or_else(|| panic!("squawk-syntax in Cargo.lock has no version"));
+    }
+    panic!("Cargo.lock does not pin squawk-syntax");
+}
+
 /// The pinned `squawk-syntax` grammar, whose list-bearing productions this
 /// build must classify.
 fn pinned_grammar() -> String {
+    assert_eq!(
+        locked_squawk_version(),
+        PINNED_SQUAWK_VERSION,
+        "squawk-syntax moved. Update PINNED_SQUAWK_VERSION and re-audit every \
+         production the new grammar gives a list."
+    );
     let cargo_home = std::env::var("CARGO_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
@@ -53,6 +86,7 @@ fn pinned_grammar() -> String {
             PathBuf::from(home).join(".cargo")
         });
     let sources = cargo_home.join("registry/src");
+    let wanted = format!("squawk-syntax-{PINNED_SQUAWK_VERSION}");
     let mut found: Vec<PathBuf> = Vec::new();
     for registry in std::fs::read_dir(&sources)
         .unwrap_or_else(|error| panic!("cannot read {}: {error}", sources.display()))
@@ -62,6 +96,9 @@ fn pinned_grammar() -> String {
             continue;
         };
         for crate_dir in crates.flatten() {
+            if crate_dir.file_name() != std::ffi::OsStr::new(&wanted) {
+                continue;
+            }
             let path = crate_dir.path().join("src/postgresql.ungram");
             if path.is_file() {
                 found.push(path);
@@ -71,17 +108,20 @@ fn pinned_grammar() -> String {
     found.sort();
     assert!(
         !found.is_empty(),
-        "the pinned squawk-syntax grammar was not found under {}; \
+        "the pinned {wanted} grammar was not found under {}; \
          this test must fail rather than pass unverified",
         sources.display()
     );
-    let newest = found.pop().expect("checked non-empty");
-    std::fs::read_to_string(newest).expect("grammar is readable")
+    assert!(
+        found.len() == 1,
+        "expected exactly one unpacked {wanted}, found {}: {found:?}; a census of \
+         the wrong copy would describe a grammar this build does not compile",
+        found.len()
+    );
+    let grammar = found.remove(0);
+    std::fs::read_to_string(grammar).expect("grammar is readable")
 }
 
-/// Every production whose right-hand side carries a repeatable list, in both
-/// spellings the grammar uses: a named `field:Type*` and an inline
-/// `field:(Type (',' Type)*)`.
 /// Whether a production body carries a repeatable list, in either spelling:
 /// a named `field:Type*` or the inline `field:(Type (',' Type)*)`.
 fn has_repeatable_list(body: &str) -> bool {

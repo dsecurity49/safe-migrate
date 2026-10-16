@@ -2686,16 +2686,26 @@
    "rule_dir": "rule_32_alter-index",
    "enabled": true,
    "transactional": true,
-   "fixtures": [
-    "safe_003_attach_partition_drop_child.sql",
-    "safe_001_alter_index.sql"
-   ],
-   "expected_live_errors": {
-"safe_003_attach_partition_drop_child.sql": {
-   "sqlstate": "42704",
-     "simulator_rule": "chain-conflict"
-    }
+  "fixtures": [
+   "safe_003_attach_partition_drop_child.sql",
+   "safe_004_attach_partition_drop_child_direct.sql",
+   "safe_005_attach_partition_drop_child_cascade.sql",
+   "safe_001_alter_index.sql"
+  ],
+  "expected_live_errors": {
+   "safe_003_attach_partition_drop_child.sql": {
+    "sqlstate": "42704",
+    "simulator_rule": "chain-conflict"
    },
+   "safe_004_attach_partition_drop_child_direct.sql": {
+    "sqlstate": "2BP01",
+    "simulator_rule": "chain-conflict"
+   },
+   "safe_005_attach_partition_drop_child_cascade.sql": {
+    "sqlstate": "2BP01",
+    "simulator_rule": "chain-conflict"
+   }
+  },
    "schemas": [
     "public",
     "sm_identity",
@@ -2706,15 +2716,16 @@
     "sm_audit",
     "sm_analytics"
    ],
-   "scope": [
-    "relations",
-    "constraints",
-    "indexes"
-   ],
-   "required_relations": [
-    "public.test_table"
-   ],
-   "notes": "Validates ALTER INDEX action parsing, execution safety, and catalog equivalence for rename, tablespace, storage options, and extension dependencies."
+  "scope": [
+   "relations",
+   "constraints",
+   "indexes",
+   "index_partitions"
+  ],
+  "required_relations": [
+   "public.test_table"
+  ],
+  "notes": "Validates ALTER INDEX action parsing, execution safety, and catalog equivalence for rename, tablespace, storage options, extension dependencies, and index attachment."
   }
  ]
 }

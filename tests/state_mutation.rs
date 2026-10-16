@@ -18,7 +18,7 @@ mod state_mutation_tests {
     use safe_migrate::_internal::model::column::Column;
     use safe_migrate::_internal::model::constraint::ConstraintKind;
     use safe_migrate::_internal::model::function::{
-        FunctionOverlay, FunctionState, RoutineKind, SecurityMode, Volatility,
+        FunctionOverlay, FunctionState, RoutineKind, Volatility,
     };
     use safe_migrate::_internal::model::index::{IndexDefinition, index_keys};
     use safe_migrate::_internal::model::relation::{
@@ -4372,6 +4372,250 @@ mod state_mutation_tests {
     }
 
     #[test]
+    fn a_replacement_may_not_change_the_setof_flag() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE FUNCTION rows_out(integer) RETURNS integer
+                     LANGUAGE sql AS $$ SELECT $1 $$;
+                 CREATE OR REPLACE FUNCTION rows_out(integer) RETURNS SETOF integer
+                     LANGUAGE sql AS $$ SELECT $1 $$;",
+                &mut state,
+            )
+            .expect("the statements should analyze");
+        let reason = conflict_reason(
+            &engine,
+            &mut state,
+            "CREATE OR REPLACE FUNCTION rows_out(integer) RETURNS SETOF integer
+                 LANGUAGE sql AS $$ SELECT $1 $$;",
+        );
+        assert!(
+            reason.contains("cannot change return type of existing function"),
+            "`proretset` is its own catalog column, so a set change is a return \
+             type change: {reason}"
+        );
+    }
+
+    #[test]
+    fn a_replacement_may_not_change_the_record_row_descriptor() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE FUNCTION named_row(integer, OUT total integer)
+                     RETURNS record LANGUAGE sql AS $$ SELECT $1, $1 $$;",
+                &mut state,
+            )
+            .expect("the statement should analyze");
+        let reason = conflict_reason(
+            &engine,
+            &mut state,
+            "CREATE OR REPLACE FUNCTION named_row(integer, OUT total text)
+                 RETURNS record LANGUAGE sql AS $$ SELECT $1, $1::text $$;",
+        );
+        assert!(
+            reason.contains("row type defined by OUT parameters is different"),
+            "the OUT parameters are the row descriptor: {reason}"
+        );
+    }
+
+    #[test]
+    fn a_replacement_may_not_rename_an_input_parameter() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE FUNCTION named_input(amount integer) RETURNS integer
+                     LANGUAGE sql AS $$ SELECT amount $$;",
+                &mut state,
+            )
+            .expect("the statement should analyze");
+        let reason = conflict_reason(
+            &engine,
+            &mut state,
+            "CREATE OR REPLACE FUNCTION named_input(total integer) RETURNS integer
+                 LANGUAGE sql AS $$ SELECT total $$;",
+        );
+        assert!(
+            reason.contains("cannot change name of input parameter \"amount\""),
+            "a named argument is part of the call syntax: {reason}"
+        );
+    }
+
+    #[test]
+    fn a_replacement_may_give_an_unnamed_input_a_name() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE FUNCTION namable(integer) RETURNS integer
+                     LANGUAGE sql AS $$ SELECT $1 $$;",
+                &mut state,
+            )
+            .expect("the statement should analyze");
+        engine
+            .analyze(
+                "CREATE OR REPLACE FUNCTION namable(amount integer) RETURNS integer
+                     LANGUAGE sql AS $$ SELECT amount $$;",
+                &mut state,
+            )
+            .expect("naming a formerly unnamed parameter is allowed");
+        assert!(!state.evidence().iter().any(|record| record.code
+            == safe_migrate::_internal::analysis::evidence::EvidenceCode::UnmodeledState));
+    }
+
+    #[test]
+    fn a_replacement_may_not_remove_a_parameter_default() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE FUNCTION defaulted(a integer DEFAULT 5) RETURNS integer
+                     LANGUAGE sql AS $$ SELECT a $$;",
+                &mut state,
+            )
+            .expect("the statement should analyze");
+        let reason = conflict_reason(
+            &engine,
+            &mut state,
+            "CREATE OR REPLACE FUNCTION defaulted(a integer) RETURNS integer
+                 LANGUAGE sql AS $$ SELECT a $$;",
+        );
+        assert!(
+            reason.contains("cannot remove parameter defaults from existing function"),
+            "a call that relied on the default would stop resolving: {reason}"
+        );
+    }
+
+    #[test]
+    fn a_procedure_replacement_may_not_gain_output_parameters() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE PROCEDURE reports() LANGUAGE sql AS $$ SELECT 1 $$;",
+                &mut state,
+            )
+            .expect("the statement should analyze");
+        let reason = conflict_reason(
+            &engine,
+            &mut state,
+            "CREATE OR REPLACE PROCEDURE reports(OUT total integer)
+                 LANGUAGE sql AS $$ SELECT 1 $$;",
+        );
+        assert!(
+            reason.contains("cannot change whether a procedure has output parameters"),
+            "a procedure's `prorettype` is `void` unless it declares output \
+             parameters: {reason}"
+        );
+    }
+
+    #[test]
+    fn a_baseline_replacement_compares_canonical_type_spellings() {
+        // The catalog reports `format_type`'s spelling while a migration may
+        // write the alias, and `int` is not the same text as `integer`.
+        let engine = setup_engine();
+        let mut cache = synced_cache();
+        let id = object_id("public", "spelled(integer)");
+        cache.functions.insert(
+            id.clone(),
+            FunctionState {
+                return_type: "integer".into(),
+                ..FunctionState::with_inputs(
+                    id.clone(),
+                    RoutineKind::Function,
+                    vec!["integer".into()],
+                )
+            },
+        );
+        let mut state = AnalysisState::new(cache);
+        assert_eq!(
+            conflict_reason(
+                &engine,
+                &mut state,
+                "CREATE OR REPLACE FUNCTION spelled(int) RETURNS int
+                     LANGUAGE sql AS $$ SELECT $1 + 1 $$;",
+            ),
+            "",
+            "a body-only replacement must not depend on how the type is spelled"
+        );
+        assert!(
+            conflict_reason(
+                &engine,
+                &mut state,
+                "CREATE OR REPLACE FUNCTION spelled(int) RETURNS text
+                     LANGUAGE sql AS $$ SELECT $1::text $$;",
+            )
+            .contains("cannot change return type"),
+            "a genuinely different type must still be refused"
+        );
+    }
+
+    #[test]
+    fn an_aggregate_state_type_that_names_nothing_is_refused() {
+        // `pg_aggregate.c` resolves the state type against the catalog before it
+        // records anything, and the built-in type catalogue is complete, so an
+        // unscoped baseline proves the absence.
+        let engine = setup_engine();
+        let mut state = setup_state();
+        assert!(
+            conflict_reason(
+                &engine,
+                &mut state,
+                "CREATE AGGREGATE total(integer)
+                     (sfunc = my_transition, stype = no_such_type);",
+            )
+            .contains("type \"no_such_type\" does not exist"),
+            "a state type nobody has is refused the way PostgreSQL refuses it"
+        );
+    }
+
+    #[test]
+    fn an_aggregate_support_function_is_not_declared_missing_from_the_catalog() {
+        // Synchronization never reads `pg_catalog`, so a built-in transition
+        // function such as `int4pl` is not in the modeled universe. Its absence
+        // there is not proof, so the statement must not be refused for it.
+        let engine = setup_engine();
+        let mut state = setup_state();
+        assert_eq!(
+            conflict_reason(
+                &engine,
+                &mut state,
+                "CREATE AGGREGATE total(integer) (sfunc = int4pl, stype = integer);",
+            ),
+            "",
+            "a routine outside the synchronized scope cannot be proven missing"
+        );
+    }
+
+    #[test]
+    fn retained_defaults_make_their_expression_types_unverifiable() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE FUNCTION keeps_default(a integer DEFAULT 5) RETURNS integer
+                     LANGUAGE sql AS $$ SELECT a $$;",
+                &mut state,
+            )
+            .expect("the statement should analyze");
+        engine
+            .analyze(
+                "CREATE OR REPLACE FUNCTION keeps_default(a integer DEFAULT 6) RETURNS integer
+                     LANGUAGE sql AS $$ SELECT a $$;",
+                &mut state,
+            )
+            .expect("retaining a default is allowed");
+        assert!(
+            state.evidence().iter().any(|record| record.code
+                == safe_migrate::_internal::analysis::evidence::EvidenceCode::UnsupportedSemantics),
+            "PostgreSQL compares the type of each retained default, and only the \
+             server can type a default expression"
+        );
+    }
+
+    #[test]
     fn alter_procedure_options_are_applied_rather_than_dropped() {
         use safe_migrate::_internal::model::function::{FunctionOverlay, SecurityMode};
 
@@ -5485,16 +5729,12 @@ mod state_mutation_tests {
         cache.functions.insert(
             function_id.clone(),
             FunctionState {
-                id: function_id.clone(),
-                internal_type_owner: None,
-                routine_kind: safe_migrate::_internal::model::function::RoutineKind::Function,
-                arg_types: vec!["mood".into()],
-                arg_type_ids: Vec::new(),
                 return_type: "mood".into(),
-                return_type_id: None,
-                volatility: Volatility::Volatile,
-                language: "sql".into(),
-                security: SecurityMode::Invoker,
+                ..FunctionState::with_inputs(
+                    function_id.clone(),
+                    safe_migrate::_internal::model::function::RoutineKind::Function,
+                    vec!["mood".into()],
+                )
             },
         );
         let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
@@ -6485,16 +6725,10 @@ mod state_mutation_tests {
             cache.functions.insert(
                 id.clone(),
                 FunctionState {
-                    id,
-                    routine_kind,
-                    arg_types: vec!["integer".into()],
-                    arg_type_ids: Vec::new(),
                     return_type: "integer".into(),
-                    return_type_id: None,
                     volatility: Volatility::Immutable,
                     language: "internal".into(),
-                    security: SecurityMode::Invoker,
-                    internal_type_owner: None,
+                    ..FunctionState::with_inputs(id.clone(), routine_kind, vec!["integer".into()])
                 },
             );
             let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
@@ -6617,20 +6851,17 @@ mod state_mutation_tests {
             cache.functions.insert(
                 id.clone(),
                 FunctionState {
-                    id,
-                    routine_kind,
-                    arg_types: if routine_kind == RoutineKind::Aggregate {
-                        vec!["integer".into()]
-                    } else {
-                        Vec::new()
-                    },
-                    arg_type_ids: Vec::new(),
                     return_type: "integer".into(),
-                    return_type_id: None,
-                    volatility: Volatility::Volatile,
                     language: "internal".into(),
-                    security: SecurityMode::Invoker,
-                    internal_type_owner: None,
+                    ..FunctionState::with_inputs(
+                        id.clone(),
+                        routine_kind,
+                        if routine_kind == RoutineKind::Aggregate {
+                            vec!["integer".into()]
+                        } else {
+                            Vec::new()
+                        },
+                    )
                 },
             );
         }
@@ -6691,16 +6922,12 @@ mod state_mutation_tests {
             cache.functions.insert(
                 routine_id.clone(),
                 FunctionState {
-                    id: routine_id.clone(),
-                    internal_type_owner: None,
-                    routine_kind,
-                    arg_types: vec!["integer".into()],
-                    arg_type_ids: Vec::new(),
                     return_type: "void".into(),
-                    return_type_id: None,
-                    volatility: Volatility::Volatile,
-                    language: "sql".into(),
-                    security: SecurityMode::Invoker,
+                    ..FunctionState::with_inputs(
+                        routine_id.clone(),
+                        routine_kind,
+                        vec!["integer".into()],
+                    )
                 },
             );
             let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);
@@ -6730,16 +6957,8 @@ mod state_mutation_tests {
         fn routine(kind: RoutineKind) -> FunctionState {
             let id = object_id("public", "work(integer)");
             FunctionState {
-                id,
-                routine_kind: kind,
-                arg_types: vec!["integer".into()],
-                arg_type_ids: Vec::new(),
                 return_type: "void".into(),
-                return_type_id: None,
-                volatility: Volatility::Volatile,
-                language: "sql".into(),
-                security: SecurityMode::Invoker,
-                internal_type_owner: None,
+                ..FunctionState::with_inputs(id, kind, vec!["integer".into()])
             }
         }
 
@@ -8975,9 +9194,7 @@ mod state_mutation_tests {
 
     #[test]
     fn test_variadic_function_drop_normalizes_array_alias() {
-        use safe_migrate::_internal::model::function::{
-            FunctionOverlay, FunctionState, SecurityMode, Volatility,
-        };
+        use safe_migrate::_internal::model::function::{FunctionOverlay, FunctionState};
 
         let engine = setup_engine();
         let function_id = object_id("public", "f_safe(integer[])");
@@ -8985,16 +9202,13 @@ mod state_mutation_tests {
         cache.functions.insert(
             function_id.clone(),
             FunctionState {
-                id: function_id.clone(),
-                internal_type_owner: None,
-                routine_kind: safe_migrate::_internal::model::function::RoutineKind::Function,
-                arg_types: vec!["integer[]".to_string()],
-                arg_type_ids: vec![None],
                 return_type: "integer".to_string(),
-                return_type_id: None,
-                volatility: Volatility::Volatile,
-                language: "sql".to_string(),
-                security: SecurityMode::Invoker,
+                arg_type_ids: vec![None],
+                ..FunctionState::with_inputs(
+                    function_id.clone(),
+                    safe_migrate::_internal::model::function::RoutineKind::Function,
+                    vec!["integer[]".to_string()],
+                )
             },
         );
         let mut state = crate::_internal::analysis::state::AnalysisState::new(cache);

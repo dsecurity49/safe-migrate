@@ -316,6 +316,8 @@ pub(crate) struct AnalysisState {
     not_evaluated: Vec<crate::_internal::report::violations::NotEvaluated>,
     /// Version asserted by configuration, used only when the cache lacks one.
     asserted_pg_version_num: Option<u32>,
+    /// Database the migrations are applied to, as stated by configuration.
+    target_database: Option<String>,
     /// Whether the initial cache was loaded from a real cache file. An empty
     /// cache can be a valid baseline for an empty database, so availability
     /// must not be inferred from the number of modeled objects.
@@ -337,6 +339,9 @@ pub(crate) struct AnalysisState {
     pub baseline_fk_dependencies: HashSet<ObjectId>,
     pub baseline_sequences: HashSet<ObjectId>,
     pub scoped_external_dependencies: HashSet<ScopedDependencyEdge>,
+    /// Out-of-scope schemas that reference the scope through a catalog class
+    /// the model does not hold, so no edge can attribute them to a family.
+    pub external_referencing_schemas: BTreeSet<String>,
     pub local: LocalState,
 }
 
@@ -1004,6 +1009,8 @@ impl AnalysisState {
         let baseline_sequences = cache.sequences.keys().cloned().collect();
         let scoped_external_dependencies =
             cache.scoped_external_dependencies.iter().cloned().collect();
+        let external_referencing_schemas =
+            cache.external_referencing_schemas.iter().cloned().collect();
         for sequence in cache.sequences.values() {
             if let Some((table, column)) = &sequence.owned_by {
                 graph.add_edge(DependencyEdge::new(
@@ -1340,6 +1347,7 @@ impl AnalysisState {
             pg_version_num: cache.pg_version_num,
             not_evaluated: Vec::new(),
             asserted_pg_version_num: None,
+            target_database: None,
             baseline_available,
             baseline_boundary_queries_complete,
             baseline_coverage,
@@ -1350,6 +1358,7 @@ impl AnalysisState {
             baseline_fk_dependencies,
             baseline_sequences,
             scoped_external_dependencies,
+            external_referencing_schemas,
             local: LocalState {
                 schemas,
                 relations,
@@ -1508,6 +1517,21 @@ impl AnalysisState {
     pub(crate) fn with_asserted_pg_version(mut self, version: Option<u32>) -> Self {
         self.asserted_pg_version_num = version;
         self
+    }
+
+    /// The database the migrations are applied to, when the caller states it.
+    pub(crate) fn set_target_database(&mut self, database: Option<String>) {
+        self.target_database = database;
+    }
+
+    /// The database the migration runs against, and whether it is known.
+    ///
+    /// PostgreSQL compares a `REINDEX DATABASE`/`REINDEX SYSTEM` name with the
+    /// database its session is attached to. A baseline records where it was
+    /// synchronized *from*, which is a different fact, so it is never used
+    /// here.
+    pub(crate) fn target_database(&self) -> Option<&str> {
+        self.target_database.as_deref()
     }
 
     /// The version in effect and where it came from. An observed cache version
@@ -1712,6 +1736,10 @@ impl AnalysisState {
                 names.insert(external.schema.clone());
             }
         }
+        // A reference through a catalog class the model does not hold — an
+        // operator, today — has no family and therefore no edge, but widening
+        // the scope would still change the answer.
+        names.extend(self.external_referencing_schemas.iter().cloned());
         names.into_iter().collect()
     }
 
@@ -4560,6 +4588,22 @@ mod evidence_tests {
     }
 
     #[test]
+    fn a_reference_through_an_unmodeled_class_still_names_its_schema() {
+        // An operator belongs to no modeled family, so it produces no edge; the
+        // schema that uses it must still be reported, or widening the scope is
+        // never suggested.
+        let mut cache = synced_cache();
+        cache.metadata.schemas = Some(vec!["public".to_string()]);
+        cache.coverage = fully_covering(cache.metadata.schemas.as_deref());
+        cache.external_referencing_schemas = vec!["reporting".to_string()];
+        let state = AnalysisState::new(cache);
+        assert_eq!(
+            state.external_referenced_schemas(),
+            vec!["reporting".to_string()]
+        );
+    }
+
+    #[test]
     fn scoped_baseline_function_drop_requires_cross_schema_dependency_proof() {
         let function_id = ObjectId::new("public", "work(integer)");
         let mut cache = synced_cache();
@@ -4568,16 +4612,12 @@ mod evidence_tests {
         cache.functions.insert(
             function_id.clone(),
             crate::_internal::model::function::FunctionState {
-                id: function_id.clone(),
-                internal_type_owner: None,
-                routine_kind: crate::_internal::model::function::RoutineKind::Function,
-                arg_types: vec!["integer".to_string()],
-                arg_type_ids: Vec::new(),
                 return_type: "integer".to_string(),
-                return_type_id: None,
-                volatility: crate::_internal::model::function::Volatility::Volatile,
-                language: "sql".to_string(),
-                security: crate::_internal::model::function::SecurityMode::Invoker,
+                ..crate::_internal::model::function::FunctionState::with_inputs(
+                    function_id.clone(),
+                    crate::_internal::model::function::RoutineKind::Function,
+                    vec!["integer".to_string()],
+                )
             },
         );
         let mut state = AnalysisState::new(cache);
@@ -4621,16 +4661,12 @@ mod evidence_tests {
     fn routine_cascade_without_dependency_edges_is_not_applied_partially() {
         let id = ObjectId::new("public", "work(integer)");
         let routine = |kind| crate::_internal::model::function::FunctionState {
-            id: id.clone(),
-            internal_type_owner: None,
-            routine_kind: kind,
-            arg_types: vec!["integer".to_string()],
-            arg_type_ids: Vec::new(),
             return_type: "integer".to_string(),
-            return_type_id: None,
-            volatility: crate::_internal::model::function::Volatility::Volatile,
-            language: "sql".to_string(),
-            security: crate::_internal::model::function::SecurityMode::Invoker,
+            ..crate::_internal::model::function::FunctionState::with_inputs(
+                id.clone(),
+                kind,
+                vec!["integer".to_string()],
+            )
         };
         let signature = || crate::_internal::analysis::facts::FunctionSigFact {
             name: crate::_internal::ast::identifiers::QualifiedName::new(

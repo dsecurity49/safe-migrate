@@ -326,7 +326,7 @@ mod tests {
         );
 
         // The current cache format uses bincode.
-        let versioned = crate::_internal::db::cache::DbCacheVersioned::V10(Box::new(cache));
+        let versioned = crate::_internal::db::cache::DbCacheVersioned::current(cache);
         let config = bincode::config::standard().with_variable_int_encoding();
         let encoded = bincode::serde::encode_to_vec(&versioned, config).unwrap();
 
@@ -429,7 +429,7 @@ mod tests {
         });
         cache.insert_baseline(id.clone(), rel);
 
-        let versioned = crate::_internal::db::cache::DbCacheVersioned::V10(Box::new(cache));
+        let versioned = crate::_internal::db::cache::DbCacheVersioned::current(cache);
         let config = bincode::config::standard().with_variable_int_encoding();
         let encoded = bincode::serde::encode_to_vec(&versioned, config).unwrap();
         let decoded: crate::_internal::db::cache::DbCacheVersioned =
@@ -488,16 +488,14 @@ mod tests {
             crate::_internal::model::function::RoutineKind::Window,
         ] {
             let current = crate::_internal::model::function::FunctionState {
-                id: id.clone(),
-                internal_type_owner: None,
-                routine_kind,
-                arg_types: vec!["mood".into()],
-                arg_type_ids: vec![Some(ObjectId::new("public", "mood"))],
                 return_type: "mood".into(),
                 return_type_id: Some(ObjectId::new("public", "mood")),
-                volatility: crate::_internal::model::function::Volatility::Volatile,
-                language: "sql".into(),
-                security: crate::_internal::model::function::SecurityMode::Invoker,
+                arg_type_ids: vec![Some(ObjectId::new("public", "mood"))],
+                ..crate::_internal::model::function::FunctionState::with_inputs(
+                    id.clone(),
+                    routine_kind,
+                    vec!["mood".into()],
+                )
             };
             let current_bytes = bincode::serde::encode_to_vec(&current, config).unwrap();
             assert_ne!(current_bytes, legacy_bytes);

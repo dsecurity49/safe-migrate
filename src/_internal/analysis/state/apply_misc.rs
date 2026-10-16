@@ -16,6 +16,20 @@ const SET_STATISTICS_MIN: i32 = -1;
 /// Largest statistics target PostgreSQL stores without clamping.
 const SET_STATISTICS_MAX: i32 = 10_000;
 
+/// The database a `REINDEX` form names, or `None` when it names none.
+///
+/// Both `DATABASE` and `SYSTEM` carry an optional name that PostgreSQL
+/// resolves against the session's database, so an omitted name is always the
+/// current database and needs no check.
+fn reindex_target_database_name(target: &ReindexTargetMutation) -> Option<&str> {
+    match target {
+        ReindexTargetMutation::Database(name) | ReindexTargetMutation::System(Some(name)) => {
+            (!name.is_empty()).then_some(name.as_str())
+        }
+        _ => None,
+    }
+}
+
 impl AnalysisState {
     pub(super) fn apply_lock_table(&mut self, lock: &LockTableMutation) -> MutationResult {
         for target in &lock.targets {
@@ -118,6 +132,25 @@ impl AnalysisState {
                     return MutationResult::conflict(
                         "cannot reindex system catalogs concurrently".to_string(),
                     );
+                }
+                // `ReindexMultipleTables` resolves both of these forms to
+                // `MyDatabaseId` and refuses a name that is not it. Analysis
+                // has no session, so the name can only be checked against the
+                // configured target; without one it cannot be resolved at all.
+                if let Some(named) = reindex_target_database_name(target) {
+                    match self.target_database() {
+                        // PostgreSQL compares with `strcmp` against the name it
+                        // reads from `pg_database`, so the comparison is exact.
+                        Some(current) if current != named => {
+                            return MutationResult::conflict(format!(
+                                "can only reindex the currently open database, not '{named}'"
+                            ));
+                        }
+                        Some(_) => {}
+                        None => {
+                            self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Statement);
+                        }
+                    }
                 }
                 // The catalog scope of these forms is not modeled, so which
                 // relations they touch remains unknown.

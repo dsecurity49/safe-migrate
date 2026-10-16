@@ -268,6 +268,11 @@ impl SafeMigrateEngine {
         parsed: &Parse<SourceFile>,
         state: &mut AnalysisState,
     ) -> Result<Vec<Violation>, Vec<String>> {
+        // The state machine needs the deployment's identity to judge statements
+        // about it, and the configuration is where that is stated. Every
+        // analysis path funnels through here, so the fact is applied once
+        // rather than by each caller.
+        state.set_target_database(self.config.target_database().map(str::to_owned));
         let errors: Vec<String> = parsed.errors().iter().map(|e| e.to_string()).collect();
         if !errors.is_empty() {
             return Err(errors);

@@ -2987,6 +2987,14 @@ impl AstVisitor {
             }
         }
 
+        // PostgreSQL gives `OWNER TO`, `RENAME TO`, and `SET SCHEMA` their own
+        // statement kinds, each of which ends at its own name; a parameter
+        // option in the same statement is a syntax error rather than an
+        // ordering choice.
+        if action.is_some() && !options.is_empty() {
+            return None;
+        }
+
         Some(StatementFact::AlterSequence {
             name,
             if_exists: node.if_exists().is_some(),
@@ -3414,11 +3422,33 @@ impl AstVisitor {
                 .collect();
             crate::_internal::analysis::facts::RetTypeFact::Table(cols)
         } else {
-            let ty = ret
-                .func_type()
-                .map(|t| t.syntax().text().to_string())
-                .unwrap_or_else(|| "unknown".into());
-            crate::_internal::analysis::facts::RetTypeFact::Scalar(ty)
+            // `FuncType` wraps `Type`, and `SETOF` sits on the inner
+            // `PathType`, so the flag has to be read from the parse tree
+            // rather than recovered from the rendered text. The type is kept
+            // without the keyword, matching `pg_proc.prorettype`.
+            match ret.func_type() {
+                Some(func_type) => {
+                    let setof_token = match &func_type {
+                        ast::FuncType::Type(ast::Type::PathType(path_type)) => {
+                            path_type.setof_token()
+                        }
+                        _ => None,
+                    };
+                    let text = func_type.syntax().text().to_string();
+                    let ty = match &setof_token {
+                        Some(token) => text[token.text().len()..].trim_start().to_string(),
+                        None => text,
+                    };
+                    crate::_internal::analysis::facts::RetTypeFact::Scalar {
+                        ty,
+                        setof: setof_token.is_some(),
+                    }
+                }
+                None => crate::_internal::analysis::facts::RetTypeFact::Scalar {
+                    ty: "unknown".to_string(),
+                    setof: false,
+                },
+            }
         }
     }
 

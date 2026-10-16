@@ -491,6 +491,12 @@ pub(crate) struct DbCache {
     /// conservative for these identities; an absent entry means no external
     /// dependent was observed when the boundary query ran.
     pub scoped_external_dependencies: Vec<ScopedDependencyEdge>,
+    /// Schemas outside the synchronized scope that depend on an in-scope object
+    /// through a catalog class this build does not model as an object, such as
+    /// an operator. They cannot be attributed to a catalog family, but a
+    /// consumer still has to be told that widening the scope would change the
+    /// answer.
+    pub external_referencing_schemas: Vec<String>,
     pub inheritances: Vec<InheritanceCache>,
     pub index_attachments: Vec<IndexAttachmentCache>,
     pub publications: HashMap<String, PublicationState>,
@@ -505,10 +511,9 @@ pub(crate) struct DbCache {
 // magic must stay one digit wide or the fixed-size prefix read breaks.
 pub(crate) const CACHE_FORMAT_VERSION: u32 = 10;
 
-/// Current durable cache header. V10 records the dependencies from a view to
-/// the routines and types its body uses, which the relation dependency rows
-/// cannot express, alongside the cross-scope edges and built-in type catalogue
-/// it already carried.
+/// Current durable cache header. V10 is unreleased, so its layout is still
+/// being shaped within the version that introduced it; caches anyone holds are
+/// V9 or older, which this header already rejects with resync guidance.
 pub(crate) const CACHE_MAGIC: &[u8] = b"SMCACHE10";
 
 // The prefix read in `api.rs` consumes a fixed number of bytes, so the magic
@@ -536,6 +541,12 @@ pub(crate) enum DbCacheVersioned {
 }
 
 impl DbCacheVersioned {
+    /// The variant this build writes. Naming it in one place keeps a format
+    /// bump from silently leaving a writer or a fixture on a stale layout.
+    pub(crate) fn current(cache: DbCache) -> Self {
+        DbCacheVersioned::V10(Box::new(cache))
+    }
+
     pub(crate) fn format_version(&self) -> u32 {
         match self {
             DbCacheVersioned::V1 => 1,
@@ -608,6 +619,7 @@ impl DbCache {
             dependencies: Vec::new(),
             view_object_dependencies: Vec::new(),
             scoped_external_dependencies: Vec::new(),
+            external_referencing_schemas: Vec::new(),
             inheritances: Vec::new(),
             index_attachments: Vec::new(),
             publications: HashMap::new(),
@@ -3562,7 +3574,7 @@ mod tests {
         });
 
         assert!(
-            DbCacheVersioned::V10(Box::new(cache))
+            DbCacheVersioned::current(cache)
                 .into_cache()
                 .unwrap_err()
                 .contains("missing complete dependency-column evidence")
@@ -3585,7 +3597,7 @@ mod tests {
             detach_pending: false,
         });
         assert!(
-            DbCacheVersioned::V10(Box::new(cache.clone()))
+            DbCacheVersioned::current(cache.clone())
                 .into_cache()
                 .is_ok()
         );
@@ -3616,7 +3628,7 @@ mod tests {
             is_partition: true,
             detach_pending: true,
         });
-        assert!(DbCacheVersioned::V10(Box::new(cache)).into_cache().is_ok());
+        assert!(DbCacheVersioned::current(cache).into_cache().is_ok());
     }
 
     #[test]

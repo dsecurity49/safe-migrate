@@ -82,6 +82,10 @@ Rule titles live once in the top-level `rules` object, keyed by `rule_id`:
 }
 ```
 
+It covers every `rule_id` the report names, in `violations` and `not_evaluated`
+alike, including the auxiliary ids a primary rule reports. `rules --json`
+remains the authoritative list of configurable primary rules.
+
 Additional top-level objects are:
 
 | Field | Contents |
@@ -180,7 +184,9 @@ Cache V10 supplies typed evidence for:
 - indexes, including included and expression/predicate dependency columns;
 - inheritance and partition topology, view dependencies, sequence ownership,
   and standalone sequence references;
-- every `pg_proc.prokind`, publications, and redacted subscriptions;
+- every `pg_proc.prokind` with the columns that make a routine's identity
+  (`proretset`, parameter names and modes, and `pronargdefaults`), plus
+  publications and redacted subscriptions;
 - every `pg_type.typtype` a user can name, including range types and the
   multirange PostgreSQL creates beside them, plus the range constructors it
   records as internally owned by that type.
@@ -199,7 +205,7 @@ The principal precision boundaries are:
 | Partitions | Synchronized predicates retain catalog evidence. Local retained-CHECK synthesis reproduces PostgreSQL-exact constraints for multi-column RANGE (including `MINVALUE`/`MAXVALUE` sentinels), LIST values (including `NULL`), boolean, and mixed-varchar bounds, and for default partitions; HASH partitions form no retained check. Expression keys and missing ancestor predicates remain `Tainted`. |
 | Indexes | Synchronized complex-index dependencies support exact cleanup. Locally parsed complex indexes do not claim that precision. CTAS `WITH NO DATA` and expression indexes remain available to safety rules. |
 | Grants and policies | `ALL TABLES IN SCHEMA` and policy role/expression changes are `Tainted`; their useful modeled effects remain available to security rules. PostgreSQL 17+ `MAINTAIN` is recognized only with a versioned baseline. |
-| Routines and settings | All synchronized routine kinds are modeled; routine DDL without a typed Squawk extractor is opaque. Unknown `RESET` parameters are opaque, while modeled timeouts/search path and schema-neutral settings remain exact. |
+| Routines and settings | All synchronized routine kinds are modeled; routine DDL without a typed Squawk extractor is opaque. Unknown `RESET` parameters are opaque, while modeled timeouts/search path and schema-neutral settings remain exact. `CREATE OR REPLACE` is checked against PostgreSQL's identity rules — return type and `SETOF`, the `RETURNS record` row descriptor, an already-named input parameter, and the default count. Comparing the *type* of a retained default needs a parse tree only the server can type, so that case is `Tainted`. An aggregate's definition is retained and its state type is resolved; its support functions are not resolved yet, and the definition is `Tainted`. |
 | Publications | Sync is database-wide. Table edits without `ONLY` are `Tainted` until effective partition scope is proven. |
 | Subscriptions | Only non-secret fields are cached; connection targets are `Redacted`. Connected create, refresh, and drop operations are `Tainted` because they depend on remote state. |
 

@@ -105,6 +105,23 @@ pub(crate) fn object_id(schema: &str, name: &str) -> ObjectId {
     ObjectId::new(schema, name)
 }
 
+/// The reason of the single `chain-conflict` a statement produces, or `""` when
+/// it produces none. Tests that assert a rejection read PostgreSQL's own words
+/// back rather than a restatement of them.
+pub(crate) fn conflict_reason(
+    engine: &SafeMigrateEngine,
+    state: &mut crate::_internal::analysis::state::AnalysisState,
+    sql: &str,
+) -> String {
+    engine
+        .analyze(sql, state)
+        .expect("the statement should analyze")
+        .into_iter()
+        .find(|violation| violation.rule_id == "chain-conflict")
+        .map(|violation| violation.reason)
+        .unwrap_or_default()
+}
+
 pub(crate) fn database_hosts_are_local(config: &postgres::Config) -> bool {
     config
         .get_hostaddrs()

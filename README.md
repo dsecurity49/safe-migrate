@@ -161,6 +161,9 @@ Without a synchronized baseline, the built-in version fallback is deliberately
 conservative. Set `assume_pg_version` only when the target is known to be
 PostgreSQL 14–18; for example, `assume_pg_version = 170000`.
 
+Set `target_database` to the database the migrations are applied to, for example
+`target_database = "app"`. Checks that depend on it report unknown without it.
+
 Suppress a reviewed finding with its primary rule ID:
 
 ```sql

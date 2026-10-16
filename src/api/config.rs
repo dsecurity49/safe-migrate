@@ -67,6 +67,11 @@ pub struct Config {
     pub(crate) allow_inline_suppressions: bool,
     pub(crate) rules: BTreeMap<String, RuleConfig>,
     pub(crate) assume_pg_version: Option<u32>,
+    /// The database the migrations are applied to. Analysis runs offline, so
+    /// this is the only place the target's identity can come from; PostgreSQL
+    /// checks a `REINDEX DATABASE`/`REINDEX SYSTEM` name against the database
+    /// the session is connected to, and never against a baseline's source.
+    pub(crate) target_database: Option<String>,
     pub(crate) disabled_rules: Vec<String>,
     pub(crate) schemas: Option<Vec<String>>,
 }
@@ -83,6 +88,7 @@ impl Default for Config {
             cache_encryption: false,
             allow_inline_suppressions: false,
             assume_pg_version: None,
+            target_database: None,
             disabled_rules: Vec::new(),
             rules: BTreeMap::new(),
             schemas: None,
@@ -142,6 +148,11 @@ impl Config {
         self.assume_pg_version
     }
 
+    /// The database the migrations are applied to, when the caller states it.
+    pub fn target_database(&self) -> Option<&str> {
+        self.target_database.as_deref()
+    }
+
     /// Return the configured schema scope, or `None` for all non-system schemas.
     pub fn schema_scope(&self) -> Option<&[String]> {
         self.schemas.as_deref()
@@ -190,6 +201,16 @@ impl Config {
     /// target is known. [`Config::validate`] rejects unsupported values.
     pub fn with_assumed_postgres_version(mut self, version_num: u32) -> Self {
         self.assume_pg_version = Some(version_num);
+        self
+    }
+
+    /// Set the database the migrations are applied to.
+    ///
+    /// A `REINDEX DATABASE` or `REINDEX SYSTEM` that names a database is
+    /// checked against this name, because analysis runs without a session.
+    #[must_use]
+    pub fn with_target_database(mut self, database: impl Into<String>) -> Self {
+        self.target_database = Some(database.into());
         self
     }
 
