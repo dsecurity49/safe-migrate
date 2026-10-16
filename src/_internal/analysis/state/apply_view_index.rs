@@ -12,10 +12,8 @@ use crate::_internal::ast::identifiers::ObjectId;
 use crate::_internal::model::column::Column;
 use crate::_internal::model::index::{IndexDefinition, index_keys};
 use crate::_internal::model::relation::{Persistence, RelationKind, RelationState};
-use crate::_internal::model::reloption::{
-    ReloptionOutcome, classify, materialized_view_reloption, view_reloption,
-};
-use std::collections::HashSet;
+use crate::_internal::model::reloption::{ReloptionOutcome, evaluate, spec_by_name};
+use std::collections::{BTreeSet, HashSet};
 
 type RelationLookup = ObjectLookup;
 type IndexLookup = ObjectLookup;
@@ -59,20 +57,36 @@ impl AnalysisState {
         kind: ReloptionTarget,
         attributes: &[crate::_internal::analysis::facts::AttributeFact],
     ) -> MutationResult {
-        let version = self.pg_version().num();
+        let version = self.pg_version();
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
         for attribute in attributes {
-            let verdict = match kind {
-                ReloptionTarget::View => view_reloption(&attribute.name),
-                ReloptionTarget::MaterializedView => materialized_view_reloption(&attribute.name),
-            };
-            match classify(verdict, version) {
-                ReloptionOutcome::Rejected => {
+            // PostgreSQL rejects a repeated option before applying anything.
+            if !seen.insert(attribute.name.as_str()) {
+                return MutationResult::conflict(format!(
+                    "parameter \"{}\" specified more than once",
+                    attribute.name
+                ));
+            }
+            match evaluate(&attribute.name, Some(&attribute.value), kind, version) {
+                ReloptionOutcome::Unrecognized { name } => {
+                    // A name the table does not hold at all may belong to a
+                    // release this build does not model, so it taints: a false
+                    // conflict on a valid migration is worse than stated
+                    // uncertainty. A name the table holds but the running
+                    // version predates is a real rejection.
+                    if spec_by_name(&name).is_some() {
+                        return MutationResult::conflict(format!(
+                            "unrecognized parameter \"{name}\""
+                        ));
+                    }
+                    self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Statement);
+                }
+                ReloptionOutcome::BadValue { name, value } => {
                     return MutationResult::conflict(format!(
-                        "unrecognized parameter \"{}\"",
-                        attribute.name
+                        "invalid value for parameter \"{name}\": {value}"
                     ));
                 }
-                ReloptionOutcome::Unknown => {
+                ReloptionOutcome::Unplaced => {
                     self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Statement);
                 }
                 ReloptionOutcome::Accepted => {}
@@ -636,7 +650,9 @@ impl AnalysisState {
         if let Err(result) = self.ensure_schema_target(&create.id.schema) {
             return result;
         }
-        if create.if_not_exists && self.index_lookup(&create.id) == IndexLookup::Present {
+        // `IF NOT EXISTS` guards the whole name, not just an index: PostgreSQL emits
+        // a notice and skips whatever relation already holds the name.
+        if create.if_not_exists && self.relation_namespace_is_taken(&create.id) {
             return MutationResult::NoOp;
         }
         if self.relation_namespace_is_taken(&create.id) {
@@ -649,6 +665,28 @@ impl AnalysisState {
             format!("index target '{}' cannot be indexed", create.table),
         ) {
             return result;
+        }
+        // Every named key and INCLUDE column must exist on the relation.
+        // PostgreSQL looks each one up by name and rejects an unknown column
+        // before building anything. An expression key is typed rather than
+        // looked up, so only the named columns are checked here.
+        let target_columns: Option<std::collections::HashSet<String>> =
+            match self.local.relations.get(&create.table) {
+                Some(RelationOverlay::Present(relation)) => Some(
+                    relation
+                        .columns
+                        .iter()
+                        .map(|column| column.name.clone())
+                        .collect(),
+                ),
+                _ => None,
+            };
+        if let Some(columns) = target_columns {
+            for column in create.key_columns.iter().chain(&create.included_columns) {
+                if !columns.contains(column) {
+                    return MutationResult::conflict(format!("column \"{column}\" does not exist"));
+                }
+            }
         }
         if create.concurrently
             && self

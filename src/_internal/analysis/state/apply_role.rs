@@ -486,6 +486,7 @@ impl AnalysisState {
                     }
                 }
                 let record_mode = grantor.is_some() && self.local.role_membership_grantors_complete;
+                let pg16_or_later = self.pg_version().satisfies(|version| version >= 160_000);
                 let mut touched = HashSet::new();
                 if let Some(grantor) = grantor.as_ref() {
                     self.snapshot_role_membership_grantors();
@@ -508,9 +509,7 @@ impl AnalysisState {
                                             record.admin = admin;
                                         }
                                         if let Some(inherit) = explicit_inherit
-                                            && self
-                                                .pg_version_num
-                                                .is_some_and(|version| version >= 160_000)
+                                            && pg16_or_later
                                         {
                                             record.inherit = inherit;
                                         }
@@ -533,8 +532,8 @@ impl AnalysisState {
                                         // an existing tuple is only updated
                                         // when an option was specified.
                                         let default_inherit = if self
-                                            .pg_version_num
-                                            .is_some_and(|version| version >= 160_000)
+                                            .pg_version()
+                                            .satisfies(|version| version >= 160_000)
                                         {
                                             member_inherits
                                         } else {
@@ -584,8 +583,8 @@ impl AnalysisState {
                                         grantor: grantor.clone(),
                                         admin: explicit_admin.unwrap_or(false),
                                         inherit: self
-                                            .pg_version_num
-                                            .is_some_and(|version| version < 160_000)
+                                            .pg_version()
+                                            .satisfies(|version| version < 160_000)
                                             || explicit_inherit.unwrap_or(true),
                                         set: explicit_set.unwrap_or(true),
                                     },

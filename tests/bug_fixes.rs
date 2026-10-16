@@ -1323,6 +1323,40 @@ mod phase10_bug_fixes_and_sorting_tests {
     // Bug 14 — Directive parsing tolerates whitespace
     // ─────────────────────────────────────────────
     #[test]
+    fn an_assumed_version_drives_maintain_expansion() {
+        use safe_migrate::_internal::model::relation::{Privilege, RelationOverlay};
+
+        let engine = setup_engine();
+        // No observed version: the config asserts one. Before the fix these
+        // sites read `pg_version_num` directly and saw `None`, so an asserted
+        // version was ignored and MAINTAIN silently went missing.
+        for (version, expected) in [(170_000, true), (160_000, false)] {
+            let mut cache = cache_with_table("public", "t_large", None);
+            cache.pg_version_num = None;
+            let mut state = AnalysisState::new(cache).with_asserted_pg_version(Some(version));
+            engine
+                .analyze("GRANT ALL ON TABLE t_large TO app_user;", &mut state)
+                .expect("GRANT ALL should analyze");
+
+            let Some(RelationOverlay::Present(relation)) =
+                state.local.relations.get(&object_id("public", "t_large"))
+            else {
+                panic!("baseline relation should remain present");
+            };
+            let grantee = object_id("", "app_user");
+            assert_eq!(
+                relation
+                    .privileges
+                    .grants
+                    .get(&grantee)
+                    .is_some_and(|privileges| privileges.contains(&Privilege::Maintain)),
+                expected,
+                "asserted PG {version} GRANT ALL MAINTAIN expansion mismatch"
+            );
+        }
+    }
+
+    #[test]
     fn test_bug014_directive_ignore_with_spaces() {
         let engine = setup_engine();
         let mut state = setup_state();

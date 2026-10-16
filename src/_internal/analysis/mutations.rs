@@ -51,9 +51,11 @@ impl ReindexTargetMutation {
     /// Human-readable name of the reindex target, suitable for violation messages.
     pub(crate) fn object_name(&self) -> String {
         match self {
-            Self::Database(n) | Self::Schema(n) => n.clone(),
-            Self::System(Some(n)) => n.clone(),
-            Self::System(None) => "current database".to_string(),
+            Self::Schema(n) => n.clone(),
+            // The database name is optional for `DATABASE` and `SYSTEM`, and
+            // both forms address the session's database when it is omitted.
+            Self::Database(n) | Self::System(Some(n)) if !n.is_empty() => n.clone(),
+            Self::Database(_) | Self::System(_) => "current database".to_string(),
             Self::Table(id) | Self::Index(id) => format!("{}.{}", id.schema, id.name),
         }
     }
@@ -336,16 +338,55 @@ pub(crate) struct CreateSequenceMutation {
 pub(crate) struct AlterSequenceMutation {
     pub id: ObjectId,
     pub if_exists: bool,
-    pub action: AlterSequenceActionMutation,
+    /// Every option the statement carries, in written order.
+    pub options: Vec<SequenceOptionMutation>,
+    /// At most one statement form beyond the options.
+    pub action: Option<AlterSequenceActionMutation>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum AlterSequenceActionMutation {
-    OwnedBy(Option<(ObjectId, String)>),
     OwnerTo(crate::_internal::analysis::facts::RoleFact),
     RenameTo(ObjectId),
     SetSchema(ObjectId),
-    Other,
+}
+
+/// One resolved `ALTER SEQUENCE` option.
+///
+/// The options of a statement form one bag rather than a clause sequence:
+/// PostgreSQL rejects a repeated option, then cross-checks the merged result.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum SequenceOptionMutation {
+    As(String),
+    Cache(i64),
+    Cycle(bool),
+    Increment(i64),
+    Logged(bool),
+    MaxValue(Option<i64>),
+    MinValue(Option<i64>),
+    OwnedBy(Option<(ObjectId, String)>),
+    SequenceName(String),
+    Start(i64),
+    Restart(Option<i64>),
+}
+
+impl SequenceOptionMutation {
+    /// The name PostgreSQL keys a repeated option on.
+    pub(crate) const fn name(&self) -> &'static str {
+        match self {
+            Self::As(_) => "as",
+            Self::Cache(_) => "cache",
+            Self::Cycle(_) => "cycle",
+            Self::Increment(_) => "increment",
+            Self::Logged(_) => "logged",
+            Self::MaxValue(_) => "maxvalue",
+            Self::MinValue(_) => "minvalue",
+            Self::OwnedBy(_) => "owned_by",
+            Self::SequenceName(_) => "sequence_name",
+            Self::Start(_) => "start",
+            Self::Restart(_) => "restart",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -624,6 +665,9 @@ pub(crate) struct CreateAggregateMutation {
     pub id: ObjectId,
     pub or_replace: bool,
     pub params: Vec<crate::_internal::analysis::facts::ParamFact>,
+    /// The attribute list the parser retained, kept so the applied state can
+    /// record what it does and does not model.
+    pub definition: Vec<crate::_internal::analysis::facts::AggregateOptionFact>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

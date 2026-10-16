@@ -11,7 +11,40 @@ notes are available on the
   `dedup_key`, `fk_dependency_related`, `rule_title`, `rule_summary`, or
   `impact`; rule titles are cited once through a new top-level `rules` object
   keyed by rule id. Consumers must branch on `schema_version`.
+- Relation options (`ALTER VIEW/MATERIALIZED VIEW SET (...)`) are now checked
+  against the server's own option tables, by relation kind. A value outside its
+  option's domain is reported where PostgreSQL reports it — `check_option` is
+  compared whole while a boolean accepts an unambiguous prefix, so `casc` is
+  rejected and `of` is not — and integer bounds are the server's. A repeated
+  option is rejected. `security_definer` is no longer accepted as a view
+  option on any version; it is a routine attribute, and PostgreSQL 15 added
+  `security_invoker` beside `security_barrier` rather than replacing it. A
+  materialized view no longer inherits the view options, and a name absent
+  from the tables still taints rather than conflicting.
+- `REINDEX` now follows PostgreSQL's legality rules instead of modelling every
+  form as acceptable. `REINDEX SYSTEM CONCURRENTLY` is rejected, `REINDEX
+  SCHEMA`/`DATABASE`/`SYSTEM` are rejected inside a transaction block, `REINDEX
+  TABLE` rejects a view, and `REINDEX TABLE` on a partitioned table is rejected
+  inside a transaction block. A temporary relation is no longer reported as
+  needing `CONCURRENTLY` when named as an index, which the old check could not
+  see. `REINDEX DATABASE` without a name now resolves to the session's
+  database, as the grammar allows.
+- `CREATE INDEX` now validates its key and `INCLUDE` columns against the target
+  relation, reporting an unknown column where PostgreSQL does. `IF NOT EXISTS`
+  now skips a name held by any relation, as PostgreSQL's guard covers the whole
+  name rather than only an index.
+- `CREATE OR REPLACE FUNCTION` and `ALTER PROCEDURE` no longer lose facts the
+  parser retained. A replacement may not change the routine's return type, and
+  replacing a routine with a different kind reports PostgreSQL's distinct
+  "cannot change routine kind". `ALTER PROCEDURE` applies the option list it
+  carries instead of degrading to an unmodeled statement, and `CREATE
+  AGGREGATE` records the definition the parser kept.
 - `certainty` is reported only when it is not `exact`.
+- `ALTER SEQUENCE` now applies every option the statement carries. Options used
+  to be read one at a time, so the result depended on clause order and a
+  conflict could be lost entirely. A repeated option, a zero `INCREMENT`, a
+  non-positive `CACHE`, unordered bounds, and a `START` outside the merged
+  bounds are now reported the way PostgreSQL reports them.
 - Remediation is labelled `recipe` in every output. `rules --json` moved to its
   own version 3, which is what tells consumers `remediation` became `recipe`.
 - `CREATE MATERIALIZED VIEW IF NOT EXISTS`, and `ALTER [MATERIALIZED] VIEW IF

@@ -85,25 +85,84 @@ impl AnalysisState {
     pub(super) fn apply_reindex(
         &mut self,
         target: &Option<ReindexTargetMutation>,
+        concurrently: bool,
     ) -> MutationResult {
+        let reindex_is_concurrent = concurrently;
         if let Some(target) = target {
+            // PostgreSQL gives `REINDEX SCHEMA`, `DATABASE` and `SYSTEM`
+            // separate commit points per relation, so none of them can run
+            // inside a transaction block. `CONCURRENTLY` is checked first and
+            // names the form the user wrote.
+            if matches!(
+                target,
+                ReindexTargetMutation::Database(_)
+                    | ReindexTargetMutation::Schema(_)
+                    | ReindexTargetMutation::System(_)
+            ) {
+                let form = match target {
+                    ReindexTargetMutation::Schema(_) => "REINDEX SCHEMA",
+                    ReindexTargetMutation::System(_) => "REINDEX SYSTEM",
+                    _ => "REINDEX DATABASE",
+                };
+                // `PreventInTransactionBlock` only rejects inside an explicit
+                // block, so a statement outside one is legal whatever its form.
+                if self.in_transaction() {
+                    return MutationResult::conflict(format!(
+                        "{form} cannot run inside a transaction block"
+                    ));
+                }
+                // Outside a block PostgreSQL still refuses a concurrent
+                // system-catalog reindex, which is the form's own rule rather
+                // than a transaction rule.
+                if matches!(target, ReindexTargetMutation::System(_)) && reindex_is_concurrent {
+                    return MutationResult::conflict(
+                        "cannot reindex system catalogs concurrently".to_string(),
+                    );
+                }
+                // The catalog scope of these forms is not modeled, so which
+                // relations they touch remains unknown.
+                self.taint(EvidenceCode::UnsupportedSemantics, EvidenceScope::Statement);
+            }
+            // A catalog relation named directly cannot be rebuilt concurrently.
+            if matches!(
+                target,
+                ReindexTargetMutation::Table(_) | ReindexTargetMutation::Index(_)
+            ) && reindex_is_concurrent
+                && self.target_is_catalog(target)
+            {
+                return MutationResult::conflict(
+                    "cannot reindex system catalogs concurrently".to_string(),
+                );
+            }
             match target {
                 ReindexTargetMutation::Database(_)
                 | ReindexTargetMutation::Schema(_)
-                | ReindexTargetMutation::System(_) => {
-                    // System/Database/Schema reindexes affect many relations at once.
-                    // Tracking exact concurrent/transaction state for all of them
-                    // is not currently modeled, so we taint the statement.
-                    self.taint(EvidenceCode::UnsupportedSemantics, EvidenceScope::Statement);
-                }
+                | ReindexTargetMutation::System(_) => {}
                 ReindexTargetMutation::Table(id) => {
                     if let Err(result) = self.ensure_relation_target(
                         id,
-                        |_| true,
+                        // PostgreSQL accepts a table, a materialized view, or a
+                        // partitioned table, and refuses anything else.
+                        |kind| {
+                            // A partitioned table is modeled as a table, so
+                            // the kind predicate is the same as PostgreSQL's.
+                            matches!(
+                                kind,
+                                crate::_internal::model::relation::RelationKind::Table
+                                    | crate::_internal::model::relation::RelationKind::MaterializedView
+                            )
+                        },
                         format!("reindexed relation '{}' does not exist", id),
-                        format!("reindexed relation '{}' is invalid", id),
+                        format!("\"{}\" is not a table or materialized view", id),
                     ) {
                         return result;
+                    }
+                    // A partitioned table has no storage of its own, so its
+                    // partitions are reindexed across commit points.
+                    if self.relation_is_partitioned(id) && self.in_transaction() {
+                        return MutationResult::conflict(
+                            "REINDEX TABLE cannot run inside a transaction block".to_string(),
+                        );
                     }
                 }
                 ReindexTargetMutation::Index(id) => {

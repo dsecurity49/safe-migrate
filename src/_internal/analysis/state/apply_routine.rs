@@ -20,6 +20,72 @@ type RoutineLookup = ObjectLookup;
 /// A routine a drop would take, with the triggers and views that depend on it.
 type DropTarget = (ObjectId, Vec<(ObjectId, ObjectId)>, Vec<ObjectId>);
 
+/// The identity constraints `CREATE OR REPLACE` places on an existing routine.
+///
+/// PostgreSQL keeps the routine's identity and lets only the body change, so a
+/// replacement that alters the return type, the OUT row descriptor, or a named
+/// input parameter is rejected. Changing an IN argument type is not one of
+/// these: it makes a distinct overload.
+fn check_routine_replacement(
+    existing: &FunctionState,
+    function: &CreateFunctionMutation,
+    rendered_return_type: &str,
+    previous_input_names: &[Option<String>],
+    previous_out_names: &[Option<String>],
+) -> Result<(), MutationResult> {
+    let hint = format!("Use DROP {} first.", function.id);
+    if rendered_return_type != existing.return_type {
+        return Err(MutationResult::conflict(format!(
+            "cannot change return type of existing function; {hint}"
+        )));
+    }
+
+    // When the return type is RECORD the OUT parameters are the row
+    // descriptor, so their names and types are part of the identity. A single
+    // OUT parameter's name may change; two or more are locked, because a
+    // caller that selected the row type by name would otherwise break.
+    let outs: Vec<&crate::_internal::analysis::facts::ParamFact> = function
+        .params
+        .iter()
+        .filter(|parameter| matches!(parameter.mode, ParamModeFact::Out))
+        .collect();
+    if existing.return_type == "record" && outs.len() > 1 {
+        let previous = previous_out_names;
+        for (position, parameter) in outs.iter().enumerate() {
+            let Some(Some(old_name)) = previous.get(position) else {
+                continue;
+            };
+            if parameter.name.as_deref() != Some(old_name.as_str()) {
+                return Err(MutationResult::conflict(format!(
+                    "cannot change return type of existing function; \
+                     row type defined by OUT parameters is different; {hint}"
+                )));
+            }
+        }
+    }
+
+    // A parameter that already carries a name is locked; PostgreSQL allows a
+    // formerly unnamed input parameter to be given one.
+    let previous = previous_input_names;
+    let named: Vec<&Option<String>> = function
+        .params
+        .iter()
+        .filter(|parameter| matches!(parameter.mode, ParamModeFact::In))
+        .map(|parameter| &parameter.name)
+        .collect();
+    for (position, new_name) in named.iter().enumerate() {
+        let Some(old_name) = previous.get(position).and_then(|name| name.as_ref()) else {
+            continue;
+        };
+        if new_name.as_deref() != Some(old_name.as_str()) {
+            return Err(MutationResult::conflict(format!(
+                "cannot change name of input parameter \"{old_name}\"; {hint}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 impl AnalysisState {
     fn routine_lookup(
         &self,
@@ -41,6 +107,44 @@ impl AnalysisState {
             }
             None => ObjectLookup::Unknown,
         }
+    }
+
+    /// The routine's return type as `FunctionState` spells it.
+    fn render_routine_return_type(&self, function: &CreateFunctionMutation) -> String {
+        function
+            .return_type
+            .as_ref()
+            .map(|return_type| match return_type {
+                RetTypeFact::Scalar(ty) => ty.clone(),
+                RetTypeFact::Table(columns) => columns
+                    .iter()
+                    .map(|column| {
+                        format!(
+                            "{} {}",
+                            column.name,
+                            column.ty.as_deref().unwrap_or("unknown")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            })
+            .unwrap_or_default()
+    }
+
+    /// The names an existing routine's input parameters carry, in order.
+    ///
+    /// `FunctionState` stores `arg_types` but not the names, and the cache
+    /// representation is fixed, so a replacement cannot be checked against a
+    /// name the state does not carry. PostgreSQL records parameter names in
+    /// `pg_proc.proargnames`; until that is modeled, no name can be locked and
+    /// this reports none.
+    fn named_input_parameters(&self, _id: &ObjectId) -> Vec<Option<String>> {
+        Vec::new()
+    }
+
+    /// The names an existing routine's OUT parameters carry, in order.
+    fn named_out_parameters(&self, _id: &ObjectId) -> Vec<Option<String>> {
+        Vec::new()
     }
 
     pub(super) fn apply_create_function(
@@ -66,6 +170,15 @@ impl AnalysisState {
                     function.id
                 ));
             }
+            // PostgreSQL reports these differently: a plain `CREATE` collides
+            // on the routine's identity, while `OR REPLACE` reaches the kind
+            // check inside the dependency update.
+            RoutineLookup::WrongKind if function.or_replace => {
+                return MutationResult::conflict(format!(
+                    "cannot change routine kind for '{}'",
+                    function.id
+                ));
+            }
             RoutineLookup::WrongKind => {
                 return MutationResult::conflict(format!(
                     "routine '{}' already exists",
@@ -76,6 +189,25 @@ impl AnalysisState {
                 self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
             }
             _ => {}
+        }
+        if function.or_replace
+            && let Some(existing) =
+                self.local
+                    .functions
+                    .get(&function.id)
+                    .and_then(|overlay| match overlay {
+                        FunctionOverlay::Present(existing) => Some(existing.clone()),
+                        FunctionOverlay::Dropped => None,
+                    })
+        {
+            let rendered = self.render_routine_return_type(function);
+            let names = self.named_input_parameters(&function.id);
+            let outs = self.named_out_parameters(&function.id);
+            if let Err(result) =
+                check_routine_replacement(&existing, function, &rendered, &names, &outs)
+            {
+                return result;
+            }
         }
         self.snapshot_function(&function.id);
         self.snapshot_generation_counter();
@@ -218,14 +350,19 @@ impl AnalysisState {
                                     VolatilityKind::Immutable => Volatility::Immutable,
                                 };
                             }
+                            FuncOptionFact::Language(language) => {
+                                existing.language = language.clone();
+                            }
+                            // `SECURITY DEFINER` is stored so the state stays
+                            // faithful to the definition, but no rule reads it:
+                            // privilege escalation is a runtime property, not a
+                            // schema transition, so there is nothing to
+                            // conclude from it during analysis.
                             FuncOptionFact::Security(security) => {
                                 existing.security = match security {
                                     SecurityKind::Invoker => SecurityMode::Invoker,
                                     SecurityKind::Definer => SecurityMode::Definer,
                                 };
-                            }
-                            FuncOptionFact::Language(language) => {
-                                existing.language = language.clone();
                             }
                             _ => {}
                         }
@@ -268,11 +405,7 @@ impl AnalysisState {
     }
 
     /// Whether a view depends on `routine` only through a reference that never
-    /// resolved to a signature.
-    ///
-    /// Such a reference names the routine without saying which overload the view
-    /// calls, so the drop can be neither proved safe nor proved refused. Reporting
-    /// a conflict there would report a drop the server accepts.
+    /// named an overload, while other overloads of that name exist.
     fn view_routine_reference_is_ambiguous(&self, routine: &ObjectId) -> bool {
         self.local
             .graph
@@ -362,14 +495,12 @@ impl AnalysisState {
                         .map(|edge| edge.dependent.clone())
                         .collect();
                     if !dependent_views.is_empty() && !function.cascade {
-                        // A reference that never resolved to a signature names
-                        // the routine only. It decides the question when the
-                        // name has no other overload; otherwise which overload
-                        // the view calls is unknown, and claiming a conflict
-                        // would report a drop the server accepts.
+                        // A reference that never resolved names the routine
+                        // only, and only when several overloads share the name
+                        // is it undecidable which one the view calls.
                         let ambiguous = self.view_routine_reference_is_ambiguous(&id);
                         if ambiguous {
-                            return self.unresolved(EvidenceCode::CatalogCoverageIncomplete);
+                            return self.unresolved(EvidenceCode::UnresolvedReference);
                         }
                         return MutationResult::conflict(format!(
                             "function '{}' is required by view '{}'; use CASCADE",
@@ -593,6 +724,39 @@ impl AnalysisState {
                 }
                 self.move_function(&procedure.id, &new_id);
             }
+            AlterFunctionAction::OptionsChange(options) => {
+                // A procedure takes the same options a function does, so they
+                // apply to the same state fields rather than degrading to an
+                // unmodeled statement.
+                self.snapshot_function(&procedure.id);
+                if let Some(FunctionOverlay::Present(existing)) =
+                    self.local.functions.get_mut(&procedure.id)
+                {
+                    for option in options {
+                        match option {
+                            FuncOptionFact::Volatility(volatility) => {
+                                existing.volatility = match volatility {
+                                    VolatilityKind::Volatile => Volatility::Volatile,
+                                    VolatilityKind::Stable => Volatility::Stable,
+                                    VolatilityKind::Immutable => Volatility::Immutable,
+                                };
+                            }
+                            FuncOptionFact::Security(security) => {
+                                existing.security = match security {
+                                    SecurityKind::Invoker => SecurityMode::Invoker,
+                                    SecurityKind::Definer => SecurityMode::Definer,
+                                };
+                            }
+                            FuncOptionFact::Language(language) => {
+                                existing.language = language.clone();
+                            }
+                            _ => {
+                                return self.unresolved(EvidenceCode::UnmodeledState);
+                            }
+                        }
+                    }
+                }
+            }
             _ => {
                 return self.unresolved(EvidenceCode::UnsupportedSemantics);
             }
@@ -671,6 +835,12 @@ impl AnalysisState {
         }
         match self.routine_lookup(&aggregate.id, |kind| kind == RoutineKind::Aggregate) {
             RoutineLookup::Present if aggregate.or_replace => {}
+            RoutineLookup::WrongKind if aggregate.or_replace => {
+                return MutationResult::conflict(format!(
+                    "cannot change routine kind for '{}'",
+                    aggregate.id
+                ));
+            }
             RoutineLookup::Present | RoutineLookup::WrongKind => {
                 return MutationResult::conflict(format!(
                     "routine '{}' already exists",
@@ -682,11 +852,13 @@ impl AnalysisState {
             }
             RoutineLookup::Tombstone | RoutineLookup::AuthoritativelyAbsent => {}
         }
-        // Aggregate transition options (SFUNC/STYPE/final/combine state and
-        // related catalog dependencies) are not carried by this mutation.
-        // Keep the routine identity for conservative lookup, but never claim
-        // the resulting aggregate state is exact.
-        self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
+        // The identity is kept for conservative lookup. The definition itself is
+        // recorded on the fact but not applied to the modeled state, so the
+        // aggregate's transition functions, state type, and initial condition
+        // remain unmodeled and nothing downstream may claim exactness.
+        if !aggregate.definition.is_empty() {
+            self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
+        }
         self.snapshot_function(&aggregate.id);
         self.local.functions.insert(
             aggregate.id.clone(),

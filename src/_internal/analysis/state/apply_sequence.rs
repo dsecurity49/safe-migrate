@@ -4,13 +4,189 @@ use crate::_internal::analysis::expr_ir::ExprIr;
 use crate::_internal::analysis::graph::{DependencyEdge, DependencyKind};
 use crate::_internal::analysis::mutations::{
     AlterSequenceActionMutation, AlterSequenceMutation, CreateSequenceMutation,
-    DropSequenceMutation,
+    DropSequenceMutation, SequenceOptionMutation,
 };
 use crate::_internal::ast::identifiers::ObjectId;
 use crate::_internal::model::sequence::{SequenceKind, SequenceOverlay, SequenceState};
 use std::collections::HashSet;
 
 type SequenceLookup = ObjectLookup;
+
+/// The value range a sequence data type admits, which is what bounds an
+/// omitted `MINVALUE` or `MAXVALUE`.
+fn sequence_type_bounds(data_type: &str) -> Option<(i64, i64)> {
+    match data_type.trim().to_ascii_lowercase().as_str() {
+        "smallint" | "int2" => Some((i16::MIN as i64, i16::MAX as i64)),
+        "integer" | "int" | "int4" => Some((i32::MIN as i64, i32::MAX as i64)),
+        "bigint" | "int8" => Some((i64::MIN, i64::MAX)),
+        _ => None,
+    }
+}
+
+/// The parameter set an `ALTER SEQUENCE` statement produces.
+///
+/// PostgreSQL merges every option into one parameter set and then cross-checks
+/// the result, so the options are not independent clauses: a repeated option is
+/// rejected, and an omitted bound follows the increment's sign.
+fn merged_sequence_parameters(
+    current: &crate::_internal::model::sequence::SequenceParameters,
+    options: &[SequenceOptionMutation],
+) -> Result<crate::_internal::model::sequence::SequenceParameters, MutationResult> {
+    use crate::_internal::model::sequence::SequencePersistence;
+
+    let mut seen = std::collections::BTreeSet::new();
+    for option in options {
+        if !seen.insert(option.name()) {
+            return Err(MutationResult::conflict(format!(
+                "conflicting or redundant options: \"{}\" specified more than once",
+                option.name()
+            )));
+        }
+    }
+
+    let mut merged = current.clone();
+    // A changed data type re-derives bounds that still sat at the old type's
+    // limits, which is what PostgreSQL's reset_max_value/reset_min_value do.
+    let mut reset_bounds = false;
+    for option in options {
+        match option {
+            SequenceOptionMutation::As(data_type) => {
+                let Some(new_bounds) = sequence_type_bounds(data_type) else {
+                    return Err(MutationResult::conflict(format!(
+                        "sequence data type \"{}\" is invalid",
+                        data_type
+                    )));
+                };
+                if let Some((_, old_max)) = sequence_type_bounds(&current.data_type)
+                    && current.max_value == old_max
+                {
+                    reset_bounds = true;
+                }
+                if let Some((old_min, _)) = sequence_type_bounds(&current.data_type)
+                    && current.min_value == old_min
+                {
+                    reset_bounds = true;
+                }
+                merged.data_type = data_type.clone();
+                let _ = new_bounds;
+            }
+            SequenceOptionMutation::Cache(value) => {
+                if *value <= 0 {
+                    return Err(MutationResult::conflict(
+                        "CACHE must be greater than zero".to_string(),
+                    ));
+                }
+                merged.cache_size = *value;
+            }
+            SequenceOptionMutation::Cycle(value) => merged.cycle = *value,
+            SequenceOptionMutation::Increment(value) => {
+                if *value == 0 {
+                    return Err(MutationResult::conflict(
+                        "INCREMENT must not be zero".to_string(),
+                    ));
+                }
+                merged.increment = *value;
+            }
+            SequenceOptionMutation::Logged(value) => {
+                merged.persistence = if *value {
+                    SequencePersistence::Permanent
+                } else {
+                    SequencePersistence::Unlogged
+                };
+            }
+            SequenceOptionMutation::MaxValue(value) => {
+                merged.max_value = match value {
+                    Some(maximum) => *maximum,
+                    None if merged.increment > 0 || reset_bounds => {
+                        let (_, max) =
+                            sequence_type_bounds(&merged.data_type).ok_or_else(|| {
+                                MutationResult::conflict(format!(
+                                    "sequence data type \"{}\" is invalid",
+                                    merged.data_type
+                                ))
+                            })?;
+                        max
+                    }
+                    None => -1,
+                };
+            }
+            SequenceOptionMutation::MinValue(value) => {
+                merged.min_value = match value {
+                    Some(minimum) => *minimum,
+                    None if merged.increment < 0 || reset_bounds => {
+                        let (min, _) =
+                            sequence_type_bounds(&merged.data_type).ok_or_else(|| {
+                                MutationResult::conflict(format!(
+                                    "sequence data type \"{}\" is invalid",
+                                    merged.data_type
+                                ))
+                            })?;
+                        min
+                    }
+                    None => 1,
+                };
+            }
+            // Ownership is a graph transition rather than a parameter, and the
+            // sequence name is documentation.
+            SequenceOptionMutation::OwnedBy(_) | SequenceOptionMutation::SequenceName(_) => {}
+            SequenceOptionMutation::Start(value) => merged.start_value = *value,
+            // RESTART moves the current value rather than the parameters.
+            SequenceOptionMutation::Restart(_) => {}
+        }
+    }
+
+    if let Some((min, max)) = sequence_type_bounds(&merged.data_type) {
+        if !(min..=max).contains(&merged.min_value) {
+            return Err(MutationResult::conflict(format!(
+                "MINVALUE ({}) is out of range for sequence data type {}",
+                merged.min_value, merged.data_type
+            )));
+        }
+        if !(min..=max).contains(&merged.max_value) {
+            return Err(MutationResult::conflict(format!(
+                "MAXVALUE ({}) is out of range for sequence data type {}",
+                merged.max_value, merged.data_type
+            )));
+        }
+    }
+    if merged.min_value >= merged.max_value {
+        return Err(MutationResult::conflict(format!(
+            "MINVALUE ({}) must be less than MAXVALUE ({})",
+            merged.min_value, merged.max_value
+        )));
+    }
+    if merged.start_value < merged.min_value {
+        return Err(MutationResult::conflict(format!(
+            "START value ({}) cannot be less than MINVALUE ({})",
+            merged.start_value, merged.min_value
+        )));
+    }
+    if merged.start_value > merged.max_value {
+        return Err(MutationResult::conflict(format!(
+            "START value ({}) cannot be greater than MAXVALUE ({})",
+            merged.start_value, merged.max_value
+        )));
+    }
+    if let Some(restart) = options.iter().find_map(|option| match option {
+        SequenceOptionMutation::Restart(value) => Some(*value),
+        _ => None,
+    }) {
+        let restart = restart.unwrap_or(merged.start_value);
+        if restart < merged.min_value {
+            return Err(MutationResult::conflict(format!(
+                "RESTART value ({restart}) cannot be less than MINVALUE ({})",
+                merged.min_value
+            )));
+        }
+        if restart > merged.max_value {
+            return Err(MutationResult::conflict(format!(
+                "RESTART value ({restart}) cannot be greater than MAXVALUE ({})",
+                merged.max_value
+            )));
+        }
+    }
+    Ok(merged)
+}
 
 impl AnalysisState {
     fn sequence_literal_matches(raw: &str, sequence: &ObjectId) -> bool {
@@ -347,71 +523,32 @@ impl AnalysisState {
             Some(SequenceOverlay::Present(sequence)) => sequence.clone(),
             _ => unreachable!("presence checked above"),
         };
-        match &alter.action {
-            AlterSequenceActionMutation::OwnedBy(owned_by) => {
-                if current.kind == SequenceKind::Identity {
-                    return MutationResult::conflict(
-                        "cannot change ownership of an identity sequence".to_string(),
-                    );
-                }
-                if let Some((table_id, column)) = owned_by {
-                    if table_id.schema != alter.id.schema {
-                        return MutationResult::conflict(
-                            "sequence must be in the same schema as its owning table".to_string(),
-                        );
-                    }
-                    if let Err(result) = self.ensure_relation_target(
-                        table_id,
-                        |kind| *kind == crate::_internal::model::relation::RelationKind::Table,
-                        format!("relation '{}' does not exist", table_id),
-                        format!("sequence owner '{}' is not a table", table_id),
-                    ) {
-                        return result;
-                    }
-                    let Some(RelationOverlay::Present(table)) = self.local.relations.get(table_id)
-                    else {
-                        unreachable!("relation target presence checked above");
-                    };
-                    if !table.has_column(column) {
-                        return MutationResult::conflict(format!(
-                            "column '{}.{}' does not exist",
-                            table_id, column
-                        ));
-                    }
-                    if table.owner != current.owner {
-                        return MutationResult::conflict(
-                            "sequence and table must have the same owner".to_string(),
-                        );
-                    }
-                }
-                self.snapshot_sequence(&alter.id);
-                self.snapshot_graph_full();
-                self.local.graph.retain_edges(|edge| {
-                    !(matches!(edge.kind, DependencyKind::SequenceOwnedBy { .. })
-                        && edge.dependent == alter.id)
-                });
-                if let Some(SequenceOverlay::Present(sequence)) =
-                    self.local.sequences.get_mut(&alter.id)
-                {
-                    sequence.owned_by = owned_by.clone();
-                    sequence.kind = if owned_by.is_some() {
-                        SequenceKind::Owned
-                    } else {
-                        SequenceKind::Standalone
-                    };
-                }
-                if let Some((table_id, column)) = owned_by {
-                    self.local.graph.add_edge(DependencyEdge::new(
-                        alter.id.clone(),
-                        table_id.clone(),
-                        DependencyKind::SequenceOwnedBy {
-                            column: column.clone(),
-                        },
-                    ));
-                }
-                MutationResult::Applied
+
+        // The value options merge into one parameter set first: a conflict
+        // there must be found before the statement's other effects land.
+        let merged = match merged_sequence_parameters(&current.parameters, &alter.options) {
+            Ok(merged) => merged,
+            Err(result) => return result,
+        };
+        let owned_by = alter.options.iter().find_map(|option| match option {
+            SequenceOptionMutation::OwnedBy(owned_by) => Some(owned_by),
+            _ => None,
+        });
+
+        if merged != current.parameters {
+            self.snapshot_sequence(&alter.id);
+            if let Some(SequenceOverlay::Present(sequence)) =
+                self.local.sequences.get_mut(&alter.id)
+            {
+                sequence.parameters = merged;
             }
-            AlterSequenceActionMutation::OwnerTo(owner) => {
+        }
+
+        if let Some(owned_by) = owned_by {
+            return self.apply_alter_sequence_owned_by(alter, &current, owned_by);
+        }
+        match &alter.action {
+            Some(AlterSequenceActionMutation::OwnerTo(owner)) => {
                 if current.kind == SequenceKind::Identity {
                     return MutationResult::conflict(
                         "cannot alter an identity sequence independently".to_string(),
@@ -459,8 +596,8 @@ impl AnalysisState {
                 }
                 MutationResult::Applied
             }
-            AlterSequenceActionMutation::RenameTo(new_id)
-            | AlterSequenceActionMutation::SetSchema(new_id) => {
+            Some(AlterSequenceActionMutation::RenameTo(new_id))
+            | Some(AlterSequenceActionMutation::SetSchema(new_id)) => {
                 if current.kind == SequenceKind::Identity {
                     return MutationResult::conflict(
                         "cannot alter an identity sequence independently".to_string(),
@@ -502,12 +639,78 @@ impl AnalysisState {
                 }
                 MutationResult::Applied
             }
-            AlterSequenceActionMutation::Other => {
-                // No typed state transition exists for this Squawk action;
-                // retaining Applied would make subsequent analysis look exact.
-                self.unresolved(EvidenceCode::UnsupportedSemantics)
+            None => MutationResult::Applied,
+        }
+    }
+
+    /// The `OWNED BY` option of an `ALTER SEQUENCE`.
+    ///
+    /// PostgreSQL runs this after the parameter options, so it observes the
+    /// sequence as the rest of the statement left it.
+    fn apply_alter_sequence_owned_by(
+        &mut self,
+        alter: &AlterSequenceMutation,
+        current: &SequenceState,
+        owned_by: &Option<(ObjectId, String)>,
+    ) -> MutationResult {
+        if current.kind == SequenceKind::Identity {
+            return MutationResult::conflict(
+                "cannot change ownership of an identity sequence".to_string(),
+            );
+        }
+        if let Some((table_id, column)) = owned_by {
+            if table_id.schema != alter.id.schema {
+                return MutationResult::conflict(
+                    "sequence must be in the same schema as its owning table".to_string(),
+                );
+            }
+            if let Err(result) = self.ensure_relation_target(
+                table_id,
+                |kind| *kind == crate::_internal::model::relation::RelationKind::Table,
+                format!("relation '{}' does not exist", table_id),
+                format!("sequence owner '{}' is not a table", table_id),
+            ) {
+                return result;
+            }
+            let Some(RelationOverlay::Present(table)) = self.local.relations.get(table_id) else {
+                unreachable!("relation target presence checked above");
+            };
+            if !table.has_column(column) {
+                return MutationResult::conflict(format!(
+                    "column '{}.{}' does not exist",
+                    table_id, column
+                ));
+            }
+            if table.owner != current.owner {
+                return MutationResult::conflict(
+                    "sequence and table must have the same owner".to_string(),
+                );
             }
         }
+        self.snapshot_sequence(&alter.id);
+        self.snapshot_graph_full();
+        self.local.graph.retain_edges(|edge| {
+            !(matches!(edge.kind, DependencyKind::SequenceOwnedBy { .. })
+                && edge.dependent == alter.id)
+        });
+        if let Some(SequenceOverlay::Present(sequence)) = self.local.sequences.get_mut(&alter.id) {
+            sequence.owned_by = owned_by.clone();
+            sequence.kind = if owned_by.is_some() {
+                SequenceKind::Owned
+            } else {
+                SequenceKind::Standalone
+            };
+        }
+        if let Some((table_id, column)) = owned_by {
+            self.local.graph.add_edge(DependencyEdge::new(
+                alter.id.clone(),
+                table_id.clone(),
+                DependencyKind::SequenceOwnedBy {
+                    column: column.clone(),
+                },
+            ));
+        }
+        MutationResult::Applied
     }
 
     pub(super) fn apply_drop_sequence(&mut self, drop: &DropSequenceMutation) -> MutationResult {

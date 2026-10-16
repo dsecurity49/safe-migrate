@@ -3324,9 +3324,12 @@ mod tests {
         assert!(matches!(
             &facts[1],
             StatementFact::AlterSequence {
-                action: crate::_internal::analysis::facts::AlterSequenceActionFact::OwnedBy(None),
+                options,
                 ..
-            }
+            } if matches!(
+                options.as_slice(),
+                [crate::_internal::analysis::facts::SequenceOptionFact::OwnedBy(None)]
+            )
         ));
         assert!(matches!(
             &facts[2],

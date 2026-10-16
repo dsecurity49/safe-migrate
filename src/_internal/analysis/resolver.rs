@@ -513,10 +513,15 @@ impl Resolver {
             StatementFact::AlterSequence {
                 name,
                 if_exists,
+                options,
                 action,
             } => {
                 mutations.push(Self::resolve_alter_sequence(
-                    name, *if_exists, action, state,
+                    name,
+                    *if_exists,
+                    options,
+                    action.as_ref(),
+                    state,
                 ));
             }
             StatementFact::DropSequence {

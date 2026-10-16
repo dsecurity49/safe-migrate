@@ -25,9 +25,11 @@ impl Resolver {
         state: &AnalysisState,
     ) -> Mutation {
         let target = match (target_kind, target_name) {
-            (ReindexTargetKindFact::Database, Some(name)) => {
-                Some(ReindexTargetMutation::Database(name.name.resolve()))
-            }
+            // The grammar makes the database name optional for `DATABASE` and
+            // `SYSTEM` alike, so both forms carry the same identity.
+            (ReindexTargetKindFact::Database, name_opt) => Some(ReindexTargetMutation::Database(
+                name_opt.map(|name| name.name.resolve()).unwrap_or_default(),
+            )),
             (ReindexTargetKindFact::Schema, Some(name)) => {
                 Some(ReindexTargetMutation::Schema(name.name.resolve()))
             }
@@ -127,9 +129,9 @@ impl Resolver {
     /// The routines a view calls, as identities the drop path can match.
     ///
     /// A call whose arguments are all plain column references of the source
-    /// resolves to the exact routine identity. Any other call keeps only the
-    /// qualified name, which still blocks a drop of that name: the call may be
-    /// this overload, and claiming otherwise would be a missed conflict.
+    /// resolves to the exact routine identity. Any other call falls back to the
+    /// lone routine of that name when the modeled universe holds one; only a
+    /// call that is still ambiguous keeps just the qualified name.
     fn resolve_view_routines(
         routines: &[crate::_internal::analysis::facts::RoutineReferenceFact],
         source: Option<&ObjectId>,
@@ -155,26 +157,35 @@ impl Resolver {
                 });
                 ViewRoutine {
                     name: ObjectId::new(name.schema.clone(), name.name.clone()),
-                    signature: signature.map(|arguments| {
-                        ObjectId::new(
-                            name.schema.clone(),
-                            format!(
-                                "{}({})",
-                                name.name,
-                                arguments
-                                    .iter()
-                                    .map(|argument| {
-                                        Resolver::normalize_function_arg_type(
-                                            argument,
-                                            state.builtin_types(),
-                                        )
-                                        .render()
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join(",")
-                            ),
-                        )
-                    }),
+                    signature: signature
+                        .map(|arguments| {
+                            ObjectId::new(
+                                name.schema.clone(),
+                                format!(
+                                    "{}({})",
+                                    name.name,
+                                    arguments
+                                        .iter()
+                                        .map(|argument| {
+                                            Resolver::normalize_function_arg_type(
+                                                argument,
+                                                state.builtin_types(),
+                                            )
+                                            .render()
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join(",")
+                                ),
+                            )
+                        })
+                        .or_else(|| {
+                            // The argument types did not resolve, but a lone routine
+                            // of this name is still the one PostgreSQL picked.
+                            state.unique_routine_named(&ObjectId::new(
+                                name.schema.clone(),
+                                name.name.clone(),
+                            ))
+                        }),
                 }
             })
             .collect()

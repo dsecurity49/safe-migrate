@@ -4158,6 +4158,286 @@ mod state_mutation_tests {
     }
 
     #[test]
+    fn alter_sequence_applies_every_option_regardless_of_order() {
+        use safe_migrate::_internal::model::sequence::SequenceOverlay;
+
+        let engine = setup_engine();
+        let parameters = |sql: &str| {
+            let mut state = setup_state();
+            engine
+                .analyze(sql, &mut state)
+                .expect("ALTER SEQUENCE should analyze");
+            let Some(SequenceOverlay::Present(sequence)) =
+                state.local.sequences.get(&object_id("public", "s"))
+            else {
+                panic!("sequence 's' should remain present");
+            };
+            (sequence.parameters.clone(), sequence.owned_by.clone())
+        };
+        let setup = "CREATE TABLE t (id int); CREATE SEQUENCE s INCREMENT BY 1;";
+
+        // PostgreSQL merges every option into one parameter set, so the
+        // outcome cannot depend on which clause was written first.
+        let increment_first = parameters(&format!(
+            "{setup} ALTER SEQUENCE s INCREMENT BY 2 OWNED BY t.id;"
+        ));
+        let owned_by_first = parameters(&format!(
+            "{setup} ALTER SEQUENCE s OWNED BY t.id INCREMENT BY 2;"
+        ));
+        assert_eq!(
+            increment_first.0.increment, 2,
+            "an option written after OWNED BY must still apply"
+        );
+        assert!(increment_first.1.is_some(), "OWNED BY must still apply");
+        assert_eq!(
+            increment_first, owned_by_first,
+            "clause order must not change the resulting sequence"
+        );
+
+        let (merged, _) = parameters(&format!(
+            "{setup} ALTER SEQUENCE s CACHE 7 CYCLE START 3 INCREMENT BY 4;"
+        ));
+        assert_eq!(merged.cache_size, 7);
+        assert!(merged.cycle);
+        assert_eq!(merged.start_value, 3);
+        assert_eq!(merged.increment, 4);
+
+        let (descending, _) = parameters(&format!(
+            "{setup} ALTER SEQUENCE s INCREMENT BY -1 NO MINVALUE;"
+        ));
+        assert_eq!(descending.min_value, i64::MIN);
+    }
+
+    #[test]
+    fn alter_sequence_rejects_conflicting_and_out_of_range_options() {
+        let engine = setup_engine();
+        let reason = |sql: &str| {
+            let mut state = setup_state();
+            engine
+                .analyze(sql, &mut state)
+                .expect("ALTER SEQUENCE should analyze")
+                .into_iter()
+                .filter(|violation| violation.rule_id == "chain-conflict")
+                .map(|violation| violation.reason)
+                .next()
+                .unwrap_or_default()
+        };
+        let setup = "CREATE TABLE t (id int); CREATE SEQUENCE s INCREMENT BY 1;";
+
+        // PostgreSQL rejects a repeated option before applying anything.
+        let repeated = reason(&format!(
+            "{setup} ALTER SEQUENCE s INCREMENT BY 2 INCREMENT BY 3;"
+        ));
+        assert!(
+            repeated.contains("specified more than once"),
+            "a repeated option must be rejected: {repeated}"
+        );
+        let zero = reason(&format!("{setup} ALTER SEQUENCE s INCREMENT BY 0;"));
+        assert!(
+            zero.contains("INCREMENT") && zero.contains("must not be zero"),
+            "a zero increment must be rejected: {zero}"
+        );
+        let cache = reason(&format!("{setup} ALTER SEQUENCE s CACHE 0;"));
+        assert!(
+            cache.contains("CACHE"),
+            "a non-positive cache must be rejected: {cache}"
+        );
+        let start = reason(&format!("{setup} ALTER SEQUENCE s MAXVALUE 5 START 10;"));
+        assert!(
+            start.contains("cannot be greater than MAXVALUE"),
+            "START is cross-checked against the merged bounds: {start}"
+        );
+        let bounds = reason(&format!("{setup} ALTER SEQUENCE s MINVALUE 50 MAXVALUE 5;"));
+        assert!(
+            bounds.contains("must be less than MAXVALUE"),
+            "the merged bounds must themselves be ordered: {bounds}"
+        );
+        let range = reason(&format!(
+            "{setup} ALTER SEQUENCE s AS smallint MAXVALUE 100000;"
+        ));
+        assert!(
+            range.contains("out of range"),
+            "a bound outside the data type must be rejected: {range}"
+        );
+    }
+
+    #[test]
+    fn create_index_validates_key_and_include_columns() {
+        let engine = setup_engine();
+        let reason = |sql: &str| {
+            let mut state = setup_state();
+            engine
+                .analyze(sql, &mut state)
+                .expect("the statement should analyze")
+                .into_iter()
+                .filter(|violation| violation.rule_id == "chain-conflict")
+                .map(|violation| violation.reason)
+                .next()
+                .unwrap_or_default()
+        };
+
+        // PostgreSQL looks every key and INCLUDE column up by name.
+        assert!(
+            reason("CREATE TABLE t (a int); CREATE INDEX i ON t (nosuch);")
+                .contains("column \"nosuch\" does not exist"),
+            "an unknown key column must be rejected"
+        );
+        assert!(
+            reason("CREATE TABLE t (a int); CREATE INDEX i ON t (a) INCLUDE (nosuch);")
+                .contains("column \"nosuch\" does not exist"),
+            "an unknown INCLUDE column must be rejected"
+        );
+        // An expression key is typed rather than looked up, so it is not a
+        // column-existence question.
+        assert_eq!(
+            reason("CREATE TABLE t (a int); CREATE INDEX i ON t ((a + 1));"),
+            ""
+        );
+        assert_eq!(
+            reason("CREATE TABLE t (a int, b int); CREATE INDEX i ON t (a) INCLUDE (b);"),
+            ""
+        );
+    }
+
+    #[test]
+    fn create_index_if_not_exists_skips_a_name_held_by_another_relation() {
+        let engine = setup_engine();
+        let reason = |sql: &str| {
+            let mut state = setup_state();
+            engine
+                .analyze(sql, &mut state)
+                .expect("the statement should analyze")
+                .into_iter()
+                .filter(|violation| violation.rule_id == "chain-conflict")
+                .map(|violation| violation.reason)
+                .next()
+                .unwrap_or_default()
+        };
+
+        // The guard covers the whole name, not only an index of that name.
+        assert_eq!(
+            reason(
+                "CREATE TABLE t (a int);
+                 CREATE TABLE dup (a int);
+                 CREATE INDEX IF NOT EXISTS dup ON t (a);"
+            ),
+            ""
+        );
+        assert!(
+            reason(
+                "CREATE TABLE t (a int);
+                 CREATE TABLE dup (a int);
+                 CREATE INDEX dup ON t (a);"
+            )
+            .contains("relation 'public.dup' already exists"),
+            "without the guard a same-name relation is a conflict"
+        );
+    }
+
+    #[test]
+    fn replacing_a_function_may_not_change_its_return_type() {
+        let engine = setup_engine();
+        let reason = |sql: &str| {
+            let mut state = setup_state();
+            engine
+                .analyze(sql, &mut state)
+                .expect("the statement should analyze")
+                .into_iter()
+                .filter(|violation| violation.rule_id == "chain-conflict")
+                .map(|violation| violation.reason)
+                .next()
+                .unwrap_or_default()
+        };
+        let setup = "CREATE FUNCTION work(integer) RETURNS integer
+                     LANGUAGE sql AS $$ SELECT $1 $$;";
+
+        assert!(
+            reason(&format!(
+                "{setup}
+                 CREATE OR REPLACE FUNCTION work(integer) RETURNS text
+                     LANGUAGE sql AS $$ SELECT $1::text $$;"
+            ))
+            .contains("cannot change return type of existing function"),
+            "a replacement may not change the return type"
+        );
+        // The same signature with the same return type is the ordinary case.
+        assert_eq!(
+            reason(&format!(
+                "{setup}
+                 CREATE OR REPLACE FUNCTION work(integer) RETURNS integer
+                     LANGUAGE sql AS $$ SELECT $1 + 1 $$;"
+            )),
+            ""
+        );
+    }
+
+    #[test]
+    fn alter_procedure_options_are_applied_rather_than_dropped() {
+        use safe_migrate::_internal::model::function::{FunctionOverlay, SecurityMode};
+
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE PROCEDURE do_work() LANGUAGE sql SECURITY INVOKER AS $$ SELECT 1 $$;
+                 ALTER PROCEDURE do_work() SECURITY DEFINER;",
+                &mut state,
+            )
+            .expect("the statements should analyze");
+        assert!(
+            matches!(
+                state.local.functions.get(&object_id("public", "do_work()")),
+                Some(FunctionOverlay::Present(function)) if function.security == SecurityMode::Definer
+            ),
+            "ALTER PROCEDURE must apply the option it carries"
+        );
+    }
+
+    #[test]
+    fn a_statement_the_build_claims_keeps_every_action() {
+        use safe_migrate::_internal::model::relation::RelationOverlay;
+        use safe_migrate::_internal::model::sequence::SequenceOverlay;
+
+        let engine = setup_engine();
+        let mut state = setup_state();
+        engine
+            .analyze(
+                "CREATE TABLE t (a int, b int);
+                 CREATE SEQUENCE s INCREMENT BY 1;
+                 ALTER TABLE t ADD COLUMN c int, ALTER COLUMN a SET DEFAULT 1;
+                 ALTER SEQUENCE s INCREMENT BY 2 CACHE 5;",
+                &mut state,
+            )
+            .expect("the statements should analyze");
+
+        assert!(
+            state
+                .local
+                .relations
+                .get(&object_id("public", "t"))
+                .is_some_and(|overlay| matches!(
+                    overlay,
+                    RelationOverlay::Present(relation)
+                        if relation.has_column("c") && relation.has_column("a")
+                )),
+            "ALTER TABLE must apply every action it carries"
+        );
+        assert!(
+            state
+                .local
+                .sequences
+                .get(&object_id("public", "s"))
+                .is_some_and(|overlay| matches!(
+                    overlay,
+                    SequenceOverlay::Present(sequence)
+                        if sequence.parameters.increment == 2
+                            && sequence.parameters.cache_size == 5
+                )),
+            "ALTER SEQUENCE must apply every option it carries"
+        );
+    }
+
+    #[test]
     fn sequence_rename_preserves_default_dependency() {
         let engine = setup_engine();
         let mut state = setup_state();
@@ -6306,7 +6586,8 @@ mod state_mutation_tests {
             )
             .unwrap();
         assert!(window_conflict.iter().any(|violation| {
-            violation.rule_id == "chain-conflict" && violation.reason.contains("already exists")
+            violation.rule_id == "chain-conflict"
+                && violation.reason.contains("cannot change routine kind")
         }));
 
         let aggregate_conflict = engine
@@ -6319,7 +6600,8 @@ mod state_mutation_tests {
             )
             .unwrap();
         assert!(aggregate_conflict.iter().any(|violation| {
-            violation.rule_id == "chain-conflict" && violation.reason.contains("already exists")
+            violation.rule_id == "chain-conflict"
+                && violation.reason.contains("cannot change routine kind")
         }));
     }
 

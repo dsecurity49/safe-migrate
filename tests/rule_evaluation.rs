@@ -1577,36 +1577,269 @@ mod rule_evaluation_tests {
     }
 
     #[test]
-    fn view_reloptions_are_version_specific() {
-        // security_definer is the pre-15 inverse of security_invoker.
+    fn security_definer_is_not_a_view_reloption_on_any_version() {
+        use crate::_internal::analysis::mutations::ReloptionTarget;
+        use crate::_internal::analysis::state::PgVersion;
+        use crate::_internal::model::reloption::{ReloptionOutcome, evaluate};
+
+        // It is a routine attribute. PostgreSQL 15 added security_invoker
+        // beside security_barrier rather than replacing anything.
+        for version in [140_000, 150_000, 160_000, 170_000, 180_000] {
+            assert_eq!(
+                evaluate(
+                    "security_definer",
+                    Some("true"),
+                    ReloptionTarget::View,
+                    PgVersion::Observed(version)
+                ),
+                ReloptionOutcome::Unrecognized {
+                    name: "security_definer".to_string()
+                },
+                "PG {version} must not accept security_definer"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reloption_added_in_a_later_release_is_rejected_before_it() {
+        use crate::_internal::analysis::mutations::ReloptionTarget;
+        use crate::_internal::analysis::state::PgVersion;
+        use crate::_internal::model::reloption::{ReloptionOutcome, evaluate};
+
+        let target = ReloptionTarget::View;
         assert_eq!(
-            crate::_internal::model::reloption::classify(
-                crate::_internal::model::reloption::view_reloption("security_definer"),
-                Some(140_000)
+            evaluate(
+                "security_invoker",
+                Some("true"),
+                target,
+                PgVersion::Observed(140_000)
             ),
-            crate::_internal::model::reloption::ReloptionOutcome::Accepted
+            ReloptionOutcome::Unrecognized {
+                name: "security_invoker".to_string()
+            }
         );
         assert_eq!(
-            crate::_internal::model::reloption::classify(
-                crate::_internal::model::reloption::view_reloption("security_definer"),
-                Some(180_000)
+            evaluate(
+                "security_invoker",
+                Some("true"),
+                target,
+                PgVersion::Observed(150_000)
             ),
-            crate::_internal::model::reloption::ReloptionOutcome::Rejected
+            ReloptionOutcome::Accepted
         );
     }
 
     #[test]
-    fn materialized_view_accepts_storage_reloptions_views_reject() {
-        use crate::_internal::model::reloption::{
-            ReloptionOutcome, classify, materialized_view_reloption, view_reloption,
+    fn reloption_values_are_checked_against_their_domain() {
+        use crate::_internal::analysis::mutations::ReloptionTarget;
+        use crate::_internal::analysis::state::PgVersion;
+        use crate::_internal::model::reloption::{ReloptionOutcome, evaluate, parses_as_bool};
+
+        let version = PgVersion::Observed(180_000);
+        let view = ReloptionTarget::View;
+        let bad = |name: &'static str, value: &str| {
+            matches!(
+                evaluate(name, Some(value), view, version),
+                ReloptionOutcome::BadValue { .. }
+            )
         };
+        // parse_bool takes a unique prefix, so these all hold.
+        for value in ["true", "t", "tr", "yes", "y", "on", "1", "TRUE", "of"] {
+            assert!(parses_as_bool(value), "{value} should parse as a bool");
+        }
+        // A bare `o` is ambiguous between on and off, which PostgreSQL
+        // rejects, and a numeric spelling must be exactly `1` or `0`.
+        for value in ["o", "maybe", "2", "01", "truex", ""] {
+            assert!(!parses_as_bool(value), "{value} should not parse");
+        }
+        assert!(bad("security_barrier", "banana"));
+        assert!(bad("security_barrier", "o"));
+        // An enum is compared whole, never by prefix.
+        assert!(bad("check_option", "casc"));
+        assert!(bad("check_option", "banana"));
+        assert!(!bad("check_option", "cascaded"));
         assert_eq!(
-            classify(materialized_view_reloption("fillfactor"), Some(180_000)),
+            evaluate("check_option", Some("LOCAL"), view, version),
+            ReloptionOutcome::Accepted
+        );
+
+        let heap = ReloptionTarget::MaterializedView;
+        assert_eq!(
+            evaluate("fillfactor", Some("100"), heap, version),
+            ReloptionOutcome::Accepted
+        );
+        assert!(matches!(
+            evaluate("fillfactor", Some("5"), heap, version),
+            ReloptionOutcome::BadValue { .. }
+        ));
+        assert!(matches!(
+            evaluate("fillfactor", Some("banana"), heap, version),
+            ReloptionOutcome::BadValue { .. }
+        ));
+    }
+
+    #[test]
+    fn materialized_view_uses_the_heap_options_and_views_do_not() {
+        use crate::_internal::analysis::mutations::ReloptionTarget;
+        use crate::_internal::analysis::state::PgVersion;
+        use crate::_internal::model::reloption::{ReloptionOutcome, evaluate};
+
+        let version = PgVersion::Observed(180_000);
+        assert_eq!(
+            evaluate(
+                "fillfactor",
+                Some("70"),
+                ReloptionTarget::MaterializedView,
+                version
+            ),
             ReloptionOutcome::Accepted
         );
         assert_eq!(
-            classify(view_reloption("fillfactor"), Some(180_000)),
-            ReloptionOutcome::Unknown
+            evaluate("fillfactor", Some("70"), ReloptionTarget::View, version),
+            ReloptionOutcome::Unrecognized {
+                name: "fillfactor".to_string()
+            },
+            "a view has no storage, so it cannot set fillfactor"
+        );
+        for view_only in ["security_barrier", "check_option"] {
+            assert_eq!(
+                evaluate(
+                    view_only,
+                    Some("true"),
+                    ReloptionTarget::MaterializedView,
+                    version
+                ),
+                ReloptionOutcome::Unrecognized {
+                    name: view_only.to_string()
+                },
+                "{view_only} is a view option and must not reach a materialized view"
+            );
+        }
+    }
+
+    #[test]
+    fn a_repeated_reloption_is_rejected() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let v = engine
+            .analyze(
+                "CREATE TABLE base_v (id int);
+                 CREATE VIEW v AS SELECT id FROM base_v;
+                 ALTER VIEW v SET (security_barrier = true, security_barrier = false);",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            v.iter()
+                .any(|violation| violation.reason.contains("specified more than once")),
+            "a repeated option must be rejected: {v:?}"
+        );
+    }
+
+    #[test]
+    fn reindex_follows_postgresql_legality() {
+        let engine = setup_engine();
+        let reason = |sql: &str| {
+            let mut state = setup_state();
+            engine
+                .analyze(sql, &mut state)
+                .expect("the statement should analyze")
+                .into_iter()
+                .filter(|violation| violation.rule_id == "chain-conflict")
+                .map(|violation| violation.reason)
+                .next()
+                .unwrap_or_default()
+        };
+
+        // System catalogs have no concurrent reindex form at any scope.
+        assert_eq!(
+            reason("REINDEX SYSTEM CONCURRENTLY;"),
+            "Migration chain conflict: cannot reindex system catalogs concurrently"
+        );
+        // Each of these takes its own commit point per relation.
+        for (sql, form) in [
+            ("BEGIN; REINDEX SYSTEM; COMMIT;", "REINDEX SYSTEM"),
+            ("BEGIN; REINDEX SCHEMA public; COMMIT;", "REINDEX SCHEMA"),
+            ("BEGIN; REINDEX DATABASE; COMMIT;", "REINDEX DATABASE"),
+        ] {
+            assert_eq!(
+                reason(sql),
+                format!("Migration chain conflict: {form} cannot run inside a transaction block"),
+                "{form} inside a transaction block"
+            );
+        }
+        assert!(
+            reason("CREATE TABLE t (a int); CREATE VIEW v AS SELECT a FROM t; REINDEX TABLE v;")
+                .contains("is not a table or materialized view"),
+            "REINDEX TABLE must reject a view"
+        );
+        assert_eq!(
+            reason(
+                "CREATE TABLE p (a int) PARTITION BY RANGE (a);
+                 BEGIN; REINDEX TABLE p; COMMIT;"
+            ),
+            "Migration chain conflict: REINDEX TABLE cannot run inside a transaction block"
+        );
+    }
+
+    #[test]
+    fn legal_reindex_statements_stay_clean() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let v = engine
+            .analyze(
+                "CREATE TABLE t (a int);
+                 CREATE INDEX t_idx ON t (a);
+                 REINDEX SYSTEM;
+                 REINDEX (CONCURRENTLY) TABLE t;
+                 REINDEX INDEX CONCURRENTLY t_idx;
+                 REINDEX TABLE CONCURRENTLY t;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !v.iter()
+                .any(|violation| violation.rule_id == "chain-conflict"),
+            "a legal REINDEX form must not conflict: {v:?}"
+        );
+    }
+
+    #[test]
+    fn a_temporary_relation_is_exempt_from_requiring_concurrency() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let v = engine
+            .analyze(
+                "CREATE TEMP TABLE bookings (id int);
+                 CREATE INDEX bookings_idx ON bookings(id);
+                 REINDEX INDEX bookings_idx;
+                 REINDEX TABLE bookings;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !v.iter()
+                .any(|violation| violation.rule_id == "require-concurrent-reindex"),
+            "a temporary relation cannot be reindexed concurrently: {v:?}"
+        );
+    }
+
+    #[test]
+    fn a_permanent_index_is_still_reported_as_needing_concurrency() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let v = engine
+            .analyze(
+                "CREATE TABLE bookings (id int);
+                 CREATE INDEX bookings_idx ON bookings(id);
+                 REINDEX INDEX bookings_idx;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            v.iter()
+                .any(|violation| violation.rule_id == "require-concurrent-reindex"),
+            "the temporary exemption must not leak to permanent relations: {v:?}"
         );
     }
 

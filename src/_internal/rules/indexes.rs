@@ -276,10 +276,7 @@ impl RequireConcurrentReindexRule {
 
         // A temporary relation cannot be reindexed concurrently; the synchronous
         // form is the only legal statement, so there is nothing to report.
-        if let ReindexTargetMutation::Table(id) | ReindexTargetMutation::Index(id) = target
-            && let Some(rel) = context.pre_state().relations.get(id)
-            && rel.persistence == Persistence::Temporary
-        {
+        if context.state().reindex_target_is_temporary(target) {
             return vec![];
         }
 

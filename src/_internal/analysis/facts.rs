@@ -347,7 +347,10 @@ pub(crate) enum StatementFact {
     AlterSequence {
         name: QualifiedName,
         if_exists: bool,
-        action: AlterSequenceActionFact,
+        /// Every option the statement carries, in written order.
+        options: Vec<SequenceOptionFact>,
+        /// At most one statement form beyond the options.
+        action: Option<AlterSequenceActionFact>,
     },
     DropSequence {
         names: Vec<QualifiedName>,
@@ -502,13 +505,39 @@ pub(crate) enum RuleEnableModeFact {
     Always,
 }
 
+/// One `ALTER SEQUENCE` option.
+///
+/// PostgreSQL collects every option of the statement into one bag, rejects a
+/// repeated option, and cross-checks the merged result, so the options are not
+/// independent clauses.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum SequenceOptionFact {
+    As(String),
+    Cache(i64),
+    Cycle(bool),
+    Increment(i64),
+    Logged(bool),
+    /// `None` is `NO MAXVALUE`.
+    MaxValue(Option<i64>),
+    /// `None` is `NO MINVALUE`.
+    MinValue(Option<i64>),
+    OwnedBy(Option<(QualifiedName, String)>),
+    SequenceName(String),
+    Start(i64),
+    /// `None` is `RESTART` with no value, which resumes at the start value.
+    Restart(Option<i64>),
+}
+
+/// The single statement form `ALTER SEQUENCE` takes alongside its options.
+///
+/// PostgreSQL parses ownership, rename, and schema changes as their own
+/// statement kinds rather than as sequence options, so a statement carrying
+/// more than one of them is not a form the server accepts.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum AlterSequenceActionFact {
-    OwnedBy(Option<(QualifiedName, String)>),
     OwnerTo(RoleFact),
     RenameTo(Ident),
     SetSchema(String),
-    Other,
 }
 
 // SET STATISTICS accepts an integer (-1..10000) or DEFAULT.
@@ -757,6 +786,16 @@ pub(crate) struct CreateAggregateFact {
     pub name: QualifiedName,
     pub or_replace: bool,
     pub params: Vec<ParamFact>,
+    /// The `CREATE AGGREGATE` attribute list, which carries the transition
+    /// functions, the state type, and the initial condition.
+    pub definition: Vec<AggregateOptionFact>,
+}
+
+/// One `CREATE AGGREGATE` attribute, as the parser retained it.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct AggregateOptionFact {
+    pub name: String,
+    pub value: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]

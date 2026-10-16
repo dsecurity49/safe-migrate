@@ -611,15 +611,28 @@ impl AnalysisState {
             .map(|param| param.value.as_str())
     }
 
-    fn postgres_boolean(value: &str) -> Option<bool> {
-        let value = value.trim().to_ascii_lowercase();
-        match value.as_str() {
-            "1" => return Some(true),
-            "0" => return Some(false),
-            "" => return None,
-            _ => {}
+    /// Whether `value` is a value `parse_bool` accepts.
+    ///
+    /// PostgreSQL compares against `true` and `false` with
+    /// `pg_strncasecmp`, which a caller reaches only after trimming, so this
+    /// trims too. A prefix matches only when it is unambiguous, except that
+    /// `on` and `off` both need at least two characters because a bare `o`
+    /// matches neither uniquely. `1` and `0` are accepted whole and never as a
+    /// prefix.
+    pub(crate) fn postgres_boolean(value: &str) -> Option<bool> {
+        let candidate = value.trim().to_ascii_lowercase();
+        if candidate.is_empty() {
+            return None;
         }
-
+        if candidate == "1" {
+            return Some(true);
+        }
+        if candidate == "0" {
+            return Some(false);
+        }
+        if candidate == "o" {
+            return None;
+        }
         let mut matched = None;
         for (spelling, parsed) in [
             ("true", true),
@@ -629,7 +642,7 @@ impl AnalysisState {
             ("no", false),
             ("off", false),
         ] {
-            if spelling.starts_with(&value) {
+            if spelling.starts_with(&candidate) {
                 if matched.is_some() {
                     return None;
                 }
@@ -637,6 +650,11 @@ impl AnalysisState {
             }
         }
         matched
+    }
+
+    /// Whether `value` is a value `parse_bool` accepts, for the reloption model.
+    pub(crate) fn reloption_parses_bool(value: &str) -> bool {
+        Self::postgres_boolean(value).is_some()
     }
 
     fn subscription_boolean_option(
@@ -1563,6 +1581,33 @@ impl AnalysisState {
 
     /// Whether the index backs an exclusion constraint, which PostgreSQL
     /// refuses to rebuild concurrently.
+    /// Whether `index` or the relation it backs is temporary.
+    ///
+    /// The index's own identity carries its schema, so a temporary index is
+    /// recognizable from that; a temporary table is not, because `REINDEX TABLE`
+    /// names the table. `REINDEX SYSTEM` and `REINDEX DATABASE` are already exempt.
+    pub(crate) fn reindex_target_is_temporary(
+        &self,
+        target: &crate::_internal::analysis::mutations::ReindexTargetMutation,
+    ) -> bool {
+        use crate::_internal::analysis::mutations::ReindexTargetMutation;
+        const TEMP_SCHEMA: &str = "pg_temp";
+        match target {
+            ReindexTargetMutation::Table(id) => match self.local.relations.get(id) {
+                Some(RelationOverlay::Present(relation)) => {
+                    relation.persistence
+                        == crate::_internal::model::relation::Persistence::Temporary
+                        || id.schema == TEMP_SCHEMA
+                }
+                _ => false,
+            },
+            ReindexTargetMutation::Index(id) => id.schema == TEMP_SCHEMA,
+            ReindexTargetMutation::Database(_)
+            | ReindexTargetMutation::Schema(_)
+            | ReindexTargetMutation::System(_) => false,
+        }
+    }
+
     pub(crate) fn index_backs_exclusion_constraint(&self, index: &ObjectId) -> bool {
         self.local.constraints.values().any(|constraint| {
             matches!(constraint.kind, ConstraintKind::Exclusion)
@@ -1604,6 +1649,37 @@ impl AnalysisState {
             FunctionOverlay::Present(function) => function.internal_type_owner.as_ref(),
             FunctionOverlay::Dropped => None,
         }
+    }
+
+    /// The single callable routine whose bare name is `name`, when the modeled
+    /// universe holds exactly one.
+    ///
+    /// PostgreSQL resolves a routine reference while creating the view, so the
+    /// candidate set at that moment is the one it sees. A lone candidate
+    /// therefore settles the reference without needing argument types, and any
+    /// later drop of it is provably refused. Two or more candidates leave the
+    /// overload open, and the caller keeps the bare name.
+    pub(crate) fn unique_routine_named(&self, name: &ObjectId) -> Option<ObjectId> {
+        let wanted = bare_routine_name(&name.name);
+        let mut found: Option<ObjectId> = None;
+        for (id, overlay) in &self.local.functions {
+            let FunctionOverlay::Present(function) = overlay else {
+                continue;
+            };
+            if !matches!(
+                function.routine_kind,
+                crate::_internal::model::function::RoutineKind::Function
+                    | crate::_internal::model::function::RoutineKind::Window
+            ) || bare_routine_name(&id.name) != wanted
+            {
+                continue;
+            }
+            if found.is_some() {
+                return None;
+            }
+            found = Some(id.clone());
+        }
+        found
     }
 
     /// Read-only semantic views used by rules instead of exposing the
@@ -2088,6 +2164,34 @@ impl AnalysisState {
         )
     }
 
+    /// Whether `id` names a partitioned table, which has no storage of its own.
+    pub(crate) fn relation_is_partitioned(&self, id: &ObjectId) -> bool {
+        match self.local.relations.get(id) {
+            Some(RelationOverlay::Present(relation)) => relation.partition_type.is_some(),
+            _ => false,
+        }
+    }
+
+    /// Whether `target` names a system catalog or a TOAST table.
+    ///
+    /// Neither has a concurrent reindex form, and the analyzer does not carry
+    /// a catalog flag, so this recognizes the naming the server uses. A name
+    /// it cannot place is not a catalog as far as this check is concerned,
+    /// which leaves the statement to the ordinary relation checks.
+    pub(crate) fn target_is_catalog(
+        &self,
+        target: &crate::_internal::analysis::mutations::ReindexTargetMutation,
+    ) -> bool {
+        use crate::_internal::analysis::mutations::ReindexTargetMutation;
+        let id = match target {
+            ReindexTargetMutation::Table(id) | ReindexTargetMutation::Index(id) => id,
+            ReindexTargetMutation::Database(_)
+            | ReindexTargetMutation::Schema(_)
+            | ReindexTargetMutation::System(_) => return false,
+        };
+        id.schema == "pg_catalog" || id.name.starts_with("pg_toast_")
+    }
+
     pub(crate) fn index_is_present(&self, id: &ObjectId) -> bool {
         self.local.graph.edges().iter().any(|edge| {
             matches!(edge.kind, DependencyKind::IndexOnRelation { .. }) && edge.dependent == *id
@@ -2498,9 +2602,7 @@ impl AnalysisState {
         &self,
         spec: &crate::_internal::analysis::facts::PrivilegeSpec,
     ) -> HashSet<Privilege> {
-        let supports_maintain = self
-            .pg_version_num
-            .is_some_and(|version| version >= 170_000);
+        let supports_maintain = self.pg_version().satisfies(|version| version >= 170_000);
         match spec {
             crate::_internal::analysis::facts::PrivilegeSpec::All => {
                 let mut privileges = [
@@ -3371,8 +3473,8 @@ impl AnalysisState {
             Mutation::Vacuum { table_id, is_full } => self.apply_vacuum(table_id, *is_full),
             Mutation::Reindex {
                 target,
-                concurrently: _,
-            } => self.apply_reindex(target),
+                concurrently,
+            } => self.apply_reindex(target, *concurrently),
         }
     }
 
@@ -3906,6 +4008,15 @@ impl PgVersion {
         }
     }
 
+    /// Whether the effective version satisfies `predicate`. An unresolved
+    /// version cannot place a feature, so it answers false.
+    pub(crate) fn satisfies(self, predicate: impl FnOnce(u32) -> bool) -> bool {
+        match self {
+            Self::Observed(version) | Self::Assumed(version) => predicate(version),
+            Self::Unresolved => false,
+        }
+    }
+
     /// Whether this version came from the user rather than from the server.
     pub(crate) fn is_asserted(self) -> bool {
         !matches!(self, Self::Observed(_))
@@ -3922,6 +4033,15 @@ impl PgVersion {
 /// `"16"`, so a diagnostic can name the release that introduced a feature.
 pub(crate) fn pg_version_label(version_num: u32) -> String {
     (version_num / 10_000).to_string()
+}
+
+/// The routine name in `name(arguments)`, which is how a routine identity is
+/// spelled.
+pub(crate) fn bare_routine_name(identity: &str) -> &str {
+    match identity.split_once('(') {
+        Some((name, _)) => name,
+        None => identity,
+    }
 }
 
 #[cfg(test)]

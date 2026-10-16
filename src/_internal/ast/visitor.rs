@@ -2898,48 +2898,99 @@ impl AstVisitor {
     fn extract_alter_sequence(node: &AlterSequence) -> Option<StatementFact> {
         let path = node.sequence_ref()?.path_ref()?;
         let name = Self::path_ref_to_qualified_name(&path)?;
-        let action = match node.actions().next() {
-            Some(ast::AlterSequenceAction::OwnerTo(owner)) => owner
-                .role_ref()
-                .map(|role| {
-                    crate::_internal::analysis::facts::AlterSequenceActionFact::OwnerTo(
-                        Self::extract_role(&role),
-                    )
-                })
-                .unwrap_or(crate::_internal::analysis::facts::AlterSequenceActionFact::Other),
-            Some(ast::AlterSequenceAction::SequenceRenameTo(rename)) => rename
-                .sequence()
-                .and_then(|sequence| sequence.path())
-                .and_then(|path| Self::path_to_qualified_name(&path))
-                .map(|name| {
-                    crate::_internal::analysis::facts::AlterSequenceActionFact::RenameTo(name.name)
-                })
-                .unwrap_or(crate::_internal::analysis::facts::AlterSequenceActionFact::Other),
-            Some(ast::AlterSequenceAction::SetSchema(set_schema)) => set_schema
-                .schema_ref()
-                .and_then(|schema| schema.ident_token())
-                .map(|token| {
-                    crate::_internal::analysis::facts::AlterSequenceActionFact::SetSchema(
-                        Self::resolve_identifier_token(token.text()),
-                    )
-                })
-                .unwrap_or(crate::_internal::analysis::facts::AlterSequenceActionFact::Other),
-            Some(ast::AlterSequenceAction::SequenceOption(ast::SequenceOption::OptionOwnedBy(
-                option,
-            ))) => match option.owned_by_target() {
-                Some(ast::OwnedByTarget::OwnedByNone(_)) => {
-                    crate::_internal::analysis::facts::AlterSequenceActionFact::OwnedBy(None)
-                }
-                Some(_) => crate::_internal::analysis::facts::AlterSequenceActionFact::OwnedBy(
-                    Self::extract_owned_by(&option),
-                ),
-                None => crate::_internal::analysis::facts::AlterSequenceActionFact::Other,
-            },
-            _ => crate::_internal::analysis::facts::AlterSequenceActionFact::Other,
+
+        use crate::_internal::analysis::facts::{
+            AlterSequenceActionFact, SequenceOptionFact as OptionFact,
         };
+        let integer = |expr: ast::Expr| expr.syntax().text().to_string().trim().parse::<i64>().ok();
+
+        let mut options = Vec::new();
+        let mut action: Option<AlterSequenceActionFact> = None;
+        for entry in node.actions() {
+            let singular = match entry {
+                ast::AlterSequenceAction::OwnerTo(owner) => Some(AlterSequenceActionFact::OwnerTo(
+                    Self::extract_role(&owner.role_ref()?),
+                )),
+                ast::AlterSequenceAction::SequenceRenameTo(rename) => {
+                    let new_name = Self::path_to_qualified_name(&rename.sequence()?.path()?)?;
+                    Some(AlterSequenceActionFact::RenameTo(new_name.name))
+                }
+                ast::AlterSequenceAction::SetSchema(set_schema) => {
+                    let token = set_schema.schema_ref()?.ident_token()?;
+                    Some(AlterSequenceActionFact::SetSchema(
+                        Self::resolve_identifier_token(token.text()),
+                    ))
+                }
+                ast::AlterSequenceAction::SetLogged(_) => {
+                    options.push(OptionFact::Logged(true));
+                    None
+                }
+                ast::AlterSequenceAction::SetUnlogged(_) => {
+                    options.push(OptionFact::Logged(false));
+                    None
+                }
+                ast::AlterSequenceAction::SequenceOption(option) => {
+                    let option = match option {
+                        ast::SequenceOption::OptionAsType(o) => {
+                            OptionFact::As(o.ty()?.syntax().text().to_string())
+                        }
+                        ast::SequenceOption::OptionCache(o) => {
+                            OptionFact::Cache(integer(o.expr()?)?)
+                        }
+                        ast::SequenceOption::OptionCycle(_) => OptionFact::Cycle(true),
+                        ast::SequenceOption::OptionNoCycle(_) => OptionFact::Cycle(false),
+                        ast::SequenceOption::OptionIncrement(o) => {
+                            OptionFact::Increment(integer(o.expr()?)?)
+                        }
+                        ast::SequenceOption::OptionMaxValue(o) => {
+                            OptionFact::MaxValue(Some(integer(o.expr()?)?))
+                        }
+                        ast::SequenceOption::OptionNoMaxValue(_) => OptionFact::MaxValue(None),
+                        ast::SequenceOption::OptionMinValue(o) => {
+                            OptionFact::MinValue(Some(integer(o.expr()?)?))
+                        }
+                        ast::SequenceOption::OptionNoMinValue(_) => OptionFact::MinValue(None),
+                        ast::SequenceOption::OptionStart(o) => {
+                            OptionFact::Start(integer(o.expr()?)?)
+                        }
+                        ast::SequenceOption::OptionRestart(o) => {
+                            OptionFact::Restart(match o.expr() {
+                                Some(expr) => Some(integer(expr)?),
+                                None => None,
+                            })
+                        }
+                        ast::SequenceOption::OptionLogged(_) => OptionFact::Logged(true),
+                        ast::SequenceOption::OptionUnlogged(_) => OptionFact::Logged(false),
+                        ast::SequenceOption::OptionOwnedBy(o) => match o.owned_by_target() {
+                            Some(ast::OwnedByTarget::OwnedByNone(_)) => OptionFact::OwnedBy(None),
+                            Some(_) => OptionFact::OwnedBy(Self::extract_owned_by(&o)),
+                            None => return None,
+                        },
+                        ast::SequenceOption::OptionSequenceName(o) => OptionFact::SequenceName(
+                            Self::path_to_qualified_name(&o.sequence()?.path()?)?
+                                .name
+                                .resolve(),
+                        ),
+                    };
+                    options.push(option);
+                    None
+                }
+            };
+            if let Some(singular) = singular {
+                // PostgreSQL parses ownership, rename, and schema changes as
+                // their own statement kinds, so a statement carrying two of
+                // them is not a form it accepts.
+                if action.is_some() {
+                    return None;
+                }
+                action = Some(singular);
+            }
+        }
+
         Some(StatementFact::AlterSequence {
             name,
             if_exists: node.if_exists().is_some(),
+            options,
             action,
         })
     }
@@ -3667,6 +3718,16 @@ impl AstVisitor {
                     ),
                 },
             ),
+            // A procedure takes the same option list a function does, so
+            // dropping it here turned `ALTER PROCEDURE ... SECURITY DEFINER`
+            // into an unmodeled statement even though PostgreSQL applies it.
+            ast::AlterProcedureAction::FuncOptionList(ol) => Some(
+                crate::_internal::analysis::facts::AlterFunctionAction::OptionsChange(
+                    ol.options()
+                        .map(|option| Self::extract_func_option(&option))
+                        .collect(),
+                ),
+            ),
             _ => None,
         });
 
@@ -3735,14 +3796,15 @@ impl AstVisitor {
 
     fn extract_create_aggregate(node: &ast::CreateAggregate) -> Option<StatementFact> {
         let name = Self::path_to_qualified_name(&node.aggregate_name()?.path()?)?;
+        let attributes = Self::extract_attribute_list(node.attribute_list());
         let params = if let Some(params) = node.param_list() {
             params
                 .params()
                 .map(|param| Self::extract_param(&param))
                 .collect()
         } else {
-            Self::extract_attribute_list(node.attribute_list())
-                .into_iter()
+            attributes
+                .iter()
                 .find(|attribute| attribute.name.eq_ignore_ascii_case("basetype"))
                 .filter(|attribute| {
                     !matches!(attribute.value.to_ascii_lowercase().as_str(), "any" | "*")
@@ -3751,7 +3813,7 @@ impl AstVisitor {
                     vec![crate::_internal::analysis::facts::ParamFact {
                         mode: crate::_internal::analysis::facts::ParamModeFact::In,
                         name: None,
-                        ty: attribute.value,
+                        ty: attribute.value.clone(),
                         default: None,
                     }]
                 })
@@ -3762,6 +3824,20 @@ impl AstVisitor {
                 name,
                 or_replace: node.or_replace().is_some(),
                 params,
+                // The parser keeps the transition functions, state type, and
+                // initial condition as attribute options. Recording them keeps
+                // the definition honest about what it knows, so the state's
+                // limits follow from the fact rather than from a blanket
+                // statement that the whole definition was discarded.
+                definition: attributes
+                    .into_iter()
+                    .map(
+                        |attribute| crate::_internal::analysis::facts::AggregateOptionFact {
+                            name: attribute.name,
+                            value: attribute.value,
+                        },
+                    )
+                    .collect(),
             },
         ))
     }
