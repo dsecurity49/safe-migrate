@@ -87,6 +87,7 @@ impl Resolver {
             id: Self::resolve_function_id(&fact.name, &fact.params, state),
             or_replace: fact.or_replace,
             params: fact.params.clone(),
+            definition: fact.definition.clone(),
         })
     }
 

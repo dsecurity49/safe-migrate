@@ -7,6 +7,7 @@ use safe_migrate::_internal::db::cache::DbCache;
 use safe_migrate::_internal::engine::engine::SafeMigrateEngine;
 use safe_migrate::_internal::model::constraint::ConstraintKind;
 use safe_migrate::_internal::model::function::{FunctionOverlay, Volatility};
+use safe_migrate::_internal::model::index::{IndexOrder, KeyCollation, KeyOpclass};
 use safe_migrate::_internal::model::relation::{Privilege, RelationKind, RelationOverlay};
 use safe_migrate::_internal::model::schema::SchemaOverlay;
 use safe_migrate::_internal::model::sequence::{SequenceKind, SequenceOverlay};
@@ -165,6 +166,7 @@ enum ComparisonScope {
     Triggers,
     ViewDependencies,
     Partitions,
+    IndexPartitions,
     Publications,
     Subscriptions,
     ExtendedStatistics,
@@ -185,6 +187,7 @@ struct NormalizedState {
     policies: BTreeSet<NormalizedPolicy>,
     triggers: BTreeMap<(String, String), NormalizedTrigger>,
     partition_edges: BTreeSet<(String, String, bool, bool)>,
+    index_attachment_edges: BTreeSet<(String, String)>,
     view_dependencies: BTreeSet<(String, String)>,
     publications: BTreeMap<String, NormalizedPublication>,
     subscriptions: BTreeMap<String, NormalizedSubscription>,
@@ -242,6 +245,7 @@ enum NormalizedRelationKind {
     Table,
     View,
     MaterializedView,
+    ForeignTable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -278,6 +282,7 @@ struct NormalizedIndex {
     has_expression_keys: bool,
     has_predicate: bool,
     is_unique: bool,
+    nulls_not_distinct: Option<bool>,
     is_immediate: bool,
     is_valid: bool,
     is_ready: bool,
@@ -401,7 +406,9 @@ enum MismatchCategory {
     ExtraExtendedStatisticsInSimulator,
     ExtendedStatisticsDefinitionMismatch,
     MissingPartitionEdgeInSimulator,
+    MissingIndexAttachmentInSimulator,
     ExtraPartitionEdgeInSimulator,
+    ExtraIndexAttachmentInSimulator,
     MissingViewDependencyInSimulator,
     ExtraViewDependencyInSimulator,
     MissingPublicationInSimulator,
@@ -2295,19 +2302,37 @@ fn snapshot_live_state(
             state.indexes.insert(NormalizedIndex {
                 index: qualified_name(&index.index_id.schema, &index.index_id.name),
                 table: qualified_name(&index.table_id.schema, &index.table_id.name),
-                using_method: Some(index.using_method.to_ascii_lowercase()),
-                key_columns: index.key_columns,
-                included_columns: index.included_columns,
-                has_expression_keys: index.has_expression_keys,
-                has_predicate: index.has_predicate,
-                is_unique: index.is_unique,
+                using_method: index
+                    .definition
+                    .method
+                    .as_ref()
+                    .map(|method| method.to_ascii_lowercase()),
+                key_columns: index.definition.key_column_names(),
+                included_columns: index.definition.included_column_names(),
+                has_expression_keys: index.definition.has_expression_keys(),
+                has_predicate: index.definition.has_predicate(),
+                is_unique: index.definition.unique,
+                nulls_not_distinct: index.definition.nulls_not_distinct,
                 is_immediate: index.is_immediate,
-                is_valid: index.is_valid,
-                is_ready: index.is_ready,
-                is_live: index.is_live,
-                has_default_sort_order: index.has_default_sort_order,
-                has_default_opclasses: index.has_default_opclasses,
-                has_default_collations: index.has_default_collations,
+                is_valid: index.definition.valid,
+                is_ready: index.definition.ready,
+                is_live: index.definition.live,
+                has_default_sort_order: index
+                    .definition
+                    .keys
+                    .iter()
+                    .all(|key| key.order == IndexOrder::Default),
+                has_default_opclasses: index
+                    .definition
+                    .keys
+                    .iter()
+                    .all(|key| matches!(key.opclass, KeyOpclass::Default(_))),
+                has_default_collations: index.definition.keys.iter().all(|key| {
+                    matches!(
+                        key.collation,
+                        KeyCollation::NotCollatable | KeyCollation::Derived
+                    )
+                }),
             });
         }
     }
@@ -2370,6 +2395,39 @@ fn snapshot_live_state(
                 qualified_name(&child_schema, &child_name),
                 row.get("is_partition"),
                 row.get("detach_pending"),
+            ));
+        }
+    }
+
+    if scope.contains(&ComparisonScope::IndexPartitions) {
+        let schema_names = schemas.to_vec();
+        for row in client.query(
+            "
+            SELECT
+                pn.nspname AS parent_schema,
+                pc.relname AS parent_name,
+                cn.nspname AS child_schema,
+                cc.relname AS child_name
+            FROM pg_inherits i
+            JOIN pg_class pc ON pc.oid = i.inhparent
+            JOIN pg_namespace pn ON pn.oid = pc.relnamespace
+            JOIN pg_class cc ON cc.oid = i.inhrelid
+            JOIN pg_namespace cn ON cn.oid = cc.relnamespace
+            WHERE pn.nspname = ANY($1) AND cn.nspname = ANY($1)
+              AND pc.relkind = 'I'
+              AND cc.relkind = 'i'
+            ",
+            &[&schema_names],
+        )? {
+            state.index_attachment_edges.insert((
+                qualified_name(
+                    &row.get::<_, String>("parent_schema"),
+                    &row.get::<_, String>("parent_name"),
+                ),
+                qualified_name(
+                    &row.get::<_, String>("child_schema"),
+                    &row.get::<_, String>("child_name"),
+                ),
             ));
         }
     }
@@ -2702,7 +2760,7 @@ fn snapshot_simulator_state(
                             generation: normalize_generated_column(
                                 relation.generated_columns.get(&column.name),
                                 &known_function_ids,
-                                state.search_path(),
+                                &state.search_path_names(),
                             ),
                             identity_generation: relation
                                 .identity_columns
@@ -2731,39 +2789,41 @@ fn snapshot_simulator_state(
     for edge in state.local.graph.edges() {
         match &edge.kind {
             DependencyKind::IndexOnRelation {
-                using_method,
-                key_columns,
-                included_columns,
-                has_expression_keys,
-                has_predicate,
-                is_unique,
+                definition,
                 is_immediate,
-                is_valid,
-                is_ready,
-                is_live,
-                has_default_sort_order,
-                has_default_opclasses,
-                has_default_collations,
                 ..
             } if scope.contains(&ComparisonScope::Indexes) => {
                 projection.indexes.insert(NormalizedIndex {
                     index: qualified_name(&edge.dependent.schema, &edge.dependent.name),
                     table: qualified_name(&edge.referenced.schema, &edge.referenced.name),
-                    using_method: using_method
+                    using_method: definition
+                        .method
                         .as_ref()
                         .map(|method| method.to_ascii_lowercase()),
-                    key_columns: key_columns.clone(),
-                    included_columns: included_columns.clone(),
-                    has_expression_keys: *has_expression_keys,
-                    has_predicate: *has_predicate,
-                    is_unique: *is_unique,
+                    key_columns: definition.key_column_names(),
+                    included_columns: definition.included_column_names(),
+                    has_expression_keys: definition.has_expression_keys(),
+                    has_predicate: definition.has_predicate(),
+                    is_unique: definition.unique,
+                    nulls_not_distinct: definition.nulls_not_distinct,
                     is_immediate: *is_immediate,
-                    is_valid: *is_valid,
-                    is_ready: *is_ready,
-                    is_live: *is_live,
-                    has_default_sort_order: *has_default_sort_order,
-                    has_default_opclasses: *has_default_opclasses,
-                    has_default_collations: *has_default_collations,
+                    is_valid: definition.valid,
+                    is_ready: definition.ready,
+                    is_live: definition.live,
+                    has_default_sort_order: definition
+                        .keys
+                        .iter()
+                        .all(|key| key.order == IndexOrder::Default),
+                    has_default_opclasses: definition
+                        .keys
+                        .iter()
+                        .all(|key| matches!(key.opclass, KeyOpclass::Default(_))),
+                    has_default_collations: definition.keys.iter().all(|key| {
+                        matches!(
+                            key.collation,
+                            KeyCollation::NotCollatable | KeyCollation::Derived
+                        )
+                    }),
                 });
             }
             DependencyKind::ForeignKey {
@@ -2787,6 +2847,14 @@ fn snapshot_simulator_state(
                     qualified_name(&edge.dependent.schema, &edge.dependent.name),
                     !matches!(edge.kind, DependencyKind::InheritanceOf),
                     matches!(edge.kind, DependencyKind::PartitionDetachPending),
+                ));
+            }
+            DependencyKind::IndexPartitionOf
+                if scope.contains(&ComparisonScope::IndexPartitions) =>
+            {
+                projection.index_attachment_edges.insert((
+                    qualified_name(&edge.referenced.schema, &edge.referenced.name),
+                    qualified_name(&edge.dependent.schema, &edge.dependent.name),
                 ));
             }
             DependencyKind::ViewDependency { .. }
@@ -3524,6 +3592,33 @@ fn compare_states(
         }
     }
 
+    if scope.contains(&ComparisonScope::IndexPartitions) {
+        for (parent, child) in live
+            .index_attachment_edges
+            .difference(&simulator.index_attachment_edges)
+        {
+            mismatches.push(Mismatch {
+                rule_dir: rule_dir.to_string(),
+                fixture: fixture.to_string(),
+                category: MismatchCategory::MissingIndexAttachmentInSimulator,
+                root_cause: RootCauseClassification::SimulatorBug,
+                note: format!("live PostgreSQL attached index {child} to {parent}"),
+            });
+        }
+        for (parent, child) in simulator
+            .index_attachment_edges
+            .difference(&live.index_attachment_edges)
+        {
+            mismatches.push(Mismatch {
+                rule_dir: rule_dir.to_string(),
+                fixture: fixture.to_string(),
+                category: MismatchCategory::ExtraIndexAttachmentInSimulator,
+                root_cause: RootCauseClassification::SimulatorBug,
+                note: format!("simulator attached index {child} to {parent}"),
+            });
+        }
+    }
+
     if scope.contains(&ComparisonScope::ViewDependencies) {
         for edge in live
             .view_dependencies
@@ -3562,6 +3657,8 @@ fn normalize_relation_kind(kind: RelationKind) -> NormalizedRelationKind {
         RelationKind::Table => NormalizedRelationKind::Table,
         RelationKind::View => NormalizedRelationKind::View,
         RelationKind::MaterializedView => NormalizedRelationKind::MaterializedView,
+        // Remote rows; no local storage or access method.
+        RelationKind::ForeignTable => NormalizedRelationKind::ForeignTable,
     }
 }
 
@@ -3570,7 +3667,7 @@ fn normalize_access_method(kind: &RelationKind, method: Option<&str>) -> Option<
         RelationKind::Table | RelationKind::MaterializedView => {
             Some(method.unwrap_or("heap").to_ascii_lowercase())
         }
-        RelationKind::View => None,
+        RelationKind::View | RelationKind::ForeignTable => None,
     }
 }
 
@@ -3755,11 +3852,11 @@ fn normalize_column_storage(
                     data_type = normalize_data_type_with_identity(base_type, base_type_id.as_ref());
                     continue;
                 }
-                TypeKind::Composite { .. } | TypeKind::Range | TypeKind::Multirange => {
+                TypeKind::Composite { .. } | TypeKind::Range { .. } | TypeKind::Multirange => {
                     return Some("EXTENDED".into());
                 }
                 TypeKind::Enum { .. } => return Some("PLAIN".into()),
-                TypeKind::Base => return None,
+                TypeKind::Base { .. } => return None,
             },
             _ if matches!(
                 state.local.relations.get(&id),
@@ -3896,9 +3993,9 @@ fn normalize_type_kind(kind: &TypeKind) -> NormalizedType {
         TypeKind::Domain { base_type, .. } => NormalizedType::Domain {
             base_type: normalize_data_type(base_type),
         },
-        TypeKind::Base => NormalizedType::Base,
+        TypeKind::Base { .. } => NormalizedType::Base,
         TypeKind::Composite { .. } => NormalizedType::Composite,
-        TypeKind::Range => NormalizedType::Range,
+        TypeKind::Range { .. } => NormalizedType::Range,
         TypeKind::Multirange => NormalizedType::Multirange,
     }
 }

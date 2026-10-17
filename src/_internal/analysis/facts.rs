@@ -1,5 +1,6 @@
 use crate::_internal::analysis::expr_ir::ExprIr;
 use crate::_internal::ast::identifiers::{Ident, QualifiedName};
+use crate::_internal::model::index::{IndexOrder, IndexPredicate, WrittenName};
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum PersistenceFact {
@@ -83,15 +84,35 @@ pub(crate) enum ResetSettingTarget {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum TypeCreationKind {
     Enum { variants: Vec<String> },
-    Range,
+    Range { subtype: Option<String> },
     Composite { fields: Vec<CompositeFieldFact> },
-    Base,
+    Base { element: Option<String> },
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct CompositeFieldFact {
     pub name: String,
     pub data_type: String,
+}
+
+/// A routine a view calls.
+///
+/// `argument_types` is populated only when every argument is a plain column
+/// reference of the view's source, which is the one case where the signature
+/// can be stated exactly.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct RoutineReferenceFact {
+    pub name: QualifiedName,
+    pub argument_types: Option<Vec<String>>,
+}
+
+/// The types a view body casts to.
+///
+/// A view that merely selects a column of a type does not depend on that type:
+/// PostgreSQL records the dependency from the cast, not the output column.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct CastTypeReferenceFact {
+    pub name: QualifiedName,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -196,22 +217,39 @@ pub(crate) enum StatementFact {
         select_outputs: Vec<SelectOutputFact>,
         select_projection_complete: bool,
         select_source: Option<QualifiedName>,
+        routines: Vec<RoutineReferenceFact>,
+        cast_types: Vec<CastTypeReferenceFact>,
     },
     AlterView {
         name: QualifiedName,
         action: AlterViewAction,
+        if_exists: bool,
     },
     CreateMaterializedView {
         name: QualifiedName,
         depends_on: Vec<QualifiedName>,
+        if_not_exists: bool,
+        with_no_data: bool,
+        /// An explicit `mv (a, b)` column list, which renames the outputs.
+        column_list: Vec<String>,
+        access_method: Option<String>,
+        tablespace: Option<String>,
+        options: Vec<AttributeFact>,
+        select_outputs: Vec<SelectOutputFact>,
+        select_projection_complete: bool,
+        select_source: Option<QualifiedName>,
+        routines: Vec<RoutineReferenceFact>,
+        cast_types: Vec<CastTypeReferenceFact>,
     },
     AlterMaterializedView {
         name: QualifiedName,
-        action: AlterMaterializedViewActionFact,
+        actions: Vec<AlterMaterializedViewActionFact>,
+        if_exists: bool,
     },
     RefreshMaterializedView {
         name: QualifiedName,
         concurrently: bool,
+        with_no_data: bool,
     },
     CreateIndex {
         name: QualifiedName,
@@ -219,14 +257,20 @@ pub(crate) enum StatementFact {
         if_not_exists: bool,
         concurrently: bool,
         using_method: Option<String>,
-        has_predicate: bool,
+        predicate: IndexPredicate,
         unique: bool,
+        nulls_not_distinct: bool,
         key_columns: Vec<String>,
+        /// Aligned with key positions; `Some` is the parsed expression for an
+        /// expression key and `None` for a plain column.
+        key_expressions: Vec<Option<ExprIr>>,
+        /// Aligned with key positions.
+        key_orders: Vec<IndexOrder>,
+        /// Aligned with key positions; `None` means the type's default.
+        key_opclasses: Vec<Option<WrittenName>>,
+        /// Aligned with key positions; `None` means the derived collation.
+        key_collations: Vec<Option<WrittenName>>,
         included_columns: Vec<String>,
-        has_expression_keys: bool,
-        has_default_sort_order: bool,
-        has_default_opclasses: bool,
-        has_default_collations: bool,
     },
     CreatePolicy {
         name: String,
@@ -301,7 +345,10 @@ pub(crate) enum StatementFact {
     AlterSequence {
         name: QualifiedName,
         if_exists: bool,
-        action: AlterSequenceActionFact,
+        /// Every option the statement carries, in written order.
+        options: Vec<SequenceOptionFact>,
+        /// At most one statement form beyond the options.
+        action: Option<AlterSequenceActionFact>,
     },
     DropSequence {
         names: Vec<QualifiedName>,
@@ -456,13 +503,39 @@ pub(crate) enum RuleEnableModeFact {
     Always,
 }
 
+/// One `ALTER SEQUENCE` option.
+///
+/// PostgreSQL collects every option of the statement into one bag, rejects a
+/// repeated option, and cross-checks the merged result, so the options are not
+/// independent clauses.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum SequenceOptionFact {
+    As(String),
+    Cache(i64),
+    Cycle(bool),
+    Increment(i64),
+    Logged(bool),
+    /// `None` is `NO MAXVALUE`.
+    MaxValue(Option<i64>),
+    /// `None` is `NO MINVALUE`.
+    MinValue(Option<i64>),
+    OwnedBy(Option<(QualifiedName, String)>),
+    SequenceName(String),
+    Start(i64),
+    /// `None` is `RESTART` with no value, which resumes at the start value.
+    Restart(Option<i64>),
+}
+
+/// The single statement form `ALTER SEQUENCE` takes alongside its options.
+///
+/// PostgreSQL parses ownership, rename, and schema changes as their own
+/// statement kinds rather than as sequence options, so a statement carrying
+/// more than one of them is not a form the server accepts.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum AlterSequenceActionFact {
-    OwnedBy(Option<(QualifiedName, String)>),
     OwnerTo(RoleFact),
     RenameTo(Ident),
     SetSchema(String),
-    Other,
 }
 
 // SET STATISTICS accepts an integer (-1..10000) or DEFAULT.
@@ -611,7 +684,13 @@ pub(crate) enum ParamModeFact {
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum RetTypeFact {
     Table(Vec<ColumnFact>),
-    Scalar(String),
+    /// A single type. `setof` is kept apart from the type name because
+    /// PostgreSQL stores it in `pg_proc.proretset` and refuses a replacement
+    /// that changes it.
+    Scalar {
+        ty: String,
+        setof: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -711,6 +790,16 @@ pub(crate) struct CreateAggregateFact {
     pub name: QualifiedName,
     pub or_replace: bool,
     pub params: Vec<ParamFact>,
+    /// The `CREATE AGGREGATE` attribute list, which carries the transition
+    /// functions, the state type, and the initial condition.
+    pub definition: Vec<AggregateOptionFact>,
+}
+
+/// One `CREATE AGGREGATE` attribute, as the parser retained it.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct AggregateOptionFact {
+    pub name: String,
+    pub value: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -833,6 +922,20 @@ pub(crate) enum AlterSubscriptionActionFact {
     Rename {
         to: String,
     },
+}
+
+impl AlterSubscriptionActionFact {
+    /// The subscription options this action carries, whichever form it takes.
+    /// Every one of them is gated on name and server version alike.
+    pub(crate) fn params(&self) -> Option<&[AttributeFact]> {
+        match self {
+            Self::Publications { params, .. }
+            | Self::RefreshPublication(params)
+            | Self::SetOptions(params)
+            | Self::Skip(params) => Some(params),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]

@@ -498,7 +498,6 @@ mod exhaustive_fuzz_tests {
 
     #[test]
     fn fuzz_tier_001_do_block_taints_certainty_not_severity() {
-        use safe_migrate::_internal::analysis::state::Confidence;
         use safe_migrate::_internal::report::violations::ViolationTier;
 
         let engine = setup_engine();
@@ -525,8 +524,9 @@ mod exhaustive_fuzz_tests {
                 .any(|f| f.violation.tier == ViolationTier::Tier1),
             "DROP TABLE keeps Tier1 regardless of earlier unmodeled state: {drops:?}"
         );
+        use safe_migrate::api::Certainty;
         assert!(
-            drops.iter().all(|f| f.certainty == Confidence::Tainted),
+            drops.iter().all(|f| f.certainty == Certainty::Tainted),
             "state after a DO block is unknowable, so certainty must drop: {drops:?}"
         );
     }
@@ -569,8 +569,8 @@ mod exhaustive_fuzz_tests {
 
     #[test]
     fn fuzz_tier_004_multiple_taints_stay_uncertain() {
-        use safe_migrate::_internal::analysis::state::Confidence;
         use safe_migrate::_internal::report::violations::ViolationTier;
+        use safe_migrate::api::Certainty;
 
         let engine = setup_engine();
         let cache = cache_with_table("public", "users", Some(100));
@@ -598,7 +598,7 @@ mod exhaustive_fuzz_tests {
                 .iter()
                 .any(|f| f.violation.tier == ViolationTier::Tier1)
         );
-        assert!(drops.iter().all(|f| f.certainty == Confidence::Tainted));
+        assert!(drops.iter().all(|f| f.certainty == Certainty::Tainted));
     }
 
     // Cascades and dependencies.

@@ -155,7 +155,7 @@ grep -F 'cache_dir="$(mktemp -d "${cache_root}/invocation.XXXXXX")"' "$manifest"
 grep -F 'managed_root="${HOME}/.cache/safe-migrate-action"' "$manifest" >/dev/null
 grep -F 'baseline_root="${managed_root}/baselines"' "$manifest" >/dev/null
 grep -F 'cache_dir="${baseline_root}/${INPUT_BASELINE}"' "$manifest" >/dev/null
-grep -F 'cache_transport_path="~/.cache/safe-migrate-action/baselines/${INPUT_BASELINE}/baseline-v9.cache"' "$manifest" >/dev/null
+grep -F 'cache_transport_path="~/.cache/safe-migrate-action/baselines/${INPUT_BASELINE}/baseline-v10.cache"' "$manifest" >/dev/null
 test "$(grep -Fc 'path: ${{ steps.baseline.outputs.cache-transport-path }}' "$manifest")" -eq 2
 if grep -F '../.safe-migrate-action-cache' "$manifest" >/dev/null; then
   printf '%s\n' "Action cache paths cannot contain '..'" >&2
@@ -171,7 +171,7 @@ fi
 grep -F 'uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9' "$manifest" >/dev/null
 grep -F 'uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9' "$manifest" >/dev/null
 grep -F "inputs.sync != 'true'" "$manifest" >/dev/null
-grep -F 'cache_prefix="safe-migrate-v9-${RUNNER_OS}-${cache_mode}-${INPUT_BASELINE}-"' "$manifest" >/dev/null
+grep -F 'cache_prefix="safe-migrate-v10-${RUNNER_OS}-${cache_mode}-${INPUT_BASELINE}-"' "$manifest" >/dev/null
 grep -F '[[ ! "$SAFE_MIGRATE_CACHE_KEY" =~ ^[0-9A-Fa-f]{64}$ ]]' "$manifest" >/dev/null
 test "$(grep -Ec '^[[:space:]]+SAFE_MIGRATE_CACHE_KEY: "[0-9A-Fa-f]{64}"$' "$workflow")" -eq 5
 if grep -Eq '^[[:space:]]+SAFE_MIGRATE_CACHE_KEY: [0-9A-Fa-f]{64}$' "$workflow"; then
@@ -185,8 +185,15 @@ grep -F 'await core.summary.addRaw(markdown).write();' "$manifest" >/dev/null
 grep -F '.replace(/[\u0000-\u001f\u007f-\u009f]/g, character =>' "$manifest" >/dev/null
 grep -F 'core.error(message, properties);' "$manifest" >/dev/null
 grep -F 'core.warning(message, properties);' "$manifest" >/dev/null
-grep -F "finding.rule_title || finding.rule_id" "$manifest" >/dev/null
-grep -F "finding.rule_summary" "$manifest" >/dev/null
+report_contract="$repo_root/scripts/action-report-contract.py"
+schema="$repo_root/live_tests/report_schema.py"
+python3 "$report_contract" "$manifest" "$schema"
+stale_manifest="$tmp_dir/stale-action.yml"
+sed 's/finding\.rule_id/finding.rule_title/' "$manifest" > "$stale_manifest"
+if python3 "$report_contract" "$stale_manifest" "$schema" >/dev/null 2>&1; then
+  printf '%s\n' 'Action report reader accepted an undocumented field' >&2
+  exit 1
+fi
 grep -F 'actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0' "$manifest" >/dev/null
 grep -F 'env -u DATABASE_URL' "$manifest" >/dev/null
 grep -F "printf '::add-mask::%s\\n'" "$manifest" >/dev/null

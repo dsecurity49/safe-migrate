@@ -1,8 +1,9 @@
 use crate::_internal::analysis::facts::StatementFact;
 use crate::_internal::analysis::mutations::{Mutation, OpaqueMutation};
-use crate::_internal::analysis::namespace::temp_object_id;
+use crate::_internal::analysis::namespace::{SearchPathEntry, temp_object_id};
 use crate::_internal::analysis::state::AnalysisState;
 use crate::_internal::ast::identifiers::{ObjectId, QualifiedName};
+use crate::_internal::model::builtin_type::BuiltinTypeCatalogue;
 use crate::_internal::model::data_type::{ParsedDataType, TypeIdentity};
 use crate::_internal::report::violations::ObjectKind;
 
@@ -20,16 +21,27 @@ pub(crate) struct Resolver;
 
 impl Resolver {
     fn resolve_creation_name(name: &QualifiedName, state: &AnalysisState) -> ObjectId {
-        // An empty path leaves PostgreSQL with no creation target, so the
-        // namespace is left empty for the state machine to reject rather than
-        // silently assuming `public`.
-        let schema = name
-            .schema
-            .as_ref()
-            .map(|i| i.resolve())
-            .unwrap_or_else(|| state.search_path().first().cloned().unwrap_or_default());
+        if let Some(schema) = &name.schema {
+            return ObjectId::new(schema.resolve(), name.name.resolve());
+        }
 
-        ObjectId::new(schema, name.name.resolve())
+        // An unqualified creation targets the first already-existing path
+        // schema.  An empty or unresolved path leaves no provable target, so
+        // the state machine taints or rejects it where the answer matters.
+        let schema = state
+            .creation_schema()
+            .map(str::to_string)
+            .or_else(|| {
+                state
+                    .search_path()
+                    .first()
+                    .and_then(SearchPathEntry::name)
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
+        let mut id = ObjectId::new(schema, name.name.resolve());
+        id.inferred_schema = true;
+        id
     }
 
     /// Creation target for a relation declared `TEMPORARY`, which PostgreSQL
@@ -52,13 +64,16 @@ impl Resolver {
         object_name: String,
         state: &AnalysisState,
         present: impl Fn(&AnalysisState, &ObjectId) -> bool,
-        search: impl Fn(&AnalysisState) -> Vec<String>,
+        search: impl Fn(&AnalysisState) -> Vec<SearchPathEntry>,
     ) -> ObjectId {
         if let Some(schema_ident) = &name.schema {
             return ObjectId::new(schema_ident.resolve(), object_name);
         }
 
-        for schema in search(state) {
+        for entry in search(state) {
+            let Some(schema) = entry.searched_schema() else {
+                continue;
+            };
             let mut candidate = ObjectId::new(schema, object_name.clone());
             if present(state, &candidate) {
                 candidate.inferred_schema = true;
@@ -67,7 +82,11 @@ impl Resolver {
         }
 
         // An empty path searches nothing, so no schema may be inferred.
-        let schema = state.search_path().first().cloned().unwrap_or_default();
+        let schema = state
+            .search_path()
+            .first()
+            .and_then(SearchPathEntry::name)
+            .unwrap_or_default();
         let mut id = ObjectId::new(schema, object_name);
         id.inferred_schema = true;
         id
@@ -108,6 +127,21 @@ impl Resolver {
             state,
             AnalysisState::type_is_present,
             AnalysisState::relation_search_path,
+        )
+    }
+
+    /// A routine reference that carries no argument types: the namespace is
+    /// the routine one, and the presence test matches any overload.
+    pub(super) fn resolve_routine_namespace_name(
+        name: &QualifiedName,
+        state: &AnalysisState,
+    ) -> ObjectId {
+        Self::resolve_in_namespace(
+            name,
+            name.name.resolve(),
+            state,
+            AnalysisState::routine_named_is_present,
+            |state| state.search_path().to_vec(),
         )
     }
 
@@ -187,17 +221,20 @@ impl Resolver {
         if let Some(id) = state.resolve_type_reference(raw) {
             return id.to_string();
         }
-        let identity = Self::normalize_function_arg_type(raw);
+        let identity = Self::normalize_function_arg_type(raw, state.builtin_types());
         // An unresolved custom type renders to nothing, so two distinct ones
         // would collapse into one signature. Keep its written name instead.
         if identity.is_unknown() {
-            return ParsedDataType::parse(raw).to_string();
+            return ParsedDataType::parse(raw, state.builtin_types()).to_string();
         }
         identity.render()
     }
 
-    pub(crate) fn normalize_function_arg_type(raw: &str) -> TypeIdentity {
-        TypeIdentity::from_syntax(&ParsedDataType::parse(raw))
+    pub(crate) fn normalize_function_arg_type(
+        raw: &str,
+        catalogue: &BuiltinTypeCatalogue,
+    ) -> TypeIdentity {
+        TypeIdentity::from_syntax(&ParsedDataType::parse(raw, catalogue))
     }
 
     pub(crate) fn resolve(fact: &StatementFact, state: &AnalysisState) -> Vec<Mutation> {
@@ -288,6 +325,8 @@ impl Resolver {
                 select_outputs,
                 select_projection_complete,
                 select_source,
+                routines,
+                cast_types,
             } => {
                 mutations.push(Self::resolve_create_view(
                     name,
@@ -296,24 +335,68 @@ impl Resolver {
                     select_outputs,
                     *select_projection_complete,
                     select_source.as_ref(),
+                    routines,
+                    cast_types,
                     state,
                 ));
             }
-            StatementFact::AlterView { name, action } => {
-                mutations.push(Self::resolve_alter_view(name, action, state));
+            StatementFact::AlterView {
+                name,
+                action,
+                if_exists,
+            } => {
+                mutations.push(Self::resolve_alter_view(name, action, *if_exists, state));
             }
-            StatementFact::CreateMaterializedView { name, depends_on } => {
+            StatementFact::CreateMaterializedView {
+                name,
+                depends_on,
+                if_not_exists,
+                with_no_data,
+                column_list,
+                access_method,
+                tablespace,
+                options,
+                select_outputs,
+                select_projection_complete,
+                select_source,
+                routines,
+                cast_types,
+            } => {
                 mutations.push(Self::resolve_create_materialized_view(
-                    name, depends_on, state,
+                    name,
+                    depends_on,
+                    *if_not_exists,
+                    *with_no_data,
+                    column_list,
+                    access_method,
+                    tablespace,
+                    options,
+                    select_outputs,
+                    *select_projection_complete,
+                    select_source.as_ref(),
+                    routines,
+                    cast_types,
+                    state,
                 ));
             }
-            StatementFact::AlterMaterializedView { name, action } => {
-                mutations.push(Self::resolve_alter_materialized_view(name, action, state));
+            StatementFact::AlterMaterializedView {
+                name,
+                actions,
+                if_exists,
+            } => {
+                mutations.push(Self::resolve_alter_materialized_view(
+                    name, actions, *if_exists, state,
+                ));
             }
-            StatementFact::RefreshMaterializedView { name, concurrently } => {
+            StatementFact::RefreshMaterializedView {
+                name,
+                concurrently,
+                with_no_data,
+            } => {
                 mutations.push(Self::resolve_refresh_materialized_view(
                     name,
                     *concurrently,
+                    *with_no_data,
                     state,
                 ));
             }
@@ -323,14 +406,15 @@ impl Resolver {
                 if_not_exists,
                 concurrently,
                 using_method,
-                has_predicate,
+                predicate,
                 unique,
+                nulls_not_distinct,
                 key_columns,
+                key_expressions,
+                key_orders,
+                key_opclasses,
+                key_collations,
                 included_columns,
-                has_expression_keys,
-                has_default_sort_order,
-                has_default_opclasses,
-                has_default_collations,
             } => {
                 mutations.push(Self::resolve_create_index(
                     name,
@@ -338,14 +422,15 @@ impl Resolver {
                     *if_not_exists,
                     *concurrently,
                     using_method,
-                    *has_predicate,
+                    predicate,
                     *unique,
+                    *nulls_not_distinct,
                     key_columns,
+                    key_expressions,
+                    key_orders,
+                    key_opclasses,
+                    key_collations,
                     included_columns,
-                    *has_expression_keys,
-                    *has_default_sort_order,
-                    *has_default_opclasses,
-                    *has_default_collations,
                     state,
                 ));
             }
@@ -457,10 +542,15 @@ impl Resolver {
             StatementFact::AlterSequence {
                 name,
                 if_exists,
+                options,
                 action,
             } => {
                 mutations.push(Self::resolve_alter_sequence(
-                    name, *if_exists, action, state,
+                    name,
+                    *if_exists,
+                    options,
+                    action.as_ref(),
+                    state,
                 ));
             }
             StatementFact::DropSequence {

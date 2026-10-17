@@ -1,17 +1,19 @@
-use super::{AnalysisState, CascadeResult, MutationResult, ObjectLookup, RelationOverlay};
+use super::{
+    AnalysisState, CascadeResult, ConflictKind, MutationResult, ObjectLookup, RelationOverlay,
+};
 use crate::_internal::analysis::evidence::{EvidenceCode, EvidenceScope};
 use crate::_internal::analysis::graph::{DependencyEdge, DependencyKind};
 use crate::_internal::analysis::mutations::{
-    CreateIndex, CreateMaterializedView, CreateView, DropIndex, DropMaterializedViewMutation,
-    DropViewMutation, RefreshMaterializedViewMutation, ReloptionTarget,
+    AlterViewFamily, CreateIndex, CreateMaterializedView, CreateView, DropIndex,
+    DropMaterializedViewMutation, DropViewMutation, RefreshMaterializedViewMutation,
+    ReloptionTarget, ViewColumn, ViewRoutine,
 };
 use crate::_internal::ast::identifiers::ObjectId;
 use crate::_internal::model::column::Column;
+use crate::_internal::model::index::{IndexDefinition, index_keys};
 use crate::_internal::model::relation::{Persistence, RelationKind, RelationState};
-use crate::_internal::model::reloption::{
-    ReloptionOutcome, classify, materialized_view_reloption, view_reloption,
-};
-use std::collections::HashSet;
+use crate::_internal::model::reloption::{ReloptionOutcome, evaluate, spec_by_name};
+use std::collections::{BTreeSet, HashSet};
 
 type RelationLookup = ObjectLookup;
 type IndexLookup = ObjectLookup;
@@ -29,16 +31,17 @@ impl AnalysisState {
             self.local.relations.get(id),
             Some(RelationOverlay::Present(_))
         ) {
-            return MutationResult::Skipped;
+            return MutationResult::NoOp;
         }
         self.snapshot_relation(id);
         let Some(RelationOverlay::Present(relation)) = self.local.relations.get_mut(id) else {
-            return MutationResult::Skipped;
+            return MutationResult::NoOp;
         };
         let Some(entry) = relation.columns.iter_mut().find(|c| c.name == column) else {
-            return MutationResult::Conflict {
-                reason: format!("column '{column}' of view '{}' does not exist", id),
-            };
+            return MutationResult::conflict(format!(
+                "column '{column}' of view '{}' does not exist",
+                id
+            ));
         };
         entry.default = default.cloned();
         entry.default_expr_text = None;
@@ -54,19 +57,36 @@ impl AnalysisState {
         kind: ReloptionTarget,
         attributes: &[crate::_internal::analysis::facts::AttributeFact],
     ) -> MutationResult {
-        let version = self.pg_version_num;
+        let version = self.pg_version();
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
         for attribute in attributes {
-            let verdict = match kind {
-                ReloptionTarget::View => view_reloption(&attribute.name),
-                ReloptionTarget::MaterializedView => materialized_view_reloption(&attribute.name),
-            };
-            match classify(verdict, version) {
-                ReloptionOutcome::Rejected => {
-                    return MutationResult::Conflict {
-                        reason: format!("unrecognized parameter \"{}\"", attribute.name),
-                    };
+            // PostgreSQL rejects a repeated option before applying anything.
+            if !seen.insert(attribute.name.as_str()) {
+                return MutationResult::conflict(format!(
+                    "parameter \"{}\" specified more than once",
+                    attribute.name
+                ));
+            }
+            match evaluate(&attribute.name, Some(&attribute.value), kind, version) {
+                ReloptionOutcome::Unrecognized { name } => {
+                    // A name the table does not hold at all may belong to a
+                    // release this build does not model, so it taints: a false
+                    // conflict on a valid migration is worse than stated
+                    // uncertainty. A name the table holds but the running
+                    // version predates is a real rejection.
+                    if spec_by_name(&name).is_some() {
+                        return MutationResult::conflict(format!(
+                            "unrecognized parameter \"{name}\""
+                        ));
+                    }
+                    self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Statement);
                 }
-                ReloptionOutcome::Unknown => {
+                ReloptionOutcome::BadValue { name, value } => {
+                    return MutationResult::conflict(format!(
+                        "invalid value for parameter \"{name}\": {value}"
+                    ));
+                }
+                ReloptionOutcome::Unplaced => {
                     self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Statement);
                 }
                 ReloptionOutcome::Accepted => {}
@@ -77,7 +97,7 @@ impl AnalysisState {
             self.local.relations.get(id),
             Some(RelationOverlay::Present(_))
         ) {
-            return MutationResult::Skipped;
+            return MutationResult::NoOp;
         }
         self.snapshot_relation(id);
         if let Some(RelationOverlay::Present(relation)) = self.local.relations.get_mut(id) {
@@ -102,7 +122,7 @@ impl AnalysisState {
             self.local.relations.get(id),
             Some(RelationOverlay::Present(_))
         ) {
-            return MutationResult::Skipped;
+            return MutationResult::NoOp;
         }
         self.snapshot_relation(id);
         if let Some(RelationOverlay::Present(relation)) = self.local.relations.get_mut(id) {
@@ -187,31 +207,29 @@ impl AnalysisState {
         kind_name: &str,
     ) -> MutationResult {
         let roots = present.iter().cloned().collect::<HashSet<_>>();
+        // View dependency rows are scope-aware, but expression and extension
+        // dependent objects outside the selected schemas are not yet a
+        // complete catalog contract. That widens what CASCADE may remove; it
+        // does not cancel the drop, which PostgreSQL performs either way.
         if present.iter().any(|id| {
             self.baseline_scoped_family_object(
                 id,
                 crate::_internal::db::cache::CatalogFamily::Relations,
             )
         }) {
-            // View dependency rows are scope-aware, but expression and
-            // extension-dependent objects outside the selected schemas are
-            // not yet represented as a complete catalog contract.
             self.taint(
                 EvidenceCode::CatalogCoverageIncomplete,
                 EvidenceScope::Chain,
             );
-            return MutationResult::Skipped;
         }
         if !cascade && self.has_external_view_dependents(&roots) {
-            return MutationResult::Conflict {
-                reason: format!(
-                    "relation '{}' still has dependent views; use CASCADE",
-                    present
-                        .first()
-                        .map(ToString::to_string)
-                        .unwrap_or_else(|| kind_name.to_string())
-                ),
-            };
+            return MutationResult::conflict(format!(
+                "relation '{}' still has dependent views; use CASCADE",
+                present
+                    .first()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| kind_name.to_string())
+            ));
         }
 
         let cascade_result = cascade.then(|| self.cascade_for_relations(present));
@@ -285,6 +303,9 @@ impl AnalysisState {
     }
 
     fn index_lookup(&self, id: &ObjectId) -> IndexLookup {
+        if self.lookup_shadowed(id) {
+            return IndexLookup::Unknown;
+        }
         if self.local.graph.edges().iter().any(|edge| {
             matches!(edge.kind, DependencyKind::IndexOnRelation { .. }) && edge.dependent == *id
         }) {
@@ -299,7 +320,7 @@ impl AnalysisState {
     }
 
     pub(super) fn apply_create_view(&mut self, create: &CreateView) -> MutationResult {
-        if let Err(result) = self.ensure_schema_target(&create.id.schema) {
+        if let Err(result) = self.ensure_creation_target(&create.id) {
             return result;
         }
         let existing_view = matches!(
@@ -307,9 +328,7 @@ impl AnalysisState {
             RelationLookup::Present
         );
         if self.relation_namespace_is_taken(&create.id) && (!create.or_replace || !existing_view) {
-            return MutationResult::Conflict {
-                reason: format!("relation '{}' already exists", create.id),
-            };
+            return MutationResult::conflict(format!("relation '{}' already exists", create.id));
         }
         if let Err(result) = self.validate_view_dependencies(&create.id, &create.depends_on) {
             return result;
@@ -354,26 +373,13 @@ impl AnalysisState {
             // A view whose output list could not be derived still exists, but
             // its columns are unknown, so any column-level claim is unsound.
             self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Statement);
-        } else if !create.or_replace || !existing_view {
-            relation.columns = create
-                .columns
-                .iter()
-                .map(|column| Column {
-                    name: column.name.clone(),
-                    data_type: column.data_type.clone(),
-                    type_id: None,
-                    is_nullable: true,
-                    default: None,
-                    avg_width: None,
-                    default_expr_text: None,
-                    type_modifier: column.type_modifier,
-                    storage: None,
-                    compression: None,
-                    statistics_target: None,
-                    options: Default::default(),
-                    generated: None,
-                })
-                .collect();
+        } else if create.or_replace && existing_view {
+            if let Err(result) = self.check_replaced_view_columns(&create.id, &create.columns) {
+                return result;
+            }
+            relation.columns = view_state_columns(&create.columns);
+        } else {
+            relation.columns = view_state_columns(&create.columns);
         }
         self.local
             .relations
@@ -381,8 +387,13 @@ impl AnalysisState {
         self.snapshot_graph_full();
         if existing_view {
             self.local.graph.retain_edges(|edge| {
-                !(matches!(edge.kind, DependencyKind::ViewDependency { .. })
-                    && edge.dependent == create.id)
+                !(edge.dependent == create.id
+                    && matches!(
+                        edge.kind,
+                        DependencyKind::ViewDependency { .. }
+                            | DependencyKind::ViewUsesRoutine { .. }
+                            | DependencyKind::ViewUsesType { .. }
+                    ))
             });
         }
         for dependency in &create.depends_on {
@@ -395,6 +406,8 @@ impl AnalysisState {
                 },
             ));
         }
+        self.record_view_routine_dependencies(&create.id, &create.routines);
+        self.add_view_type_dependencies(&create.id, &create.cast_types);
         MutationResult::Applied
     }
 
@@ -402,13 +415,14 @@ impl AnalysisState {
         &mut self,
         create: &CreateMaterializedView,
     ) -> MutationResult {
-        if let Err(result) = self.ensure_schema_target(&create.id.schema) {
+        if let Err(result) = self.ensure_creation_target(&create.id) {
             return result;
         }
+        if create.if_not_exists && self.relation_namespace_is_taken(&create.id) {
+            return MutationResult::NoOp;
+        }
         if self.relation_namespace_is_taken(&create.id) {
-            return MutationResult::Conflict {
-                reason: format!("relation '{}' already exists", create.id),
-            };
+            return MutationResult::conflict(format!("relation '{}' already exists", create.id));
         }
         if let Err(result) = self.validate_view_dependencies(&create.id, &create.depends_on) {
             return result;
@@ -426,7 +440,21 @@ impl AnalysisState {
             Persistence::Permanent,
             self.local.transactions.len(),
         );
-        relation.is_populated = Some(true);
+        relation.is_populated = Some(!create.with_no_data);
+        relation.access_method = create.access_method.clone();
+        relation.tablespace = create.tablespace.clone();
+        for option in &create.options {
+            relation
+                .table_options
+                .insert(option.name.clone(), option.value.clone());
+        }
+        if !create.projection_complete {
+            // A view whose output list could not be derived still exists, but
+            // its columns are unknown, so any column-level claim is unsound.
+            self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Statement);
+        } else {
+            relation.columns = view_state_columns(&create.columns);
+        }
         self.local
             .relations
             .insert(create.id.clone(), RelationOverlay::Present(relation));
@@ -441,6 +469,8 @@ impl AnalysisState {
                 },
             ));
         }
+        self.record_view_routine_dependencies(&create.id, &create.routines);
+        self.add_view_type_dependencies(&create.id, &create.cast_types);
         MutationResult::Applied
     }
 
@@ -449,10 +479,7 @@ impl AnalysisState {
         refresh: &RefreshMaterializedViewMutation,
     ) -> MutationResult {
         if refresh.concurrently && self.in_transaction() {
-            return MutationResult::Conflict {
-                reason: "REFRESH MATERIALIZED VIEW CONCURRENTLY cannot run inside a transaction"
-                    .to_string(),
-            };
+            return MutationResult::Conflict(ConflictKind::ConcurrentInTransaction);
         }
         match self.relation_lookup(&refresh.id, |kind| *kind == RelationKind::MaterializedView) {
             RelationLookup::Present => {
@@ -460,63 +487,179 @@ impl AnalysisState {
                     match self.local.relations.get(&refresh.id) {
                         Some(RelationOverlay::Present(relation)) => match relation.is_populated {
                             Some(false) => {
-                                return MutationResult::Conflict {
-                                    reason: format!(
-                                        "materialized view '{}' must be populated before a concurrent refresh",
-                                        refresh.id
-                                    ),
-                                };
+                                return MutationResult::conflict(format!(
+                                    "CONCURRENTLY cannot be used when the materialized view '{}' is not populated",
+                                    refresh.id
+                                ));
                             }
                             None => {
-                                self.taint(
-                                    EvidenceCode::CatalogCoverageIncomplete,
-                                    EvidenceScope::Statement,
-                                );
-                                return MutationResult::Skipped;
+                                return self
+                                    .unresolved_statement(EvidenceCode::CatalogCoverageIncomplete);
                             }
                             Some(true) => {}
                         },
                         _ => unreachable!("materialized-view lookup established presence"),
                     }
                 }
+                // PostgreSQL rejects the option pair before it looks for the
+                // unique index a concurrent refresh requires.
+                if refresh.concurrently && refresh.with_no_data {
+                    return MutationResult::conflict(
+                        "CONCURRENTLY and WITH NO DATA options cannot be used together".to_string(),
+                    );
+                }
                 if let Some(RelationOverlay::Present(relation)) =
                     self.local.relations.get_mut(&refresh.id)
                 {
-                    relation.is_populated = Some(true);
+                    relation.is_populated = Some(!refresh.with_no_data);
                 }
                 MutationResult::Applied
             }
-            RelationLookup::WrongKind => MutationResult::Conflict {
-                reason: format!("'{}' is not a materialized view", refresh.id),
-            },
-            RelationLookup::AuthoritativelyAbsent | RelationLookup::Tombstone => {
-                MutationResult::Conflict {
-                    reason: format!("materialized view '{}' does not exist", refresh.id),
-                }
+            RelationLookup::WrongKind => {
+                MutationResult::conflict(format!("'{}' is not a materialized view", refresh.id))
             }
-            RelationLookup::Unknown => {
-                self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
-                MutationResult::Skipped
+            RelationLookup::AuthoritativelyAbsent | RelationLookup::Tombstone => {
+                MutationResult::conflict(format!(
+                    "materialized view '{}' does not exist",
+                    refresh.id
+                ))
+            }
+            RelationLookup::Unknown => self.unresolved(EvidenceCode::UnknownObjectState),
+        }
+    }
+
+    /// `ALTER VIEW` / `ALTER MATERIALIZED VIEW` with every action of the
+    /// statement. `IF EXISTS` guards the relation lookup, and an action the
+    /// model does not represent makes the statement opaque.
+    /// Record the routines a view calls as dependency edges.
+    ///
+    /// A call PostgreSQL could have resolved in a schema the model cannot see
+    /// leaves the recorded edge untrustworthy, so the statement's claims are
+    /// tainted along with it.
+    fn record_view_routine_dependencies(&mut self, view: &ObjectId, routines: &[ViewRoutine]) {
+        for routine in routines {
+            if routine.name.inferred_schema && self.path_shadows(&routine.name.schema) {
+                self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Statement);
+            }
+            self.local.graph.add_edge(DependencyEdge::new(
+                view.clone(),
+                routine
+                    .signature
+                    .clone()
+                    .unwrap_or_else(|| routine.name.clone()),
+                DependencyKind::ViewUsesRoutine {
+                    routine: routine.signature.clone(),
+                    name: routine.name.clone(),
+                },
+            ));
+        }
+    }
+
+    /// Record a view's dependency on each type its body casts to.
+    fn add_view_type_dependencies(&mut self, view: &ObjectId, cast_types: &[ObjectId]) {
+        for ty in cast_types {
+            self.local.graph.add_edge(DependencyEdge::new(
+                view.clone(),
+                ty.clone(),
+                DependencyKind::ViewUsesType { ty: ty.clone() },
+            ));
+        }
+    }
+
+    /// PostgreSQL only lets `CREATE OR REPLACE VIEW` append columns: every
+    /// position it already had keeps its name and its exact type, typmod
+    /// included.
+    fn check_replaced_view_columns(
+        &mut self,
+        id: &ObjectId,
+        columns: &[ViewColumn],
+    ) -> Result<(), MutationResult> {
+        let Some(RelationOverlay::Present(existing)) = self.local.relations.get(id) else {
+            return Err(self.unresolved(EvidenceCode::CatalogCoverageIncomplete));
+        };
+        // A view always has at least one column, so an empty list means the
+        // previous definition was never resolved.
+        let previous = existing.columns.clone();
+        if previous.is_empty() {
+            return Err(self.unresolved(EvidenceCode::CatalogCoverageIncomplete));
+        }
+        if columns.len() < previous.len() {
+            return Err(MutationResult::conflict(
+                "cannot drop columns from view".to_string(),
+            ));
+        }
+        for (old, new) in previous.iter().zip(columns) {
+            if old.name != new.name {
+                return Err(MutationResult::conflict(format!(
+                    "cannot change name of view column \"{}\" to \"{}\"",
+                    old.name, new.name
+                )));
+            }
+            // The type string is `format_type`, so it already carries the
+            // typmod exactly as PostgreSQL compares the pair of attributes.
+            if old.data_type == new.data_type {
+                continue;
+            }
+            // An unstated type on either side cannot prove a change happened.
+            if old.data_type.is_none() || new.data_type.is_none() {
+                return Err(self.unresolved(EvidenceCode::CatalogCoverageIncomplete));
+            }
+            return Err(MutationResult::conflict(format!(
+                "cannot change data type of view column \"{}\" from {} to {}",
+                old.name,
+                old.data_type.as_deref().unwrap_or_default(),
+                new.data_type.as_deref().unwrap_or_default(),
+            )));
+        }
+        Ok(())
+    }
+
+    pub(super) fn apply_alter_view_family(&mut self, alter: &AlterViewFamily) -> MutationResult {
+        match self.relation_lookup(&alter.id, |kind| *kind == alter.kind) {
+            RelationLookup::WrongKind => {
+                return MutationResult::conflict(format!(
+                    "'{}' is not a {}",
+                    alter.id,
+                    match alter.kind {
+                        RelationKind::View => "view",
+                        _ => "materialized view",
+                    }
+                ));
+            }
+            RelationLookup::AuthoritativelyAbsent | RelationLookup::Tombstone => {
+                if alter.if_exists {
+                    return MutationResult::NoOp;
+                }
+                return MutationResult::conflict(format!("relation '{}' does not exist", alter.id));
+            }
+            RelationLookup::Unknown => return self.unresolved(EvidenceCode::UnknownObjectState),
+            RelationLookup::Present => {}
+        }
+        // PostgreSQL applies every action of the statement, so an unmodeled
+        // action still contributes its transparency signal.
+        for action in &alter.actions {
+            match self.apply(action, None) {
+                MutationResult::Applied | MutationResult::NoOp => {}
+                result => return result,
             }
         }
+        MutationResult::Applied
     }
 
     pub(super) fn apply_create_index(&mut self, create: &CreateIndex) -> MutationResult {
         if create.concurrently && self.in_transaction() {
-            return MutationResult::Conflict {
-                reason: "CREATE INDEX CONCURRENTLY cannot run inside a transaction".to_string(),
-            };
+            return MutationResult::Conflict(ConflictKind::ConcurrentInTransaction);
         }
-        if let Err(result) = self.ensure_schema_target(&create.id.schema) {
+        if let Err(result) = self.ensure_creation_target(&create.id) {
             return result;
         }
-        if create.if_not_exists && self.index_lookup(&create.id) == IndexLookup::Present {
-            return MutationResult::Skipped;
+        // `IF NOT EXISTS` guards the whole name, not just an index: PostgreSQL emits
+        // a notice and skips whatever relation already holds the name.
+        if create.if_not_exists && self.relation_namespace_is_taken(&create.id) {
+            return MutationResult::NoOp;
         }
         if self.relation_namespace_is_taken(&create.id) {
-            return MutationResult::Conflict {
-                reason: format!("relation '{}' already exists", create.id),
-            };
+            return MutationResult::conflict(format!("relation '{}' already exists", create.id));
         }
         if let Err(result) = self.ensure_relation_target(
             &create.table,
@@ -525,6 +668,28 @@ impl AnalysisState {
             format!("index target '{}' cannot be indexed", create.table),
         ) {
             return result;
+        }
+        // Every named key and INCLUDE column must exist on the relation.
+        // PostgreSQL looks each one up by name and rejects an unknown column
+        // before building anything. An expression key is typed rather than
+        // looked up, so only the named columns are checked here.
+        let target_columns: Option<std::collections::HashSet<String>> =
+            match self.local.relations.get(&create.table) {
+                Some(RelationOverlay::Present(relation)) => Some(
+                    relation
+                        .columns
+                        .iter()
+                        .map(|column| column.name.clone())
+                        .collect(),
+                ),
+                _ => None,
+            };
+        if let Some(columns) = target_columns {
+            for column in create.key_columns.iter().chain(&create.included_columns) {
+                if !columns.contains(column) {
+                    return MutationResult::conflict(format!("column \"{column}\" does not exist"));
+                }
+            }
         }
         if create.concurrently
             && self
@@ -537,49 +702,46 @@ impl AnalysisState {
                 })
                 .is_some()
         {
-            return MutationResult::Conflict {
-                reason: format!(
-                    "CREATE INDEX CONCURRENTLY cannot run on partitioned table '{}'",
-                    create.table
-                ),
-            };
+            return MutationResult::conflict(format!(
+                "CREATE INDEX CONCURRENTLY cannot run on partitioned table '{}'",
+                create.table
+            ));
         }
         self.snapshot_graph();
         self.local.graph.add_edge(DependencyEdge::new(
             create.id.clone(),
             create.table.clone(),
             DependencyKind::IndexOnRelation {
-                using_method: create
-                    .using_method
-                    .clone()
-                    .or_else(|| Some("btree".to_string())),
-                key_columns: create.key_columns.clone(),
-                included_columns: create.included_columns.clone(),
+                definition: IndexDefinition {
+                    method: create
+                        .using_method
+                        .clone()
+                        .or_else(|| Some("btree".to_string())),
+                    keys: self.resolved_statement_index_keys(create),
+                    included: index_keys(create.included_columns.clone()),
+                    expression_keys: create
+                        .key_expressions
+                        .iter()
+                        .filter(|key| key.is_some())
+                        .count(),
+                    unique: create.unique,
+                    nulls_not_distinct: Some(create.nulls_not_distinct),
+                    predicate: create.predicate.clone(),
+                    unestablished: false,
+                    valid: true,
+                    ready: true,
+                    live: true,
+                },
                 dependency_columns: create
                     .key_columns
                     .iter()
                     .chain(&create.included_columns)
                     .cloned()
                     .collect(),
-                dependency_columns_known: !create.has_expression_keys && !create.has_predicate,
-                has_expression_keys: create.has_expression_keys,
-                has_predicate: create.has_predicate,
+                dependency_columns_known: create.key_expressions.iter().all(Option::is_none)
+                    && !create.predicate.has_predicate(),
                 is_concurrent: create.concurrently,
-                is_unique: create.unique,
-                // PostgreSQL-created indexes are immediate unless a
-                // constraint later adopts them with deferred semantics.
                 is_immediate: true,
-                is_valid: true,
-                is_ready: true,
-                is_live: true,
-                has_default_sort_order: create.has_default_sort_order,
-                has_default_opclasses: create.has_default_opclasses,
-                has_default_collations: create.has_default_collations,
-                // Eligibility facts are known even when dependency-column
-                // proof is incomplete: expression and partial indexes are
-                // deterministically ineligible for USING INDEX. Keep that
-                // distinction separate from dependency_columns_known, which
-                // governs exact column-drop cleanup.
                 eligibility_known: true,
             },
         ));
@@ -593,36 +755,29 @@ impl AnalysisState {
             match self.relation_lookup(id, |kind| *kind == RelationKind::View) {
                 RelationLookup::Present => present.push(id.clone()),
                 RelationLookup::WrongKind => {
-                    return MutationResult::Conflict {
-                        reason: format!("'{}' is not a view", id),
-                    };
+                    return MutationResult::conflict(format!("'{}' is not a view", id));
                 }
                 RelationLookup::AuthoritativelyAbsent if drop.if_exists => {}
                 RelationLookup::AuthoritativelyAbsent => {
-                    return MutationResult::Conflict {
-                        reason: format!("view '{}' does not exist", id),
-                    };
+                    return MutationResult::conflict(format!("view '{}' does not exist", id));
                 }
                 RelationLookup::Tombstone if drop.if_exists => {}
                 RelationLookup::Tombstone => {
-                    return MutationResult::Conflict {
-                        reason: format!("view '{}' does not exist", id),
-                    };
+                    return MutationResult::conflict(format!("view '{}' does not exist", id));
                 }
                 RelationLookup::Unknown => {
-                    self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
                     unknown_target = true;
+                    if !drop.if_exists {
+                        return self.unresolved(EvidenceCode::UnknownObjectState);
+                    }
                 }
             }
         }
-        // PostgreSQL resolves all names in a multi-target DROP before
-        // executing the statement.  Do not remove known targets when another
-        // target is outside a scoped/incomplete baseline.
         if unknown_target {
-            return MutationResult::Skipped;
+            return self.unresolved(EvidenceCode::UnknownObjectState);
         }
         if present.is_empty() {
-            return MutationResult::Skipped;
+            return MutationResult::NoOp;
         }
         self.apply_drop_relation_family(&present, drop.cascade, "view")
     }
@@ -637,47 +792,50 @@ impl AnalysisState {
             match self.relation_lookup(id, |kind| *kind == RelationKind::MaterializedView) {
                 RelationLookup::Present => present.push(id.clone()),
                 RelationLookup::WrongKind => {
-                    return MutationResult::Conflict {
-                        reason: format!("'{}' is not a materialized view", id),
-                    };
+                    return MutationResult::conflict(format!(
+                        "'{}' is not a materialized view",
+                        id
+                    ));
                 }
                 RelationLookup::AuthoritativelyAbsent if drop.if_exists => {}
                 RelationLookup::AuthoritativelyAbsent => {
-                    return MutationResult::Conflict {
-                        reason: format!("materialized view '{}' does not exist", id),
-                    };
+                    return MutationResult::conflict(format!(
+                        "materialized view '{}' does not exist",
+                        id
+                    ));
                 }
                 RelationLookup::Tombstone if drop.if_exists => {}
                 RelationLookup::Tombstone => {
-                    return MutationResult::Conflict {
-                        reason: format!("materialized view '{}' does not exist", id),
-                    };
+                    return MutationResult::conflict(format!(
+                        "materialized view '{}' does not exist",
+                        id
+                    ));
                 }
                 RelationLookup::Unknown => {
-                    self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
                     unknown_target = true;
+                    if !drop.if_exists {
+                        return self.unresolved(EvidenceCode::UnknownObjectState);
+                    }
                 }
             }
         }
         if unknown_target {
-            return MutationResult::Skipped;
+            return self.unresolved(EvidenceCode::UnknownObjectState);
         }
         if present.is_empty() {
-            return MutationResult::Skipped;
+            return MutationResult::NoOp;
         }
         self.apply_drop_relation_family(&present, drop.cascade, "materialized view")
     }
 
     pub(super) fn apply_drop_index(&mut self, drop: &DropIndex) -> MutationResult {
         if drop.concurrently && self.in_transaction() {
-            return MutationResult::Conflict {
-                reason: "DROP INDEX CONCURRENTLY cannot run inside a transaction".to_string(),
-            };
+            return MutationResult::Conflict(ConflictKind::ConcurrentInTransaction);
         }
         if drop.concurrently && drop.cascade {
-            return MutationResult::Conflict {
-                reason: "DROP INDEX CONCURRENTLY cannot use CASCADE".to_string(),
-            };
+            return MutationResult::conflict(
+                "DROP INDEX CONCURRENTLY cannot use CASCADE".to_string(),
+            );
         }
         // PostgreSQL resolves every target before it applies a multi-index
         // DROP. Preflight the complete statement so a later invalid target
@@ -692,13 +850,10 @@ impl AnalysisState {
                 }
                 IndexLookup::AuthoritativelyAbsent if drop.if_exists => {}
                 IndexLookup::AuthoritativelyAbsent => {
-                    return MutationResult::Conflict {
-                        reason: format!("index '{}' does not exist", id),
-                    };
+                    return MutationResult::conflict(format!("index '{}' does not exist", id));
                 }
                 IndexLookup::Unknown => {
-                    self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
-                    return MutationResult::Skipped;
+                    return self.unresolved(EvidenceCode::UnknownObjectState);
                 }
                 IndexLookup::WrongKind | IndexLookup::Tombstone => {
                     unreachable!("indexes have no overlay kind or tombstone")
@@ -707,7 +862,7 @@ impl AnalysisState {
         }
 
         if targets.is_empty() {
-            return MutationResult::Skipped;
+            return MutationResult::NoOp;
         }
 
         if targets.iter().any(|id| {
@@ -721,22 +876,14 @@ impl AnalysisState {
             // INDEX conflict semantics cannot be proven from the partial
             // graph. Leave the baseline unchanged until index ownership
             // coverage is object-complete.
-            self.taint(
-                EvidenceCode::CatalogCoverageIncomplete,
-                EvidenceScope::Chain,
-            );
-            return MutationResult::Skipped;
+            return self.unresolved(EvidenceCode::CatalogCoverageIncomplete);
         }
 
         for id in &targets {
             let Some(index_edge) = self.local.graph.edges().iter().find(|edge| {
                 matches!(edge.kind, DependencyKind::IndexOnRelation { .. }) && edge.dependent == *id
             }) else {
-                self.taint(
-                    EvidenceCode::CatalogCoverageIncomplete,
-                    EvidenceScope::Chain,
-                );
-                return MutationResult::Skipped;
+                return self.unresolved(EvidenceCode::CatalogCoverageIncomplete);
             };
             let referenced_table = self.local.graph.resolve_rename(&index_edge.referenced);
             let resolved_index = self.local.graph.resolve_rename(id);
@@ -751,12 +898,10 @@ impl AnalysisState {
                     })
                     .is_some()
             {
-                return MutationResult::Conflict {
-                    reason: format!(
-                        "DROP INDEX CONCURRENTLY cannot run on partitioned index '{}'",
-                        id
-                    ),
-                };
+                return MutationResult::conflict(format!(
+                    "DROP INDEX CONCURRENTLY cannot run on partitioned index '{}'",
+                    id
+                ));
             }
             let unresolved_constraint = self.baseline_indexes.contains(id)
                 && self
@@ -774,11 +919,7 @@ impl AnalysisState {
                             && constraint.backing_index.is_none()
                     });
             if unresolved_constraint {
-                self.taint(
-                    EvidenceCode::CatalogCoverageIncomplete,
-                    EvidenceScope::Chain,
-                );
-                return MutationResult::Skipped;
+                return self.unresolved(EvidenceCode::CatalogCoverageIncomplete);
             }
             let backs_constraint = self
                 .local
@@ -789,12 +930,10 @@ impl AnalysisState {
                         && constraint.backing_index.as_ref() == Some(resolved_index)
                 });
             if backs_constraint {
-                return MutationResult::Conflict {
-                    reason: format!(
-                        "cannot drop index '{}' because a constraint requires it",
-                        id
-                    ),
-                };
+                return MutationResult::conflict(format!(
+                    "cannot drop index '{}' because a constraint requires it",
+                    id
+                ));
             }
             if matches!(
                 index_edge.kind,
@@ -803,28 +942,25 @@ impl AnalysisState {
                     ..
                 }
             ) {
-                self.taint(
-                    EvidenceCode::CatalogCoverageIncomplete,
-                    EvidenceScope::Chain,
-                );
-                return MutationResult::Skipped;
+                return self.unresolved(EvidenceCode::CatalogCoverageIncomplete);
+            }
+        }
+        // An attached child index cannot be dropped on its own. PostgreSQL
+        // refuses unconditionally here: CASCADE does not help and IF EXISTS
+        // does not downgrade it.
+        for target in &targets {
+            if let Some(parent) = self.index_parent_of(target) {
+                return MutationResult::conflict(format!(
+                    "cannot drop index '{}' because index '{}' requires it",
+                    target.name, parent.name
+                ));
             }
         }
         // An attached partition index goes with its parent.
-        let attached_children = self
-            .local
-            .graph
-            .edges()
+        let attached_children: Vec<ObjectId> = targets
             .iter()
-            .filter(|edge| {
-                matches!(edge.kind, DependencyKind::IndexPartitionOf)
-                    && targets.iter().any(|target| {
-                        self.local.graph.resolve_rename(target)
-                            == self.local.graph.resolve_rename(&edge.referenced)
-                    })
-            })
-            .map(|edge| edge.dependent.clone())
-            .collect::<Vec<_>>();
+            .flat_map(|target| self.index_partitions_of(target))
+            .collect();
         let mut removed = targets.clone();
         removed.extend(attached_children.iter().cloned());
         let table_indexes = self
@@ -863,4 +999,26 @@ impl AnalysisState {
         });
         MutationResult::Applied
     }
+}
+
+/// A view's projected columns as relation columns.
+fn view_state_columns(columns: &[ViewColumn]) -> Vec<Column> {
+    columns
+        .iter()
+        .map(|column| Column {
+            name: column.name.clone(),
+            data_type: column.data_type.clone(),
+            type_id: None,
+            is_nullable: true,
+            default: None,
+            avg_width: None,
+            default_expr_text: None,
+            type_modifier: column.type_modifier,
+            storage: None,
+            compression: None,
+            statistics_target: None,
+            options: Default::default(),
+            generated: None,
+        })
+        .collect()
 }

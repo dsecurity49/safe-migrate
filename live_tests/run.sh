@@ -31,10 +31,17 @@ print(','.join(v['rule_id'] for v in data['violations']))
 "
 }
 
+# Validate a report against the published schema before anything reads it.
+validate_report() {
+    python3 "${SCRIPT_DIR}/report_schema.py" "$1"
+}
+
 VERBOSE=0
 OFFLINE=0
 TARGET_DIR=""
 TARGET_FILE=""
+REPORT_FILE="$(mktemp "${TMPDIR:-/tmp}/safe-migrate-report.XXXXXX.json")"
+trap 'rm -f "$REPORT_FILE"' EXIT
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -145,7 +152,12 @@ for dir in "${dirs[@]}"; do
             dir_fail=$((dir_fail + 1))
             failures="$failures  [CRASH] $rule_dir\n"
         else
-            if ! violation_rules=$(printf '%s' "$json" | extract_rules); then
+            printf '%s' "$json" > "$REPORT_FILE"
+            if ! schema_error=$(validate_report "$REPORT_FILE" 2>&1); then
+                [ "$VERBOSE" -eq 1 ] && echo "  [SCHEMA] $rule_dir: $schema_error"
+                dir_fail=$((dir_fail + 1))
+                failures="$failures  [SCHEMA]  $rule_dir ($schema_error)\n"
+            elif ! violation_rules=$(extract_rules < "$REPORT_FILE"); then
                 [ "$VERBOSE" -eq 1 ] && echo "  [UNREADABLE] $rule_dir"
                 dir_fail=$((dir_fail + 1))
                 failures="$failures  [UNREADABLE]  $rule_dir\n"
@@ -185,7 +197,17 @@ for dir in "${dirs[@]}"; do
                 continue
             fi
 
-            if ! violation_rules=$(printf '%s' "$json" | extract_rules); then
+            printf '%s' "$json" > "$REPORT_FILE"
+            if ! schema_error=$(validate_report "$REPORT_FILE" 2>&1); then
+                # An unreadable report must not be read as "no findings", which
+                # would turn a safe_* fixture green.
+                [ "$VERBOSE" -eq 1 ] && echo "  [SCHEMA] $rule_dir/$fname: $schema_error"
+                dir_fail=$((dir_fail + 1))
+                failures="$failures  [SCHEMA]  $rule_dir/$fname ($schema_error)\n"
+                continue
+            fi
+
+            if ! violation_rules=$(extract_rules < "$REPORT_FILE"); then
                 # A safe_* fixture expects zero findings. An unreadable report
                 # used to yield an empty rule list and score as a pass, so a
                 # crash or a report schema change turned this check green.

@@ -10,6 +10,7 @@ mod tests {
     };
     use crate::_internal::ast::identifiers::{Ident, QualifiedName};
     use crate::_internal::ast::visitor::AstVisitor;
+    use crate::_internal::model::index::{IndexOrder, IndexPredicate, WrittenName};
     use squawk_syntax::ast::SourceFile;
 
     // ========================================================================
@@ -1002,10 +1003,31 @@ mod tests {
         let facts = parse_and_extract_statement(sql);
         assert!(facts.is_some());
         match facts.unwrap() {
-            StatementFact::CreateIndex { has_predicate, .. } => {
-                assert!(has_predicate);
+            StatementFact::CreateIndex { predicate, .. } => {
+                assert!(predicate.has_predicate());
+                assert!(matches!(predicate, IndexPredicate::Parsed(_)));
             }
             _ => panic!("Expected CreateIndex fact"),
+        }
+    }
+
+    #[test]
+    fn create_index_records_nulls_not_distinct() {
+        for (sql, expected) in [
+            (
+                "CREATE UNIQUE INDEX idx ON users(email) NULLS NOT DISTINCT;",
+                true,
+            ),
+            ("CREATE UNIQUE INDEX idx ON users(email);", false),
+        ] {
+            let facts = parse_and_extract_statement(sql);
+            let Some(StatementFact::CreateIndex {
+                nulls_not_distinct, ..
+            }) = facts
+            else {
+                panic!("Expected CreateIndex fact for: {sql}");
+            };
+            assert_eq!(nulls_not_distinct, expected, "for: {sql}");
         }
     }
 
@@ -3064,14 +3086,30 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_create_materialized_view_population_is_not_silent() {
-        let parsed = SourceFile::parse(
-            "CREATE MATERIALIZED VIEW snapshot AS SELECT id FROM source WITH NO DATA;",
+    fn create_materialized_view_carries_its_population_and_guard() {
+        let population = |sql: &str| {
+            let parsed = SourceFile::parse(sql);
+            let statement = parsed.tree().stmts().next().expect("statement");
+            match AstVisitor::extract(&statement).expect("materialized view fact") {
+                StatementFact::CreateMaterializedView {
+                    with_no_data,
+                    if_not_exists,
+                    ..
+                } => (with_no_data, if_not_exists),
+                other => panic!("expected CreateMaterializedView, got {other:?}"),
+            }
+        };
+        assert_eq!(
+            population("CREATE MATERIALIZED VIEW snapshot AS SELECT id FROM source;"),
+            (false, false)
         );
-        let statement = parsed.tree().stmts().next().expect("statement");
-        assert!(
-            AstVisitor::extract(&statement).is_none(),
-            "unpopulated materialized views must use the opaque engine path"
+        assert_eq!(
+            population("CREATE MATERIALIZED VIEW snapshot AS SELECT id FROM source WITH NO DATA;"),
+            (true, false)
+        );
+        assert_eq!(
+            population("CREATE MATERIALIZED VIEW IF NOT EXISTS snapshot AS SELECT id FROM source;"),
+            (false, true)
         );
     }
 
@@ -3097,11 +3135,13 @@ mod tests {
         for (sql, expected) in [
             (
                 "CREATE TYPE floatrange AS RANGE (subtype = float8);",
-                TypeCreationKind::Range,
+                TypeCreationKind::Range {
+                    subtype: Some("float8".to_string()),
+                },
             ),
             (
                 "CREATE TYPE my_input (INPUT = int4in, OUTPUT = int4out);",
-                TypeCreationKind::Base,
+                TypeCreationKind::Base { element: None },
             ),
         ] {
             let parsed = SourceFile::parse(sql);
@@ -3139,6 +3179,94 @@ mod tests {
     }
 
     #[test]
+    fn expression_indexes_keep_their_parsed_identity() {
+        let parsed =
+            SourceFile::parse("CREATE UNIQUE INDEX normalized_name ON source ((lower(name)));");
+        let statement = parsed.tree().stmts().next().expect("statement");
+        let Some(StatementFact::CreateIndex {
+            unique,
+            concurrently,
+            predicate,
+            key_columns,
+            key_expressions,
+            ..
+        }) = AstVisitor::extract(&statement)
+        else {
+            panic!("expected create index fact");
+        };
+        assert!(unique);
+        assert!(!concurrently);
+        assert!(!predicate.has_predicate());
+        // An expression key names no column, so the columns list is empty while
+        // the key itself is still present and carries its parsed identity.
+        assert!(key_columns.is_empty());
+        assert_eq!(key_expressions.len(), 1);
+        assert!(key_expressions[0].is_some());
+    }
+
+    #[test]
+    fn a_collated_column_key_stays_a_column() {
+        // PostgreSQL strips top-level COLLATE and parentheses before deciding
+        // a key is a column, so a collated bare column is a column key that
+        // carries the written collation, not an expression.
+        for sql in [
+            "CREATE INDEX ON source (name COLLATE \"C\");",
+            "CREATE INDEX ON source ((name) COLLATE \"C\");",
+        ] {
+            let Some(StatementFact::CreateIndex {
+                key_columns,
+                key_expressions,
+                key_collations,
+                ..
+            }) = parse_and_extract_statement(sql)
+            else {
+                panic!("expected create index fact for: {sql}");
+            };
+            assert_eq!(key_columns, ["name"], "for: {sql}");
+            assert_eq!(key_expressions, [None], "for: {sql}");
+            assert_eq!(
+                key_collations,
+                [Some(WrittenName {
+                    schema: None,
+                    name: "C".to_string(),
+                })],
+                "for: {sql}"
+            );
+        }
+        let Some(StatementFact::CreateIndex {
+            key_columns,
+            key_expressions,
+            key_collations,
+            ..
+        }) = parse_and_extract_statement("CREATE INDEX ON source ((name));")
+        else {
+            panic!("expected create index fact");
+        };
+        assert_eq!(key_columns, ["name"]);
+        assert_eq!(key_expressions, [None]);
+        assert_eq!(key_collations, [None]);
+        let Some(StatementFact::CreateIndex {
+            key_columns,
+            key_expressions,
+            key_collations,
+            ..
+        }) = parse_and_extract_statement("CREATE INDEX ON source (lower(name) COLLATE \"C\");")
+        else {
+            panic!("expected create index fact");
+        };
+        assert!(key_columns.is_empty());
+        assert_eq!(key_expressions.len(), 1);
+        assert!(key_expressions[0].is_some());
+        assert_eq!(
+            key_collations,
+            [Some(WrittenName {
+                schema: None,
+                name: "C".to_string(),
+            })]
+        );
+    }
+
+    #[test]
     fn expression_indexes_preserve_index_rule_metadata() {
         let parsed =
             SourceFile::parse("CREATE UNIQUE INDEX normalized_name ON source ((lower(name)));");
@@ -3148,8 +3276,7 @@ mod tests {
             Some(StatementFact::CreateIndex {
                 unique: true,
                 concurrently: false,
-                has_predicate: false,
-                has_expression_keys: true,
+                predicate: IndexPredicate::None,
                 ..
             })
         ));
@@ -3162,22 +3289,25 @@ mod tests {
         let statement = parsed.tree().stmts().next().expect("statement");
         let Some(StatementFact::CreateIndex {
             key_columns,
-            has_expression_keys,
+            key_expressions,
             included_columns,
-            has_default_sort_order,
-            has_default_opclasses,
-            has_default_collations,
+            key_orders,
+            key_opclasses,
+            key_collations,
+            nulls_not_distinct,
             ..
         }) = AstVisitor::extract(&statement)
         else {
             panic!("expected create index fact");
         };
         assert_eq!(key_columns, ["name"]);
-        assert!(!has_expression_keys);
+        // Key positions stay aligned: one plain column, no expressions.
+        assert_eq!(key_expressions, [None]);
         assert_eq!(included_columns, ["id"]);
-        assert!(has_default_sort_order);
-        assert!(has_default_opclasses);
-        assert!(has_default_collations);
+        assert_eq!(key_orders, [IndexOrder::Default]);
+        assert_eq!(key_opclasses, [None]);
+        assert_eq!(key_collations, [None]);
+        assert!(!nulls_not_distinct);
     }
 
     #[test]
@@ -3203,7 +3333,9 @@ mod tests {
             let parsed = SourceFile::parse(sql);
             let stmt = parsed.tree().stmts().next().expect("statement");
             match AstVisitor::extract(&stmt).unwrap_or_else(|| panic!("no fact for: {sql}")) {
-                StatementFact::AlterMaterializedView { action, .. } => action,
+                StatementFact::AlterMaterializedView { actions, .. } => {
+                    actions.into_iter().next().expect("at least one action")
+                }
                 other => panic!("expected AlterMaterializedView fact, got {other:?} for: {sql}"),
             }
         };
@@ -3278,9 +3410,12 @@ mod tests {
         assert!(matches!(
             &facts[1],
             StatementFact::AlterSequence {
-                action: crate::_internal::analysis::facts::AlterSequenceActionFact::OwnedBy(None),
+                options,
                 ..
-            }
+            } if matches!(
+                options.as_slice(),
+                [crate::_internal::analysis::facts::SequenceOptionFact::OwnedBy(None)]
+            )
         ));
         assert!(matches!(
             &facts[2],

@@ -1,4 +1,5 @@
 use crate::_internal::ast::identifiers::ObjectId;
+use crate::_internal::model::index::IndexDefinition;
 use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
 
@@ -21,23 +22,28 @@ pub(crate) enum DependencyKind {
         /// expression-column dependencies are not modeled yet.
         referenced_column: Option<String>,
     },
+    /// A routine a view calls, which a drop of that routine must clear.
+    ///
+    /// `routine` is the exact routine identity when the call resolved to one.
+    /// When it is `None` the call could not be pinned to a signature, so only
+    /// the qualified name is known and any overload of it is a dependent.
+    ViewUsesRoutine {
+        routine: Option<ObjectId>,
+        name: ObjectId,
+    },
+    /// A type a view body casts to, which a drop of that type must clear.
+    ///
+    /// PostgreSQL records this from the cast alone: a view that selects a
+    /// column of a type creates no such dependency.
+    ViewUsesType {
+        ty: ObjectId,
+    },
     IndexOnRelation {
-        using_method: Option<String>,
-        key_columns: Vec<String>,
-        included_columns: Vec<String>,
+        definition: IndexDefinition,
         dependency_columns: Vec<String>,
         dependency_columns_known: bool,
-        has_expression_keys: bool,
-        has_predicate: bool,
         is_concurrent: bool,
-        is_unique: bool,
         is_immediate: bool,
-        is_valid: bool,
-        is_ready: bool,
-        is_live: bool,
-        has_default_sort_order: bool,
-        has_default_opclasses: bool,
-        has_default_collations: bool,
         eligibility_known: bool,
     },
     /// A primary-key/unique constraint whose ordered key columns are known.
@@ -384,7 +390,33 @@ impl DependencyGraph {
             .collect()
     }
 
-    #[cfg(test)]
+    /// The table an index is defined on, if the graph records one.
+    pub(crate) fn index_table_of(&self, index: &ObjectId) -> Option<&ObjectId> {
+        self.edges
+            .iter()
+            .find(|edge| {
+                edge.dependent == *index
+                    && matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
+            })
+            .map(|edge| &edge.referenced)
+    }
+
+    /// Rewrite a recorded index definition in place.
+    pub(crate) fn update_index_definition(
+        &mut self,
+        index: &ObjectId,
+        apply: impl FnOnce(&mut crate::_internal::model::index::IndexDefinition),
+    ) {
+        for edge in &mut self.edges {
+            if edge.dependent == *index
+                && let DependencyKind::IndexOnRelation { definition, .. } = &mut edge.kind
+            {
+                apply(definition);
+                return;
+            }
+        }
+    }
+
     pub(crate) fn partitions_of(&self, id: &ObjectId) -> Vec<&ObjectId> {
         if self.edges.len() >= Self::CASCADE_INDEX_MIN_EDGES {
             return self
@@ -530,6 +562,8 @@ impl DependencyGraph {
                 DependencyKind::IndexPartitionOf => {}
                 DependencyKind::ForeignKey { .. }
                 | DependencyKind::ViewDependency { .. }
+                | DependencyKind::ViewUsesRoutine { .. }
+                | DependencyKind::ViewUsesType { .. }
                 | DependencyKind::InheritanceOf
                 | DependencyKind::PartitionOf
                 | DependencyKind::PartitionDetachPending
@@ -754,19 +788,23 @@ impl DependencyGraph {
                     continue;
                 }
                 let DependencyKind::IndexOnRelation {
-                    key_columns,
-                    included_columns,
+                    definition,
                     dependency_columns,
                     ..
                 } = &mut edge.kind
                 else {
                     continue;
                 };
-                for column in key_columns
+                let index_keys = definition
+                    .keys
                     .iter_mut()
-                    .chain(included_columns)
-                    .chain(dependency_columns)
-                {
+                    .chain(&mut definition.included)
+                    .filter_map(|key| match &mut key.kind {
+                        crate::_internal::model::index::IndexKeyKind::Column(name) => Some(name),
+                        crate::_internal::model::index::IndexKeyKind::Expression(_) => None,
+                    })
+                    .collect::<Vec<&mut String>>();
+                for column in index_keys.into_iter().chain(dependency_columns.iter_mut()) {
                     if column == old_name {
                         *column = new_name.to_string();
                     }
@@ -818,6 +856,46 @@ impl DependencyGraph {
         self.propagate_relation_rename(old_id, new_id);
     }
 
+    /// Views that depend on a routine.
+    ///
+    /// A reference that resolved to an exact signature matches only that
+    /// routine. One that could not be resolved matches every routine of that
+    /// name, because the call may be any of its overloads.
+    pub(crate) fn views_for_function(&self, function_id: &ObjectId) -> Vec<&DependencyEdge> {
+        let (schema, signature) = Self::split_routine_signature(function_id);
+        self.edges
+            .iter()
+            .filter(|edge| {
+                let DependencyKind::ViewUsesRoutine { routine, name } = &edge.kind else {
+                    return false;
+                };
+                name.schema == schema
+                    && match routine {
+                        Some(resolved) => resolved == function_id,
+                        None => name.name == signature,
+                    }
+            })
+            .collect()
+    }
+
+    /// The schema and bare name of a routine whose identity is `name(arguments)`.
+    fn split_routine_signature(routine: &ObjectId) -> (&str, &str) {
+        match routine.name.split_once('(') {
+            Some((name, _)) => (routine.schema.as_str(), name),
+            None => (routine.schema.as_str(), routine.name.as_str()),
+        }
+    }
+
+    /// Views whose body casts to a type.
+    pub(crate) fn views_for_type(&self, ty: &ObjectId) -> Vec<&DependencyEdge> {
+        self.edges
+            .iter()
+            .filter(|edge| {
+                matches!(&edge.kind, DependencyKind::ViewUsesType { ty: referenced } if referenced == ty)
+            })
+            .collect()
+    }
+
     pub(crate) fn triggers_for_function(&self, function_id: &ObjectId) -> Vec<&DependencyEdge> {
         self.edges
             .iter()
@@ -838,6 +916,7 @@ impl DependencyGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::_internal::model::index::{IndexPredicate, index_keys};
 
     fn id(name: &str) -> ObjectId {
         ObjectId::new("public", name)
@@ -1070,22 +1149,23 @@ mod tests {
             "index",
             "target",
             DependencyKind::IndexOnRelation {
-                using_method: Some("btree".into()),
-                key_columns: vec!["id".into()],
-                included_columns: Vec::new(),
+                definition: IndexDefinition {
+                    method: Some("btree".into()),
+                    keys: index_keys(vec!["id".into()]),
+                    included: index_keys(Vec::new()),
+                    expression_keys: 0,
+                    unique: false,
+                    nulls_not_distinct: Some(false),
+                    predicate: IndexPredicate::None,
+                    unestablished: false,
+                    valid: true,
+                    ready: true,
+                    live: true,
+                },
                 dependency_columns: Vec::new(),
                 dependency_columns_known: true,
-                has_expression_keys: false,
-                has_predicate: false,
                 is_concurrent: false,
-                is_unique: false,
                 is_immediate: true,
-                is_valid: true,
-                is_ready: true,
-                is_live: true,
-                has_default_sort_order: true,
-                has_default_opclasses: true,
-                has_default_collations: true,
                 eligibility_known: true,
             },
         ));

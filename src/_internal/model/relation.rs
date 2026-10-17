@@ -407,6 +407,16 @@ pub(crate) enum RelationKind {
     Table,
     View,
     MaterializedView,
+    /// `pg_class.relkind = 'f'`.
+    ForeignTable,
+}
+
+impl RelationKind {
+    /// A foreign table is a table for `DROP`, `TRUNCATE`, `PARTITION OF` and
+    /// `INHERITS`; the server rejects it for locking and foreign-key targets.
+    pub(crate) fn is_table_like(&self) -> bool {
+        matches!(self, Self::Table | Self::ForeignTable)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -13,14 +13,57 @@ use std::collections::HashSet;
 type TypeLookup = ObjectLookup;
 
 impl AnalysisState {
+    /// Reject a type the server would refuse to create: a duplicate enum
+    /// label, or a component type that names nothing resolvable.
+    fn check_created_type(&mut self, kind: &TypeKind) -> Result<(), MutationResult> {
+        let declared: Vec<&str> = match kind {
+            TypeKind::Enum { variants } => {
+                let mut seen = HashSet::new();
+                for label in variants {
+                    if !seen.insert(label) {
+                        return Err(MutationResult::conflict(format!(
+                            "enum label \"{label}\" already exists"
+                        )));
+                    }
+                }
+                Vec::new()
+            }
+            TypeKind::Composite { fields } => fields
+                .iter()
+                .map(|field| field.data_type.as_str())
+                .collect(),
+            TypeKind::Domain { base_type, .. } => vec![base_type.as_str()],
+            TypeKind::Range { subtype } => subtype.as_deref().into_iter().collect(),
+            TypeKind::Base { element } => element.as_deref().into_iter().collect(),
+            TypeKind::Multirange => Vec::new(),
+        };
+        for declared_type in declared {
+            if let Some(result) = self.check_declared_type(declared_type) {
+                return Err(result);
+            }
+        }
+        Ok(())
+    }
+
+    /// What a reference to `old_id` becomes when the type is renamed: the new
+    /// name, or its array form when the reference was written `name[]`.
+    fn renamed_type_id(current: &ObjectId, rename: &Rename) -> Option<ObjectId> {
+        if current == &rename.old_id {
+            return Some(rename.new_id.clone());
+        }
+        (current == &Self::array_type_id(&rename.old_id))
+            .then(|| Self::array_type_id(&rename.new_id))
+    }
+
     pub(super) fn apply_create_type(&mut self, create: &CreateTypeMutation) -> MutationResult {
-        if let Err(result) = self.ensure_schema_target(&create.id.schema) {
+        if let Err(result) = self.ensure_creation_target(&create.id) {
             return result;
         }
         if self.relation_namespace_is_taken(&create.id) {
-            return MutationResult::Conflict {
-                reason: format!("type '{}' already exists", create.id),
-            };
+            return MutationResult::conflict(format!("type '{}' already exists", create.id));
+        }
+        if let Err(result) = self.check_created_type(&create.kind) {
+            return result;
         }
         self.snapshot_type(&create.id);
         self.snapshot_generation_counter();
@@ -45,31 +88,29 @@ impl AnalysisState {
                 crate::_internal::db::cache::CatalogFamily::Types,
             ) =>
             {
-                return MutationResult::Conflict {
-                    reason: format!("type '{}' does not exist", rename.old_id),
-                };
+                return MutationResult::conflict(format!(
+                    "type '{}' does not exist",
+                    rename.old_id
+                ));
             }
             TypeLookup::Tombstone | TypeLookup::AuthoritativelyAbsent | TypeLookup::Unknown => {
-                self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
-                return MutationResult::Skipped;
+                return self.unresolved(EvidenceCode::UnknownObjectState);
             }
             TypeLookup::WrongKind => unreachable!("all present type kinds are accepted"),
         }
         if rename.old_id != rename.new_id && self.relation_namespace_is_taken(&rename.new_id) {
-            return MutationResult::Conflict {
-                reason: format!("type '{}' already exists", rename.new_id),
-            };
+            return MutationResult::conflict(format!("type '{}' already exists", rename.new_id));
         }
         if rename.old_id.schema != rename.new_id.schema
             && !self.schema_is_present(&rename.new_id.schema)
         {
             if self.schema_absence_is_authoritative(&rename.new_id.schema) {
-                return MutationResult::Conflict {
-                    reason: format!("schema '{}' does not exist", rename.new_id.schema),
-                };
+                return MutationResult::conflict(format!(
+                    "schema '{}' does not exist",
+                    rename.new_id.schema
+                ));
             }
-            self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
-            return MutationResult::Skipped;
+            return self.unresolved(EvidenceCode::UnknownObjectState);
         }
 
         let mut remapped_functions = Vec::new();
@@ -82,7 +123,13 @@ impl AnalysisState {
                 .iter()
                 .enumerate()
                 .map(|(index, raw)| {
-                    if function.arg_type_ids.get(index) == Some(&Some(rename.old_id.clone())) {
+                    if function
+                        .arg_type_ids
+                        .get(index)
+                        .and_then(|id| id.as_ref())
+                        .and_then(|id| Self::renamed_type_id(id, rename))
+                        .is_some()
+                    {
                         Self::remapped_type_display(
                             raw,
                             &rename.new_id,
@@ -93,14 +140,17 @@ impl AnalysisState {
                     }
                 })
                 .collect::<Vec<_>>();
-            let new_return_type = if function.return_type_id == Some(rename.old_id.clone()) {
-                Self::remapped_type_display(
+            let new_return_type = match function
+                .return_type_id
+                .as_ref()
+                .and_then(|id| Self::renamed_type_id(id, rename))
+            {
+                Some(_) => Self::remapped_type_display(
                     &function.return_type,
                     &rename.new_id,
                     rename.old_id.schema != rename.new_id.schema,
-                )
-            } else {
-                function.return_type.clone()
+                ),
+                None => function.return_type.clone(),
             };
             let base_name = function_id
                 .name
@@ -134,12 +184,10 @@ impl AnalysisState {
                 || (self.local.functions.contains_key(new_id)
                     && !moved_function_ids.contains(new_id))
             {
-                return MutationResult::Conflict {
-                    reason: format!(
-                        "routine '{}' already exists after renaming type '{}'",
-                        new_id, rename.old_id
-                    ),
-                };
+                return MutationResult::conflict(format!(
+                    "routine '{}' already exists after renaming type '{}'",
+                    new_id, rename.old_id
+                ));
             }
         }
 
@@ -153,13 +201,17 @@ impl AnalysisState {
         for overlay in self.local.relations.values_mut() {
             if let RelationOverlay::Present(relation) = overlay {
                 for column in &mut relation.columns {
-                    if column.type_id == Some(rename.old_id.clone()) {
+                    let remapped = column
+                        .type_id
+                        .as_ref()
+                        .and_then(|id| Self::renamed_type_id(id, rename));
+                    if let Some(new_type_id) = remapped {
                         column.data_type = Some(Self::remapped_type_display(
                             column.data_type.as_deref().unwrap_or_default(),
                             &rename.new_id,
                             rename.old_id.schema != rename.new_id.schema,
                         ));
-                        column.type_id = Some(rename.new_id.clone());
+                        column.type_id = Some(new_type_id);
                     }
                 }
             }
@@ -173,14 +225,21 @@ impl AnalysisState {
                     },
                 ..
             }) = overlay
-                && *base_type_id == Some(rename.old_id.clone())
+                && base_type_id
+                    .as_ref()
+                    .and_then(|id| Self::renamed_type_id(id, rename))
+                    .is_some()
             {
+                let new_base_id = base_type_id
+                    .as_ref()
+                    .and_then(|id| Self::renamed_type_id(id, rename))
+                    .expect("presence checked above");
                 *base_type = Self::remapped_type_display(
                     base_type,
                     &rename.new_id,
                     rename.old_id.schema != rename.new_id.schema,
                 );
-                *base_type_id = Some(rename.new_id.clone());
+                *base_type_id = Some(new_base_id);
             }
         }
         for (old_id, new_id, arg_types, return_type) in remapped_functions {
@@ -190,13 +249,20 @@ impl AnalysisState {
                 function.id = new_id.clone();
                 function.arg_types = arg_types;
                 for type_id in &mut function.arg_type_ids {
-                    if *type_id == Some(rename.old_id.clone()) {
-                        *type_id = Some(rename.new_id.clone());
+                    if let Some(remapped) = type_id
+                        .as_ref()
+                        .and_then(|id| Self::renamed_type_id(id, rename))
+                    {
+                        *type_id = Some(remapped);
                     }
                 }
                 function.return_type = return_type;
-                if function.return_type_id == Some(rename.old_id.clone()) {
-                    function.return_type_id = Some(rename.new_id.clone());
+                if let Some(remapped) = function
+                    .return_type_id
+                    .as_ref()
+                    .and_then(|id| Self::renamed_type_id(id, rename))
+                {
+                    function.return_type_id = Some(remapped);
                 }
                 self.local
                     .functions
@@ -219,13 +285,10 @@ impl AnalysisState {
             TypeLookup::Present => {}
             TypeLookup::WrongKind => unreachable!("all present type kinds are accepted"),
             TypeLookup::AuthoritativelyAbsent | TypeLookup::Tombstone => {
-                return MutationResult::Conflict {
-                    reason: format!("type '{}' does not exist", alter.id),
-                };
+                return MutationResult::conflict(format!("type '{}' does not exist", alter.id));
             }
             TypeLookup::Unknown => {
-                self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
-                return MutationResult::Skipped;
+                return self.unresolved(EvidenceCode::UnknownObjectState);
             }
         }
         if matches!(&alter.action, AlterTypeActionMutation::AddValue { .. })
@@ -237,9 +300,7 @@ impl AnalysisState {
                 }))
             )
         {
-            return MutationResult::Conflict {
-                reason: format!("type '{}' is not an enum", alter.id),
-            };
+            return MutationResult::conflict(format!("type '{}' is not an enum", alter.id));
         }
         self.snapshot_type(&alter.id);
         if let Some(TypeOverlay::Present(existing)) = self.local.types.get_mut(&alter.id) {
@@ -251,17 +312,15 @@ impl AnalysisState {
                 } => {
                     if let TypeKind::Enum { variants } = &mut existing.kind {
                         if variants.contains(new_value) {
-                            return MutationResult::Skipped;
+                            return MutationResult::NoOp;
                         }
                         let insertion_index = if let Some(neighbor) = neighbor {
                             let Some(index) = variants.iter().position(|value| value == neighbor)
                             else {
-                                return MutationResult::Conflict {
-                                    reason: format!(
-                                        "enum label '{}' does not exist on type '{}'",
-                                        neighbor, alter.id
-                                    ),
-                                };
+                                return MutationResult::conflict(format!(
+                                    "enum label '{}' does not exist on type '{}'",
+                                    neighbor, alter.id
+                                ));
                             };
                             if *before { index } else { index + 1 }
                         } else {
@@ -275,26 +334,23 @@ impl AnalysisState {
                     new_value,
                 } => {
                     let TypeKind::Enum { variants } = &mut existing.kind else {
-                        return MutationResult::Conflict {
-                            reason: format!("type '{}' is not an enum", alter.id),
-                        };
+                        return MutationResult::conflict(format!(
+                            "type '{}' is not an enum",
+                            alter.id
+                        ));
                     };
                     let Some(old_index) = variants.iter().position(|value| value == old_value)
                     else {
-                        return MutationResult::Conflict {
-                            reason: format!(
-                                "'{}' is not an existing label of enum '{}'",
-                                old_value, alter.id
-                            ),
-                        };
+                        return MutationResult::conflict(format!(
+                            "'{}' is not an existing label of enum '{}'",
+                            old_value, alter.id
+                        ));
                     };
                     if variants.iter().any(|value| value == new_value) {
-                        return MutationResult::Conflict {
-                            reason: format!(
-                                "enum label '{}' already exists on type '{}'",
-                                new_value, alter.id
-                            ),
-                        };
+                        return MutationResult::conflict(format!(
+                            "enum label '{}' already exists on type '{}'",
+                            new_value, alter.id
+                        ));
                     }
                     variants[old_index] = new_value.clone();
                 }
@@ -304,13 +360,14 @@ impl AnalysisState {
     }
 
     pub(super) fn apply_create_domain(&mut self, create: &CreateDomainMutation) -> MutationResult {
-        if let Err(result) = self.ensure_schema_target(&create.id.schema) {
+        if let Err(result) = self.ensure_creation_target(&create.id) {
             return result;
         }
         if self.relation_namespace_is_taken(&create.id) {
-            return MutationResult::Conflict {
-                reason: format!("type '{}' already exists", create.id),
-            };
+            return MutationResult::conflict(format!("type '{}' already exists", create.id));
+        }
+        if let Some(result) = self.check_declared_type(&create.base_type) {
+            return result;
         }
         self.snapshot_type(&create.id);
         self.snapshot_generation_counter();
@@ -332,20 +389,14 @@ impl AnalysisState {
 
     pub(super) fn apply_alter_domain(&mut self, alter: &AlterDomainMutation) -> MutationResult {
         match self.type_lookup(&alter.id, |kind| matches!(kind, TypeKind::Domain { .. })) {
-            TypeLookup::Present => {
-                self.taint(EvidenceCode::UnsupportedSemantics, EvidenceScope::Chain);
-                MutationResult::Skipped
+            TypeLookup::Present => self.unresolved(EvidenceCode::UnsupportedSemantics),
+            TypeLookup::WrongKind => {
+                MutationResult::conflict(format!("type '{}' is not a domain", alter.id))
             }
-            TypeLookup::WrongKind => MutationResult::Conflict {
-                reason: format!("type '{}' is not a domain", alter.id),
-            },
-            TypeLookup::AuthoritativelyAbsent | TypeLookup::Tombstone => MutationResult::Conflict {
-                reason: format!("domain '{}' does not exist", alter.id),
-            },
-            TypeLookup::Unknown => {
-                self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
-                MutationResult::Skipped
+            TypeLookup::AuthoritativelyAbsent | TypeLookup::Tombstone => {
+                MutationResult::conflict(format!("domain '{}' does not exist", alter.id))
             }
+            TypeLookup::Unknown => self.unresolved(EvidenceCode::UnknownObjectState),
         }
     }
 
@@ -355,25 +406,22 @@ impl AnalysisState {
             match self.type_lookup(id, |kind| matches!(kind, TypeKind::Domain { .. })) {
                 TypeLookup::Present => present.push(id.clone()),
                 TypeLookup::WrongKind => {
-                    return MutationResult::Conflict {
-                        reason: format!("type '{}' is not a domain", id),
-                    };
+                    return MutationResult::conflict(format!("type '{}' is not a domain", id));
                 }
                 TypeLookup::AuthoritativelyAbsent | TypeLookup::Tombstone if drop.if_exists => {}
                 TypeLookup::AuthoritativelyAbsent | TypeLookup::Tombstone => {
-                    return MutationResult::Conflict {
-                        reason: format!("domain '{}' does not exist", id),
-                    };
+                    return MutationResult::conflict(format!("domain '{}' does not exist", id));
                 }
                 TypeLookup::Unknown => {
-                    self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
-                    return MutationResult::Skipped;
+                    return self.unresolved(EvidenceCode::UnknownObjectState);
                 }
             }
         }
         if present.is_empty() {
-            return MutationResult::Skipped;
+            return MutationResult::NoOp;
         }
+        // A scoped baseline cannot enumerate every dependent, which widens what
+        // CASCADE removes. PostgreSQL still drops the domain.
         if present.iter().any(|id| {
             self.baseline_scoped_family_object(
                 id,
@@ -384,16 +432,15 @@ impl AnalysisState {
                 EvidenceCode::CatalogCoverageIncomplete,
                 EvidenceScope::Chain,
             );
-            return MutationResult::Skipped;
         }
         if let Some(dependent) = present.iter().find(|id| self.has_type_dependents(id)) {
             if !drop.cascade {
-                return MutationResult::Conflict {
-                    reason: format!("domain '{}' has dependent objects; use CASCADE", dependent),
-                };
+                return MutationResult::conflict(format!(
+                    "domain '{}' has dependent objects; use CASCADE",
+                    dependent
+                ));
             }
-            self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
-            return MutationResult::Skipped;
+            return self.unresolved(EvidenceCode::UnmodeledState);
         }
         for id in &present {
             self.snapshot_type(id);
@@ -408,25 +455,25 @@ impl AnalysisState {
             match self.type_lookup(id, |kind| !matches!(kind, TypeKind::Domain { .. })) {
                 TypeLookup::Present => present.push(id.clone()),
                 TypeLookup::WrongKind => {
-                    return MutationResult::Conflict {
-                        reason: format!("type '{}' is a domain; use DROP DOMAIN", id),
-                    };
+                    return MutationResult::conflict(format!(
+                        "type '{}' is a domain; use DROP DOMAIN",
+                        id
+                    ));
                 }
                 TypeLookup::AuthoritativelyAbsent | TypeLookup::Tombstone if drop.if_exists => {}
                 TypeLookup::AuthoritativelyAbsent | TypeLookup::Tombstone => {
-                    return MutationResult::Conflict {
-                        reason: format!("type '{}' does not exist", id),
-                    };
+                    return MutationResult::conflict(format!("type '{}' does not exist", id));
                 }
                 TypeLookup::Unknown => {
-                    self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
-                    return MutationResult::Skipped;
+                    return self.unresolved(EvidenceCode::UnknownObjectState);
                 }
             }
         }
         if present.is_empty() {
-            return MutationResult::Skipped;
+            return MutationResult::NoOp;
         }
+        // A scoped baseline cannot enumerate every dependent, which widens what
+        // CASCADE removes. PostgreSQL still drops the type.
         if present.iter().any(|id| {
             self.baseline_scoped_family_object(
                 id,
@@ -437,16 +484,15 @@ impl AnalysisState {
                 EvidenceCode::CatalogCoverageIncomplete,
                 EvidenceScope::Chain,
             );
-            return MutationResult::Skipped;
         }
         if let Some(dependent) = present.iter().find(|id| self.has_type_dependents(id)) {
             if !drop.cascade {
-                return MutationResult::Conflict {
-                    reason: format!("type '{}' has dependent objects; use CASCADE", dependent),
-                };
+                return MutationResult::conflict(format!(
+                    "type '{}' has dependent objects; use CASCADE",
+                    dependent
+                ));
             }
-            self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
-            return MutationResult::Skipped;
+            return self.unresolved(EvidenceCode::UnmodeledState);
         }
         for id in &present {
             self.snapshot_type(id);
@@ -472,6 +518,11 @@ impl AnalysisState {
                 kind: TypeKind::Domain { base_type_id: Some(base), .. },
                 ..
             }) if base == id)
+        }) || self.local.graph.views_for_type(id).iter().any(|edge| {
+            matches!(
+                self.local.relations.get(&edge.dependent),
+                Some(RelationOverlay::Present(_))
+            )
         })
     }
 }

@@ -5,6 +5,194 @@ commits and pull requests. Published binaries, checksums, and generated release
 notes are available on the
 [GitHub Releases page](https://github.com/dsecurity49/safe-migrate/releases).
 
+## v0.11.0 — Unreleased
+
+- Report schema version 3. Violations no longer carry `operation_kind`,
+  `dedup_key`, `fk_dependency_related`, `rule_title`, `rule_summary`, or
+  `impact`; rule titles are cited once through a new top-level `rules` object
+  keyed by rule id. Consumers must branch on `schema_version`.
+- Relation options (`ALTER VIEW/MATERIALIZED VIEW SET (...)`) are now checked
+  against the server's own option tables, by relation kind. A value outside its
+  option's domain is reported where PostgreSQL reports it — `check_option` is
+  compared whole while a boolean accepts an unambiguous prefix, so `casc` is
+  rejected and `of` is not — and integer bounds are the server's. A repeated
+  option is rejected. `security_definer` is no longer accepted as a view
+  option on any version; it is a routine attribute, and PostgreSQL 15 added
+  `security_invoker` beside `security_barrier` rather than replacing it. A
+  materialized view no longer inherits the view options, and a name absent
+  from the tables still taints rather than conflicting.
+- `REINDEX` now follows PostgreSQL's legality rules instead of modelling every
+  form as acceptable. `REINDEX SYSTEM CONCURRENTLY` is rejected, `REINDEX
+  SCHEMA`/`DATABASE`/`SYSTEM` are rejected inside a transaction block, `REINDEX
+  TABLE` rejects a view, and `REINDEX TABLE` on a partitioned table is rejected
+  inside a transaction block. A temporary relation is no longer reported as
+  needing `CONCURRENTLY` when named as an index, which the old check could not
+  see. `REINDEX DATABASE` without a name now resolves to the session's
+  database, as the grammar allows.
+- `CREATE INDEX` now validates its key and `INCLUDE` columns against the target
+  relation, reporting an unknown column where PostgreSQL does. `IF NOT EXISTS`
+  now skips a name held by any relation, as PostgreSQL's guard covers the whole
+  name rather than only an index.
+- `CREATE OR REPLACE` of a routine is checked against every identity rule
+  PostgreSQL applies, in its order: return type and `SETOF`, the `RETURNS record`
+  row descriptor, an already-named input parameter, and the default count. A
+  procedure gaining or losing output parameters is named as such. Comparing the
+  *type* of a retained default needs a parse tree only the server can type, so
+  that case taints rather than claiming a check it cannot make. `ALTER
+  PROCEDURE` applies the option list it carries instead of degrading to an
+  unmodeled statement. Replacing a routine with a different kind reports
+  PostgreSQL's distinct "cannot change routine kind". `CREATE AGGREGATE` now
+  keeps its definition and refuses a state type no catalog holds; its support
+  functions are not yet resolved, because a safe check needs PostgreSQL's
+  aggregate kind and type-coercion rules and a narrower one would reject
+  definitions the server accepts.
+- A synchronized baseline records `proretset`, parameter names and modes, and
+  `pronargdefaults`, so the replacement checks above also apply to a routine
+  that already exists.
+- A report's `rules` object now titles every `rule_id` it names, including a
+  check listed in `not_evaluated` and the auxiliary ids a primary rule reports.
+  Those findings previously reached a consumer with no title.
+- `REINDEX DATABASE <name>` and `REINDEX SYSTEM <name>` are refused unless the
+  name is the database the migration runs against. The new `target_database`
+  setting states it; without it the name is reported as unknown rather than
+  assumed safe. A baseline's `source_database` is where it was synchronized
+  *from* and is never used for this.
+- A schema outside the synchronized scope that depends on an in-scope object
+  through a catalog class the model does not hold, such as an operator, is
+  reported when the scope is suggested to be widened.
+- `certainty` is reported only when it is not `exact`.
+- `ALTER SEQUENCE` now applies every option the statement carries. Options used
+  to be read one at a time, so the result depended on clause order and a
+  conflict could be lost entirely. A repeated option, a zero `INCREMENT`, a
+  non-positive `CACHE`, unordered bounds, and a `START` outside the merged
+  bounds are now reported the way PostgreSQL reports them.
+- Remediation is labelled `recipe` in every output. `rules --json` moved to its
+  own version 3, which is what tells consumers `remediation` became `recipe`.
+- `CREATE MATERIALIZED VIEW IF NOT EXISTS`, and `ALTER [MATERIALIZED] VIEW IF
+  EXISTS`, now skip the way PostgreSQL skips them instead of reporting a
+  conflict. The guard still does not hide a relation of the wrong kind.
+- `CREATE MATERIALIZED VIEW ... WITH NO DATA` and `REFRESH MATERIALIZED VIEW
+  ... WITH NO DATA` are modeled instead of being treated as unsupported: a
+  materialized view created or left unpopulated can no longer be refreshed
+  concurrently, and `CONCURRENTLY` with `WITH NO DATA` is reported the way
+  PostgreSQL reports it.
+- Every action of a comma-separated `ALTER MATERIALIZED VIEW` is now applied,
+  so an unsupported action no longer disappears behind a modeled one in front
+  of it.
+- A view now depends on every routine its query calls, wherever the call sits —
+  target list, `WHERE`, `HAVING` or a join condition — so dropping such a
+  routine is reported instead of succeeding. `CASCADE` drops the dependent
+  view. A call that cannot be tied to a signature is reported as unresolved
+  rather than as a conflict, and an exact signature does not block a different
+  overload.
+- Dropping a type a view body casts to is reported, as `CASCADE` clears it.
+  A view that only selects a column of a type is not a dependent, matching the
+  server: PostgreSQL records the dependency from the cast, not the output
+  column.
+- A view synchronized from the catalog now carries its dependencies on routines
+  and types, the way a view created in this migration already did. Run
+  `safe-migrate sync` to pick them up.
+- `CREATE OR REPLACE VIEW` is validated the way the server validates it: a
+  leading column may not be renamed, have its type changed, or disappear, and a
+  new column may only be appended. Appending columns no longer leaves the view
+  with its old column list, so altering a column the replacement added is no
+  longer reported as missing.
+- `CREATE MATERIALIZED VIEW` records its columns, access method, tablespace and
+  storage parameters. A view selecting `*` from a materialized view now sees the
+  columns it actually has, and an explicit column list renames them.
+- Built-in types are read from `pg_catalog.pg_type` instead of a hand-written
+  table, so `bytea`, `jsonb`, `inet`, `xml`, `uuid` and the range types now
+  carry their own routine signatures and type identities rather than collapsing
+  into one. Type widths come from the catalog too.
+- `citext` is no longer assumed to be built in; it resolves only when the
+  extension is installed, so a user type of the same name is no longer shadowed.
+- Cache format V10; run `safe-migrate sync`. V1–V9 are rejected.
+- `DROP TABLE`, `DROP VIEW`, `DROP MATERIALIZED VIEW`, `DROP DOMAIN`,
+  `DROP TYPE` and `ALTER TABLE ... DROP COLUMN` now drop their target under a
+  scoped or incomplete baseline instead of being skipped, and report that the
+  rest of the migration is no longer exact.
+- A constraint cloned onto a partition is named as PostgreSQL names it, and an
+  explicitly written default operator class or sort direction counts as the
+  same as omitting it.
+- `ALTER INDEX ... ATTACH PARTITION` is validated instead of accepted whenever
+  both indexes exist. Mismatched definitions and children of unrelated tables
+  are now reported.
+- `DROP INDEX` on an index attached to a parent index is reported, and is not
+  bypassed by `CASCADE` or `IF EXISTS`.
+- Creating, attaching or detaching a partition maintains its index attachments,
+  and two indexes on different expressions are no longer interchangeable.
+- A scoped baseline now records cross-schema dependents for types, routines and
+  indexes as well as relations, so a scoped `sync` no longer overlooks
+  dependents outside the schemas it loaded.
+- Foreign tables are read from a baseline, so `ALTER TABLE`, `GRANT`,
+  `TRUNCATE` and partition operations on one no longer report that it does not
+  exist. `DROP TABLE` still refuses one, as the server does.
+- Subscription options are checked against the server version, and an option
+  PostgreSQL does not recognise is rejected.
+- An array argument names the element's array type, so `DROP FUNCTION` and
+  `ALTER FUNCTION` on one resolve to the function PostgreSQL would. Previously
+  `name[]` was treated as `name` and `name[][]` matched nothing at all.
+- A type declaration the server would refuse is reported: a length or
+  precision outside its range, a type nothing resolves to, an enum label
+  declared twice, and a composite, domain or range naming a missing type.
+- The type-change rewrite warning now matches what PostgreSQL actually does.
+  Changing a numeric's scale, or converting between `character` and `varchar`,
+  rewrites the table and is reported; two spellings of one type are not.
+- `ALTER INDEX ... ATTACH PARTITION` accepts a parent index that is still
+  invalid because partitions are missing, which is how `CREATE INDEX ON ONLY`
+  is completed. An index whose equivalence cannot be decided no longer reports
+  a conflict.
+- The attachment comparison now follows PostgreSQL's own `CompareIndexInfo`:
+  operator classes are compared by the operator family they resolve to, so
+  `text_pattern_ops` and `varchar_pattern_ops` attach to each other while a
+  class outside the family does not, and sort order is not compared because
+  PostgreSQL does not compare it. `NULLS NOT DISTINCT` and a written `WHERE`
+  predicate are compared; a predicate synchronized from the catalog stays
+  opaque, so comparing it leaves the attachment undecidable rather than equal.
+- Collations are compared by the identity they resolve to. A written
+  `COLLATE "default"` against an omitted one, a collation nothing resolves, and
+  an exclusion constraint's backing index are undecidable on attach instead of
+  equal. A collated column key such as `b COLLATE "C"` is recorded as the
+  column it is, carrying its collation, rather than as an expression key.
+- `REINDEX` marks a broken index usable, so rebuilding one and then constraining
+  from it no longer fails.
+- A cloned partition constraint no longer has to share its parent's name to
+  attach.
+- An explicitly written default operator class is recognized whether the column
+  is spelled `integer` or `int4`.
+- A Tier 1 check that did not run now caps the verdict at `CAUTIOUS` in every
+  output mode: it no longer reads `safe` or `safe with risk`. The exit status
+  is unchanged, so a degraded run without a usable baseline keeps its
+  documented exit code while the report lists what could not be checked.
+- A check skipped for want of evidence names the out-of-scope schemas the
+  boundary query observed instead of advising a bare resync.
+- Tier labels are colored only when standard output is a terminal, so
+  redirected and piped reports contain no escape sequences.
+- Column identities are rendered as `schema.relation.column`, with an inferred
+  schema annotated at the end.
+- The human report and the interactive viewer now list the checks that were
+  skipped for want of evidence, with their cause and remedy. A run without
+  findings previously said only `No violations detected.` while the JSON and
+  Markdown reports already carried the skipped checks; the interactive header
+  counts them as well.
+- Name resolution follows the search path the synchronized session actually
+  had instead of substituting the sync scope for it. A schema outside the
+  scope is kept as an unknown entry, so a lookup that could have resolved in
+  it is reported as uncertain rather than resolved against a schema the
+  session may not have searched. `$user` under a role the baseline does not
+  know taints only a lookup that resolves past it, not every statement after
+  `SET search_path`.
+- An unqualified `CREATE` targets the first schema the path searches, as the
+  server does; when an unknown entry precedes it, the statement is reported
+  rather than placed. `pg_temp` is searched or created only when the session's
+  temporary namespace exists, and stands at its written position in the path.
+- A view call resolves in the routine namespace, so a table of the same name
+  cannot capture it, and a default operator class follows the path with
+  `pg_catalog` first unless the path lists it.
+- `float(p)` is accepted: the precision selects `real` for 1–24 and `double
+  precision` for 25–53, an out-of-range precision is reported, and no modifier
+  is recorded because the server records none.
+
 ## v0.10.0 — 2026-10-02
 
 - Range types are read from the baseline and their constructor is owned by the

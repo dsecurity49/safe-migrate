@@ -3,21 +3,27 @@ use crate::_internal::analysis::evidence::{
 };
 use crate::_internal::analysis::graph::{DependencyEdge, DependencyGraph, DependencyKind};
 use crate::_internal::analysis::mutations::Mutation;
-use crate::_internal::analysis::namespace::{SESSION_TEMP_SCHEMA, is_session_temp_schema};
+use crate::_internal::analysis::namespace::{
+    SESSION_TEMP_SCHEMA, SYSTEM_CATALOG_SCHEMA, SearchPathEntry, is_session_temp_schema,
+};
 use crate::_internal::analysis::settings::ScopedSetting;
 use crate::_internal::analysis::transaction::{NamespaceSnapshot, StateChange, TransactionFrame};
 use crate::_internal::ast::identifiers::ObjectId;
 use crate::_internal::db::cache::CatalogCoverage;
 use crate::_internal::db::cache::DbCache;
+use crate::_internal::db::cache::ScopedDependencyEdge;
+use crate::_internal::model::builtin_type::BuiltinTypeCatalogue;
 use crate::_internal::model::constraint::{ConstraintKind, ConstraintState};
+use crate::_internal::model::data_type::ParsedDataType;
 use crate::_internal::model::function::FunctionOverlay;
 pub(crate) use crate::_internal::model::relation::RelationOverlay;
 use crate::_internal::model::relation::{Persistence, Privilege, RelationKind};
+use crate::_internal::model::replication::SUBSCRIPTION_PARAMS;
 use crate::_internal::model::schema::SchemaOverlay;
 use crate::_internal::model::sequence::SequenceOverlay;
 use crate::_internal::model::trigger::TriggerOverlay;
 use crate::_internal::model::types::{TypeKind, TypeOverlay, TypeState};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::hash::Hash;
 
 mod apply_misc;
@@ -32,6 +38,7 @@ mod apply_settings;
 mod apply_transaction;
 mod apply_type;
 mod apply_view_index;
+mod index_topology;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub(crate) enum Confidence {
@@ -39,16 +46,70 @@ pub(crate) enum Confidence {
     Tainted,
 }
 
+/// Why PostgreSQL rejects a statement against known state.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ConflictKind {
+    /// A `CONCURRENTLY` operation cannot run inside a transaction block.
+    ConcurrentInTransaction,
+    /// Any other statement PostgreSQL rejects.
+    Rejected { reason: String },
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum MutationResult {
     Applied,
-    Skipped,
+    /// PostgreSQL executed the statement but nothing in the modeled state
+    /// changed, so no dependent rule can observe a difference.
+    NoOp,
     /// PostgreSQL did not execute this statement because an earlier statement
     /// aborted the active transaction.
     NotExecuted,
-    Conflict {
-        reason: String,
-    },
+    /// The modeled outcome cannot be stated, and this is the evidence recorded
+    /// for it. The cause rides on the result so a rule never re-derives it.
+    Unresolved(EvidenceCode),
+    Conflict(ConflictKind),
+}
+
+impl MutationResult {
+    pub(crate) fn is_unresolved(&self) -> bool {
+        matches!(self, Self::Unresolved(_))
+    }
+
+    /// The recorded cause when unresolved, so a caller never has to match on
+    /// the variant and invent a fallback for a case that cannot occur.
+    pub(crate) fn unresolved_cause(&self) -> Option<EvidenceCode> {
+        match self {
+            Self::Unresolved(cause) => Some(*cause),
+            _ => None,
+        }
+    }
+
+    /// PostgreSQL ran the statement but the modeled state did not change, so a
+    /// rule whose finding depends on a transition cannot have observed one.
+    pub(crate) fn is_noop(&self) -> bool {
+        matches!(self, Self::NoOp)
+    }
+
+    pub(crate) fn conflict(reason: impl Into<String>) -> Self {
+        Self::Conflict(ConflictKind::Rejected {
+            reason: reason.into(),
+        })
+    }
+
+    pub(crate) fn is_concurrent_transaction_conflict(&self) -> bool {
+        matches!(self, Self::Conflict(ConflictKind::ConcurrentInTransaction))
+    }
+
+    /// The PostgreSQL-facing message for a rejected statement.
+    pub(crate) fn conflict_reason(&self) -> Option<&str> {
+        match self {
+            Self::Conflict(ConflictKind::Rejected { reason }) => Some(reason.as_str()),
+            Self::Conflict(ConflictKind::ConcurrentInTransaction) => {
+                Some("CONCURRENTLY operation cannot run inside a transaction block")
+            }
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -110,12 +171,18 @@ pub(crate) struct LocalState {
     pub triggers: HashMap<ObjectId, TriggerOverlay>,
     pub constraints: HashMap<(ObjectId, String), ConstraintState>,
     pub graph: DependencyGraph,
-    pub search_path: Vec<String>,
+    pub search_path: Vec<SearchPathEntry>,
+    /// Built-in types of the synchronized cluster, used to resolve written
+    /// type names. Empty only when no baseline supplied one.
+    pub builtin_types: BuiltinTypeCatalogue,
+    pub opclasses: crate::_internal::model::opclass::OpclassCatalogue,
+    /// Collations of the synchronized cluster, used to resolve written
+    /// `COLLATE` names. Empty only when no baseline supplied one.
+    pub collations: crate::_internal::model::collation::CollationCatalogue,
     /// Performance hint: a temporary object has been created in this session.
     /// `temp_namespace_exists` derives the real answer, so this only has to be
     /// a superset to stay correct across rollback and `ON COMMIT DROP`.
     pub saw_temp_object: bool,
-    pub default_search_path: Vec<String>,
     pub search_path_template: Vec<String>,
     pub session_search_path_template: Vec<String>,
     pub default_search_path_template: Vec<String>,
@@ -178,6 +245,7 @@ struct HydratedRelationTypes {
 #[cfg(test)]
 mod pre_state_tests {
     use super::*;
+    use crate::_internal::model::index::{IndexDefinition, IndexPredicate, index_keys};
 
     #[test]
     fn incremental_capture_matches_a_fresh_public_pre_state() {
@@ -210,22 +278,23 @@ mod pre_state_tests {
             index_id,
             table_id.clone(),
             DependencyKind::IndexOnRelation {
-                using_method: Some("btree".into()),
-                key_columns: vec!["id".into()],
-                included_columns: Vec::new(),
+                definition: IndexDefinition {
+                    method: Some("btree".into()),
+                    keys: index_keys(vec!["id".into()]),
+                    included: index_keys(Vec::new()),
+                    expression_keys: 0,
+                    unique: false,
+                    nulls_not_distinct: Some(false),
+                    predicate: IndexPredicate::None,
+                    unestablished: false,
+                    valid: true,
+                    ready: true,
+                    live: true,
+                },
                 dependency_columns: vec!["id".into()],
                 dependency_columns_known: true,
-                has_expression_keys: false,
-                has_predicate: false,
                 is_concurrent: false,
-                is_unique: false,
                 is_immediate: true,
-                is_valid: true,
-                is_ready: true,
-                is_live: true,
-                has_default_sort_order: true,
-                has_default_opclasses: true,
-                has_default_collations: true,
                 eligibility_known: true,
             },
         ));
@@ -249,6 +318,12 @@ mod pre_state_tests {
 #[derive(Clone)]
 pub(crate) struct AnalysisState {
     pub pg_version_num: Option<u32>,
+    /// Rules that could not state a finding because their evidence was missing.
+    not_evaluated: Vec<crate::_internal::report::violations::NotEvaluated>,
+    /// Version asserted by configuration, used only when the cache lacks one.
+    asserted_pg_version_num: Option<u32>,
+    /// Database the migrations are applied to, as stated by configuration.
+    target_database: Option<String>,
     /// Whether the initial cache was loaded from a real cache file. An empty
     /// cache can be a valid baseline for an empty database, so availability
     /// must not be inferred from the number of modeled objects.
@@ -269,10 +344,10 @@ pub(crate) struct AnalysisState {
     pub baseline_foreign_keys: HashSet<(ObjectId, String)>,
     pub baseline_fk_dependencies: HashSet<ObjectId>,
     pub baseline_sequences: HashSet<ObjectId>,
-    pub scoped_external_relation_dependencies: HashSet<ObjectId>,
-    pub scoped_external_type_dependencies: HashSet<ObjectId>,
-    pub scoped_external_routine_dependencies: HashSet<ObjectId>,
-    pub scoped_external_index_dependencies: HashSet<ObjectId>,
+    pub scoped_external_dependencies: HashSet<ScopedDependencyEdge>,
+    /// Out-of-scope schemas that reference the scope through a catalog class
+    /// the model does not hold, so no edge can attribute them to a family.
+    pub external_referencing_schemas: BTreeSet<String>,
     pub local: LocalState,
 }
 
@@ -304,7 +379,7 @@ impl AnalysisState {
                     self.local
                         .search_path
                         .first()
-                        .map(String::as_str)
+                        .and_then(SearchPathEntry::name)
                         .unwrap_or("public")
                 )
             }
@@ -516,6 +591,7 @@ impl AnalysisState {
                         .local
                         .search_path
                         .first()
+                        .and_then(SearchPathEntry::name)
                         .is_none_or(|schema| !schema_has_complete_inheritance(schema)),
                     crate::_internal::analysis::facts::PublicationObjectFact::Unknown => false,
                     _ => false,
@@ -547,15 +623,28 @@ impl AnalysisState {
             .map(|param| param.value.as_str())
     }
 
-    fn postgres_boolean(value: &str) -> Option<bool> {
-        let value = value.trim().to_ascii_lowercase();
-        match value.as_str() {
-            "1" => return Some(true),
-            "0" => return Some(false),
-            "" => return None,
-            _ => {}
+    /// Whether `value` is a value `parse_bool` accepts.
+    ///
+    /// PostgreSQL compares against `true` and `false` with
+    /// `pg_strncasecmp`, which a caller reaches only after trimming, so this
+    /// trims too. A prefix matches only when it is unambiguous, except that
+    /// `on` and `off` both need at least two characters because a bare `o`
+    /// matches neither uniquely. `1` and `0` are accepted whole and never as a
+    /// prefix.
+    pub(crate) fn postgres_boolean(value: &str) -> Option<bool> {
+        let candidate = value.trim().to_ascii_lowercase();
+        if candidate.is_empty() {
+            return None;
         }
-
+        if candidate == "1" {
+            return Some(true);
+        }
+        if candidate == "0" {
+            return Some(false);
+        }
+        if candidate == "o" {
+            return None;
+        }
         let mut matched = None;
         for (spelling, parsed) in [
             ("true", true),
@@ -565,7 +654,7 @@ impl AnalysisState {
             ("no", false),
             ("off", false),
         ] {
-            if spelling.starts_with(&value) {
+            if spelling.starts_with(&candidate) {
                 if matched.is_some() {
                     return None;
                 }
@@ -575,6 +664,11 @@ impl AnalysisState {
         matched
     }
 
+    /// Whether `value` is a value `parse_bool` accepts, for the reloption model.
+    pub(crate) fn reloption_parses_bool(value: &str) -> bool {
+        Self::postgres_boolean(value).is_some()
+    }
+
     fn subscription_boolean_option(
         params: Option<&[crate::_internal::analysis::facts::AttributeFact]>,
         name: &str,
@@ -582,23 +676,46 @@ impl AnalysisState {
         Self::subscription_option(params, name).and_then(Self::postgres_boolean)
     }
 
-    fn validate_subscription_boolean_options(
+    /// Checks every subscription parameter against the server that will run it:
+    /// the name must be one PostgreSQL knows, the version must have introduced
+    /// it, and a boolean option must carry a boolean value.
+    fn validate_subscription_options(
+        &mut self,
         params: Option<&[crate::_internal::analysis::facts::AttributeFact]>,
-        names: &[&str],
-    ) -> Result<(), String> {
+    ) -> Result<(), MutationResult> {
         let Some(params) = params else {
             return Ok(());
         };
+        let version = self.pg_version();
         for option in params {
-            if names
+            let Some(param) = SUBSCRIPTION_PARAMS
                 .iter()
-                .any(|name| option.name.eq_ignore_ascii_case(name))
-                && Self::postgres_boolean(&option.value).is_none()
-            {
-                return Err(format!(
+                .find(|param| option.name.eq_ignore_ascii_case(param.name))
+            else {
+                return Err(MutationResult::conflict(format!(
+                    "unrecognized parameter \"{}\"",
+                    option.name
+                )));
+            };
+            if param.boolean && Self::postgres_boolean(&option.value).is_none() {
+                return Err(MutationResult::conflict(format!(
                     "subscription option '{}' requires a PostgreSQL boolean value",
                     option.name
-                ));
+                )));
+            }
+            let (Some(since), Some(version_num)) = (param.since, version.num()) else {
+                // Either every supported release has it, or the server is unknown.
+                if version.num().is_none() && param.since.is_some() {
+                    self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Statement);
+                }
+                continue;
+            };
+            if version_num < since {
+                return Err(MutationResult::conflict(format!(
+                    "subscription option '{}' requires PostgreSQL {}",
+                    option.name,
+                    pg_version_label(since)
+                )));
             }
         }
         Ok(())
@@ -759,7 +876,7 @@ impl AnalysisState {
 
     fn hydrate_relation_type_overlays(
         cache: &DbCache,
-        search_path: &[String],
+        search_path: &[SearchPathEntry],
     ) -> HydratedRelationTypes {
         let mut relations = HashMap::new();
         let mut baseline_relations = HashSet::new();
@@ -828,15 +945,20 @@ impl AnalysisState {
         let source_statement_timeout =
             baseline_available.then_some(cache.metadata.source_statement_timeout_ms);
         let default_search_path = cache.search_path.clone();
-        let default_search_path_template = if cache.metadata.schemas.is_none() {
-            cache
-                .metadata
-                .source_search_path
-                .clone()
-                .unwrap_or_else(|| default_search_path.clone())
-        } else {
-            default_search_path.clone()
-        };
+        let catalog_search_path = SearchPathEntry::from_catalog_names(&default_search_path);
+        // The template must be the path PostgreSQL actually searched. Under a
+        // `--schemas` scope the cache's resolved path has already had every
+        // out-of-scope entry dropped, so resolving against it would retarget an
+        // unqualified name to a schema PostgreSQL never reached first. The raw
+        // setting keeps those entries visible, where they become unknown rather
+        // than absent. The scope is deliberately not appended here: the template
+        // is what `SET search_path TO DEFAULT` restores, and that must be the
+        // session's own setting.
+        let default_search_path_template = cache
+            .metadata
+            .source_search_path
+            .clone()
+            .unwrap_or_else(|| default_search_path.clone());
         let current_role_known = cache.metadata.source_role.is_some();
         let current_role = cache
             .metadata
@@ -877,7 +999,7 @@ impl AnalysisState {
             baseline_relations,
             baseline_fk_dependencies,
             types,
-        } = Self::hydrate_relation_type_overlays(&cache, &default_search_path);
+        } = Self::hydrate_relation_type_overlays(&cache, &catalog_search_path);
         let mut baseline_indexes = HashSet::new();
         let mut baseline_foreign_keys = HashSet::new();
         let mut incomplete_fk_operator_evidence = false;
@@ -893,26 +1015,10 @@ impl AnalysisState {
             .map(|(id, sequence)| (id.clone(), SequenceOverlay::Present(sequence.clone())))
             .collect();
         let baseline_sequences = cache.sequences.keys().cloned().collect();
-        let scoped_external_relation_dependencies = cache
-            .scoped_external_relation_dependencies
-            .iter()
-            .cloned()
-            .collect();
-        let scoped_external_type_dependencies = cache
-            .scoped_external_type_dependencies
-            .iter()
-            .cloned()
-            .collect();
-        let scoped_external_routine_dependencies = cache
-            .scoped_external_routine_dependencies
-            .iter()
-            .cloned()
-            .collect();
-        let scoped_external_index_dependencies = cache
-            .scoped_external_index_dependencies
-            .iter()
-            .cloned()
-            .collect();
+        let scoped_external_dependencies =
+            cache.scoped_external_dependencies.iter().cloned().collect();
+        let external_referencing_schemas =
+            cache.external_referencing_schemas.iter().cloned().collect();
         for sequence in cache.sequences.values() {
             if let Some((table, column)) = &sequence.owned_by {
                 graph.add_edge(DependencyEdge::new(
@@ -960,27 +1066,11 @@ impl AnalysisState {
                 idx.index_id,
                 idx.table_id,
                 DependencyKind::IndexOnRelation {
-                    using_method: Some(idx.using_method),
-                    key_columns: idx.key_columns,
-                    included_columns: idx.included_columns,
+                    definition: idx.definition,
                     dependency_columns: idx.dependency_columns,
                     dependency_columns_known: idx.dependency_columns_known,
-                    has_expression_keys: idx.has_expression_keys,
-                    has_predicate: idx.has_predicate,
                     is_concurrent: false,
-                    is_unique: idx.is_unique,
                     is_immediate: idx.is_immediate,
-                    is_valid: idx.is_valid,
-                    is_ready: idx.is_ready,
-                    is_live: idx.is_live,
-                    has_default_sort_order: idx.has_default_sort_order,
-                    has_default_opclasses: idx.has_default_opclasses,
-                    has_default_collations: idx.has_default_collations,
-                    // Eligibility facts are distinct from dependency-column
-                    // proof. A catalog row can deterministically prove an
-                    // index is ineligible (for example, partial or
-                    // expression-based) while dependency columns remain a
-                    // separate completeness concern.
                     eligibility_known: true,
                 },
             ));
@@ -1028,6 +1118,54 @@ impl AnalysisState {
             }
         }
 
+        for dependency in cache.view_object_dependencies {
+            let dependent = dependency.dependent;
+            let dependent_schema_is_omitted = baseline_schemas
+                .as_ref()
+                .is_some_and(|schemas| !schemas.contains(&dependent.schema));
+            let is_view = relations.get(&dependent).is_some_and(|relation| {
+                matches!(
+                    relation,
+                    RelationOverlay::Present(state)
+                        if matches!(
+                            state.kind,
+                            crate::_internal::model::relation::RelationKind::View
+                                | crate::_internal::model::relation::RelationKind::MaterializedView
+                    )
+                )
+            });
+            if !(is_view || dependent_schema_is_omitted) {
+                continue;
+            }
+            match dependency.target {
+                crate::_internal::db::cache::ViewDependencyTarget::Routine { routine } => {
+                    let name = ObjectId::new(
+                        routine.schema.clone(),
+                        routine
+                            .name
+                            .split_once('(')
+                            .map_or(routine.name.as_str(), |(name, _)| name)
+                            .to_string(),
+                    );
+                    graph.add_edge(DependencyEdge::new(
+                        dependent,
+                        routine.clone(),
+                        DependencyKind::ViewUsesRoutine {
+                            routine: Some(routine),
+                            name,
+                        },
+                    ));
+                }
+                crate::_internal::db::cache::ViewDependencyTarget::Type { ty } => {
+                    graph.add_edge(DependencyEdge::new(
+                        dependent,
+                        ty.clone(),
+                        DependencyKind::ViewUsesType { ty },
+                    ));
+                }
+            }
+        }
+
         for inheritance in cache.inheritances {
             // A committed first phase of DETACH CONCURRENTLY remains visible
             // as an inheritance row with inhdetachpending until FINALIZE.
@@ -1043,6 +1181,14 @@ impl AnalysisState {
                 } else {
                     DependencyKind::InheritanceOf
                 },
+            ));
+        }
+
+        for attachment in cache.index_attachments {
+            graph.add_edge(DependencyEdge::new(
+                attachment.child.clone(),
+                attachment.parent.clone(),
+                DependencyKind::IndexPartitionOf,
             ));
         }
 
@@ -1141,7 +1287,7 @@ impl AnalysisState {
                         Self::resolve_type_reference_from_catalog(
                             raw,
                             &type_catalog,
-                            &default_search_path,
+                            &catalog_search_path,
                             |id| matches!(relations.get(id), Some(RelationOverlay::Present(_))),
                         )
                     })
@@ -1149,7 +1295,7 @@ impl AnalysisState {
                 function.return_type_id = Self::resolve_type_reference_from_catalog(
                     &function.return_type,
                     &type_catalog,
-                    &default_search_path,
+                    &catalog_search_path,
                     |id| matches!(relations.get(id), Some(RelationOverlay::Present(_))),
                 );
             }
@@ -1207,6 +1353,9 @@ impl AnalysisState {
 
         let mut state = Self {
             pg_version_num: cache.pg_version_num,
+            not_evaluated: Vec::new(),
+            asserted_pg_version_num: None,
+            target_database: None,
             baseline_available,
             baseline_boundary_queries_complete,
             baseline_coverage,
@@ -1216,10 +1365,8 @@ impl AnalysisState {
             baseline_foreign_keys,
             baseline_fk_dependencies,
             baseline_sequences,
-            scoped_external_relation_dependencies,
-            scoped_external_type_dependencies,
-            scoped_external_routine_dependencies,
-            scoped_external_index_dependencies,
+            scoped_external_dependencies,
+            external_referencing_schemas,
             local: LocalState {
                 schemas,
                 relations,
@@ -1244,9 +1391,14 @@ impl AnalysisState {
                 triggers,
                 constraints,
                 graph,
-                search_path: default_search_path.clone(),
+                search_path: Vec::new(),
+                builtin_types: cache
+                    .builtin_types
+                    .clone()
+                    .unwrap_or_else(BuiltinTypeCatalogue::fallback),
+                opclasses: cache.opclasses.clone().unwrap_or_default(),
+                collations: cache.collations.clone().unwrap_or_default(),
                 saw_temp_object: false,
-                default_search_path,
                 search_path_template: default_search_path_template.clone(),
                 session_search_path_template: default_search_path_template.clone(),
                 default_search_path_template,
@@ -1273,7 +1425,6 @@ impl AnalysisState {
             },
         };
         state.refresh_role_sensitive_search_path();
-        state.local.default_search_path = state.local.search_path.clone();
         if baseline_available && incomplete_fk_operator_evidence {
             state.taint(
                 crate::_internal::analysis::evidence::EvidenceCode::CatalogCoverageIncomplete,
@@ -1313,13 +1464,21 @@ impl AnalysisState {
         if let Some(schema) = &name.schema {
             return schema.resolve();
         }
-        for schema in &self.local.search_path {
-            let candidate = ObjectId::new(schema.clone(), sig_str.to_string());
+        for entry in &self.local.search_path {
+            let Some(schema) = entry.searched_schema() else {
+                continue;
+            };
+            let candidate = ObjectId::new(schema, sig_str.to_string());
             if self.routine_is_present(&candidate) {
-                return schema.clone();
+                return schema.to_string();
             }
         }
-        self.local.search_path.first().cloned().unwrap_or_default()
+        self.local
+            .search_path
+            .first()
+            .and_then(SearchPathEntry::name)
+            .unwrap_or_default()
+            .to_string()
     }
 
     pub(crate) fn resolve_relation_id(
@@ -1330,18 +1489,38 @@ impl AnalysisState {
             return ObjectId::new(schema.resolve(), name.name.resolve());
         }
         let resolved_name = name.name.resolve();
-        for schema in &self.local.search_path {
-            let mut candidate = ObjectId::new(schema.clone(), resolved_name.clone());
+        for entry in &self.local.search_path {
+            let Some(schema) = entry.searched_schema() else {
+                continue;
+            };
+            let mut candidate = ObjectId::new(schema, resolved_name.clone());
             if self.relation_namespace_object_is_present(&candidate) {
                 candidate.inferred_schema = true;
                 return candidate;
             }
         }
         // An empty path searches nothing, so no schema may be inferred.
-        let schema = self.local.search_path.first().cloned().unwrap_or_default();
+        let schema = self
+            .local
+            .search_path
+            .first()
+            .and_then(SearchPathEntry::name)
+            .unwrap_or_default();
         let mut id = ObjectId::new(schema, resolved_name);
         id.inferred_schema = true;
         id
+    }
+
+    /// The schema an unqualified creation targets: the first path entry whose
+    /// schema the model knows exists. The system catalog is not a valid target,
+    /// and an unresolved entry never is, because PostgreSQL may not create
+    /// there or may not have searched it at all.
+    pub(crate) fn creation_schema(&self) -> Option<&str> {
+        self.local.search_path.iter().find_map(|entry| {
+            entry
+                .searched_schema()
+                .filter(|schema| *schema != SYSTEM_CATALOG_SCHEMA)
+        })
     }
 
     pub(crate) fn relation_is_present(&self, id: &ObjectId) -> bool {
@@ -1351,17 +1530,92 @@ impl AnalysisState {
         )
     }
 
-    /// Returns the effective PostgreSQL version used for semantic decisions.
-    /// A synchronized cache supplies the authoritative version; callers pass
-    /// their configured fallback for cache-free analysis.
-    pub(crate) fn effective_pg_version_num(&self, fallback: u32) -> u32 {
-        self.pg_version_num.unwrap_or(fallback)
+    /// Record a configured version, used only when the cache carries none.
+    pub(crate) fn record_not_evaluated(
+        &mut self,
+        record: crate::_internal::report::violations::NotEvaluated,
+    ) {
+        if !self
+            .not_evaluated
+            .iter()
+            .any(|entry| entry.rule_id == record.rule_id && entry.cause == record.cause)
+        {
+            self.not_evaluated.push(record);
+        }
+    }
+
+    pub(crate) fn not_evaluated(&self) -> &[crate::_internal::report::violations::NotEvaluated] {
+        &self.not_evaluated
+    }
+
+    /// Record a configured version, used only when the cache carries none.
+    pub(crate) fn with_asserted_pg_version(mut self, version: Option<u32>) -> Self {
+        self.asserted_pg_version_num = version;
+        self
+    }
+
+    /// The database the migrations are applied to, when the caller states it.
+    pub(crate) fn set_target_database(&mut self, database: Option<String>) {
+        self.target_database = database;
+    }
+
+    /// The database the migration runs against, and whether it is known.
+    ///
+    /// PostgreSQL compares a `REINDEX DATABASE`/`REINDEX SYSTEM` name with the
+    /// database its session is attached to. A baseline records where it was
+    /// synchronized *from*, which is a different fact, so it is never used
+    /// here.
+    pub(crate) fn target_database(&self) -> Option<&str> {
+        self.target_database.as_deref()
+    }
+
+    /// The version in effect and where it came from. An observed cache version
+    /// always wins over a configured one.
+    pub(crate) fn pg_version(&self) -> PgVersion {
+        match (self.pg_version_num, self.asserted_pg_version_num) {
+            (Some(version), _) => PgVersion::Observed(version),
+            (None, Some(version)) => PgVersion::Assumed(version),
+            (None, None) => PgVersion::Unresolved,
+        }
     }
 
     /// Read-only search-path view for name resolution. Keeping resolution on
     /// this accessor prevents callers from coupling themselves to `LocalState`.
-    pub(crate) fn search_path(&self) -> &[String] {
+    pub(crate) fn search_path(&self) -> &[SearchPathEntry] {
         &self.local.search_path
+    }
+
+    /// The named schemas of the effective path, in order. Used where an
+    /// unresolved entry can neither match nor change the answer.
+    #[cfg(test)]
+    pub(crate) fn search_path_names(&self) -> Vec<String> {
+        self.local
+            .search_path
+            .iter()
+            .filter_map(|entry| entry.searched_schema())
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Whether an unqualified lookup that resolved to `schema` could have
+    /// resolved elsewhere: an unresolved entry lies before it in the path, so
+    /// PostgreSQL may have searched a schema the model cannot see first.
+    pub(crate) fn path_shadows(&self, schema: &str) -> bool {
+        let mut shadow = false;
+        for entry in &self.local.search_path {
+            match entry {
+                SearchPathEntry::Schema(name) if name == schema => return shadow,
+                SearchPathEntry::Schema(_) => {}
+                SearchPathEntry::Unresolved(_) => shadow = true,
+            }
+        }
+        shadow
+    }
+
+    /// Built-in types of the synchronized cluster, used to resolve written type
+    /// names to catalog identities.
+    pub(crate) fn builtin_types(&self) -> &BuiltinTypeCatalogue {
+        &self.local.builtin_types
     }
 
     /// Whether this session has a temporary schema, which is searched before
@@ -1380,18 +1634,32 @@ impl AnalysisState {
                     .any(|id| is_session_temp_schema(&id.schema)))
     }
 
-    /// Schemas to search for an unqualified relation or type, implicit first.
-    pub(crate) fn relation_search_path(&self) -> Vec<String> {
-        if !self.temp_namespace_exists() {
+    /// Entries to search for an unqualified relation or type, implicit first.
+    ///
+    /// PostgreSQL searches the temporary namespace before every path entry
+    /// only when the path does not name it; a written `pg_temp` is searched at
+    /// its position like any other entry.
+    pub(crate) fn relation_search_path(&self) -> Vec<SearchPathEntry> {
+        if !self.temp_namespace_exists()
+            || self
+                .local
+                .search_path
+                .iter()
+                .any(|entry| entry.searched_schema() == Some(SESSION_TEMP_SCHEMA))
+        {
             return self.local.search_path.clone();
         }
-        let mut path = vec![SESSION_TEMP_SCHEMA.to_string()];
+        let mut path = Vec::with_capacity(self.local.search_path.len() + 1);
+        path.push(SearchPathEntry::Schema(SESSION_TEMP_SCHEMA.to_string()));
         path.extend(self.local.search_path.iter().cloned());
         path
     }
 
     pub(crate) fn note_temp_object_created(&mut self) {
         self.local.saw_temp_object = true;
+        // A path that names the temporary alias could not search it before the
+        // namespace existed; now it can, at its written position.
+        self.refresh_role_sensitive_search_path();
     }
 
     /// Column names and types of a present relation, for view projection.
@@ -1413,6 +1681,33 @@ impl AnalysisState {
 
     /// Whether the index backs an exclusion constraint, which PostgreSQL
     /// refuses to rebuild concurrently.
+    /// Whether `index` or the relation it backs is temporary.
+    ///
+    /// The index's own identity carries its schema, so a temporary index is
+    /// recognizable from that; a temporary table is not, because `REINDEX TABLE`
+    /// names the table. `REINDEX SYSTEM` and `REINDEX DATABASE` are already exempt.
+    pub(crate) fn reindex_target_is_temporary(
+        &self,
+        target: &crate::_internal::analysis::mutations::ReindexTargetMutation,
+    ) -> bool {
+        use crate::_internal::analysis::mutations::ReindexTargetMutation;
+        const TEMP_SCHEMA: &str = "pg_temp";
+        match target {
+            ReindexTargetMutation::Table(id) => match self.local.relations.get(id) {
+                Some(RelationOverlay::Present(relation)) => {
+                    relation.persistence
+                        == crate::_internal::model::relation::Persistence::Temporary
+                        || id.schema == TEMP_SCHEMA
+                }
+                _ => false,
+            },
+            ReindexTargetMutation::Index(id) => id.schema == TEMP_SCHEMA,
+            ReindexTargetMutation::Database(_)
+            | ReindexTargetMutation::Schema(_)
+            | ReindexTargetMutation::System(_) => false,
+        }
+    }
+
     pub(crate) fn index_backs_exclusion_constraint(&self, index: &ObjectId) -> bool {
         self.local.constraints.values().any(|constraint| {
             matches!(constraint.kind, ConstraintKind::Exclusion)
@@ -1456,6 +1751,37 @@ impl AnalysisState {
         }
     }
 
+    /// The single callable routine whose bare name is `name`, when the modeled
+    /// universe holds exactly one.
+    ///
+    /// PostgreSQL resolves a routine reference while creating the view, so the
+    /// candidate set at that moment is the one it sees. A lone candidate
+    /// therefore settles the reference without needing argument types, and any
+    /// later drop of it is provably refused. Two or more candidates leave the
+    /// overload open, and the caller keeps the bare name.
+    pub(crate) fn unique_routine_named(&self, name: &ObjectId) -> Option<ObjectId> {
+        let wanted = bare_routine_name(&name.name);
+        let mut found: Option<ObjectId> = None;
+        for (id, overlay) in &self.local.functions {
+            let FunctionOverlay::Present(function) = overlay else {
+                continue;
+            };
+            if !matches!(
+                function.routine_kind,
+                crate::_internal::model::function::RoutineKind::Function
+                    | crate::_internal::model::function::RoutineKind::Window
+            ) || bare_routine_name(&id.name) != wanted
+            {
+                continue;
+            }
+            if found.is_some() {
+                return None;
+            }
+            found = Some(id.clone());
+        }
+        found
+    }
+
     /// Read-only semantic views used by rules instead of exposing the
     /// family-specific baseline storage representation.
     pub(crate) fn baseline_relation_is_known(&self, id: &ObjectId) -> bool {
@@ -1475,6 +1801,22 @@ impl AnalysisState {
         family: crate::_internal::db::cache::CatalogFamily,
     ) -> bool {
         self.baseline_coverage.has(family)
+    }
+
+    /// Schemas outside the synchronized scope that a loaded object depends on.
+    /// Adding one of these to `schemas` is what makes the boundary answerable.
+    pub(crate) fn external_referenced_schemas(&self) -> Vec<String> {
+        let mut names: BTreeSet<String> = BTreeSet::new();
+        for edge in &self.scoped_external_dependencies {
+            if let Some(external) = &edge.external {
+                names.insert(external.schema.clone());
+            }
+        }
+        // A reference through a catalog class the model does not hold — an
+        // operator, today — has no family and therefore no edge, but widening
+        // the scope would still change the answer.
+        names.extend(self.external_referencing_schemas.iter().cloned());
+        names.into_iter().collect()
     }
 
     /// A schema-scoped baseline cannot prove that cross-schema dependents were
@@ -1501,17 +1843,14 @@ impl AnalysisState {
         if matches!(
             family,
             crate::_internal::db::cache::CatalogFamily::Relations
+                | crate::_internal::db::cache::CatalogFamily::Types
+                | crate::_internal::db::cache::CatalogFamily::Routines
+                | crate::_internal::db::cache::CatalogFamily::Indexes
         ) {
-            return self.scoped_external_relation_dependencies.contains(id);
-        }
-        if matches!(family, crate::_internal::db::cache::CatalogFamily::Types) {
-            return self.scoped_external_type_dependencies.contains(id);
-        }
-        if matches!(family, crate::_internal::db::cache::CatalogFamily::Routines) {
-            return self.scoped_external_routine_dependencies.contains(id);
-        }
-        if matches!(family, crate::_internal::db::cache::CatalogFamily::Indexes) {
-            return self.scoped_external_index_dependencies.contains(id);
+            return self
+                .scoped_external_dependencies
+                .iter()
+                .any(|edge| edge.exposes(family, id));
         }
         true
     }
@@ -1535,24 +1874,17 @@ impl AnalysisState {
     pub(crate) fn has_usable_unique_index(&self, relation_id: &ObjectId) -> bool {
         self.local.graph.edges().iter().any(|edge| {
             if let crate::_internal::analysis::graph::DependencyKind::IndexOnRelation {
-                is_unique,
-                has_expression_keys,
-                has_predicate,
-                is_valid,
-                is_ready,
-                is_live,
+                definition,
                 eligibility_known,
                 ..
             } = &edge.kind
             {
                 edge.referenced == *relation_id
                     && *eligibility_known
-                    && *is_unique
-                    && !*has_expression_keys
-                    && !*has_predicate
-                    && *is_valid
-                    && *is_ready
-                    && *is_live
+                    && definition.is_usable()
+                    && definition.unique
+                    && !definition.has_expression_keys()
+                    && !definition.has_predicate()
             } else {
                 false
             }
@@ -1574,11 +1906,21 @@ impl AnalysisState {
         self.local.transaction_aborted = true;
     }
 
+    /// Whether an inferred identity cannot be relied on: an unresolved path
+    /// entry precedes the schema the search resolved to, so PostgreSQL may
+    /// have answered from a schema the model cannot see.
+    fn lookup_shadowed(&self, id: &ObjectId) -> bool {
+        id.inferred_schema && self.path_shadows(&id.schema)
+    }
+
     fn relation_lookup(
         &self,
         id: &ObjectId,
         expected: impl FnOnce(&RelationKind) -> bool,
     ) -> ObjectLookup {
+        if self.lookup_shadowed(id) {
+            return ObjectLookup::Unknown;
+        }
         match self.local.relations.get(id) {
             Some(RelationOverlay::Present(relation)) if expected(&relation.kind) => {
                 ObjectLookup::Present
@@ -1614,22 +1956,18 @@ impl AnalysisState {
     {
         match self.relation_lookup(id, expected) {
             ObjectLookup::Present => Ok(()),
-            ObjectLookup::WrongKind => Err(MutationResult::Conflict {
-                reason: wrong_kind_reason,
-            }),
+            ObjectLookup::WrongKind => Err(MutationResult::conflict(wrong_kind_reason)),
             ObjectLookup::AuthoritativelyAbsent | ObjectLookup::Tombstone => {
-                Err(MutationResult::Conflict {
-                    reason: missing_reason,
-                })
+                Err(MutationResult::conflict(missing_reason))
             }
-            ObjectLookup::Unknown => {
-                self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
-                Err(MutationResult::Skipped)
-            }
+            ObjectLookup::Unknown => Err(self.unresolved(EvidenceCode::UnknownObjectState)),
         }
     }
 
     fn type_lookup(&self, id: &ObjectId, expected: impl FnOnce(&TypeKind) -> bool) -> ObjectLookup {
+        if self.lookup_shadowed(id) {
+            return ObjectLookup::Unknown;
+        }
         match self.local.types.get(id) {
             Some(TypeOverlay::Present(state)) if expected(&state.kind) => ObjectLookup::Present,
             Some(TypeOverlay::Present(_)) => ObjectLookup::WrongKind,
@@ -1652,28 +1990,37 @@ impl AnalysisState {
         missing_reason: String,
         wrong_kind_reason: String,
     ) -> Result<(), MutationResult> {
+        if self.lookup_shadowed(id) {
+            return Err(self.unresolved(EvidenceCode::UnknownObjectState));
+        }
         match self.local.functions.get(id) {
             Some(FunctionOverlay::Present(function)) if function.routine_kind == expected => Ok(()),
-            Some(FunctionOverlay::Present(_)) => Err(MutationResult::Conflict {
-                reason: wrong_kind_reason,
-            }),
-            Some(FunctionOverlay::Dropped) => Err(MutationResult::Conflict {
-                reason: missing_reason,
-            }),
+            Some(FunctionOverlay::Present(_)) => Err(MutationResult::conflict(wrong_kind_reason)),
+            Some(FunctionOverlay::Dropped) => Err(MutationResult::conflict(missing_reason)),
             None if self.baseline_covers_family_object(
                 id,
                 crate::_internal::db::cache::CatalogFamily::Routines,
             ) =>
             {
-                Err(MutationResult::Conflict {
-                    reason: missing_reason,
-                })
+                Err(MutationResult::conflict(missing_reason))
             }
-            None => {
-                self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
-                Err(MutationResult::Skipped)
-            }
+            None => Err(self.unresolved(EvidenceCode::UnknownObjectState)),
         }
+    }
+
+    /// Validate the namespace a creation targets, where an unqualified target
+    /// was inferred from the search path.
+    ///
+    /// An unresolved entry before the chosen schema means PostgreSQL may have
+    /// picked a different target entirely, which is uncertain — not a conflict.
+    pub(super) fn ensure_creation_target(&mut self, id: &ObjectId) -> Result<(), MutationResult> {
+        if is_session_temp_schema(&id.schema) {
+            return Ok(());
+        }
+        if self.lookup_shadowed(id) {
+            return Err(self.unresolved(EvidenceCode::UnknownObjectState));
+        }
+        self.ensure_schema_target(&id.schema)
     }
 
     /// Validate the namespace in which a newly-created object will live.
@@ -1690,18 +2037,13 @@ impl AnalysisState {
         match self.schema_lookup(schema) {
             ObjectLookup::Present => Ok(()),
             ObjectLookup::Tombstone | ObjectLookup::AuthoritativelyAbsent => {
-                Err(MutationResult::Conflict {
-                    reason: if schema.is_empty() {
-                        "no schema has been selected to create in".to_string()
-                    } else {
-                        format!("schema '{}' does not exist", schema)
-                    },
-                })
+                Err(MutationResult::conflict(if schema.is_empty() {
+                    "no schema has been selected to create in".to_string()
+                } else {
+                    format!("schema '{}' does not exist", schema)
+                }))
             }
-            ObjectLookup::Unknown => {
-                self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
-                Err(MutationResult::Skipped)
-            }
+            ObjectLookup::Unknown => Err(self.unresolved(EvidenceCode::UnknownObjectState)),
             ObjectLookup::WrongKind => {
                 unreachable!("schemas do not share an overlay with other object kinds")
             }
@@ -1805,33 +2147,54 @@ impl AnalysisState {
         )
     }
 
+    /// Whether any overload of `id`'s name is present in `id`'s schema, for a
+    /// routine reference that carries no argument types.
+    pub(crate) fn routine_named_is_present(&self, id: &ObjectId) -> bool {
+        self.local.functions.iter().any(|(candidate, overlay)| {
+            matches!(overlay, FunctionOverlay::Present(_))
+                && candidate.schema == id.schema
+                && bare_routine_name(&candidate.name) == id.name
+        })
+    }
+
     fn resolve_type_reference_from_catalog(
         raw: &str,
         types: &HashMap<ObjectId, TypeOverlay>,
-        search_path: &[String],
+        search_path: &[SearchPathEntry],
         row_type_exists: impl Fn(&ObjectId) -> bool,
     ) -> Option<ObjectId> {
-        let (schema, name) = Self::parse_type_reference(raw)?;
+        let (schema, name, is_array) = Self::parse_type_reference(raw)?;
+        // PostgreSQL names an array type after its element and renders it with
+        // one `[]`, which is the spelling `format_type` gives the catalog.
+        let array_name = is_array.then(|| format!("{name}[]"));
+        let as_array = move |element: ObjectId| match &array_name {
+            Some(array_name) => ObjectId::new(&element.schema, array_name.clone()),
+            None => element,
+        };
         if let Some(schema) = schema {
             let candidate = ObjectId::new(schema, name);
             return (matches!(types.get(&candidate), Some(TypeOverlay::Present(_)))
                 || row_type_exists(&candidate))
-            .then_some(candidate);
+            .then(|| as_array(candidate));
         }
-        search_path.iter().find_map(|schema| {
+        search_path.iter().find_map(|entry| {
+            let schema = entry.searched_schema()?;
             let candidate = ObjectId::new(schema, &name);
             (matches!(types.get(&candidate), Some(TypeOverlay::Present(_)))
                 || row_type_exists(&candidate))
-            .then_some(candidate)
+            .then(|| as_array(candidate))
         })
     }
 
     /// Parse a SQL type name exactly enough to resolve modeled named types.
     /// Quoted identifiers retain their case, unquoted identifiers fold to
-    /// lowercase, and any number of array suffixes are ignored for lookup.
-    fn parse_type_reference(raw: &str) -> Option<(Option<String>, String)> {
+    /// lowercase. Array suffixes name the element's own array type, and any
+    /// number of them collapse onto that one type.
+    fn parse_type_reference(raw: &str) -> Option<(Option<String>, String, bool)> {
         let mut token = raw.trim();
+        let mut is_array = false;
         while let Some(without_array) = token.strip_suffix("[]") {
+            is_array = true;
             token = without_array.trim_end();
         }
 
@@ -1864,8 +2227,8 @@ impl AnalysisState {
         }
         parts.push(Self::resolve_type_identifier(&current, part_is_quoted)?);
         match parts.as_slice() {
-            [name] => Some((None, name.clone())),
-            [schema, name] => Some((Some(schema.clone()), name.clone())),
+            [name] => Some((None, name.clone(), is_array)),
+            [schema, name] => Some((Some(schema.clone()), name.clone(), is_array)),
             _ => None,
         }
     }
@@ -1880,18 +2243,24 @@ impl AnalysisState {
         })
     }
 
+    /// Whether the server can resolve a declared type: a built-in, a type the
+    /// migration created, or one the baseline holds.
+    pub(crate) fn declared_type_resolves(&self, declared: &str) -> bool {
+        ParsedDataType::parse(declared, self.builtin_types()).is_builtin()
+            || self.resolve_type_reference(declared).is_some()
+    }
+
     pub(crate) fn resolve_type_reference(&self, raw: &str) -> Option<ObjectId> {
-        Self::resolve_type_reference_from_catalog(
-            raw,
-            &self.local.types,
-            &self.local.search_path,
-            |id| {
-                matches!(
-                    self.local.relations.get(id),
-                    Some(RelationOverlay::Present(_))
-                )
-            },
-        )
+        // PostgreSQL searches the session temporary schema before every explicit
+        // path entry for types as well as relations, so this must agree with
+        // `resolve_type_lookup_name` or one type has two identities.
+        let search_path = self.relation_search_path();
+        Self::resolve_type_reference_from_catalog(raw, &self.local.types, &search_path, |id| {
+            matches!(
+                self.local.relations.get(id),
+                Some(RelationOverlay::Present(_))
+            )
+        })
     }
 
     fn type_reference_name(id: &ObjectId, qualified: bool) -> String {
@@ -1922,17 +2291,51 @@ impl AnalysisState {
         }
     }
 
+    /// The identity a declaration `name[]` resolves to. PostgreSQL has one array
+    /// type per element, so however many `[]` were written, they name this.
+    pub(crate) fn array_type_id(element: &ObjectId) -> ObjectId {
+        ObjectId::new(&element.schema, format!("{}[]", element.name))
+    }
+
     fn remapped_type_display(raw: &str, new_id: &ObjectId, schema_changed: bool) -> String {
         let suffix = raw.find('[').map(|index| &raw[index..]).unwrap_or("");
         // Keep the qualification the reference was written with; a moved type
         // gains one, or the reference would no longer resolve.
         let was_qualified =
-            Self::parse_type_reference(raw).is_some_and(|(schema, _)| schema.is_some());
+            Self::parse_type_reference(raw).is_some_and(|(schema, _, _)| schema.is_some());
         format!(
             "{}{}",
             Self::type_reference_name(new_id, was_qualified || schema_changed),
             suffix
         )
+    }
+
+    /// Whether `id` names a partitioned table, which has no storage of its own.
+    pub(crate) fn relation_is_partitioned(&self, id: &ObjectId) -> bool {
+        match self.local.relations.get(id) {
+            Some(RelationOverlay::Present(relation)) => relation.partition_type.is_some(),
+            _ => false,
+        }
+    }
+
+    /// Whether `target` names a system catalog or a TOAST table.
+    ///
+    /// Neither has a concurrent reindex form, and the analyzer does not carry
+    /// a catalog flag, so this recognizes the naming the server uses. A name
+    /// it cannot place is not a catalog as far as this check is concerned,
+    /// which leaves the statement to the ordinary relation checks.
+    pub(crate) fn target_is_catalog(
+        &self,
+        target: &crate::_internal::analysis::mutations::ReindexTargetMutation,
+    ) -> bool {
+        use crate::_internal::analysis::mutations::ReindexTargetMutation;
+        let id = match target {
+            ReindexTargetMutation::Table(id) | ReindexTargetMutation::Index(id) => id,
+            ReindexTargetMutation::Database(_)
+            | ReindexTargetMutation::Schema(_)
+            | ReindexTargetMutation::System(_) => return false,
+        };
+        id.schema == "pg_catalog" || id.name.starts_with("pg_toast_")
     }
 
     pub(crate) fn index_is_present(&self, id: &ObjectId) -> bool {
@@ -2345,9 +2748,7 @@ impl AnalysisState {
         &self,
         spec: &crate::_internal::analysis::facts::PrivilegeSpec,
     ) -> HashSet<Privilege> {
-        let supports_maintain = self
-            .pg_version_num
-            .is_some_and(|version| version >= 170_000);
+        let supports_maintain = self.pg_version().satisfies(|version| version >= 170_000);
         match spec {
             crate::_internal::analysis::facts::PrivilegeSpec::All => {
                 let mut privileges = [
@@ -2513,7 +2914,7 @@ impl AnalysisState {
                 return Some(true);
             }
             let role_state = self.present_role(&candidate.name)?;
-            match self.pg_version_num {
+            match self.pg_version().num() {
                 Some(version) if version >= 160_000 => {
                     pending.extend(role_state.can_inherit_from.iter().cloned());
                 }
@@ -2546,7 +2947,7 @@ impl AnalysisState {
             {
                 return Some(true);
             }
-            match self.pg_version_num {
+            match self.pg_version().num() {
                 Some(version) if version >= 160_000 => {
                     pending.extend(role.can_inherit_from.iter().cloned());
                 }
@@ -2759,39 +3160,56 @@ impl AnalysisState {
                 .is_none_or(|schemas| schemas.contains(name))
     }
 
+    /// Recompute the effective search path from the session template.
+    ///
+    /// PostgreSQL silently ignores a path entry that does not name an existing
+    /// schema, so the model drops entries it can prove absent and keeps every
+    /// other one — a schema it cannot prove anything about stays as an
+    /// unresolved placeholder rather than disappearing. Nothing is tainted
+    /// here: an unresolved entry only makes an answer uncertain when a lookup
+    /// actually resolves past it (`path_shadows`), which is where the taint
+    /// belongs.
     fn refresh_role_sensitive_search_path(&mut self) {
         let template = self.local.search_path_template.clone();
-        let mut effective = Vec::new();
-        let mut role_identity_unknown = false;
-        let mut schema_state_unknown = false;
+        let mut effective: Vec<SearchPathEntry> = Vec::new();
         for entry in template {
-            let schema = if entry == "$user" {
+            if entry == "$user" {
                 if self.local.current_role_known {
-                    self.local.current_role.clone()
-                } else {
-                    role_identity_unknown = true;
-                    continue;
+                    let role_schema = self.local.current_role.clone();
+                    self.push_path_entry(&mut effective, role_schema);
+                } else if !effective.contains(&SearchPathEntry::Unresolved(None)) {
+                    effective.push(SearchPathEntry::Unresolved(None));
                 }
             } else {
-                entry
-            };
-            if self.schema_is_present(&schema) {
-                if !effective.contains(&schema) {
-                    effective.push(schema);
-                }
-            } else if !self.schema_absence_is_authoritative(&schema) {
-                schema_state_unknown = true;
-                if !effective.contains(&schema) {
-                    effective.push(schema);
-                }
+                self.push_path_entry(&mut effective, entry);
             }
         }
         self.local.search_path = effective;
-        if role_identity_unknown {
-            self.taint(EvidenceCode::UnresolvedReference, EvidenceScope::Chain);
-        }
-        if schema_state_unknown {
-            self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
+    }
+
+    fn push_path_entry(&self, effective: &mut Vec<SearchPathEntry>, schema: String) {
+        let entry = if is_session_temp_schema(&schema) {
+            // The alias names the session's own temporary schema and nothing
+            // else, so a path naming it searches nothing until that namespace
+            // exists; relation and type lookups add it themselves.
+            if !self.temp_namespace_exists() {
+                return;
+            }
+            SearchPathEntry::Schema(schema)
+        } else if schema == SYSTEM_CATALOG_SCHEMA {
+            // Every database has the system catalog even though sync models no
+            // objects inside it; dropping the entry would misstate the search
+            // order for what the model does know (operator classes).
+            SearchPathEntry::Schema(schema)
+        } else if self.schema_is_present(&schema) {
+            SearchPathEntry::Schema(schema)
+        } else if self.schema_absence_is_authoritative(&schema) {
+            return;
+        } else {
+            SearchPathEntry::Unresolved(Some(schema))
+        };
+        if !effective.contains(&entry) {
+            effective.push(entry);
         }
     }
 
@@ -2950,13 +3368,24 @@ impl AnalysisState {
                 })
                 .collect();
         };
+        // Both endpoints of a cross-scope edge carry a schema.
+        let remap_edges = |set: &mut HashSet<ScopedDependencyEdge>| {
+            *set = std::mem::take(set)
+                .into_iter()
+                .map(|mut edge| {
+                    Self::remap_schema_id(&mut edge.scoped, old_name, new_name);
+                    if let Some(external) = edge.external.as_mut() {
+                        Self::remap_schema_id(external, old_name, new_name);
+                    }
+                    edge
+                })
+                .collect();
+        };
         remap_set(&mut self.baseline_relations);
         remap_set(&mut self.baseline_indexes);
         remap_set(&mut self.baseline_fk_dependencies);
         remap_set(&mut self.baseline_sequences);
-        remap_set(&mut self.scoped_external_relation_dependencies);
-        remap_set(&mut self.scoped_external_type_dependencies);
-        remap_set(&mut self.scoped_external_routine_dependencies);
+        remap_edges(&mut self.scoped_external_dependencies);
         self.baseline_foreign_keys = std::mem::take(&mut self.baseline_foreign_keys)
             .into_iter()
             .map(|(mut table, name)| {
@@ -3069,8 +3498,7 @@ impl AnalysisState {
         }
 
         let result = self.apply_inner(mutation, precomputed_cascade);
-        if matches!(result, MutationResult::Conflict { .. }) && !self.local.transactions.is_empty()
-        {
+        if matches!(result, MutationResult::Conflict(_)) && !self.local.transactions.is_empty() {
             self.local.transaction_aborted = true;
         }
         // Keep the derived dependency indexes inside their invariant boundary
@@ -3097,6 +3525,7 @@ impl AnalysisState {
             Mutation::RefreshMaterializedView(refresh) => {
                 self.apply_refresh_materialized_view(refresh)
             }
+            Mutation::AlterViewFamily(alter) => self.apply_alter_view_family(alter),
             Mutation::CreateIndex(create) => self.apply_create_index(create),
             Mutation::CreatePolicy(create_policy) => self.apply_create_policy(create_policy),
             Mutation::DropPolicy(drop_policy) => self.apply_drop_policy(drop_policy),
@@ -3191,8 +3620,8 @@ impl AnalysisState {
             Mutation::Vacuum { table_id, is_full } => self.apply_vacuum(table_id, *is_full),
             Mutation::Reindex {
                 target,
-                concurrently: _,
-            } => self.apply_reindex(target),
+                concurrently,
+            } => self.apply_reindex(target, *concurrently),
         }
     }
 
@@ -3234,15 +3663,7 @@ impl AnalysisState {
                     baseline_foreign_keys: self.baseline_foreign_keys.clone(),
                     baseline_fk_dependencies: self.baseline_fk_dependencies.clone(),
                     baseline_sequences: self.baseline_sequences.clone(),
-                    scoped_external_relation_dependencies: self
-                        .scoped_external_relation_dependencies
-                        .clone(),
-                    scoped_external_type_dependencies: self
-                        .scoped_external_type_dependencies
-                        .clone(),
-                    scoped_external_routine_dependencies: self
-                        .scoped_external_routine_dependencies
-                        .clone(),
+                    scoped_external_dependencies: self.scoped_external_dependencies.clone(),
                     baseline_schemas: self.baseline_schemas.clone(),
                     search_path: self.local.search_path.clone(),
                     search_path_template: self.local.search_path_template.clone(),
@@ -3304,11 +3725,9 @@ impl AnalysisState {
         }
         self.ensure_schema_target(&new_id.schema)?;
         match self.local.functions.get(new_id) {
-            Some(crate::_internal::model::function::FunctionOverlay::Present(_)) => {
-                Err(MutationResult::Conflict {
-                    reason: format!("routine '{}' already exists", new_id),
-                })
-            }
+            Some(crate::_internal::model::function::FunctionOverlay::Present(_)) => Err(
+                MutationResult::conflict(format!("routine '{}' already exists", new_id)),
+            ),
             // A prior DROP in this migration leaves a tombstone but the
             // namespace is available again, just as it is in PostgreSQL.
             Some(crate::_internal::model::function::FunctionOverlay::Dropped) => Ok(()),
@@ -3475,6 +3894,19 @@ impl AnalysisState {
         self.record_evidence(EvidenceRecord::new(code, scope));
     }
 
+    /// Record `code` and return the outcome carrying it, so the reported
+    /// evidence and the rule-visible cause cannot disagree.
+    pub(crate) fn unresolved(&mut self, code: EvidenceCode) -> MutationResult {
+        self.taint(code, EvidenceScope::Chain);
+        MutationResult::Unresolved(code)
+    }
+
+    /// `unresolved` for a cause that stays scoped to its own statement.
+    pub(crate) fn unresolved_statement(&mut self, code: EvidenceCode) -> MutationResult {
+        self.taint(code, EvidenceScope::Statement);
+        MutationResult::Unresolved(code)
+    }
+
     pub(crate) fn set_evidence_location(&mut self, location: Option<EvidenceLocation>) {
         self.local.current_evidence_location = location;
     }
@@ -3534,12 +3966,7 @@ impl AnalysisState {
                     self.baseline_foreign_keys = snapshot.baseline_foreign_keys;
                     self.baseline_fk_dependencies = snapshot.baseline_fk_dependencies;
                     self.baseline_sequences = snapshot.baseline_sequences;
-                    self.scoped_external_relation_dependencies =
-                        snapshot.scoped_external_relation_dependencies;
-                    self.scoped_external_type_dependencies =
-                        snapshot.scoped_external_type_dependencies;
-                    self.scoped_external_routine_dependencies =
-                        snapshot.scoped_external_routine_dependencies;
+                    self.scoped_external_dependencies = snapshot.scoped_external_dependencies;
                     self.baseline_schemas = snapshot.baseline_schemas;
                     self.local.search_path = snapshot.search_path;
                     self.local.search_path_template = snapshot.search_path_template;
@@ -3709,11 +4136,67 @@ impl AnalysisState {
     }
 }
 
+/// Where the PostgreSQL version used for semantic decisions came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PgVersion {
+    Observed(u32),
+    Assumed(u32),
+    Unresolved,
+}
+
+/// Oldest release we support. Assuming an older server reports more risk.
+pub(crate) const OLDEST_SUPPORTED_PG_VERSION_NUM: u32 = 140_000;
+
+impl PgVersion {
+    pub(crate) fn num(self) -> Option<u32> {
+        match self {
+            Self::Observed(version) | Self::Assumed(version) => Some(version),
+            Self::Unresolved => None,
+        }
+    }
+
+    /// Whether the effective version satisfies `predicate`. An unresolved
+    /// version cannot place a feature, so it answers false.
+    pub(crate) fn satisfies(self, predicate: impl FnOnce(u32) -> bool) -> bool {
+        match self {
+            Self::Observed(version) | Self::Assumed(version) => predicate(version),
+            Self::Unresolved => false,
+        }
+    }
+
+    /// Whether this version came from the user rather than from the server.
+    pub(crate) fn is_asserted(self) -> bool {
+        !matches!(self, Self::Observed(_))
+    }
+
+    /// Version to branch on, defaulting to the oldest supported release so an
+    /// unanswerable version question reports risk rather than safety.
+    pub(crate) fn conservative_num(self) -> u32 {
+        self.num().unwrap_or(OLDEST_SUPPORTED_PG_VERSION_NUM)
+    }
+}
+
+/// Renders a `server_version_num` as the major release, e.g. `160_002` to
+/// `"16"`, so a diagnostic can name the release that introduced a feature.
+pub(crate) fn pg_version_label(version_num: u32) -> String {
+    (version_num / 10_000).to_string()
+}
+
+/// The routine name in `name(arguments)`, which is how a routine identity is
+/// spelled.
+pub(crate) fn bare_routine_name(identity: &str) -> &str {
+    match identity.split_once('(') {
+        Some((name, _)) => name,
+        None => identity,
+    }
+}
+
 #[cfg(test)]
 mod evidence_tests {
     use super::*;
     use crate::_internal::analysis::evidence::{EvidenceCode, EvidenceRecord, EvidenceScope};
     use crate::_internal::db::cache::{CatalogFamily, SchemaCoverage};
+    use crate::_internal::model::index::{IndexOrder, IndexPredicate};
 
     /// Coverage for a hand-built baseline that retrieved `families`.
     fn covering(schemas: Option<&[String]>, families: &[CatalogFamily]) -> CatalogCoverage {
@@ -3805,7 +4288,7 @@ mod evidence_tests {
             None,
         );
 
-        assert!(matches!(result, MutationResult::Conflict { .. }));
+        assert!(matches!(result, MutationResult::Conflict(_)));
         assert!(
             state
                 .evidence()
@@ -3831,7 +4314,10 @@ mod evidence_tests {
             None,
         );
 
-        assert_eq!(result, MutationResult::Skipped);
+        assert_eq!(
+            result,
+            MutationResult::Unresolved(EvidenceCode::UnknownObjectState)
+        );
         assert!(
             state
                 .evidence()
@@ -3859,7 +4345,10 @@ mod evidence_tests {
             None,
         );
 
-        assert_eq!(result, MutationResult::Skipped);
+        assert_eq!(
+            result,
+            MutationResult::Unresolved(EvidenceCode::UnknownObjectState)
+        );
         assert!(
             state
                 .evidence()
@@ -3918,7 +4407,10 @@ mod evidence_tests {
             None,
         );
 
-        assert_eq!(result, MutationResult::Skipped);
+        assert_eq!(
+            result,
+            MutationResult::Unresolved(EvidenceCode::UnknownObjectState)
+        );
         assert!(
             state
                 .evidence()
@@ -3928,7 +4420,7 @@ mod evidence_tests {
     }
 
     #[test]
-    fn baseline_drop_requires_dependency_catalog_coverage() {
+    fn baseline_drop_applies_and_taints_without_dependency_catalog_coverage() {
         let table_id = ObjectId::new("public", "known_table");
         let mut cache = synced_cache();
         cache.insert_baseline(
@@ -3943,14 +4435,18 @@ mod evidence_tests {
 
         let result = state.apply(
             &Mutation::DropTable(crate::_internal::analysis::mutations::DropTable {
-                ids: vec![table_id],
+                ids: vec![table_id.clone()],
                 if_exists: false,
                 cascade: false,
             }),
             None,
         );
 
-        assert_eq!(result, MutationResult::Skipped);
+        // PostgreSQL drops the table regardless of what the baseline loaded.
+        // Only the reach of the cascade is open, so the drop applies and the
+        // chain stops being exact.
+        assert_eq!(result, MutationResult::Applied);
+        assert!(!state.relation_is_present(&table_id));
         assert!(
             state
                 .evidence()
@@ -4025,7 +4521,10 @@ mod evidence_tests {
             }),
             None,
         );
-        assert_eq!(result, MutationResult::Skipped);
+        assert_eq!(
+            result,
+            MutationResult::Unresolved(EvidenceCode::CatalogCoverageIncomplete)
+        );
         assert!(
             state
                 .evidence()
@@ -4066,7 +4565,10 @@ mod evidence_tests {
             ),
             None,
         );
-        assert_eq!(result, MutationResult::Skipped);
+        assert_eq!(
+            result,
+            MutationResult::Unresolved(EvidenceCode::CatalogCoverageIncomplete)
+        );
         assert!(matches!(
             state.local.sequences.get(&sequence_id),
             Some(SequenceOverlay::Present(_))
@@ -4107,7 +4609,10 @@ mod evidence_tests {
             ),
             None,
         );
-        assert_eq!(result, MutationResult::Skipped);
+        assert_eq!(
+            result,
+            MutationResult::Unresolved(EvidenceCode::CatalogCoverageIncomplete)
+        );
         assert!(matches!(
             state.local.sequences.get(&sequence_id),
             Some(SequenceOverlay::Present(_))
@@ -4121,7 +4626,7 @@ mod evidence_tests {
     }
 
     #[test]
-    fn baseline_drop_column_requires_dependency_coverage() {
+    fn baseline_drop_column_applies_and_taints_without_dependency_coverage() {
         let table_id = ObjectId::new("public", "known_table");
         let mut cache = synced_cache();
         cache.insert_baseline(
@@ -4147,10 +4652,13 @@ mod evidence_tests {
             }),
             None,
         );
-        assert_eq!(result, MutationResult::Skipped);
+        // PostgreSQL drops the column whatever the baseline could not load; only the
+        // exactness of the surrounding state is lost.
+        assert_eq!(result, MutationResult::Applied);
         assert!(state.local.relations.get(&table_id).is_some_and(|overlay| {
-            matches!(overlay, RelationOverlay::Present(relation) if relation.has_column("id"))
+            matches!(overlay, RelationOverlay::Present(relation) if !relation.has_column("id"))
         }));
+        assert_eq!(state.local.confidence, Confidence::Tainted);
         assert!(
             state
                 .evidence()
@@ -4160,7 +4668,7 @@ mod evidence_tests {
     }
 
     #[test]
-    fn scoped_baseline_type_drop_requires_cross_schema_dependency_proof() {
+    fn scoped_baseline_type_drop_applies_and_taints() {
         let type_id = ObjectId::new("public", "known_type");
         let mut cache = synced_cache();
         cache.metadata.schemas = Some(vec!["public".to_string()]);
@@ -4170,7 +4678,7 @@ mod evidence_tests {
             crate::_internal::model::types::TypeState {
                 id: type_id.clone(),
                 generation: 0,
-                kind: crate::_internal::model::types::TypeKind::Base,
+                kind: crate::_internal::model::types::TypeKind::Base { element: None },
             },
         );
         let mut state = AnalysisState::new(cache);
@@ -4182,16 +4690,35 @@ mod evidence_tests {
             }),
             None,
         );
-        assert_eq!(result, MutationResult::Skipped);
+        // PostgreSQL drops the type regardless of the proof; only the chain's
+        // exactness is lost.
+        assert_eq!(result, MutationResult::Applied);
         assert!(matches!(
             state.local.types.get(&type_id),
-            Some(crate::_internal::model::types::TypeOverlay::Present(_))
+            Some(crate::_internal::model::types::TypeOverlay::Dropped)
         ));
+        assert_eq!(state.local.confidence, Confidence::Tainted);
         assert!(
             state
                 .evidence()
                 .iter()
                 .any(|record| record.code == EvidenceCode::CatalogCoverageIncomplete)
+        );
+    }
+
+    #[test]
+    fn a_reference_through_an_unmodeled_class_still_names_its_schema() {
+        // An operator belongs to no modeled family, so it produces no edge; the
+        // schema that uses it must still be reported, or widening the scope is
+        // never suggested.
+        let mut cache = synced_cache();
+        cache.metadata.schemas = Some(vec!["public".to_string()]);
+        cache.coverage = fully_covering(cache.metadata.schemas.as_deref());
+        cache.external_referencing_schemas = vec!["reporting".to_string()];
+        let state = AnalysisState::new(cache);
+        assert_eq!(
+            state.external_referenced_schemas(),
+            vec!["reporting".to_string()]
         );
     }
 
@@ -4204,16 +4731,12 @@ mod evidence_tests {
         cache.functions.insert(
             function_id.clone(),
             crate::_internal::model::function::FunctionState {
-                id: function_id.clone(),
-                internal_type_owner: None,
-                routine_kind: crate::_internal::model::function::RoutineKind::Function,
-                arg_types: vec!["integer".to_string()],
-                arg_type_ids: Vec::new(),
                 return_type: "integer".to_string(),
-                return_type_id: None,
-                volatility: crate::_internal::model::function::Volatility::Volatile,
-                language: "sql".to_string(),
-                security: crate::_internal::model::function::SecurityMode::Invoker,
+                ..crate::_internal::model::function::FunctionState::with_inputs(
+                    function_id.clone(),
+                    crate::_internal::model::function::RoutineKind::Function,
+                    vec!["integer".to_string()],
+                )
             },
         );
         let mut state = AnalysisState::new(cache);
@@ -4235,7 +4758,10 @@ mod evidence_tests {
             ),
             None,
         );
-        assert_eq!(result, MutationResult::Skipped);
+        assert_eq!(
+            result,
+            MutationResult::Unresolved(EvidenceCode::CatalogCoverageIncomplete)
+        );
         assert!(matches!(
             state.local.functions.get(&function_id),
             Some(crate::_internal::model::function::FunctionOverlay::Present(
@@ -4254,16 +4780,12 @@ mod evidence_tests {
     fn routine_cascade_without_dependency_edges_is_not_applied_partially() {
         let id = ObjectId::new("public", "work(integer)");
         let routine = |kind| crate::_internal::model::function::FunctionState {
-            id: id.clone(),
-            internal_type_owner: None,
-            routine_kind: kind,
-            arg_types: vec!["integer".to_string()],
-            arg_type_ids: Vec::new(),
             return_type: "integer".to_string(),
-            return_type_id: None,
-            volatility: crate::_internal::model::function::Volatility::Volatile,
-            language: "sql".to_string(),
-            security: crate::_internal::model::function::SecurityMode::Invoker,
+            ..crate::_internal::model::function::FunctionState::with_inputs(
+                id.clone(),
+                kind,
+                vec!["integer".to_string()],
+            )
         };
         let signature = || crate::_internal::analysis::facts::FunctionSigFact {
             name: crate::_internal::ast::identifiers::QualifiedName::new(
@@ -4292,7 +4814,7 @@ mod evidence_tests {
                 ),
                 None,
             ),
-            MutationResult::Skipped
+            MutationResult::Unresolved(EvidenceCode::UnmodeledState)
         );
         assert!(
             procedure_state
@@ -4319,7 +4841,7 @@ mod evidence_tests {
                 ),
                 None,
             ),
-            MutationResult::Skipped
+            MutationResult::Unresolved(EvidenceCode::UnmodeledState)
         );
         assert!(
             aggregate_state
@@ -4345,7 +4867,7 @@ mod evidence_tests {
         });
         assert!(matches!(
             state.apply(&concurrent, None),
-            MutationResult::Conflict { .. }
+            MutationResult::Conflict(_)
         ));
 
         let mut state = AnalysisState::new(DbCache::new());
@@ -4358,7 +4880,7 @@ mod evidence_tests {
             });
         assert!(matches!(
             state.apply(&concurrent_cascade, None),
-            MutationResult::Conflict { .. }
+            MutationResult::Conflict(_)
         ));
 
         let mut state = AnalysisState::new(DbCache::new());
@@ -4373,18 +4895,19 @@ mod evidence_tests {
                 if_not_exists: false,
                 concurrently: true,
                 using_method: None,
-                has_predicate: false,
+                predicate: IndexPredicate::None,
                 unique: false,
+                nulls_not_distinct: false,
                 key_columns: vec!["id".to_string()],
+                key_expressions: vec![None],
+                key_orders: vec![IndexOrder::Default],
+                key_opclasses: vec![None],
+                key_collations: vec![None],
                 included_columns: Vec::new(),
-                has_expression_keys: false,
-                has_default_sort_order: true,
-                has_default_opclasses: true,
-                has_default_collations: true,
             });
         assert!(matches!(
             state.apply(&concurrent_create, None),
-            MutationResult::Conflict { .. }
+            MutationResult::Conflict(_)
         ));
 
         let mut refresh_state = AnalysisState::new(DbCache::new());
@@ -4396,11 +4919,12 @@ mod evidence_tests {
             crate::_internal::analysis::mutations::RefreshMaterializedViewMutation {
                 id: ObjectId::new("public", "mv"),
                 concurrently: true,
+                with_no_data: false,
             },
         );
         assert!(matches!(
             refresh_state.apply(&concurrent_refresh, None),
-            MutationResult::Conflict { .. }
+            MutationResult::Conflict(_)
         ));
 
         let partitioned_table = ObjectId::new("public", "events");
@@ -4418,18 +4942,19 @@ mod evidence_tests {
                 if_not_exists: false,
                 concurrently: true,
                 using_method: None,
-                has_predicate: false,
+                predicate: IndexPredicate::None,
                 unique: false,
+                nulls_not_distinct: false,
                 key_columns: vec!["id".to_string()],
+                key_expressions: vec![None],
+                key_orders: vec![IndexOrder::Default],
+                key_opclasses: vec![None],
+                key_collations: vec![None],
                 included_columns: Vec::new(),
-                has_expression_keys: false,
-                has_default_sort_order: true,
-                has_default_opclasses: true,
-                has_default_collations: true,
             });
         assert!(matches!(
             partition_state.apply(&concurrent_partition_index, None),
-            MutationResult::Conflict { .. }
+            MutationResult::Conflict(_)
         ));
 
         let partition_drop_table = ObjectId::new("public", "drop_events");
@@ -4449,14 +4974,15 @@ mod evidence_tests {
                     if_not_exists: false,
                     concurrently: false,
                     using_method: None,
-                    has_predicate: false,
+                    predicate: IndexPredicate::None,
                     unique: false,
+                    nulls_not_distinct: false,
                     key_columns: vec!["id".to_string()],
+                    key_expressions: vec![None],
+                    key_orders: vec![IndexOrder::Default],
+                    key_opclasses: vec![None],
+                    key_collations: vec![None],
                     included_columns: Vec::new(),
-                    has_expression_keys: false,
-                    has_default_sort_order: true,
-                    has_default_opclasses: true,
-                    has_default_collations: true,
                 }),
                 None,
             ),
@@ -4472,7 +4998,7 @@ mod evidence_tests {
                 }),
                 None,
             ),
-            MutationResult::Conflict { .. }
+            MutationResult::Conflict(_)
         ));
     }
 
@@ -4497,11 +5023,12 @@ mod evidence_tests {
                 crate::_internal::analysis::mutations::RefreshMaterializedViewMutation {
                     id: view_id,
                     concurrently: true,
+                    with_no_data: false,
                 },
             ),
             None,
         );
-        assert!(matches!(result, MutationResult::Conflict { .. }));
+        assert!(matches!(result, MutationResult::Conflict(_)));
     }
 
     #[test]
@@ -4633,7 +5160,10 @@ mod evidence_tests {
             }),
             None,
         );
-        assert_eq!(result, MutationResult::Skipped);
+        assert_eq!(
+            result,
+            MutationResult::Unresolved(EvidenceCode::UnmodeledState)
+        );
         assert!(
             state
                 .evidence()

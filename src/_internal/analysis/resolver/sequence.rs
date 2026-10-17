@@ -2,7 +2,7 @@ use super::Resolver;
 use crate::_internal::analysis::facts::AlterSequenceActionFact;
 use crate::_internal::analysis::mutations::{
     AlterSequenceActionMutation, AlterSequenceMutation, CreateSequenceMutation,
-    DropSequenceMutation, Mutation,
+    DropSequenceMutation, Mutation, SequenceOptionMutation,
 };
 use crate::_internal::analysis::state::AnalysisState;
 use crate::_internal::ast::identifiers::{ObjectId, QualifiedName};
@@ -60,14 +60,33 @@ impl Resolver {
     pub(super) fn resolve_alter_sequence(
         name: &QualifiedName,
         if_exists: bool,
-        action: &AlterSequenceActionFact,
+        options: &[crate::_internal::analysis::facts::SequenceOptionFact],
+        action: Option<&AlterSequenceActionFact>,
         state: &AnalysisState,
     ) -> Mutation {
+        use crate::_internal::analysis::facts::SequenceOptionFact;
         let id = Self::resolve_relation_lookup_name(name, state);
-        let action = match action {
-            AlterSequenceActionFact::OwnedBy(owned_by) => {
-                AlterSequenceActionMutation::OwnedBy(Self::resolve_owned_by(owned_by, state))
-            }
+        let options = options
+            .iter()
+            .map(|option| match option {
+                SequenceOptionFact::As(data_type) => SequenceOptionMutation::As(data_type.clone()),
+                SequenceOptionFact::Cache(value) => SequenceOptionMutation::Cache(*value),
+                SequenceOptionFact::Cycle(value) => SequenceOptionMutation::Cycle(*value),
+                SequenceOptionFact::Increment(value) => SequenceOptionMutation::Increment(*value),
+                SequenceOptionFact::Logged(value) => SequenceOptionMutation::Logged(*value),
+                SequenceOptionFact::MaxValue(value) => SequenceOptionMutation::MaxValue(*value),
+                SequenceOptionFact::MinValue(value) => SequenceOptionMutation::MinValue(*value),
+                SequenceOptionFact::OwnedBy(owned_by) => {
+                    SequenceOptionMutation::OwnedBy(Self::resolve_owned_by(owned_by, state))
+                }
+                SequenceOptionFact::SequenceName(name) => {
+                    SequenceOptionMutation::SequenceName(name.clone())
+                }
+                SequenceOptionFact::Start(value) => SequenceOptionMutation::Start(*value),
+                SequenceOptionFact::Restart(value) => SequenceOptionMutation::Restart(*value),
+            })
+            .collect();
+        let action = action.map(|action| match action {
             AlterSequenceActionFact::OwnerTo(owner) => {
                 AlterSequenceActionMutation::OwnerTo(owner.clone())
             }
@@ -79,11 +98,11 @@ impl Resolver {
             AlterSequenceActionFact::SetSchema(schema) => {
                 AlterSequenceActionMutation::SetSchema(ObjectId::new(schema, &id.name))
             }
-            AlterSequenceActionFact::Other => AlterSequenceActionMutation::Other,
-        };
+        });
         Mutation::AlterSequence(AlterSequenceMutation {
             id,
             if_exists,
+            options,
             action,
         })
     }

@@ -1,6 +1,6 @@
 use crate::_internal::analysis::mutations::Mutation;
 use crate::_internal::analysis::state::MutationResult;
-use crate::_internal::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
+use crate::_internal::report::violations::{ObjectKind, Violation, ViolationTier};
 use crate::_internal::rules::{Rule, RuleContext};
 
 pub(crate) struct RequireLockTimeoutRule;
@@ -56,7 +56,7 @@ impl Rule for RequireLockTimeoutRule {
         vec![Violation {
             source_range: None,
             rule_id: self.id(),
-            operation_kind: OperationKind::Other("timeout_check".to_string()),
+
             object_kind: subject.0,
             object_name: subject.1,
             tier: self.default_tier(),
@@ -64,7 +64,6 @@ impl Rule for RequireLockTimeoutRule {
             recipe: self.recipe(),
             dedup_key: Some(self.id().to_string()),
             sql: None,
-            fk_dependency_related: false,
         }]
     }
 }
@@ -112,7 +111,7 @@ impl Rule for RequireStatementTimeoutRule {
         vec![Violation {
             source_range: None,
             rule_id: self.id(),
-            operation_kind: OperationKind::Other("timeout_check".to_string()),
+
             object_kind: subject.0,
             object_name: subject.1,
             tier: self.default_tier(),
@@ -120,7 +119,6 @@ impl Rule for RequireStatementTimeoutRule {
             recipe: self.recipe(),
             dedup_key: Some(self.id().to_string()),
             sql: None,
-            fk_dependency_related: false,
         }]
     }
 }

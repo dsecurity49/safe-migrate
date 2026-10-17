@@ -1,6 +1,6 @@
 use crate::_internal::analysis::mutations::{AlterTableActionMutation, Mutation};
-use crate::_internal::analysis::state::MutationResult;
-use crate::_internal::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
+
+use crate::_internal::report::violations::{ObjectKind, Violation, ViolationTier};
 use crate::_internal::rules::{Rule, RuleContext};
 
 pub(crate) struct DisableTriggerRule;
@@ -17,9 +17,6 @@ impl Rule for DisableTriggerRule {
     }
 
     fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
-        if *context.result() == MutationResult::Skipped {
-            return vec![];
-        }
         let mut violations = Vec::new();
 
         if let Mutation::AlterTable(alter) = context.mutation() {
@@ -29,7 +26,7 @@ impl Rule for DisableTriggerRule {
                     violations.push(Violation {
                         source_range: None,
                         rule_id: self.id(),
-                        operation_kind: OperationKind::DisableTrigger,
+
                         object_kind: ObjectKind::Trigger,
                         object_name: format!("{} on {}", name, alter.id),
                         tier: self.default_tier(),
@@ -37,14 +34,12 @@ impl Rule for DisableTriggerRule {
                         recipe: self.recipe(),
                         dedup_key: None,
                         sql: None,
-                        fk_dependency_related: false,
                     });
                 }
                 AlterTableActionMutation::EnableTrigger { trigger_name } => {
                     let name = trigger_name.as_deref().unwrap_or("ALL");
                     violations.push(Violation { source_range: None,
                         rule_id: self.id(),
-                        operation_kind: OperationKind::EnableTrigger,
                         object_kind: ObjectKind::Trigger,
                         object_name: format!("{} on {}", name, alter.id),
                         tier: ViolationTier::Tier3, // Tier 3 because it is restorative
@@ -52,7 +47,7 @@ impl Rule for DisableTriggerRule {
                         recipe: "Re-enabling triggers restores business logic. Ensure state consistency was maintained during the disabled window.",
                         dedup_key: None,
                                     sql: None,
-                                    fk_dependency_related: false,
+
                     });
                 }
                 _ => {}

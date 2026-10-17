@@ -1,15 +1,14 @@
 mod rule_evaluation_tests {
     use crate::common::*;
+    use safe_migrate::_internal::analysis::evidence::EvidenceCode;
     use safe_migrate::_internal::analysis::state::{AnalysisState, Confidence, RelationOverlay};
     use safe_migrate::_internal::ast::identifiers::ObjectId;
     use safe_migrate::_internal::engine::engine::SafeMigrateEngine;
     use safe_migrate::_internal::model::column::Column;
-    use safe_migrate::_internal::model::function::{
-        FunctionOverlay, FunctionState, RoutineKind, SecurityMode, Volatility,
-    };
+    use safe_migrate::_internal::model::function::{FunctionOverlay, FunctionState, RoutineKind};
     use safe_migrate::_internal::model::relation::{Persistence, RelationKind, RelationState};
     use safe_migrate::_internal::report::violations::ViolationTier;
-    use safe_migrate::api::{Config, RuleConfig};
+    use safe_migrate::api::{Certainty, Config, RuleConfig};
 
     #[test]
     fn test_rule_idempotency() {
@@ -436,10 +435,10 @@ mod rule_evaluation_tests {
 
     #[test]
     fn test_earlier_taint_lowers_certainty_of_later_findings_only() {
-        use safe_migrate::_internal::analysis::state::Confidence;
-
         let engine = setup_engine();
         let mut cache = crate::common::synced_cache();
+        // Pin an observed version so certainty reflects only evidence taint.
+        cache.pg_version_num = Some(180_002);
         let tid = object_id("public", "t");
         cache.insert_baseline(
             tid.clone(),
@@ -492,12 +491,57 @@ mod rule_evaluation_tests {
 
         // The DO block can only invalidate state observed after it.
         assert!(
-            db.iter().all(|f| f.certainty == Confidence::Exact),
+            db.iter().all(|f| f.certainty == Certainty::Exact),
             "a finding produced before the unmodeled statement is still exact: {db:?}"
         );
         assert!(
-            drop.iter().all(|f| f.certainty == Confidence::Tainted),
+            drop.iter().all(|f| f.certainty == Certainty::Tainted),
             "a finding produced after the unmodeled statement is uncertain: {drop:?}"
+        );
+    }
+
+    #[test]
+    fn test_unobserved_version_marks_findings_assumed_not_exact() {
+        let engine = setup_engine();
+
+        let analyse = |cache: crate::_internal::db::cache::DbCache| {
+            let mut state = AnalysisState::new(cache);
+            engine
+                .analyze_chain_with_locations(
+                    &[("001.sql".to_string(), "DROP DATABASE mydb;".to_string())],
+                    &mut state,
+                )
+                .unwrap()
+        };
+
+        let mut observed = crate::common::synced_cache();
+        observed.pg_version_num = Some(180_002);
+        assert!(
+            analyse(observed)
+                .iter()
+                .all(|f| f.certainty == Certainty::Exact),
+            "an observed server version keeps a finding exact"
+        );
+
+        assert!(
+            analyse(crate::common::synced_cache())
+                .iter()
+                .all(|f| f.certainty == Certainty::Assumed),
+            "with no observed version the finding is still reported, marked assumed"
+        );
+
+        let mut cache = crate::common::synced_cache();
+        cache.pg_version_num = None;
+        let mut state = AnalysisState::new(cache).with_asserted_pg_version(Some(170_000));
+        let findings = engine
+            .analyze_chain_with_locations(
+                &[("001.sql".to_string(), "DROP DATABASE mydb;".to_string())],
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            findings.iter().all(|f| f.certainty == Certainty::Assumed),
+            "a configured version is an assertion, not an observation"
         );
     }
 
@@ -861,16 +905,9 @@ mod rule_evaluation_tests {
         state.local.functions.insert(
             function_id.clone(),
             FunctionOverlay::Present(FunctionState {
-                id: function_id,
-                routine_kind: RoutineKind::Function,
-                arg_types: Vec::new(),
-                arg_type_ids: Vec::new(),
                 return_type: "trigger".into(),
-                return_type_id: None,
-                volatility: Volatility::Volatile,
                 language: "plpgsql".into(),
-                security: SecurityMode::Invoker,
-                internal_type_owner: None,
+                ..FunctionState::with_inputs(function_id, RoutineKind::Function, Vec::new())
             }),
         );
 
@@ -1055,6 +1092,30 @@ mod rule_evaluation_tests {
     }
 
     #[test]
+    fn unresolved_statement_records_unevaluated_rules_with_a_remedy() {
+        let engine = setup_engine();
+        let mut cache = crate::common::synced_cache();
+        // A target outside the synced scope cannot be seen, so post-state rules
+        // must decline rather than guess.
+        cache.metadata.schemas = Some(vec!["app".to_string()]);
+        let mut state = AnalysisState::new(cache);
+
+        engine
+            .analyze("DROP TABLE public.secret_table CASCADE;", &mut state)
+            .unwrap();
+
+        let not_evaluated = state.not_evaluated();
+        assert!(
+            !not_evaluated.is_empty(),
+            "an unresolvable target must record which rules did not run"
+        );
+        assert!(
+            not_evaluated.iter().any(|entry| !entry.recipe.is_empty()),
+            "each record must say what would make the rule evaluable"
+        );
+    }
+
+    #[test]
     fn scoped_cache_reports_unknown_schema_as_coverage_not_drift() {
         let engine = setup_engine();
         let mut cache = crate::common::synced_cache();
@@ -1133,16 +1194,12 @@ mod rule_evaluation_tests {
             cache.functions.insert(
                 routine_id.clone(),
                 FunctionState {
-                    id: routine_id.clone(),
-                    internal_type_owner: None,
-                    routine_kind,
-                    arg_types: vec!["integer".into()],
-                    arg_type_ids: Vec::new(),
                     return_type: "void".into(),
-                    return_type_id: None,
-                    volatility: Volatility::Volatile,
-                    language: "sql".into(),
-                    security: SecurityMode::Invoker,
+                    ..FunctionState::with_inputs(
+                        routine_id.clone(),
+                        routine_kind,
+                        vec!["integer".into()],
+                    )
                 },
             );
             let mut state = AnalysisState::new(cache);
@@ -1508,36 +1565,323 @@ mod rule_evaluation_tests {
     }
 
     #[test]
-    fn view_reloptions_are_version_specific() {
-        // security_definer is the pre-15 inverse of security_invoker.
+    fn security_definer_is_not_a_view_reloption_on_any_version() {
+        use crate::_internal::analysis::mutations::ReloptionTarget;
+        use crate::_internal::analysis::state::PgVersion;
+        use crate::_internal::model::reloption::{ReloptionOutcome, evaluate};
+
+        // It is a routine attribute. PostgreSQL 15 added security_invoker
+        // beside security_barrier rather than replacing anything.
+        for version in [140_000, 150_000, 160_000, 170_000, 180_000] {
+            assert_eq!(
+                evaluate(
+                    "security_definer",
+                    Some("true"),
+                    ReloptionTarget::View,
+                    PgVersion::Observed(version)
+                ),
+                ReloptionOutcome::Unrecognized {
+                    name: "security_definer".to_string()
+                },
+                "PG {version} must not accept security_definer"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reloption_added_in_a_later_release_is_rejected_before_it() {
+        use crate::_internal::analysis::mutations::ReloptionTarget;
+        use crate::_internal::analysis::state::PgVersion;
+        use crate::_internal::model::reloption::{ReloptionOutcome, evaluate};
+
+        let target = ReloptionTarget::View;
         assert_eq!(
-            crate::_internal::model::reloption::classify(
-                crate::_internal::model::reloption::view_reloption("security_definer"),
-                Some(140_000)
+            evaluate(
+                "security_invoker",
+                Some("true"),
+                target,
+                PgVersion::Observed(140_000)
             ),
-            crate::_internal::model::reloption::ReloptionOutcome::Accepted
+            ReloptionOutcome::Unrecognized {
+                name: "security_invoker".to_string()
+            }
         );
         assert_eq!(
-            crate::_internal::model::reloption::classify(
-                crate::_internal::model::reloption::view_reloption("security_definer"),
-                Some(180_000)
+            evaluate(
+                "security_invoker",
+                Some("true"),
+                target,
+                PgVersion::Observed(150_000)
             ),
-            crate::_internal::model::reloption::ReloptionOutcome::Rejected
+            ReloptionOutcome::Accepted
         );
     }
 
     #[test]
-    fn materialized_view_accepts_storage_reloptions_views_reject() {
-        use crate::_internal::model::reloption::{
-            ReloptionOutcome, classify, materialized_view_reloption, view_reloption,
+    fn reloption_values_are_checked_against_their_domain() {
+        use crate::_internal::analysis::mutations::ReloptionTarget;
+        use crate::_internal::analysis::state::PgVersion;
+        use crate::_internal::model::reloption::{ReloptionOutcome, evaluate, parses_as_bool};
+
+        let version = PgVersion::Observed(180_000);
+        let view = ReloptionTarget::View;
+        let bad = |name: &'static str, value: &str| {
+            matches!(
+                evaluate(name, Some(value), view, version),
+                ReloptionOutcome::BadValue { .. }
+            )
         };
+        // parse_bool takes a unique prefix, so these all hold.
+        for value in ["true", "t", "tr", "yes", "y", "on", "1", "TRUE", "of"] {
+            assert!(parses_as_bool(value), "{value} should parse as a bool");
+        }
+        // A bare `o` is ambiguous between on and off, which PostgreSQL
+        // rejects, and a numeric spelling must be exactly `1` or `0`.
+        for value in ["o", "maybe", "2", "01", "truex", ""] {
+            assert!(!parses_as_bool(value), "{value} should not parse");
+        }
+        assert!(bad("security_barrier", "banana"));
+        assert!(bad("security_barrier", "o"));
+        // An enum is compared whole, never by prefix.
+        assert!(bad("check_option", "casc"));
+        assert!(bad("check_option", "banana"));
+        assert!(!bad("check_option", "cascaded"));
         assert_eq!(
-            classify(materialized_view_reloption("fillfactor"), Some(180_000)),
+            evaluate("check_option", Some("LOCAL"), view, version),
+            ReloptionOutcome::Accepted
+        );
+
+        let heap = ReloptionTarget::MaterializedView;
+        assert_eq!(
+            evaluate("fillfactor", Some("100"), heap, version),
+            ReloptionOutcome::Accepted
+        );
+        assert!(matches!(
+            evaluate("fillfactor", Some("5"), heap, version),
+            ReloptionOutcome::BadValue { .. }
+        ));
+        assert!(matches!(
+            evaluate("fillfactor", Some("banana"), heap, version),
+            ReloptionOutcome::BadValue { .. }
+        ));
+    }
+
+    #[test]
+    fn materialized_view_uses_the_heap_options_and_views_do_not() {
+        use crate::_internal::analysis::mutations::ReloptionTarget;
+        use crate::_internal::analysis::state::PgVersion;
+        use crate::_internal::model::reloption::{ReloptionOutcome, evaluate};
+
+        let version = PgVersion::Observed(180_000);
+        assert_eq!(
+            evaluate(
+                "fillfactor",
+                Some("70"),
+                ReloptionTarget::MaterializedView,
+                version
+            ),
             ReloptionOutcome::Accepted
         );
         assert_eq!(
-            classify(view_reloption("fillfactor"), Some(180_000)),
-            ReloptionOutcome::Unknown
+            evaluate("fillfactor", Some("70"), ReloptionTarget::View, version),
+            ReloptionOutcome::Unrecognized {
+                name: "fillfactor".to_string()
+            },
+            "a view has no storage, so it cannot set fillfactor"
+        );
+        for view_only in ["security_barrier", "check_option"] {
+            assert_eq!(
+                evaluate(
+                    view_only,
+                    Some("true"),
+                    ReloptionTarget::MaterializedView,
+                    version
+                ),
+                ReloptionOutcome::Unrecognized {
+                    name: view_only.to_string()
+                },
+                "{view_only} is a view option and must not reach a materialized view"
+            );
+        }
+    }
+
+    #[test]
+    fn a_repeated_reloption_is_rejected() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let v = engine
+            .analyze(
+                "CREATE TABLE base_v (id int);
+                 CREATE VIEW v AS SELECT id FROM base_v;
+                 ALTER VIEW v SET (security_barrier = true, security_barrier = false);",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            v.iter()
+                .any(|violation| violation.reason.contains("specified more than once")),
+            "a repeated option must be rejected: {v:?}"
+        );
+    }
+
+    #[test]
+    fn reindex_follows_postgresql_legality() {
+        let engine = setup_engine();
+        let reason = |sql: &str| {
+            let mut state = setup_state();
+            engine
+                .analyze(sql, &mut state)
+                .expect("the statement should analyze")
+                .into_iter()
+                .filter(|violation| violation.rule_id == "chain-conflict")
+                .map(|violation| violation.reason)
+                .next()
+                .unwrap_or_default()
+        };
+
+        // System catalogs have no concurrent reindex form at any scope.
+        assert_eq!(
+            reason("REINDEX SYSTEM CONCURRENTLY;"),
+            "Migration chain conflict: cannot reindex system catalogs concurrently"
+        );
+        // Each of these takes its own commit point per relation.
+        for (sql, form) in [
+            ("BEGIN; REINDEX SYSTEM; COMMIT;", "REINDEX SYSTEM"),
+            ("BEGIN; REINDEX SCHEMA public; COMMIT;", "REINDEX SCHEMA"),
+            ("BEGIN; REINDEX DATABASE; COMMIT;", "REINDEX DATABASE"),
+        ] {
+            assert_eq!(
+                reason(sql),
+                format!("Migration chain conflict: {form} cannot run inside a transaction block"),
+                "{form} inside a transaction block"
+            );
+        }
+        assert!(
+            reason("CREATE TABLE t (a int); CREATE VIEW v AS SELECT a FROM t; REINDEX TABLE v;")
+                .contains("is not a table or materialized view"),
+            "REINDEX TABLE must reject a view"
+        );
+        assert_eq!(
+            reason(
+                "CREATE TABLE p (a int) PARTITION BY RANGE (a);
+                 BEGIN; REINDEX TABLE p; COMMIT;"
+            ),
+            "Migration chain conflict: REINDEX TABLE cannot run inside a transaction block"
+        );
+    }
+
+    #[test]
+    fn a_named_reindex_target_must_be_the_migration_target() {
+        let engine_for = |database: &str| {
+            SafeMigrateEngine::new(Config::default().with_target_database(database))
+        };
+        let reason = |engine: &SafeMigrateEngine, sql: &str| {
+            let mut state = setup_state();
+            engine
+                .analyze(sql, &mut state)
+                .expect("the statement should analyze")
+                .into_iter()
+                .find(|violation| violation.rule_id == "chain-conflict")
+                .map(|violation| violation.reason)
+                .unwrap_or_default()
+        };
+        let app = engine_for("app");
+
+        // `ReindexMultipleTables` resolves both forms against `MyDatabaseId`,
+        // so a name that is not the current database is refused for either.
+        for form in ["DATABASE", "SYSTEM"] {
+            assert!(
+                reason(&app, &format!("REINDEX {form} other;"))
+                    .contains("can only reindex the currently open database"),
+                "REINDEX {form} must reject a database that is not the target"
+            );
+            assert_eq!(
+                reason(&app, &format!("REINDEX {form} app;")),
+                "",
+                "REINDEX {form} naming the target is legal"
+            );
+        }
+        // An omitted name is the current database by the grammar.
+        assert_eq!(reason(&app, "REINDEX DATABASE;"), "");
+        assert_eq!(reason(&app, "REINDEX SYSTEM;"), "");
+    }
+
+    #[test]
+    fn an_unchecked_reindex_target_name_is_reported_as_unknown() {
+        // Without a configured target the name cannot be checked, and saying
+        // nothing would claim an exactness the analysis does not have.
+        let engine = SafeMigrateEngine::new(Config::default());
+        let mut state = setup_state();
+        engine
+            .analyze("REINDEX DATABASE other;", &mut state)
+            .expect("the statement should analyze");
+        assert!(
+            state
+                .evidence()
+                .iter()
+                .any(|record| record.code == EvidenceCode::UnknownObjectState),
+            "an unresolvable target name must not pass silently"
+        );
+    }
+
+    #[test]
+    fn legal_reindex_statements_stay_clean() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let v = engine
+            .analyze(
+                "CREATE TABLE t (a int);
+                 CREATE INDEX t_idx ON t (a);
+                 REINDEX SYSTEM;
+                 REINDEX (CONCURRENTLY) TABLE t;
+                 REINDEX INDEX CONCURRENTLY t_idx;
+                 REINDEX TABLE CONCURRENTLY t;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !v.iter()
+                .any(|violation| violation.rule_id == "chain-conflict"),
+            "a legal REINDEX form must not conflict: {v:?}"
+        );
+    }
+
+    #[test]
+    fn a_temporary_relation_is_exempt_from_requiring_concurrency() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let v = engine
+            .analyze(
+                "CREATE TEMP TABLE bookings (id int);
+                 CREATE INDEX bookings_idx ON bookings(id);
+                 REINDEX INDEX bookings_idx;
+                 REINDEX TABLE bookings;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            !v.iter()
+                .any(|violation| violation.rule_id == "require-concurrent-reindex"),
+            "a temporary relation cannot be reindexed concurrently: {v:?}"
+        );
+    }
+
+    #[test]
+    fn a_permanent_index_is_still_reported_as_needing_concurrency() {
+        let engine = setup_engine();
+        let mut state = setup_state();
+        let v = engine
+            .analyze(
+                "CREATE TABLE bookings (id int);
+                 CREATE INDEX bookings_idx ON bookings(id);
+                 REINDEX INDEX bookings_idx;",
+                &mut state,
+            )
+            .unwrap();
+        assert!(
+            v.iter()
+                .any(|violation| violation.rule_id == "require-concurrent-reindex"),
+            "the temporary exemption must not leak to permanent relations: {v:?}"
         );
     }
 

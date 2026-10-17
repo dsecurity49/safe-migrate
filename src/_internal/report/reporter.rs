@@ -4,8 +4,10 @@ use crate::_internal::analysis::state::Confidence;
 use crate::_internal::report::violations::{ReportFinding, Violation, ViolationTier};
 use crate::_internal::rules::destructive::IRREVERSIBLE_MIGRATION_RULE_ID;
 use crate::_internal::rules::registry;
+use crate::api::Certainty;
 use comfy_table::Table;
 use owo_colors::{OwoColorize, Style};
+use std::io::IsTerminal;
 
 /// Four-way verdict classification based on violation tiers.
 #[derive(Debug, PartialEq, Eq)]
@@ -49,6 +51,28 @@ impl Verdict {
 
 /// Compute the overall verdict from a set of violations.
 pub(crate) fn compute_verdict(violations: &[Violation]) -> Verdict {
+    compute_verdict_with(violations, &[])
+}
+
+/// As [`compute_verdict`], but a verdict may not read safer than `CAUTIOUS`
+/// while a blocking-capable rule did not run: SAFE must mean every check ran.
+pub(crate) fn compute_verdict_with(
+    violations: &[Violation],
+    not_evaluated: &[crate::_internal::report::violations::NotEvaluated],
+) -> Verdict {
+    let verdict = verdict_from_violations(violations);
+    let blocked_by_gap = matches!(verdict, Verdict::Safe | Verdict::SafeWithRisk)
+        && not_evaluated
+            .iter()
+            .any(|entry| entry.tier == ViolationTier::Tier1);
+    if blocked_by_gap {
+        Verdict::Cautious
+    } else {
+        verdict
+    }
+}
+
+fn verdict_from_violations(violations: &[Violation]) -> Verdict {
     let has_tier1 = violations.iter().any(|v| v.tier == ViolationTier::Tier1);
     let has_tier2 = violations.iter().any(|v| v.tier == ViolationTier::Tier2);
     let has_irreversible_tier3 = violations
@@ -63,11 +87,19 @@ pub(crate) fn compute_verdict(violations: &[Violation]) -> Verdict {
     }
 }
 
-fn no_color() -> bool {
-    std::env::var_os("NO_COLOR").is_some()
+/// Whether the human report may emit ANSI styling.
+///
+/// Honours the `NO_COLOR` convention and never styles output that is not going
+/// to a terminal, so redirected or piped reports stay free of escape codes.
+pub(crate) fn color_enabled(no_color_env: bool, stdout_is_terminal: bool) -> bool {
+    !no_color_env && stdout_is_terminal
 }
-pub(crate) fn tier_label_colored(tier: &ViolationTier) -> String {
-    tier_label_with_color(tier, !no_color())
+
+fn no_color() -> bool {
+    !color_enabled(
+        std::env::var_os("NO_COLOR").is_some(),
+        std::io::stdout().is_terminal(),
+    )
 }
 
 pub(super) fn tier_label_with_color(tier: &ViolationTier, color: bool) -> String {
@@ -94,16 +126,34 @@ fn terminal_width() -> usize {
         .max(60)
 }
 
+/// Rule titles for exactly the rules a report cites. Kept out of each finding
+/// because it is identical for every occurrence of a rule.
+fn rules_catalogue<'a>(rule_ids: impl Iterator<Item = &'a str>) -> serde_json::Value {
+    let mut catalogue = serde_json::Map::new();
+    for rule_id in rule_ids {
+        if catalogue.contains_key(rule_id) {
+            continue;
+        }
+        if let Some(title) = registry::rule_title(rule_id) {
+            catalogue.insert(rule_id.to_string(), serde_json::json!(title));
+        }
+    }
+    serde_json::Value::Object(catalogue)
+}
+
 pub(crate) struct Reporter;
 
 impl Reporter {
-    pub(crate) const JSON_SCHEMA_VERSION: u32 = 2;
+    // v3 adds the top-level `not_evaluated` object, whose entries carry an
+    // optional `missing_schemas` list.
+    pub(crate) const JSON_SCHEMA_VERSION: u32 = 3;
 
     pub(crate) fn json_report(
         violations: &[Violation],
         confidence: &Confidence,
+        not_evaluated: &[crate::_internal::report::violations::NotEvaluated],
     ) -> serde_json::Value {
-        let verdict = compute_verdict(violations);
+        let verdict = compute_verdict_with(violations, not_evaluated);
         let tier1 = violations
             .iter()
             .filter(|violation| violation.tier == ViolationTier::Tier1)
@@ -130,6 +180,7 @@ impl Reporter {
                 "tier3": tier3,
             },
             "evidence": [],
+            "rules": rules_catalogue(violations.iter().map(|violation| violation.rule_id)),
             "violations": violations,
         })
     }
@@ -138,8 +189,10 @@ impl Reporter {
     /// evidence alongside the existing finding contract.
     pub(crate) fn json_outcome_with_locations(
         outcome: &AnalysisOutcome<ReportFinding>,
+        not_evaluated: &[crate::_internal::report::violations::NotEvaluated],
     ) -> serde_json::Value {
-        let mut report = Self::json_report_with_locations(&outcome.findings, &outcome.confidence);
+        let mut report =
+            Self::json_report_with_locations(&outcome.findings, &outcome.confidence, not_evaluated);
         report["evidence"] = serde_json::to_value(&outcome.evidence)
             .expect("analysis evidence is always serializable");
         report
@@ -150,45 +203,50 @@ impl Reporter {
     pub(crate) fn json_report_with_locations(
         findings: &[ReportFinding],
         confidence: &Confidence,
+        not_evaluated: &[crate::_internal::report::violations::NotEvaluated],
     ) -> serde_json::Value {
         let violations: Vec<_> = findings
             .iter()
             .map(|finding| finding.violation.clone())
             .collect();
-        let mut report = Self::json_report(&violations, confidence);
+        let mut report = Self::json_report(&violations, confidence, not_evaluated);
         report["violations"] = serde_json::Value::Array(
             findings
                 .iter()
                 .map(|finding| {
-                    let mut value = serde_json::to_value(finding).unwrap_or_else(|error| {
+                    serde_json::to_value(finding).unwrap_or_else(|error| {
                         serde_json::json!({
                             "rule_id": finding.violation.rule_id,
                             "message": "Failed to serialize report finding",
                             "serialization_error": error.to_string(),
                         })
-                    });
-                    if let Some(descriptor) = registry::find_primary_rule(finding.violation.rule_id)
-                        && let Some(object) = value.as_object_mut()
-                    {
-                        object.insert("rule_title".into(), descriptor.title.into());
-                        object.insert("rule_summary".into(), descriptor.summary.into());
-                        object.insert("impact".into(), descriptor.impact.into());
-                    }
-                    value
+                    })
                 })
                 .collect(),
+        );
+        // A check that did not run still needs its title, or a consumer cannot
+        // label the entry it is told about.
+        report["rules"] = rules_catalogue(
+            findings
+                .iter()
+                .map(|finding| finding.violation.rule_id)
+                .chain(not_evaluated.iter().map(|entry| entry.rule_id)),
         );
         report
     }
 
     /// Deterministic Markdown rendering for pull-request artifacts. It uses
     /// the same verdict, confidence, tier, and finding data as JSON output.
-    pub(crate) fn markdown_report(findings: &[ReportFinding], confidence: &Confidence) -> String {
+    pub(crate) fn markdown_report(
+        findings: &[ReportFinding],
+        confidence: &Confidence,
+        not_evaluated: &[crate::_internal::report::violations::NotEvaluated],
+    ) -> String {
         let violations: Vec<_> = findings
             .iter()
             .map(|finding| finding.violation.clone())
             .collect();
-        let verdict = compute_verdict(&violations);
+        let verdict = compute_verdict_with(&violations, not_evaluated);
         let confidence = match confidence {
             Confidence::Exact => "Exact",
             Confidence::Tainted => "Tainted",
@@ -226,18 +284,9 @@ impl Reporter {
             output.push_str(&format!(
                 "\n### {} — {} (`{}`)\n\n",
                 markdown_tier_label(&violation.tier),
-                registry::find_primary_rule(violation.rule_id)
-                    .map(|descriptor| descriptor.title)
-                    .unwrap_or(violation.rule_id),
+                registry::rule_title(violation.rule_id).unwrap_or(violation.rule_id),
                 markdown_code(violation.rule_id)
             ));
-            if let Some(descriptor) = registry::find_primary_rule(violation.rule_id) {
-                output.push_str(&format!(
-                    "**Impact:** {}  \n**Rule summary:** {}  \n",
-                    markdown_escape(descriptor.impact),
-                    markdown_escape(descriptor.summary)
-                ));
-            }
             if let Some(location) = &finding.location {
                 output.push_str(&format!(
                     "**Location:** `{}:{}:{}`  \n",
@@ -248,6 +297,12 @@ impl Reporter {
             }
             if let Some(statement_index) = finding.statement_index {
                 output.push_str(&format!("**Statement:** {}  \n", statement_index));
+            }
+            if finding.certainty != Certainty::Exact {
+                output.push_str(&format!(
+                    "**Certainty:** {}  \n",
+                    markdown_escape(&finding.certainty.to_string())
+                ));
             }
             output.push_str(&format!(
                 "**Object:** {} {}  \n**Reason:** {}  \n**Recommendation:** {}\n",
@@ -270,13 +325,45 @@ impl Reporter {
                 output.push_str(&markdown_sql_block(sql.trim()));
             }
         }
+        output.push_str(&Self::markdown_rules_catalogue(
+            findings.iter().map(|finding| finding.violation.rule_id),
+        ));
         output
     }
 
+    /// Rule titles for the cited rules, listed once rather than under every
+    /// occurrence of the rule.
+    fn markdown_rules_catalogue<'a>(rule_ids: impl Iterator<Item = &'a str>) -> String {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut output = String::new();
+        for rule_id in rule_ids {
+            if !seen.insert(rule_id) {
+                continue;
+            }
+            let Some(title) = registry::rule_title(rule_id) else {
+                continue;
+            };
+            output.push_str(&format!(
+                "- `{}` — {}\n",
+                markdown_code(rule_id),
+                markdown_escape(title)
+            ));
+        }
+        if output.is_empty() {
+            return output;
+        }
+        format!("\n## Rules\n\n{output}")
+    }
+
     /// Render findings and structured conservative-analysis evidence.
-    pub(crate) fn markdown_outcome(outcome: &AnalysisOutcome<ReportFinding>) -> String {
-        let mut output = Self::markdown_report(&outcome.findings, &outcome.confidence);
+    pub(crate) fn markdown_outcome(
+        outcome: &AnalysisOutcome<ReportFinding>,
+        not_evaluated: &[crate::_internal::report::violations::NotEvaluated],
+    ) -> String {
+        let mut output =
+            Self::markdown_report(&outcome.findings, &outcome.confidence, not_evaluated);
         append_markdown_evidence(&mut output, &outcome.evidence);
+        append_markdown_not_evaluated(&mut output, not_evaluated);
         output
     }
 
@@ -284,7 +371,11 @@ impl Reporter {
         compute_verdict(violations) == Verdict::Halt
     }
 
-    pub(crate) fn print_report(violations: &[Violation], confidence: &Confidence) -> bool {
+    pub(crate) fn print_report(
+        violations: &[Violation],
+        confidence: &Confidence,
+        not_evaluated: &[crate::_internal::report::violations::NotEvaluated],
+    ) -> bool {
         let mut tier1 = 0usize;
         let mut tier2 = 0usize;
         let mut tier3 = 0usize;
@@ -297,7 +388,7 @@ impl Reporter {
             }
         }
 
-        let verdict = compute_verdict(violations);
+        let verdict = compute_verdict_with(violations, not_evaluated);
         let conf_str = match confidence {
             Confidence::Exact => "Exact",
             Confidence::Tainted => "Tainted",
@@ -305,127 +396,134 @@ impl Reporter {
 
         let width = terminal_width();
 
+        // Three borderless columns so the fields spread evenly instead of
+        // bunching left; UTF8_BORDERS_ONLY keeps the edges clean.
         let mut header_table = Table::new();
         header_table.load_preset(comfy_table::presets::UTF8_BORDERS_ONLY);
         header_table.set_content_arrangement(comfy_table::ContentArrangement::DynamicFullWidth);
         header_table.set_width(width as u16);
-        header_table.set_header(vec!["safe-migrate lint"]);
-        header_table.add_row(vec![format!(
-            "Verdict: {}   Confidence: {}",
-            verdict.label(),
-            conf_str
-        )]);
-        header_table.add_row(vec![format!(
-            "HALT: {}   WARN: {}   SAFE: {}",
-            tier1, tier2, tier3
-        )]);
+        header_table.set_header(vec!["safe-migrate lint", "", ""]);
+        header_table.add_row(vec![
+            format!("Verdict: {}", verdict.label()),
+            format!("Confidence: {}", conf_str),
+            String::new(),
+        ]);
+        header_table.add_row(vec![
+            format!("HALT: {}", tier1),
+            format!("WARN: {}", tier2),
+            format!("SAFE: {}", tier3),
+        ]);
         println!("{}", header_table);
 
         if violations.is_empty() {
             println!("\n  No violations detected.\n");
-            return false;
-        }
-
-        println!();
-
-        let sep_width = (width as f32 * 0.82) as usize;
-
-        let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
-        let mut sql_to_group_idx: std::collections::HashMap<(&str, &str), usize> =
-            std::collections::HashMap::new();
-
-        for (i, v) in violations.iter().enumerate() {
-            if let Some(sql) = &v.sql {
-                let key = (sql.as_str(), v.object_name.as_str());
-                if let Some(&gi) = sql_to_group_idx.get(&key) {
-                    groups[gi].1.push(i);
-                    continue;
-                }
-
-                let new_gi = groups.len();
-                groups.push((i, Vec::new()));
-                sql_to_group_idx.insert(key, new_gi);
-            } else {
-                groups.push((i, Vec::new()));
+            print!("{}", human_not_evaluated(not_evaluated));
+            if not_evaluated.is_empty() {
+                return false;
             }
-        }
+        } else {
+            println!();
 
-        for (gi, (primary_idx, secondary_idxs)) in groups.iter().enumerate() {
-            let v = &violations[*primary_idx];
-            let tier_str = tier_label_colored(&v.tier);
+            let sep_width = (width as f32 * 0.82) as usize;
 
-            let descriptor = registry::find_primary_rule(v.rule_id);
-            let rule_label = descriptor
-                .map(|descriptor| format!("{} ({})", descriptor.title, v.rule_id))
-                .unwrap_or_else(|| v.rule_id.to_string());
-            println!(" [{}] {}", tier_str, rule_label);
-            if let Some(descriptor) = descriptor {
-                println!("   impact : {}", descriptor.impact);
-                println!("   summary: {}", descriptor.summary);
-            }
+            let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
+            let mut sql_to_group_idx: std::collections::HashMap<(&str, &str), usize> =
+                std::collections::HashMap::new();
 
-            let display_name = match &v.object_kind {
-                crate::_internal::report::violations::ObjectKind::Database
-                | crate::_internal::report::violations::ObjectKind::Role
-                | crate::_internal::report::violations::ObjectKind::Publication => {
-                    let step1 = if let Some(idx) = v.object_name.find('.') {
-                        &v.object_name[idx + 1..]
-                    } else {
-                        &v.object_name
-                    };
-                    step1
-                        .strip_suffix(" (inferred)")
-                        .unwrap_or(step1)
-                        .to_string()
-                }
-                _ => v.object_name.clone(),
-            };
+            for (i, v) in violations.iter().enumerate() {
+                if let Some(sql) = &v.sql {
+                    let key = (sql.as_str(), v.object_name.as_str());
+                    if let Some(&gi) = sql_to_group_idx.get(&key) {
+                        groups[gi].1.push(i);
+                        continue;
+                    }
 
-            if v.object_kind == crate::_internal::report::violations::ObjectKind::Unknown {
-                println!("   object : {}", terminal_inline(&display_name));
-            } else {
-                println!(
-                    "   object : {} {}",
-                    v.object_kind,
-                    terminal_inline(&display_name)
-                );
-            }
-
-            println!("   reason : {}", terminal_inline(&v.reason));
-
-            let clean_recipe = v
-                .recipe
-                .lines()
-                .map(|l| l.trim())
-                .filter(|l| !l.is_empty())
-                .collect::<Vec<_>>()
-                .join(" ");
-            println!("   recipe : {}", terminal_inline(&clean_recipe));
-
-            if let Some(sql) = &v.sql {
-                let sql_trimmed = sql.trim();
-                if !sql_trimmed.is_empty() {
-                    println!("   sql    : {}", terminal_block(sql_trimmed));
+                    let new_gi = groups.len();
+                    groups.push((i, Vec::new()));
+                    sql_to_group_idx.insert(key, new_gi);
+                } else {
+                    groups.push((i, Vec::new()));
                 }
             }
 
-            for &sec_idx in secondary_idxs {
-                let sv = &violations[sec_idx];
-                println!(
-                    "   also   : [{}] {}",
-                    tier_label_colored(&sv.tier),
-                    sv.rule_id
-                );
+            // Resolve styling once; asking the terminal per finding would repeat the
+            // syscall for every row.
+            let color = !no_color();
+
+            for (gi, (primary_idx, secondary_idxs)) in groups.iter().enumerate() {
+                let v = &violations[*primary_idx];
+                let tier_str = tier_label_with_color(&v.tier, color);
+
+                let descriptor = registry::find_primary_rule(v.rule_id);
+                let rule_label = descriptor
+                    .map(|descriptor| format!("{} ({})", descriptor.title, v.rule_id))
+                    .unwrap_or_else(|| v.rule_id.to_string());
+                println!(" [{}] {}", tier_str, rule_label);
+
+                let display_name = match &v.object_kind {
+                    crate::_internal::report::violations::ObjectKind::Database
+                    | crate::_internal::report::violations::ObjectKind::Role
+                    | crate::_internal::report::violations::ObjectKind::Publication => {
+                        let step1 = if let Some(idx) = v.object_name.find('.') {
+                            &v.object_name[idx + 1..]
+                        } else {
+                            &v.object_name
+                        };
+                        step1
+                            .strip_suffix(" (inferred)")
+                            .unwrap_or(step1)
+                            .to_string()
+                    }
+                    _ => v.object_name.clone(),
+                };
+
+                if v.object_kind == crate::_internal::report::violations::ObjectKind::Unknown {
+                    println!("   object : {}", terminal_inline(&display_name));
+                } else {
+                    println!(
+                        "   object : {} {}",
+                        v.object_kind,
+                        terminal_inline(&display_name)
+                    );
+                }
+
+                println!("   reason : {}", terminal_inline(&v.reason));
+
+                let clean_recipe = v
+                    .recipe
+                    .lines()
+                    .map(|l| l.trim())
+                    .filter(|l| !l.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                println!("   recipe : {}", terminal_inline(&clean_recipe));
+
+                if let Some(sql) = &v.sql {
+                    let sql_trimmed = sql.trim();
+                    if !sql_trimmed.is_empty() {
+                        println!("   sql    : {}", terminal_block(sql_trimmed));
+                    }
+                }
+
+                for &sec_idx in secondary_idxs {
+                    let sv = &violations[sec_idx];
+                    println!(
+                        "   also   : [{}] {}",
+                        tier_label_with_color(&sv.tier, color),
+                        sv.rule_id
+                    );
+                }
+
+                if gi < groups.len() - 1 {
+                    println!();
+                    println!(" {}", "─".repeat(sep_width));
+                    println!();
+                }
             }
 
-            if gi < groups.len() - 1 {
-                println!();
-                println!(" {}", "─".repeat(sep_width));
-                println!();
-            }
+            println!();
+            print!("{}", human_not_evaluated(not_evaluated));
         }
-
-        println!();
 
         let mut summary_table = Table::new();
         summary_table.load_preset(comfy_table::presets::UTF8_BORDERS_ONLY);
@@ -446,13 +544,16 @@ impl Reporter {
     }
 
     /// Print findings and a compact, deterministic evidence summary.
-    pub(crate) fn print_outcome(outcome: &AnalysisOutcome<ReportFinding>) -> bool {
+    pub(crate) fn print_outcome(
+        outcome: &AnalysisOutcome<ReportFinding>,
+        not_evaluated: &[crate::_internal::report::violations::NotEvaluated],
+    ) -> bool {
         let violations: Vec<_> = outcome
             .findings
             .iter()
             .map(|finding| finding.violation.clone())
             .collect();
-        let should_halt = Self::print_report(&violations, &outcome.confidence);
+        let should_halt = Self::print_report(&violations, &outcome.confidence, not_evaluated);
         if !outcome.evidence.is_empty() {
             println!("Analysis evidence:");
             for evidence in &outcome.evidence {
@@ -472,6 +573,50 @@ impl Reporter {
         }
         should_halt
     }
+}
+
+fn append_markdown_not_evaluated(
+    output: &mut String,
+    not_evaluated: &[crate::_internal::report::violations::NotEvaluated],
+) {
+    if not_evaluated.is_empty() {
+        return;
+    }
+    output.push_str("\n## Not evaluated\n\n");
+    output.push_str(
+        "These checks did not run because the required evidence was unavailable.\n\n\
+         | Rule | Tier | Cause | Remedy |\n| --- | --- | --- | --- |\n",
+    );
+    for entry in not_evaluated {
+        output.push_str(&format!(
+            "| `{}` | {:?} | `{}` | {} |\n",
+            entry.rule_id,
+            entry.tier,
+            entry.cause.as_str(),
+            markdown_escape(&entry.recipe)
+        ));
+    }
+}
+
+/// Human rendering of skipped checks, shared by the report and interactive viewer.
+pub(crate) fn human_not_evaluated(
+    not_evaluated: &[crate::_internal::report::violations::NotEvaluated],
+) -> String {
+    if not_evaluated.is_empty() {
+        return String::new();
+    }
+    let mut output = String::from(" Checks not evaluated:\n");
+    for entry in not_evaluated {
+        output.push_str(&format!(
+            "   - {} [{:?}]\n     cause  : {}\n     remedy : {}\n",
+            terminal_inline(entry.rule_id),
+            entry.tier,
+            terminal_inline(entry.cause.as_str()),
+            terminal_inline(&entry.recipe),
+        ));
+    }
+    output.push('\n');
+    output
 }
 
 fn append_markdown_evidence(output: &mut String, evidence: &[EvidenceRecord]) {

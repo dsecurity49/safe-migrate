@@ -8,6 +8,7 @@ use crate::_internal::analysis::facts::{
     TypeCreationKind,
 };
 use crate::_internal::ast::identifiers::{Ident, QualifiedName};
+use crate::_internal::model::index::{IndexOrder, IndexPredicate, WrittenName};
 use squawk_syntax::ast::{
     AlterColumnOption, AlterConstraint, AlterDomain, AlterIndex, AlterSequence, AlterTable,
     AlterTableAction, AlterTrigger, AlterType, AstNode, AttachPartition, Column, ColumnConstraint,
@@ -15,8 +16,9 @@ use squawk_syntax::ast::{
     CreateSequence, CreateTable, CreateTableAs, CreateTrigger, CreateType, CreateView, CteName,
     DetachPartition, DropDomain, DropIndex, DropMaterializedView, DropPolicy, DropSequence,
     DropTable, DropTrigger, DropType, DropView, Grant, Lock, NameRef, PartitionBy, PartitionType,
-    Path, PathSegment, PathSegmentRef, RelationNameRef, ReleaseSavepoint, Revoke, RevokeCommand,
-    Rollback, SchemaRef, SelectInto, Set, SetSchema, Stmt, TableArg, TableConstraint, Truncate,
+    Path, PathRef, PathSegment, PathSegmentRef, RelationNameRef, ReleaseSavepoint, Revoke,
+    RevokeCommand, Rollback, SchemaRef, SelectInto, Set, SetSchema, Stmt, TableArg,
+    TableConstraint, Truncate,
 };
 use squawk_syntax::{SyntaxKind, ast};
 
@@ -2068,6 +2070,53 @@ impl AstVisitor {
             .collect()
     }
 
+    /// PostgreSQL stores both bits absolutely, so `ASC NULLS LAST` and
+    /// `DESC NULLS FIRST` are one order; saying nothing means `ASC NULLS LAST`.
+    fn index_key_order(
+        sort_order: Option<ast::SortOrder>,
+        nulls_order: Option<ast::NullsOrder>,
+    ) -> IndexOrder {
+        let descending = matches!(sort_order, Some(ast::SortOrder::SortDesc(_)));
+        // PostgreSQL defaults to NULLS LAST for ASC and NULLS FIRST for DESC,
+        // so a bare `DESC` is the default order, not a non-default one.
+        let nulls_first = match nulls_order {
+            Some(ast::NullsOrder::NullsFirst(_)) => true,
+            Some(ast::NullsOrder::NullsLast(_)) => false,
+            None => descending,
+        };
+        match (descending, nulls_first) {
+            (false, false) | (true, true) => IndexOrder::Default,
+            (true, false) => IndexOrder::DescNullsLast,
+            (false, true) => IndexOrder::AscNullsFirst,
+        }
+    }
+
+    /// Strip the wrappers PostgreSQL removes before deciding an index key's
+    /// kind, so `(col)`, `col COLLATE c`, and their compositions reduce the
+    /// same way the server reduces them.
+    fn strip_index_key_wrappers(expression: Option<ast::Expr>) -> Option<ast::Expr> {
+        match expression {
+            Some(ast::Expr::ParenExpr(paren)) => Self::strip_index_key_wrappers(paren.expr()),
+            Some(ast::Expr::Collate(collate)) => Self::strip_index_key_wrappers(collate.expr()),
+            other => other,
+        }
+    }
+
+    /// A dotted reference's written name, keeping the schema qualifier: a
+    /// collation or operator class resolved through the path is a different
+    /// identity from the same trailing name in the catalog.
+    fn index_item_written_name<T: AstNode>(
+        reference: Option<T>,
+        child: impl Fn(&T) -> Option<PathRef>,
+    ) -> Option<WrittenName> {
+        let reference = reference?;
+        let qualified = Self::path_ref_to_qualified_name(&child(&reference)?)?;
+        Some(WrittenName {
+            schema: qualified.schema.map(|schema| schema.resolve()),
+            name: qualified.name.resolve(),
+        })
+    }
+
     fn extract_create_index(node: &CreateIndex) -> Option<StatementFact> {
         let relation = node.table_relation_name()?.table_name_ref()?.path_ref()?;
         let relation = Self::path_ref_to_qualified_name(&relation)?;
@@ -2092,7 +2141,21 @@ impl AstVisitor {
                 .unwrap_or_default()
         });
 
-        let has_predicate = node.where_clause().is_some();
+        let predicate = match node.where_clause() {
+            None => IndexPredicate::None,
+            Some(clause) => match clause.expr() {
+                Some(expr) => IndexPredicate::Parsed(
+                    crate::_internal::analysis::expr_visitor::ExprVisitor::convert(expr),
+                ),
+                None => IndexPredicate::Opaque,
+            },
+        };
+        // `NULLS NOT DISTINCT` is the `false` case of the catalog's
+        // `indnullsnotdistinct`, which reads "distinct is false".
+        let nulls_not_distinct = matches!(
+            node.nulls_distinct_option(),
+            Some(ast::NullsDistinctOption::NullsNotDistinct(_))
+        );
         let unique = node.unique_token().is_some();
         let included_columns = node
             .index_include_clause()
@@ -2105,30 +2168,46 @@ impl AstVisitor {
             })
             .collect();
         let mut key_columns = Vec::new();
-        let mut has_expression_keys = false;
-        let mut has_default_sort_order = true;
-        let mut has_default_opclasses = true;
-        let mut has_default_collations = true;
+        let mut key_expressions: Vec<Option<ExprIr>> = Vec::new();
+        let mut key_orders: Vec<IndexOrder> = Vec::new();
+        let mut key_opclasses: Vec<Option<WrittenName>> = Vec::new();
+        let mut key_collations: Vec<Option<WrittenName>> = Vec::new();
         for item in node
             .partition_item_list()
             .into_iter()
             .flat_map(|items| items.partition_items())
         {
-            if item.sort_order().is_some() || item.nulls_order().is_some() {
-                has_default_sort_order = false;
-            }
-            if item.op_class_ref().is_some() {
-                has_default_opclasses = false;
-            }
-            if item.collate().is_some() {
-                has_default_collations = false;
-            }
-            match item.expr() {
+            // `DefineIndex` strips top-level `COLLATE` (and parentheses)
+            // before deciding a key is a column or an expression, so a
+            // collated bare column is a column key carrying the collation,
+            // not an expression.
+            let collate = match item.expr() {
+                Some(ast::Expr::Collate(collate)) => Some(collate),
+                _ => item.collate(),
+            };
+            let mut expression = match item.expr() {
+                Some(ast::Expr::Collate(collate)) => collate.expr(),
+                expression => expression,
+            };
+            expression = Self::strip_index_key_wrappers(expression);
+            match expression {
                 Some(ast::Expr::NameRef(name)) => {
                     key_columns.push(Self::resolve_identifier_token(name.text()));
+                    key_expressions.push(None);
                 }
-                _ => has_expression_keys = true,
+                Some(expr) => key_expressions.push(Some(
+                    crate::_internal::analysis::expr_visitor::ExprVisitor::convert(expr),
+                )),
+                None => key_expressions.push(None),
             }
+            key_orders.push(Self::index_key_order(item.sort_order(), item.nulls_order()));
+            key_opclasses.push(Self::index_item_written_name(item.op_class_ref(), |r| {
+                r.path_ref()
+            }));
+            key_collations.push(Self::index_item_written_name(
+                collate.and_then(|collate| collate.collation_ref()),
+                |r| r.path_ref(),
+            ));
         }
 
         Some(StatementFact::CreateIndex {
@@ -2137,14 +2216,15 @@ impl AstVisitor {
             if_not_exists: node.if_not_exists().is_some(),
             concurrently: node.concurrently_token().is_some(),
             using_method,
-            has_predicate,
+            predicate,
             unique,
+            nulls_not_distinct,
             key_columns,
+            key_expressions,
+            key_orders,
+            key_opclasses,
+            key_collations,
             included_columns,
-            has_expression_keys,
-            has_default_sort_order,
-            has_default_opclasses,
-            has_default_collations,
         })
     }
 
@@ -2311,10 +2391,129 @@ impl AstVisitor {
             return None;
         }
         let path = node.view()?.path()?;
-        // Only a plain `SELECT` exposes a target list. Compound, parenthesized
-        // and `VALUES` queries still create the view, but its columns are then
-        // unknown, so the projection is left incomplete.
-        let (select_source, select_outputs) = match node.query() {
+        let (select_source, select_outputs) = Self::extract_single_source_projection(node.query());
+        let projection_was_complete = select_outputs.is_some();
+        let select_outputs = select_outputs.unwrap_or_default();
+        Some(StatementFact::CreateView {
+            name: Self::path_to_qualified_name(&path)?,
+            or_replace: node.or_replace().is_some(),
+            depends_on: Self::extract_view_dependencies(node.syntax()),
+            select_projection_complete: select_source.is_some() && projection_was_complete,
+            select_outputs,
+            select_source,
+            routines: Self::extract_view_routines(node.syntax()),
+            cast_types: Self::extract_view_cast_types(node.syntax()),
+        })
+    }
+
+    /// The qualified name a cast target writes.
+    fn qualified_name_from_type(
+        cast_type: &ast::Type,
+    ) -> Option<crate::_internal::analysis::facts::CastTypeReferenceFact> {
+        let text = cast_type.syntax().text().to_string();
+        let name = Self::routine_name_from_text(text.split('(').next().unwrap_or(&text))?;
+        Some(crate::_internal::analysis::facts::CastTypeReferenceFact { name })
+    }
+
+    /// The routines a view calls, wherever they appear in the query.
+    ///
+    /// The whole query is scanned rather than the target list alone, because
+    /// PostgreSQL records the dependency from anywhere in the definition —
+    /// `WHERE`, `HAVING`, `JOIN ... ON` and the grouping clauses all hold one.
+    /// The types a view body casts to, which a drop of that type must clear.
+    fn extract_view_cast_types(
+        syntax: &squawk_syntax::SyntaxNode,
+    ) -> Vec<crate::_internal::analysis::facts::CastTypeReferenceFact> {
+        let mut references: Vec<crate::_internal::analysis::facts::CastTypeReferenceFact> =
+            Vec::new();
+        for cast in syntax.descendants().filter_map(ast::CastExpr::cast) {
+            let Some(cast_type) = cast.ty() else { continue };
+            let Some(reference) = Self::qualified_name_from_type(&cast_type) else {
+                continue;
+            };
+            if !references.contains(&reference) {
+                references.push(reference);
+            }
+        }
+        references
+    }
+
+    /// The routine and cast references a view query makes.
+    fn extract_view_routines(
+        syntax: &squawk_syntax::SyntaxNode,
+    ) -> Vec<crate::_internal::analysis::facts::RoutineReferenceFact> {
+        let mut references: Vec<crate::_internal::analysis::facts::RoutineReferenceFact> =
+            Vec::new();
+        for call in syntax.descendants().filter_map(ast::CallExpr::cast) {
+            let Some(expr) = call.expr() else {
+                continue;
+            };
+            let Some(qualified) = Self::routine_name_from_text(&expr.syntax().text().to_string())
+            else {
+                continue;
+            };
+            // Argument types are stated only for plain column references,
+            // which are the arguments whose type the source relation fixes.
+            // A qualified column reference is not one of them.
+            let argument_types = call.arg_list().and_then(|args| {
+                args.args()
+                    .map(|argument| match argument.expr() {
+                        Some(ast::Expr::NameRef(column)) => Some(Self::resolve_identifier_token(
+                            column.syntax().first_token()?.text(),
+                        )),
+                        _ => None,
+                    })
+                    .collect::<Option<Vec<String>>>()
+            });
+            let reference = crate::_internal::analysis::facts::RoutineReferenceFact {
+                name: qualified,
+                argument_types,
+            };
+            if !references.contains(&reference) {
+                references.push(reference);
+            }
+        }
+        references
+    }
+
+    /// The qualified name a function call names, written as `name` or
+    /// `schema.name`.
+    fn routine_name_from_text(text: &str) -> Option<QualifiedName> {
+        let (schema, name) = match text.split_once('.') {
+            Some((schema, name)) => (Some(schema), name),
+            None => (None, text),
+        };
+        let part = |raw: &str| {
+            let is_quoted = raw.len() > 1 && raw.starts_with('"') && raw.ends_with('"');
+            Ident::new(
+                if is_quoted {
+                    &raw[1..raw.len() - 1]
+                } else {
+                    raw
+                }
+                .to_string(),
+                is_quoted,
+            )
+        };
+        Some(QualifiedName::new(
+            schema.map(part),
+            part(name.trim_end_matches('(').trim()),
+        ))
+    }
+
+    /// The source relation and target list of a query that selects from a
+    /// single plain relation.
+    ///
+    /// Only a plain `SELECT` exposes a target list. Compound, parenthesized
+    /// and `VALUES` queries still create the relation, but its columns are
+    /// then unknown, so the projection is left incomplete.
+    fn extract_single_source_projection(
+        query: Option<ast::SelectVariant>,
+    ) -> (
+        Option<QualifiedName>,
+        Option<Vec<crate::_internal::analysis::facts::SelectOutputFact>>,
+    ) {
+        match query {
             Some(ast::SelectVariant::Select(select)) => {
                 let source = select.from_clause().and_then(|from| {
                     let mut items = from.items();
@@ -2341,55 +2540,44 @@ impl AstVisitor {
                 (source, outputs)
             }
             _ => (None, None),
-        };
-        let select_projection_complete = select_source.is_some() && select_outputs.is_some();
-        Some(StatementFact::CreateView {
-            name: Self::path_to_qualified_name(&path)?,
-            or_replace: node.or_replace().is_some(),
-            depends_on: Self::extract_view_dependencies(node.syntax()),
-            select_outputs: select_outputs.unwrap_or_default(),
-            select_projection_complete,
-            select_source,
-        })
+        }
     }
 
     fn extract_alter_view(node: &ast::AlterView) -> Option<StatementFact> {
         let path = node.view_ref()?.path_ref()?;
-        let name = Self::path_ref_to_qualified_name(&path)?;
+        let action_node = node.action()?;
+        Some(StatementFact::AlterView {
+            name: Self::path_ref_to_qualified_name(&path)?,
+            action: Self::extract_alter_view_action(action_node)?,
+            if_exists: node.if_exists().is_some(),
+        })
+    }
 
-        let action = node.action()?;
-        match action {
+    fn extract_alter_view_action(
+        action_node: ast::AlterViewAction,
+    ) -> Option<crate::_internal::analysis::facts::AlterViewAction> {
+        Some(match action_node {
             ast::AlterViewAction::ViewRenameTo(rt) => {
                 let new_name_node = rt.view()?.path()?;
-                Some(StatementFact::AlterView {
-                    name,
-                    action: crate::_internal::analysis::facts::AlterViewAction::RenameTo {
-                        new_name: Self::path_to_qualified_name(&new_name_node)?.name,
-                    },
-                })
+                crate::_internal::analysis::facts::AlterViewAction::RenameTo {
+                    new_name: Self::path_to_qualified_name(&new_name_node)?.name,
+                }
             }
             ast::AlterViewAction::OwnerTo(ot) => {
-                let new_owner = Self::extract_role(&ot.role_ref()?);
-                Some(StatementFact::AlterView {
-                    name,
-                    action: crate::_internal::analysis::facts::AlterViewAction::OwnerTo {
-                        new_owner,
-                    },
-                })
+                crate::_internal::analysis::facts::AlterViewAction::OwnerTo {
+                    new_owner: Self::extract_role(&ot.role_ref()?),
+                }
             }
             ast::AlterViewAction::SetSchema(ss) => {
                 let token = ss.schema_ref()?.ident_token()?;
-                Some(StatementFact::AlterView {
-                    name,
-                    action: crate::_internal::analysis::facts::AlterViewAction::SetSchema {
-                        new_schema: Self::resolve_identifier_token(token.text()),
-                    },
-                })
+                crate::_internal::analysis::facts::AlterViewAction::SetSchema {
+                    new_schema: Self::resolve_identifier_token(token.text()),
+                }
             }
             ast::AlterViewAction::AlterViewColumn(avc) => {
                 let col_token = avc.name()?.ident_token()?;
                 let column = Self::resolve_identifier_token(col_token.text());
-                let action = match avc.alter_view_column_action()? {
+                match avc.alter_view_column_action()? {
                     ast::AlterViewColumnAction::SetDefault(sd) => {
                         crate::_internal::analysis::facts::AlterViewAction::SetDefault {
                             column,
@@ -2401,8 +2589,7 @@ impl AstVisitor {
                     ast::AlterViewColumnAction::DropDefault(_) => {
                         crate::_internal::analysis::facts::AlterViewAction::DropDefault { column }
                     }
-                };
-                Some(StatementFact::AlterView { name, action })
+                }
             }
             ast::AlterViewAction::RenameColumn(rc) => {
                 let from_token = rc.column_name_ref()?.ident_token()?;
@@ -2411,58 +2598,85 @@ impl AstVisitor {
                 let to_token = rc.column_name()?.ident_token()?;
                 let to = Self::identifier_from_token(to_token.text());
 
-                Some(StatementFact::AlterView {
-                    name,
-                    action: crate::_internal::analysis::facts::AlterViewAction::RenameColumn {
-                        from,
-                        to,
-                    },
-                })
+                crate::_internal::analysis::facts::AlterViewAction::RenameColumn { from, to }
             }
             ast::AlterViewAction::SetOptions(so) => {
-                let options = Self::extract_attribute_list(so.attribute_list());
-                Some(StatementFact::AlterView {
-                    name,
-                    action: crate::_internal::analysis::facts::AlterViewAction::SetOptions {
-                        options,
-                    },
-                })
+                crate::_internal::analysis::facts::AlterViewAction::SetOptions {
+                    options: Self::extract_attribute_list(so.attribute_list()),
+                }
             }
             ast::AlterViewAction::ResetOptions(ro) => {
-                let options = Self::extract_attribute_list(ro.attribute_list());
-                Some(StatementFact::AlterView {
-                    name,
-                    action: crate::_internal::analysis::facts::AlterViewAction::ResetOptions {
-                        options,
-                    },
-                })
+                crate::_internal::analysis::facts::AlterViewAction::ResetOptions {
+                    options: Self::extract_attribute_list(ro.attribute_list()),
+                }
             }
-        }
+        })
     }
 
     fn extract_create_materialized_view(node: &CreateMaterializedView) -> Option<StatementFact> {
-        // A materialized view created WITH NO DATA cannot be refreshed
-        // concurrently until it has been populated; populated state is not
-        // modeled, so preserve the opaque path for this explicit form.
-        if node
-            .data_option()
-            .is_some_and(|option| matches!(option, ast::DataOption::WithNoData(_)))
-        {
-            return None;
-        }
         let path = node.view()?.path()?;
+        let (select_source, select_outputs) = Self::extract_single_source_projection(node.query());
+        let projection_was_complete = select_outputs.is_some();
+        let select_outputs = select_outputs.unwrap_or_default();
         Some(StatementFact::CreateMaterializedView {
             name: Self::path_to_qualified_name(&path)?,
             depends_on: Self::extract_view_dependencies(node.syntax()),
+            if_not_exists: node.if_not_exists().is_some(),
+            with_no_data: node
+                .data_option()
+                .is_some_and(|option| matches!(option, ast::DataOption::WithNoData(_))),
+            column_list: node
+                .column_list()
+                .map(|list| {
+                    list.column_names()
+                        .filter_map(|name| {
+                            Some(Self::resolve_identifier_token(name.ident_token()?.text()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            access_method: node
+                .using_method()
+                .and_then(|method| method.access_method_ref())
+                .and_then(|reference| reference.ident_token())
+                .map(|token| Self::resolve_identifier_token(token.text())),
+            tablespace: node
+                .tablespace_clause()
+                .and_then(|clause| clause.tablespace_ref())
+                .and_then(|reference| reference.ident_token())
+                .map(|token| Self::resolve_identifier_token(token.text())),
+            options: node
+                .with_params()
+                .and_then(|params| params.attribute_list())
+                .map(|attribute_list| Self::extract_attribute_list(Some(attribute_list)))
+                .unwrap_or_default(),
+            select_projection_complete: select_source.is_some() && projection_was_complete,
+            select_outputs,
+            select_source,
+            routines: Self::extract_view_routines(node.syntax()),
+            cast_types: Self::extract_view_cast_types(node.syntax()),
         })
     }
 
     fn extract_alter_materialized_view(node: &ast::AlterMaterializedView) -> Option<StatementFact> {
         let path = node.view_ref()?.path_ref()?;
-        let name = Self::path_ref_to_qualified_name(&path)?;
-        let action_node = node.action().next()?;
+        // An action the model does not represent makes the whole statement
+        // opaque, rather than silently applying the remaining actions.
+        let actions: Option<Vec<_>> = node
+            .action()
+            .map(Self::extract_alter_materialized_view_action)
+            .collect();
+        Some(StatementFact::AlterMaterializedView {
+            name: Self::path_ref_to_qualified_name(&path)?,
+            actions: actions?,
+            if_exists: node.if_exists().is_some(),
+        })
+    }
 
-        let action = match action_node {
+    fn extract_alter_materialized_view_action(
+        action_node: ast::AlterMaterializedViewAction,
+    ) -> Option<crate::_internal::analysis::facts::AlterMaterializedViewActionFact> {
+        Some(match action_node {
             ast::AlterMaterializedViewAction::ViewRenameTo(rt) => {
                 let segment = rt.view()?.path()?.segment()?;
                 crate::_internal::analysis::facts::AlterMaterializedViewActionFact::RenameTo {
@@ -2559,9 +2773,7 @@ impl AstVisitor {
                     _ => return None,
                 }
             }
-        };
-
-        Some(StatementFact::AlterMaterializedView { name, action })
+        })
     }
 
     fn extract_refresh(node: &ast::Refresh) -> Option<StatementFact> {
@@ -2569,6 +2781,9 @@ impl AstVisitor {
         Some(StatementFact::RefreshMaterializedView {
             name: Self::path_ref_to_qualified_name(&path)?,
             concurrently: node.concurrently_token().is_some(),
+            with_no_data: node
+                .data_option()
+                .is_some_and(|option| matches!(option, ast::DataOption::WithNoData(_))),
         })
     }
 
@@ -2710,48 +2925,107 @@ impl AstVisitor {
     fn extract_alter_sequence(node: &AlterSequence) -> Option<StatementFact> {
         let path = node.sequence_ref()?.path_ref()?;
         let name = Self::path_ref_to_qualified_name(&path)?;
-        let action = match node.actions().next() {
-            Some(ast::AlterSequenceAction::OwnerTo(owner)) => owner
-                .role_ref()
-                .map(|role| {
-                    crate::_internal::analysis::facts::AlterSequenceActionFact::OwnerTo(
-                        Self::extract_role(&role),
-                    )
-                })
-                .unwrap_or(crate::_internal::analysis::facts::AlterSequenceActionFact::Other),
-            Some(ast::AlterSequenceAction::SequenceRenameTo(rename)) => rename
-                .sequence()
-                .and_then(|sequence| sequence.path())
-                .and_then(|path| Self::path_to_qualified_name(&path))
-                .map(|name| {
-                    crate::_internal::analysis::facts::AlterSequenceActionFact::RenameTo(name.name)
-                })
-                .unwrap_or(crate::_internal::analysis::facts::AlterSequenceActionFact::Other),
-            Some(ast::AlterSequenceAction::SetSchema(set_schema)) => set_schema
-                .schema_ref()
-                .and_then(|schema| schema.ident_token())
-                .map(|token| {
-                    crate::_internal::analysis::facts::AlterSequenceActionFact::SetSchema(
-                        Self::resolve_identifier_token(token.text()),
-                    )
-                })
-                .unwrap_or(crate::_internal::analysis::facts::AlterSequenceActionFact::Other),
-            Some(ast::AlterSequenceAction::SequenceOption(ast::SequenceOption::OptionOwnedBy(
-                option,
-            ))) => match option.owned_by_target() {
-                Some(ast::OwnedByTarget::OwnedByNone(_)) => {
-                    crate::_internal::analysis::facts::AlterSequenceActionFact::OwnedBy(None)
-                }
-                Some(_) => crate::_internal::analysis::facts::AlterSequenceActionFact::OwnedBy(
-                    Self::extract_owned_by(&option),
-                ),
-                None => crate::_internal::analysis::facts::AlterSequenceActionFact::Other,
-            },
-            _ => crate::_internal::analysis::facts::AlterSequenceActionFact::Other,
+
+        use crate::_internal::analysis::facts::{
+            AlterSequenceActionFact, SequenceOptionFact as OptionFact,
         };
+        let integer = |expr: ast::Expr| expr.syntax().text().to_string().trim().parse::<i64>().ok();
+
+        let mut options = Vec::new();
+        let mut action: Option<AlterSequenceActionFact> = None;
+        for entry in node.actions() {
+            let singular = match entry {
+                ast::AlterSequenceAction::OwnerTo(owner) => Some(AlterSequenceActionFact::OwnerTo(
+                    Self::extract_role(&owner.role_ref()?),
+                )),
+                ast::AlterSequenceAction::SequenceRenameTo(rename) => {
+                    let new_name = Self::path_to_qualified_name(&rename.sequence()?.path()?)?;
+                    Some(AlterSequenceActionFact::RenameTo(new_name.name))
+                }
+                ast::AlterSequenceAction::SetSchema(set_schema) => {
+                    let token = set_schema.schema_ref()?.ident_token()?;
+                    Some(AlterSequenceActionFact::SetSchema(
+                        Self::resolve_identifier_token(token.text()),
+                    ))
+                }
+                ast::AlterSequenceAction::SetLogged(_) => {
+                    options.push(OptionFact::Logged(true));
+                    None
+                }
+                ast::AlterSequenceAction::SetUnlogged(_) => {
+                    options.push(OptionFact::Logged(false));
+                    None
+                }
+                ast::AlterSequenceAction::SequenceOption(option) => {
+                    let option = match option {
+                        ast::SequenceOption::OptionAsType(o) => {
+                            OptionFact::As(o.ty()?.syntax().text().to_string())
+                        }
+                        ast::SequenceOption::OptionCache(o) => {
+                            OptionFact::Cache(integer(o.expr()?)?)
+                        }
+                        ast::SequenceOption::OptionCycle(_) => OptionFact::Cycle(true),
+                        ast::SequenceOption::OptionNoCycle(_) => OptionFact::Cycle(false),
+                        ast::SequenceOption::OptionIncrement(o) => {
+                            OptionFact::Increment(integer(o.expr()?)?)
+                        }
+                        ast::SequenceOption::OptionMaxValue(o) => {
+                            OptionFact::MaxValue(Some(integer(o.expr()?)?))
+                        }
+                        ast::SequenceOption::OptionNoMaxValue(_) => OptionFact::MaxValue(None),
+                        ast::SequenceOption::OptionMinValue(o) => {
+                            OptionFact::MinValue(Some(integer(o.expr()?)?))
+                        }
+                        ast::SequenceOption::OptionNoMinValue(_) => OptionFact::MinValue(None),
+                        ast::SequenceOption::OptionStart(o) => {
+                            OptionFact::Start(integer(o.expr()?)?)
+                        }
+                        ast::SequenceOption::OptionRestart(o) => {
+                            OptionFact::Restart(match o.expr() {
+                                Some(expr) => Some(integer(expr)?),
+                                None => None,
+                            })
+                        }
+                        ast::SequenceOption::OptionLogged(_) => OptionFact::Logged(true),
+                        ast::SequenceOption::OptionUnlogged(_) => OptionFact::Logged(false),
+                        ast::SequenceOption::OptionOwnedBy(o) => match o.owned_by_target() {
+                            Some(ast::OwnedByTarget::OwnedByNone(_)) => OptionFact::OwnedBy(None),
+                            Some(_) => OptionFact::OwnedBy(Self::extract_owned_by(&o)),
+                            None => return None,
+                        },
+                        ast::SequenceOption::OptionSequenceName(o) => OptionFact::SequenceName(
+                            Self::path_to_qualified_name(&o.sequence()?.path()?)?
+                                .name
+                                .resolve(),
+                        ),
+                    };
+                    options.push(option);
+                    None
+                }
+            };
+            if let Some(singular) = singular {
+                // PostgreSQL parses ownership, rename, and schema changes as
+                // their own statement kinds, so a statement carrying two of
+                // them is not a form it accepts.
+                if action.is_some() {
+                    return None;
+                }
+                action = Some(singular);
+            }
+        }
+
+        // PostgreSQL gives `OWNER TO`, `RENAME TO`, and `SET SCHEMA` their own
+        // statement kinds, each of which ends at its own name; a parameter
+        // option in the same statement is a syntax error rather than an
+        // ordering choice.
+        if action.is_some() && !options.is_empty() {
+            return None;
+        }
+
         Some(StatementFact::AlterSequence {
             name,
             if_exists: node.if_exists().is_some(),
+            options,
             action,
         })
     }
@@ -2924,13 +3198,34 @@ impl AstVisitor {
                     })
                     .collect::<Option<Vec<_>>>()?,
             },
-            // The model records these kinds without their subtype or I/O
-            // metadata, matching what the catalog sync reports for them.
-            ast::CreateTypeKind::RangeType(_) => TypeCreationKind::Range,
-            ast::CreateTypeKind::BaseType(_) => TypeCreationKind::Base,
+            // A range type is defined by its subtype and a base type by its
+            // element; both arrive as attributes on the same list.
+            ast::CreateTypeKind::RangeType(range) => TypeCreationKind::Range {
+                subtype: Self::type_attribute(
+                    Self::extract_attribute_list(range.attribute_list()),
+                    "subtype",
+                ),
+            },
+            ast::CreateTypeKind::BaseType(base) => TypeCreationKind::Base {
+                element: Self::type_attribute(
+                    Self::extract_attribute_list(base.attribute_list()),
+                    "typelem",
+                ),
+            },
         };
 
         Some(StatementFact::CreateType(CreateTypeFact { name, kind }))
+    }
+
+    /// The named type an attribute list declares, if it names one.
+    fn type_attribute(
+        attributes: Vec<crate::_internal::analysis::facts::AttributeFact>,
+        name: &str,
+    ) -> Option<String> {
+        attributes
+            .into_iter()
+            .find(|attribute| attribute.name.eq_ignore_ascii_case(name))
+            .map(|attribute| attribute.value)
     }
 
     fn extract_alter_type(node: &AlterType) -> Option<StatementFact> {
@@ -3154,11 +3449,33 @@ impl AstVisitor {
                 .collect();
             crate::_internal::analysis::facts::RetTypeFact::Table(cols)
         } else {
-            let ty = ret
-                .func_type()
-                .map(|t| t.syntax().text().to_string())
-                .unwrap_or_else(|| "unknown".into());
-            crate::_internal::analysis::facts::RetTypeFact::Scalar(ty)
+            // `FuncType` wraps `Type`, and `SETOF` sits on the inner
+            // `PathType`, so the flag has to be read from the parse tree
+            // rather than recovered from the rendered text. The type is kept
+            // without the keyword, matching `pg_proc.prorettype`.
+            match ret.func_type() {
+                Some(func_type) => {
+                    let setof_token = match &func_type {
+                        ast::FuncType::Type(ast::Type::PathType(path_type)) => {
+                            path_type.setof_token()
+                        }
+                        _ => None,
+                    };
+                    let text = func_type.syntax().text().to_string();
+                    let ty = match &setof_token {
+                        Some(token) => text[token.text().len()..].trim_start().to_string(),
+                        None => text,
+                    };
+                    crate::_internal::analysis::facts::RetTypeFact::Scalar {
+                        ty,
+                        setof: setof_token.is_some(),
+                    }
+                }
+                None => crate::_internal::analysis::facts::RetTypeFact::Scalar {
+                    ty: "unknown".to_string(),
+                    setof: false,
+                },
+            }
         }
     }
 
@@ -3458,6 +3775,16 @@ impl AstVisitor {
                     ),
                 },
             ),
+            // A procedure takes the same option list a function does, so
+            // dropping it here turned `ALTER PROCEDURE ... SECURITY DEFINER`
+            // into an unmodeled statement even though PostgreSQL applies it.
+            ast::AlterProcedureAction::FuncOptionList(ol) => Some(
+                crate::_internal::analysis::facts::AlterFunctionAction::OptionsChange(
+                    ol.options()
+                        .map(|option| Self::extract_func_option(&option))
+                        .collect(),
+                ),
+            ),
             _ => None,
         });
 
@@ -3526,14 +3853,15 @@ impl AstVisitor {
 
     fn extract_create_aggregate(node: &ast::CreateAggregate) -> Option<StatementFact> {
         let name = Self::path_to_qualified_name(&node.aggregate_name()?.path()?)?;
+        let attributes = Self::extract_attribute_list(node.attribute_list());
         let params = if let Some(params) = node.param_list() {
             params
                 .params()
                 .map(|param| Self::extract_param(&param))
                 .collect()
         } else {
-            Self::extract_attribute_list(node.attribute_list())
-                .into_iter()
+            attributes
+                .iter()
                 .find(|attribute| attribute.name.eq_ignore_ascii_case("basetype"))
                 .filter(|attribute| {
                     !matches!(attribute.value.to_ascii_lowercase().as_str(), "any" | "*")
@@ -3542,7 +3870,7 @@ impl AstVisitor {
                     vec![crate::_internal::analysis::facts::ParamFact {
                         mode: crate::_internal::analysis::facts::ParamModeFact::In,
                         name: None,
-                        ty: attribute.value,
+                        ty: attribute.value.clone(),
                         default: None,
                     }]
                 })
@@ -3553,6 +3881,20 @@ impl AstVisitor {
                 name,
                 or_replace: node.or_replace().is_some(),
                 params,
+                // The parser keeps the transition functions, state type, and
+                // initial condition as attribute options. Recording them keeps
+                // the definition honest about what it knows, so the state's
+                // limits follow from the fact rather than from a blanket
+                // statement that the whole definition was discarded.
+                definition: attributes
+                    .into_iter()
+                    .map(
+                        |attribute| crate::_internal::analysis::facts::AggregateOptionFact {
+                            name: attribute.name,
+                            value: attribute.value,
+                        },
+                    )
+                    .collect(),
             },
         ))
     }

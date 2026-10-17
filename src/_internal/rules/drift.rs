@@ -1,6 +1,6 @@
 use crate::_internal::analysis::mutations::Mutation;
 use crate::_internal::ast::identifiers::ObjectId;
-use crate::_internal::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
+use crate::_internal::report::violations::{ObjectKind, Violation, ViolationTier};
 use crate::_internal::rules::{BASELINE_RELATION_CAPABILITIES, Rule, RuleCapability, RuleContext};
 
 pub(crate) struct DriftDetectionRule;
@@ -18,6 +18,12 @@ impl Rule for DriftDetectionRule {
 
     fn required_capabilities(&self) -> &'static [RuleCapability] {
         BASELINE_RELATION_CAPABILITIES
+    }
+
+    fn evaluates_when_unresolved(&self) -> bool {
+        // This rule's finding *is* the missing evidence, so it must speak when
+        // the post-state is unknown.
+        true
     }
 
     fn evaluate(&self, context: &RuleContext<'_>) -> Vec<Violation> {
@@ -42,7 +48,7 @@ impl Rule for DriftDetectionRule {
             ) => {
                 violations.push(Violation { source_range: None,
                     rule_id: self.id(),
-                        operation_kind: OperationKind::UnresolvedReference,
+
                     object_kind: object_kind.clone(),
                     object_name: object_name.clone(),
                     tier: self.default_tier(),
@@ -54,7 +60,7 @@ impl Rule for DriftDetectionRule {
                     recipe: self.recipe(),
                     dedup_key: None,
                     sql: None,
-                    fk_dependency_related: false,
+
                 });
             }
             Mutation::DropTable(d) => {
@@ -63,7 +69,7 @@ impl Rule for DriftDetectionRule {
                         if !pre_state.relations.contains_key(id) {
                             violations.push(Violation { source_range: None,
                                 rule_id: self.id(),
-                                operation_kind: OperationKind::DropTable,
+
                                 object_kind: ObjectKind::Table,
                                 object_name: id.to_string(),
                                 tier: self.default_tier(),
@@ -74,7 +80,7 @@ impl Rule for DriftDetectionRule {
                                 recipe: self.recipe(),
                                 dedup_key: None,
                                 sql: None,
-                                fk_dependency_related: false,
+
                             });
                         }
                     }
@@ -84,7 +90,7 @@ impl Rule for DriftDetectionRule {
                 if !pre_state.relations.contains_key(&a.id) {
                     violations.push(Violation { source_range: None,
                         rule_id: self.id(),
-                        operation_kind: OperationKind::Other("alter_table".to_string()),
+
                         object_kind: ObjectKind::Table,
                         object_name: a.id.to_string(),
                         tier: self.default_tier(),
@@ -95,7 +101,7 @@ impl Rule for DriftDetectionRule {
                         recipe: self.recipe(),
                         dedup_key: None,
                                     sql: None,
-                                    fk_dependency_related: false,
+
                     });
                 }
             }
@@ -104,7 +110,7 @@ impl Rule for DriftDetectionRule {
                     if !d.if_exists && !pre_state.relations.contains_key(id) {
                         violations.push(Violation { source_range: None,
                             rule_id: self.id(),
-                            operation_kind: OperationKind::DropView,
+
                             object_kind: ObjectKind::View,
                             object_name: id.to_string(),
                             tier: self.default_tier(),
@@ -115,7 +121,7 @@ impl Rule for DriftDetectionRule {
                             recipe: self.recipe(),
                             dedup_key: None,
                                             sql: None,
-                                            fk_dependency_related: false,
+
                         });
                     }
                 }
@@ -125,7 +131,7 @@ impl Rule for DriftDetectionRule {
                     if !d.if_exists && !pre_state.relations.contains_key(id) {
                         violations.push(Violation { source_range: None,
                             rule_id: self.id(),
-                            operation_kind: OperationKind::DropMaterializedView,
+
                             object_kind: ObjectKind::MaterializedView,
                             object_name: id.to_string(),
                             tier: self.default_tier(),
@@ -136,7 +142,7 @@ impl Rule for DriftDetectionRule {
                             recipe: self.recipe(),
                             dedup_key: None,
                                             sql: None,
-                                            fk_dependency_related: false,
+
                         });
                     }
                 }
@@ -146,7 +152,7 @@ impl Rule for DriftDetectionRule {
                     if !d.if_exists && !pre_state.sequences.contains_key(id) {
                         violations.push(Violation { source_range: None,
                             rule_id: self.id(),
-                            operation_kind: OperationKind::DropSequence,
+
                             object_kind: ObjectKind::Sequence,
                             object_name: id.to_string(),
                             tier: self.default_tier(),
@@ -157,7 +163,7 @@ impl Rule for DriftDetectionRule {
                             recipe: self.recipe(),
                             dedup_key: None,
                                             sql: None,
-                                            fk_dependency_related: false,
+
                         });
                     }
                 }
@@ -170,7 +176,7 @@ impl Rule for DriftDetectionRule {
                     if !d.if_exists && !pre_state.functions.contains_key(&id) {
                         violations.push(Violation { source_range: None,
                             rule_id: self.id(),
-                            operation_kind: OperationKind::DropFunction,
+
                             object_kind: ObjectKind::Function,
                             object_name: id.to_string(),
                             tier: self.default_tier(),
@@ -181,7 +187,7 @@ impl Rule for DriftDetectionRule {
                             recipe: self.recipe(),
                             dedup_key: None,
                                             sql: None,
-                                            fk_dependency_related: false,
+
                         });
                     }
                 }
@@ -191,7 +197,7 @@ impl Rule for DriftDetectionRule {
                     if !d.if_exists && !pre_state.indexes.iter().any(|idx| idx.dependent == *id) {
                         violations.push(Violation { source_range: None,
                         rule_id: self.id(),
-                        operation_kind: OperationKind::DropIndex,
+
                         object_kind: ObjectKind::Index,
                         object_name: id.to_string(),
                         tier: self.default_tier(),
@@ -202,7 +208,7 @@ impl Rule for DriftDetectionRule {
                         recipe: self.recipe(),
                         dedup_key: None,
                                     sql: None,
-                                    fk_dependency_related: false,
+
                         });
                     }
                 }
@@ -212,7 +218,7 @@ impl Rule for DriftDetectionRule {
                     if !d.if_exists && !pre_state.types.contains_key(id) {
                         violations.push(Violation { source_range: None,
                             rule_id: self.id(),
-                            operation_kind: OperationKind::DropDomain,
+
                             object_kind: ObjectKind::Domain,
                             object_name: id.to_string(),
                             tier: self.default_tier(),
@@ -223,7 +229,7 @@ impl Rule for DriftDetectionRule {
                             recipe: self.recipe(),
                             dedup_key: None,
                                             sql: None,
-                                            fk_dependency_related: false,
+
                         });
                     }
                 }
@@ -233,7 +239,7 @@ impl Rule for DriftDetectionRule {
                     if !d.if_exists && !pre_state.types.contains_key(id) {
                         violations.push(Violation { source_range: None,
                             rule_id: self.id(),
-                            operation_kind: OperationKind::DropType,
+
                             object_kind: ObjectKind::Type,
                             object_name: id.to_string(),
                             tier: self.default_tier(),
@@ -244,7 +250,7 @@ impl Rule for DriftDetectionRule {
                             recipe: self.recipe(),
                             dedup_key: None,
                             sql: None,
-                            fk_dependency_related: false,
+
                         });
                     }
                 }
@@ -260,7 +266,7 @@ impl Rule for DriftDetectionRule {
                 {
                     violations.push(Violation { source_range: None,
                         rule_id: self.id(),
-                        operation_kind: OperationKind::Rename,
+
                         object_kind: ObjectKind::Table, // Or general
                         object_name: r.old_id.to_string(),
                         tier: self.default_tier(),
@@ -271,14 +277,14 @@ impl Rule for DriftDetectionRule {
                         recipe: self.recipe(),
                         dedup_key: None,
                         sql: None,
-                        fk_dependency_related: false,
+
                     });
                 }
             }
             Mutation::AlterType(a) if !pre_state.types.contains_key(&a.id) => {
                 violations.push(Violation { source_range: None,
                     rule_id: self.id(),
-                    operation_kind: OperationKind::AlterType,
+
                     object_kind: ObjectKind::Type,
                     object_name: a.id.to_string(),
                     tier: self.default_tier(),
@@ -289,13 +295,13 @@ impl Rule for DriftDetectionRule {
                     recipe: self.recipe(),
                     dedup_key: None,
                             sql: None,
-                            fk_dependency_related: false,
+
                 });
             }
             Mutation::AlterFunction(f) if !pre_state.functions.contains_key(&f.id) => {
                 violations.push(Violation { source_range: None,
                     rule_id: self.id(),
-                    operation_kind: OperationKind::AlterFunction,
+
                     object_kind: ObjectKind::Function,
                     object_name: f.id.to_string(),
                     tier: self.default_tier(),
@@ -306,7 +312,7 @@ impl Rule for DriftDetectionRule {
                     recipe: self.recipe(),
                     dedup_key: None,
                             sql: None,
-                            fk_dependency_related: false,
+
                 });
             }
             Mutation::DropProcedure(d) => {
@@ -326,7 +332,7 @@ impl Rule for DriftDetectionRule {
                         violations.push(Violation {
                             source_range: None,
                             rule_id: self.id(),
-                            operation_kind: OperationKind::DropProcedure,
+
                             object_kind: ObjectKind::Procedure,
                             object_name: id.to_string(),
                             tier: self.default_tier(),
@@ -337,7 +343,7 @@ impl Rule for DriftDetectionRule {
                             recipe: self.recipe(),
                             dedup_key: None,
                             sql: None,
-                            fk_dependency_related: false,
+
                         });
                     }
                 }
@@ -355,7 +361,7 @@ impl Rule for DriftDetectionRule {
                     violations.push(Violation {
                         source_range: None,
                         rule_id: self.id(),
-                        operation_kind: OperationKind::AlterProcedure,
+
                         object_kind: ObjectKind::Procedure,
                         object_name: procedure.id.to_string(),
                         tier: self.default_tier(),
@@ -366,7 +372,7 @@ impl Rule for DriftDetectionRule {
                         recipe: self.recipe(),
                         dedup_key: None,
                         sql: None,
-                        fk_dependency_related: false,
+
                     });
                 }
             }
@@ -377,7 +383,7 @@ impl Rule for DriftDetectionRule {
                 {
                     violations.push(Violation { source_range: None,
                         rule_id: self.id(),
-                        operation_kind: OperationKind::CreateTable,
+
                         object_kind: ObjectKind::Table,
                         object_name: c.id.to_string(),
                         tier: self.default_tier(),
@@ -388,7 +394,7 @@ impl Rule for DriftDetectionRule {
                         recipe: self.recipe(),
                         dedup_key: None,
                         sql: None,
-                        fk_dependency_related: false,
+
                     });
                 }
             }

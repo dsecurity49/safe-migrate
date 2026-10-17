@@ -1,12 +1,18 @@
 use crate::_internal::ast::identifiers::ObjectId;
 use crate::_internal::db::cache::{
-    CACHE_V9_MAGIC, CatalogCoverageBuilder, CatalogFamily, ConstraintDependencyCache,
+    CACHE_MAGIC, CatalogCoverageBuilder, CatalogFamily, ConstraintDependencyCache,
     ConstraintKeyCache, DbCache, DbCacheVersioned, DefaultSequenceDependencyCache, ForeignKeyCache,
-    GeneratedColumnDependencyCache, IndexCache, InheritanceCache, ViewDependencyCache,
+    GeneratedColumnDependencyCache, IndexAttachmentCache, IndexCache, InheritanceCache,
+    ScopedDependencyEdge, ViewDependencyCache, ViewDependencyTarget,
 };
 use crate::_internal::db::cache_file::{
     MAX_CACHE_DECODE_BYTES, MAX_CACHE_FILE_BYTES, protect_cache_bytes,
     protect_cache_bytes_with_key, validate_cache_encryption_configuration,
+};
+use crate::_internal::model::builtin_type::BuiltinTypeCatalogue;
+use crate::_internal::model::index::{
+    IndexDefinition, IndexKey, IndexKeyKind, IndexOrder, IndexPredicate, KeyCollation, KeyOpclass,
+    ResolvedName,
 };
 use crate::_internal::model::relation::{Persistence, RelationKind, RelationState};
 use anyhow::{Context, Result};
@@ -223,6 +229,7 @@ fn relation_kind_from_pg(code: u8) -> Result<RelationKind> {
         b'r' | b'p' => Ok(RelationKind::Table),
         b'v' => Ok(RelationKind::View),
         b'm' => Ok(RelationKind::MaterializedView),
+        b'f' => Ok(RelationKind::ForeignTable),
         other => anyhow::bail!("unsupported pg_class.relkind byte {other}"),
     }
 }
@@ -374,7 +381,7 @@ fn write_cache_with_protection_and_limits(
         .context("Failed to init zstd compression")?;
     let mut encoder = SizeLimitedWriter::new(encoder, max_decode_bytes);
 
-    if let Err(error) = encoder.write_all(CACHE_V9_MAGIC) {
+    if let Err(error) = encoder.write_all(CACHE_MAGIC) {
         if encoder.limit_exceeded() {
             anyhow::bail!(
                 "Cache payload exceeds the {} MiB decoded-size limit",
@@ -384,7 +391,7 @@ fn write_cache_with_protection_and_limits(
         return Err(error).context("Failed to write cache payload header");
     }
 
-    let versioned = DbCacheVersioned::V9(Box::new(cache));
+    let versioned = DbCacheVersioned::current(cache);
     let bincode_config = bincode::config::standard().with_variable_int_encoding();
 
     let encode_result =
@@ -588,6 +595,127 @@ pub(crate) fn populate_cache_in_current_transaction(
     populate_cache_from_client(client, schemas)
 }
 
+/// A view's dependencies on the routines and types its body uses.
+///
+/// `pg_depend` records these from the view's rewrite rules, so a view loaded
+/// from the catalog carries the same obligations as one built from statements.
+/// The routine signature is formed exactly as `load_routines` forms it, so a
+/// drop matches whichever path produced the view.
+fn load_view_object_dependencies(
+    client: &mut impl GenericClient,
+    schema_values: &Option<Vec<String>>,
+    builtin_types: &BuiltinTypeCatalogue,
+) -> Result<Vec<crate::_internal::db::cache::ViewObjectDependencyCache>> {
+    let query = r#"
+        SELECT vn.nspname AS obj_schema,
+               vc.relname AS obj_name,
+               'pg_proc'::text AS ref_kind,
+               pn.nspname AS ref_schema,
+               p.proname AS ref_name,
+               ARRAY(
+                   SELECT pg_catalog.format_type(t, NULL)
+                   FROM unnest(p.proargtypes::oid[]) WITH ORDINALITY AS u(t, n)
+                   ORDER BY n
+               )::text[] AS ref_args
+        FROM pg_rewrite rw
+        JOIN pg_class vc ON vc.oid = rw.ev_class
+        JOIN pg_namespace vn ON vn.oid = vc.relnamespace
+        JOIN pg_depend d ON d.objid = rw.oid
+        JOIN pg_proc p ON p.oid = d.refobjid
+        JOIN pg_namespace pn ON pn.oid = p.pronamespace
+            WHERE vc.relkind IN ('v', 'm')
+              AND d.classid = 'pg_rewrite'::regclass
+              AND d.refclassid = 'pg_proc'::regclass
+              AND d.deptype = 'n'
+              AND vn.nspname NOT LIKE 'pg\_%' ESCAPE '\'
+              AND vn.nspname <> 'information_schema'
+              AND pn.nspname NOT LIKE 'pg\_%' ESCAPE '\'
+              AND pn.nspname <> 'information_schema'
+              AND (
+              $1::text[] IS NULL
+              OR vn.nspname = ANY($1)
+              OR pn.nspname = ANY($1)
+          )
+        UNION ALL
+        SELECT vn.nspname AS obj_schema,
+               vc.relname AS obj_name,
+               'pg_type'::text AS ref_kind,
+               tn.nspname AS ref_schema,
+               t.typname AS ref_name,
+               NULL::text[] AS ref_args
+        FROM pg_rewrite rw
+        JOIN pg_class vc ON vc.oid = rw.ev_class
+        JOIN pg_namespace vn ON vn.oid = vc.relnamespace
+        JOIN pg_depend d ON d.objid = rw.oid
+        JOIN pg_type t ON t.oid = d.refobjid
+        JOIN pg_namespace tn ON tn.oid = t.typnamespace
+            WHERE vc.relkind IN ('v', 'm')
+              AND d.classid = 'pg_rewrite'::regclass
+              AND d.refclassid = 'pg_type'::regclass
+              AND d.deptype = 'n'
+              AND vn.nspname NOT LIKE 'pg\_%' ESCAPE '\'
+              AND vn.nspname <> 'information_schema'
+              AND tn.nspname NOT LIKE 'pg\_%' ESCAPE '\'
+              AND tn.nspname <> 'information_schema'
+              AND (
+              $1::text[] IS NULL
+              OR vn.nspname = ANY($1)
+              OR tn.nspname = ANY($1)
+          )
+    "#;
+
+    let rows = client
+        .query(query, &[schema_values])
+        .context("Failed to load view object dependencies from pg_rewrite/pg_depend")?;
+
+    let mut dependencies: Vec<crate::_internal::db::cache::ViewObjectDependencyCache> = Vec::new();
+    for row in rows {
+        let dependent = ObjectId::new(
+            row.try_get::<_, String>("obj_schema")
+                .context("view schema")?,
+            row.try_get::<_, String>("obj_name").context("view name")?,
+        );
+        let schema = row
+            .try_get::<_, String>("ref_schema")
+            .context("referenced schema")?;
+        let name = row
+            .try_get::<_, String>("ref_name")
+            .context("referenced name")?;
+        let kind: String = row.try_get("ref_kind").context("referenced kind")?;
+        let raw_args: Vec<String> = row
+            .try_get::<_, Option<Vec<String>>>("ref_args")
+            .context("referenced argument types")?
+            .unwrap_or_default();
+        let target = match kind.as_str() {
+            "pg_proc" => {
+                let signature = raw_args
+                    .iter()
+                    .map(|argument| {
+                        crate::_internal::analysis::resolver::Resolver::normalize_function_arg_type(
+                            argument,
+                            builtin_types,
+                        )
+                        .render()
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                ViewDependencyTarget::Routine {
+                    routine: ObjectId::new(schema, format!("{name}({signature})")),
+                }
+            }
+            _ => ViewDependencyTarget::Type {
+                ty: ObjectId::new(schema, name),
+            },
+        };
+        let dependency =
+            crate::_internal::db::cache::ViewObjectDependencyCache { dependent, target };
+        if !dependencies.contains(&dependency) {
+            dependencies.push(dependency);
+        }
+    }
+    Ok(dependencies)
+}
+
 fn load_view_dependencies(
     client: &mut impl GenericClient,
     schema_values: &Option<Vec<String>>,
@@ -652,530 +780,148 @@ fn load_view_dependencies(
         .collect()
 }
 
-/// Return synchronized relations whose known catalog dependents cross an
-/// explicit schema boundary. The query covers the catalog classes that can
-/// expose a dependent relation (relations/indexes, constraints, rewrites,
-/// defaults, and triggers); unscoped synchronization needs no boundary list.
-fn load_scoped_external_index_dependencies(
+/// Every dependency crossing an explicit schema scope, with both endpoints.
+///
+/// One query resolves both sides of each `pg_depend` row: the in-scope object
+/// being depended on, and the out-of-scope object that depends on it. Class to
+/// catalog resolution lives in one lateral per side, so a dependent class
+/// cannot be handled inconsistently between families.
+fn load_scoped_external_dependencies(
     client: &mut impl GenericClient,
     schema_values: &Option<Vec<String>>,
-) -> Result<Vec<ObjectId>> {
+) -> Result<ScopedExternalDependencies> {
     let Some(schemas) = schema_values else {
-        return Ok(Vec::new());
+        return Ok(ScopedExternalDependencies {
+            edges: Vec::new(),
+            external_schemas: Vec::new(),
+        });
     };
     if schemas.is_empty() {
-        return Ok(Vec::new());
+        return Ok(ScopedExternalDependencies {
+            edges: Vec::new(),
+            external_schemas: Vec::new(),
+        });
     }
     let query = r#"
-        SELECT DISTINCT ref_n.nspname AS ref_schema, ref_c.relname AS ref_name
+        SELECT DISTINCT
+            ref_side.family AS ref_family,
+            ref_side.relkind AS ref_relkind,
+            ref_side.schema AS ref_schema,
+            ref_side.name AS ref_name,
+            dep_side.schema AS dep_schema,
+            dep_side.name AS dep_name
         FROM pg_depend d
-        JOIN pg_class ref_c ON d.refclassid = 'pg_class'::regclass
-                           AND d.refobjid = ref_c.oid
-        JOIN pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace
-        JOIN pg_class dep_c ON d.classid = 'pg_class'::regclass
-                           AND d.objid = dep_c.oid
-        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
-        WHERE ref_c.relkind IN ('i', 'I')
-          AND ref_n.nspname = ANY($1)
-          AND NOT (dep_n.nspname = ANY($1))
-          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
-          AND dep_n.nspname <> 'information_schema'
-        UNION
-        SELECT DISTINCT ref_n.nspname, ref_c.relname
-        FROM pg_depend d
-        JOIN pg_class ref_c ON d.refclassid = 'pg_class'::regclass
-                           AND d.refobjid = ref_c.oid
-        JOIN pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace
-        JOIN pg_constraint dep_con ON d.classid = 'pg_constraint'::regclass
-                                  AND d.objid = dep_con.oid
-        JOIN pg_class dep_c ON dep_c.oid = dep_con.conrelid
-        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
-        WHERE ref_c.relkind IN ('i', 'I')
-          AND ref_n.nspname = ANY($1)
-          AND NOT (dep_n.nspname = ANY($1))
-          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
-          AND dep_n.nspname <> 'information_schema'
-        UNION
-        SELECT DISTINCT ref_n.nspname, ref_c.relname
-        FROM pg_depend d
-        JOIN pg_class ref_c ON d.refclassid = 'pg_class'::regclass
-                           AND d.refobjid = ref_c.oid
-        JOIN pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace
-        JOIN pg_rewrite dep_rw ON d.classid = 'pg_rewrite'::regclass
-                              AND d.objid = dep_rw.oid
-        JOIN pg_class dep_c ON dep_c.oid = dep_rw.ev_class
-        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
-        WHERE ref_c.relkind IN ('i', 'I')
-          AND ref_n.nspname = ANY($1)
-          AND NOT (dep_n.nspname = ANY($1))
-          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
-          AND dep_n.nspname <> 'information_schema'
-        UNION
-        SELECT DISTINCT ref_n.nspname, ref_c.relname
-        FROM pg_depend d
-        JOIN pg_class ref_c ON d.refclassid = 'pg_class'::regclass
-                           AND d.refobjid = ref_c.oid
-        JOIN pg_attrdef dep_ad ON d.classid = 'pg_attrdef'::regclass
-                              AND d.objid = dep_ad.oid
-        JOIN pg_class dep_c ON dep_c.oid = dep_ad.adrelid
-        JOIN pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace
-        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
-        WHERE ref_c.relkind IN ('i', 'I')
-          AND ref_n.nspname = ANY($1)
-          AND NOT (dep_n.nspname = ANY($1))
-          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
-          AND dep_n.nspname <> 'information_schema'
-        UNION
-        SELECT DISTINCT ref_n.nspname, ref_c.relname
-        FROM pg_depend d
-        JOIN pg_class ref_c ON d.refclassid = 'pg_class'::regclass
-                           AND d.refobjid = ref_c.oid
-        JOIN pg_trigger dep_tg ON d.classid = 'pg_trigger'::regclass
-                              AND d.objid = dep_tg.oid
-        JOIN pg_class dep_c ON dep_c.oid = dep_tg.tgrelid
-        JOIN pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace
-        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
-        WHERE ref_c.relkind IN ('i', 'I')
-          AND ref_n.nspname = ANY($1)
-          AND NOT (dep_n.nspname = ANY($1))
-          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
-          AND dep_n.nspname <> 'information_schema'
-        UNION
-        SELECT DISTINCT ref_n.nspname, ref_c.relname
-        FROM pg_depend d
-        JOIN pg_class ref_c ON d.refclassid = 'pg_class'::regclass
-                           AND d.refobjid = ref_c.oid
-        JOIN pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace
-        JOIN pg_proc dep_p ON d.classid = 'pg_proc'::regclass
-                          AND d.objid = dep_p.oid
-        JOIN pg_namespace dep_n ON dep_n.oid = dep_p.pronamespace
-        WHERE ref_c.relkind IN ('i', 'I')
-          AND ref_n.nspname = ANY($1)
-          AND NOT (dep_n.nspname = ANY($1))
-          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
-          AND dep_n.nspname <> 'information_schema'
-        UNION
-        SELECT DISTINCT ref_n.nspname, ref_c.relname
-        FROM pg_depend d
-        JOIN pg_class ref_c ON d.refclassid = 'pg_class'::regclass
-                           AND d.refobjid = ref_c.oid
-        JOIN pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace
-        JOIN pg_policy dep_pol ON d.classid = 'pg_policy'::regclass
-                              AND d.objid = dep_pol.oid
-        JOIN pg_class dep_c ON dep_c.oid = dep_pol.polrelid
-        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
-        WHERE ref_c.relkind IN ('i', 'I')
-          AND ref_n.nspname = ANY($1)
-          AND NOT (dep_n.nspname = ANY($1))
-          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
-          AND dep_n.nspname <> 'information_schema'
+        CROSS JOIN LATERAL (
+            SELECT 'r' AS family, c.relkind::text AS relkind,
+                   n.nspname AS schema, c.relname AS name
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE d.refclassid = 'pg_class'::regclass AND c.oid = d.refobjid
+            UNION ALL
+            SELECT 't', NULL, n.nspname, t.typname
+            FROM pg_type t
+            JOIN pg_namespace n ON n.oid = t.typnamespace
+            WHERE d.refclassid = 'pg_type'::regclass AND t.oid = d.refobjid
+            UNION ALL
+            SELECT 'p', NULL, n.nspname, p.proname
+            FROM pg_proc p
+            JOIN pg_namespace n ON n.oid = p.pronamespace
+            WHERE d.refclassid = 'pg_proc'::regclass AND p.oid = d.refobjid
+            UNION ALL
+            SELECT 'o', NULL, n.nspname, o.oprname
+            FROM pg_operator o
+            JOIN pg_namespace n ON n.oid = o.oprnamespace
+            WHERE d.refclassid = 'pg_operator'::regclass AND o.oid = d.refobjid
+        ) ref_side
+        LEFT JOIN LATERAL (
+            SELECT n.nspname AS schema, c.relname AS name
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE c.oid = COALESCE(
+                CASE d.classid WHEN 'pg_class'::regclass THEN d.objid END,
+                CASE d.classid
+                    WHEN 'pg_constraint'::regclass
+                        THEN (SELECT conrelid FROM pg_constraint WHERE oid = d.objid)
+                    WHEN 'pg_rewrite'::regclass
+                        THEN (SELECT ev_class FROM pg_rewrite WHERE oid = d.objid)
+                    WHEN 'pg_attrdef'::regclass
+                        THEN (SELECT adrelid FROM pg_attrdef WHERE oid = d.objid)
+                    WHEN 'pg_trigger'::regclass
+                        THEN (SELECT tgrelid FROM pg_trigger WHERE oid = d.objid)
+                    WHEN 'pg_policy'::regclass
+                        THEN (SELECT polrelid FROM pg_policy WHERE oid = d.objid)
+                END
+            )
+            UNION ALL
+            SELECT n.nspname, p.proname
+            FROM pg_proc p
+            JOIN pg_namespace n ON n.oid = p.pronamespace
+            WHERE d.classid = 'pg_proc'::regclass AND p.oid = d.objid
+        ) dep_side ON TRUE
+        WHERE ref_side.schema = ANY($1)
+          AND (
+            dep_side.schema IS NULL
+            OR NOT (dep_side.schema = ANY($1))
+          )
+          AND (
+            dep_side.schema IS NULL
+            OR (
+              dep_side.schema NOT LIKE 'pg\_%' ESCAPE '\'
+              AND dep_side.schema <> 'information_schema'
+            )
+          )
     "#;
-    client
+    let mut edges = Vec::new();
+    let mut external_schemas: std::collections::BTreeSet<String> = Default::default();
+    for row in client
         .query(query, &[schemas])
-        .context("Failed to load scoped index dependency boundaries")?
-        .into_iter()
-        .map(|row| {
-            Ok(ObjectId::new(
-                row.try_get::<_, String>("ref_schema")?,
-                row.try_get::<_, String>("ref_name")?,
-            ))
-        })
-        .collect()
-}
-
-fn load_scoped_external_relation_dependencies(
-    client: &mut impl GenericClient,
-    schema_values: &Option<Vec<String>>,
-) -> Result<Vec<ObjectId>> {
-    let Some(schemas) = schema_values else {
-        return Ok(Vec::new());
-    };
-    if schemas.is_empty() {
-        return Ok(Vec::new());
+        .context("Failed to load scoped external dependency boundaries")?
+    {
+        let relkind: Option<String> = row.try_get("ref_relkind")?;
+        let family = match (
+            row.try_get::<_, String>("ref_family")?.as_str(),
+            relkind.as_deref(),
+        ) {
+            ("r", Some("i" | "I")) => CatalogFamily::Indexes,
+            ("r", _) => CatalogFamily::Relations,
+            ("t", _) => CatalogFamily::Types,
+            ("p", _) => CatalogFamily::Routines,
+            // An operator is a real cross-scope reference, but nothing in the
+            // model is an operator, so it has no family to belong to. It still
+            // names a schema the consumer should know about.
+            ("o", _) => {
+                if let Some(schema) = row.try_get::<_, Option<String>>("dep_schema")? {
+                    external_schemas.insert(schema);
+                }
+                continue;
+            }
+            (other, _) => return Err(anyhow::anyhow!("unknown dependency family {other}")),
+        };
+        let scoped = ObjectId::new(
+            row.try_get::<_, String>("ref_schema")?,
+            row.try_get::<_, String>("ref_name")?,
+        );
+        let external_schema: Option<String> = row.try_get("dep_schema")?;
+        edges.push(match external_schema {
+            Some(schema) => ScopedDependencyEdge::new(
+                family,
+                scoped,
+                ObjectId::new(schema, row.try_get::<_, String>("dep_name")?),
+            ),
+            None => ScopedDependencyEdge::unresolved_external(family, scoped),
+        });
     }
-    let query = r#"
-        SELECT DISTINCT ref_n.nspname AS ref_schema, ref_c.relname AS ref_name
-        FROM pg_depend d
-        JOIN pg_class ref_c ON d.refclassid = 'pg_class'::regclass
-                           AND d.refobjid = ref_c.oid
-        JOIN pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace
-        JOIN pg_class dep_c ON d.classid = 'pg_class'::regclass
-                           AND d.objid = dep_c.oid
-        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
-        WHERE ref_n.nspname = ANY($1)
-          AND NOT (dep_n.nspname = ANY($1))
-          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
-          AND dep_n.nspname <> 'information_schema'
-        UNION
-        SELECT DISTINCT ref_n.nspname, ref_c.relname
-        FROM pg_depend d
-        JOIN pg_class ref_c ON d.refclassid = 'pg_class'::regclass
-                           AND d.refobjid = ref_c.oid
-        JOIN pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace
-        JOIN pg_constraint dep_con ON d.classid = 'pg_constraint'::regclass
-                                  AND d.objid = dep_con.oid
-        JOIN pg_class dep_c ON dep_c.oid = dep_con.conrelid
-        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
-        WHERE ref_n.nspname = ANY($1)
-          AND NOT (dep_n.nspname = ANY($1))
-          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
-          AND dep_n.nspname <> 'information_schema'
-        UNION
-        SELECT DISTINCT ref_n.nspname, ref_c.relname
-        FROM pg_depend d
-        JOIN pg_class ref_c ON d.refclassid = 'pg_class'::regclass
-                           AND d.refobjid = ref_c.oid
-        JOIN pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace
-        JOIN pg_rewrite dep_rw ON d.classid = 'pg_rewrite'::regclass
-                              AND d.objid = dep_rw.oid
-        JOIN pg_class dep_c ON dep_c.oid = dep_rw.ev_class
-        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
-        WHERE ref_n.nspname = ANY($1)
-          AND NOT (dep_n.nspname = ANY($1))
-          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
-          AND dep_n.nspname <> 'information_schema'
-        UNION
-        SELECT DISTINCT ref_n.nspname, ref_c.relname
-        FROM pg_depend d
-        JOIN pg_class ref_c ON d.refclassid = 'pg_class'::regclass
-                           AND d.refobjid = ref_c.oid
-        JOIN pg_attrdef dep_ad ON d.classid = 'pg_attrdef'::regclass
-                              AND d.objid = dep_ad.oid
-        JOIN pg_class dep_c ON dep_c.oid = dep_ad.adrelid
-        JOIN pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace
-        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
-        WHERE ref_n.nspname = ANY($1)
-          AND NOT (dep_n.nspname = ANY($1))
-          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
-          AND dep_n.nspname <> 'information_schema'
-        UNION
-        SELECT DISTINCT ref_n.nspname, ref_c.relname
-        FROM pg_depend d
-        JOIN pg_class ref_c ON d.refclassid = 'pg_class'::regclass
-                           AND d.refobjid = ref_c.oid
-        JOIN pg_trigger dep_tg ON d.classid = 'pg_trigger'::regclass
-                              AND d.objid = dep_tg.oid
-        JOIN pg_class dep_c ON dep_c.oid = dep_tg.tgrelid
-        JOIN pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace
-        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
-        WHERE ref_n.nspname = ANY($1)
-          AND NOT (dep_n.nspname = ANY($1))
-          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
-          AND dep_n.nspname <> 'information_schema'
-        UNION
-        SELECT DISTINCT ref_n.nspname, ref_c.relname
-        FROM pg_depend d
-        JOIN pg_class ref_c ON d.refclassid = 'pg_class'::regclass
-                           AND d.refobjid = ref_c.oid
-        JOIN pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace
-        JOIN pg_proc dep_p ON d.classid = 'pg_proc'::regclass
-                          AND d.objid = dep_p.oid
-        JOIN pg_namespace dep_n ON dep_n.oid = dep_p.pronamespace
-        WHERE ref_n.nspname = ANY($1)
-          AND NOT (dep_n.nspname = ANY($1))
-          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
-          AND dep_n.nspname <> 'information_schema'
-        UNION
-        SELECT DISTINCT ref_n.nspname, ref_c.relname
-        FROM pg_depend d
-        JOIN pg_class ref_c ON d.refclassid = 'pg_class'::regclass
-                           AND d.refobjid = ref_c.oid
-        JOIN pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace
-        JOIN pg_policy dep_pol ON d.classid = 'pg_policy'::regclass
-                              AND d.objid = dep_pol.oid
-        JOIN pg_class dep_c ON dep_c.oid = dep_pol.polrelid
-        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
-        WHERE ref_n.nspname = ANY($1)
-          AND NOT (dep_n.nspname = ANY($1))
-          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
-          AND dep_n.nspname <> 'information_schema'
-    "#;
-    client
-        .query(query, &[schemas])
-        .context("Failed to load scoped relation dependency boundaries")?
-        .into_iter()
-        .map(|row| {
-            Ok(ObjectId::new(
-                row.try_get::<_, String>("ref_schema")?,
-                row.try_get::<_, String>("ref_name")?,
-            ))
-        })
-        .collect()
+    Ok(ScopedExternalDependencies {
+        edges,
+        external_schemas: external_schemas.into_iter().collect(),
+    })
 }
 
-fn load_scoped_external_type_dependencies(
-    client: &mut impl GenericClient,
-    schema_values: &Option<Vec<String>>,
-) -> Result<Vec<ObjectId>> {
-    let Some(schemas) = schema_values else {
-        return Ok(Vec::new());
-    };
-    let query = r#"
-        SELECT DISTINCT ref_n.nspname AS ref_schema, ref_t.typname AS ref_name
-        FROM pg_depend d
-        JOIN pg_type ref_t ON d.refclassid = 'pg_type'::regclass
-                          AND d.refobjid = ref_t.oid
-        JOIN pg_namespace ref_n ON ref_n.oid = ref_t.typnamespace
-        JOIN pg_class dep_c ON d.classid = 'pg_class'::regclass
-                           AND d.objid = dep_c.oid
-        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
-        WHERE ref_n.nspname = ANY($1)
-          AND NOT (dep_n.nspname = ANY($1))
-          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
-          AND dep_n.nspname <> 'information_schema'
-        UNION
-        SELECT DISTINCT ref_n.nspname, ref_t.typname
-        FROM pg_depend d
-        JOIN pg_type ref_t ON d.refclassid = 'pg_type'::regclass
-                          AND d.refobjid = ref_t.oid
-        JOIN pg_namespace ref_n ON ref_n.oid = ref_t.typnamespace
-        JOIN pg_rewrite dep_rw ON d.classid = 'pg_rewrite'::regclass
-                              AND d.objid = dep_rw.oid
-        JOIN pg_class dep_c ON dep_c.oid = dep_rw.ev_class
-        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
-        WHERE ref_n.nspname = ANY($1)
-          AND NOT (dep_n.nspname = ANY($1))
-          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
-          AND dep_n.nspname <> 'information_schema'
-        UNION
-        SELECT DISTINCT ref_n.nspname, ref_t.typname
-        FROM pg_depend d
-        JOIN pg_type ref_t ON d.refclassid = 'pg_type'::regclass
-                          AND d.refobjid = ref_t.oid
-        JOIN pg_proc dep_p ON d.classid = 'pg_proc'::regclass
-                          AND d.objid = dep_p.oid
-        JOIN pg_namespace dep_n ON dep_n.oid = dep_p.pronamespace
-        JOIN pg_namespace ref_n ON ref_n.oid = ref_t.typnamespace
-        WHERE ref_n.nspname = ANY($1)
-          AND NOT (dep_n.nspname = ANY($1))
-          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
-          AND dep_n.nspname <> 'information_schema'
-        UNION
-        SELECT DISTINCT ref_n.nspname, ref_t.typname
-        FROM pg_depend d
-        JOIN pg_type ref_t ON d.refclassid = 'pg_type'::regclass
-                          AND d.refobjid = ref_t.oid
-        JOIN pg_namespace ref_n ON ref_n.oid = ref_t.typnamespace
-        JOIN pg_constraint dep_con ON d.classid = 'pg_constraint'::regclass
-                                  AND d.objid = dep_con.oid
-        JOIN pg_class dep_c ON dep_c.oid = dep_con.conrelid
-        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
-        WHERE ref_n.nspname = ANY($1)
-          AND NOT (dep_n.nspname = ANY($1))
-          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
-          AND dep_n.nspname <> 'information_schema'
-        UNION
-        SELECT DISTINCT ref_n.nspname, ref_t.typname
-        FROM pg_depend d
-        JOIN pg_type ref_t ON d.refclassid = 'pg_type'::regclass
-                          AND d.refobjid = ref_t.oid
-        JOIN pg_namespace ref_n ON ref_n.oid = ref_t.typnamespace
-        JOIN pg_attrdef dep_ad ON d.classid = 'pg_attrdef'::regclass
-                              AND d.objid = dep_ad.oid
-        JOIN pg_class dep_c ON dep_c.oid = dep_ad.adrelid
-        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
-        WHERE ref_n.nspname = ANY($1)
-          AND NOT (dep_n.nspname = ANY($1))
-          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
-          AND dep_n.nspname <> 'information_schema'
-        UNION
-        SELECT DISTINCT ref_n.nspname, ref_t.typname
-        FROM pg_depend d
-        JOIN pg_type ref_t ON d.refclassid = 'pg_type'::regclass
-                          AND d.refobjid = ref_t.oid
-        JOIN pg_namespace ref_n ON ref_n.oid = ref_t.typnamespace
-        JOIN pg_trigger dep_tg ON d.classid = 'pg_trigger'::regclass
-                              AND d.objid = dep_tg.oid
-        JOIN pg_class dep_c ON dep_c.oid = dep_tg.tgrelid
-        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
-        WHERE ref_n.nspname = ANY($1)
-          AND NOT (dep_n.nspname = ANY($1))
-          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
-          AND dep_n.nspname <> 'information_schema'
-        UNION
-        SELECT DISTINCT ref_n.nspname, ref_t.typname
-        FROM pg_depend d
-        JOIN pg_type ref_t ON d.refclassid = 'pg_type'::regclass
-                          AND d.refobjid = ref_t.oid
-        JOIN pg_namespace ref_n ON ref_n.oid = ref_t.typnamespace
-        JOIN pg_policy dep_pol ON d.classid = 'pg_policy'::regclass
-                              AND d.objid = dep_pol.oid
-        JOIN pg_class dep_c ON dep_c.oid = dep_pol.polrelid
-        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
-        WHERE ref_n.nspname = ANY($1)
-          AND NOT (dep_n.nspname = ANY($1))
-          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
-          AND dep_n.nspname <> 'information_schema'
-    "#;
-    client
-        .query(query, &[schemas])
-        .context("Failed to load scoped type dependency boundaries")?
-        .into_iter()
-        .map(|row| {
-            Ok(ObjectId::new(
-                row.try_get::<_, String>("ref_schema")?,
-                row.try_get::<_, String>("ref_name")?,
-            ))
-        })
-        .collect()
-}
-
-fn load_scoped_external_routine_dependencies(
-    client: &mut impl GenericClient,
-    schema_values: &Option<Vec<String>>,
-) -> Result<Vec<ObjectId>> {
-    let Some(schemas) = schema_values else {
-        return Ok(Vec::new());
-    };
-    let query = r#"
-        SELECT DISTINCT
-            ref_n.nspname AS ref_schema,
-            ref_p.proname AS ref_name,
-            ARRAY(
-                SELECT pg_catalog.format_type(t, NULL)
-                FROM unnest(ref_p.proargtypes::oid[]) WITH ORDINALITY AS args(t, n)
-                ORDER BY n
-            )::text[] AS arg_types
-        FROM pg_depend d
-        JOIN pg_proc ref_p ON d.refclassid = 'pg_proc'::regclass
-                          AND d.refobjid = ref_p.oid
-        JOIN pg_namespace ref_n ON ref_n.oid = ref_p.pronamespace
-        JOIN pg_class dep_c ON d.classid = 'pg_class'::regclass
-                           AND d.objid = dep_c.oid
-        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
-        WHERE ref_n.nspname = ANY($1)
-          AND NOT (dep_n.nspname = ANY($1))
-          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
-          AND dep_n.nspname <> 'information_schema'
-        UNION
-        SELECT DISTINCT
-            ref_n.nspname,
-            ref_p.proname,
-            ARRAY(
-                SELECT pg_catalog.format_type(t, NULL)
-                FROM unnest(ref_p.proargtypes::oid[]) WITH ORDINALITY AS args(t, n)
-                ORDER BY n
-            )::text[]
-        FROM pg_depend d
-        JOIN pg_proc ref_p ON d.refclassid = 'pg_proc'::regclass
-                          AND d.refobjid = ref_p.oid
-        JOIN pg_namespace ref_n ON ref_n.oid = ref_p.pronamespace
-        JOIN pg_rewrite dep_rw ON d.classid = 'pg_rewrite'::regclass
-                              AND d.objid = dep_rw.oid
-        JOIN pg_class dep_c ON dep_c.oid = dep_rw.ev_class
-        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
-        WHERE ref_n.nspname = ANY($1)
-          AND NOT (dep_n.nspname = ANY($1))
-          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
-          AND dep_n.nspname <> 'information_schema'
-        UNION
-        SELECT DISTINCT
-            ref_n.nspname,
-            ref_p.proname,
-            ARRAY(
-                SELECT pg_catalog.format_type(t, NULL)
-                FROM unnest(ref_p.proargtypes::oid[]) WITH ORDINALITY AS args(t, n)
-                ORDER BY n
-            )::text[]
-        FROM pg_depend d
-        JOIN pg_proc ref_p ON d.refclassid = 'pg_proc'::regclass
-                          AND d.refobjid = ref_p.oid
-        JOIN pg_namespace ref_n ON ref_n.oid = ref_p.pronamespace
-        JOIN pg_constraint dep_con ON d.classid = 'pg_constraint'::regclass
-                                  AND d.objid = dep_con.oid
-        JOIN pg_class dep_c ON dep_c.oid = dep_con.conrelid
-        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
-        WHERE ref_n.nspname = ANY($1)
-          AND NOT (dep_n.nspname = ANY($1))
-          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
-          AND dep_n.nspname <> 'information_schema'
-        UNION
-        SELECT DISTINCT
-            ref_n.nspname,
-            ref_p.proname,
-            ARRAY(
-                SELECT pg_catalog.format_type(t, NULL)
-                FROM unnest(ref_p.proargtypes::oid[]) WITH ORDINALITY AS args(t, n)
-                ORDER BY n
-            )::text[]
-        FROM pg_depend d
-        JOIN pg_proc ref_p ON d.refclassid = 'pg_proc'::regclass
-                          AND d.refobjid = ref_p.oid
-        JOIN pg_namespace ref_n ON ref_n.oid = ref_p.pronamespace
-        JOIN pg_attrdef dep_ad ON d.classid = 'pg_attrdef'::regclass
-                              AND d.objid = dep_ad.oid
-        JOIN pg_class dep_c ON dep_c.oid = dep_ad.adrelid
-        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
-        WHERE ref_n.nspname = ANY($1)
-          AND NOT (dep_n.nspname = ANY($1))
-          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
-          AND dep_n.nspname <> 'information_schema'
-        UNION
-        SELECT DISTINCT
-            ref_n.nspname,
-            ref_p.proname,
-            ARRAY(
-                SELECT pg_catalog.format_type(t, NULL)
-                FROM unnest(ref_p.proargtypes::oid[]) WITH ORDINALITY AS args(t, n)
-                ORDER BY n
-            )::text[]
-        FROM pg_depend d
-        JOIN pg_proc ref_p ON d.refclassid = 'pg_proc'::regclass
-                          AND d.refobjid = ref_p.oid
-        JOIN pg_namespace ref_n ON ref_n.oid = ref_p.pronamespace
-        JOIN pg_trigger dep_tg ON d.classid = 'pg_trigger'::regclass
-                              AND d.objid = dep_tg.oid
-        JOIN pg_class dep_c ON dep_c.oid = dep_tg.tgrelid
-        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
-        WHERE ref_n.nspname = ANY($1)
-          AND NOT (dep_n.nspname = ANY($1))
-          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
-          AND dep_n.nspname <> 'information_schema'
-        UNION
-        SELECT DISTINCT
-            ref_n.nspname,
-            ref_p.proname,
-            ARRAY(
-                SELECT pg_catalog.format_type(t, NULL)
-                FROM unnest(ref_p.proargtypes::oid[]) WITH ORDINALITY AS args(t, n)
-                ORDER BY n
-            )::text[]
-        FROM pg_depend d
-        JOIN pg_proc ref_p ON d.refclassid = 'pg_proc'::regclass
-                          AND d.refobjid = ref_p.oid
-        JOIN pg_namespace ref_n ON ref_n.oid = ref_p.pronamespace
-        JOIN pg_policy dep_pol ON d.classid = 'pg_policy'::regclass
-                              AND d.objid = dep_pol.oid
-        JOIN pg_class dep_c ON dep_c.oid = dep_pol.polrelid
-        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
-        WHERE ref_n.nspname = ANY($1)
-          AND NOT (dep_n.nspname = ANY($1))
-          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
-          AND dep_n.nspname <> 'information_schema'
-    "#;
-    client
-        .query(query, &[schemas])
-        .context("Failed to load scoped routine dependency boundaries")?
-        .into_iter()
-        .map(|row| {
-            let args: Vec<String> = row.try_get("arg_types")?;
-            let args = args
-                .iter()
-                .map(|arg| {
-                    crate::_internal::analysis::resolver::Resolver::normalize_function_arg_type(arg)
-                        .render()
-                })
-                .collect::<Vec<_>>();
-            Ok(ObjectId::new(
-                row.try_get::<_, String>("ref_schema")?,
-                format!(
-                    "{}({})",
-                    row.try_get::<_, String>("ref_name")?,
-                    args.join(",")
-                ),
-            ))
-        })
-        .collect()
+/// What the scope-boundary query observed: family-attributed edges plus the
+/// schemas that reference the scope through a class the model does not hold.
+struct ScopedExternalDependencies {
+    edges: Vec<ScopedDependencyEdge>,
+    external_schemas: Vec<String>,
 }
 
 fn load_roles(
@@ -1615,7 +1361,7 @@ fn load_relations_and_columns(
         LEFT JOIN pg_class replica_index ON replica_index.oid = replica_i.indexrelid
         LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid
         LEFT JOIN pg_partitioned_table p ON p.partrelid = c.oid
-        WHERE c.relkind IN ('r', 'p', 'v', 'm')
+        WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f')
           AND n.nspname NOT IN ('pg_catalog', 'information_schema')
           {schema_filter_with_fk};
     "
@@ -1759,7 +1505,7 @@ fn load_relations_and_columns(
         LEFT JOIN pg_stats s ON s.schemaname = n.nspname AND s.tablename = c.relname AND s.attname = a.attname
         LEFT JOIN pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum
         WHERE a.attnum > 0 AND NOT a.attisdropped
-          AND c.relkind IN ('r', 'p', 'v', 'm')
+          AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
           AND n.nspname NOT IN ('pg_catalog', 'information_schema')
           {schema_filter_with_fk}
         -- Composite-type fields are ordered by pg_attribute.attnum.  Keep the
@@ -2000,7 +1746,7 @@ fn load_relation_decorations(
         JOIN pg_namespace n ON n.oid = c.relnamespace
         LEFT JOIN pg_trigger t ON t.tgrelid = c.oid
         LEFT JOIN pg_policy p ON p.polrelid = c.oid
-        WHERE c.relkind IN ('r', 'p', 'v', 'm') AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+        WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') AND n.nspname NOT IN ('pg_catalog', 'information_schema')
         {schema_filter_with_fk}
         GROUP BY n.nspname, c.relname, c.oid;
     "
@@ -2058,7 +1804,7 @@ fn load_relation_decorations(
         FROM pg_class c
         JOIN pg_namespace n ON n.oid = c.relnamespace
         CROSS JOIN LATERAL pg_catalog.aclexplode(c.relacl) acl
-        WHERE c.relkind IN ('r', 'p', 'v', 'm')
+        WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f')
           AND n.nspname NOT IN ('pg_catalog', 'information_schema')
           AND acl.grantee <> c.relowner
           {schema_filter_with_fk};
@@ -2160,7 +1906,7 @@ fn load_triggers(
         LEFT JOIN pg_class inferred_pc ON inferred_pc.oid = inferred_pt.table_oid
         LEFT JOIN pg_namespace inferred_pn ON inferred_pn.oid = inferred_pc.relnamespace
         WHERE (t.tgisinternal = false OR (t.tgparentid <> 0 AND pt.tgisinternal = false))
-          AND c.relkind IN ('r', 'p', 'v', 'm')
+          AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
           AND n.nspname NOT IN ('pg_catalog', 'information_schema')
           {schema_filter_with_fk};
     "
@@ -2242,7 +1988,7 @@ fn load_constraints(
         LEFT JOIN pg_class backing ON backing.oid = con.conindid
         LEFT JOIN pg_namespace backing_n ON backing_n.oid = backing.relnamespace
         WHERE con.contype IN ('c', 'f', 'p', 'u', 'x', 'n')
-          AND c.relkind IN ('r', 'p', 'v', 'm')
+          AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
           AND n.nspname NOT IN ('pg_catalog', 'information_schema')
           {schema_filter_with_fk};
         "
@@ -2329,7 +2075,7 @@ fn load_constraint_keys(
         JOIN pg_class c ON c.oid = con.conrelid
         JOIN pg_namespace n ON n.oid = c.relnamespace
         WHERE con.contype IN ('p', 'u', 'n')
-          AND c.relkind IN ('r', 'p')
+          AND c.relkind IN ('r', 'p', 'f')
           AND n.nspname NOT IN ('pg_catalog', 'information_schema')
           {schema_filter_with_fk};
     "
@@ -2398,7 +2144,7 @@ fn load_constraint_dependencies(
         JOIN pg_class c ON c.oid = con.conrelid
         JOIN pg_namespace n ON n.oid = c.relnamespace
         WHERE con.contype IN ('c', 'x')
-          AND c.relkind IN ('r', 'p')
+          AND c.relkind IN ('r', 'p', 'f')
           AND n.nspname NOT IN ('pg_catalog', 'information_schema')
           {schema_filter_with_fk};
         "
@@ -2458,7 +2204,7 @@ fn load_generated_column_dependencies(
         WHERE a.attnum > 0
           AND NOT a.attisdropped
           AND a.attgenerated = 's'
-          AND c.relkind IN ('r', 'p')
+          AND c.relkind IN ('r', 'p', 'f')
           AND n.nspname NOT IN ('pg_catalog', 'information_schema')
           {schema_filter_with_fk}
         ORDER BY n.nspname, c.relname, a.attname, source_a.attname;
@@ -2515,7 +2261,7 @@ fn load_default_sequence_dependencies(
         WHERE a.attnum > 0
           AND NOT a.attisdropped
           AND a.attgenerated = ''
-          AND c.relkind IN ('r', 'p')
+          AND c.relkind IN ('r', 'p', 'f')
           AND n.nspname NOT IN ('pg_catalog', 'information_schema')
           {schema_filter_with_fk}
         ORDER BY n.nspname, c.relname, a.attname, seqn.nspname, seq.relname;
@@ -2677,6 +2423,55 @@ fn load_foreign_keys(
         .collect()
 }
 
+fn load_index_attachments(
+    client: &mut impl GenericClient,
+    schema_values: &Option<Vec<String>>,
+) -> Result<Vec<IndexAttachmentCache>> {
+    let query = r#"
+        SELECT
+            child_ns.nspname AS child_schema,
+            child.relname AS child_name,
+            parent_ns.nspname AS parent_schema,
+            parent.relname AS parent_name
+        FROM pg_inherits inh
+        JOIN pg_class child ON child.oid = inh.inhrelid
+        JOIN pg_namespace child_ns ON child_ns.oid = child.relnamespace
+        JOIN pg_class parent ON parent.oid = inh.inhparent
+        JOIN pg_namespace parent_ns ON parent_ns.oid = parent.relnamespace
+        WHERE child.relkind = 'i'
+          AND parent.relkind = 'I'
+          AND child_ns.nspname NOT IN ('pg_catalog', 'information_schema')
+          AND parent_ns.nspname NOT IN ('pg_catalog', 'information_schema')
+          AND (
+              $1::text[] IS NULL
+              OR child_ns.nspname = ANY($1)
+              OR parent_ns.nspname = ANY($1)
+          )
+        ORDER BY child_ns.nspname, child.relname
+    "#;
+    let rows = client
+        .query(query, &[schema_values])
+        .context("Failed to load index attachments from pg_inherits")?;
+    rows.iter()
+        .map(|row| {
+            Ok(IndexAttachmentCache {
+                child: ObjectId::new(
+                    row.try_get::<_, String>("child_schema")
+                        .context("attached index schema")?,
+                    row.try_get::<_, String>("child_name")
+                        .context("attached index name")?,
+                ),
+                parent: ObjectId::new(
+                    row.try_get::<_, String>("parent_schema")
+                        .context("parent index schema")?,
+                    row.try_get::<_, String>("parent_name")
+                        .context("parent index name")?,
+                ),
+            })
+        })
+        .collect()
+}
+
 fn load_inheritances(
     client: &mut impl GenericClient,
     schema_values: &Option<Vec<String>>,
@@ -2695,8 +2490,8 @@ fn load_inheritances(
         JOIN pg_namespace child_ns ON child_ns.oid = child.relnamespace
         JOIN pg_class parent ON parent.oid = inh.inhparent
         JOIN pg_namespace parent_ns ON parent_ns.oid = parent.relnamespace
-        WHERE child.relkind IN ('r', 'p')
-          AND parent.relkind IN ('r', 'p')
+        WHERE child.relkind IN ('r', 'p', 'f')
+          AND parent.relkind IN ('r', 'p', 'f')
           AND child_ns.nspname NOT IN ('pg_catalog', 'information_schema')
           AND parent_ns.nspname NOT IN ('pg_catalog', 'information_schema')
           AND (
@@ -2740,7 +2535,15 @@ fn load_indexes(
     client: &mut impl GenericClient,
     schema_values: &Option<Vec<String>>,
     schema_filter_nt: &str,
+    pg_version_num: u32,
 ) -> Result<Vec<IndexCache>> {
+    // `indnullsnotdistinct` exists from PostgreSQL 15; a layout without it can
+    // only hold indexes that are NULLS DISTINCT, so the literal is exact.
+    let nulls_not_distinct = if pg_version_num >= 150_000 {
+        "x.indnullsnotdistinct"
+    } else {
+        "FALSE"
+    };
     let query = format!(
         "
         SELECT
@@ -2775,6 +2578,89 @@ fn load_indexes(
             ) AS included_columns,
             ARRAY(
                 SELECT a.attname
+                FROM generate_series(1, x.indnkeyatts) AS k(ord)
+                LEFT JOIN pg_attribute a
+                  ON a.attrelid = x.indrelid
+                 AND a.attnum = x.indkey[k.ord - 1]
+                 AND NOT a.attisdropped
+                ORDER BY k.ord
+            ) AS key_attnames,
+            ARRAY(
+                SELECT CASE
+                    WHEN opc.opcdefault AND opc.opcmethod = i.relam THEN true
+                    ELSE false
+                END
+                FROM generate_series(1, x.indnkeyatts) AS k(ord)
+                LEFT JOIN pg_opclass opc ON opc.oid = x.indclass[k.ord - 1]
+                ORDER BY k.ord
+            ) AS key_opclass_defaults,
+            ARRAY(
+                SELECT nf.nspname
+                FROM generate_series(1, x.indnkeyatts) AS k(ord)
+                LEFT JOIN pg_opclass opc ON opc.oid = x.indclass[k.ord - 1]
+                LEFT JOIN pg_opfamily f ON f.oid = opc.opcfamily
+                LEFT JOIN pg_namespace nf ON nf.oid = f.opfnamespace
+                ORDER BY k.ord
+            ) AS key_opfamily_schemas,
+            ARRAY(
+                SELECT f.opfname
+                FROM generate_series(1, x.indnkeyatts) AS k(ord)
+                LEFT JOIN pg_opclass opc ON opc.oid = x.indclass[k.ord - 1]
+                LEFT JOIN pg_opfamily f ON f.oid = opc.opcfamily
+                ORDER BY k.ord
+            ) AS key_opfamily_names,
+            ARRAY(
+                SELECT CASE
+                    WHEN x.indcollation[k.ord - 1] = 0 THEN 'not_collatable'
+                    WHEN x.indkey[k.ord - 1] <> 0
+                         AND x.indcollation[k.ord - 1] = a.attcollation THEN 'derived'
+                    -- An expression key with the database default collation is
+                    -- the collation the expression inherits, not a choice.
+                    WHEN x.indkey[k.ord - 1] = 0
+                         AND x.indcollation[k.ord - 1] = 100 THEN 'derived'
+                    ELSE 'resolved'
+                END
+                FROM generate_series(1, x.indnkeyatts) AS k(ord)
+                LEFT JOIN pg_attribute a
+                  ON a.attrelid = x.indrelid
+                 AND a.attnum = x.indkey[k.ord - 1]
+                ORDER BY k.ord
+            ) AS key_collation_kinds,
+            ARRAY(
+                SELECT CASE
+                    WHEN x.indcollation[k.ord - 1] = 0 THEN NULL
+                    WHEN x.indkey[k.ord - 1] <> 0
+                         AND x.indcollation[k.ord - 1] = a.attcollation THEN NULL
+                    WHEN x.indkey[k.ord - 1] = 0
+                         AND x.indcollation[k.ord - 1] = 100 THEN NULL
+                    ELSE nc.nspname
+                END
+                FROM generate_series(1, x.indnkeyatts) AS k(ord)
+                LEFT JOIN pg_collation coll ON coll.oid = x.indcollation[k.ord - 1]
+                LEFT JOIN pg_namespace nc ON nc.oid = coll.collnamespace
+                LEFT JOIN pg_attribute a
+                  ON a.attrelid = x.indrelid
+                 AND a.attnum = x.indkey[k.ord - 1]
+                ORDER BY k.ord
+            ) AS key_collation_schemas,
+            ARRAY(
+                SELECT CASE
+                    WHEN x.indcollation[k.ord - 1] = 0 THEN NULL
+                    WHEN x.indkey[k.ord - 1] <> 0
+                         AND x.indcollation[k.ord - 1] = a.attcollation THEN NULL
+                    WHEN x.indkey[k.ord - 1] = 0
+                         AND x.indcollation[k.ord - 1] = 100 THEN NULL
+                    ELSE coll.collname
+                END
+                FROM generate_series(1, x.indnkeyatts) AS k(ord)
+                LEFT JOIN pg_collation coll ON coll.oid = x.indcollation[k.ord - 1]
+                LEFT JOIN pg_attribute a
+                  ON a.attrelid = x.indrelid
+                 AND a.attnum = x.indkey[k.ord - 1]
+                ORDER BY k.ord
+            ) AS key_collation_names,
+            ARRAY(
+                SELECT a.attname
                 FROM pg_depend d
                 JOIN pg_attribute a
                   ON a.attrelid = d.refobjid
@@ -2793,37 +2679,23 @@ fn load_indexes(
                 WHERE key_part.ordinality <= x.indnkeyatts
                   AND key_part.attnum = 0
             ) AS has_expression_keys,
-            NOT EXISTS (
-                SELECT 1
-                FROM unnest(x.indoption::smallint[]) AS option_part(flags)
-                WHERE option_part.flags <> 0
-            ) AS has_default_sort_order,
-            NOT EXISTS (
-                SELECT 1
-                FROM unnest(x.indclass::oid[]) WITH ORDINALITY AS opclass_part(opclass_oid, ordinality)
-                JOIN pg_opclass opclass ON opclass.oid = opclass_part.opclass_oid
-                WHERE opclass_part.ordinality <= x.indnkeyatts
-                  AND (NOT opclass.opcdefault OR opclass.opcmethod <> i.relam)
-            ) AS has_default_opclasses,
-            NOT EXISTS (
-                SELECT 1
-                FROM unnest(x.indcollation::oid[]) WITH ORDINALITY AS collation_part(collation_oid, ordinality)
-                JOIN unnest(x.indkey::smallint[]) WITH ORDINALITY AS key_part(attnum, key_ordinality)
-                  ON key_part.key_ordinality = collation_part.ordinality
-                JOIN pg_attribute a
-                  ON a.attrelid = x.indrelid
-                 AND a.attnum = key_part.attnum
-                 AND NOT a.attisdropped
-                WHERE collation_part.ordinality <= x.indnkeyatts
-                  AND key_part.attnum <> 0
-                  AND collation_part.collation_oid <> a.attcollation
-            ) AS has_default_collations
+            COALESCE(
+                (
+                    SELECT array_agg(o.flags ORDER BY o.ord)
+                    FROM unnest(x.indoption::smallint[])
+                        WITH ORDINALITY AS o(flags, ord)
+                    WHERE o.ord <= x.indnkeyatts
+                ),
+                ARRAY[]::smallint[]
+            ) AS indoption_bits,
+            pg_catalog.pg_indexam_has_property(am.oid, 'can_order') AS am_can_order,
+            {nulls_not_distinct} AS nulls_not_distinct
         FROM pg_index x
         JOIN pg_class i ON i.oid = x.indexrelid
+        JOIN pg_am am ON am.oid = i.relam
         JOIN pg_namespace n_i ON n_i.oid = i.relnamespace
         JOIN pg_class t ON t.oid = x.indrelid
         JOIN pg_namespace n_t ON n_t.oid = t.relnamespace
-        JOIN pg_am am ON am.oid = i.relam
         WHERE n_i.nspname !~ '^pg_'
           AND n_i.nspname <> 'information_schema'
           AND n_t.nspname !~ '^pg_'
@@ -2847,12 +2719,58 @@ fn load_indexes(
         let included_columns: Vec<String> = row
             .try_get("included_columns")
             .context("index included columns")?;
-        let has_expression_keys: bool = row
-            .try_get("has_expression_keys")
-            .context("index expression key flag")?;
-        let has_predicate: bool = row
-            .try_get("has_predicate")
-            .context("index predicate flag")?;
+        let key_attnames: Vec<Option<String>> =
+            row.try_get("key_attnames").context("index key attnames")?;
+        let key_opclass_defaults: Vec<bool> = row
+            .try_get("key_opclass_defaults")
+            .context("index key default opclass flags")?;
+        let key_opfamily_schemas: Vec<Option<String>> = row
+            .try_get("key_opfamily_schemas")
+            .context("index key opfamily schemas")?;
+        let key_opfamily_names: Vec<Option<String>> = row
+            .try_get("key_opfamily_names")
+            .context("index key opfamily names")?;
+        let key_collation_kinds: Vec<String> = row
+            .try_get("key_collation_kinds")
+            .context("index key collation kinds")?;
+        let key_collation_schemas: Vec<Option<String>> = row
+            .try_get("key_collation_schemas")
+            .context("index key collation schemas")?;
+        let key_collation_names: Vec<Option<String>> = row
+            .try_get("key_collation_names")
+            .context("index key collation names")?;
+        let indoption_bits: Vec<i16> = row.try_get("indoption_bits").context("index sort bits")?;
+        let am_can_order: bool = row.try_get("am_can_order").context("index access method")?;
+        let keys = key_attnames
+            .iter()
+            .enumerate()
+            .map(|(ord, attname)| {
+                synced_index_key(
+                    attname.as_ref(),
+                    key_opclass_defaults.get(ord).copied().unwrap_or(false),
+                    key_opfamily_schemas.get(ord).and_then(Option::as_deref),
+                    key_opfamily_names.get(ord).and_then(Option::as_deref),
+                    key_collation_kinds.get(ord).map(String::as_str),
+                    key_collation_schemas.get(ord).and_then(Option::as_deref),
+                    key_collation_names.get(ord).and_then(Option::as_deref),
+                    indoption_bits.get(ord).copied(),
+                    am_can_order,
+                )
+            })
+            .collect::<Vec<_>>();
+        let definition = build_index_definition(
+            row.try_get("using_method").context("index access method")?,
+            keys,
+            &included_columns,
+            row.try_get("is_unique").context("index uniqueness")?,
+            row.try_get("has_predicate")
+                .context("index predicate flag")?,
+            row.try_get("nulls_not_distinct")
+                .context("index null treatment")?,
+            row.try_get("is_valid").context("index validity flag")?,
+            row.try_get("is_ready").context("index readiness flag")?,
+            row.try_get("is_live").context("index liveness flag")?,
+        );
         let mut dependency_columns: Vec<String> = row
             .try_get("dependency_columns")
             .context("index dependency columns")?;
@@ -2877,29 +2795,12 @@ fn load_indexes(
                 row.try_get::<_, String>("table_name")
                     .context("indexed table name")?,
             ),
-            using_method: row.try_get("using_method").context("index access method")?,
-            key_columns,
-            included_columns,
+            definition,
             dependency_columns,
             dependency_columns_known: true,
-            has_expression_keys,
-            has_predicate,
-            is_unique: row.try_get("is_unique").context("index uniqueness flag")?,
             is_immediate: row
                 .try_get("is_immediate")
                 .context("index immediacy flag")?,
-            is_valid: row.try_get("is_valid").context("index validity flag")?,
-            is_ready: row.try_get("is_ready").context("index readiness flag")?,
-            is_live: row.try_get("is_live").context("index liveness flag")?,
-            has_default_sort_order: row
-                .try_get("has_default_sort_order")
-                .context("index sort ordering")?,
-            has_default_opclasses: row
-                .try_get("has_default_opclasses")
-                .context("index operator classes")?,
-            has_default_collations: row
-                .try_get("has_default_collations")
-                .context("index collations")?,
         });
     }
     Ok(indexes)
@@ -2909,6 +2810,7 @@ fn load_routines(
     client: &mut impl GenericClient,
     schema_values: &Option<Vec<String>>,
     schema_filter: &str,
+    builtin_types: &BuiltinTypeCatalogue,
 ) -> Result<std::collections::HashMap<ObjectId, crate::_internal::model::function::FunctionState>> {
     let query = format!(
         "
@@ -2920,6 +2822,19 @@ fn load_routines(
                 FROM unnest(p.proargtypes::oid[]) WITH ORDINALITY AS u(t, n)
                 ORDER BY n
             )::text[] AS arg_types,
+            ARRAY(
+                SELECT pg_catalog.format_type(t, NULL)
+                FROM unnest(
+                    COALESCE(p.proallargtypes, p.proargtypes)::oid[]
+                ) WITH ORDINALITY AS u(t, n)
+                ORDER BY n
+            )::text[] AS all_arg_types,
+            -- PostgreSQL spells an unnamed parameter as an empty name and
+            -- leaves `proargmodes` NULL when every parameter is an input.
+            COALESCE(p.proargnames::text[], ARRAY[]::text[]) AS param_names,
+            COALESCE(p.proargmodes::text[], ARRAY[]::text[]) AS param_modes,
+            p.pronargdefaults::int4 AS default_count,
+            p.proretset AS returns_set,
             pg_catalog.pg_get_function_result(p.oid) AS return_type,
             p.provolatile::text AS volatility,
             p.prokind::text AS routine_kind,
@@ -2965,6 +2880,7 @@ fn load_routines(
                 .map(|arg_type| {
                     crate::_internal::analysis::resolver::Resolver::normalize_function_arg_type(
                         arg_type,
+                        builtin_types,
                     )
                     .render()
                 })
@@ -2976,6 +2892,49 @@ fn load_routines(
             let security_definer: bool = row
                 .try_get("security_definer")
                 .context("routine security mode")?;
+            let all_arg_types = row
+                .try_get::<_, Option<Vec<String>>>("all_arg_types")
+                .context("routine argument types")?
+                .unwrap_or_else(|| raw_arg_types.clone());
+            let param_names = row
+                .try_get::<_, Vec<String>>("param_names")
+                .context("routine parameter names")?;
+            let param_modes = row
+                .try_get::<_, Vec<String>>("param_modes")
+                .context("routine parameter modes")?;
+            let parameters = all_arg_types
+                .iter()
+                .enumerate()
+                .map(|(position, ty)| {
+                    let mode = match param_modes.get(position) {
+                        // An absent `proargmodes` array means every parameter is
+                        // an input, which is how PostgreSQL reads it.
+                        None => crate::_internal::model::function::ParameterMode::In,
+                        Some(code) => crate::_internal::model::function::ParameterMode::from_pg(code)
+                            .ok_or_else(|| anyhow::anyhow!("unknown routine parameter mode {code}"))?,
+                    };
+                    Ok(crate::_internal::model::function::RoutineParameter {
+                        name: param_names
+                            .get(position)
+                            .filter(|name| !name.is_empty())
+                            .cloned(),
+                        mode,
+                        ty: crate::_internal::analysis::resolver::Resolver::normalize_function_arg_type(
+                            ty, builtin_types,
+                        )
+                        .render(),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            debug_assert_eq!(
+                parameters
+                    .iter()
+                    .filter(|parameter| parameter.mode.is_input())
+                    .map(|parameter| parameter.ty.clone())
+                    .collect::<Vec<_>>(),
+                arg_types,
+                "the input signature must be the parameter list restricted to inputs"
+            );
             Ok((
                 id.clone(),
                 crate::_internal::model::function::FunctionState {
@@ -2983,11 +2942,28 @@ fn load_routines(
                     routine_kind,
                     arg_types,
                     arg_type_ids: Vec::new(),
-                    return_type: row
-                        .try_get::<_, Option<String>>("return_type")
-                        .context("routine return type")?
-                        .unwrap_or_default(),
+                    // `pg_get_function_result` renders a set-returning routine
+                    // as `SETOF t`; `proretset` carries the flag, so the type
+                    // is stored alone and the two compare independently.
+                    return_type: {
+                        let rendered = row
+                            .try_get::<_, Option<String>>("return_type")
+                            .context("routine return type")?
+                            .unwrap_or_default();
+                        match rendered.strip_prefix("SETOF ") {
+                            Some(base) => base.to_string(),
+                            None => rendered,
+                        }
+                    },
                     return_type_id: None,
+                    returns_set: row
+                        .try_get("returns_set")
+                        .context("routine SETOF flag")?,
+                    parameters,
+                    default_count: row
+                        .try_get::<_, i32>("default_count")
+                        .context("routine parameter default count")?
+                        .max(0) as u32,
                     volatility,
                     language: row.try_get("language").context("routine language")?,
                     security: if security_definer {
@@ -3008,6 +2984,277 @@ fn load_routines(
             ))
         })
         .collect()
+}
+
+/// Load the built-in types the analyzer can name in a migration.
+///
+/// Only what a migration can actually declare is kept. Arrays are excluded
+/// because `typarray` plus `[]` already describes them, composites because a
+/// table's row type belongs to the relation cache, and pseudo-types because
+/// `format_type` already returns their `typname`, so they need no mapping.
+///
+/// Arrays are identified by `typcategory`, not `typelem`: `name`, `box`,
+/// `line`, `lseg` and `point` all carry a non-zero `typelem` recording their
+/// array linkage while being ordinary declarable types themselves.
+///
+/// Must run after the connection pins `search_path` to `pg_catalog`, otherwise
+/// `format_type` schema-qualifies every name.
+/// Whether every key of an index uses the default sort order.
+///
+/// The bits are normalized through [`IndexOrder`] rather than tested for zero,
+/// because `DESC NULLS FIRST` is stored as `3` and is the same order as `0`.
+/// They are also ignored entirely when the access method cannot order, since
+/// `indoption` bits are access-method specific.
+/// One key's operator-class identity from the catalog: the resolved family,
+/// plus whether PostgreSQL chose it as the access method's default.
+fn synced_opclass(
+    is_default: bool,
+    family_schema: Option<&str>,
+    family_name: Option<&str>,
+) -> KeyOpclass {
+    match (family_schema, family_name) {
+        (Some(schema), Some(name)) => {
+            let family = ResolvedName {
+                schema: schema.to_string(),
+                name: name.to_string(),
+            };
+            if is_default {
+                KeyOpclass::Default(Some(family))
+            } else {
+                KeyOpclass::Explicit(family)
+            }
+        }
+        // `pg_opfamily` cannot be missing for a live index; a gap stays
+        // unknown rather than becoming a false difference.
+        _ => KeyOpclass::Unresolved,
+    }
+}
+
+/// One key's collation identity from the catalog.
+fn synced_collation(kind: Option<&str>, schema: Option<&str>, name: Option<&str>) -> KeyCollation {
+    match kind {
+        Some("not_collatable") => KeyCollation::NotCollatable,
+        Some("derived") => KeyCollation::Derived,
+        Some("resolved") => match (schema, name) {
+            (Some(schema), Some(name)) => KeyCollation::Resolved(ResolvedName {
+                schema: schema.to_string(),
+                name: name.to_string(),
+            }),
+            _ => KeyCollation::Unresolved,
+        },
+        _ => KeyCollation::Unresolved,
+    }
+}
+
+/// Build a key's description from the parallel catalog arrays.
+///
+/// A NULL attname is an expression: `indkey` records it as 0 and PostgreSQL
+/// stores no identity for it, so the key is recorded as an expression and
+/// never compared by content.
+#[allow(clippy::too_many_arguments)]
+fn synced_index_key(
+    attname: Option<&String>,
+    opclass_default: bool,
+    opfamily_schema: Option<&str>,
+    opfamily_name: Option<&str>,
+    collation_kind: Option<&str>,
+    collation_schema: Option<&str>,
+    collation_name: Option<&str>,
+    bits: Option<i16>,
+    can_order: bool,
+) -> IndexKey {
+    IndexKey {
+        kind: match attname {
+            Some(name) => IndexKeyKind::Column(name.clone()),
+            None => IndexKeyKind::Expression(None),
+        },
+        opclass: synced_opclass(opclass_default, opfamily_schema, opfamily_name),
+        collation: synced_collation(collation_kind, collation_schema, collation_name),
+        order: IndexOrder::from_indoption(bits.unwrap_or(0) as u16, can_order),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_index_definition(
+    method: String,
+    keys: Vec<IndexKey>,
+    included_attnames: &[String],
+    unique: bool,
+    predicate: bool,
+    nulls_not_distinct: bool,
+    valid: bool,
+    ready: bool,
+    live: bool,
+) -> IndexDefinition {
+    let expression_keys = keys
+        .iter()
+        .filter(|key| matches!(key.kind, IndexKeyKind::Expression(_)))
+        .count();
+    IndexDefinition {
+        method: Some(method),
+        keys,
+        included: included_attnames
+            .iter()
+            .map(|name| IndexKey::column(name.clone()))
+            .collect(),
+        expression_keys,
+        unique,
+        nulls_not_distinct: Some(nulls_not_distinct),
+        predicate: if predicate {
+            IndexPredicate::Opaque
+        } else {
+            IndexPredicate::None
+        },
+        unestablished: false,
+        valid,
+        ready,
+        live,
+    }
+}
+
+fn load_opclasses(
+    client: &mut impl GenericClient,
+) -> Result<crate::_internal::model::opclass::OpclassCatalogue> {
+    let rows = client
+        .query(
+            "
+            SELECT
+                n.nspname AS namespace,
+                o.opcname AS name,
+                t.typname AS intype,
+                ARRAY(
+                    SELECT pg_catalog.format_type(t.oid, NULL)
+                    UNION ALL
+                    SELECT t.typname
+                ) AS aliases,
+                am.amname AS method,
+                o.opcdefault AS is_default,
+                fn.nspname AS family_namespace,
+                f.opfname AS family_name
+            FROM pg_catalog.pg_opclass o
+            JOIN pg_catalog.pg_namespace n ON n.oid = o.opcnamespace
+            JOIN pg_catalog.pg_type t ON t.oid = o.opcintype
+            JOIN pg_catalog.pg_am am ON am.oid = o.opcmethod
+            JOIN pg_catalog.pg_opfamily f ON f.oid = o.opcfamily
+            JOIN pg_catalog.pg_namespace fn ON fn.oid = f.opfnamespace
+            ",
+            &[],
+        )
+        .context("Failed to load operator classes")?;
+    Ok(
+        crate::_internal::model::opclass::OpclassCatalogue::from_entries(
+            rows.into_iter()
+                .map(|row| {
+                    Ok(crate::_internal::model::opclass::OpclassEntry {
+                        name: row.try_get("name").context("operator class name")?,
+                        namespace: row.try_get("namespace").context("operator class schema")?,
+                        family: ResolvedName {
+                            schema: row
+                                .try_get("family_namespace")
+                                .context("operator family schema")?,
+                            name: row.try_get("family_name").context("operator family name")?,
+                        },
+                        intype: row.try_get("intype").context("operator class input type")?,
+                        aliases: row
+                            .try_get("aliases")
+                            .context("operator class input type aliases")?,
+                        method: row
+                            .try_get("method")
+                            .context("operator class access method")?,
+                        is_default: row
+                            .try_get("is_default")
+                            .context("operator class default flag")?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+        ),
+    )
+}
+
+fn load_collations(
+    client: &mut impl GenericClient,
+) -> Result<crate::_internal::model::collation::CollationCatalogue> {
+    let rows = client
+        .query(
+            "
+            SELECT
+                n.nspname AS schema,
+                c.collname AS name
+            FROM pg_catalog.pg_collation c
+            JOIN pg_catalog.pg_namespace n ON n.oid = c.collnamespace
+            ",
+            &[],
+        )
+        .context("Failed to load collations")?;
+    Ok(
+        crate::_internal::model::collation::CollationCatalogue::from_entries(
+            rows.into_iter()
+                .map(|row| {
+                    Ok(ResolvedName {
+                        schema: row.try_get("schema").context("collation schema")?,
+                        name: row.try_get("name").context("collation name")?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+        ),
+    )
+}
+
+fn load_builtin_types(
+    client: &mut impl GenericClient,
+) -> Result<crate::_internal::model::builtin_type::BuiltinTypeCatalogue> {
+    let rows = client
+        .query(
+            "
+            SELECT
+                t.oid,
+                t.typname,
+                pg_catalog.format_type(t.oid, NULL) AS canonical,
+                t.typcategory::text AS category,
+                t.typlen,
+                t.typarray,
+                t.typmodout <> 0 AS accepts_typmod
+            FROM pg_catalog.pg_type t
+            JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
+            WHERE n.nspname = 'pg_catalog'
+              AND t.typtype IN ('b', 'r', 'm')
+              AND t.typcategory <> 'A';
+            ",
+            &[],
+        )
+        .context("Failed to load built-in types")?;
+
+    let types = rows
+        .into_iter()
+        .map(|row| {
+            use crate::_internal::model::builtin_type::{BuiltinType, TypeCategory};
+            // `typlen` is negative for variable-length types, so only a
+            // positive value states a fixed width.
+            let typlen: i16 = row.try_get("typlen").context("built-in type length")?;
+            let category: String = row.try_get("category").context("built-in type category")?;
+            Ok(BuiltinType {
+                oid: Some(row.try_get("oid").context("built-in type oid")?),
+                typname: row.try_get("typname").context("built-in type name")?,
+                canonical: row
+                    .try_get("canonical")
+                    .context("built-in type canonical name")?,
+                category: TypeCategory::from_catalog(&category),
+                fixed_bits: (typlen > 0).then(|| i32::from(typlen) * 8),
+                array_oid: match row
+                    .try_get::<_, u32>("typarray")
+                    .context("built-in type array oid")?
+                {
+                    0 => None,
+                    oid => Some(oid),
+                },
+                accepts_typmod: row
+                    .try_get("accepts_typmod")
+                    .context("built-in type typmod flag")?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(crate::_internal::model::builtin_type::BuiltinTypeCatalogue::new(types))
 }
 
 fn load_types(
@@ -3040,6 +3287,11 @@ fn load_types(
                     FILTER (WHERE a.attname IS NOT NULL),
                 ARRAY[]::text[]
             ) AS composite_field_names,
+            range.rngsubtype::regtype::text AS range_subtype,
+            CASE WHEN t.typelem <> 0
+                 THEN t.typelem::regtype::text
+                 ELSE NULL
+            END AS element_type,
             COALESCE(
                 array_agg(
                     CASE WHEN field_type_ns.nspname <> 'pg_catalog'
@@ -3056,6 +3308,7 @@ fn load_types(
         FROM pg_type t
         JOIN pg_namespace n ON n.oid = t.typnamespace
         LEFT JOIN pg_enum e ON e.enumtypid = t.oid
+        LEFT JOIN pg_range range ON range.rngtypid = t.oid
         LEFT JOIN pg_class composite_rel ON composite_rel.oid = t.typrelid
         LEFT JOIN pg_attribute a
           ON a.attrelid = t.typrelid
@@ -3067,7 +3320,8 @@ fn load_types(
           AND ({type_predicate})
           AND (t.typtype <> 'c' OR composite_rel.relkind = 'c')
           {schema_filter}
-        GROUP BY n.nspname, t.typname, t.typtype, t.typbasetype, t.typtypmod;
+        GROUP BY n.nspname, t.typname, t.typtype, t.typbasetype, t.typtypmod,
+                 t.typelem, range.rngsubtype;
         "
     );
     client
@@ -3087,9 +3341,13 @@ fn load_types(
                         .context("PostgreSQL omitted the base type for a domain")?,
                     base_type_id: None,
                 },
-                "r" => crate::_internal::model::types::TypeKind::Range,
+                "r" => crate::_internal::model::types::TypeKind::Range {
+                    subtype: row.try_get("range_subtype").context("range subtype")?,
+                },
                 "m" => crate::_internal::model::types::TypeKind::Multirange,
-                "b" => crate::_internal::model::types::TypeKind::Base,
+                "b" => crate::_internal::model::types::TypeKind::Base {
+                    element: row.try_get("element_type").context("element type")?,
+                },
                 "c" => {
                     let names: Vec<String> = row
                         .try_get("composite_field_names")
@@ -3574,6 +3832,14 @@ fn populate_cache_from_client(
     // Schemas are an authoritative catalog only for the requested sync scope.
     // FK-only external schemas pulled in below deliberately do not enter it.
     cache.schemas = load_schemas(client, &schema_values, schema_filter)?;
+
+    // Built-ins are cluster-wide, so they are read once and never scoped, and
+    // they are read first because every loader that renders a type name needs
+    // them to agree with what a migration would resolve.
+    cache.builtin_types = Some(load_builtin_types(client)?);
+    cache.opclasses = Some(load_opclasses(client)?);
+    cache.collations = Some(load_collations(client)?);
+    let builtin_types = cache.builtin_types.as_ref().expect("just loaded");
     coverage.record(CatalogFamily::Schemas);
     // A scoped request can name schemas that do not exist yet. PostgreSQL's
     // effective search path skips those entries, so do not let them become
@@ -3644,12 +3910,18 @@ fn populate_cache_from_client(
         load_foreign_keys(client, schemas, &schema_values, schema_filter_n1_or_n2)?;
 
     cache.inheritances = load_inheritances(client, &schema_values)?;
+    cache.index_attachments = load_index_attachments(client, &schema_values)?;
     coverage.record(CatalogFamily::Inheritance);
 
-    cache.indexes = load_indexes(client, &schema_values, schema_filter_nt)?;
+    cache.indexes = load_indexes(
+        client,
+        &schema_values,
+        schema_filter_nt,
+        cache.pg_version_num.unwrap_or_default(),
+    )?;
     coverage.record(CatalogFamily::Indexes);
 
-    cache.functions = load_routines(client, &schema_values, schema_filter)?;
+    cache.functions = load_routines(client, &schema_values, schema_filter, builtin_types)?;
     coverage.record(CatalogFamily::Routines);
 
     cache.publications = load_publications(client, cache.pg_version_num.unwrap_or_default())?;
@@ -3664,15 +3936,18 @@ fn populate_cache_from_client(
     // pg_depend rows use PostgreSQL dependency codes (n/a/i) and were ignored
     // after synchronization, so avoid loading them into Cache V8.
     cache.dependencies = load_view_dependencies(client, &schema_values)?;
+    cache.view_object_dependencies = load_view_object_dependencies(
+        client,
+        &schema_values,
+        &cache
+            .builtin_types
+            .clone()
+            .unwrap_or_else(BuiltinTypeCatalogue::fallback),
+    )?;
     coverage.record(CatalogFamily::Dependencies);
-    cache.scoped_external_relation_dependencies =
-        load_scoped_external_relation_dependencies(client, &schema_values)?;
-    cache.scoped_external_type_dependencies =
-        load_scoped_external_type_dependencies(client, &schema_values)?;
-    cache.scoped_external_routine_dependencies =
-        load_scoped_external_routine_dependencies(client, &schema_values)?;
-    cache.scoped_external_index_dependencies =
-        load_scoped_external_index_dependencies(client, &schema_values)?;
+    let scoped_external = load_scoped_external_dependencies(client, &schema_values)?;
+    cache.scoped_external_dependencies = scoped_external.edges;
+    cache.external_referencing_schemas = scoped_external.external_schemas;
     // All scope-boundary queries above completed inside the same repeatable
     // read transaction. Mark this only after every query succeeds; a cache
     // that was assembled programmatically or by a partial loader remains
@@ -3849,7 +4124,7 @@ mod atomic_write_tests {
         let mut payload = Vec::new();
         decoder.read_to_end(&mut payload).unwrap();
         let payload = payload
-            .strip_prefix(CACHE_V9_MAGIC)
+            .strip_prefix(CACHE_MAGIC)
             .expect("writer must prefix cache payloads");
         let config = bincode::config::standard().with_variable_int_encoding();
         let versioned: DbCacheVersioned = bincode::serde::decode_from_slice(payload, config)
@@ -3945,7 +4220,7 @@ mod atomic_write_tests {
             writable_cache(),
             Ok,
             MAX_CACHE_FILE_BYTES,
-            CACHE_V9_MAGIC.len(),
+            CACHE_MAGIC.len(),
         )
         .unwrap_err();
 

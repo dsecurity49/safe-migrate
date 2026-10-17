@@ -25,17 +25,17 @@ impl AnalysisState {
         match self.schema_lookup(&create_schema.name) {
             SchemaLookup::Present => {
                 return if create_schema.if_not_exists {
-                    MutationResult::Skipped
+                    MutationResult::NoOp
                 } else {
-                    MutationResult::Conflict {
-                        reason: format!("schema '{}' already exists", create_schema.name),
-                    }
+                    MutationResult::conflict(format!(
+                        "schema '{}' already exists",
+                        create_schema.name
+                    ))
                 };
             }
             SchemaLookup::AuthoritativelyAbsent | SchemaLookup::Tombstone => {}
             SchemaLookup::Unknown => {
-                self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
-                return MutationResult::Skipped;
+                return self.unresolved(EvidenceCode::UnknownObjectState);
             }
             SchemaLookup::WrongKind => unreachable!("schemas have a dedicated namespace"),
         }
@@ -53,9 +53,7 @@ impl AnalysisState {
             ),
         };
         if owner_known && self.local.roles_known && self.present_role(&owner_name).is_none() {
-            return MutationResult::Conflict {
-                reason: format!("role '{}' does not exist", owner_name),
-            };
+            return MutationResult::conflict(format!("role '{}' does not exist", owner_name));
         }
         if !owner_known || !self.local.roles_known {
             self.taint(
@@ -89,27 +87,27 @@ impl AnalysisState {
                 match self.schema_lookup(name) {
                     SchemaLookup::Present => {}
                     SchemaLookup::Tombstone | SchemaLookup::AuthoritativelyAbsent => {
-                        return MutationResult::Conflict {
-                            reason: format!("schema '{}' does not exist", name),
-                        };
+                        return MutationResult::conflict(format!(
+                            "schema '{}' does not exist",
+                            name
+                        ));
                     }
                     SchemaLookup::Unknown => {
-                        self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
-                        return MutationResult::Skipped;
+                        return self.unresolved(EvidenceCode::UnknownObjectState);
                     }
                     SchemaLookup::WrongKind => {
                         unreachable!("schemas do not share an overlay with other object kinds")
                     }
                 }
                 let Some((owner_name, owner_known)) = self.role_fact_identity(new_owner) else {
-                    self.taint(EvidenceCode::UnresolvedReference, EvidenceScope::Chain);
-                    return MutationResult::Skipped;
+                    return self.unresolved(EvidenceCode::UnresolvedReference);
                 };
                 if owner_known && self.local.roles_known && self.present_role(&owner_name).is_none()
                 {
-                    return MutationResult::Conflict {
-                        reason: format!("role '{}' does not exist", owner_name),
-                    };
+                    return MutationResult::conflict(format!(
+                        "role '{}' does not exist",
+                        owner_name
+                    ));
                 }
                 if !owner_known || !self.local.roles_known {
                     self.taint(
@@ -127,13 +125,13 @@ impl AnalysisState {
                 match self.schema_lookup(old_name) {
                     SchemaLookup::Present => {}
                     SchemaLookup::Unknown => {
-                        self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
-                        return MutationResult::Skipped;
+                        return self.unresolved(EvidenceCode::UnknownObjectState);
                     }
                     SchemaLookup::Tombstone | SchemaLookup::AuthoritativelyAbsent => {
-                        return MutationResult::Conflict {
-                            reason: format!("schema '{}' does not exist", old_name),
-                        };
+                        return MutationResult::conflict(format!(
+                            "schema '{}' does not exist",
+                            old_name
+                        ));
                     }
                     SchemaLookup::WrongKind => {
                         unreachable!("schemas do not share an overlay with other object kinds")
@@ -141,13 +139,13 @@ impl AnalysisState {
                 }
                 match self.schema_lookup(new_name) {
                     SchemaLookup::Present => {
-                        return MutationResult::Conflict {
-                            reason: format!("schema '{}' already exists", new_name),
-                        };
+                        return MutationResult::conflict(format!(
+                            "schema '{}' already exists",
+                            new_name
+                        ));
                     }
                     SchemaLookup::Unknown => {
-                        self.taint(EvidenceCode::UnknownObjectState, EvidenceScope::Chain);
-                        return MutationResult::Skipped;
+                        return self.unresolved(EvidenceCode::UnknownObjectState);
                     }
                     SchemaLookup::Tombstone | SchemaLookup::AuthoritativelyAbsent => {}
                     SchemaLookup::WrongKind => {
@@ -168,9 +166,10 @@ impl AnalysisState {
                 SchemaLookup::Present => {}
                 SchemaLookup::Tombstone | SchemaLookup::AuthoritativelyAbsent => {
                     if !drop_schema.if_exists {
-                        return MutationResult::Conflict {
-                            reason: format!("schema '{}' does not exist", name),
-                        };
+                        return MutationResult::conflict(format!(
+                            "schema '{}' does not exist",
+                            name
+                        ));
                     }
                 }
                 SchemaLookup::Unknown => {
@@ -186,7 +185,7 @@ impl AnalysisState {
         // DROP. A scoped cache cannot prove an unknown schema is absent even
         // with IF EXISTS, so it cannot safely remove the known siblings.
         if unknown_target {
-            return MutationResult::Skipped;
+            return self.unresolved(EvidenceCode::UnknownObjectState);
         }
         let present_names: Vec<String> = drop_schema
             .names
@@ -195,7 +194,7 @@ impl AnalysisState {
             .cloned()
             .collect();
         if present_names.is_empty() {
-            return MutationResult::Skipped;
+            return MutationResult::NoOp;
         }
         if drop_schema.cascade {
             self.snapshot_namespace();
@@ -384,12 +383,10 @@ impl AnalysisState {
                     && !drop_schema.names.contains(&edge.dependent.schema)
             });
             if has_external_dependents {
-                return MutationResult::Conflict {
-                    reason: format!(
-                        "schema(s) {:?} have dependent objects outside the schema; use CASCADE",
-                        drop_schema.names
-                    ),
-                };
+                return MutationResult::conflict(format!(
+                    "schema(s) {:?} have dependent objects outside the schema; use CASCADE",
+                    drop_schema.names
+                ));
             }
             let has_relation = self.local.relations.iter().any(|(id, overlay)| {
                 drop_schema.names.contains(&id.schema)
@@ -411,19 +408,16 @@ impl AnalysisState {
                     && !matches!(overlay, TriggerOverlay::Dropped)
             });
             if has_relation || has_type || has_sequence || has_function || has_trigger {
-                return MutationResult::Conflict {
-                    reason: format!(
-                        "schema(s) {:?} still contain objects; use CASCADE to drop them",
-                        drop_schema.names
-                    ),
-                };
+                return MutationResult::conflict(format!(
+                    "schema(s) {:?} still contain objects; use CASCADE to drop them",
+                    drop_schema.names
+                ));
             }
             // The state model deliberately omits several PostgreSQL object
             // families. With RESTRICT, any omitted object can make this
             // statement fail, so an apparently empty modeled namespace is not
             // sufficient evidence to drop the schema exactly.
-            self.taint(EvidenceCode::UnmodeledState, EvidenceScope::Chain);
-            return MutationResult::Skipped;
+            return self.unresolved(EvidenceCode::UnmodeledState);
         }
         for name in present_names {
             self.snapshot_schema(&name);

@@ -3,6 +3,7 @@ use crate::common::{object_id, setup_engine, synced_cache};
 use safe_migrate::_internal::analysis::facts::{PublicationObjectFact, PublicationScope};
 use safe_migrate::_internal::analysis::graph::DependencyKind;
 use safe_migrate::_internal::db::cache::{DbCache, IndexCache};
+use safe_migrate::_internal::model::index::{IndexDefinition, IndexPredicate, index_keys};
 use safe_migrate::_internal::model::relation::{Persistence, RelationKind, RelationState};
 use safe_migrate::_internal::model::role::RoleState;
 use safe_migrate::_internal::model::schema::{SchemaOverlay, SchemaState};
@@ -208,7 +209,11 @@ fn schema_rename_remaps_namespace_and_rolls_back_atomically() {
             .contains(&object_id("schema_new", "t"))
     );
     assert_eq!(state.local.search_path_template, ["schema_old", "public"]);
-    assert_eq!(state.local.search_path, ["public"]);
+    // The template stays the session's own setting, so `SET search_path TO
+    // DEFAULT` restores it unchanged. The effective path searches it against
+    // current schema state: the renamed-away `schema_old` is now provably
+    // absent, while `public` still exists.
+    assert_eq!(state.search_path_names(), ["public"]);
     assert!(matches!(
         state.local.publications.get("app_publication"),
         Some(safe_migrate::_internal::model::replication::PublicationOverlay::Present(publication))
@@ -237,7 +242,7 @@ fn schema_rename_remaps_namespace_and_rolls_back_atomically() {
             .sequences
             .contains_key(&object_id("schema_old", "t_id_seq"))
     );
-    assert_eq!(state.local.search_path, ["schema_old", "public"]);
+    assert_eq!(state.search_path_names(), ["schema_old", "public"]);
     assert_eq!(
         state.baseline_schemas.as_ref(),
         Some(&std::collections::HashSet::from([
@@ -316,21 +321,22 @@ fn table_set_schema_moves_the_relation_and_preserves_baseline_origin() {
     cache.indexes.push(IndexCache {
         index_id: index_id.clone(),
         table_id: old_id.clone(),
-        using_method: "btree".into(),
-        key_columns: vec!["id".into()],
-        included_columns: Vec::new(),
+        definition: IndexDefinition {
+            method: Some("btree".into()),
+            keys: index_keys(vec!["id".into()]),
+            included: index_keys(Vec::new()),
+            expression_keys: 0,
+            unique: false,
+            nulls_not_distinct: Some(false),
+            predicate: IndexPredicate::None,
+            unestablished: false,
+            valid: true,
+            ready: true,
+            live: true,
+        },
         dependency_columns: vec!["id".into()],
         dependency_columns_known: true,
-        has_expression_keys: false,
-        has_predicate: false,
-        is_unique: false,
         is_immediate: true,
-        is_valid: true,
-        is_ready: true,
-        is_live: true,
-        has_default_sort_order: true,
-        has_default_opclasses: true,
-        has_default_collations: true,
     });
     let mut state = AnalysisState::new(cache);
 
